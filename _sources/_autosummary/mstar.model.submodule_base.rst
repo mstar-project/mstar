@@ -16,7 +16,7 @@ mstar.model.submodule\_base
       chunk_loop_name
       chunk_tick_name
       engine_step
-      lora_rows
+      with_segment_steps
    
    
 

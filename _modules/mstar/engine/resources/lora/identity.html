@@ -1015,22 +1015,18 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">A request on an adapter fills KV pages that differ from the base model's for the same</span>
 <span class="sd">tokens, so its prompt's key chain hangs from a root that names the adapter's weights</span>
-<span class="sd">(``AdapterPrefixRoots``). The preprocess worker, which keys prompts, reads each adapter</span>
-<span class="sd">once when it is registered; nothing about an adapter travels per step.</span>
+<span class="sd">(``adapter_prefix_root``). The API server takes it from the adapter's digest when it</span>
+<span class="sd">selects the adapter for a request (``ServedModels``); nothing about an adapter travels</span>
+<span class="sd">per step.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.checkpoint</span><span class="w"> </span><span class="kn">import</span> <span class="n">read_lora_file</span>
-
-<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="c1"># folded into every adapter's root, so no adapter digest can coincide with another use of the chain root</span>
 <span class="n">_NAMESPACE</span> <span class="o">=</span> <span class="s2">"lora-adapter"</span>
@@ -1063,14 +1059,6 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="read_adapter_digest">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.read_adapter_digest">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">read_adapter_digest</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The digest of the adapter at ``path``, read as the pool reads it (``spec.convert_keys``)."""</span>
-    <span class="k">return</span> <span class="n">adapter_digest</span><span class="p">(</span><span class="n">read_lora_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">convert_keys</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">convert_keys</span><span class="p">))</span></div>
-
-
-
 <div class="viewcode-block" id="adapter_prefix_root">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.adapter_prefix_root">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">adapter_prefix_root</span><span class="p">(</span><span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
@@ -1080,58 +1068,6 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    same weights share pages, and one name reloaded with other weights does not.</span>
 <span class="sd">    """</span>
     <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="n">_NAMESPACE</span><span class="p">,</span> <span class="n">digest</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="AdapterPrefixRoots">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.AdapterPrefixRoots">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">AdapterPrefixRoots</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Adapter name -&gt; the root its requests' key chains hang from.</span>
-
-<span class="sd">    A name that is not registered has no root, and a request on it must not be keyed</span>
-<span class="sd">    at all: keyed under the base model's empty root, its pages would serve base</span>
-<span class="sd">    requests. ``register`` and ``unregister`` are the hooks for loading and unloading</span>
-<span class="sd">    an adapter at runtime; reads happen on the request-preparation threads (the</span>
-<span class="sd">    prepare pool, or the preprocess thread inline), writes on whichever thread registers.</span>
-<span class="sd">    """</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">roots</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_roots</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">roots</span> <span class="ow">or</span> <span class="p">{})</span>
-
-<div class="viewcode-block" id="AdapterPrefixRoots.read">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.AdapterPrefixRoots.read">[docs]</a>
-    <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">,</span> <span class="n">digests</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"AdapterPrefixRoots"</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Register every adapter ``spec`` (a ``LoraSpec``) serves under ``digests``, or,</span>
-<span class="sd">        for one not in it, under the digest of its file, read once."""</span>
-        <span class="n">roots</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">()</span>
-        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">digest</span> <span class="o">=</span> <span class="p">(</span><span class="n">digests</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-            <span class="n">roots</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">digest</span> <span class="k">if</span> <span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">read_adapter_digest</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">path</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">roots</span></div>
-
-
-<div class="viewcode-block" id="AdapterPrefixRoots.register">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.AdapterPrefixRoots.register">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_roots</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">adapter_prefix_root</span><span class="p">(</span><span class="n">digest</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"LoRA </span><span class="si">%s</span><span class="s2">: prefix-cache root </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">digest</span><span class="o">.</span><span class="n">hex</span><span class="p">()[:</span><span class="mi">16</span><span class="p">])</span></div>
-
-
-<div class="viewcode-block" id="AdapterPrefixRoots.unregister">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.AdapterPrefixRoots.unregister">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">unregister</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_roots</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
-
-
-<div class="viewcode-block" id="AdapterPrefixRoots.root">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.identity.html#mstar.engine.resources.lora.identity.AdapterPrefixRoots.root">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">root</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_roots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span></div>
-</div>
 
 </pre></div>
 

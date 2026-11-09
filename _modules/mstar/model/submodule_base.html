@@ -1025,8 +1025,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.knobs</span><span class="w"> </span><span class="kn">import</span> <span class="n">device_loopback_enabled</span>  <span class="c1"># noqa: F401  (re-export)</span>
 
 <span class="c1"># What ``check_stop`` returns, besides loop names, for a stop no loop can carry:</span>
@@ -2010,13 +2009,14 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># setting, so a new eager shape never searches.</span>
     <span class="n">capture_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
-    <span class="c1"># The LoRA pools bound to this node's modules (``module_lora_spec``); set by</span>
-    <span class="c1"># `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,</span>
-    <span class="c1"># and to each piecewise region's (``lora_rows``), from its segments: in order, the</span>
-    <span class="c1"># rows the adapted linears see, each a request's span of tokens (a request may have</span>
-    <span class="c1"># several, as CFG's cond and uncond copies). A step that lays its rows out otherwise</span>
-    <span class="c1"># declares its own ``LoraStep`` under the pool's key.</span>
-    <span class="n">lora_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="c1"># The keys of this node's resources whose step is its segments</span>
+    <span class="c1"># (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The</span>
+    <span class="c1"># engine adds a step of the segments under each to the node's step (``engine_step``),</span>
+    <span class="c1"># and to each piecewise region's from the region's own: in order, the rows the node's</span>
+    <span class="c1"># computation sees, each a request's span of tokens (a request may have several, as</span>
+    <span class="c1"># CFG's cond and uncond copies). A step that lays its rows out otherwise declares its</span>
+    <span class="c1"># own step under the resource's key.</span>
+    <span class="n">segment_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -2044,6 +2044,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        names a label this node doesn't have fails at bind rather than in the</span>
 <span class="sd">        middle of a forward.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">segment_keys</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">resource</span><span class="p">,</span> <span class="s2">"steps_from_segments"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span> <span class="o">=</span> <span class="n">resources</span>
         <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
             <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_resources"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -2051,7 +2054,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">bind</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">bind_module_lora</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">lora_keys</span> <span class="o">=</span> <span class="n">bind_module_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">)</span></div>
+        <span class="n">bind_module_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.cg_key_info">
@@ -2760,16 +2763,17 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="lora_rows">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.lora_rows">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">lora_rows</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">lora_keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare</span>
-<span class="sd">    itself, its rows the step's segments, as a new step (a declaration reused across</span>
-<span class="sd">    calls keeps its own). A step without segments gets none: an adapted module it runs</span>
-<span class="sd">    refuses for want of a plan (``LoraLayerDelta``)."""</span>
-    <span class="k">if</span> <span class="n">lora_keys</span> <span class="ow">and</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<div class="viewcode-block" id="with_segment_steps">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.with_segment_steps">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">with_segment_steps</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the</span>
+<span class="sd">    resources whose step is the segments, ``Resource.steps_from_segments``) that it does</span>
+<span class="sd">    not declare itself, as a new step (a declaration reused across calls keeps its own). A</span>
+<span class="sd">    step without segments gets none: a resource that needs one refuses for want of a plan</span>
+<span class="sd">    (``LoraLayerDelta``)."""</span>
+    <span class="k">if</span> <span class="n">keys</span> <span class="ow">and</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">segments</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">)</span>
-        <span class="n">added</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">lora_keys</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">}</span>
+        <span class="n">added</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">}</span>
         <span class="k">if</span> <span class="n">added</span><span class="p">:</span>
             <span class="n">step</span> <span class="o">=</span> <span class="n">replace</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="o">**</span><span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">,</span> <span class="o">**</span><span class="n">added</span><span class="p">})</span>
     <span class="k">return</span> <span class="n">step</span></div>
@@ -2779,11 +2783,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="engine_step">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.engine_step">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">engine_step</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""What the engine calls for a node's step: its ``declare_step``, with the LoRA</span>
-<span class="sd">    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes</span>
-<span class="sd">    no LoRA step."""</span>
+<span class="w">    </span><span class="sd">"""What the engine calls for a node's step: its ``declare_step``, with a step of its</span>
+<span class="sd">    segments under each resource that takes them as they are (``with_segment_steps``),</span>
+<span class="sd">    so a model declares nothing for such a resource (a LoRA pool)."""</span>
     <span class="c1"># the engine drives duck-typed submodules too</span>
-    <span class="k">return</span> <span class="n">lora_rows</span><span class="p">(</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"lora_keys"</span><span class="p">,</span> <span class="p">()))</span></div>
+    <span class="k">return</span> <span class="n">with_segment_steps</span><span class="p">(</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"segment_keys"</span><span class="p">,</span> <span class="p">()))</span></div>
 
 
 

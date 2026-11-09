@@ -1042,8 +1042,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Only the rank that chooses batches decides (a lockstep instance's leader), so no other</span>
 <span class="sd">rank keeps reservations; the admit refusal stays as a backstop.</span>
 
-<span class="sd">A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per</span>
-<span class="sd">node, and each admits only its own node's rows. A request holds a slot in each until it</span>
+<span class="sd">A spec over several nodes (an LLM and its vision encoder) builds a pool per node</span>
+<span class="sd">(``LoraSpec.for_node``), and each admits only its own node's rows. A request holds a slot in each until it</span>
 <span class="sd">is removed (none in a pool whose targets its adapter has nothing for), but where the</span>
 <span class="sd">graph runs the encoder once, before the LLM (Qwen3.5), it takes them in that order and a</span>
 <span class="sd">row holding an LLM slot never waits on the encoder's pool, so the two pools' waits</span>
@@ -1090,7 +1090,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">LoraReqConfig</span><span class="p">,</span>
     <span class="n">LoraSpec</span><span class="p">,</span>
-    <span class="n">LoraStep</span><span class="p">,</span>
     <span class="n">describe_load_error</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.store</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoadedAdapter</span><span class="p">,</span> <span class="n">LoraAdapterStore</span><span class="p">,</span> <span class="n">adapter_targets</span>
@@ -1102,6 +1101,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">AdmitOutcome</span><span class="p">,</span>
     <span class="n">AdmitRuntimeError</span><span class="p">,</span>
     <span class="n">AllocationFailed</span><span class="p">,</span>
+    <span class="n">ResourceStep</span><span class="p">,</span>
     <span class="n">StepContext</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.h2d</span><span class="w"> </span><span class="kn">import</span> <span class="n">H2DMirror</span><span class="p">,</span> <span class="n">PinnedStager</span>
@@ -1155,11 +1155,10 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_Served</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Where an adapter is read from, and what its weights must digest to (None until</span>
-<span class="sd">    its first read, for an adapter that arrived without one)."""</span>
+<span class="w">    </span><span class="sd">"""Where an adapter is read from, and what its weights must digest to."""</span>
 
     <span class="n">path</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span>
 
 
 <div class="viewcode-block" id="LoraAddressing">
@@ -1190,9 +1189,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    A layer computes its base output, then calls this before anything consumes ``y`` —</span>
 <span class="sd">    for a row-parallel linear, before its all-reduce. Rows on the base model address the</span>
-<span class="sd">    zero adapter, which the kernels skip; a step with no adapter row at all returns ``y``</span>
-<span class="sd">    untouched (``LoraAdapterPool.active``). The layer's slot weights are views resolved</span>
-<span class="sd">    once, here; a call reads only the step's addressing.</span>
+<span class="sd">    zero adapter, which the kernels skip; a step that runs the pool lean</span>
+<span class="sd">    (``StepContext.lean``: no row names an adapter) returns ``y`` untouched</span>
+<span class="sd">    (``LoraAdapterPool.active``). The layer's slot</span>
+<span class="sd">    weights are views resolved once, here; a call reads only the step's addressing.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="s2">"LoraAdapterPool"</span><span class="p">,</span> <span class="n">target</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
@@ -1221,7 +1221,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"belongs in preprocess or the forward"</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span><span class="o">.</span><span class="n">active</span><span class="p">:</span>
-            <span class="c1"># a base-only step: no row names an adapter, so nothing is launched</span>
+            <span class="c1"># a lean step: no row names an adapter, so nothing is launched</span>
             <span class="k">return</span> <span class="n">y</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_embedding</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
@@ -1302,11 +1302,13 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># holds no per-token state, so a request whose prompt prefix was served from the cache</span>
     <span class="c1"># runs here exactly as one that computed it</span>
     <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="c1"># a dropped request keeps its adapter and slot, and its rebuild runs under that adapter</span>
-    <span class="n">supports_drop</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># a step none of whose rows names an adapter runs no delta (`lean_for`), so each</span>
     <span class="c1"># bucket, piecewise regions' included, has a twin with no LoRA kernel</span>
     <span class="n">lean_capture</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># a node's rows are its segments' tokens, so it declares nothing for the pool</span>
+    <span class="n">steps_from_segments</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># a dropped request keeps its adapter and slot, and its rebuild runs under that adapter</span>
+    <span class="n">supports_drop</span> <span class="o">=</span> <span class="kc">True</span>
 
 <div class="viewcode-block" id="LoraAdapterPool.build">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.build">[docs]</a>
@@ -1393,11 +1395,18 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_slots</span> <span class="o">=</span> <span class="p">[</span><span class="n">SlotState</span><span class="p">(</span><span class="n">index</span><span class="o">=</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_slots</span><span class="p">)]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_resident</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># adapter -&gt; slot</span>
+        <span class="n">unpinned</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">adapter_digests</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">unpinned</span><span class="p">:</span>
+            <span class="c1"># each rank would serve whatever its own read finds</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"LoRA adapters </span><span class="si">{</span><span class="n">unpinned</span><span class="si">}</span><span class="s2"> have no pinned digest: the API server resolves "</span>
+                <span class="s2">"the serving config's adapters (resolve_lora_adapters)"</span>
+            <span class="p">)</span>
         <span class="c1"># adapter -&gt; where it is read from: those a new request may name, and those</span>
         <span class="c1"># unloaded while live requests still named them, kept until the last of those</span>
         <span class="c1"># requests is removed</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_Served</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">name</span><span class="p">:</span> <span class="n">_Served</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapter_digests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">name</span><span class="p">:</span> <span class="n">_Served</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapter_digests</span><span class="p">[</span><span class="n">name</span><span class="p">])</span>
             <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span>
         <span class="c1"># adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only</span>
@@ -1454,8 +1463,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># read adapters ahead, so a first request finds its adapter in the host tier</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span> <span class="k">if</span> <span class="n">n</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_empty</span><span class="p">][:</span><span class="n">spec</span><span class="o">.</span><span class="n">cpu_capacity</span><span class="p">]:</span>
             <span class="n">served</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-            <span class="n">adapter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_store</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">served</span><span class="o">.</span><span class="n">path</span><span class="p">,</span> <span class="n">served</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_pin_digest</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">served</span><span class="p">,</span> <span class="n">adapter</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_store</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">served</span><span class="o">.</span><span class="n">path</span><span class="p">,</span> <span class="n">served</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
 
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
             <span class="s2">"LoRA pool: </span><span class="si">%d</span><span class="s2"> slots (+ zero adapter), max rank </span><span class="si">%d</span><span class="s2">, targets </span><span class="si">%s</span><span class="s2">, </span><span class="si">%.2f</span><span class="s2"> MiB"</span><span class="p">,</span>
@@ -1505,18 +1513,18 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">"the LoRA pool has no plan for this step: the step running the adapted "</span>
                 <span class="s2">"module (the node's, or a piecewise region's) is None or declares no "</span>
-                <span class="s2">"segments to lay its LoRA rows out from"</span>
+                <span class="s2">"segments to lay its rows out from"</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">[</span><span class="n">grouping</span><span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="LoraAdapterPool.base_only">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.base_only">[docs]</a>
+<div class="viewcode-block" id="LoraAdapterPool.outside_step">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.outside_step">[docs]</a>
     <span class="nd">@contextmanager</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">base_only</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="kc">None</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""A forward outside any step (a compile's warm-up) on this thread, as a base-only</span>
-<span class="sd">        step: its deltas add nothing. A compile traced here takes the base-only branch,</span>
-<span class="sd">        so the first step with an adapter row compiles its own."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">outside_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""A forward outside any step (a compile's warm-up) on this thread, as a lean</span>
+<span class="sd">        step: its deltas add nothing. A compile traced here takes the lean branch, so the</span>
+<span class="sd">        first step with an adapter row compiles its own."""</span>
         <span class="n">saved</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span> <span class="o">=</span> <span class="p">{},</span> <span class="n">threading</span><span class="o">.</span><span class="n">get_ident</span><span class="p">(),</span> <span class="kc">False</span>
         <span class="k">try</span><span class="p">:</span>
@@ -1553,12 +1561,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="LoraAdapterPool.ingest_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">overrides</span><span class="p">:</span> <span class="n">ResourceReqConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="n">adapter</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">adapter</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">overrides</span><span class="p">,</span> <span class="n">LoraReqConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">overrides</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">overrides</span><span class="p">,</span> <span class="n">LoraReqConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">adapter</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">adapter</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">adapter</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"unknown LoRA adapter </span><span class="si">{</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2">; this deployment serves </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
-                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">served</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">adapter</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">served</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"unknown LoRA adapter </span><span class="si">{</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2">; this deployment serves </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">served</span><span class="o">.</span><span class="n">digest</span> <span class="o">!=</span> <span class="n">config</span><span class="o">.</span><span class="n">digest</span><span class="p">:</span>
+                    <span class="c1"># its prompt was keyed under the weights it was selected on</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"LoRA adapter </span><span class="si">{</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2"> was loaded again with other weights after "</span>
+                        <span class="s2">"this request selected it; send the request again"</span>
+                    <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_adapter_of</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">adapter</span>
             <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_row_slot</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">ZERO_SLOT</span>
@@ -1600,14 +1617,14 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="LoraAdapterPool.load_adapter">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``load_adapter_async``, waited on."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">load_adapter_async</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">digest</span><span class="p">)</span><span class="o">.</span><span class="n">result</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="LoraAdapterPool.load_adapter_async">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_adapter_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Future</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_adapter_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Future</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Serve ``name`` from ``path``: read it on the reader thread, check it against the</span>
 <span class="sd">        spec (and against ``digest``, the weights the API server checked), and only then</span>
 <span class="sd">        make it servable. The read is not kept, since the host tier holds only what</span>
@@ -1620,14 +1637,14 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">()</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_load</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">digest</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">adapter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_store</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">digest</span><span class="p">)</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_refuse_reload</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">adapter</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="c1"># no request can name it before it is served, below</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_empty</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">_Served</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">adapter</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">_Served</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">digest</span><span class="p">)</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"LoRA pool: loaded </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_refuse_reload</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1767,7 +1784,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="LoraAdapterPool.admit">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.admit">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Give each row whose adapter is not resident yet a slot, loading it there.</span>
 
 <span class="sd">        Nothing to do once every row holds its slot, which is every step after a request's</span>
@@ -1853,7 +1870,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="LoraAdapterPool.rollback_admit">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.rollback_admit">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">rollback_admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rollback_admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Give back the slots this step's admit took. An adapter it loaded stays resident</span>
 <span class="sd">        in its now-unheld slot, as a cache."""</span>
         <span class="k">del</span> <span class="n">step</span>
@@ -1877,7 +1894,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="LoraAdapterPool.commit">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.commit">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">commit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">del</span> <span class="n">step</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">==</span> <span class="n">PIECEWISE_WALK</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enclosing</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># the region is done; the eager code after it reads the enclosing plan</span>
@@ -1981,21 +1998,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">return</span>
             <span class="n">adapter</span> <span class="o">=</span> <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
             <span class="n">current</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retiring</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">current</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">current</span><span class="o">.</span><span class="n">path</span> <span class="o">!=</span> <span class="n">served</span><span class="o">.</span><span class="n">path</span> <span class="ow">or</span> <span class="p">(</span>
-                <span class="n">current</span><span class="o">.</span><span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">current</span><span class="o">.</span><span class="n">digest</span> <span class="o">!=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">digest</span>
-            <span class="p">):</span>
+            <span class="k">if</span> <span class="n">current</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">current</span> <span class="o">!=</span> <span class="n">served</span><span class="p">:</span>
                 <span class="k">return</span>  <span class="c1"># unloaded, or reloaded with other weights, while it was read</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_pin_digest</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">current</span><span class="p">,</span> <span class="n">adapter</span><span class="o">.</span><span class="n">digest</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">adapter</span><span class="p">)</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_pin_digest</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">served</span><span class="p">:</span> <span class="n">_Served</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""An adapter that arrived with no digest takes its first read's, so a file</span>
-<span class="sd">        changed after it is refused rather than served under the name."""</span>
-        <span class="k">if</span> <span class="n">served</span><span class="o">.</span><span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="k">for</span> <span class="n">table</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_serving</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retiring</span><span class="p">):</span>
-            <span class="k">if</span> <span class="n">table</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="n">served</span><span class="p">:</span>
-                <span class="n">table</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">served</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">digest</span><span class="o">=</span><span class="n">digest</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_pick_slot</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exclude</span><span class="o">=</span><span class="p">())</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""An empty slot, else the unheld one released longest ago (ties to the lowest</span>
@@ -2091,7 +2096,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="LoraAdapterPool.plan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.plan">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LoraAddressing</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">ResourceStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LoraAddressing</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">get_ident</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">==</span> <span class="n">PIECEWISE_WALK</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># before the memoized return below, which a region's repeat plan takes too</span>

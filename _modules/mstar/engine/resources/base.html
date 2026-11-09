@@ -1015,6 +1015,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">AbstractContextManager</span><span class="p">,</span> <span class="n">nullcontext</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">IntEnum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
@@ -1228,6 +1229,21 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Whether a capture of ``config_type`` gets this resource's lean twin."""</span>
         <span class="k">return</span> <span class="kc">True</span></div>
 
+
+<div class="viewcode-block" id="Resource.outside_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.outside_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">outside_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AbstractContextManager</span><span class="p">[</span><span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Run a ``lean_capture`` resource's callers outside any planned step (a</span>
+<span class="sd">        compile's warm-up) on this thread, as in a step that runs it lean."""</span>
+        <span class="k">return</span> <span class="n">nullcontext</span><span class="p">()</span></div>
+
+
+    <span class="c1"># Whether this resource's step on a node is the node's own segments</span>
+    <span class="c1"># (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node</span>
+    <span class="c1"># packs its rows), so the node declares nothing for it: ``engine_step`` adds a</span>
+    <span class="c1"># ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the</span>
+    <span class="c1"># node's tokens).</span>
+    <span class="n">steps_from_segments</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># stays correct when a hit skips the front of a request; required of every resource on a keyed node</span>
     <span class="n">prefix_skip_safe</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>

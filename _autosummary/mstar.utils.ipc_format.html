@@ -1008,7 +1008,7 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="mstar.utils.ipc_format.LoadLoraAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code></a>(op_id, lora_name, lora_path)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="mstar.utils.ipc_format.LoadLoraAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code></a>(op_id, lora_name, lora_path, ...)</p></td>
 <td><p>Serve a LoRA adapter from now on (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.LoraAdapterAck" title="mstar.utils.ipc_format.LoraAdapterAck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterAck</span></code></a>(op_id, worker_id[, error])</p></td>
@@ -1473,7 +1473,7 @@ step can fail several of them for different reasons.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">LoadLoraAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">op_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#LoadLoraAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">LoadLoraAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">op_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#LoadLoraAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
 <p>Serve a LoRA adapter from now on (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>). The API server
 sends it to the conductor, which forwards it to every worker hosting the LoRA pool
@@ -1487,13 +1487,13 @@ the prefix cache under: a worker reading other weights refuses the load.</p>
 <li><p><strong>op_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>lora_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>lora_path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>lora_digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>lora_digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter.lora_digest">
-<span class="sig-name descname"><span class="pre">lora_digest</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">lora_digest</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">

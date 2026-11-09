@@ -1014,27 +1014,32 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""Loading and unloading LoRA adapters at runtime, as the conductor sees it.</span>
 
 <span class="sd">The API server asks; the conductor forwards the request to every worker hosting a node</span>
-<span class="sd">with the LoRA pool and answers once all of them have acknowledged. A load becomes</span>
-<span class="sd">servable (the conductor's ``LoraSpec`` names it, so ``LoraReqConfig.validate`` accepts it)</span>
-<span class="sd">only when every worker loaded it; if any failed, the others are told to unload it again.</span>
-<span class="sd">An unload stops the conductor validating new requests on the name at once, before any</span>
-<span class="sd">worker hears of it.</span>
+<span class="sd">with the LoRA pool and answers once all of them have acknowledged. A load is answered as</span>
+<span class="sd">done only when every worker loaded it; if any failed, the others are told to unload it</span>
+<span class="sd">again. Which names are served is the API server's to track (``ServedModels``, which a</span>
+<span class="sd">request's adapter is selected from): the conductor keeps no registry of its own, only</span>
+<span class="sd">the operations in flight, during which it refuses requests on their adapters with a 409:</span>
+<span class="sd">each worker finishes an operation in its own time, so the ranks of one lockstep instance</span>
+<span class="sd">could open such a request differently.</span>
 
-<span class="sd">A worker that never answers (hung, dead) would leave the name refused with a 409 for good,</span>
-<span class="sd">on this side and the API server's. Past ``runtime_update_timeout_s`` an operation is given</span>
-<span class="sd">up: a load is undone on every worker and answered with a 504, an unload (the name already</span>
-<span class="sd">out of the conductor's spec) answered as done.</span>
+<span class="sd">A worker that never answers (hung, dead) would leave the name refused with a 409 for good.</span>
+<span class="sd">Past ``runtime_update_timeout_s`` an operation is given up: a load is undone on every</span>
+<span class="sd">worker and answered with a 504, an unload (the name already out of the API server's</span>
+<span class="sd">selection) answered as done.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Iterable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
+
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.request_types</span><span class="w"> </span><span class="kn">import</span> <span class="n">APIServerMessage</span><span class="p">,</span> <span class="n">LoraAdapterResult</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraReqConfig</span><span class="p">,</span> <span class="n">LoraSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceReqConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.ipc_format</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">LoadLoraAdapter</span><span class="p">,</span>
     <span class="n">LoraAdapterAck</span><span class="p">,</span>
@@ -1067,21 +1072,17 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">LoraAdapterOps</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The conductor's half of ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``.</span>
 
-<span class="sd">    ``spec`` is the conductor's own ``LoraSpec`` (None for a deployment without LoRA), the</span>
-<span class="sd">    one whose adapters it answers from, and ``others`` every other ``LoraSpec`` that</span>
-<span class="sd">    serves the same adapters (other nodes' specs, and the per-worker copies requests are</span>
-<span class="sd">    validated against); ``workers`` are the workers hosting any of their</span>
-<span class="sd">    nodes; ``send(peer, message)`` is the conductor's communicator; ``clock`` its</span>
-<span class="sd">    clock (``time.perf_counter``, as its other timed checks).</span>
+<span class="sd">    ``spec`` is a LoRA pool's spec, whose runtime-update settings every pool shares (None</span>
+<span class="sd">    for a deployment without LoRA); ``workers`` are the workers hosting the pools' nodes;</span>
+<span class="sd">    ``send(peer, message)`` is the conductor's communicator;</span>
+<span class="sd">    ``clock`` its clock (``time.perf_counter``, as its other timed checks).</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">LoraSpec</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">workers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">send</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">],</span> <span class="kc">None</span><span class="p">],</span>
         <span class="n">clock</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">,</span>
-        <span class="n">others</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span> <span class="o">=</span> <span class="n">spec</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_others</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">others</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_workers</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">workers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span> <span class="o">=</span> <span class="n">send</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_clock</span> <span class="o">=</span> <span class="n">clock</span>
@@ -1091,10 +1092,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.load">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">body</span><span class="p">:</span> <span class="n">LoadLoraAdapter</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">refusal</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">refusal</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">body</span><span class="o">.</span><span class="n">lora_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="o">.</span><span class="n">adapters</span><span class="p">:</span>
-            <span class="n">refusal</span> <span class="o">=</span> <span class="mi">400</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"The lora adapter '</span><span class="si">{</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="si">}</span><span class="s2">' has already been loaded."</span>
         <span class="k">if</span> <span class="n">refusal</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="o">*</span><span class="n">refusal</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="o">*</span><span class="n">refusal</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_start</span><span class="p">(</span><span class="n">body</span><span class="p">,</span> <span class="n">WorkerMessageType</span><span class="o">.</span><span class="n">LOAD_LORA_ADAPTER</span><span class="p">)</span></div>
 
@@ -1102,15 +1101,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="LoraAdapterOps.unload">
 <a class="viewcode-back" href="../../../_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.unload">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">unload</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">body</span><span class="p">:</span> <span class="n">UnloadLoraAdapter</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Running requests on the name finish on its weights; the API server took it out</span>
+<span class="sd">        of selection before asking."""</span>
         <span class="n">refusal</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_refusal</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">refusal</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">body</span><span class="o">.</span><span class="n">lora_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="o">.</span><span class="n">adapters</span><span class="p">:</span>
-            <span class="n">refusal</span> <span class="o">=</span> <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"The lora adapter '</span><span class="si">{</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="si">}</span><span class="s2">' cannot be found."</span>
         <span class="k">if</span> <span class="n">refusal</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="o">*</span><span class="n">refusal</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="o">*</span><span class="n">refusal</span><span class="p">)</span>
             <span class="k">return</span>
-        <span class="c1"># refuse new requests on it from here on; running ones finish on its weights</span>
-        <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="p">,</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_others</span><span class="p">):</span>
-            <span class="n">spec</span><span class="o">.</span><span class="n">remove_adapter</span><span class="p">(</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_start</span><span class="p">(</span><span class="n">body</span><span class="p">,</span> <span class="n">WorkerMessageType</span><span class="o">.</span><span class="n">UNLOAD_LORA_ADAPTER</span><span class="p">)</span></div>
 
 
@@ -1128,6 +1124,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">op</span><span class="o">.</span><span class="n">waiting</span><span class="p">:</span>
             <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="p">[</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">]</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_finish</span><span class="p">(</span><span class="n">op</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="LoraAdapterOps.refuse_request">
+<a class="viewcode-back" href="../../../_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.refuse_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">refuse_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">configs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">ResourceReqConfig</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Refuse (409) a request whose adapter a load or unload is in flight for."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">busy</span> <span class="o">=</span> <span class="p">{</span><span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">lora_name</span> <span class="k">for</span> <span class="n">op</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
+        <span class="k">for</span> <span class="n">config</span> <span class="ow">in</span> <span class="n">configs</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">LoraReqConfig</span><span class="p">)</span> <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">adapter</span> <span class="ow">in</span> <span class="n">busy</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="n">HTTPException</span><span class="p">(</span>
+                    <span class="n">status_code</span><span class="o">=</span><span class="mi">409</span><span class="p">,</span>
+                    <span class="n">detail</span><span class="o">=</span><span class="sa">f</span><span class="s2">"LoRA adapter '</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">adapter</span><span class="si">}</span><span class="s2">' is being loaded or unloaded; retry once that is done"</span><span class="p">,</span>
+                <span class="p">)</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_refusal</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -1164,9 +1175,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="o">.</span><span class="n">runtime_update_timeout_s</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">op</span><span class="o">.</span><span class="n">is_load</span><span class="p">:</span>
-                <span class="c1"># out of the spec since it started: new requests are refused, which is</span>
+                <span class="c1"># out of selection since it started: new requests are refused, which is</span>
                 <span class="c1"># what the client asked for; a silent worker forgets it, or dies</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">)</span>
                 <span class="k">continue</span>
             <span class="c1"># every worker, the silent ones included: a load still being read there is</span>
             <span class="c1"># undone once it lands (the worker holds the unload behind it)</span>
@@ -1175,7 +1186,6 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">op_id</span><span class="p">,</span> <span class="mi">504</span><span class="p">,</span>
                 <span class="sa">f</span><span class="s2">"LoRA adapter '</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">' was not loaded: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">waiting</span><span class="p">)</span><span class="si">}</span><span class="s2"> worker(s) did not "</span>
                 <span class="sa">f</span><span class="s2">"answer within </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="o">.</span><span class="n">runtime_update_timeout_s</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> s"</span><span class="p">,</span>
-                <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">,</span>
             <span class="p">)</span></div>
 
 
@@ -1197,23 +1207,18 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"LoRA adapter </span><span class="si">%s</span><span class="s2">: unload failed on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="p">)</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"LoRA adapter </span><span class="si">%s</span><span class="s2"> unloaded"</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="p">:</span>
-            <span class="n">digest</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">lora_digest</span>
-            <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="p">,</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_others</span><span class="p">):</span>
-                <span class="n">spec</span><span class="o">.</span><span class="n">add_adapter</span><span class="p">(</span>
-                    <span class="n">name</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">lora_path</span><span class="p">,</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">digest</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">digest</span><span class="p">),</span>
-                <span class="p">)</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"LoRA adapter </span><span class="si">%s</span><span class="s2"> loaded from </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">lora_path</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">200</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_roll_back</span><span class="p">(</span><span class="n">op</span><span class="p">,</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workers</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="p">)))</span>
         <span class="c1"># each worker logged its own failure in full; what they ack is fit for a client</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"LoRA adapter </span><span class="si">%s</span><span class="s2"> failed to load on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="p">)</span>
         <span class="n">detail</span> <span class="o">=</span> <span class="s2">"; "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">errors</span><span class="o">.</span><span class="n">values</span><span class="p">())))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_answer</span><span class="p">(</span>
-            <span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">400</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"LoRA adapter '</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">' failed to load: </span><span class="si">{</span><span class="n">detail</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">,</span>
+            <span class="n">op</span><span class="o">.</span><span class="n">body</span><span class="o">.</span><span class="n">op_id</span><span class="p">,</span> <span class="mi">400</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"LoRA adapter '</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">' failed to load: </span><span class="si">{</span><span class="n">detail</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
         <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_roll_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op</span><span class="p">:</span> <span class="n">_PendingOp</span><span class="p">,</span> <span class="n">workers</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1225,11 +1230,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">message_type</span><span class="o">=</span><span class="n">WorkerMessageType</span><span class="o">.</span><span class="n">UNLOAD_LORA_ADAPTER</span><span class="p">,</span> <span class="n">body</span><span class="o">=</span><span class="n">rollback</span><span class="p">,</span>
             <span class="p">))</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_answer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">served</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">name</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spec</span><span class="o">.</span><span class="n">adapters</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_answer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="s2">"api_server"</span><span class="p">,</span> <span class="n">APIServerMessage</span><span class="p">(</span>
             <span class="n">message_type</span><span class="o">=</span><span class="s2">"lora_adapter_result"</span><span class="p">,</span>
-            <span class="n">body</span><span class="o">=</span><span class="n">LoraAdapterResult</span><span class="p">(</span><span class="n">op_id</span><span class="o">=</span><span class="n">op_id</span><span class="p">,</span> <span class="n">error_message</span><span class="o">=</span><span class="n">error</span><span class="p">,</span> <span class="n">status</span><span class="o">=</span><span class="n">status</span><span class="p">,</span> <span class="n">served</span><span class="o">=</span><span class="n">served</span><span class="p">),</span>
+            <span class="n">body</span><span class="o">=</span><span class="n">LoraAdapterResult</span><span class="p">(</span><span class="n">op_id</span><span class="o">=</span><span class="n">op_id</span><span class="p">,</span> <span class="n">error_message</span><span class="o">=</span><span class="n">error</span><span class="p">,</span> <span class="n">status</span><span class="o">=</span><span class="n">status</span><span class="p">),</span>
         <span class="p">))</span></div>
 
 </pre></div>

@@ -16,7 +16,6 @@ mstar.engine.resources.lora.config
       describe_load_error
       lora_enabled
       resolve_adapter_path
-      served_lora_adapters
    
    
 
@@ -30,7 +29,6 @@ mstar.engine.resources.lora.config
       LoraModuleRef
       LoraReqConfig
       LoraSpec
-      LoraStep
       LoraTarget
    
    

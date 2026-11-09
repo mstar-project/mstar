@@ -1102,6 +1102,11 @@ streams.</p></li>
 <p>BAGEL (<code class="docutils literal notranslate"><span class="pre">bagel_model.py</span></code>) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.</p>
+<p>A spec can also build its own request’s config from <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
+(<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config</span></code>), which the conductor adds beside the model’s. That
+is how a resource the deployment declares, such as a LoRA pool, takes per-request
+settings without model code. A row with no config under a resource’s key may let that
+resource run lean for the step; see <strong>Lean captures</strong> under the resources table.</p>
 <p><code class="docutils literal notranslate"><span class="pre">get_sampling_config(node_name,</span> <span class="pre">model_kwargs)</span></code> still exists as a helper for assembling
 sampling parameters. The engine no longer reads it directly. Pass its result into a
 <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> here.</p>
@@ -1321,15 +1326,19 @@ doesn’t cover the resize. A label under a step’s retention (<code class="doc
 pages only up to its protected prefix, which the retention never releases.</p>
 <p>A request on a LoRA adapter fills different KV for the same tokens, so its keys chain from
 a root that names the adapter’s weights: a SHA-256 over every module’s A, B (with dtype
-and shape) and alpha, read once when the adapter is registered (<code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots</span></code> in
-<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/lora/identity.py</span></code>, built by the preprocess worker at startup).
-The root travels with the request as <code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_root</span></code> so that a page
+and shape) and alpha, read once when the adapter is registered (<code class="docutils literal notranslate"><span class="pre">adapter_prefix_root</span></code>
+in <code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/lora/identity.py</span></code>). The API server takes the root when it
+selects a request’s adapter (<code class="docutils literal notranslate"><span class="pre">ServedModels.select</span></code>) and the preprocess worker keys the
+prompt from it. The root travels with the request as <code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_root</span></code> so that a page
 generation fills is keyed under it too. The same tokens under two adapters, or under an
 adapter and the base model, never share pages; two names for identical weights do; and a
-name registered again with other weights misses everything the old weights filled. A
-base-model request chains from the empty root, so its keys are what they were before
-LoRA. A request whose adapter has no registered root is not keyed at all. Nothing on the
-model side is needed for this.</p>
+name registered again with other weights misses everything the old weights filled; a
+request selected under the old weights carries their digest (<code class="docutils literal notranslate"><span class="pre">LoraReqConfig.digest</span></code>),
+and a pool serving the new ones refuses it at ingest. A base-model request chains from
+the empty root, so its keys are what they were before LoRA. Only a registered adapter
+can be selected, so every request on one has its root; one that arrives without is not
+cached.
+Nothing on the model side is needed for this.</p>
 </section>
 </section>
 <section id="step-2a-declare-your-resources">
@@ -1611,9 +1620,9 @@ bucket on it and the model leaves those buckets out.</p></td>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
 <td><p>Per-request LoRA adapters on the node’s LoRA-capable linears: a pool of device
 slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
-Returned from <code class="docutils literal notranslate"><span class="pre">get_lora_specs</span></code> (one per node), not this list, and built only
-when the serving YAML has a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block. See <a class="reference internal" href="#per-request-lora-adapters">Per-request LoRA
-adapters</a>.</p></td>
+Opt-in (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.opt_in</span></code>): declared in this list, built only when
+the serving YAML has a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block. One spec spans every node
+adapters reach, with a pool per node. See <a class="reference internal" href="#per-request-lora-adapters">Per-request LoRA adapters</a>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1626,12 +1635,14 @@ engine captures a twin for each set of them, keyed by that set (<code class="doc
 replays the twin of every resource its rows let run lean, else one with fewer of them
 (largest set first, ties in declaration order), else the plain bucket; the engine names the
 set in <code class="docutils literal notranslate"><span class="pre">StepContext.lean</span></code>, eager steps included, and each resource checks its rows again
-at plan. Twins are sized, planned and captured after every plain bucket, and a twin left
-out (under the capture budget, say) is logged at INFO and is not a dropped bucket: its
-steps replay the plain bucket. Lean resources: the LoRA pool, for steps none of whose rows
-names an adapter, in every kind of capture; and a sampler (see <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code>), for
-steps whose rows all sample greedily, in batched captures. A model declares nothing for
-these.</p>
+at plan. A resource whose callers read its plan inside the forward also overrides
+<code class="docutils literal notranslate"><span class="pre">Resource.outside_step</span></code>, which the engine enters around compile warm-ups outside any step
+(the LoRA pool’s runs them lean). Twins are sized, planned and captured after every plain
+bucket, and a twin left out (under the capture budget, say) is logged at INFO and is not a
+dropped bucket: its steps replay the plain bucket. Lean resources: the LoRA pool, for
+steps none of whose rows names an adapter, in every kind of capture; and a sampler (see
+<code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code>), for steps whose rows all sample greedily, in batched captures. A
+model declares nothing for these.</p>
 <p>Orpheus declares four specs for its one autoregressive node. Its <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code> node
 appears in no spec, so it receives no resources:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># mstar/model/orpheus/config.py</span>
@@ -1958,19 +1969,27 @@ one batch can run different adapters, or none. The engine owns the adapter weigh
 model declares which linears adapters may touch; it never indexes the pool itself.</p>
 <p>A model declares LoRA from its own modules: the shared linears add the delta
 themselves once bound, and <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> builds the spec by walking each node’s
-weights root. Orpheus is the reference (<code class="docutils literal notranslate"><span class="pre">OrpheusModel.get_lora_specs</span></code>):</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">PER_SEGMENT</span><span class="p">,</span> <span class="n">meta_root</span><span class="p">,</span> <span class="n">module_lora_spec</span>
+weights root. The spec is opt-in (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.opt_in</span></code>), declared in
+<code class="docutils literal notranslate"><span class="pre">get_node_resources</span></code> beside the model’s other resources and built only when the
+serving YAML has a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block. Orpheus is the reference
+(<code class="docutils literal notranslate"><span class="pre">OrpheusModel.get_node_resources</span></code>):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">PER_SEGMENT</span><span class="p">,</span> <span class="n">module_lora_spec</span>
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_lora_specs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]:</span>
-    <span class="c1"># the module the node's weight loader fills, at one rank, on the meta device</span>
-    <span class="n">root</span> <span class="o">=</span> <span class="n">meta_root</span><span class="p">(</span><span class="k">lambda</span> <span class="n">group</span><span class="p">:</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">group</span><span class="p">))</span>
-    <span class="k">return</span> <span class="p">[</span><span class="n">module_lora_spec</span><span class="p">(</span>
-        <span class="n">root</span><span class="p">,</span> <span class="n">resource_key</span><span class="o">=</span><span class="n">LORA_RESOURCE_KEY</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-        <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>      <span class="c1"># the root's attribute path in the node submodule</span>
-        <span class="n">adapter_roots</span><span class="o">=</span><span class="p">[(</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"model."</span><span class="p">)],</span>  <span class="c1"># adapters saved on the bare LlamaModel</span>
-        <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>    <span class="c1"># rows that are not the step's tokens</span>
-        <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                  <span class="c1"># every embedding call is in the forward</span>
-    <span class="p">)]</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="p">[</span>
+        <span class="o">...</span><span class="p">,</span>  <span class="c1"># KV, attention, positions, sampler</span>
+        <span class="n">module_lora_spec</span><span class="p">(</span>
+            <span class="c1"># builds the module the node's weight loader fills, at one rank, on the</span>
+            <span class="c1"># meta device: only once the spec is read, which a deployment without</span>
+            <span class="c1"># a `lora:` block never does</span>
+            <span class="k">lambda</span> <span class="n">group</span><span class="p">:</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">group</span><span class="p">),</span>
+            <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
+            <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>      <span class="c1"># the root's attribute path in the node submodule</span>
+            <span class="n">adapter_roots</span><span class="o">=</span><span class="p">[(</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"model."</span><span class="p">)],</span>  <span class="c1"># adapters saved on the bare LlamaModel</span>
+            <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>    <span class="c1"># rows that are not the step's tokens</span>
+            <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                  <span class="c1"># every embedding call is in the forward</span>
+        <span class="p">),</span>
+    <span class="p">]</span>
 </pre></div>
 </div>
 <p>The weights root states how the checkpoint lands on it once
@@ -2013,23 +2032,24 @@ step, a text projection or a conditioning encoder run in <code class="docutils l
 split projections adapters write, rewritten to the checkpoint’s before the
 root’s rules place them. <code class="docutils literal notranslate"><span class="pre">ignore</span></code>: modules an adapter may carry that never run.</p></li>
 <li><p><strong>Several nodes.</strong> A model whose adapters reach several nodes (an LLM and its vision
-encoder, which a TP config may put on different ranks) returns a spec per node, the
-first keyed <code class="docutils literal notranslate"><span class="pre">&quot;lora&quot;</span></code> and the others apart, told about each other by
-<code class="docutils literal notranslate"><span class="pre">link_lora_specs</span></code>: a module belongs to the spec that places it (the one whose
-<code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> claim it most specifically, when several do), and the others leave
-it alone (<code class="docutils literal notranslate"><span class="pre">ignored_modules</span></code>), so one adapter file serves both. The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes them all, the conductor opens every request
-with the same adapter on each, and the startup and runtime-load checks read an adapter
-under every spec.</p></li>
-<li><p><strong>Binding and rows.</strong> <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code> binds every placed module
-under <code class="docutils literal notranslate"><span class="pre">root_path</span></code>, after checking it is the declared target and that the pool’s
-shard is its rank-local shape (a module built whole on a TP node fails here, not in a
-forward). The engine (<code class="docutils literal notranslate"><span class="pre">engine_step</span></code>) adds each pool’s <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> to the node’s
-step from its segments, which are, in order, the rows its linears see (a request may
-have several: Chatterbox’s cond and uncond copies; Qwen3.5’s vision encoder: one
-segment per frame, the merger’s rows folding them). A step that lays its rows out
-otherwise declares its own <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under the pool’s key, which the engine keeps. A
-step that is <code class="docutils literal notranslate"><span class="pre">None</span></code> or declares no segments gets none, and an adapted module it runs
-refuses, so a node serving adapters returns a step with its segments wherever one runs.</p></li>
+encoder, which a TP config may put on different ranks) builds a spec per node with
+<code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> and declares one, <code class="docutils literal notranslate"><span class="pre">join_lora_specs(llm,</span> <span class="pre">vision)</span></code>: its targets
+name their nodes, a checkpoint module belongs to the node that places it (the one whose
+<code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> claim it most specifically, when several do), so one adapter file
+serves both, and each node gets a pool of its own (<code class="docutils literal notranslate"><span class="pre">LoraSpec.per_node</span></code>, keyed
+<code class="docutils literal notranslate"><span class="pre">lora&#64;&lt;node&gt;</span></code>). The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes them all.</p></li>
+<li><p><strong>Binding and rows.</strong> <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code> binds every module placed
+on its node under <code class="docutils literal notranslate"><span class="pre">root_path</span></code>, after checking it is the declared target and that the
+pool’s shard is its rank-local shape (a module built whole on a TP node fails here,
+not in a forward). The pool’s step is the node’s own segments
+(<code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>): the engine (<code class="docutils literal notranslate"><span class="pre">engine_step</span></code>) adds a
+<code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> of them under the pool’s key, the rows its linears see, in order (a
+request may have several: Chatterbox’s cond and uncond copies; Qwen3.5’s vision
+encoder: one segment per frame, the merger’s rows folding them). A step that lays its
+rows out otherwise declares its own step under the pool’s key, which the engine keeps.
+A step that is <code class="docutils literal notranslate"><span class="pre">None</span></code> or declares no segments gets none, and an adapted module it
+runs refuses, so a node serving adapters returns a step with its segments wherever one
+runs.</p></li>
 <li><p><strong>Only inside the step.</strong> The pool holds a step’s addressing from its plan to its
 commit (or rollback), for the thread that planned it, so a delta called outside a step
 (<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, which the async worker runs on the main thread while the GPU
@@ -2074,15 +2094,19 @@ tokens and bias LoRA are refused by name. A YAML <code class="docutils literal n
 the model’s targets (dropping vocabulary-sized ones saves their slots); an adapter
 touching a dropped target is refused, and its modules stay unbound. Without the list,
 a deployment with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off keeps the targets its configured adapters
-touch: the conductor reads them once at startup (<code class="docutils literal notranslate"><span class="pre">served_lora_targets</span></code>) and spawns
-every worker with that list, so every process builds the same pools; an adapter it
-cannot read fails the deployment.</p></li>
-<li><p><strong>Requests.</strong> Nothing per model. The conductor opens every request with a
-<code class="docutils literal notranslate"><span class="pre">LoraReqConfig</span></code> from the <code class="docutils literal notranslate"><span class="pre">lora_adapter</span></code> request kwarg (<code class="docutils literal notranslate"><span class="pre">None</span></code> for the base
-model), which the OpenAI <code class="docutils literal notranslate"><span class="pre">model</span></code> field maps onto. <code class="docutils literal notranslate"><span class="pre">validate</span></code> refuses, with a 400, an
-unknown adapter, one whose rank exceeds <code class="docutils literal notranslate"><span class="pre">max_rank</span></code>, and one that touches a module the
-model did not declare as a target. A request on an adapter is prefix-cached in its
-adapter’s own namespace (see <strong>Cross-request prefix reuse</strong>).</p></li>
+touch (a node left with none gets no pool): the API server reads them once at startup
+(<code class="docutils literal notranslate"><span class="pre">resolve_lora_adapters</span></code>) and the conductor, handed that config, spawns every worker
+with the list, so every process builds the same pools; an adapter it cannot read fails
+the deployment.</p></li>
+<li><p><strong>Requests.</strong> Nothing per model. <code class="docutils literal notranslate"><span class="pre">LoraSpec.request_config</span></code> opens a request that
+names an adapter in the <code class="docutils literal notranslate"><span class="pre">lora_adapter</span></code> kwarg, which the OpenAI <code class="docutils literal notranslate"><span class="pre">model</span></code> field maps
+onto, with a <code class="docutils literal notranslate"><span class="pre">LoraReqConfig</span></code>, which each node’s pool takes; a base-model request
+carries none. The API server refuses, with a 400, an adapter it does not serve
+(<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>), and the conductor, with a 409, one a runtime load or unload is in
+flight for; an adapter is checked when it is registered (rank within
+<code class="docutils literal notranslate"><span class="pre">max_rank</span></code>, only declared targets, shapes that fit), not per request. A request on an
+adapter is prefix-cached in its adapter’s own namespace (see <strong>Cross-request prefix
+reuse</strong>).</p></li>
 <li><p><strong>Capture and compile.</strong> Nothing per model: a node serving adapters captures the same
 buckets and compiles the same as one that does not. A capture plans every row on the
 zero adapter; a replay’s plan writes each row’s slot into the buffers that capture
@@ -2123,7 +2147,7 @@ once, and its admit fails it before handing out any slot, so it takes none that 
 request needs. A reservation counts slots and pins none: which slot an admit takes follows
 from the slot table alone. An
 adapter with nothing for a pool’s targets (a text-only adapter on a vision tower’s pool)
-takes no slot there and runs no delta (its steps can replay the base-only capture): the
+takes no slot there and runs no delta (its steps can replay the lean capture; see <strong>Lean captures</strong>): the
 pool knows it from the file’s header at startup, or from a runtime load’s read, and its
 rows address the zero adapter. Only the
 rank that chooses batches admits: on a lockstep instance the leader, whose choice the
@@ -3246,13 +3270,12 @@ A resource sized per step refuses <code class="docutils literal notranslate"><sp
 (adapters held in pinned host memory), <code class="docutils literal notranslate"><span class="pre">adapters</span></code> (adapter name to safetensors
 path: the names requests can ask for), <code class="docutils literal notranslate"><span class="pre">targets</span></code> (the subset of the model’s
 targets to allocate; by default, with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off, the targets the
-configured adapters touch, and every target with it on; a secondary node’s spec
-left with none builds no pool, while a YAML list leaving the model’s first spec
-(its LLM’s) none is an error), <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> (default false: serve
+configured adapters touch, and every target with it on; a node left with none
+gets no pool, while a YAML list keeping none at all is an error), <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> (default false: serve
 <code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>),
 <code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code> (default 120: how long the conductor waits for every
-worker to answer one before giving up on it). One <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes every LoRA spec of the
-model</p></td>
+worker to answer one before giving up on it). The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes the
+pool of every node the model’s spec reaches</p></td>
 </tr>
 </tbody>
 </table>
@@ -3961,8 +3984,8 @@ buffers may round, and widens a narrower one, so a declaration wider than <code 
 output replays the loop in more precision than the eager loop runs. A step whose spans
 under some label exceed the ragged resource’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> takes no lease and
 runs eagerly. On a node serving LoRA adapters a leased step still declares its spans, with
-no attention step, so the engine plans the LoRA rows of the bound modules around the loop
-(<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>). Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns
+no attention step, so the engine adds the pool’s step of them for the bound modules around
+the loop (<code class="docutils literal notranslate"><span class="pre">engine_step</span></code>). Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns
 the deepstack taps (its <code class="docutils literal notranslate"><span class="pre">_capture_block_loop</span></code>), which its own <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> reads
 off the replay.
 A tower builds on the pieces in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/qwen3_vit.py</span></code>:

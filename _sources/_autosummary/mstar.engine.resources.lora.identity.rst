@@ -15,17 +15,10 @@ mstar.engine.resources.lora.identity
    
       adapter_digest
       adapter_prefix_root
-      read_adapter_digest
    
    
 
    
-   
-   .. rubric:: Classes
-
-   .. autosummary::
-   
-      AdapterPrefixRoots
    
    
 

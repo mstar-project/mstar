@@ -720,16 +720,8 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.read"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.read()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.register"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.register()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.root"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.root()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.unregister"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.unregister()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.adapter_digest"><code class="docutils literal notranslate"><span class="pre">adapter_digest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.adapter_prefix_root"><code class="docutils literal notranslate"><span class="pre">adapter_prefix_root()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.read_adapter_digest"><code class="docutils literal notranslate"><span class="pre">read_adapter_digest()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -746,8 +738,9 @@
 <p>Which weights an adapter name stands for, as the prefix cache keys them.</p>
 <p>A request on an adapter fills KV pages that differ from the base model’s for the same
 tokens, so its prompt’s key chain hangs from a root that names the adapter’s weights
-(<code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots</span></code>). The preprocess worker, which keys prompts, reads each adapter
-once when it is registered; nothing about an adapter travels per step.</p>
+(<code class="docutils literal notranslate"><span class="pre">adapter_prefix_root</span></code>). The API server takes it from the adapter’s digest when it
+selects the adapter for a request (<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>); nothing about an adapter travels
+per step.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -757,95 +750,9 @@ once when it is registered; nothing about an adapter travels per step.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.identity.adapter_prefix_root" title="mstar.engine.resources.lora.identity.adapter_prefix_root"><code class="xref py py-obj docutils literal notranslate"><span class="pre">adapter_prefix_root</span></code></a>(digest)</p></td>
 <td><p>The root an adapter's key chains hang from.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.identity.read_adapter_digest" title="mstar.engine.resources.lora.identity.read_adapter_digest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_adapter_digest</span></code></a>(spec, path)</p></td>
-<td><p>The digest of the adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code>, read as the pool reads it (<code class="docutils literal notranslate"><span class="pre">spec.convert_keys</span></code>).</p></td>
-</tr>
 </tbody>
 </table>
 </div>
-<p class="rubric">Classes</p>
-<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
-<tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots" title="mstar.engine.resources.lora.identity.AdapterPrefixRoots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AdapterPrefixRoots</span></code></a>([roots])</p></td>
-<td><p>Adapter name -&gt; the root its requests' key chains hang from.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.AdapterPrefixRoots">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.identity.</span></span><span class="sig-name descname"><span class="pre">AdapterPrefixRoots</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">roots</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#AdapterPrefixRoots"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Adapter name -&gt; the root its requests’ key chains hang from.</p>
-<p>A name that is not registered has no root, and a request on it must not be keyed
-at all: keyed under the base model’s empty root, its pages would serve base
-requests. <code class="docutils literal notranslate"><span class="pre">register</span></code> and <code class="docutils literal notranslate"><span class="pre">unregister</span></code> are the hooks for loading and unloading
-an adapter at runtime; reads happen on the request-preparation threads (the
-prepare pool, or the preprocess thread inline), writes on whichever thread registers.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>roots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>] </em><em>| </em><em>None</em>)</p>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.AdapterPrefixRoots.read">
-<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digests</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#AdapterPrefixRoots.read"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.read" title="Link to this definition">#</a></dt>
-<dd><p>Register every adapter <code class="docutils literal notranslate"><span class="pre">spec</span></code> (a <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code>) serves under <code class="docutils literal notranslate"><span class="pre">digests</span></code>, or,
-for one not in it, under the digest of its file, read once.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>digests</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>] </em><em>| </em><em>None</em>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots" title="mstar.engine.resources.lora.identity.AdapterPrefixRoots"><em>AdapterPrefixRoots</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.AdapterPrefixRoots.register">
-<span class="sig-name descname"><span class="pre">register</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#AdapterPrefixRoots.register"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.register" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.AdapterPrefixRoots.root">
-<span class="sig-name descname"><span class="pre">root</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#AdapterPrefixRoots.root"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.root" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a> | None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.AdapterPrefixRoots.unregister">
-<span class="sig-name descname"><span class="pre">unregister</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#AdapterPrefixRoots.unregister"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.unregister" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-</dd></dl>
-
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.adapter_digest">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.identity.</span></span><span class="sig-name descname"><span class="pre">adapter_digest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">adapter</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#adapter_digest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.adapter_digest" title="Link to this definition">#</a></dt>
@@ -869,20 +776,6 @@ same weights share pages, and one name reloaded with other weights does not.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.identity.read_adapter_digest">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.identity.</span></span><span class="sig-name descname"><span class="pre">read_adapter_digest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/identity.html#read_adapter_digest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.identity.read_adapter_digest" title="Link to this definition">#</a></dt>
-<dd><p>The digest of the adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code>, read as the pool reads it (<code class="docutils literal notranslate"><span class="pre">spec.convert_keys</span></code>).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
@@ -939,16 +832,8 @@ same weights share pages, and one name reloaded with other weights does not.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.read"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.read()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.register"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.register()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.root"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.root()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.AdapterPrefixRoots.unregister"><code class="docutils literal notranslate"><span class="pre">AdapterPrefixRoots.unregister()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.adapter_digest"><code class="docutils literal notranslate"><span class="pre">adapter_digest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.adapter_prefix_root"><code class="docutils literal notranslate"><span class="pre">adapter_prefix_root()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.identity.read_adapter_digest"><code class="docutils literal notranslate"><span class="pre">read_adapter_digest()</span></code></a></li>
 </ul>
   </nav></div>
 

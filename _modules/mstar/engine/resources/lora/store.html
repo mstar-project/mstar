@@ -1021,7 +1021,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1200,35 +1200,20 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="check_adapter_file">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.check_adapter_file">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">check_adapter_file</span><span class="p">(</span>
-    <span class="n">spec</span><span class="p">:</span> <span class="n">LoraSpec</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">others</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The adapter at ``path`` checked against ``spec`` and the model's ``others`` (its</span>
-<span class="sd">    LoRA specs for other nodes, a vision tower's say, which serve the same adapters), each</span>
-<span class="sd">    from the checkpoint's header; returns its digest. The digest is read once per way the</span>
-<span class="sd">    specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.</span>
-<span class="sd">    Raises ``ValueError`` for an adapter the deployment cannot serve."""</span>
-    <span class="n">digests</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># convert_keys -&gt; the digest of the file read that way</span>
-    <span class="k">for</span> <span class="n">each</span> <span class="ow">in</span> <span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="o">*</span><span class="n">others</span><span class="p">):</span>
-        <span class="n">each</span><span class="o">.</span><span class="n">check_adapter</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">inspect_adapter</span><span class="p">(</span><span class="n">each</span><span class="p">,</span> <span class="n">path</span><span class="p">))</span>
-        <span class="k">if</span> <span class="n">each</span><span class="o">.</span><span class="n">convert_keys</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">digests</span><span class="p">:</span>
-            <span class="n">digests</span><span class="p">[</span><span class="n">each</span><span class="o">.</span><span class="n">convert_keys</span><span class="p">]</span> <span class="o">=</span> <span class="n">adapter_digest</span><span class="p">(</span><span class="n">read_lora_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">convert_keys</span><span class="o">=</span><span class="n">each</span><span class="o">.</span><span class="n">convert_keys</span><span class="p">))</span>
-    <span class="n">digest</span><span class="p">,</span> <span class="o">*</span><span class="n">rest</span> <span class="o">=</span> <span class="n">digests</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
-    <span class="c1"># one digest pins the adapter on every spec's pools (``adapter_digests``)</span>
-    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">other</span> <span class="o">!=</span> <span class="n">digest</span> <span class="k">for</span> <span class="n">other</span> <span class="ow">in</span> <span class="n">rest</span><span class="p">):</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"LoRA adapter </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> digests differently under the model's LoRA specs; "</span>
-            <span class="s2">"they must read checkpoints alike (convert_keys)"</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">digest</span></div>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_adapter_file</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">LoraSpec</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The adapter at ``path`` checked against ``spec`` from the checkpoint's header;</span>
+<span class="sd">    returns its digest. Raises ``ValueError`` for an adapter the deployment cannot</span>
+<span class="sd">    serve."""</span>
+    <span class="n">spec</span><span class="o">.</span><span class="n">check_adapter</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">inspect_adapter</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">path</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">adapter_digest</span><span class="p">(</span><span class="n">read_lora_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">convert_keys</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">convert_keys</span><span class="p">))</span></div>
 
 
 
 <div class="viewcode-block" id="check_adapters">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.check_adapters">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">check_adapters</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">LoraSpec</span><span class="p">,</span> <span class="n">others</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]</span> <span class="o">=</span> <span class="p">())</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Every adapter ``spec`` serves, through ``check_adapter_file`` (against ``others``</span>
-<span class="sd">    too); returns each one's digest.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_adapters</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">LoraSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Every adapter ``spec`` serves, through ``check_adapter_file``; returns each one's</span>
+<span class="sd">    digest.</span>
 
 <span class="sd">    Raises naming every adapter that fails, so a bad adapter in the serving config stops</span>
 <span class="sd">    the deployment at startup, the same whether or not a worker would have preloaded it.</span>
@@ -1237,7 +1222,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">errors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">try</span><span class="p">:</span>
-            <span class="n">digests</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">check_adapter_file</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">others</span><span class="p">)</span>
+            <span class="n">digests</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">check_adapter_file</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 - each bad adapter is named below</span>
             <span class="n">errors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> at </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">errors</span><span class="p">:</span>
@@ -1357,7 +1342,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">raw</span> <span class="o">=</span> <span class="n">read_lora_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">convert_keys</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">convert_keys</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">raw</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"LoRA adapter </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> holds no LoRA layers"</span><span class="p">)</span>
-        <span class="c1"># modules another spec loads (or the deployment never runs) are not this one's</span>
+        <span class="c1"># modules another node's pool loads (or the deployment never runs) are not this one's</span>
         <span class="n">modules</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">raw</span><span class="o">.</span><span class="n">layers</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">_ignored</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">m</span><span class="p">))</span>
         <span class="n">unmapped</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">modules</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">_maps</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">m</span><span class="p">)]</span>
         <span class="k">if</span> <span class="n">unmapped</span><span class="p">:</span>

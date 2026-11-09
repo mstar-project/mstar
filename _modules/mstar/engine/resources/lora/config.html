@@ -1026,12 +1026,11 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">check_sizes</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">check_sizes</span><span class="p">,</span> <span class="n">instance_key</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">scrub_paths</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
@@ -1042,6 +1041,9 @@ window.runMermaid = runMermaid;</script>
 <span class="n">LORA_RESOURCE_KEY</span> <span class="o">=</span> <span class="s2">"lora"</span>
 <span class="c1"># The request kwarg that names a request's adapter; the OpenAI ``model`` field maps onto it.</span>
 <span class="n">LORA_ADAPTER_KWARG</span> <span class="o">=</span> <span class="s2">"lora_adapter"</span>
+<span class="c1"># The digest of the adapter's weights when the API server selected it (``ServedModels``),</span>
+<span class="c1"># set there, never by a client.</span>
+<span class="n">LORA_DIGEST_KWARG</span> <span class="o">=</span> <span class="s2">"lora_digest"</span>
 
 
 <div class="viewcode-block" id="lora_enabled">
@@ -1053,15 +1055,6 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    reports it with the deployment's other problems."""</span>
     <span class="n">resources</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"resources"</span><span class="p">)</span>
     <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">resources</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">)</span> <span class="ow">and</span> <span class="n">LORA_RESOURCE_KEY</span> <span class="ow">in</span> <span class="n">resources</span></div>
-
-
-
-<div class="viewcode-block" id="served_lora_adapters">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.served_lora_adapters">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">served_lora_adapters</span><span class="p">(</span><span class="n">model_config</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""The adapter names a deployment's YAML serves; empty when it does not turn LoRA on."""</span>
-    <span class="n">block</span> <span class="o">=</span> <span class="n">model_config</span><span class="p">[</span><span class="s2">"resources"</span><span class="p">][</span><span class="n">LORA_RESOURCE_KEY</span><span class="p">]</span> <span class="k">if</span> <span class="n">lora_enabled</span><span class="p">(</span><span class="n">model_config</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
-    <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">block</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"adapters"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">())</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">)</span> <span class="k">else</span> <span class="p">()</span></div>
 
 
 
@@ -1133,6 +1126,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``layers`` names the stack layer indices this target exists on (a hybrid stack has</span>
 <span class="sd">    attention on some layers only); None means all of the spec's ``num_layers``.</span>
 
+<span class="sd">    ``node`` is the graph node the target's linears run on, which a spec over several</span>
+<span class="sd">    nodes names for every target (each node's pool holds its own, ``LoraSpec.for_node``);</span>
+<span class="sd">    None for a spec over one node.</span>
+
 <span class="sd">    ``kind="embedding"`` is a token embedding: ``in_features`` is the vocabulary, a row's</span>
 <span class="sd">    input is its token id, and the shrink gathers A's column for it (``x @ A^T`` of the</span>
 <span class="sd">    token's one-hot), as PEFT's ``lora_embedding_A`` / ``_B`` define it.</span>
@@ -1151,6 +1148,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">slice_packs</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">slice_align</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">kind</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"linear"</span><span class="p">,</span> <span class="s2">"embedding"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"linear"</span>
     <span class="n">per_segment</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">token_fold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
@@ -1334,7 +1332,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">AdapterInfo</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""What validation needs to know about an adapter checkpoint, read without its weights.</span>
 
-<span class="sd">    ``rank`` covers every LoRA module in the file, those left to another spec included.</span>
+<span class="sd">    ``rank`` covers every LoRA module in the file, those left to another node's pool included.</span>
 <span class="sd">    ``misfits`` names modules whose shapes do not fit their target (an adapter trained on</span>
 <span class="sd">    another size of the model)."""</span>
 
@@ -1354,15 +1352,28 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.</span>
 <span class="sd">    ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``</span>
 <span class="sd">    places each checkpoint module on a target; a node's spec comes from</span>
-<span class="sd">    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose</span>
-<span class="sd">    ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver</span>
-<span class="sd">    is refused as the deployment's specs are declared, ``declared_lora_specs``).</span>
-<span class="sd">    ``convert_keys`` rewrites a model-native checkpoint layout first.</span>
+<span class="sd">    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose ``LoraMap`` is</span>
+<span class="sd">    what binds the node's modules, and a pool built with any other resolver is refused at</span>
+<span class="sd">    bind. ``convert_keys`` rewrites a model-native checkpoint layout first. ``declare``</span>
+<span class="sd">    gives ``num_layers``, ``targets``, ``module_map`` and ``ignored_modules`` in place of</span>
+<span class="sd">    passing them, on their first read: ``module_lora_spec`` walks a node's modules there,</span>
+<span class="sd">    which a deployment that never builds the spec skips.</span>
+
+<span class="sd">    Opt-in (``NodeResourceSpec.opt_in``): built only for a deployment whose serving config</span>
+<span class="sd">    has a ``resources: lora:`` block. One spec covers every node an adapter reaches (an</span>
+<span class="sd">    LLM and its vision tower), and each node gets a pool of its own (``per_node``): the</span>
+<span class="sd">    nodes may sit in different lockstep instances, whose ranks must make the same slot</span>
+<span class="sd">    decisions.</span>
 <span class="sd">    """</span>
 
-    <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">targets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LoraTarget</span><span class="p">]</span>
-    <span class="n">module_map</span><span class="p">:</span> <span class="n">LoraModuleResolver</span>
+    <span class="n">opt_in</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">per_node</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="c1"># what ``declare`` may give defaults by factory, which sets no class attribute that</span>
+    <span class="c1"># would answer a read before ``__getattr__`` does</span>
+    <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">int</span><span class="p">)</span>
+    <span class="n">targets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LoraTarget</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">module_map</span><span class="p">:</span> <span class="n">LoraModuleResolver</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="kc">None</span><span class="p">)</span>
     <span class="n">max_slots</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span>
     <span class="n">max_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
     <span class="n">cpu_capacity</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
@@ -1374,7 +1385,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># before it gives up on it (a load is then undone everywhere)</span>
     <span class="n">runtime_update_timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">120.0</span>
     <span class="c1"># adapter name -&gt; the digest (``identity.adapter_digest``) its weights were checked</span>
-    <span class="c1"># and prefix-keyed under; every read must match it. The conductor fills these in for</span>
+    <span class="c1"># and prefix-keyed under; every read must match it. The API server fills these in for</span>
     <span class="c1"># the serving config's adapters, and a runtime load carries its own.</span>
     <span class="n">adapter_digests</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># the slot weights' dtype; None takes the nodes' compute dtype (the serving config's</span>
@@ -1385,21 +1396,43 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># something else in the process registered Triton's (registration is process-wide)</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"torch"</span><span class="p">,</span> <span class="s2">"triton"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"auto"</span>
     <span class="n">convert_keys</span><span class="p">:</span> <span class="n">Callable</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># checkpoint modules this spec neither loads nor refuses: another node's LoRA spec of</span>
-    <span class="c1"># the same model loads them (a vision tower's), or the deployment never runs them</span>
-    <span class="n">ignored_modules</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># checkpoint modules this spec neither loads nor refuses: the deployment never runs</span>
+    <span class="c1"># them, or (in a node's pool) another node's pool loads them</span>
+    <span class="n">ignored_modules</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="kc">None</span><span class="p">)</span>
     <span class="c1"># targets the YAML's ``targets`` list dropped: a layer binding one gets no delta,</span>
     <span class="c1"># while binding a name the spec never declared stays an error</span>
     <span class="n">dropped_targets</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">)</span>
-    <span class="n">_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AdapterInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">declare</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+        <span class="n">check_sizes</span><span class="p">({</span><span class="n">name</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_SIZES</span><span class="p">})</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_DECLARED</span><span class="p">:</span>
+                <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>  <span class="c1"># read through `__getattr__`</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_declaration</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+        <span class="c1"># reached only for an attribute not set: a field ``declare`` gives, read first</span>
+        <span class="n">declare</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"declare"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">declare</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_DECLARED</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">!r}</span><span class="s2"> object has no attribute </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">declare</span><span class="p">())</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">declare</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_declaration</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_declaration</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> declares no targets"</span><span class="p">)</span>
-        <span class="n">check_sizes</span><span class="p">({</span><span class="n">name</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_SIZES</span><span class="p">})</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">astray</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">astray</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> spans nodes </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span><span class="si">}</span><span class="s2">, so "</span>
+                    <span class="sa">f</span><span class="s2">"each target names one of them; </span><span class="si">{</span><span class="n">astray</span><span class="si">}</span><span class="s2"> do not"</span>
+                <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_slots</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1411,6 +1444,37 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraAdapterPool</span>
 
         <span class="k">return</span> <span class="n">LoraAdapterPool</span>
+
+<div class="viewcode-block" id="LoraSpec.for_node">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.for_node">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">for_node</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"LoraSpec | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``node``'s pool: the targets on it, keyed ``lora@&lt;node&gt;``; None when the</span>
+<span class="sd">        YAML's ``targets`` left it none. Placement stays the whole spec's, so a pool reads</span>
+<span class="sd">        an adapter file as the API server checked it, leaving the modules another node's</span>
+<span class="sd">        targets place to that node's pool."""</span>
+        <span class="n">own</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">node</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">node</span><span class="p">)}</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">own</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">elsewhere</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">-</span> <span class="n">own</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="n">ignored</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignored_modules</span>
+        <span class="k">if</span> <span class="n">elsewhere</span><span class="p">:</span>
+            <span class="n">ignored</span> <span class="o">=</span> <span class="n">_ignoring</span><span class="p">(</span><span class="n">ignored</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">module_map</span><span class="p">,</span> <span class="n">elsewhere</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">resource_key</span><span class="o">=</span><span class="n">instance_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">node</span><span class="p">),</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="n">node</span><span class="p">},</span>
+            <span class="n">targets</span><span class="o">=</span><span class="n">own</span><span class="p">,</span> <span class="n">ignored_modules</span><span class="o">=</span><span class="n">ignored</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="LoraSpec.request_config">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.request_config">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"LoraReqConfig | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The adapter the ``lora_adapter`` kwarg names, and the digest it was selected</span>
+<span class="sd">        under; None for a base-model request, which lets the pool run lean</span>
+<span class="sd">        (``Resource.lean_capture``)."""</span>
+        <span class="n">kwargs</span> <span class="o">=</span> <span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">adapter</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">LORA_ADAPTER_KWARG</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">LoraReqConfig</span><span class="p">(</span><span class="n">adapter</span><span class="o">=</span><span class="n">adapter</span><span class="p">,</span> <span class="n">digest</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">LORA_DIGEST_KWARG</span><span class="p">))</span></div>
+
 
 <div class="viewcode-block" id="LoraSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.apply_yaml_overrides">[docs]</a>
@@ -1426,11 +1490,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">targets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""How many adapters stay resident, the largest rank served, and which adapters</span>
-<span class="sd">        this deployment serves. ``targets`` keeps only those of the model's targets (one</span>
-<span class="sd">        list for every LoRA spec of the model, so a name another spec declares is not an</span>
-<span class="sd">        error here; ``serving_resources`` checks the list as a whole): dropping the LM</span>
-<span class="sd">        head and embedding saves their vocabulary-sized slots, and an adapter that</span>
-<span class="sd">        touches a dropped target is refused.</span>
+<span class="sd">        this deployment serves. ``targets`` keeps only those of the model's targets:</span>
+<span class="sd">        dropping the LM head and embedding saves their vocabulary-sized slots, a node left</span>
+<span class="sd">        with none gets no pool, and an adapter that touches a dropped target is refused.</span>
 
 <span class="sd">        Every value is checked before any is set, so a refused override leaves the spec</span>
 <span class="sd">        as declared."""</span>
@@ -1459,15 +1521,25 @@ window.runMermaid = runMermaid;</script>
             <span class="n">adapters</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">resolve_adapter_path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">adapters</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
         <span class="k">if</span> <span class="n">adapter_digests</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">served</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapters</span> <span class="k">if</span> <span class="n">adapters</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">adapters</span>
-            <span class="c1"># hex, as the conductor writes them into the config it spawns workers with</span>
+            <span class="c1"># hex, as the API server writes them into the config the conductor gets</span>
             <span class="n">adapter_digests</span> <span class="o">=</span> <span class="p">{</span>
                 <span class="n">name</span><span class="p">:</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">digest</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">digest</span> <span class="ow">in</span> <span class="n">adapter_digests</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">served</span>
             <span class="p">}</span>
-        <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
-            <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">targets</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">)</span>
-        <span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"targets must be a list of target names; got </span><span class="si">{</span><span class="n">targets</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">targets</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"targets must be a list of target names; got </span><span class="si">{</span><span class="n">targets</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">unknown</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">unknown</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"`resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:` names </span><span class="si">{</span><span class="n">unknown</span><span class="si">}</span><span class="s2">, which this "</span>
+                    <span class="sa">f</span><span class="s2">"model does not declare; it declares </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">kept</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">}</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">kept</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"`resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:` keeps none of </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
 
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">sizes</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
@@ -1478,37 +1550,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">adapters</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">adapters</span> <span class="o">=</span> <span class="n">adapters</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">adapter_digests</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">adapter_digests</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">adapter_digests</span> <span class="o">=</span> <span class="n">adapter_digests</span>
         <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">|</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">targets</span><span class="p">))</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">targets</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">}</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
-
-
-<div class="viewcode-block" id="LoraSpec.stop_ignoring">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.stop_ignoring">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">stop_ignoring</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">modules</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Refuse, rather than ignore, the checkpoint modules ``modules`` matches: those</span>
-<span class="sd">        of another node's spec the deployment does not build, which no spec loads now."""</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignored_modules</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="n">ignored</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignored_modules</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">ignored_modules</span> <span class="o">=</span> <span class="k">lambda</span> <span class="n">m</span><span class="p">:</span> <span class="n">ignored</span><span class="p">(</span><span class="n">m</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">modules</span><span class="p">(</span><span class="n">m</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
-
-
-<div class="viewcode-block" id="LoraSpec.adapter_info">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.adapter_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">adapter_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdapterInfo</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Rank and unmapped modules of a configured adapter, read once and cached."""</span>
-        <span class="n">info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">info</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.store</span><span class="w"> </span><span class="kn">import</span> <span class="n">inspect_adapter</span>
-
-            <span class="n">info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">inspect_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapters</span><span class="p">[</span><span class="n">name</span><span class="p">])</span>
-        <span class="k">return</span> <span class="n">info</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">|</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">kept</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">targets</span> <span class="o">=</span> <span class="n">kept</span></div>
 
 
 <div class="viewcode-block" id="LoraSpec.check_adapter">
@@ -1539,28 +1585,27 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"it was trained on another size of the model, or lays a module out "</span>
                 <span class="s2">"differently from the target it names"</span>
             <span class="p">)</span></div>
-
-
-<div class="viewcode-block" id="LoraSpec.add_adapter">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.add_adapter">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">add_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Serve ``name`` from ``path``, whose weights digest to ``digest``, from now on</span>
-<span class="sd">        (a runtime load)."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">adapters</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
-        <span class="k">if</span> <span class="n">digest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">adapter_digests</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">digest</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
-
-
-<div class="viewcode-block" id="LoraSpec.remove_adapter">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraSpec.remove_adapter">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">remove_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Stop serving ``name`` (a runtime unload)."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">adapter_digests</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_info</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 </div>
 
+
+
+<span class="c1"># what ``LoraSpec.declare`` gives</span>
+<span class="n">_DECLARED</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"num_layers"</span><span class="p">,</span> <span class="s2">"targets"</span><span class="p">,</span> <span class="s2">"module_map"</span><span class="p">,</span> <span class="s2">"ignored_modules"</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_ignoring</span><span class="p">(</span>
+    <span class="n">never_run</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">place</span><span class="p">:</span> <span class="n">LoraModuleResolver</span><span class="p">,</span> <span class="n">elsewhere</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``LoraSpec.ignored_modules`` of one node's pool: what the spec ignores, and the</span>
+<span class="sd">    modules ``place`` puts on ``elsewhere``, the other nodes' targets."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">ignored</span><span class="p">(</span><span class="n">module</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">never_run</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">never_run</span><span class="p">(</span><span class="n">module</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">True</span>
+        <span class="n">ref</span> <span class="o">=</span> <span class="n">place</span><span class="p">(</span><span class="n">module</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">ref</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ref</span><span class="o">.</span><span class="n">target</span> <span class="ow">in</span> <span class="n">elsewhere</span>
+
+    <span class="k">return</span> <span class="n">ignored</span>
 
 
 <span class="n">_SIZES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"max_slots"</span><span class="p">,</span> <span class="s2">"max_rank"</span><span class="p">,</span> <span class="s2">"cpu_capacity"</span><span class="p">)</span>
@@ -1575,35 +1620,22 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraReqConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">LoraReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The adapter a request runs under; None runs the base model."""</span>
+<span class="w">    </span><span class="sd">"""The adapter a request runs under. A base-model request carries none.</span>
 
-    <span class="n">adapter</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="sd">    Which adapters are served is the API server's to check (``ServedModels``), where a</span>
+<span class="sd">    request names one; a pool refuses at ingest a name it does not serve, or serves under</span>
+<span class="sd">    other weights than ``digest``, which the request's prompt was keyed under: the name</span>
+<span class="sd">    was unloaded and loaded again since."""</span>
+
+    <span class="n">adapter</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="LoraReqConfig.validate">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraReqConfig.validate">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"LoraSpec | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"adapter must be a non-empty string; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">spec</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">adapter</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"unknown LoRA adapter </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2">; this deployment serves "</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">adapters</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
-            <span class="p">)</span>
-        <span class="n">spec</span><span class="o">.</span><span class="n">check_adapter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">adapter_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="p">))</span></div>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"adapter must be a non-empty string; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">adapter</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 </div>
-
-
-
-<div class="viewcode-block" id="LoraStep">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraStep">[docs]</a>
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LoraStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""One step's rows: a segment per request, its ``span`` the tokens that request puts</span>
-<span class="sd">    through the LoRA'd linears this step, in the order they are packed."""</span></div>
 
 </pre></div>
 

@@ -1047,7 +1047,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># resolved once, before it is submitted: the response names the adapter that</span>
         <span class="c1"># served it, as vLLM's does, whether the model field or the lora_adapter kwarg</span>
         <span class="c1"># picked it</span>
-        <span class="n">model_kwargs</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">lora_kwargs</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">)</span>
+        <span class="n">model_kwargs</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">lora_kwargs</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">)</span><span class="o">.</span><span class="n">model_kwargs</span>
         <span class="n">served</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">LORA_ADAPTER_KWARG</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">served</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">model_name</span> <span class="o">=</span> <span class="n">served</span>

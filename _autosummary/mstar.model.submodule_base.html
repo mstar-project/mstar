@@ -861,7 +861,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.lora_keys"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.lora_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_rows_in_combined()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>
@@ -872,6 +871,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.resident_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.resident_walks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.segment_keys"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.segment_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.side_stream_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.side_stream_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
@@ -949,7 +949,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.lora_rows"><code class="docutils literal notranslate"><span class="pre">lora_rows()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.with_segment_steps"><code class="docutils literal notranslate"><span class="pre">with_segment_steps()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -973,10 +973,10 @@
 <td><p>The chunk Loop's loop-back signal, carrying nothing.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.engine_step" title="mstar.model.submodule_base.engine_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">engine_step</span></code></a>(submodule, *args, **kwargs)</p></td>
-<td><p>What the engine calls for a node's step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with the LoRA pools' rows added (<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>), so a model serving LoRA from its modules writes no LoRA step.</p></td>
+<td><p>What the engine calls for a node's step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with a step of its segments under each resource that takes them as they are (<code class="docutils literal notranslate"><span class="pre">with_segment_steps</span></code>), so a model declares nothing for such a resource (a LoRA pool).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.lora_rows" title="mstar.model.submodule_base.lora_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora_rows</span></code></a>(step, lora_keys)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under each of <code class="docutils literal notranslate"><span class="pre">lora_keys</span></code> that it does not declare itself, its rows the step's segments, as a new step (a declaration reused across calls keeps its own).</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.with_segment_steps" title="mstar.model.submodule_base.with_segment_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">with_segment_steps</span></code></a>(step, keys)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> of its segments under each of <code class="docutils literal notranslate"><span class="pre">keys</span></code> (the resources whose step is the segments, <code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>) that it does not declare itself, as a new step (a declaration reused across calls keeps its own).</p></td>
 </tr>
 </tbody>
 </table>
@@ -2520,11 +2520,6 @@ request. Only for a walk whose emit edge is not persisted.</p>
 </dl>
 </dd></dl>
 
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.lora_keys">
-<span class="sig-name descname"><span class="pre">lora_keys</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.lora_keys" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.max_batch_size">
 <span class="sig-name descname"><span class="pre">max_batch_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size" title="Link to this definition">#</a></dt>
@@ -2689,6 +2684,11 @@ The engine still refuses if a resource can’t.</p>
 </dd>
 </dl>
 </dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.segment_keys">
+<span class="sig-name descname"><span class="pre">segment_keys</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.segment_keys" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.side_stream_walks">
@@ -3324,9 +3324,9 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.engine_step">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">engine_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#engine_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.engine_step" title="Link to this definition">#</a></dt>
-<dd><p>What the engine calls for a node’s step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with the LoRA
-pools’ rows added (<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>), so a model serving LoRA from its modules writes
-no LoRA step.</p>
+<dd><p>What the engine calls for a node’s step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with a step of its
+segments under each resource that takes them as they are (<code class="docutils literal notranslate"><span class="pre">with_segment_steps</span></code>),
+so a model declares nothing for such a resource (a LoRA pool).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
@@ -3335,17 +3335,18 @@ no LoRA step.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.lora_rows">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">lora_rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#lora_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.lora_rows" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under each of <code class="docutils literal notranslate"><span class="pre">lora_keys</span></code> that it does not declare
-itself, its rows the step’s segments, as a new step (a declaration reused across
-calls keeps its own). A step without segments gets none: an adapted module it runs
-refuses for want of a plan (<code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code>).</p>
+<dt class="sig sig-object py" id="mstar.model.submodule_base.with_segment_steps">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">with_segment_steps</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#with_segment_steps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.with_segment_steps" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> of its segments under each of <code class="docutils literal notranslate"><span class="pre">keys</span></code> (the
+resources whose step is the segments, <code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>) that it does
+not declare itself, as a new step (a declaration reused across calls keeps its own). A
+step without segments gets none: a resource that needs one refuses for want of a plan
+(<code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>lora_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -3544,7 +3545,6 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.lora_keys"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.lora_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_rows_in_combined()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>
@@ -3555,6 +3555,7 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.resident_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.resident_walks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.segment_keys"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.segment_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.side_stream_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.side_stream_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
@@ -3632,7 +3633,7 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.lora_rows"><code class="docutils literal notranslate"><span class="pre">lora_rows()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.with_segment_steps"><code class="docutils literal notranslate"><span class="pre">with_segment_steps()</span></code></a></li>
 </ul>
   </nav></div>
 

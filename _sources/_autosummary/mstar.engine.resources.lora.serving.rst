@@ -13,11 +13,10 @@ mstar.engine.resources.lora.serving
 
    .. autosummary::
    
-      declared_lora_specs
-      drop_lora_specs_without_targets
-      lora_specs
+      lora_spec
+      refuse_unresolved_lora_adapters
+      resolve_lora_adapters
       served_lora_targets
-      size_lora_specs
    
    
 

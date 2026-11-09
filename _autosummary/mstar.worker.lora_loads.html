@@ -733,6 +733,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.lora_loads.LoraLoads.unload"><code class="docutils literal notranslate"><span class="pre">LoraLoads.unload()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.lora_loads.lora_pools"><code class="docutils literal notranslate"><span class="pre">lora_pools()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -751,6 +752,15 @@ and is acknowledged from the main loop.</p>
 <p>A load reads, converts, shards, pins and digests a whole adapter file. On the main loop it
 would stall scheduling for as long as that takes, so each pool reads on its own reader
 thread and the main loop acknowledges the load once every pool has it.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.lora_loads.lora_pools" title="mstar.worker.lora_loads.lora_pools"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora_pools</span></code></a>(resources)</p></td>
+<td><p>The LoRA adapter pools among an engine's resources.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -859,6 +869,20 @@ ones that loaded, and the conductor rolls back the other workers.</p>
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.worker.lora_loads.lora_pools">
+<span class="sig-prename descclassname"><span class="pre">mstar.worker.lora_loads.</span></span><span class="sig-name descname"><span class="pre">lora_pools</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/lora_loads.html#lora_pools"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.lora_loads.lora_pools" title="Link to this definition">#</a></dt>
+<dd><p>The LoRA adapter pools among an engine’s resources.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>resources</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>'Resource'</em><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[‘LoraAdapterPool’]</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -921,6 +945,7 @@ ones that loaded, and the conductor rolls back the other workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.lora_loads.LoraLoads.unload"><code class="docutils literal notranslate"><span class="pre">LoraLoads.unload()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.lora_loads.lora_pools"><code class="docutils literal notranslate"><span class="pre">lora_pools()</span></code></a></li>
 </ul>
   </nav></div>
 

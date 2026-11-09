@@ -725,6 +725,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.expire"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.expire()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.load"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.load()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.next_deadline"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.next_deadline()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.refuse_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.refuse_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.unload"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.unload()</span></code></a></li>
 </ul>
 </li>
@@ -743,19 +744,21 @@
 <span id="mstar-conductor-lora-ops"></span><h1>mstar.conductor.lora_ops<a class="headerlink" href="#module-mstar.conductor.lora_ops" title="Link to this heading">#</a></h1>
 <p>Loading and unloading LoRA adapters at runtime, as the conductor sees it.</p>
 <p>The API server asks; the conductor forwards the request to every worker hosting a node
-with the LoRA pool and answers once all of them have acknowledged. A load becomes
-servable (the conductor’s <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> names it, so <code class="docutils literal notranslate"><span class="pre">LoraReqConfig.validate</span></code> accepts it)
-only when every worker loaded it; if any failed, the others are told to unload it again.
-An unload stops the conductor validating new requests on the name at once, before any
-worker hears of it.</p>
-<p>A worker that never answers (hung, dead) would leave the name refused with a 409 for good,
-on this side and the API server’s. Past <code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code> an operation is given
-up: a load is undone on every worker and answered with a 504, an unload (the name already
-out of the conductor’s spec) answered as done.</p>
+with the LoRA pool and answers once all of them have acknowledged. A load is answered as
+done only when every worker loaded it; if any failed, the others are told to unload it
+again. Which names are served is the API server’s to track (<code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>, which a
+request’s adapter is selected from): the conductor keeps no registry of its own, only
+the operations in flight, during which it refuses requests on their adapters with a 409:
+each worker finishes an operation in its own time, so the ranks of one lockstep instance
+could open such a request differently.</p>
+<p>A worker that never answers (hung, dead) would leave the name refused with a 409 for good.
+Past <code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code> an operation is given up: a load is undone on every
+worker and answered with a 504, an unload (the name already out of the API server’s
+selection) answered as done.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.conductor.lora_ops.LoraAdapterOps" title="mstar.conductor.lora_ops.LoraAdapterOps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterOps</span></code></a>(spec, workers, send[, clock, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.conductor.lora_ops.LoraAdapterOps" title="mstar.conductor.lora_ops.LoraAdapterOps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterOps</span></code></a>(spec, workers, send[, clock])</p></td>
 <td><p>The conductor's half of <code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>.</p></td>
 </tr>
 </tbody>
@@ -763,15 +766,13 @@ out of the conductor’s spec) answered as done.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.conductor.lora_ops.LoraAdapterOps">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.conductor.lora_ops.</span></span><span class="sig-name descname"><span class="pre">LoraAdapterOps</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">workers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">time.perf_counter</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">others</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/conductor/lora_ops.html#LoraAdapterOps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.conductor.lora_ops.LoraAdapterOps" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.conductor.lora_ops.</span></span><span class="sig-name descname"><span class="pre">LoraAdapterOps</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">workers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">time.perf_counter</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/conductor/lora_ops.html#LoraAdapterOps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.conductor.lora_ops.LoraAdapterOps" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>The conductor’s half of <code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">spec</span></code> is the conductor’s own <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (None for a deployment without LoRA), the
-one whose adapters it answers from, and <code class="docutils literal notranslate"><span class="pre">others</span></code> every other <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> that
-serves the same adapters (other nodes’ specs, and the per-worker copies requests are
-validated against); <code class="docutils literal notranslate"><span class="pre">workers</span></code> are the workers hosting any of their
-nodes; <code class="docutils literal notranslate"><span class="pre">send(peer,</span> <span class="pre">message)</span></code> is the conductor’s communicator; <code class="docutils literal notranslate"><span class="pre">clock</span></code> its
-clock (<code class="docutils literal notranslate"><span class="pre">time.perf_counter</span></code>, as its other timed checks).</p>
+<p><code class="docutils literal notranslate"><span class="pre">spec</span></code> is a LoRA pool’s spec, whose runtime-update settings every pool shares (None
+for a deployment without LoRA); <code class="docutils literal notranslate"><span class="pre">workers</span></code> are the workers hosting the pools’ nodes;
+<code class="docutils literal notranslate"><span class="pre">send(peer,</span> <span class="pre">message)</span></code> is the conductor’s communicator;
+<code class="docutils literal notranslate"><span class="pre">clock</span></code> its clock (<code class="docutils literal notranslate"><span class="pre">time.perf_counter</span></code>, as its other timed checks).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -779,7 +780,6 @@ clock (<code class="docutils literal notranslate"><span class="pre">time.perf_co
 <li><p><strong>workers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>send</strong> (<em>Callable</em><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a><em>]</em><em>, </em><em>None</em><em>]</em>)</p></li>
 <li><p><strong>clock</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
-<li><p><strong>others</strong> (<em>Sequence</em><em>[</em><a class="reference internal" href="mstar.engine.resources.lora.html#mstar.engine.resources.lora.LoraSpec" title="mstar.engine.resources.lora.LoraSpec"><em>LoraSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -834,9 +834,25 @@ nothing pending.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.conductor.lora_ops.LoraAdapterOps.refuse_request">
+<span class="sig-name descname"><span class="pre">refuse_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">configs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/conductor/lora_ops.html#LoraAdapterOps.refuse_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.conductor.lora_ops.LoraAdapterOps.refuse_request" title="Link to this definition">#</a></dt>
+<dd><p>Refuse (409) a request whose adapter a load or unload is in flight for.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>configs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.ResourceReqConfig" title="mstar.engine.resources.spec.ResourceReqConfig"><em>ResourceReqConfig</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.conductor.lora_ops.LoraAdapterOps.unload">
 <span class="sig-name descname"><span class="pre">unload</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">body</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/conductor/lora_ops.html#LoraAdapterOps.unload"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.conductor.lora_ops.LoraAdapterOps.unload" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>Running requests on the name finish on its weights; the API server took it out
+of selection before asking.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>body</strong> (<a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.UnloadLoraAdapter" title="mstar.utils.ipc_format.UnloadLoraAdapter"><em>UnloadLoraAdapter</em></a>)</p>
 </dd>
@@ -902,6 +918,7 @@ nothing pending.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.expire"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.expire()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.load"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.load()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.next_deadline"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.next_deadline()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.refuse_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.refuse_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.conductor.lora_ops.LoraAdapterOps.unload"><code class="docutils literal notranslate"><span class="pre">LoraAdapterOps.unload()</span></code></a></li>
 </ul>
 </li>
