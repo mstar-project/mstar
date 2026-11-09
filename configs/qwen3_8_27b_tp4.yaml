@@ -1,5 +1,5 @@
 model: "qwen3_8_27b"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (262,144 tokens)
 node_groups:
   - node_names: [vision_encoder]
     ranks: [0]

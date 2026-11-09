@@ -153,8 +153,8 @@ def test_deployment_context_default_and_resource_override(limit):
         assert second.config.max_seq_len == 128
 
 
-@pytest.mark.parametrize("path", sorted(Path(__file__).parents[2].glob("configs/qwen3_5_*.yaml")), ids=lambda p: p.name)
-def test_shipped_qwen3_5_configs_keep_the_models_context(path):
+@pytest.mark.parametrize("path", sorted(Path(__file__).parents[2].glob("configs/qwen3_[58]_*.yaml")), ids=lambda p: p.name)
+def test_shipped_qwen_configs_keep_the_models_context(path):
     from mstar.engine.resources.kv.config import KVSpec
     from mstar.engine.resources.spec import apply_yaml_overrides
 
