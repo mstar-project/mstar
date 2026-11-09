@@ -326,7 +326,8 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
                 "weights": to_device_nonblocking(weights, device),
                 "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
             },
-            # one segment per frame: a frame attends to itself alone
+            # one segment per frame: a frame attends to itself alone, and the frames, in
+            # order, are the rows the tower's linears see (the merger's folded)
             resource_step_info={"main": vision_seq_lengths(grid)},
         )
 

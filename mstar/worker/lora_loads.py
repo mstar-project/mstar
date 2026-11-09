@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 from mstar.engine.resources.lora.config import describe_load_error
 from mstar.utils.ipc_format import (
@@ -23,10 +23,18 @@ from mstar.utils.ipc_format import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.base import Resource
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.worker.services import WorkerServices
 
 logger = logging.getLogger(__name__)
+
+
+def lora_pools(resources: Mapping[str, "Resource"]) -> list["LoraAdapterPool"]:
+    """The LoRA adapter pools among an engine's resources."""
+    from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+    return [resource for resource in resources.values() if isinstance(resource, LoraAdapterPool)]
 
 
 @dataclass(slots=True)
@@ -68,10 +76,10 @@ class LoraLoads:
         if self._defer(body):
             return
         load = LoraLoad(body)
-        digest = None if body.lora_digest is None else bytes.fromhex(body.lora_digest)
+        digest = bytes.fromhex(body.lora_digest)
         # a pool that refuses outright (the name already served) fails the load without
         # the rest being asked
-        for pool in self._engines.engine.lora_pools():
+        for pool in lora_pools(self._engines.engine.resources):
             try:
                 load.reads.append((pool, pool.load_adapter_async(body.lora_name, body.lora_path, digest)))
             except Exception as exc:  # noqa: BLE001 - a bad adapter fails the load, not the worker
@@ -87,7 +95,7 @@ class LoraLoads:
             return
         error = None
         try:
-            for pool in self._engines.engine.lora_pools():
+            for pool in lora_pools(self._engines.engine.resources):
                 pool.unload_adapter(body.lora_name)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Worker %s: LoRA adapter %s failed to unload", self._worker_id, body.lora_name)

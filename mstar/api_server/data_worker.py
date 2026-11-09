@@ -49,8 +49,6 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
-from mstar.engine.resources.lora.identity import AdapterPrefixRoots
-from mstar.engine.resources.lora.serving import lora_specs
 from mstar.model.base import (
     ClientChunk,
     Model,
@@ -226,26 +224,6 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
-def adapter_prefix_roots(
-    model: Model | None, model_config: dict | None,
-    digests: dict[str, bytes] | None = None,
-) -> AdapterPrefixRoots | None:
-    """The roots the deployment's LoRA adapters key their prompts under.
-
-    None when the deployment keys no label or serves no adapter. Otherwise each adapter
-    is keyed under its digest in ``digests`` (the API server's startup check) or read
-    once, here, so its digest names the weights as they were when it was registered and
-    no request pays for reading it.
-    """
-    if model is None or not model_config or not keyed_labels(model):
-        return None
-    # LoRA first: a deployment without it leaves its `resources:` block to the conductor
-    lora = lora_specs(model, model_config)
-    if not lora or not _kv_page_sizes(model, model_config):
-        return None
-    return AdapterPrefixRoots.read(lora[0], digests)
-
-
 class ResultQueue(queue.Queue):
     """What the data worker hands the API message thread: output chunks, or
     profile updates.
@@ -284,13 +262,11 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
-        adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
     ):
-        """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
-        server's startup check read them. ``upload_dir`` is where the API server saves
-        uploads: a request refused in preprocessing has its files there removed at once."""
+        """``upload_dir`` is where the API server saves uploads: a request refused in
+        preprocessing has its files there removed at once."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -342,9 +318,6 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        # registered adapters' prefix-cache roots; a runtime load or unload updates it
-        self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
-
         self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -366,7 +339,6 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
-                adapter_roots=self.adapter_prefix_roots,
                 conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
                 upload_dir=upload_dir,
@@ -734,12 +706,10 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
-        adapter_roots: AdapterPrefixRoots | None = None,
         conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
     ):
-        self._adapter_roots = adapter_roots
         self.conductor_outbox = conductor_outbox
         self.upload_dir = upload_dir
         # keying a label needs the deployment's page size as well as the
@@ -993,10 +963,13 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None and not input.prefix_root:
+                # under the base model's empty root its pages would serve base requests
+                model_kwargs["prefix_cache"] = False
             if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
-                    adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
+                    root=input.prefix_root,
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -1374,27 +1347,19 @@ class PreprocessWorkerThread:
     def _prefix_keys(
         self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
-        adapter: str | None = None,
+        root: bytes = b"",
     ) -> dict:
         """Key each page of every label's keyed spans, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
         page, and the output tensor each label's sampled ids arrive in. The keys
         are not rooted in the process (the engine does that). Each keyed span's row
-        in ``rows`` gains its digest and end key. The chains of a request on a LoRA
-        adapter hang from the adapter's root, which is also sent as ``prefix_root``;
-        a base request's hang from the empty root, as before LoRA.
+        in ``rows`` gains its digest and end key. The chains hang from ``root``
+        (``PreprocessInput.prefix_root``: a LoRA adapter's), which is also sent as
+        ``prefix_root``; a base request's hang from the empty root.
         """
         if not self._keyed_labels:
             return {}
-        root = b""
-        if adapter is not None:
-            roots = self._adapter_roots
-            root = roots.root(adapter) if roots is not None else None
-            if root is None:
-                # under the empty root its pages would serve the base model; the
-                # conductor refuses an adapter it does not serve in any case
-                return {"prefix_cache": False}
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
         decode: dict[str, dict[str, str]] = {}

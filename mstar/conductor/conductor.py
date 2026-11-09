@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 
 import torch
 import yaml
+from fastapi import HTTPException
 
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -36,14 +37,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
-from mstar.engine.resources.lora.config import (
-    LORA_ADAPTER_KWARG,
-    LORA_RESOURCE_KEY,
-    LoraReqConfig,
-    LoraSpec,
-)
-from mstar.engine.resources.lora.serving import lora_specs, served_lora_targets
-from mstar.engine.resources.lora.store import check_adapters
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import (
     ForwardPassArgs,
@@ -446,8 +440,12 @@ class Conductor:
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         status_interval_s: float | None = None,
-        lora_adapter_digests: dict[str, str] | None = None,
+        model_config: dict | None = None,
     ):
+        """``model_config`` is the serving config as the API server resolved it (its LoRA
+        adapters' digests pinned, say), which the workers are spawned with; None reads
+        ``model_config_file``, which the model's placement methods read in any case. A
+        LoRA adapter without its digest is refused either way."""
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
@@ -487,8 +485,10 @@ class Conductor:
         self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
 
-        with open(model_config_file, "r") as f:
-            self.model_config = yaml.safe_load(f)
+        if model_config is None:
+            with open(model_config_file, "r") as f:
+                model_config = yaml.safe_load(f)
+        self.model_config = model_config
         # fail here, once, rather than in every worker
         knobs.check(self.model_config.get("knobs"))
         # Every check that needs only the model, this YAML and the environment,
@@ -504,7 +504,6 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
-        self._settle_lora_adapters(lora_adapter_digests)
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -726,7 +725,10 @@ class Conductor:
 
         A KV resource with declared labels gets a config even when the model
         returned none, or its keys and layout would have nowhere to go. So does
-        a declared LoRA pool, from the ``lora_adapter`` kwarg.
+        any resource whose spec builds one from the request's kwargs
+        (``NodeResourceSpec.request_config``). A request on a LoRA adapter that
+        a runtime load or unload is in flight for is refused
+        (``LoraAdapterOps.refuse_request``).
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
@@ -738,71 +740,31 @@ class Conductor:
             raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
-        # the adapter config is the conductor's to fill, like the KV configs above,
-        # so a model that declares a LoRA spec needs no request code of its own; every
-        # node with a LoRA pool (an LLM, its vision encoder) runs the request's adapter
-        adapter = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
-        specs = {s.resource_key: s for s in self._node_resources()}
-        if LORA_RESOURCE_KEY in specs:
-            for key, spec in specs.items():
-                if isinstance(spec, LoraSpec):
-                    configs.setdefault(key, LoraReqConfig(adapter=adapter))
-        elif adapter is not None:
-            raise ValueError(
-                f"the request asks for LoRA adapter {adapter!r}, but this deployment "
-                "serves no LoRA adapters"
-            )
+        # each declared resource builds its own config from the request's kwargs (a LoRA
+        # pool's from the adapter it names), so a model needs no request code for one
+        for spec in self._node_resources():
+            config = spec.request_config(model_kwargs)
+            if config is not None:
+                configs.setdefault(spec.resource_key, config)
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        if lora_ops is not None:
+            lora_ops.refuse_request(configs.values())
         return configs
 
-    def _settle_lora_adapters(self, digests: dict[str, str] | None) -> None:
-        """Check the serving config's LoRA adapters before any worker starts, unless the
-        API server already did (``digests``, name -> hex), so a bad adapter fails the
-        deployment at startup with every bad adapter named.
-
-        The digests go into the config the workers are spawned with
-        (``adapter_digests``), so every read a worker makes, at startup or after the
-        adapter left its host tier, serves the weights the API server keyed the prefix
-        cache under, the same on every rank. So do the targets the adapters touch, when
-        runtime updates are off (``served_lora_targets``): computed here once, every
-        process and rank builds the same specs."""
-        block = (self.model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
-        if not block.get("adapters"):
-            return
-        # every node's LoRA spec, the one keyed `lora` first: each serves the adapters
-        specs = lora_specs(self.model, self.model_config)
-        if digests is None:
-            digests = {
-                name: d.hex() for name, d in check_adapters(specs[0], others=specs[1:]).items()
-            }
-        # one block sizes every LoRA spec, so each spec's pools pin the same digests
-        block["adapter_digests"] = dict(digests)
-        targets = served_lora_targets(specs)
-        if targets is not None:
-            logger.info("LoRA: serving only the targets the adapters touch: %s", targets)
-            block["targets"] = targets
-
     def _lora_ops(self) -> LoraAdapterOps:
-        """Runtime LoRA loads and unloads, against the specs requests are validated with
-        and the workers hosting their nodes. Built on first use.
-
-        Each worker's ``_resource_specs`` holds its own copy of a spec, with its own
-        adapter-info cache, so a load or unload updates the copies as well."""
+        """Runtime LoRA loads and unloads, for the deployment's LoRA pools (one per node,
+        ``LoraSpec.per_node``) and the workers hosting their nodes. Built on first use."""
         ops = getattr(self, "_lora_ops_cache", None)
         if ops is None:
-            specs = [s for s in self._node_resources() if isinstance(s, LoraSpec)]
-            copies = [
-                s for per_worker in self._resource_specs() for s in per_worker.values()
-                if isinstance(s, LoraSpec)
-            ]
-            nodes = set().union(*(s.nodes for s in specs))
+            pools = [spec for spec in self._node_resources() if isinstance(spec, LoraSpec)]
+            nodes = set().union(*(spec.nodes for spec in pools))
             workers = [
                 worker_id for worker_id in self.worker_ids
                 if any(nodes & set(wg.section.get_nodes())
                        for wg in self._per_worker_graphs[worker_id])
             ]
             ops = self._lora_ops_cache = LoraAdapterOps(
-                specs[0] if specs else None, workers, self.communicator.send,
-                others=[*specs[1:], *copies],
+                pools[0] if pools else None, workers, self.communicator.send,
             )
         return ops
 
@@ -1293,7 +1255,8 @@ class Conductor:
 
         An exception here would otherwise reach the run loop, which only logs
         it, and the client would wait for its timeout. A ``ValueError`` raised
-        before any worker heard of the request is the client's fault: a 400.
+        before any worker heard of the request is the client's fault: a 400,
+        and an ``HTTPException`` carries its own status.
         """
         try:
             self._do_ingest_request(body)
@@ -1304,6 +1267,9 @@ class Conductor:
                 self._drop_request(body.request_id)
                 if isinstance(exc, ValueError):
                     self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
+                    return
+                if isinstance(exc, HTTPException):
+                    self._reject_request(body.request_id, exc.detail, status=exc.status_code)
                     return
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
@@ -1414,7 +1380,7 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
-                # the LoRA adapter the chains were keyed under, the same for all
+                # what the chains hang from (a LoRA adapter's root), the same for all
                 prefix_root=kwargs.get("prefix_root"),
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),

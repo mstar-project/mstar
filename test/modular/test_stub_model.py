@@ -13,7 +13,7 @@ def test_a_stub_declares_nothing_and_inherits_the_base_defaults():
     assert isinstance(model, Model), "code under test may rely on any method of Model"
     assert model.get_node_resources() == [] and model.get_graph_walk_graphs() == {}
     assert model.get_submodule("LLM") is None, "None is how a model asks for dummy mode"
-    assert model.kv_labels() == {} and model.get_lora_specs() == []
+    assert model.kv_labels() == {}
 
 
 @pytest.mark.parametrize("method", [
