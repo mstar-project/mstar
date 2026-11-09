@@ -392,6 +392,37 @@ def test_a_follower_gives_back_the_log_of_a_request_rank_0s_pool_couldnt_hold():
     )
 
 
+def test_a_request_whose_intake_fails_while_it_takes_room_gives_back_every_slice_at_its_teardown(monkeypatch):
+    """The talker's log took a slice past the follower's full pool, and the pinned allocation for the LLM's log
+    raised. The talker's slice had no owner, so a's teardown never gave it back."""
+    talker, node = "talker", SimpleNamespace(input_names={"text_inputs"}, outputs=[SimpleNamespace(name="new_token")])
+    nodes = {NODE: node, talker: node}
+    loop = SimpleNamespace(get_nodes=lambda: nodes)
+    graphs = {
+        PREFILL: SimpleNamespace(get_nodes=lambda: nodes, get_loops=dict),
+        DECODE: SimpleNamespace(get_nodes=lambda: nodes, get_loops=lambda: {"decode_loop": loop}),
+    }
+    policies = {NODE: POLICY, talker: POLICY}
+    what = NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))
+    writes = {"kv": {NODE: what}, "kv2": {talker: what}}
+    layouts = dict.fromkeys(writes, [StreamLayout(spans=PROMPT, growth=(("decode_loop", 1),))])
+    follower = Rebuilds(policies, graphs, HostPool(16, torch.device("cpu")), followed=frozenset(policies))
+    take = follower.pool.take
+
+    def take_one(nbytes, spill=False):
+        """Allocates the first slice past the pool, and raises at the second as the pinned allocator would."""
+        if follower.pool._spilled:
+            raise RuntimeError("CUDA error: out of memory")
+        return take(nbytes, spill)
+    monkeypatch.setattr(follower.pool, "take", take_one)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        follower.ingest_request(A, writes, layouts, unpausable=False)
+    follower.remove_request(A)
+
+    assert not follower.pool._spilled, "the follower holds a slice outside its pool that no request owns"
+
+
 def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
     """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
