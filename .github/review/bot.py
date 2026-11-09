@@ -1225,9 +1225,55 @@ def main(steps):
                     f.write(f"{key}={value}\n")
 
 
+# ---------------------------------------------------------------- merge-queue check
+
+# A merge-queue branch GitHub makes for an entry: gh-readonly-queue/<base>/pr-<number>-<base sha>.
+QUEUE_REF = re.compile(r"(?:refs/heads/)?gh-readonly-queue/.+/pr-(\d+)-[0-9a-f]{40}")
+# The states that change where a reviewer stands. COMMENTED and PENDING don't.
+DECIDING = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def merge_approved(reviews, head, has_write, bots):
+    """(passes, why): whether the PR, at `head`, may merge on its reviews (GitHub's, oldest first): someone stands at
+    APPROVED who is a person with write access, or one of the bot's `bots` logins, on `head`. A person's approval
+    is GitHub's business and doesn't go stale on a push (`main`'s protection as it is). A later CHANGES_REQUESTED or
+    a dismissal takes back that reviewer's approval. A person without write access doesn't count, or their word
+    would rescue a stale bot approval that GitHub's own rule still counts."""
+    standing = {}
+    for r in reviews:
+        if r.get("state") in DECIDING and r.get("user"):
+            standing[r["user"]["login"]] = r
+    approved = {login: r for login, r in standing.items() if r["state"] == "APPROVED"}
+    people = [login for login, r in approved.items() if r["user"].get("type") == "User" and login not in bots]
+    person = next((login for login in people if has_write(login)), None)
+    if person:
+        return True, f"approved by {person}"
+    bot = [r for login, r in approved.items() if login in bots]
+    if any(r.get("commit_id") == head for r in bot):
+        return True, f"the bot approved the PR's head {head[:7]}"
+    return False, (f"the bot's approval is on {bot[-1].get('commit_id', '?')[:7]}, not the PR's head {head[:7]}: "
+                   "a new `/review` or a person's approval is needed" if bot else "no current approval")
+
+
+def approval_current(out, repo, head_ref):
+    """The merge-queue check that a bot approval counts only for the commit it reviewed (review-approval-current.yml).
+    A ref that doesn't parse or any failed read fails it."""
+    m = QUEUE_REF.fullmatch(head_ref)
+    if not m:
+        sys.exit(f"::error::Not a merge-queue branch: {head_ref}")
+    pr = int(m[1])
+    head = api(f"repos/{repo}/pulls/{pr}")["head"]["sha"]
+    passes, why = merge_approved(api_list(f"repos/{repo}/pulls/{pr}/reviews"), head,
+                                 lambda login: permission(repo, login) in WRITE, BOT_USERS)
+    if not passes:
+        sys.exit(f"::error::PR #{pr} has no approval for its current commit: {why}")
+    print(f"::notice::PR #{pr}: {why}.")
+
+
 STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
-         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post}
+         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post,
+         "approval_current": approval_current}
 
 if __name__ == "__main__":
     main(STEPS)

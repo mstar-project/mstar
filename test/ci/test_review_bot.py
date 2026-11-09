@@ -632,6 +632,53 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(self.handoff(None)[0], {"exit": "No Claude Code messages to hand off."})
 
 
+class TestMergeCheck(unittest.TestCase):
+    """bot.merge_approved and approval_current: a bot approval counts only for the commit it reviewed."""
+
+    def test_who_counts_for_the_head(self):
+        def review(login, state, commit=HEAD, kind="User"):
+            return {"user": {"login": login, "type": kind}, "state": state, "commit_id": commit}
+        app = ("mstar-review[bot]",)
+        fork = ("mstar-review[bot]", "github-actions[bot]")
+        bot_ok, bot_stale = review(app[0], "APPROVED", kind="Bot"), review(app[0], "APPROVED", "old", "Bot")
+        writer = {"ann"}
+        for name, reviews, writers, bots, passes in (
+                ("a person's approval", [review("ann", "APPROVED", "old")], writer, app, True),
+                ("a current bot approval", [bot_ok], writer, app, True),
+                ("a stale bot approval", [bot_stale], writer, app, False),
+                ("nothing at all", [], writer, app, False),
+                ("a person's later CHANGES_REQUESTED", [review("ann", "APPROVED"), review("ann", "CHANGES_REQUESTED"),
+                                                        bot_stale], writer, app, False),
+                ("a comment doesn't take back an approval", [review("ann", "APPROVED"), review("ann", "COMMENTED")],
+                 writer, app, True),
+                ("a person without write access", [review("ann", "APPROVED"), bot_stale], set(), app, False),
+                ("a dismissed bot approval", [bot_ok, review(app[0], "DISMISSED", kind="Bot")], writer, app, False),
+                ("the bot's later approval on the head", [bot_stale, bot_ok], writer, app, True),
+                ("github-actions doesn't count with the app",
+                 [review("github-actions[bot]", "APPROVED", kind="Bot")], writer, app, False),
+                ("with no app, the job's token is the bot",
+                 [review("github-actions[bot]", "APPROVED", kind="Bot")], writer, fork, True),
+        ):
+            with self.subTest(name):
+                self.assertEqual(bot.merge_approved(reviews, HEAD, writers.__contains__, bots)[0], passes)
+
+    def test_the_step_reads_the_queue_entry_and_fails_closed(self):
+        ref = f"refs/heads/gh-readonly-queue/main/pr-7-{LAST}"
+        routes = {"GET repos/o/r/pulls/7": {"head": {"sha": HEAD}},
+                  "GET repos/o/r/pulls/7/reviews": [{"user": {"login": "mstar-review[bot]", "type": "Bot"},
+                                                     "state": "APPROVED", "commit_id": "old"}]}
+        self.assertIn("no approval for its current commit",
+                      step(bot.approval_current, routes, repo="o/r", head_ref=ref)[0]["exit"])
+        current = {**routes, "GET repos/o/r/pulls/7/reviews": [{"user": {"login": "mstar-review[bot]", "type": "Bot"},
+                                                                "state": "APPROVED", "commit_id": HEAD}]}
+        self.assertNotIn("exit", step(bot.approval_current, current, repo="o/r", head_ref=ref)[0])
+        self.assertIn("Not a merge-queue branch",
+                      step(bot.approval_current, {}, repo="o/r", head_ref="refs/heads/feature/x")[0]["exit"],
+                      "a ref that doesn't parse would pass the check")
+        with self.assertRaises(RuntimeError):
+            step(bot.approval_current, {**routes, "GET repos/o/r/pulls/7/reviews": Fail()}, repo="o/r", head_ref=ref)
+
+
 class TestAfterTheReview(unittest.TestCase):
     def test_a_corrupt_or_missing_execution_file_still_records_usage(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -717,7 +764,7 @@ class TestAfterTheReview(unittest.TestCase):
             return next(answers)
 
         with workspace(), mock.patch.object(bot.time, "sleep"):
-            _, fake = step(bot.post, {
+            out, fake = step(bot.post, {
                 "POST repos/o/r/pulls/7/comments": create,
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
@@ -733,6 +780,29 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertEqual(render_summary.saved_state(summary)["outside_diff"],
                          [{"priority": "P0", "claim": "range", "location": "b.py:9", "detail": "range"}],
                          "a finding GitHub refused would be lost")
+        self.assertEqual(json.loads(out["result"])["inline"], {"41": "P1", "43": "P2"},
+                         "the approval rule's snapshot would miss a finding this run posted")
+        self.assertNotIn("inline_comments", json.loads(out["result"]), "the job output holds what the rule reads")
+
+    def test_inline_comments_are_inert_but_a_suggestion_applies_as_written(self):
+        posted = []
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
+                      {"path": "a.py", "line": 3,
+                       "body": "**[P1]** @org/team ![x](https://x.example/a.png)\n\n```suggestion\nuse(@team)\n```"},
+                  ]}
+        with workspace():
+            step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99", "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+        for markup in ("@org", "!["):
+            self.assertNotIn(markup, posted[0]["body"], "the model's text would ping a team or load an image")
+        self.assertIn("```suggestion\nuse(@team)\n```", posted[0]["body"], "an applied suggestion would carry "
+                      "zero-width spaces")
+        self.assertTrue(posted[0]["body"].startswith("**[P1]** "), "the tag the bot counts findings by would be gone")
 
     def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
         item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
