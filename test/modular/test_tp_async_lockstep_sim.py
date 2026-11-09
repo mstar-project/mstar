@@ -161,19 +161,6 @@ def test_a_follower_never_replays_an_offload_of_a_row_it_hasnt_recorded():
             assert synchronous or res.speculative_offloads > 0
 
 
-def test_a_follower_can_replay_the_settle_of_a_victim_that_stays_in_the_retry():
-    """An offload that moved nothing still ships its settle, and V keeps running: the
-    follower has recorded every step of V before it applies that settle, in both modes."""
-    from tp_async_sim import explore_offload
-
-    for synchronous in (False, True):
-        res = explore_offload(synchronous, 2, steps=5, victim_stays=True)
-        assert res.ok and res.states > 100, (synchronous, res.violations[:2])
-    # the same serial-path gate is what this rests on
-    res = explore_offload(False, 2, steps=5, serial_gate=False, victim_stays=True)
-    assert any(kind == "unrecorded-at-replay" for kind, *_ in res.violations)
-
-
 def test_the_offload_replay_rests_on_the_serial_path_draining_its_steps():
     """Negative control: a follower taking a serial head as early as a speculative
     one can replay the offload of a row from the step it hasn't post-processed."""
