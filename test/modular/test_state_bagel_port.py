@@ -496,7 +496,9 @@ def test_a_request_opens_with_bagels_per_node_labels_and_its_sampling_settings()
     }
     assert kv.needed_labels_per_node_walk[("LLM_cfg_text", "image_gen_cfg2")] == ["cfg_text"]
     assert kv.needed_labels_per_node_walk[("LLM", "decode")] == ["main", "cfg_img"]
-    assert kv.needed_labels is None, "the conductor would open labels an unguided request never touches"
+    assert kv.needed_labels is None, (
+        "a flat needed_labels would open the request's labels on every node and walk, not per node and walk"
+    )
 
 
 # A prefix hit can't end inside a step that reads its keyed walk as a whole

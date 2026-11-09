@@ -361,7 +361,7 @@ def test_decoder_declares_context_span_only_on_encoder_walks():
     assert sub.declare_step(DECODE_WALK, ["d"], [decode_row]).state[CROSS_KV_CACHE].eager_add is False
 
 
-def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
+def test_a_prompt_stages_its_timestamp_rule_row_and_a_decode_step_keeps_it_in_the_decoder_state():
     from types import SimpleNamespace
 
     cfg = _tiny_config()
@@ -606,20 +606,19 @@ def test_engine_stop_check_takes_the_batched_path():
 
     sub.check_stop = per_request
     infos = {}
-    for handle, rid in enumerate(("eos", "word")):
+    for rid in ("eos", "text"):
         infos[rid] = type("I", (), {
-            "graph_walk": DECODE_WALK, "max_tokens": 444, "rid_handle": handle,
+            "graph_walk": DECODE_WALK, "max_tokens": 444,
             "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
-            "dynamic_loop_iter_counts": {"decode_loop": 0},
         })()
     failures = {}
     batch = SimpleNamespace(
-        node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
+        node_name="decoder", request_ids=["eos", "text"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
     )
     engine = make_engine(_submodules={"decoder": make_mgmt(submodule=sub)})
     tokens = torch.tensor([EOT, 1234, 0])  # a padding row past the real ones
-    stops = engine.check_stop_for_batch(batch, {}, host_rows=HostRows(("eos", "word"), {"new_token": tokens}),
+    stops = engine.check_stop_for_batch(batch, {}, host_rows=HostRows(("eos", "text"), {"new_token": tokens}),
     )
     assert stops == {"eos": {"decode_loop"}} and not failures
 
