@@ -1709,6 +1709,79 @@ def test_offline_deployment_decodes_once_with_full_attention(model):
     assert (torch.cat(chunks).int() - whole.int()).abs().max() <= 1
 
 
+# -- request contract -----------------------------------------------------------
+
+
+def _loop_conductor(model):
+    """A conductor with only what ``_loop_caps`` reads: the model and its loops' ``max_iters``."""
+    from mstar.conductor.conductor import Conductor
+
+    c = Conductor.__new__(Conductor)
+    c.model = model
+    c._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    return c
+
+
+def test_request_kwargs_are_the_keys_the_model_and_its_adapter_read(model, tmp_path):
+    assert model.request_kwargs() == {
+        "temperature", "top_p", "top_k", "ras_window", "ras_tau", "ignore_eos", "n_cfm_timesteps",
+        "max_new_tokens", "max_output_tokens", "seed", "voice", "instruct", "ref_text", "ref_audio",
+    }
+    sa = adapters.CosyVoice3Adapter().speech_to_request(
+        _speech(voice="anna", instructions="slowly", temperature=0.7, top_p=0.9, seed=5), tmp_path
+    )
+    assert set(sa.model_kwargs) <= model.request_kwargs()
+    # the adapter drops speed rather than forwarding it, and the model has none
+    assert "speed" not in model.request_kwargs()
+
+
+@pytest.mark.parametrize("key", ["max_new_tokens", "max_output_tokens", "top_k", "n_cfm_timesteps", "ras_window"])
+@pytest.mark.parametrize("bad", [2.7, "20", True, -1])
+def test_integer_knobs_are_strict(model, key, bad):
+    with pytest.raises(ValueError, match=key if key != "max_output_tokens" else "max_new_tokens"):
+        model.process_prompt("hello world", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]},
+                             **{key: bad})
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"temperature": "0.5"}, "temperature"),
+        ({"top_p": True}, "top_p"),
+        ({"ras_tau": float("nan")}, "ras_tau"),
+        ({"ignore_eos": "false"}, "ignore_eos"),
+        ({"seed": 1.5}, "seed"),
+        ({"voice": 5}, "voice must be a string"),
+        ({"instruct": ["slowly"]}, "instruct must be a string"),
+    ],
+)
+def test_wrong_types_are_value_errors(model, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        model.process_prompt("hello world", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]},
+                             **kwargs)
+
+
+def test_whole_floats_pass_for_integer_knobs(model):
+    out = model.process_prompt("one two three", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]},
+                               max_new_tokens=10.0, n_cfm_timesteps=5.0, top_k=10.0)
+    assert out.metadata[MAX_SPEECH_TOKENS] == 10
+    knobs = model.resolve_generation_kwargs({"n_cfm_timesteps": 5.0, "top_k": 10.0})
+    assert (knobs["n_cfm_timesteps"], knobs["top_k"]) == (5, 10)
+    assert all(type(knobs[k]) is int for k in ("n_cfm_timesteps", "top_k"))
+
+
+def test_a_token_budget_past_the_decode_loop_is_refused_not_clamped(model):
+    c = _loop_conductor(model)
+    limit = model._speech_limit
+    assert c._loop_caps({"max_new_tokens": limit}) == {DECODE_LOOP: limit - 1}
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        c._loop_caps({"max_new_tokens": limit + 1})
+
+
 def test_native_convolution_windows_nest_across_threads():
     """Two threads' windows overlap; cuDNN comes back only when both have left."""
     import threading

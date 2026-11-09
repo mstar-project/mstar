@@ -142,10 +142,12 @@ def test_request_defaults_and_validation():
         {"num_frames": 1e999},
         {"height": 768.5, "width": 1344},
         {"num_inference_steps": 2.7},
+        {"height": 768, "width": "1344"},
+        {"flow_shift": "3"},
     ):
         with pytest.raises(ValueError):
             model.resolve_request(bad)
-    assert model.resolve_request({"height": 768.0, "width": "1344"})["width"] == 1344
+    assert model.resolve_request({"height": 768.0, "width": 1344})["height"] == 768
     for anchors in (5, [["first"]], [None], {"first": 1}):
         with pytest.raises(ValueError, match="keyframe_anchors"):
             model.keyframe_anchors({"keyframe_anchors": anchors}, 1)
