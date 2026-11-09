@@ -78,7 +78,9 @@ class _Socket:
         return msgs
 
     def send(self, entity, msg):
-        self.sent.append((entity, msg))
+        with self.cond:
+            self.sent.append((entity, msg))
+            self.cond.notify_all()
 
     # the data worker's outbox encodes with this: identity, so sends arrive as objects
     codec = SimpleNamespace(encode=lambda msg: msg)
@@ -93,10 +95,18 @@ class _Socket:
     def sent_of(self, message_type):
         return [m.body for e, m in self.sent if e == "conductor" and m.message_type == message_type]
 
+    def wait_for_sent(self, message_type):
+        with self.cond:
+            assert self.cond.wait_for(lambda: self.sent_of(message_type), timeout=10), (
+                f"data worker did not send {message_type}"
+            )
+            return self.sent_of(message_type)
+
 
 class _TensorManager:
     def __init__(self):
         self.forced = []
+        self.cleanup_done = threading.Event()
 
     def store_and_return_tensor_info(self, request_id, tensors):
         return {}
@@ -117,6 +127,7 @@ class _TensorManager:
 
     def force_cleanup_request(self, request_id):
         self.forced.append(request_id)
+        self.cleanup_done.set()
 
     def ack_unread_tensors(self, graph_edges):
         pass
@@ -198,7 +209,9 @@ def rig():
 def test_cancelled_collection_sends_abort_through_the_data_worker(rig):
     """Cancellation crosses the real facade and worker queue into the outbox;
     input tensors stay owned until the conductor authorizes hard cleanup."""
-    key = rig.submit("cancel while waiting").request_id
+    rig.server.submit_request(text="cancel while waiting", request_id="X", streaming=False, **TEXT)
+    (submitted,) = rig.socket.wait_for_sent(ConductorMessageType.NEW_REQUEST)
+    key = submitted.request_id
     assert key != "X"
 
     async def cancel():
@@ -219,21 +232,19 @@ def test_cancelled_collection_sends_abort_through_the_data_worker(rig):
             await task
 
     asyncio.run(cancel())
-    rig.settle()
+    aborts = rig.socket.wait_for_sent(ConductorMessageType.ABORT_REQUEST)
+    reads_done = rig.socket.wait_for_sent(ConductorMessageType.READS_DONE)
 
     assert not rig.server.pending_requests
     assert not rig.server._live
     assert not rig.server._client_ids
-    assert [body.request_id for body in rig.socket.sent_of(ConductorMessageType.ABORT_REQUEST)] == [key]
-    assert [
-        (body.request_id, body.entity_id)
-        for body in rig.socket.sent_of(ConductorMessageType.READS_DONE)
-    ] == [(key, PREPROCESS)]
+    assert [body.request_id for body in aborts] == [key]
+    assert [(body.request_id, body.entity_id) for body in reads_done] == [(key, PREPROCESS)]
     assert rig.tm.forced == [], "abort must not unlink inputs before REMOVE_REQUEST"
 
     # Deliver the conductor's cleanup authorization through the real worker loop.
     rig.socket.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(key))
-    rig.settle()
+    assert rig.tm.cleanup_done.wait(timeout=10), "data worker did not apply REMOVE_REQUEST"
     assert rig.tm.forced == [key]
 
 
