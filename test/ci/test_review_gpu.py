@@ -105,12 +105,12 @@ class TestApproval(unittest.TestCase):
         pr = {"head": {"sha": "0123456789", "repo": OWN_HEAD}, "base": {"sha": "abcdef", "repo": BASE_REPO},
               "user": {"login": "an-author"}, "title": "T"}
 
-        def why(verdict, run, files=("docs/models.rst",), since="", skipped=(), questions=()):
+        def why(verdict, run, files=("docs/models.rst",), since="", skipped=(), questions=(), prior=(), threads=()):
             fake = FakeGh({f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
-                           {"permission": "write"}, "POST graphql": threads_page(),
+                           {"permission": "write"}, "POST graphql": threads_page(*threads),
                            f"GET repos/{R}/compare/main...0123456789": {"files": [{"filename": f} for f in files]}})
-            r = {"outside_diff": [], "prior_findings": [], "questions": list(questions), "skipped": list(skipped),
-                 "inline": {},
+            r = {"outside_diff": [], "prior_findings": list(prior), "questions": list(questions),
+                 "skipped": list(skipped), "inline": {},
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             with workspace(), unittest.mock.patch.object(bot, "run", fake):
@@ -123,6 +123,13 @@ class TestApproval(unittest.TestCase):
                          "a review that left files unread could approve them")
         self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
                          "a review that left a question open could approve")
+        for status in ("fixed", "moot"):
+            judged = [{"ref": "4", "priority": "P1", "status": status, "why": "fixed in the caller"}]
+            self.assertEqual(why("pass", "full", prior=judged, threads=[thread(4, "**[P1]** x", outdated=True)]), [],
+                             "a finding whose lines changed couldn't be cleared by a re-review")
+            self.assertEqual(why("pass", "full", prior=judged, threads=[thread(4, "**[P1]** x")]),
+                             ["open P0–P2 findings: inline 4 (P1)"],
+                             "the model's word alone would clear a finding no line of which changed")
         self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
                          "a change that needs no GPU run could never be approved")
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],

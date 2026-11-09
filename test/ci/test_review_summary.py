@@ -105,7 +105,12 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(r["risk"]["level"], "medium", "a small fix commit could rate a medium PR low and approve it")
         self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
         self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
-        self.assertEqual(carried(review(), earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(review(), earlier, True)["questions"], earlier["questions"],
+                         "a comment about anything else would drop every question")
+        answered = {**review(), "answered_questions": ["Should this be a resource?"]}
+        self.assertEqual(carried(answered, earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(answered, earlier, False)["questions"], earlier["questions"],
+                         "the model could say a question was answered when nobody commented")
         self.assertEqual(carried(review(), earlier, True)["risk"]["level"], "low",
                          "a maintainer's answer would leave the earlier risk standing")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}

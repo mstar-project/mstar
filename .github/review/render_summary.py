@@ -96,6 +96,9 @@ SCHEMA = {
             },
             "required": ["location", "text"],
         }},
+        "answered_questions": {**STRINGS, "description": "on a re-review, each question in last-review.json that a "
+                                                          "comment from a maintainer other than the author answered, "
+                                                          "verbatim; empty when none"},
         "checked": STRINGS,
         "skipped": {**STRINGS, "description": "files not reviewed: only with a small turn cap (a contributor run) "
                                               "and a diff too large for it; else empty"},
@@ -156,7 +159,8 @@ SCHEMA = {
                                                             "anything else. Short; empty when there is nothing"},
         }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
-    "required": ["inline_comments", "outside_diff", "since_last", "description_problems", "questions", "checked",
+    "required": ["inline_comments", "outside_diff", "since_last", "description_problems", "questions",
+                 "answered_questions", "checked",
                  "skipped", "types", "prior_findings", "design", "latent", "risk"],
 }
 
@@ -272,9 +276,10 @@ def carried(review, earlier, answered):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
-    still open loses any `fixed_in` from before); and its risk level as a floor, with the `look_at` that names
-    the decision, and its questions, unless a maintainer other than the author has commented since
-    (`answered`), when this review's judgement stands; and what the live test can't exercise
+    still open loses any `fixed_in` from before); its risk level as a floor, with the `look_at` that names
+    the decision, unless a maintainer other than the author has commented since (`answered`), when this review's
+    judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
+    (`answered_questions`), so one comment can't drop the rest; and what the live test can't exercise
     (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
     the bot's GPUs able to run it. Everything here is carried into the next state too."""
     earlier = earlier or {}
@@ -297,9 +302,10 @@ def carried(review, earlier, answered):
         if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
             review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
                               "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
-        asked = {q["text"] for q in review["questions"]}
-        review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
-                                                       if q["text"] not in asked]]
+    asked = {q["text"] for q in review["questions"]}
+    settled = set(review.get("answered_questions") or ()) if answered else set()
+    review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
+                                                   if q["text"] not in asked and q["text"] not in settled]]
     untestable = (earlier.get("live_test") or {}).get("untestable")
     if untestable and not (review.get("live_test") or {}).get("untestable"):
         review["live_test"] = {**(review.get("live_test") or {}), "untestable": untestable}
@@ -307,21 +313,22 @@ def carried(review, earlier, answered):
 
 
 def bot_threads(pages):
-    """(first comment, priority, text after the tag) of every inline thread the bot started, a page of the PR's review
-    threads (GraphQL) at a time. An untagged one counts as a P2, since its priority is unknown and it should still
-    block approval."""
+    """(first comment, priority, text after the tag, whether GitHub shows it outdated) of every inline thread the bot
+    started, a page of the PR's review threads (GraphQL) at a time. An untagged one counts as a P2, since its priority
+    is unknown and it should still block approval."""
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             first = thread["comments"]["nodes"][0]
             if first["author"] and first["author"]["login"] in POSTING_BOTS:
                 match = TAG.match(first["body"])
-                yield first, match[1] if match else "P2", first["body"][match.end() if match else 0:]
+                yield first, match[1] if match else "P2", first["body"][match.end() if match else 0:], \
+                    thread.get("isOutdated")
 
 
 def inline_findings(pages):
     """The bot's inline findings as they stand, comment id to priority tag, what a later step checks them against
     (gpu_review.findings_changed)."""
-    return {str(first.get("databaseId", "")): priority for first, priority, _ in bot_threads(pages)}
+    return {str(first.get("databaseId", "")): priority for first, priority, _, _ in bot_threads(pages)}
 
 
 EDITED = "edited after the bot posted it; a person decides"
@@ -344,7 +351,7 @@ def open_findings(review, pages, stacked):
         return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
 
     found, counted = [], {f["location"] for f in review["outside_diff"]}
-    for first, priority, text in bot_threads(pages):
+    for first, priority, text, _ in bot_threads(pages):
         ref = str(first.get("databaseId", ""))
         edited = first.get("lastEditedAt")
         if ref in cleared and not edited:
