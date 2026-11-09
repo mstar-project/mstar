@@ -217,6 +217,13 @@ class WindowOp(StrEnum):
     CLOSE = "close"   # the request ended: delete the upload and its windows
 
 
+class LiveOp(StrEnum):
+    """A ``live`` request's operation on a live call."""
+    TAKING = "taking"   # taking_input: whether the call still takes input
+    APPEND = "append"   # stream_input: text, files, model_kwargs or samples, maybe ending streams
+    REJECT = "reject"   # reject_input: end the call with the client's error
+
+
 def soundfile_library() -> str | None:
     """The libsndfile that ``soundfile`` loaded (the copy its wheel bundles, else the
     system one it found), for ``mstar-server`` to encode the compressed speech formats
@@ -644,12 +651,13 @@ class RustFrontendBridge:
         ``ClientAudio`` stream ``stream``), answered as the Python route would
         act on it. The call is the submission its ``call`` names; one that has
         ended has no key and takes nothing."""
-        op, key = msg.get("op"), self._keys.get(msg.get("call"))
+        key = self._keys.get(msg.get("call"))
         reply = {"t": "live", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
         try:
-            if op == "taking":
+            op = LiveOp(msg.get("op"))
+            if op is LiveOp.TAKING:
                 meta = {"taking": key is not None and self.server.taking_input(key)}
-            elif op == "reject":
+            elif op is LiveOp.REJECT:
                 meta = {"rejected": key is not None and self.server.reject_input(key, msg["error"], int(msg["status"]))}
             elif key is None:
                 meta = {"accepted": False}
@@ -685,8 +693,8 @@ class RustFrontendBridge:
                     route = "realtime" if audio else "generate/ws"
                     text, error_id = client_error_text(exc, f"{route} append failed", log=logger, type_name=False)
                     meta = {"error": text, "status": 500, "error_id": error_id}
-        except Exception as exc:  # noqa: BLE001
-            text, _ = client_error_text(exc, f"generate/ws {op} failed", log=logger, type_name=False)
+        except Exception as exc:  # noqa: BLE001 — an unknown op included
+            text, _ = client_error_text(exc, f"live {msg.get('op')!r} failed", log=logger, type_name=False)
             meta = {"error": text, "status": 500}
         reply["metadata"] = meta
         self._send(reply)
