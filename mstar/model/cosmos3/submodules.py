@@ -29,13 +29,13 @@ Nodes:
                                  packed image/video patches to text-space
                                  tokens for the reasoner prefill.
   Cosmos3ReasonerSubmodule    -- the understanding tower as a causal VLM, a
-                                 ``SampledTokenDecoder`` (shares the DiT's
-                                 transformer instance and kv/attn resources,
-                                 plus its own sampler and positions):
-                                 ``reasoner_prefill`` / ``reasoner_prefill_vision``
-                                 write the prompt's K/V and sample the first
-                                 token, ``reasoner_decode`` one token per loop
-                                 iteration.
+                                 ``SampledTokenDecoder`` on the VLM scaffold
+                                 (shares the DiT's transformer instance and
+                                 kv/attn resources, plus its own sampler and
+                                 positions): ``prefill_text`` /
+                                 ``prefill_vision`` write the prompt's K/V and
+                                 sample the first token, ``decode`` one token
+                                 per iteration of ``decode_loop``.
 
 Because the text tokens never receive a timestep embedding, the understanding
 K/V is denoise-step independent, so writing it once and re-reading it every step
@@ -57,6 +57,7 @@ from torch.fx.experimental import _config as fx_config
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
+    check_inductor_options,
 )
 from mstar.engine.fp32_precision import cudnn_benchmark
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
@@ -87,14 +88,12 @@ from mstar.model.cosmos3.constants import (
     PREFILL_COND_VIDEO_WALK,
     PREFILL_COND_WALK,
     PREFILL_WALK,
-    REASONER_DECODE_WALK,
-    REASONER_PREFILL_WALK,
     VIDEO_GEN_AR_WALK,
     VIDEO_GEN_WALK,
     VIDEO_SOUND_GEN_WALK,
 )
 from mstar.model.cosmos3.sessions import SessionStore
-from mstar.model.keys import ROPE
+from mstar.model.keys import MIXED, ROPE
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -106,6 +105,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.knobs import ingraph_decode_rope
 
 logger = logging.getLogger(__name__)
 
@@ -186,8 +186,8 @@ SAMPLER = "sampler"
 # rollouts keep their latents in the model dtype.
 LATENT_DTYPE = torch.float32
 
-# The reasoner's decode loop.
-REASONER_DECODE_LOOP = "reasoner_decode_loop"
+# The reasoner's decode loop (the VLM scaffold's name).
+REASONER_DECODE_LOOP = "decode_loop"
 # The reasoner keeps every request's text under one cache label.
 REASONER_LABEL = "main"
 
@@ -3160,9 +3160,15 @@ class Cosmos3TextTower(torch.nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.transformer.embed_tokens(input_ids)
 
+    def build_cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotary tables for ``[3, N]`` mRoPE ids."""
+        return self.transformer.build_cos_sin(position_ids, self.embed_dtype)
+
     @torch.autocast(device_type="cuda", enabled=False)
-    def forward(self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor) -> torch.Tensor:
-        return self.transformer.text_forward(input_embeds, position_ids, label)
+    def forward(
+        self, input_embeds: torch.Tensor, *, label: str, cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        return self.transformer.text_layers(input_embeds, *cos_sin, label)
 
     @torch.autocast(device_type="cuda", enabled=False)
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -3170,65 +3176,102 @@ class Cosmos3TextTower(torch.nn.Module):
 
 
 class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
-    """The understanding tower served as a causal VLM.
+    """The understanding tower served as a causal VLM, on the VLM scaffold.
 
     Shares the DiT node's ``Cosmos3OmniTransformer`` instance and its ``kv`` /
     ``attn`` resources; declares its own sampler and position counter. A
-    prompt with images or videos prefills on ``reasoner_prefill_vision``, the
-    vision encoder's tokens spliced in at its pads. Positions are 3D mRoPE
+    prompt with images or videos prefills as one row on ``prefill_vision``,
+    the vision encoder's tokens spliced in at its pads. Positions are 3D mRoPE
     ids: a text prompt's and each decode step's are the position resource's
     on all three axes; a vision prompt places its own from the intake's
     layout (`prompt_positions`) and moves the counter to ``max(position) + 1``.
     """
 
-    PREFILL_WALK = REASONER_PREFILL_WALK
-    DECODE_WALK = REASONER_DECODE_WALK
-    DECODE_LOOP = REASONER_DECODE_LOOP
     ATTN_KEY = ATTN
-    # the prefills, which capture nothing, run eagerly and uncompiled (and every
-    # step does with accelerator graphs off)
+    # Eager steps stay uncompiled; the captures compile their own forward.
     disable_torch_compile = True
-    # one vision prefill a step, as before: a video prompt can run to tens of
-    # thousands of tokens, and nothing caps a step's tokens
-    PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1]
-    # the decode ladder it captured before moving onto the scaffold
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
-    # decode reads its ids back from the routed token and emits a tensor a
-    # request, as before the scaffold; the device path is a measured change
-    device_loopback = None
-    # prefills stay eager, as before: their captures are unmeasured here
-    CAPTURE_PREFILL = False
+    # Ladders trimmed from the scaffold's: every capture here is extra startup
+    # and graph memory beside the DiT's, and one more Dynamo recompile of the
+    # layer code the DiT prefill shares. A prompt with one 512x341 image is
+    # ~220 tokens; a step past a ladder runs eagerly.
+    # MSTAR_DECODE_BUCKETS narrows the decode ladder, as for every model. 24 and
+    # 48 halve the padding of a step between the powers of two, which a busy
+    # server's decode batches mostly are (+7% at c=32, +14% at c=64).
+    DECODE_CAPTURE_BATCH_SIZES = [
+        int(x) for x in os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,24,32,48,64").split(",")
+    ]
+    PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
+    PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048]
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
 
-    def capture_compile_mode(self, graph_walk: str) -> str | None:
-        # max-autotune until the default compile level (mstar serve -O) is measured on this model
-        return "max-autotune-no-cudagraphs"
-
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
+
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # Decode keeps the mode it was tuned with; prefills take the
+        # deployment's level (mstar serve -O).
+        return "max-autotune-no-cudagraphs" if graph_walk == self.DECODE_WALK else None
+
+    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
+        # the deployment switch every Cosmos3 node's captures follow
+        if not self.config.accelerator_graph or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH"):
+            return []
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        if os.environ.get("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"):
+            # the understanding tower's prefill captures, as the DiT's
+            configs = [c for c in configs if c.capture_graph_walk == self.DECODE_WALK]
+        for c in configs:
+            if c.capture_graph_walk == self.DECODE_WALK:
+                # cuBLAS for the decode GEMMs, max-autotune for everything else.
+                # Autotune's timings of these decode-width GEMMs swing ~50% between
+                # processes on a host, and in its slow mode it picks Triton
+                # templates that run ~2x slower in the graph than cuBLAS (o / up /
+                # down projections at 8-32 rows, H200), baking a boot's luck into
+                # every replay.
+                c.inductor_options = check_inductor_options({"max_autotune_gemm_backends": "ATEN"})
+        return configs
+
+    # ------------------------------------------------------------------
+    # mRoPE
+    # ------------------------------------------------------------------
 
     def prompt_positions(self, start: int, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
         return layout_position_ids(
             layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
         )
 
-    def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
+    @staticmethod
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A captured step of a text walk, whose rotary tables come from the
+        planned positions inside the graph (as Qwen3.5's): always for decode,
+        with ``ingraph_decode_rope`` for text prefill and mixed steps. Only a
+        media walk's rows bring their own 3D positions."""
+        if not engine_inputs.captured:
+            return False
+        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
+
+    def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
         out = super().preprocess(graph_walk, engine_inputs, inputs)
-        # [3, tokens]: the position resource's on text and decode rows, a vision prompt's own on its row
-        out["position_ids"] = mrope_position_ids(self.node_resources[ROPE].pos_ids(REASONER_LABEL), inputs)
+        if self._rope_in_graph(engine_inputs, graph_walk):
+            return out
+        # the tables of the step's [3, tokens] positions: the position resource's on
+        # text and decode rows, a vision prompt's own on its row
+        out["cos"], out["sin"] = self.model.build_cos_sin(
+            mrope_position_ids(self.node_resources[ROPE].pos_ids(REASONER_LABEL), inputs),
+        )
         return out
 
-    def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, position_ids=None, **tensors) -> dict:
-        return {"position_ids": position_ids}
-
-    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
-        # the deployment switch every Cosmos3 node's captures follow
-        if not self.config.accelerator_graph or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH"):
-            return []
-        # a decode step past the top bucket runs eagerly rather than being capped, as before
-        configs = super().get_accelerator_graph_configs(device, tp_world_size)
-        for config in configs:
-            config.caps_eager_batch_size = False
-        return configs
+    def decoder_kwargs(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, num_tokens: int,
+        cos: torch.Tensor | None = None, sin: torch.Tensor | None = None, **tensors: torch.Tensor,
+    ) -> dict:
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos is None or sin is None:
+            # one token a row, no custom grids: the same scalar on all three axes
+            pos = self.node_resources[ROPE].pos_ids(REASONER_LABEL)
+            assert pos is not None, "position resource has no plan for this step; `plan` must run before the forward"
+            cos, sin = self.model.build_cos_sin(pos[:num_tokens].unsqueeze(0).expand(3, -1))
+        return {"cos_sin": (cos, sin)}

@@ -22,6 +22,8 @@ from mstar.model.cosmos3.loader import (
     cosmos3_name_remapper,
     read_transformer_weight_keys,
     read_transformer_weight_shapes,
+    stacked_param_name,
+    stacked_param_shapes,
 )
 
 DROID_DIR = Path(os.environ.get("COSMOS3_DROID_DIR", "/nonexistent-cosmos3-droid"))
@@ -110,17 +112,15 @@ def test_droid_loader_key_coverage() -> None:
     dropped = {k for k in index_keys if cosmos3_name_remapper(k) is None}
     assert dropped == set(DROP_KEYS), dropped
 
-    mapped = {cosmos3_name_remapper(k) for k in index_keys}
-    mapped.discard(None)
+    mapped = {stacked_param_name(name) for k in index_keys if (name := cosmos3_name_remapper(k)) is not None}
     missing = model_keys - mapped
     unexpected = mapped - model_keys
     assert not missing, f"backbone params not covered by checkpoint: {sorted(missing)[:20]}"
     assert not unexpected, f"checkpoint keys with no backbone param: {sorted(unexpected)[:20]}"
 
-    # Nano's counts minus the five audio keys (modality embed + proj_in/out
-    # weight and bias): 814 - 5 == 809 in the index, 813 - 5 == 808 built.
+    # Nano's count minus the five audio keys (modality embed + proj_in/out
+    # weight and bias): 814 - 5 == 809 in the index.
     assert len(index_keys) == 809, len(index_keys)
-    assert len(model_keys) == 808, len(model_keys)
 
 
 @needs_droid
@@ -130,7 +130,7 @@ def test_droid_loader_shape_coverage() -> None:
         model = Cosmos3OmniTransformer(cfg)
 
     try:
-        ckpt_shapes = read_transformer_weight_shapes(DROID_DIR)
+        ckpt_shapes = stacked_param_shapes(read_transformer_weight_shapes(DROID_DIR))
     except Exception as exc:  # noqa: BLE001 — LFS pointer / missing shards
         pytest.skip(f"transformer shards unreadable: {exc}")
 

@@ -5,9 +5,10 @@ The published checkpoint is the diffusers ``transformer/`` layout: flat
 ``layers.N.*`` keys with unfused attention projections (``to_q/to_k/to_v`` for
 the understanding pathway, ``add_q_proj/add_k_proj/add_v_proj`` for the
 generation pathway) and ``_moe_gen``-suffixed GEN MLP/norms. Our backbone
-module mirrors that layout one-to-one, so loading needs no key remapping and
-no stacked-parameter fusion. The text ``lm_head`` is dropped for generators
-that never decode text and loaded for checkpoints served as a reasoner.
+module mirrors that layout one-to-one, except that the understanding
+pathway's q, k and v load into one fused ``to_qkv`` (``TRANSFORMER_STACKED``).
+The text ``lm_head`` is dropped for generators that never decode text and
+loaded for checkpoints served as a reasoner.
 
 Edge checkpoints add ``vision_encoder/model.safetensors`` (the SigLIP2-style
 tower under ``model.visual.*`` and the patch-merger projector under
@@ -23,12 +24,47 @@ from pathlib import Path
 
 import torch
 
+from mstar.model.loader.base import StackedParamRule
+
 # Checkpoint keys deliberately not loaded into a generator-only backbone. The
 # text ``lm_head`` exists in every checkpoint (the understanding tower
 # descends from a text LM) but generation emits flow velocity via
 # ``proj_out``; only a backbone that also serves the reasoner builds and loads
 # it (see ``cosmos3_name_remapper``).
 DROP_KEYS: frozenset[str] = frozenset({"lm_head.weight"})
+
+# The understanding pathway's projections, fused into one GEMM.
+TRANSFORMER_STACKED = [
+    StackedParamRule(".to_qkv", ".to_q", "q"),
+    StackedParamRule(".to_qkv", ".to_k", "k"),
+    StackedParamRule(".to_qkv", ".to_v", "v"),
+]
+
+
+def stacked_param_name(name: str) -> str:
+    """The backbone parameter a checkpoint key loads into: its fused one for
+    a q / k / v projection, else the key itself."""
+    for rule in TRANSFORMER_STACKED:
+        marker = rule.source_suffix + "."
+        if marker in name:
+            return name.replace(marker, rule.target_suffix + ".")
+    return name
+
+
+def stacked_param_shapes(shapes: dict[str, tuple[int, ...]]) -> dict[str, tuple[int, ...]]:
+    """Checkpoint tensor shapes as the backbone's parameters hold them: a fused
+    projection's rows are its shards' rows together."""
+    out: dict[str, tuple[int, ...]] = {}
+    for name, shape in shapes.items():
+        target = stacked_param_name(name)
+        if target == name:
+            out[name] = tuple(shape)
+        elif target in out:
+            out[target] = (out[target][0] + shape[0], *shape[1:])
+        else:
+            out[target] = tuple(shape)
+    return out
+
 
 # The Edge ``vision_encoder/`` shard's key prefix; the reasoner's vision
 # module keeps the ``visual`` / ``projector`` names below it.
@@ -119,9 +155,10 @@ def load_transformer_weights(
 
     Mirrors the meta-device + ``load_hf_weights`` path the other model packages
     use, but resolves the shard list from the diffusers ``diffusion_pytorch_model``
-    index (the generic iterator only knows the ``model.safetensors`` name). No
-    stacked-parameter rules: the checkpoint's projections are unfused and match
-    the backbone parameter names directly. Raises if any backbone parameter is
+    index (the generic iterator only knows the ``model.safetensors`` name). The
+    checkpoint's q / k / v projections load into the fused ``to_qkv``
+    (``TRANSFORMER_STACKED``); every other key matches its backbone parameter
+    directly. Raises if any backbone parameter is
     left unfilled — the completeness guarantee bagel's loader also enforces.
     """
     from mstar.model.loader import iter_safetensors_file, load_hf_weights
@@ -135,7 +172,7 @@ def load_transformer_weights(
 
     with_lm_head = hasattr(model, "lm_head")
     loaded = load_hf_weights(
-        model, _weights(),
+        model, _weights(), stacked_params=TRANSFORMER_STACKED,
         name_remapper=lambda name: cosmos3_name_remapper(name, with_lm_head=with_lm_head),
     )
 

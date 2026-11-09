@@ -170,11 +170,10 @@ def test_fused_gen_attends_to_normed_und_k() -> None:
     out_u, out_g = attn(und, gen, (cos_u, sin_u, cos_g, sin_g))
 
     H, Hkv, D = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
-    q_u = attn._apply_rope(attn.to_q(und).view(-1, H, D), cos_u, sin_u)
-    k_raw = attn.to_k(und).view(-1, Hkv, D)
+    q_u, k_raw, v_u = attn._und_qkv(und)
+    q_u = attn._apply_rope(q_u, cos_u, sin_u)
     k_u = attn._apply_rope(k_raw, cos_u, sin_u)
     k_u_gen = attn._apply_rope(attn.k_norm_und_for_gen(k_raw), cos_u, sin_u)
-    v_u = attn.to_v(und).view(-1, Hkv, D)
     q_g = attn._apply_rope(attn.norm_added_q(attn.add_q_proj(gen).view(-1, H, D)), cos_g, sin_g)
     k_g = attn._apply_rope(attn.norm_added_k(attn.add_k_proj(gen).view(-1, Hkv, D)), cos_g, sin_g)
     v_g = attn.add_v_proj(gen).view(-1, Hkv, D)
@@ -271,7 +270,7 @@ def test_cached_prefill_writes_gen_facing_k() -> None:
     attn0 = model.layers[0].self_attn
     und_norm = model.layers[0].input_layernorm(model.embed_tokens(static["input_ids"]))
     cos, sin = model._rotary(static["text_mrope_ids"], und_norm.device, und_norm.dtype)
-    k_raw = attn0.to_k(und_norm).view(-1, attn0.num_key_value_heads, attn0.head_dim)
+    _, k_raw, _ = attn0._und_qkv(und_norm)
     expected = attn0._apply_rope(attn0.k_norm_und_for_gen(k_raw), cos, sin)
     assert torch.allclose(res.committed[0][0], expected, atol=1e-5)
 
@@ -297,7 +296,7 @@ def test_text_forward_keeps_raw_k() -> None:
     attn0 = model.layers[0].self_attn
     und_norm = model.layers[0].input_layernorm(embeds)
     cos, sin = model._rotary(pos, embeds.device, embeds.dtype)
-    k_raw = attn0._apply_rope(attn0.to_k(und_norm).view(-1, attn0.num_key_value_heads, attn0.head_dim), cos, sin)
+    k_raw = attn0._apply_rope(attn0._und_qkv(und_norm)[1], cos, sin)
     assert torch.allclose(res.committed[0][0], k_raw, atol=1e-6)
 
 
@@ -471,6 +470,8 @@ def test_edge_transformer_key_and_shape_coverage() -> None:
         cosmos3_name_remapper,
         read_transformer_weight_keys,
         read_transformer_weight_shapes,
+        stacked_param_name,
+        stacked_param_shapes,
     )
 
     cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
@@ -478,12 +479,12 @@ def test_edge_transformer_key_and_shape_coverage() -> None:
         model = Cosmos3OmniTransformer(cfg)
     model_keys = set(model.state_dict())
     index_keys = read_transformer_weight_keys(EDGE_DIR)
-    # A reasoner backbone keeps lm_head; every key maps one-to-one.
-    mapped = {cosmos3_name_remapper(k, with_lm_head=True) for k in index_keys}
+    # A reasoner backbone keeps lm_head; every key maps to its parameter (q / k / v to the fused one).
+    mapped = {stacked_param_name(cosmos3_name_remapper(k, with_lm_head=True)) for k in index_keys}
     assert mapped == model_keys, (sorted(model_keys - mapped)[:5], sorted(mapped - model_keys)[:5])
     assert len(index_keys) == 549
     try:
-        shapes = read_transformer_weight_shapes(EDGE_DIR)
+        shapes = stacked_param_shapes(read_transformer_weight_shapes(EDGE_DIR))
     except Exception as exc:  # noqa: BLE001 — LFS pointers / missing shards
         pytest.skip(f"transformer shards unreadable: {exc}")
     mismatched = {k: (tuple(v.shape), shapes.get(k)) for k, v in model.state_dict().items()
