@@ -78,7 +78,11 @@ gets faster on a GPU without a change to model code.
   count.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
-  per-pair tiles by token count, then the grouped `"*"` row.
+  per-pair tiles by token count, then the grouped `"*"` row. Its `bfloat16` entries are
+  `fused_experts`' per-pair path (Qwen3-Omni): up to which token count it runs, and its tiles
+  (`gate_up` `bj, bk, warps`; `down` `bn, bc, warps`; no router). An entry of the `"*"` row
+  alone runs the grouped GEMMs at every count. The sweep times fp8 only, so a bf16 entry is
+  measured end to end, its provenance naming how.
 - `ragged_attention`: a cacheless self-attention's kernel by one rank's head geometry
   (`--shape num_qo_heads=...,num_kv_heads=...,head_dim=...`), rows by the longest query segment:
   torch's cuDNN SDPA (`cudnn`) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),

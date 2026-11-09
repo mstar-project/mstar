@@ -131,10 +131,14 @@ class FusedColumnLinear(nn.Module, LoraCapable):
         return QuantCapability(True)
 
     def lora_target(self) -> LoraTarget:
-        # a slice per shard, named by the shard ids the stacked rules route by
+        # a slice per shard, named by the shard ids the stacked rules route by; a
+        # module with no shard id is stored fused, as `weight_loader` loads it, so it
+        # packs every slice (Qwen3.5's ViT `qkv`)
+        names = tuple(self._shard_sizes)
         return LoraTarget(
             in_features=self.weight.shape[1],
             out_slices=tuple(self._shard_sizes.values()),
             parallel="none",
-            slice_names=tuple(self._shard_sizes),
+            slice_names=names,
+            slice_packs=((None, names),) if len(names) > 1 else None,
         )

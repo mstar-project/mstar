@@ -77,7 +77,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -276,13 +276,12 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``."""
+        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``, upright by its EXIF
+        orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
-        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
-            image = raw
+        with open_upright_image(filepath, formats=PILLOW_IMAGE_FORMATS) as image:
             width, height = image.size
             if width < 64 or height < 64:
                 raise ValueError(f"reference image too small: {width}x{height}; both sides must be >= 64 px")

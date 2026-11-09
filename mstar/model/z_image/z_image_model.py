@@ -196,9 +196,13 @@ class ZImageModel(Model):
         height = int(model_kwargs.get("height", self.config.default_height))
         width = int(model_kwargs.get("width", self.config.default_width))
         align = self.config.spatial_alignment
-        for name, value in (("height", height), ("width", width)):
+        # the rotary table has one row per token along each image axis (axes 1 and 2)
+        axes = self.config.transformer.axes_lens
+        for name, value, axis_len in (("height", height, axes[1]), ("width", width, axes[2])):
             if value <= 0 or value % align:
                 raise ValueError(f"Z-Image {name}={value} must be a positive multiple of {align}")
+            if value > axis_len * align:
+                raise ValueError(f"Z-Image {name}={value} exceeds the model's {axis_len * align} px")
         if height * width > self.max_image_area:
             raise ValueError(
                 f"Z-Image {width}x{height} exceeds this server's max_image_area of {self.max_image_area} pixels "
