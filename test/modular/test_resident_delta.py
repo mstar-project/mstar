@@ -1348,7 +1348,8 @@ def _counts(kv) -> tuple:
     return (
         kv._unused,
         {rid: (a.pages, a.remaining, a.asks_again, a.grown, a.grown_from) for rid, a in kv._allotments.items()},
-        sorted(kv._stalled),
+        # a request the moves set aside waits holding only on rank 0, which alone moves it
+        sorted(kv._stalled & kv._asks.keys()),
         {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
         sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
         kv._arena.free_pages(),
