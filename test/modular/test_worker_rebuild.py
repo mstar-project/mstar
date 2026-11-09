@@ -23,7 +23,7 @@ from test_kv_prefix_lease import _StubTransfer
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, Residency, StepContext
+from mstar.engine.resources import AllocationFailed, Residency, StepAllowance, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
@@ -31,6 +31,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import make_model
 from mstar.testing_utils.worker import make_worker
+from mstar.worker import worker as worker_mod
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.preemption import Preemption
@@ -204,8 +205,8 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w._rebuilds._copied, w._rebuilds._ids_walks = {node: {walk: frozenset({"embeds"})}}, {node: frozenset({walk})}
     w._rebuilds._kept = {node: {1: KeptIds((LayoutRow(walk, 4),))}}
     w._rebuilds._prefilling = {node: {1}}
-    w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
-    w._rebuilds._droppable = {node: {1: pool.take(64)}}
+    w._rebuilds._pool, w._rebuilds._allowance = (pool := HostPool(1 << 10, torch.device("cpu"))), StepAllowance()
+    w._rebuilds._keeps_ids = {node: {1: pool.take(64)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "text_inputs": [t]} for rid, t in embeds.items()
@@ -281,18 +282,32 @@ def test_a_lockstep_node_keeps_ids_and_sets_the_pool_aside():
     assert rebuilds.pool is not None and NODE in rebuilds.nodes, "a follower would have no ids to replay a drop from"
 
 
-def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
-    """``rebuild_host_mb: 0`` turned off the ids' room alone, so a worker whose node copies media still pinned
-    ``rebuild_media_host_mb`` at startup and kept every request's ids and copies there."""
+def _make_media_rebuilds(config: dict) -> Rebuilds:
+    """`_make_rebuilds` on a worker whose node copies media."""
     from test_rebuild_policy import MEDIA, VISION
     from test_rebuild_policy import _graphs as media_graphs
 
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
     my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
-    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
-    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    return _make_rebuilds(model, config, my_walks, set(), torch.device("cpu"), engine)
 
-    assert NODE in rebuilds.nodes and rebuilds.pool is None, "the worker pinned the media pool with rebuilds off"
+
+@pytest.mark.parametrize("config, mb", [({}, 1024), ({"rebuild_host_mb": 2}, 2)])
+def test_rebuild_host_mb_alone_sizes_the_pool_of_a_node_that_copies_media(monkeypatch, config, mb):
+    """``rebuild_media_host_mb`` was added to ``rebuild_host_mb`` where a node copies media, so two keys sized one
+    pool and only ever added up."""
+    monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
+
+    assert _make_media_rebuilds(config).pool.nbytes == mb << 20, "the pool would be another size than the key says"
+
+
+def test_rebuild_host_mb_0_rebuilds_no_request_there():
+    """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
+    preemption still ran its pass for the node, as for one with a rebuild policy."""
+    rebuilds = _make_media_rebuilds({"rebuild_host_mb": 0})
+
+    assert rebuilds.pool is None and not rebuilds.nodes, "a node with no pool would still count as one that drops"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
@@ -528,21 +543,30 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
 
 def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
     """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
-    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run."""
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run. Each such pass
+    refills the allowance, so a copy larger than one allowance lands over two passes, with no tick between them."""
     from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
     from test_rebuild_policy import _copying, _vision_step
 
     rebuilds = _copying(R)
+    # half of the row's 16-byte copy
+    rebuilds._allowance = StepAllowance(8)
     rebuilds.record(_vision_step((R,), {}, completion_event=None))
     w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
-    w._rebuilds = rebuilds
+    w._rebuilds, waits = rebuilds, []
 
-    # the loop ends on its first idle wait
+    def wait_for_work(timeout_ms):
+        waits.append(timeout_ms)
+        if len(waits) == 2:
+            raise _StopLoopError
+
+    w.communicator = SimpleNamespace(send=lambda *a, **k: None, wait_for_work=wait_for_work)
     with pytest.raises(_StopLoopError):
         w.run()
 
     [record] = rebuilds._kept[NODE][R].records
     assert record.ready(), "the request would wait for its copies with no step to start them"
+    assert waits == [0, 10], "the loop would wait its tick while copies are queued"
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():

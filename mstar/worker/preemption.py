@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class Preempted:
-    """How often a request was preempted, and how many samples it had kept when it last returned."""
+    """How often a request was preempted, and how many samples it had kept when it was last preempted."""
     times: int = 0
-    returned_at: int = -1
+    sampled_at: int = -1
 
 
 class Preemption:
@@ -104,21 +104,18 @@ class Preemption:
         self._walked = None
         for refusal in refusals:
             kv = self._caches.get(refusal.key)
-            if kv is None or not self._moves(kv, refusal.mark.node_name):
+            if kv is None or not self._moves(kv, refusal.node_name):
                 continue
             newer = engine.newer_than(refusal.rid)
             victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
             if victims is not None:
-                self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+                self._move(kv, self.counts[refusal.node_name], victims, refusal.rid)
                 return
         self._walked = walked
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` a row of ``rid``'s rebuild on ``node_name`` ran."""
         self.counts[node_name].rebuild_tokens += tokens
-        kept = self._rebuilds.kept(rid, node_name)
-        if rid in self._preempted and kept is not None:
-            self._preempted[rid].returned_at = len(kept.sampled)
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)
@@ -184,7 +181,9 @@ class Preemption:
             counts.victims += 1
             counts.preempted_again += record.times == 2
             kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
-            counts.returns_preempted += kept is not None and record.returned_at == len(kept.sampled)
+            if kept is not None:
+                counts.returns_preempted += record.sampled_at == len(kept.sampled)
+                record.sampled_at = len(kept.sampled)
             self._scheduler.return_backlogged(rid)
         for rid in victims.to_host:
             for node_name in kv.nodes:

@@ -186,6 +186,27 @@ def test_a_request_that_moved_holds_back_newer_prompts_once_it_is_the_oldest(mov
     assert _admitted(kv, "v") and _ready(kv, "c2")
 
 
+def test_small_prompts_pass_a_dropped_request_with_pages_free_while_an_older_request_runs():
+    """A dropped request waited in the queue at its arrival, so six 1-page prompts waited behind v with 6 pages free.
+    It holds newer prompts back only once it is the oldest."""
+    kv = _pool()
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "v", 7, arrival=2)
+    assert _preempt(kv, "r", _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True).to_drop == [
+        "v"
+    ]
+    _drop(kv, "v")
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+
+    started = []
+    for arrival in range(3, 9):
+        _request(kv, f"c{arrival}", 1, arrival)
+        if _ready(kv, f"c{arrival}"):
+            started.append(arrival)
+
+    assert len(started) == 6, "the 1-page prompts waited behind v with pages free"
+
+
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
     kv = _pool()
     engine = Engine.__new__(Engine)
@@ -1252,12 +1273,12 @@ def test_a_request_back_from_the_host_moves_again_for_an_older_request_waiting_i
 
 def _rebuilt(kv) -> None:
     """``v``, dropped for ``o``, is rebuilt beside ``a``, which arrived before it."""
-    _running(kv, "o", 3, arrival=0)
+    _running(kv, "o", 4, arrival=0)
     _running(kv, "v", 2, arrival=2)
-    assert _step(kv, "o", 5 * PAGE_SIZE).ok
+    assert _step(kv, "o", 4 * PAGE_SIZE).ok
     assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
     _drop(kv, "v")
-    _request(kv, "a", 2, arrival=1)
+    _request(kv, "a", 4, arrival=1)
     _remove(kv, "o")
     assert _ready(kv, "a") and _admitted(kv, "v")
     assert _step(kv, "v", 2 * PAGE_SIZE).ok
@@ -1276,7 +1297,7 @@ def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     assert "v" in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v held back pages an older request needed"
 
 
-def test_a_rebuilt_request_isnt_chosen_again_until_it_writes_a_token():
+def test_a_rebuilt_request_isnt_dropped_again_until_it_writes_a_token():
     """A rebuilt request lands as the newest request holding pages, so the next older request that ran short dropped
     it again before it kept a token, and the whole rebuild was wasted. With requests going around more than once,
     that could repeat for as long as older requests ran short."""
@@ -1285,11 +1306,59 @@ def test_a_rebuilt_request_isnt_chosen_again_until_it_writes_a_token():
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 
-    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
 
     assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v's rebuild was thrown away unused"
     assert victims.waits, "a took room that v's next step needs"
     assert _step(kv, "v", 1).ok, "v's first step after its rebuild ran short"
+
+
+def _droppable(kv):
+    """Whether the KV allows a drop, as the worker asks through the engine."""
+    return lambda rid: kv.check_drop(rid, kv._laid_out_tokens(rid)) is None
+
+
+def test_an_older_request_short_of_pages_moves_a_rebuilt_one_to_the_host_rather_than_itself():
+    """A rebuilt request was held back from every move until it wrote a token, though a move to the host keeps its
+    rebuilt KV. An older request that ran short then copied itself to the host for the newer one."""
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
+
+    assert victims == Victims(["v"], [], []), "a moved itself to the host for a newer request"
+
+
+def test_a_rebuilt_request_back_from_the_host_gives_back_its_allotment_before_it_reloads():
+    """The hold read the tokens written past the rebuild, which an offload sets to 0 until the reload. A rebuilt
+    request that had moved to the host and been let back in then held its allotment against every older request
+    until it reloaded."""
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    _offload(kv, "v")
+    assert _admitted(kv, "v") and kv.residency("v") is Residency.ON_HOST
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
+
+    assert victims == Victims([], [], ["v"]), "v kept the allotment for a reload while an older request ran short"
+
+
+def test_a_rebuilt_request_stays_undroppable_through_a_trip_to_the_host_until_it_writes():
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    _offload(kv, "v")
+    assert _ready(kv, "v")
+
+    assert not _droppable(kv)("v"), "a drop would throw away the rebuild before it kept a token"
+    assert _step(kv, "v", 1).ok
+    assert _droppable(kv)("v"), "v stayed undroppable after writing past its rebuild"
 
 
 def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():
@@ -1379,10 +1448,10 @@ def test_a_victim_that_can_be_rebuilt_never_moves_into_room_set_aside_on_the_hos
 def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
     kv = _pool()
     kv._cpu_pool = host._HostPool(4)
-    _running(kv, "o", 3, arrival=0)
+    _running(kv, "o", 4, arrival=0)
     _running(kv, "r", 2, arrival=1, rebuildable=False)
     _running(kv, "x", 2, arrival=2)
-    assert _step(kv, "o", 3 * PAGE_SIZE).ok
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
     assert _preempt(kv, "o", _step(kv, "o", PAGE_SIZE).reason.pages_short, droppable=lambda rid: False) == (
         Victims(["x"], [], [])
     )
@@ -1451,6 +1520,20 @@ def test_the_room_the_host_sets_aside_grows_with_each_page_a_request_takes():
     assert kv._cpu_pool.reserved == {"r": 3}, "the room set aside isn't the pages r holds"
 
 
+def test_the_host_counts_no_room_set_aside_once_a_request_that_moved_into_it_reloads_and_is_removed(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    assert _step(kv, "r", PAGE_SIZE).ok and kv._cpu_pool.reserved == {"r": 3}
+    assert _offload(kv, "r") == 3 and kv._cpu_pool._unmoved == 0
+    assert kv.can_reload("r") and kv.reload("r")
+
+    _remove(kv, "r")
+
+    assert kv._cpu_pool._unmoved == 0, "the host still counts room set aside for a request that is gone"
+
+
 def test_a_request_the_full_host_cant_cover_turns_guaranteed_at_that_page_and_is_counted(caplog):
     kv = _pool()
     kv._cpu_pool = host._HostPool(3)
@@ -1512,6 +1595,31 @@ def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_foo
     )
 
 
+def test_a_request_short_of_its_guarantee_returns_from_the_host_while_newer_guaranteed_prompts_keep_arriving():
+    """r moved itself to the host, short of its guarantee, and asks to return with its whole footprint. Each newer
+    guaranteed prompt started in the room the last one left, so r waited until it timed out."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=1, rebuildable=False)
+    _running(kv, "s", 1, arrival=2, rebuildable=False)
+    _running(kv, "x", 6, arrival=3)
+    assert _preempt(kv, "r", _step(kv, "r", PAGE_SIZE).reason.pages_short, droppable=lambda rid: False) == (
+        Victims(["r"], [], [])
+    )
+    assert _offload(kv, "r")
+
+    finished = "x"
+    for arrival in range(4, 24):
+        _remove(kv, finished)
+        finished = f"g{arrival}"
+        _request(kv, finished, 1, arrival, guaranteed=True)
+        _runner(kv).admit_request(finished, NODE, WALK)
+        if _admitted(kv, "r"):
+            break
+
+    assert "r" in kv._allotments, "r waited on the host while newer guaranteed prompts kept passing it"
+
+
 def test_a_waiting_request_the_full_host_turns_guaranteed_moves_more_newer_requests_for_its_footprint():
     """p asks the host to set room aside for its prompt only once z2's drop has made room for that prompt. The host
     has none, so p turns guaranteed and asks for its whole footprint, which z2's pages don't cover."""
@@ -1555,6 +1663,37 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitt
 
     _drop(kv, "z1")
     assert "p" in kv._guaranteed and not _admitted(kv, "p")
+    _drop(kv, "z2")
+
+    assert "p" not in kv._allotments, "p was admitted guaranteed with less than its footprint"
+    for rid in ("o", "z1", "z2"):
+        _remove(kv, rid)
+    assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
+
+
+def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim(
+    monkeypatch,
+):
+    """q's end grows the room to p's 2-page prompt, so the runner admits p, the host has no room to set aside for it,
+    and p asks for its 6-page footprint. Its earmark still asked for the prompt, so z2's drop then admitted p,
+    guaranteed, with 2 pages."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(0)
+    _running(kv, "o", 5, arrival=0)
+    _running(kv, "z1", 2, arrival=2)
+    _running(kv, "z2", 1, arrival=3)
+    _running(kv, "q", 2, arrival=4)
+    for rid in ("z2", "z1"):
+        short = _step(kv, rid, 3 * PAGE_SIZE).reason.pages_short
+        assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "p", 2, arrival=1, rebuildable=False)
+    assert not _ready(kv, "p")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2", "z1"]
+    _remove(kv, "q")
+    assert not _admitted(kv, "p") and "p" in kv._guaranteed
+
     _drop(kv, "z2")
 
     assert "p" not in kv._allotments, "p was admitted guaranteed with less than its footprint"

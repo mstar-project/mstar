@@ -42,6 +42,7 @@ from mstar.engine.resources import Residency
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.manager import Victims
 from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
@@ -223,6 +224,70 @@ def test_a_victim_the_host_takes_keeps_its_log_for_a_later_drop():
 
     assert kv.residency("v") is Residency.ON_HOST
     assert w._rebuilds.kept("v", NODE) is not None, "a drop after its return would find no log to rebuild it from"
+
+
+@pytest.mark.parametrize("sampled", [False, True], ids=["moved again before it samples", "samples between moves"])
+def test_a_request_moved_to_the_host_again_before_it_samples_is_counted(sampled):
+    """The count read the samples a request had kept when its rebuild landed, so a request moved to the host and
+    sent back before it sampled was never counted, and with drops held back until a rebuilt request writes a token
+    the count stayed 0."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    w = _worker(kv)
+
+    def run_short(rid):
+        batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={rid: 0})
+        while (outcome := _step(kv, rid, PAGE_SIZE)).ok:
+            pass
+        w._handle_admit_failure(batch, _refused(batch, outcome.reason))
+
+    run_short("r")
+    assert kv.residency("v") is Residency.ON_HOST
+    _remove(kv, "r")
+    assert _ready(kv, "v")
+    if sampled:
+        w._rebuilds._kept[NODE]["v"].sampled.append(1)
+    _running(kv, "q", 3, arrival=0)
+    run_short("q")
+
+    assert kv.residency("v") is Residency.ON_HOST
+    assert w._preemption.counts[NODE].returns_preempted == (not sampled), (
+        "a request sent back to the host before it sampled went uncounted, or one that sampled was counted"
+    )
+
+
+def test_a_move_in_a_pool_whose_nodes_keep_no_log_still_lets_the_next_move_again_count():
+    """A move in a host-only pool read no samples and reset the request's record, so on a worker with a pool that
+    keeps a log beside it, the next move in the logged pool of a request that never sampled went uncounted."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    w = _worker(kv)
+    engine = w.engine_manager.engine
+    talker = _Engine(offload_request=lambda node, rid: 0)
+    w.engine_manager.get_engine = lambda node: talker if node == "TALKER" else engine
+
+    def run_short(rid):
+        batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={rid: 0})
+        while (outcome := _step(kv, rid, PAGE_SIZE)).ok:
+            pass
+        w._handle_admit_failure(batch, _refused(batch, outcome.reason))
+
+    run_short("r")
+    host_only = PagedKVCache("talker", frozenset({"TALKER"}), SimpleNamespace())
+    w._preemption._move(host_only, w._preemption.counts["TALKER"], Victims(["v"], [], []), "r")
+    _remove(kv, "r")
+    assert _ready(kv, "v")
+    _running(kv, "q", 3, arrival=0)
+    run_short("q")
+
+    assert kv.residency("v") is Residency.ON_HOST
+    assert w._preemption.counts[NODE].returns_preempted == 1, (
+        "a move in a pool that keeps no log hid the next move of a request that never sampled"
+    )
 
 
 def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
@@ -674,7 +739,7 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
 
     w._set_rebuildable(1, configs)
 
-    assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+    assert (1 in w._rebuilds._keeps_ids[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
 def _rebuildable_keyed_over_part(**conductor) -> bool:

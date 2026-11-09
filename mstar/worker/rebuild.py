@@ -16,9 +16,8 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.resources import Rebuild
+from mstar.engine.resources import Rebuild, StepAllowance
 from mstar.engine.resources.kv.config import SpanKind, StreamLayout, rebuild_refusal
-from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 from mstar.utils.h2d import to_device_nonblocking
@@ -34,11 +33,9 @@ logger = logging.getLogger(__name__)
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
-# The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
-# what a walk reads besides the ids and ``rebuild_host_mb`` isn't 0. A 1024-token image at hidden size 4096 is 8 MiB
-# of bf16 encoder output. With ``rebuild_host_mb``'s default that makes the pool 1 GiB, a power of two, so it isn't
-# rounded up to 2 GiB.
-DEFAULT_REBUILD_MEDIA_HOST_MB = 960
+# The default where a node copies what a walk reads besides the ids: 128 images of 1024 tokens at hidden size 4096,
+# 8 MiB each of bf16 encoder output.
+DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
 class LayoutRow(NamedTuple):
@@ -199,20 +196,25 @@ class Rebuilds:
         # node -> the dtype it runs in, which its host copies take. A node missing here copies nothing.
         self._node_dtypes = node_dtypes
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
-        # without one no request keeps ids, so none is dropped
+        assert pool is not None or not policies, "a node that rebuilds requests keeps their ids in the host pool"
         self._pool = pool
         # node -> handle -> its log. Per node, since a colocated node of another partition samples ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
         # node -> the handles whose log hasn't recorded every prefill step yet
         self._prefilling: dict[str, set[int]] = {node: set() for node in policies}
-        # node -> the handles whose pages a drop there can free, each with the slice of the pool its log takes. Only
-        # these keep a log.
-        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
+        # node -> the handles that keep their ids, those whose pages a drop there can free, each with the slice of
+        # the pool its log takes
+        self._keeps_ids: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
-        self._allowance = StepAllowance() if allowance is None else allowance
-        # the copies to the host not yet started, oldest first
+        assert allowance is not None or not any(names for walks in self._copied.values() for names in walks.values()), (
+            "host copies spend the engine's StepAllowance"
+        )
+        self._allowance = allowance
+        # the copies to the host not yet started, oldest first, and the event recorded after the last one `flush`
+        # started, None before one or where copies run in place
         self._queued: deque[QueuedCopy] = deque()
+        self._last_landed: torch.Event | None = None
         # nodes that have logged a request the pool couldn't hold
         self._logged_full: set[str] = set()
 
@@ -265,7 +267,7 @@ class Rebuilds:
             logger.warning(
                 "%s: the rebuild host pool has no room for the %d bytes a request's ids and host copies take, with %d "
                 "of %d bytes in use, so the request can't be dropped there. Only the first on each node is logged, "
-                "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
+                "and the serving config's rebuild_host_mb sizes the pool.",
                 node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
             )
         return piece
@@ -295,7 +297,7 @@ class Rebuilds:
         taken = {}
         if not unpausable:
             for node in written.keys() - refused:
-                piece = None if self._pool is None else self._log_room(node, written[node])
+                piece = self._log_room(node, written[node])
                 if piece is None:
                     refused.add(node)
                 else:
@@ -305,7 +307,7 @@ class Rebuilds:
         }
         for node, piece in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = piece
+                self._keeps_ids[node][rid] = piece
                 self._kept[node][rid] = KeptIds(tuple(
                     LayoutRow(step[0].walk, sum(span.length for span in step))
                     for layout in written[node] for step in layout.steps()
@@ -349,7 +351,7 @@ class Rebuilds:
             # which the step fails.
             if not inputs or walk not in walks or not (chunk is None or chunk.is_first):
                 continue
-            kept, piece = self._kept[node][rid], self._droppable[node][rid]
+            kept, piece = self._kept[node][rid], self._keeps_ids[node][rid]
             row = kept.rows[len(kept.records)]
             names = sorted({*([ids_input] if walk in self._ids_walks[node] else ()), *self._copied[node][walk]})
             tensors = [
@@ -392,15 +394,16 @@ class Rebuilds:
 
     def flush(self) -> None:
         """Start the queued copies to the host, oldest first, up to what the step's allowance has left, once the
-        step's outputs are sent. A copy that runs past the allowance is split there, and the rest waits for the next
-        step's. The device tensor a queued copy reads stays held until its copy starts."""
+        step's outputs are sent or on a pass of the worker's loop that runs no step (`flush_idle`). A copy that runs
+        past the allowance is split there, and the rest waits for the next allowance. The device tensor a queued copy
+        reads stays held until its copy starts."""
         while self._queued:
             queued = self._queued[0]
             nbytes = self._allowance.spend(queued.src.numel())
             if not nbytes:
                 return
             copy = self._pool.copy_out(queued.src[:nbytes], HostSlice(queued.into.offset, nbytes), queued.after)
-            queued.record.landed = copy.landed
+            queued.record.landed = self._last_landed = copy.landed
             if nbytes < queued.src.numel():
                 self._queued[0] = queued._replace(
                     src=queued.src[nbytes:], into=HostSlice(queued.into.offset + nbytes, queued.into.nbytes - nbytes),
@@ -410,17 +413,26 @@ class Rebuilds:
             queued.record.queued -= 1
 
     def flush_idle(self) -> None:
-        """`flush` with a step's allowance on a pass of the worker's loop that runs no step. A drop waits for the
-        queued copies, so with every request waiting, no step would ever start them."""
+        """`flush` on a pass of the worker's loop that runs no step, with a step's allowance once the last copy it
+        started has landed. A drop waits for the queued copies, so with every request waiting, no step would ever
+        start them. Waiting for the last copy keeps a burst of such passes from queuing more than one allowance."""
+        if not self._queued:
+            return
+        if self._last_landed is not None:
+            self._last_landed.synchronize()
         self._allowance.refill()
         self.flush()
 
+    @property
+    def copies_queued(self) -> bool:
+        return bool(self._queued)
+
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
-        piece = self._droppable[node][rid]
+        piece = self._keeps_ids[node][rid]
         if used < piece.nbytes:
             self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
-            self._droppable[node][rid] = HostSlice(piece.offset, used)
+            self._keeps_ids[node][rid] = HostSlice(piece.offset, used)
 
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
@@ -429,7 +441,7 @@ class Rebuilds:
             # its slice goes back to the pool, so no copy may start into it
             records = {id(record) for record in kept.records}
             self._queued = deque(queued for queued in self._queued if id(queued.record) not in records)
-        piece = self._droppable[node].pop(rid, None)
+        piece = self._keeps_ids[node].pop(rid, None)
         if piece is not None:
             self._pool.give(piece)
 

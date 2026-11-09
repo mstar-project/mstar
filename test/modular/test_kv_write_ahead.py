@@ -35,8 +35,8 @@ from test_kv_host_index import (
 )
 from test_kv_prefix_offload import _commit, _step
 
+from mstar.engine.resources import StepAllowance
 from mstar.engine.resources.kv.config import KVReqConfig
-from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.model.submodule_base import ARNodeInputs
 

@@ -133,7 +133,8 @@ KV_PREEMPTED_AGAIN = Family(
 )
 KV_RETURNS_PREEMPTED = Family(
     "mstar_kv_returns_preempted_total", COUNTER,
-    "Dropped requests preempted again after their return, before they kept another token.",
+    "Requests preempted again before they sampled a token since they were last preempted. Only requests that "
+    "keep a rebuild log are counted.",
     ("component",),
 )
 COMPONENT_PENDING_STEPS = Family(
@@ -145,8 +146,8 @@ COMPONENT_PENDING_STEPS = Family(
 )
 REBUILD_HOST_BYTES_USED = Family(
     "mstar_rebuild_host_bytes_used", GAUGE,
-    "Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "
-    "request dropped from the KV cache is rebuilt from.",
+    "Bytes of a worker's rebuild host pool that hold kept prompt ids and host "
+    "copies, which a request dropped from the KV cache is rebuilt from.",
     ("component",),
 )
 REBUILD_HOST_BYTES_TOTAL = Family(

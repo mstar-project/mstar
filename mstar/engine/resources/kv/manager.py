@@ -22,6 +22,7 @@ from mstar.engine.resources.base import (
     PublishedInfo,
     Rebuild,
     Residency,
+    StepAllowance,
 )
 from mstar.engine.resources.kv.arena import PageArena, StreamPages, columns_from_raw, new_page_arena, plan_columns
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, held_pages, on_pages
@@ -38,7 +39,7 @@ from mstar.engine.resources.kv.config import (
     step_end,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
-from mstar.engine.resources.kv.host_writes import HostWrites, StepAllowance
+from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -572,7 +573,7 @@ class KVManager(AttentionResource):
         host_allowance: StepAllowance | None = None,
     ):
         self.config = cfg
-        self._host_allowance = StepAllowance() if host_allowance is None else host_allowance
+        self._host_allowance = host_allowance
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -897,6 +898,7 @@ class KVManager(AttentionResource):
             self._open_host_writes()
 
     def _open_host_writes(self) -> None:
+        assert self._host_allowance is not None, f"KV {self.name}: copies to the host spend the engine's StepAllowance"
         self._host_writes = HostWrites(
             self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes, self._host_allowance,
         )
@@ -1408,7 +1410,7 @@ class KVManager(AttentionResource):
         self._recount(rid)
 
     def _warn_unkeyed(self, rid: str, node_name: str, graph_walk: str) -> None:
-        """Say once per node that a stream the model declared arrived with no keys and no layout.
+        """Say once per node that a stream the model declared arrived with no keys or no layout.
 
         Nothing else would: an unkeyed request is served in full and never
         reported, so the cache stays empty while every other line looks healthy.
@@ -1424,12 +1426,16 @@ class KVManager(AttentionResource):
         keys = overrides.prefix_keys or {}
         layouts = overrides.kv_layout or {}
         for label in overrides.get_labels(node_name, graph_walk):
-            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label) and label not in layouts:
+            layout = layouts.get(label)
+            # a layout that keys no span leaves its request unkeyed on purpose
+            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label) and (
+                layout is None or layout.keyed_spans
+            ):
                 self._warned_unkeyed.add(node_name)
                 logger.warning(
-                    "KV %s: requests reach %s with no layout for %s, which the "
+                    "KV %s: requests reach %s with no %s for %s, which the "
                     "model declared for prefix reuse, so nothing will be cached",
-                    self.name, node_name, label,
+                    self.name, node_name, "layout" if layout is None else "keys", label,
                 )
                 return
 
@@ -3382,9 +3388,11 @@ class KVManager(AttentionResource):
         with self._lock:
             if not self._movable(rid):
                 return (
-                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, holds a "
-                    "lease no walk's admit has taken over, or has written nothing since its rebuild landed"
+                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, or holds a "
+                    "lease no walk's admit has taken over"
                 )
+            if self._rebuilt.get(rid, -1) >= self._written(rid):
+                return f"KV {self.name}: {rid} has written nothing since its rebuild landed, which a drop would waste"
             if not self._overrides[rid].rebuildable:
                 return f"KV {self.name}: {rid} can't be rebuilt on this worker"
             held = self._laid_out_tokens(rid)
@@ -4109,6 +4117,7 @@ class KVManager(AttentionResource):
             if allotment is not None:
                 self._unused -= allotment.remaining
             self._asks.pop(rid, None)
+            self._stalled.discard(rid)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
@@ -4132,7 +4141,6 @@ class KVManager(AttentionResource):
             self._settle(rid, self._room() - room, allotment)
             self._forget_earmark(rid)
             self._ran_short.pop(rid, None)
-            self._stalled.discard(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -4276,6 +4284,8 @@ class KVManager(AttentionResource):
                 if counts.get(page, 0) != refs.get(page, 0)
             )
         )
+        unmoved = sum(pool._unmoved_by(rid) for rid in pool.reserved)
+        assert pool._unmoved == unmoved, f"the host counts {pool._unmoved} pages set aside, but requests hold {unmoved}"
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every rank of the
@@ -4819,13 +4829,12 @@ class KVManager(AttentionResource):
 
     def _movable(self, rid: str) -> bool:
         """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no step or read is in flight on
-        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. A
-        rebuilt request stays until a step writes past its rebuild, so every rebuild keeps at least one token, and that
-        step runs on the page its return reserved. ``rid`` also stays while it holds a lease, until a walk's admit
-        takes the lease over. The probe that took the lease moved the position counter, which a smaller hit after a
-        move couldn't move back, and a walk the cache served keeps its KV only in the lease."""
+        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid``
+        also stays while it holds a lease, until a walk's admit takes the lease over. The probe that took the lease
+        moved the position counter, which a smaller hit after a move couldn't move back, and a walk the cache served
+        keeps its KV only in the lease."""
         return (
-            rid not in self._guaranteed and rid not in self._dropped and self._rebuilt.get(rid, -1) < self._written(rid)
+            rid not in self._guaranteed and rid not in self._dropped
             and not any(
                 stream.step_in_flight or stream.read_pending or stream.lease is not None
                 for stream in self._streams[rid].values()

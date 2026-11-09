@@ -186,11 +186,14 @@ def _make_rebuilds(
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
-    host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if host_mb and any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
-        host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
+    copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
+    host_mb = _serving_mb(
+        model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
+    )
+    if not host_mb:
+        policies = {}
     return Rebuilds(
-        policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
+        policies, graphs, HostPool(host_mb << 20, device) if policies else None, engine.host_allowance,
         {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
     )
 
@@ -832,7 +835,7 @@ class Worker:
 
     def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
-        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
         for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:
@@ -4009,7 +4012,8 @@ class Worker:
                         side_steps.finish(block=True)
                         continue
                     self._rebuilds.flush_idle()
-                    self.communicator.wait_for_work(10)
+                    # the next pass's `flush_idle` waits for the copies just started, so it needn't wait the tick too
+                    self.communicator.wait_for_work(0 if self._rebuilds.copies_queued else 10)
                     continue
 
                 if self.enable_nvtx:

@@ -362,23 +362,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
-     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, which a
-       request dropped from the KV cache is rebuilt from. A request takes its room when it
-       arrives, 8 B a token (int64), and gives back what its ids don't use once its prompt is kept. One
-       the pool can't hold then is never dropped on that node, though it can still move to the
-       host with ``cpu_offload_pages``. Every rank of a TP, SP or CFG node keeps the ids,
+     - *(optional, default 64, or 1024 where a node copies media)* MiB of pinned host memory a worker serving a
+       node whose model declares a rebuild policy sets aside at startup for what its requests are rebuilt from
+       after a drop from the KV cache: their prompt ids, and, where the node's rebuild policy copies what a walk
+       reads besides the ids, those copies too, such as Qwen3.5's encoder output for a prompt with images or
+       video at one rank. A request takes its room when it arrives, 8 B a token (int64) and its copies at the
+       values per slot the policy declares in the node's dtype, and gives back what it doesn't use once its
+       prompt and copies are kept. One the pool can't hold then is never dropped on that node, though it can
+       still move to the host with ``cpu_offload_pages``. Every rank of a TP, SP or CFG node keeps the ids,
        since each rank rebuilds the requests its first rank drops. A non-negative int, and 0 sets no pool
-       aside, so no request is dropped there. The pool is this plus
-       ``rebuild_media_host_mb`` where that applies, rounded up to a power of two, as the pinned allocator
-       would round it anyway.
-   * - ``rebuild_media_host_mb``
-     - *(optional, default 960)* MiB added to that pool on a worker where a node's rebuild policy
-       copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
-       with images or video, at one rank. A request takes room for its ids and copies together,
-       at the values per slot the policy declares in the node's dtype, and gives back what its copies didn't use once
-       they are taken. A non-negative int, and with ``rebuild_host_mb: 0`` there is no pool to add to. With
-       both defaults the pool is 1 GiB.
+       aside, so no request is dropped there and the node preempts as one with no rebuild policy does. The
+       pool is rounded up to a power of two, as the pinned allocator would round it anyway.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -505,7 +499,7 @@ in moves newer requests that wait holding pages, to the host or by a drop as abo
 it. A request on the host returns once its pages and one more page fit, or every page its
 grant needed when it moved itself, and its pages are then copied back. A dropped request returns
 once its prompt, or its history and one more page if that is larger, fits, counting no prompt page
-another request holds, then recomputes its KV in prefill chunks cut by its walk's chunk budget, and isn't taken again until it writes a token past
+another request holds, then recomputes its KV in prefill chunks cut by its walk's chunk budget, and isn't dropped again until it writes a token past
 that. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
@@ -521,9 +515,12 @@ media it keeps no copies of, or a node that keeps no token ids writes its KV, mo
 it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
 grows with each page the request takes after that, so its move always fits. Bagel generations, which
 write a label per guidance, and requests with media above one rank are such requests. When the host
-pool has no room for it, at admission or later, the request reserves its whole footprint in that pool,
-as a voice request does, and the host pool logs it. So ``cpu_offload_pages`` also sets how many pages
-such requests can hold with only their prompt reserved.
+pool has no room for it at admission, or later once the device has room for the rest of its
+footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
+host pool logs it. While the device has no room for that either, nothing is logged: newer requests
+move for it as for any request that runs short, and otherwise it moves to the host, into the room
+set aside for it, and returns once its whole footprint fits. So ``cpu_offload_pages`` also sets how
+many pages such requests can hold with only their prompt reserved.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
 step that follows, so every rank admits each step from the same reservations. On a node with a
@@ -1153,7 +1150,7 @@ or ``increase()``.
   request needs the room.
 - ``mstar_rebuild_host_bytes_used{model_name, component}``,
   ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
-  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids and host copies, and the pool's size.
   A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU

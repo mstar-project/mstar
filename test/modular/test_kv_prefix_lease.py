@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import Resource, StepRunner
+from mstar.engine.resources import Resource, StepAllowance, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -75,6 +75,7 @@ def _manager(max_num_pages: int = 32, cpu_offload_pages: int = 0) -> KVManager:
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cuda" if cpu_offload_pages else "cpu"),
         dtype=torch.float32,
+        host_allowance=StepAllowance(),
     )
     kv.enable_prefix_cache(ROOT)
     return kv
