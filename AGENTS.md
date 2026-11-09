@@ -187,6 +187,8 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ## Testing
 
+Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
+
 ```bash
 ruff check .                          # CI enforces this
 # the CPU Core CI job's tests, no GPU or weights; see "Running the CPU suite" below
