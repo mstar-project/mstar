@@ -720,7 +720,7 @@ def test_a_dropped_request_is_charged_nothing_for_hits_another_request_holds():
     _remove(kv, "s")
 
     assert _admitted(kv, "v"), "v waited for room for the 3 pages a holds"
-    kv.prepare_rebuild("v", Rebuild(WALK, array("i", [*tokens, 0])))
+    kv.prepare_rebuild("v", Rebuild(array("i", [0])))
     kv.apply_cached_prefix("v", NODE, WALK, inputs, kv.resolve_cached_prefix("v", NODE, WALK, inputs))
     assert _step(kv, "v", PAGE_SIZE).ok and _step(kv, "v", PAGE_SIZE + 1).ok, "v ran short of its allotment"
 
@@ -756,7 +756,7 @@ def test_a_dropped_request_refused_before_its_rebuild_is_measured_on_the_chain_t
     assert _preempt(kv, "w", outcome.reason.pages_short, droppable=lambda rid: False).waits
     _runner(kv).readmit("w", NODE)
 
-    kv.prepare_rebuild("v", Rebuild(WALK, array("i", [*tokens, 0])))
+    kv.prepare_rebuild("v", Rebuild(array("i", [0])))
 
     assert _make_room(kv, droppable=lambda rid: True) is None, "moving w frees less than v's return needs"
     assert kv._need("v", NODE, WALK, None) == kv._dropped["v"].returns - 3, "v paid for the 3 pages a holds"
