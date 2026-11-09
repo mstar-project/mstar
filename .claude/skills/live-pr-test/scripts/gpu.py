@@ -550,9 +550,9 @@ def provider_of(cfg: dict, record: dict) -> Provider:
     return PROVIDERS[record["provider"]](cfg, record.get("region"))
 
 
-def known(e: dict) -> bool:
+def has_provider(e: dict) -> bool:
     """Whether a ledger entry's provider is one gpu.py has. One it no longer has (a removed provider's
-    entry) has nothing gpu.py can reach or release, so it counts toward no cap and `terminate` drops it."""
+    entry) is out of gpu.py's reach: it counts toward no cap, and `terminate` drops it without releasing anything."""
     return e["provider"] in PROVIDERS
 
 
@@ -634,7 +634,7 @@ def entry(key: str, unknown_provider_ok: bool = False) -> dict:
     d = ledger()
     if key not in d:
         die(f"unknown instance {key!r}; known: {', '.join(d) or 'none'}")
-    if not (unknown_provider_ok or known(d[key])):
+    if not (unknown_provider_ok or has_provider(d[key])):
         die(f"{key} is a {d[key]['provider']!r} instance, a provider gpu.py doesn't have, so there is nothing to "
             f"reach, extend or release; `gpu.py terminate {key}` drops it from the ledger")
     return d[key]
@@ -687,7 +687,7 @@ def cmd_launch(args, cfg):
     pending, lost = f"pending:{name}", None
     with contextlib.nullcontext({}) if args.dry_run else ledger_txn() as d:
         if not args.dry_run:
-            live = {k: e for k, e in d.items() if known(e)}
+            live = {k: e for k, e in d.items() if has_provider(e)}
             if len(live) >= max_instances and not args.allow_over_budget:
                 die(f"{len(live)} instance(s) already up ({', '.join(live)}); budget.max_concurrent_instances is "
                     f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
@@ -888,8 +888,9 @@ def eras_create(body: dict) -> str:
 
 def status(e: dict, cfg: dict) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
-    if not known(e):
-        return f"{e['provider']!r} is not a provider gpu.py has; nothing to release, terminate drops it", None, 0
+    if not has_provider(e):
+        return (f"{e['provider']!r} is not a provider gpu.py has, so it can't reach or release it; end it on "
+                "the provider if it's still up, then terminate drops it"), None, 0
     if not e["instance_id"]:
         return f"create's answer lost; terminate it to end {e['name']}", None, 0
     return provider_of(cfg, e).status(e)
@@ -962,7 +963,7 @@ def cmd_copy(args, cfg):
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
-    if not known(e):
+    if not has_provider(e):
         with ledger_txn() as d:
             d.pop(key, None)
         print(f"dropped {key} from the ledger: gpu.py has no {e['provider']!r} provider, so nothing was released")
@@ -1005,7 +1006,7 @@ def cmd_extend(args, cfg):
                 die(f"{args.instance} can't run later than its current deadline: the Eras Pod's deadline was fixed "
                     "at launch, so it would still end then. Launch a new one for more time")
             check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
-            check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance and known(x))
+            check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance and has_provider(x))
                         + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
         e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
@@ -1055,7 +1056,7 @@ def cmd_watchdog(args, cfg):
         e = ledger().get(args.instance)
         if e is None:
             return  # terminated normally
-        if not known(e):
+        if not has_provider(e):
             print(f"{time.ctime()}: gpu.py has no {e['provider']!r} provider; nothing to terminate", flush=True)
             return
         if time.time() >= e["deadline"]:

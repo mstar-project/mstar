@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import http.client
 import io
+import itertools
 import os
 import runpy
 import subprocess
@@ -125,12 +126,16 @@ class TestGpu(unittest.TestCase):
         # a 502, and a 503 whose page says "not available" (a proxy's, not RunPod's capacity answer)
         # and a 200 with no id in it
         names = set()
-        for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available"),
-                       KeyError("id")):
-            GPU["save_ledger"]({})
-            names.add(self.launch(answer)[0][0]["name"])
-            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
-                             f"the pod the lost create made never reached the ledger ({answer})")
+        # all in one second, with suffixes that differ as random ones almost always do
+        hexes = (f"{i:04x}" for i in itertools.count())
+        with unittest.mock.patch.object(self.g["time"], "strftime", return_value="1109-000000"), \
+                unittest.mock.patch.object(self.g["secrets"], "token_hex", side_effect=lambda n: next(hexes)):
+            for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available"),
+                           KeyError("id")):
+                GPU["save_ledger"]({})
+                names.add(self.launch(answer)[0][0]["name"])
+                self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
+                                 f"the pod the lost create made never reached the ledger ({answer})")
         self.assertEqual(len(names), 3, "launches in the same second would share a name, so a lost create could "
                                         "adopt another launch's pod")
 
@@ -220,7 +225,7 @@ class TestGpu(unittest.TestCase):
     def test_an_entry_of_a_provider_gpu_py_does_not_have_holds_nothing_up(self):
         key = "slurm:node1:42"
         GPU["save_ledger"]({key: {"provider": "slurm", "instance_id": "42", "name": "live-pr-7-x", "pr": 7,
-                                  "usd_per_hour": 0.0, "gpu": "H200", "count": 1, "region": "node1",
+                                  "usd_per_hour": 100.0, "gpu": "H200", "count": 1, "region": "node1",
                                   "launched_at": time.time() - 3600, "deadline": time.time() + 3600}})
         with contextlib.redirect_stdout(io.StringIO()) as out:
             GPU["cmd_list"](argparse.Namespace(all=False), CFG)
