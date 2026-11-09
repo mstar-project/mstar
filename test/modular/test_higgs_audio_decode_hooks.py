@@ -5,15 +5,20 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
 from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+from mstar.model.keys import SAMPLER
 from mstar.model.submodule_base import END_PARTITION, HostRows
 
 
 def _submodule(slot_masters=True):
-    sub = HiggsAudioLLMSubmodule(torch.nn.Linear(1, 1), HiggsAudioModelConfig())
+    config = HiggsAudioModelConfig()
+    # as the model builds it: the audio walk, no text-only prompt
+    encoders = (audio_encoder(config.audio_in_token_idx),)
+    sub = HiggsAudioLLMSubmodule(torch.nn.Linear(1, 1), config, encoders, text_prompts=False)
     sub.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=slot_masters)}
     return sub
 
@@ -31,6 +36,7 @@ def _info(walk="decode", decoded=0, max_tokens=8, ignore_eos=False):
 def test_decode_loop_routes_one_signal_to_itself_and_the_client():
     model = object.__new__(HiggsAudioModel)
     model.config = HiggsAudioModelConfig()
+    model.media = ()
     outputs = model.get_graph_walk_graphs()["decode"].section.outputs
     assert {(edge.next_node, edge.name) for edge in outputs} == {
         ("LLM", "text_inputs"), (EMIT_TO_CLIENT, "text_inputs"),
@@ -70,7 +76,10 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     assert want == {"b": {"decode_loop"}}
     rows = HostRows(("a", "b", "c", "d"), {"new_token": tokens})
     assert sub.check_stop_batched(["d", "c", "b", "a"], infos, rows) == want
-    # a prefill row's stop token ends the partition: there is no loop yet
-    prefill = {rid: SimpleNamespace(**{**vars(info), "graph_walk": "prefill_audio"}) for rid, info in infos.items()}
+    # a stop token on the last prefill ends the partition: there is no loop yet
+    prefill = {
+        rid: SimpleNamespace(**{**vars(info), "graph_walk": "prefill_audio", "step_metadata": {FINAL_PREFILL: True}})
+        for rid, info in infos.items()
+    }
     assert sub.check_stop("b", prefill["b"], {"new_token": [tokens[1]]}) == {END_PARTITION}
     assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {END_PARTITION}}

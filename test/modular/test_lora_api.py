@@ -410,11 +410,11 @@ def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
     open the request and another refuse it."""
     spec = make_spec({}, runtime_updates=True)
     conductor = object.__new__(Conductor)
-    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda *a, **kw: {})
     conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
     conductor._kv_labels, conductor.requests = {}, {}
     conductor._lora_ops_cache = ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], _Outbox())
-    conductor._do_ingest_request = lambda body: conductor._get_resource_configs(body.model_kwargs, {})
+    conductor._do_ingest_request = lambda body: conductor._get_resource_configs([], [], body.model_kwargs)
     rejected = []
     conductor._reject_request = lambda rid, error, status: rejected.append((rid, status))
 

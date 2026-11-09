@@ -111,9 +111,9 @@ def _media_io(path):
 
 
 def _audio_features(path):
-    from mstar.model.components.audio_features import load_audio_file
+    from mstar.model.components.audio_features import load_speech_file
 
-    return load_audio_file(path, 16000)
+    return load_speech_file(path, 16000, media_io.MAX_AUDIO_SECONDS)
 
 
 def _qwen3_tts(path):
@@ -139,7 +139,7 @@ def _nemotron_duplex(path):
 
 LOADERS = [
     pytest.param(_media_io, 16000, id="media_io.decode_audio"),
-    pytest.param(_audio_features, 16000, id="audio_features.load_audio_file"),
+    pytest.param(_audio_features, 16000, id="audio_features.load_speech_file"),
     pytest.param(_qwen3_tts, 24000, id="qwen3_tts"),
     pytest.param(_chatterbox, 24000, id="chatterbox"),
     pytest.param(_nemotron_duplex, 16000, id="nemotron_duplex"),

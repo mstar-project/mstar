@@ -607,8 +607,8 @@ def _orpheus():
                       "model.embed_tokens": (c.hidden_size, c.vocab_size)},
         a2=lambda c: _subset(llama_layers(c, "model."), "0.self_attn.q_proj", "0.self_attn.v_proj",
                              "1.mlp.down_proj"),
-        run=_ids_run(lambda s: s.language_model, lambda s, ids: s.embed_tokens(ids),
-                     lambda s, x: s.language_model(x, label="main"), lambda s, x: s.lm_head(x)),
+        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed(ids),
+                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.logits(x)),
         declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
         released=lambda: (model_object(OrpheusModel, OrpheusModelConfig()),
                           lambda c, g: OrpheusForCausalLM(c, comm_group=g)),
@@ -618,27 +618,58 @@ def _orpheus():
 
 
 def _higgs():
-    from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
+    """Higgs-Audio's LLM node as the model builds it (its audio encoder, no text-only
+    prompt), its LoRA rows planned by the walk it serves (``prefill_audio``). The forward
+    is this test's own embed, splice, stack and head, over prompts that open with one
+    audio pad (served prompts carry one per audio token) whose row replaces its embedding."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.multimodal import splice_media
+
+    def build(c, group, weights):
+        model = model_object(HiggsAudioModel, c)
+        llm = model.build_llm(group).to(DTYPE)
+        llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
+        encoders = (audio_encoder(c.audio_in_token_idx),)
+        return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
+
+    def inputs(c, n, seed):
+        ids = torch.randint(0, c.vocab_size - 1, (n,), generator=torch.Generator().manual_seed(seed))
+        ids[0] = c.audio_in_token_idx
+        return ids
+
+    def audio(s, ids):
+        """The encoder's rows for the pads in ``ids``: one row for every pad, so a batch
+        splices what each of its prompts would alone."""
+        pads = int((ids == s.config.audio_in_token_idx).sum())
+        return rand(1, s.config.hidden_size, seed=7).to(DTYPE).expand(pads, -1)
+
+    def embed(s, ids):
+        return splice_media(s.model.embed(ids), ids == s.config.audio_in_token_idx, audio(s, ids))
+
+    def declare(sub, rids, rows):
+        return engine_step(sub, "prefill_audio", rids, [
+            ARNodeInputs(input_ids=i, input_seq_len=len(i), tensor_inputs={"audio_embeds": audio(sub, i)})
+            for i in rows
+        ])
 
     head = "audio_decoder_proj.text_lm_head"
     return Stack(
         config=lambda: HiggsAudioModelConfig(
             hidden_size=16, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-            head_dim=4, intermediate_size=32, vocab_size=64,
+            head_dim=4, intermediate_size=32, vocab_size=64, audio_in_token_idx=63,
         ),
         lora_spec=lambda c: _declared(model_object(HiggsAudioModel, c)),
-        build=lambda c, group, w: HiggsAudioLLMSubmodule(_loaded(HiggsAudioLLM(c, comm_group=group).to(DTYPE), w), c),
+        build=build,
         weights=lambda c: llama_weights(c, "", head, qk_norm=True),
         a1=lambda c: {**llama_layers(c, ""), head: (c.vocab_size, c.hidden_size)},
         a2=lambda c: _subset(llama_layers(c, ""), "0.self_attn.k_proj", "1.mlp.up_proj", "1.self_attn.o_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed_tokens(ids),
-                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.vocab_size),
+        run=_ids_run(lambda s: s.model, embed,
+                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.logits(x)),
+        declare=declare, inputs=inputs,
         released=lambda: (model_object(HiggsAudioModel, HiggsAudioModelConfig()),
-                          lambda c, g: HiggsAudioLLM(c, comm_group=g)),
+                          lambda c, g: model_object(HiggsAudioModel, c).build_llm(g)),
         a2_rename=lambda m: f"model.{m}",  # a Qwen3ForCausalLM-shaped adapter
     )
 

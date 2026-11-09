@@ -247,9 +247,9 @@ def _orpheus() -> ModelSpec:
         return out
 
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.language_model, lengths, rope)
-        hidden = sub.language_model(sub.embed_tokens(ids), label="main")
-        return sub.lm_head(_last(hidden, lengths)).float()
+        _stub_attention(sub.model, lengths, rope)
+        hidden = sub.model(sub.model.embed(ids), label="main")
+        return sub.model.logits(_last(hidden, lengths)).float()
 
     def hf(model):
         import torch
@@ -282,7 +282,7 @@ def _higgs() -> ModelSpec:
         import torch
         from transformers import Qwen3Config, Qwen3ForCausalLM
 
-        from mstar.model.higgs_audio.components.llm import higgs_llm_remap
+        from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 
         c = model.config
         ref = Qwen3ForCausalLM(Qwen3Config(
@@ -293,7 +293,7 @@ def _higgs() -> ModelSpec:
         )).to(torch.bfloat16)
 
         def rename(name):
-            name = higgs_llm_remap(name)
+            name = HiggsAudioModel._llm_remap(name)
             if name is None:
                 return None
             return name if name.startswith("lm_head") else f"model.{name}"

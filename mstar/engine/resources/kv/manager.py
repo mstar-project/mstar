@@ -651,6 +651,8 @@ class KVManager(AttentionResource):
         self._preplanned = False
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
+        # (resident plan, KV plan) of the last lengths-only step, for its promotion
+        self._lengths_plan: tuple[object, KVPlanOutputs] | None = None
 
         # (rid, to_label) reservations a staged step made; clear_preplan
         # releases them. recorded in admit, not plan: forks are not staged.
@@ -2699,9 +2701,25 @@ class KVManager(AttentionResource):
         )
         laps = PhaseLaps(f"{ctx.plan_phase}.{self.name}.")
         self.reset_default_cursors()
-        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
-            # nothing reads a plan of this step, and its graph fills the addressing
-            return KVPlanOutputs({})
+        if ctx.resident is not None:
+            bucket = ctx.slot_lease.bucket
+            if bucket in ctx.resident.host_plan_free:
+                # nothing reads a plan of this step, and its graph fills the addressing
+                return KVPlanOutputs({})
+            if (bucket, self._resident.key) in ctx.resident.lengths_only:
+                # its graph fills the addressing and the attention's page arrays;
+                # a promoted step keeps the resident plan its pre-plan staged
+                plan = ctx.resident_plan
+                held = self._lengths_plan
+                if held is not None and held[0] is plan:
+                    return held[1]
+                out = KVPlanOutputs({
+                    plan.writes.streams[self._resident.key].label: KVPlanOutput(
+                        self._resident.decode_indptrs(plan, bucket.bs),
+                    ),
+                })
+                self._lengths_plan = (plan, out)
+                return out
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
