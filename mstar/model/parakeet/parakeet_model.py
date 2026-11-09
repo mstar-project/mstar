@@ -248,9 +248,8 @@ class ParakeetModel(Model):
             return super().get_partitions()
         return [
             PartitionDefinition(name=DEFAULT_PARTITION, graph_walks={WALK}),
-            PartitionDefinition(name="Encoder", graph_walks={LIVE_ENCODE_WALK}, initial_walk=LIVE_ENCODE_WALK),
-            PartitionDefinition(name="Decoder", graph_walks={LIVE_DECODE_WALK}, initial_walk=LIVE_DECODE_WALK,
-                                producer_partitions=["Encoder"]),
+            PartitionDefinition(name="Encoder", graph_walks={LIVE_ENCODE_WALK}),
+            PartitionDefinition(name="Decoder", graph_walks={LIVE_DECODE_WALK}),
         ]
 
     def get_partition_topology(self) -> PartitionTopology:

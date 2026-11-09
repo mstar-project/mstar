@@ -202,7 +202,7 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
         assert isinstance(model.get_graph_walk_graphs()[walk], Loop), partition
 
     def done(signals):
-        return {p: model.get_initial_forward_pass_args(p, ["audio"], ["text"], signals, {}).request_done
+        return {p: not model.walk_plan(p, ["audio"], ["text"], signals, {})
                 for p in ("default", "Encoder", "Decoder")}
 
     assert done({"audio": [_pointer(1)]}) == {"default": False, "Encoder": True, "Decoder": True}
