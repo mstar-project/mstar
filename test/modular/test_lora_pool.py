@@ -105,8 +105,17 @@ def make_pool(paths, **kw) -> LoraAdapterPool:
     return LoraAdapterPool(make_spec(paths, **kw), "cpu")
 
 
-def ctx(rids, capture=False, lease=None, padded=None, idle=False) -> StepContext:
-    c = StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=capture, slot_lease=lease, idle=idle)
+def engine_lean(pool, rids) -> frozenset[str]:
+    """What the engine names lean in an eager step of ``rids`` (``StepContext.lean``)."""
+    from mstar.testing_utils.engine import make_mgmt
+
+    return make_mgmt(resources={pool.resource_key: pool}).lean_of(rids)
+
+
+def ctx(rids, capture=False, lease=None, padded=None, lean=frozenset()) -> StepContext:
+    """A step's context; under ``lease``, lean as its bucket is, as the engine sets it."""
+    c = StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=capture, slot_lease=lease,
+                    lean=lean if lease is None else lease.bucket.lean)
     if padded is not None:
         c.set_padded_rids(padded)
     return c
@@ -119,7 +128,7 @@ def step(rids, spans=None) -> ResourceStep:
 
 def run_step(pool, rids, spans=None, commit=True, **ctx_kw):
     """Admit and plan a step over ``rids``; and commit it, unless a delta is to run in it."""
-    s, c = step(rids, spans), ctx(rids, **ctx_kw)
+    s, c = step(rids, spans), ctx(rids, lean=engine_lean(pool, rids), **ctx_kw)
     outcome = pool.admit(s, c)
     if outcome.ok:
         pool.plan(s, c)
@@ -217,7 +226,7 @@ def test_an_adapter_with_nothing_for_the_pools_targets_takes_no_slot(adapters, t
     for rid, name in [("r1", "a1"), ("e1", "mlp")]:
         ingest(pool, rid, name)
     assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
-    assert admitted(runner, "e1") and pool.idle_for(["e1"]) and not pool.idle_for(["e1", "r1"])
+    assert admitted(runner, "e1") and pool.lean_for(["e1"]) and not pool.lean_for(["e1", "r1"])
     assert run_step(pool, ["r1", "e1"]).ok and pool.slot_of("e1") == ZERO_SLOT
     assert pool.slot_state(1).refcount == 1 and pool.resident_slot("mlp") is None and "mlp" not in pool.store
 
@@ -444,7 +453,7 @@ def test_compiles_without_graph_breaks(adapters):
 
 def test_compiled_steps_of_varying_tokens_do_not_recompile(adapters):
     """As the engine compiles an eager forward (``dynamic=None``): one graph for the
-    first shape, one dynamic graph from the second, one more for the first idle
+    first shape, one dynamic graph from the second, one more for the first lean
     step (the delta is skipped, guarded on ``pool.active``), and no recompile for the
     later steps, whose token counts, rows and adapters all differ."""
     from torch._dynamo.utils import counters
@@ -466,8 +475,7 @@ def test_compiled_steps_of_varying_tokens_do_not_recompile(adapters):
         rids = [f"s{i}r{j}" for j in range(len(names))]
         for rid, name in zip(rids, names, strict=True):
             ingest(pool, rid, name)
-        # idle as the engine decides it: no row names an adapter
-        s, c = step(rids, spans), ctx(rids, idle=all(name is None for name in names))
+        s, c = step(rids, spans), ctx(rids, lean=engine_lean(pool, rids))
         assert pool.admit(s, c).ok
         pool.plan(s, c)
         tokens = sum(spans)

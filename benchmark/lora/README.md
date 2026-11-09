@@ -130,7 +130,7 @@ What to read:
 Any `failed` request in a `load_c*.json` invalidates that run.
 
 A step none of whose rows names an adapter replays a capture with no LoRA kernel in it
-(an idle capture, see "Idle captures" in `docs/adding_models.rst`). Measured before
+(a lean capture, see "Lean captures" in `docs/adding_models.rst`). Measured before
 main had resident decode planning (#1127), on an H200 with
 `compare_engines` (3 rounds, per-arm `e_off`), Qwen3.5-9B base-model traffic (GPU-bound)
 kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without that capture and
