@@ -746,7 +746,8 @@ class TestAfterTheReview(unittest.TestCase):
                          "a later step couldn't tell an edited finding")
         self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
     def test_an_escaped_character_before_a_token_shape_cant_break_the_post(self):
-        fields = {"outside_diff": [], "since_last": "\u00eeyJabcdefghijk.lmnopqrstuv.w", "description_problems": [],
+        fields = {"outside_diff": [], "since_last": "\x0eyJabcdefghijk.lmnopqrstuv.w \u00eeyJabcdefghijk.lmnopqrstuv.w",
+                  "description_problems": [],
                   "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
                   "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}}
         with workspace():
@@ -758,6 +759,7 @@ class TestAfterTheReview(unittest.TestCase):
                 "GET repos/o/r/issues/7/comments": [],
             }, repo="o/r", pr="7", head_sha=HEAD, mode="light", salvaged="false", runner_temp=".")
         self.assertEqual(out["id"], "99")
+        self.assertEqual(json.loads(out["result"])["risk"]["level"], "low")
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30

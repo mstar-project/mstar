@@ -783,6 +783,18 @@ def post_inline(repo, pr, head_sha, review, exact=()):
     return posted
 
 
+def redact_fields(value, exact=()):
+    """`value`, JSON-shaped, with `redact` run on each string in it. Redacting the JSON's text instead can break
+    it: an escape's last letter can join a token pattern."""
+    if isinstance(value, str):
+        return redact(value, exact)
+    if isinstance(value, list):
+        return [redact_fields(v, exact) for v in value]
+    if isinstance(value, dict):
+        return {redact(str(k), exact): redact_fields(v, exact) for k, v in value.items()}
+    return value
+
+
 def job_token_forms(token):
     """The job's token as a read of it could carry it: as is, and base64 with no padding, so a copy that drops it is
     caught too."""
@@ -802,8 +814,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         posted = post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
-        carried = render_summary.carried(review, *earlier_review(repo, pr))
-        review = json.loads(redact(json.dumps(carried, ensure_ascii=False), exact))
+        review = redact_fields(render_summary.carried(review, *earlier_review(repo, pr)), exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
@@ -816,8 +827,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
     # they are still there, unchanged.
-    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}},
-                                  ensure_ascii=False), exact)
+    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted}}
+    out["result"] = json.dumps(redact_fields(result, exact))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
@@ -896,8 +907,8 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev="", job_token=""):
     saved = Path(runner_temp, "handoff")
     saved.mkdir(parents=True, exist_ok=True)
     exact = job_token_forms(job_token)
-    meta = {"pr": pr, "head_sha": head_sha, "mode": mode, **h}
-    (saved / "handoff.json").write_text(redact(json.dumps(meta, ensure_ascii=False), exact))
+    meta = redact_fields({"pr": pr, "head_sha": head_sha, "mode": mode, **h}, exact)
+    (saved / "handoff.json").write_text(json.dumps(meta))
     (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode), exact))
     out["dir"] = str(saved)
 
