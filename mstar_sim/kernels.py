@@ -135,6 +135,12 @@ def _advance_column(slots, store, STRIDE, COL, TRASH, **_):
     store.index_copy_(0, cells, store.index_select(0, cells) + (slots != TRASH))
 
 
+def _gather_write_slots(slots, kv_len, store, page, offset, STRIDE, BLOCK, PAGE, **_):
+    n = slots.numel()
+    page[:n].copy_(store.index_select(0, slots * STRIDE + BLOCK + kv_len // PAGE))
+    offset[:n].copy_(kv_len % PAGE)
+
+
 def _gather_block_rows(slots, kv_len, store, table, lens, **_):
     if store._data.device.type == "meta":  # no lengths to read: an unknown length costs the row's longest
         warnings.warn("mstar_sim: the resident table is too big to keep: decode attention is priced at max_seq_len",
@@ -151,5 +157,6 @@ KEPT_WRITES = {
     "_scatter_cells_kernel": _scatter_cells,
     "_gather_column_kernel": _gather_column,
     "_advance_column_kernel": _advance_column,
+    "_gather_write_slots_kernel": _gather_write_slots,
     "_gather_block_rows_kernel": _gather_block_rows,
 }

@@ -2863,13 +2863,15 @@ def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths(cells, priced):
         import flashinfer.decode as decode
         from mstar.engine.resources import resident
         from mstar.engine.resources.attn.wrappers import FmhaDecodeWrapper
+        from mstar.engine.resources.kv.resident import _gather_write_slots_kernel
 
         seen, lengths = [], decode._row_lengths
         decode._row_lengths = lambda *a: seen.append(lengths(*a)) or seen[-1]
         store = torch.zeros(%d, dtype=torch.long, device="cuda")
         slots = torch.tensor([1], device="cuda")
-        cells = torch.tensor([[17], [300]], device="cuda")  # (the stride is 16: row 1's length, column 1)
-        kv_len = torch.zeros(1, dtype=torch.long, device="cuda")
+        # (the stride is 16: row 1's length is cell 17, and its block column 4, where token 300 of 64 a page goes, 28)
+        cells = torch.tensor([[17, 28], [300, 77]], device="cuda")
+        kv_len, page, offset = (torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(3))
         wrapper = FmhaDecodeWrapper(types.SimpleNamespace(tensor=torch.empty(1 << 20, device="cuda")), 16, 8, 128, 64,
                                     batch_size=1, max_seq_len=4096, device=torch.device("cuda"))
         q = torch.empty(1, 16, 128, dtype=torch.bfloat16, device="cuda")
@@ -2878,16 +2880,21 @@ def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths(cells, priced):
         with torch.cuda.graph(graph):
             resident.scatter_cells(store, cells)
             resident.gather_column(store, slots, 16, 1, kv_len)
+            _gather_write_slots_kernel[(1,)](slots, kv_len, store, page, offset,
+                                             STRIDE=16, BLOCK=8, PAGE=64, num_warps=1)
             wrapper.gather_resident(store, slots, kv_len, 16, 8)
             wrapper.run(q, kv)
             resident.advance_column(store, slots, 16, 1)
         seen.clear()
         graph.replay()
-        cells.copy_(torch.zeros(2, 1, dtype=torch.long, device="cuda"))  # the next step queues no write
+        cells.copy_(torch.zeros(2, 2, dtype=torch.long, device="cuda"))  # the next step queues no write
         graph.replay()
         print(seen)
+        print(page.tolist(), offset.tolist())
     """ % cells, gpu="b200")
-    assert out.strip() == str(priced), out
+    lengths, addresses = out.strip().split("\n")
+    assert lengths == str(priced), out
+    assert cells != 64 or addresses == "[77] [45]", out  # where the second step's token goes
 
 
 def test_every_cuda_seam_mstar_reaches_is_emulated():
