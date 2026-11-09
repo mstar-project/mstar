@@ -40,7 +40,7 @@ dependencies = [
     "torchvision>=0.25.0",
     # torchaudio 2.11.1 needs a newer torch than its metadata says (torch>=2.11): its
     # libtorchaudio.so needs stable-ABI symbols torch 2.11 and 2.12 don't export, so it
-    # fails to load, and serving with it, since transformers imports torchaudio.
+    # fails to load, and `mstar serve` exits with it, since transformers imports torchaudio.
     "torchaudio>=2.10.0,!=2.11.1",
     "uvicorn",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed

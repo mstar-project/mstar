@@ -63,8 +63,8 @@ class DockerPinTests(unittest.TestCase):
 
     def test_asr_pins_the_images_torch_stack(self):
         # torchcodec declares no torch requirement and fails to load next to another torch
-        # (0.17 on torch 2.10, 0.10 on torch 2.12), and torchaudio's floor-only metadata let
-        # torch 2.10 take torchaudio 2.11, so the extra pins all three as the images do
+        # (0.17 on torch 2.10, 0.10 on torch 2.12), and torchaudio 2.11.0 declares no torch
+        # requirement either, so torch 2.10 took it; the extra pins all three as the images do
         args = build_args(DOCKERFILES[0])
         extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
         asr = extras["asr"]
