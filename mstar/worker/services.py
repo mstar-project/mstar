@@ -3,15 +3,16 @@ and the read-only facts about this worker's place in the deployment
 (``WorkerLayout``). Neither holds a component's state."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import refuse_combined_walks_across_tp_groups
+from mstar.worker.scheduling_policy import WalkPriority, resolve_walk_priorities
 
 if TYPE_CHECKING:
     from mstar.communication.base import BaseCommunicator
@@ -76,8 +77,13 @@ class WorkerLayout:
     is_tp_follower: bool = False
     # (node, real walk) -> combined walk; scheduling keys use the combined one
     combined_walk_of: Mapping[tuple[str, str], str] = field(default_factory=_no_entries)
-    # (node, walk) -> the model's priority for it (``Model.get_walk_priorities``)
-    walk_priorities: Mapping[tuple[str, str], int] = field(default_factory=_no_entries)
+    # this worker's (node, walk) pairs -> the entry deciding their priority (the
+    # serving config's ``scheduling.walk_priorities``, else ``Model.get_walk_priorities``)
+    walk_priorities: Mapping[tuple[str, str], WalkPriority] = field(default_factory=_no_entries)
+    # the serving config's ``scheduling``: its policy ("priority", or "round_robin"
+    # whatever the priorities), and the ``max_wait`` of a key no entry bounds
+    scheduling_policy: str = "priority"
+    default_max_wait: int | None = None
     # (node, walk) keys on the side lane; known once ``EngineManager.build`` has
     # validated them, so ``Worker`` fills this in after building the engines
     side_keys: frozenset[tuple[str, str]] = frozenset()
@@ -120,7 +126,8 @@ class WorkerLayout:
         )
         node_to_partition: dict[str, str] = {}
         innermost: Mapping[tuple[str, str], str] = {}
-        priorities: dict[tuple[str, str], int] = {}
+        priorities: dict[tuple[str, str], WalkPriority] = {}
+        scheduling = SchedulingSettings.from_config((model_config or {}).get("scheduling"))
         consumers: list[Connection] = []
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
@@ -132,7 +139,10 @@ class WorkerLayout:
                         for node_name in section.get_nodes():
                             node_to_partition[node_name] = pdef.name
             innermost = innermost_loops(walks)
-            priorities = walk_priorities_of(model, walks)
+            priorities = {
+                pair: entry for pair, entry in walk_priorities_of(model, walks, scheduling.entries).items()
+                if pair in my_walks
+            }
             topology = model.get_partition_topology()
             if topology:
                 consumers = [
@@ -149,6 +159,8 @@ class WorkerLayout:
             is_tp_follower=bool(parallel - leaders),
             combined_walk_of=MappingProxyType(model.combined_walk_of() if model is not None else {}),
             walk_priorities=MappingProxyType(priorities),
+            scheduling_policy=scheduling.policy,
+            default_max_wait=scheduling.max_wait,
             all_wg_nodes=all_wg_nodes,
             innermost_loop_by_node=MappingProxyType(innermost),
             consumer_connections=tuple(consumers),
@@ -156,19 +168,57 @@ class WorkerLayout:
         )
 
 
-def walk_priorities_of(model: Model, walks: Mapping[str, GraphSection]) -> dict[tuple[str, str], int]:
-    """``Model.get_walk_priorities`` as (node, walk) keys, refusing a pair no walk has:
-    a typo there would silently leave the walk it meant at round robin."""
-    priorities: dict[tuple[str, str], int] = {}
-    for node, by_walk in model.get_walk_priorities().items():
-        for walk, priority in by_walk.items():
-            if walk not in walks or node not in walks[walk].get_nodes():
+@dataclass(frozen=True)
+class SchedulingSettings:
+    """The serving config's ``scheduling`` block, checked."""
+
+    policy: str = "priority"
+    max_wait: int | None = None
+    # the deployment's own priorities, which replace the model's; None keeps the model's
+    entries: tuple[WalkPriority, ...] | None = None
+
+    POLICIES = ("priority", "round_robin")
+    KEYS = frozenset({"policy", "max_wait", "walk_priorities"})
+    ENTRY_KEYS = frozenset(WalkPriority._fields)
+
+    @classmethod
+    def from_config(cls, block: Any) -> SchedulingSettings:
+        if block is None:
+            return cls()
+        if not isinstance(block, Mapping) or block.keys() - cls.KEYS:
+            raise ValueError(f"scheduling must be a mapping of {sorted(cls.KEYS)}, got {block!r}")
+        policy = block.get("policy", "priority")
+        if policy not in cls.POLICIES:
+            raise ValueError(f"scheduling.policy must be one of {cls.POLICIES}, got {policy!r}")
+        max_wait = block.get("max_wait")
+        if max_wait is not None and (not isinstance(max_wait, int) or isinstance(max_wait, bool) or max_wait < 1):
+            raise ValueError(f"scheduling.max_wait must be a positive int, got {max_wait!r}")
+        entries = block.get("walk_priorities")
+        if entries is not None:
+            if not isinstance(entries, list) or not all(
+                isinstance(e, Mapping) and not e.keys() - cls.ENTRY_KEYS for e in entries
+            ):
                 raise ValueError(
-                    f"{type(model).__name__}.get_walk_priorities names {node!r} on walk {walk!r}, "
-                    "which that walk does not run"
+                    "scheduling.walk_priorities must be a list of mappings of "
+                    f"{sorted(cls.ENTRY_KEYS)}, got {entries!r}"
                 )
-            priorities[(node, walk)] = priority
-    return priorities
+            entries = tuple(WalkPriority(**e) for e in entries)
+        return cls(policy=policy, max_wait=max_wait, entries=entries)
+
+
+def walk_priorities_of(
+    model: Model, walks: Mapping[str, GraphSection], entries: Sequence[WalkPriority] | None = None,
+) -> dict[tuple[str, str], WalkPriority]:
+    """``entries`` (the serving config's), else ``Model.get_walk_priorities``, resolved
+    to the (node, walk) pairs of the model's walks they reach. Refuses an entry that names
+    no node or walk the model runs: a typo there would silently leave its target at
+    round robin."""
+    owner = "scheduling.walk_priorities" if entries is not None else f"{type(model).__name__}.get_walk_priorities"
+    return resolve_walk_priorities(
+        model.get_walk_priorities() if entries is None else entries,
+        {walk: section.get_nodes() for walk, section in walks.items()},
+        owner,
+    )
 
 
 def innermost_loops(walks: Mapping[str, GraphSection]) -> dict[tuple[str, str], str]:

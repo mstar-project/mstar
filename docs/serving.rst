@@ -325,6 +325,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        closes its socket with ``1009`` before any handler sees it, so the client gets no
        error frame. Raise it for clients that send big uncompressed frames, such as several
        raw camera images in one openpi observation.
+   * - ``scheduling``
+     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
+       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
+       turns the model's priorities off. ``max_wait``: the most of a worker's steps a ready key
+       may go without running before it goes first, for every key its entry leaves unbounded.
+       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
+       a node, a walk or both, which replaces the model's list; the most specific entry for a
+       pair decides. An entry naming nothing the model runs, a negative priority, a
+       ``max_wait`` under 1, two entries for the same target or an unknown field fail
+       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
+       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation

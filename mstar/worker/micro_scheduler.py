@@ -142,7 +142,7 @@ class MicroScheduler:
         self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
-        self.policy = self._policy(layout.walk_priorities)
+        self.policy = self._policy(layout)
 
         # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
@@ -230,17 +230,29 @@ class MicroScheduler:
             self._budgeted[key] = budgeted
         return budgeted
 
-    def _policy(self, walk_priorities: Mapping[tuple[str, str], int]) -> SchedulingPolicy:
-        """Round robin, or ``Priority`` over the model's (node, walk) priorities. A
-        combined walk's key takes the highest of its walks', so its rows are served as
-        the most urgent of them; each real walk keeps its own, which a chain keys on."""
-        if not any(walk_priorities.values()):
+    def _policy(self, layout: WorkerLayout) -> SchedulingPolicy:
+        """Round robin, or ``Priority`` over this worker's (node, walk) entries. A
+        combined walk's key takes the highest priority and the tightest bound of its
+        walks', so its rows are served as the most urgent of them; each real walk keeps
+        its own, which a chain keys on. A worker with nothing above 0 and nothing bounded
+        keeps round robin, which already serves the least recent key first."""
+        default_wait = layout.default_max_wait
+        if layout.scheduling_policy == "round_robin" or (
+            default_wait is None and not any(e.priority or e.max_wait for e in layout.walk_priorities.values())
+        ):
             return RoundRobin()
-        priorities = dict(walk_priorities)
-        for (node, walk), priority in walk_priorities.items():
-            key = self._key(node, walk)
-            priorities[key] = max(priorities.get(key, priority), priority)
-        return Priority(priorities)
+        priorities: dict[tuple[str, str], int] = {}
+        max_waits: dict[tuple[str, str], int] = {}
+        for (node, walk) in layout.my_walks | layout.walk_priorities.keys():
+            entry = layout.walk_priorities.get((node, walk))
+            priority = entry.priority if entry is not None else 0
+            bound = entry.max_wait if entry is not None and entry.max_wait is not None else default_wait
+            for key in {(node, walk), self._key(node, walk)}:
+                if priority:
+                    priorities[key] = max(priorities.get(key, priority), priority)
+                if bound is not None:
+                    max_waits[key] = min(max_waits.get(key, bound), bound)
+        return Priority(priorities, max_waits)
 
     def chain_yields(self, chain_key: tuple[str, str], consecutive: int, mid_prompt: bool) -> bool:
         """The policy's verdict on whether a speculation chain into ``chain_key`` gives
@@ -455,7 +467,7 @@ class MicroScheduler:
         # scheduled, so round robin picks it again next pass anyway -- and
         # under a colocated model the node behind it is the one that frees
         # its pages (snac_decoder behind Orpheus's LLM).
-        for rr_key in self.policy.order(ready, self.node_and_walk_to_last_batch_num):
+        for rr_key in self.policy.order(ready, self):
             if rr_key in keys:
                 continue  # already tried above, off its backlog
             scheduled = schedule(rr_key, ready.get(rr_key, []))

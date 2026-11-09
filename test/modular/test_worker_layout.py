@@ -62,7 +62,7 @@ def _model(topology=True, combined=None, priorities=None):
         ) if topology else None,
         chunking_policy_of=lambda: {("consumer", "consume"): object()},
         combined_walk_of=lambda: combined or {},
-        get_walk_priorities=lambda: priorities or {},
+        get_walk_priorities=lambda: list(priorities or []),
     )
 
 
@@ -181,9 +181,21 @@ def test_combined_walks_come_from_the_model():
     assert _derive(_model(combined=combined), sharding=SimpleNamespace(groups=[])).combined_walk_of == combined
 
 
-def test_walk_priorities_come_from_the_model_as_node_walk_keys():
-    layout = _derive(_model(priorities={"consumer": {"consume": 2}}))
-    assert dict(layout.walk_priorities) == {("consumer", "consume"): 2}
+def test_walk_priorities_resolve_to_this_workers_pairs_and_the_deployment_replaces_them():
+    from mstar.worker.scheduling_policy import WalkPriority
+
+    model = _model(priorities=[WalkPriority(walk="consume", priority=2), WalkPriority(walk="produce", priority=5)])
+    layout = _derive(model)
+    # "produce" runs on another worker: this one keeps only the pairs it runs
+    assert {pair: e.priority for pair, e in layout.walk_priorities.items()} == {
+        ("consumer", "consume"): 2, ("helper", "consume"): 2,
+    }
+    assert (layout.scheduling_policy, layout.default_max_wait) == ("priority", None)
+    config = {"scheduling": {"policy": "round_robin", "max_wait": 6,
+                             "walk_priorities": [{"node": "consumer", "walk": "consume", "priority": 1}]}}
+    layout = _derive(model, model_config=config)
+    assert {pair: e.priority for pair, e in layout.walk_priorities.items()} == {("consumer", "consume"): 1}
+    assert (layout.scheduling_policy, layout.default_max_wait) == ("round_robin", 6)
 
 
 COMBINED = {("consumer", "consume"): "mixed", ("consumer", "again"): "mixed"}

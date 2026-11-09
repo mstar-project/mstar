@@ -141,6 +141,9 @@ def _applying_chunking(build):
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
+if TYPE_CHECKING:
+    from mstar.worker.scheduling_policy import WalkPriority
+
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
 
@@ -795,14 +798,18 @@ class Model(ABC):
         """
         return type(self).__name__
 
-    def get_walk_priorities(self) -> dict[str, dict[str, int]]:
-        """``{node: {walk: priority}}``: walks a worker serves before others while they
-        have ready rows, higher first; unlisted walks are 0. A speculation chain gives way
-        to a ready walk above its own at once. Empty, the default, keeps round robin.
-        Starves lower walks while a higher one stays ready, so declare it for a walk
-        whose steps are short and latency-sensitive, such as a TTS prompt's first audio,
-        and for every node on that walk's path: a node left at 0 gets fewer turns."""
-        return {}
+    def get_walk_priorities(self) -> "list[WalkPriority]":
+        """Entries naming a node, a walk, or one (node, walk), each with a priority and
+        optionally a ``max_wait``: keys a worker serves before others while they have
+        ready rows, higher first, unlisted 0, and the most steps a key may go without
+        running while ready before it goes first. Where entries overlap, the most
+        specific decides. A speculation chain gives way to a ready key above its own,
+        or one past its bound, at once. Empty, the default, keeps round robin; a
+        deployment's ``scheduling`` block can replace the list or turn it off. Declare
+        a priority for a walk whose steps are short and latency-sensitive, such as a
+        TTS prompt's prefill: a higher key that stays ready holds the rest back up to
+        their ``max_wait``, or indefinitely without one."""
+        return []
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""

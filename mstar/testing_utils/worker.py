@@ -48,7 +48,7 @@ def make_scheduler(
     engine_manager=None, *, parallel_leader_nodes=None, parallel_nodes=frozenset(),
     combined_walk_of=None, chunk_loops=None, side_keys=frozenset(), request_state=None,
     graph_runtime=None, tensor_manager=None, async_sched=(False, None), model_config=None,
-    batch_builder_type=None, speculation_mixes_walks=None, rebuilds=None, walk_priorities=None,
+    batch_builder_type=None, speculation_mixes_walks=None, rebuilds=None, walk_priorities=None, layout_fields=None,
     **scheduler_kwargs,
 ) -> MicroScheduler:
     """A real ``MicroScheduler``, with a real ``Lockstep`` and ``Admission``
@@ -72,6 +72,7 @@ def make_scheduler(
         is_tp_follower=bool(parallel_nodes - parallel_leader_nodes),
         combined_walk_of=combined_walk_of or {}, chunk_loops=chunk_loops or ChunkLoops(),
         side_keys=frozenset(side_keys), walk_priorities=walk_priorities or {},
+        **(layout_fields or {}),
     )
     lifecycle = RequestLifecycle(layout=layout, graph_runtime=graph_runtime)
     admission = Admission(services=services, layout=layout, lifecycle=lifecycle)
