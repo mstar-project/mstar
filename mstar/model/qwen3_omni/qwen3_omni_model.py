@@ -1596,6 +1596,31 @@ class Qwen3OmniModel(Model):
             return self._create_vision_encoder_submodule(device, autocast_dtype)
         return None
 
+    def get_quantization_roots(self):
+        from mstar.model.components.quant_linear import QuantizableLinears
+        from mstar.model.loader.base import CheckpointRules
+        from mstar.model.qwen3_omni.components.thinker import (
+            Qwen3OmniThinkerModel,
+            thinker_remap,
+            thinker_stacked_params,
+        )
+        from mstar.quantization.resolve import QuantizationRoot
+
+        # the Thinker's attention projections and routed experts may go low precision; its router and LM head
+        # stay bf16 (the router isn't a linear here)
+        linears = QuantizableLinears(
+            candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"), keep_bf16=("lm_head",),
+        )
+        return [QuantizationRoot(
+            node="Thinker", root_type=Qwen3OmniThinkerModel, linears=linears,
+            rules=CheckpointRules(
+                stacked_params=thinker_stacked_params(self.config.thinker_text.num_experts),
+                remap=thinker_remap, prefix="thinker.",
+            ),
+            checkpoint_dir=lambda: getattr(self, "local_dir", None),
+            build=lambda comm_group: Qwen3OmniThinkerModel(self.config, comm_group=comm_group),
+        )]
+
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,

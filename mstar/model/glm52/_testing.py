@@ -248,3 +248,32 @@ def build_cpu_resources(
     for rid in request_ids:
         runner.ingest_request(rid)
     return resources, runner
+
+
+_ST_DTYPES = {
+    torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32", torch.float8_e4m3fn: "F8_E4M3",
+    torch.uint8: "U8", torch.int32: "I32", torch.int64: "I64",
+}
+
+
+def planned_load(model, state, load=None, quantization=None):
+    """Load an in-memory GLM-5.2 stream (``(name, tensor)`` pairs) into ``model`` (a ``Glm52ForCausalLM``)
+    under the node's quantization plan, as the engine does for a checkpoint directory: the plan is resolved
+    from the stream's names and dtypes, the stored fp8 linears load as stored, the rest as the plan says.
+    ``load(stream)`` runs the load (default ``model.load_weights``); ``quantization`` is a serving block."""
+    from mstar.model.glm52.quantization import glm52_quantization_root
+    from mstar.quantization.checkpoint import CheckpointQuant, TensorInfo
+    from mstar.quantization.scope import NodeQuantization
+    from mstar.quantization.spec import parse_quantization
+
+    state = list(state)
+    infos = {name: TensorInfo(_ST_DTYPES[t.dtype], tuple(t.shape)) for name, t in state}
+    quant = model.config.quantization_config
+    ckpt = CheckpointQuant.from_tensors(
+        infos, None if quant is None else {"quant_method": "fp8", "weight_block_size": list(quant.weight_block_size)})
+    decl = glm52_quantization_root(model.config, checkpoint_dir=lambda: None)
+    scope = NodeQuantization("LLM", parse_quantization(quantization).for_node("LLM"), [decl], checkpoint=ckpt)
+    with scope.activated():
+        loaded = (load or model.load_weights)(iter(state))
+        scope.finish(model)
+    return loaded

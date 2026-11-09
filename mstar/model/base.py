@@ -140,6 +140,7 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+    from mstar.quantization.resolve import QuantizationRoot
 
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
@@ -774,6 +775,13 @@ class Model(ABC):
         hands each node the subset naming it.
         """
         pass
+
+    def get_quantization_roots(self) -> list["QuantizationRoot"]:
+        """The weights roots whose linears (and MoE experts) a ``quantization:`` block may set, one per node
+        that has one (``mstar.quantization.resolve.QuantizationRoot``). The engine resolves each root's plan
+        against the deployment's block and the checkpoint, and carries it out around the node's own weight
+        loader. Default: none, so the block can't name this model's nodes and its checkpoints load as today."""
+        return []
 
     def get_lora_specs(self) -> list["LoraSpec"]:
         """The per-request LoRA adapters this model can serve: a spec per node they

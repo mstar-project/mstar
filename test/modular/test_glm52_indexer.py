@@ -31,7 +31,11 @@ def _force_cpu_flashinfer(monkeypatch):
 from test_glm52_moe import BLOCK, _fabricate_checkpoint  # noqa: E402
 
 from mstar.engine.resources.dsa.manager import index_topk, select_topk_causal  # noqa: E402
-from mstar.model.glm52._testing import cpu_positions, install_cpu_rope  # noqa: E402
+from mstar.model.glm52._testing import (  # noqa: E402
+    cpu_positions,
+    install_cpu_rope,
+    planned_load,  # noqa: E402
+)
 from mstar.model.glm52.components.attention import (  # noqa: E402
     Glm52MLAAttention,
     masked_reference_attention,
@@ -237,14 +241,11 @@ def test_load_indexer_keys_land_dequantized_on_full_layer():
     state, refs = _fabricate_checkpoint(cfg)
 
     # The stream also carries a poison MTP indexer fp8 key with NO scale
-    # sibling — if the layer-index skip stopped running before the dequant
-    # stream, this load would raise "unpaired".
-    loaded = load_glm52_hf_weights(
-        model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
-        num_hidden_layers=cfg.num_hidden_layers,
-    )
+    # sibling: it lands on no parameter of this model, so the plan ignores it, and
+    # the layer-index skip drops it before the dequant pairing could miss its scale.
+    loaded = planned_load(model, state, load=lambda stream: load_glm52_hf_weights(
+        model, stream, cfg.n_routed_experts, num_hidden_layers=cfg.num_hidden_layers,
+    ))
 
     # Completeness both ways still holds with the indexer params included.
     assert loaded == set(dict(model.named_parameters()))
@@ -277,12 +278,9 @@ def test_load_indexer_flag_off_skips_indexer_keys():
     model = Glm52ForCausalLM(cfg)
     state, _ = _fabricate_checkpoint(cfg)
 
-    loaded = load_glm52_hf_weights(
-        model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
-        num_hidden_layers=cfg.num_hidden_layers, load_indexer=False,
-    )
+    loaded = planned_load(model, state, load=lambda stream: load_glm52_hf_weights(
+        model, stream, cfg.n_routed_experts, num_hidden_layers=cfg.num_hidden_layers, load_indexer=False,
+    ))
 
     params = set(dict(model.named_parameters()))
     indexer_params = {n for n in params if ".indexer." in n}

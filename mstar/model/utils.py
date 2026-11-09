@@ -523,6 +523,12 @@ def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -
     ``process_weights_after_loading(device)`` gets it called (the attention layers build
     their absorbed w_kc/w_vc here).
     """
+    from mstar.quantization.scope import active_scope
+
+    # a quantization plan's layers take their final format first: the hooks read the weights they hold
+    scope = active_scope()
+    if scope is not None:
+        scope.finalize_within(root)
     for module in root.modules():
         hook = getattr(module, "process_weights_after_loading", None)
         if callable(hook):

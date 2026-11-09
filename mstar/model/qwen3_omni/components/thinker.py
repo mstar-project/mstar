@@ -53,10 +53,12 @@ def thinker_remap(name: str) -> str | None:
     if "rotary_emb" in name:
         return None
     name = name.replace("block_sparse_moe.", "mlp.")
-    m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", name)
+    # (a quantized checkpoint's ``weight_scale_inv``, ``weight_packed``, ... follow the weight onto
+    # ``<param>_scale_inv``, ``<param>_packed``, ...)
+    m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight\w*)$", name)
     if m:
-        prefix, expert_idx, proj = m.groups()
-        return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
+        prefix, expert_idx, proj, suffix = m.groups()
+        return f"{prefix}.experts.{proj}.__expert{expert_idx}__.{suffix}"
     return name
 
 

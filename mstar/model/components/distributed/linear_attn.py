@@ -32,6 +32,7 @@ from mstar.model.components.linear_attn import (
     GDNProjLayout,
     gate_pad,
 )
+from mstar.model.components.quant_linear import span
 
 
 def _shard_blocks(
@@ -98,6 +99,7 @@ class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | int | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         # an int is already a block index — only names go through the map
         blocks = (
@@ -107,8 +109,9 @@ class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
         offset = 0
         for block in blocks:
             size = self.output_sizes[block]
+            start, rows = span(offset, size, units[0], loaded_weight.shape[0])
             super().weight_loader(
-                param, loaded_weight.narrow(0, offset, size), block,
+                param, loaded_weight.narrow(0, start, rows), block, units=units,
             )
             offset += size
 

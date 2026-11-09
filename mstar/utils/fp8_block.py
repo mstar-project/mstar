@@ -111,6 +111,24 @@ def dequantize_fp8_block_weight(
     return (weight_fp8.to(torch.float32) * scale).to(out_dtype)
 
 
+def quantize_fp8_block_weight(
+    weight: torch.Tensor, block_size: tuple[int, int] = (128, 128),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``weight`` ``(..., out, in)`` as e4m3 plus one fp32 ``scale_inv`` per ``block_size`` tile
+    (``(..., ceil(out/bo), ceil(in/bi))``), each tile's amax mapped to e4m3's largest normal: the
+    block-scale checkpoint layout :func:`dequantize_fp8_block_weight` reads back."""
+    bo, bi = block_size
+    *lead, out_f, in_f = weight.shape
+    nbo, nbi = _ceil_div(out_f, bo), _ceil_div(in_f, bi)
+    padded = torch.nn.functional.pad(weight.float(), (0, nbi * bi - in_f, 0, nbo * bo - out_f))
+    tiles = padded.reshape(*lead, nbo, bo, nbi, bi)
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    scale_inv = (tiles.abs().amax(dim=(-3, -1)) / fp8_max).clamp_min(torch.finfo(torch.float32).tiny)
+    q = (tiles / scale_inv[..., :, None, :, None]).clamp(-fp8_max, fp8_max).to(FP8_DTYPE)
+    q = q.reshape(*lead, nbo * bo, nbi * bi)[..., :out_f, :in_f].contiguous()
+    return q, scale_inv
+
+
 def dequant_fp8_block_stream(
     weights: Iterable[tuple[str, torch.Tensor]],
     quant_config: Fp8BlockQuantConfig,

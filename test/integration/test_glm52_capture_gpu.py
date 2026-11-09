@@ -23,6 +23,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.quantization.scope import load_submodule
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU",
@@ -84,7 +85,7 @@ def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
         monkeypatch.setattr(serve_e2e, "BLOCK", FP8_BLOCK)
         save_file(_hf_checkpoint(ref, cfg), str(tmp_path / "model.safetensors"))
         del ref
-        submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
+        submodule = load_submodule(model, NODE, device="cuda", autocast_dtype=DTYPE)
     else:
         for name, param in ref.named_parameters():
             if name.endswith("e_score_correction_bias"):

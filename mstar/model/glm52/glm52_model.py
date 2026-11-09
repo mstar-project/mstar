@@ -514,6 +514,25 @@ class Glm52Model(Model):
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
+    def get_quantization_roots(self):
+        from mstar.model.glm52.quantization import glm52_quantization_root
+
+        return [glm52_quantization_root(self.config, checkpoint_dir=self._local_checkpoint)]
+
+    def _local_checkpoint(self) -> str | None:
+        """The checkpoint directory when its files are here already (never a download)."""
+        path = getattr(self, "model_path_hf", None)
+        if not path:
+            return None
+        if Path(path).is_dir():
+            return str(path)
+        try:
+            from huggingface_hub import snapshot_download
+
+            return snapshot_download(repo_id=path, cache_dir=self.cache_dir, local_files_only=True)
+        except Exception:  # noqa: BLE001 - not cached here: the boot check skips the checkpoint's headers
+            return None
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -609,8 +628,7 @@ class Glm52Model(Model):
         if quant is not None:
             self.config.quantization_config = quant
             logger.info(
-                "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
-                "fp8=%s, routed experts fp8-resident=%s, kernels=%s.",
-                quant.fmt, quant.weight_block_size, self.config.dense_fp8,
-                self.config.moe_fp8_resident, self.config.kernels,
+                "Glm52Model: fp8 %s checkpoint (block %s); routed experts fp8-resident=%s, "
+                "kernels=%s; the quantization plan places the rest.",
+                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident, self.config.kernels,
             )

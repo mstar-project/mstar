@@ -423,6 +423,20 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_quantization_roots(self):
+        from mstar.model.loader.base import CheckpointRules
+        from mstar.model.qwen3_5.components.language_model import QUANTIZABLE_LINEARS
+        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+        from mstar.quantization.resolve import QuantizationRoot
+
+        return [QuantizationRoot(
+            node="LLM", root_type=Qwen3_5ForCausalLM, linears=QUANTIZABLE_LINEARS,
+            rules=CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper),
+            # the metadata snapshot is the full one once a worker has fetched it
+            checkpoint_dir=lambda: getattr(self, "local_dir", None),
+            build=lambda comm_group: Qwen3_5ForCausalLM(self.config, comm_group),
+        )]
+
     def _create_submodule(
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:

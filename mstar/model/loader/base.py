@@ -193,6 +193,12 @@ def load_weights_into(
 
     Returns: set of parameter paths that received a tensor.
     """
+    from mstar.quantization.scope import active_scope
+
+    # a declared weights root under a quantization scope: its storage swapped and the stream adapted first
+    scope = active_scope()
+    if scope is not None:
+        weights = scope.wrap_load(module, weights, stacked_params, name_remapper)
     stacked = stacked_params or []
     match_stacked = _StackedMatcher(stacked)
     params_dict = dict(module.named_parameters())

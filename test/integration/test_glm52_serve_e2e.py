@@ -20,6 +20,7 @@ from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.quantization.scope import load_submodule
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -286,14 +287,14 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     prompt_ids = prompt_tensors.new_input_tensors["text_inputs"][0].to(DEVICE)
     assert prompt_ids.tolist() == list("hello glm".encode("utf-8"))
 
-    submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
+    submodule = load_submodule(model, NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
 
     # The fp8-resident containers survived autocast + device move.
     moe = submodule.language_model.model.layers[1].mlp
-    assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
-    assert moe.experts.gate_up_proj_fp8.is_cuda
-    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.float32
+    assert moe.experts.gate_up_proj.dtype == torch.uint8
+    assert moe.experts.gate_up_proj.is_cuda
+    assert moe.experts.gate_up_proj_scale_inv.dtype == torch.int32  # fp32 scales in an int32 container
     assert moe.gate.e_score_correction_bias.dtype == torch.float32
     # (16, 16) scale blocks are not the fused kernel's, so the default
     # resolves to the reference dispatch, which registers no CUDA graphs.
@@ -324,7 +325,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
 def test_serve_path_is_deterministic_fp8(tmp_path):
     _write_checkpoint(tmp_path, seed=1)
     model = _load_model(tmp_path)
-    submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
+    submodule = load_submodule(model, NODE, device="cuda", autocast_dtype=DTYPE)
     prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
