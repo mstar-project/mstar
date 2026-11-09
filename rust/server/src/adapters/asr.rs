@@ -74,7 +74,9 @@ fn transcription_kwargs(req: &TranscriptionRequest) -> Result<Kwargs, String> {
     if let Some(prompt) = req.prompt.as_deref().filter(|p| !p.is_empty()) {
         gk::set_default(&mut mk, "initial_prompt", s(prompt));
     }
-    if let Some(t) = req.temperature {
+    // only when sent: its 0.0 default would be logged as ignored on every
+    // request to a model without a sampler
+    if let (true, Some(t)) = (req.temperature_sent, req.temperature) {
         let value = serde_json::Number::from_f64(t).map_or(Kwarg::Float(t), |n| Kwarg::Json(Value::Number(n)));
         gk::set_default(&mut mk, "temperature", value);
     }
@@ -294,6 +296,9 @@ impl OpenAIAdapter for Qwen3ASR {
         if prompt.contains("<|audio_pad|>") {
             return Err("the prompt must not contain <|audio_pad|>".to_string());
         }
+        let mut mk = mk;
+        // the model writes no timestamps; the route's segments come from the windows
+        gk::remove(&mut mk, "timestamps");
         Ok(audio_args(audio_path, String::new(), &["audio", "text"], mk))
     }
     fn stream_text(&self, raw: &str) -> String {

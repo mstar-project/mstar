@@ -72,6 +72,9 @@ pub struct TranscriptionRequest {
     pub prompt: Option<String>,
     pub response_format: String,
     pub temperature: Option<f64>,
+    /// `"temperature" in model_fields_set`: the client sent it (a null too), or
+    /// the driver set it on a window's attempt.
+    pub temperature_sent: bool,
     pub timestamp_granularities: Option<Vec<String>>,
     pub stream: Option<bool>,
     /// Python's int; JSON caps it far below where the range check refuses it.
@@ -88,6 +91,7 @@ impl Default for TranscriptionRequest {
             prompt: None,
             response_format: "json".to_string(),
             temperature: Some(0.0),
+            temperature_sent: false,
             timestamp_granularities: None,
             stream: Some(false),
             seed: None,
@@ -269,6 +273,7 @@ pub fn validate(fields: Vec<(String, FieldValue)>, errors_url: &str) -> Result<T
         }
     }
     if let Some(v) = field("temperature") {
+        req.temperature_sent = true;
         req.temperature = if null(v) {
             None
         } else {
