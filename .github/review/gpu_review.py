@@ -658,7 +658,8 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
                             f"{'not ' if outcome.why else ''}be approved.\n\n{left_for_you(pr, review, outcome)}\n")
         return
     if outcome.why:
-        print("not approved: " + "; ".join(outcome.why))
+        # json.dumps: the model's text and file names, so a newline can't start a workflow command.
+        print("not approved: " + json.dumps("; ".join(outcome.why)))
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"

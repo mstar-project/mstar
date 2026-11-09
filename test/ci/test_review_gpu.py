@@ -442,6 +442,12 @@ class TestComment(unittest.TestCase):
             ("```mermaid\n@team\n```\n```\n@a\n```\n", [], ["@team", "@a"],
              "GitHub draws a mermaid fence, it isn't code"),
             ("```Mermaid\n@team\n```\n", [], ["@team"], "drawn fences are matched in any case"),
+            ("\ufeff```\ncode\n```\n@team\n", ["```\ncode\n```\n"], ["\ufeff", "@team"],
+             "GitHub skips a leading BOM, so the closing line would open a fence here and @team would go live"),
+            ("\ufeff\ufeff```\ncode\n```\n@team\n", ["```\ncode\n```\n"], ["\ufeff", "@team"],
+             "only the first BOM is skipped, so all go"),
+            ("```\nkept @a\n```\n```mermaid\n@team\n", ["kept @a\n"], ["@team", "\n```mermaid"],
+             "a sure fence stays as written before the first unsure one"),
             ("``` &#109;ermaid\n@team\n```\n", [], ["@team"], "a language spelled by an entity may be a drawn one"),
         ]
         for report, kept_text, gone, why in cases:
@@ -456,13 +462,20 @@ class TestComment(unittest.TestCase):
         self.assertEqual(text.count("<!--"), 1, "a fence could carry a forged verdict marker")
         self.assertIn("@a\n```\r@\u200bteam", gpu_review.render_summary.inert_report("```\n@a\n```\r@team"),
                       "a bare \\r ends a line, so that close is a close")
-        twice = "- x\n@a\n```\n@b\n```\n<details>\n@c\n"
-        once = gpu_review.render_summary.inert_report(twice)
-        self.assertEqual(gpu_review.render_summary.inert_report(once), once, "a second pass would change the report")
+        for twice in ("- x\n@a\n```\n@b\n```\n<details>\n@c\n", "```mermaid\n@a\n`````\n~~~~\n@b\n"):
+            once = gpu_review.render_summary.inert_report(twice)
+            self.assertEqual(gpu_review.render_summary.inert_report(once), once,
+                             "a second pass would change the report")
 
     def test_a_report_cant_swallow_what_the_bot_posts_after_it(self):
         _, text = self.comment("```\nnever closed\n")
         self.assertTrue(text.endswith("never closed\n\n```\n"), "an open fence would swallow the approval text")
+        for unsure in ("```mermaid\nnever closed\n", "- x\n  ```\nnever closed\n", "<details>\n```\nnever closed\n",
+                       "```geojson\na\n````\n~~~ x\n"):
+            with self.subTest(unsure):
+                _, text = self.comment(unsure)
+                self.assertNotRegex(text, r"(?m)^[ >\-*+0-9.)]*(`{3}|~{3})",
+                                    "GitHub would open a fence the closers don't close, over the bot's text")
         _, text = self.comment("<details>\n<summary>x</summary>\n\nbody\n")
         self.assertTrue(text.endswith("\n</details>\n"), "an open <details> would fold away the approval text")
         _, text = self.comment("```\n" + "x\n" * 40000)
@@ -623,6 +636,11 @@ class TestApprove(unittest.TestCase):
         text, out, writes = self.approve({"value": "on"}, verdict="fail")
         self.assertEqual(writes, [])
         self.assertIn("- [ ] the live test's verdict is fail", text, "the rule's condition would not reach the human")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.approve({"value": "on"}, verdict="fail", untestable="x\n::add-mask::y")
+        self.assertFalse([x for x in stdout.getvalue().splitlines() if x.startswith("::add-mask")],
+                         "a newline in the model's text would run as a workflow command")
         self.assertNotIn("Not approved", text)
         text, _, _ = self.approve({"value": "off"}, verdict="fail")
         self.assertIn("By the rule this would not be approved.\n\n#### What's left for you\n- [ ] the live test's",

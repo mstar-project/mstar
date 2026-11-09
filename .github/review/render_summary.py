@@ -48,6 +48,9 @@ MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<
 LINE = re.compile(r"[^\r\n]*(?:\r\n?|\n|\Z)")
 FENCE_OPEN = re.compile(r"( {0,3})(?:(`{3,})([^`]*)|(~{3,})(.*))")
 FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+# The start of a run that could open a fence, and only the start: splitting it there leaves no run a fence can open,
+# and a run already split isn't matched again.
+FENCE_RUN = re.compile(r"(?<![\u200b`~])([`~])(?=\1\1)")
 LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]|$)")
 # The HTML a report may keep, exactly so, for a folded section. At the start of a line it opens an HTML block
 # that lasts until a blank line.
@@ -177,11 +180,12 @@ def inert(value):
 def report_blocks(text):
     """`text`, at the top level of a comment, as ([piece, in a fence] for each run of lines, the fence left open or
     ""). A fenced code block by CommonMark's rule is left out of `inert` only where GitHub is sure to read it as one.
-    An opener that isn't sure ends that for the rest of the text, which is then just `inert`, fence or not: one
-    indented under what may be a list item (the item's end also ends the fence, so the next line is outside it),
-    one in the HTML block a bare tag opens (no fence at all), one GitHub draws instead of showing. Skipping only that
-    line wouldn't do: if GitHub does read it as a fence, GitHub's closing line would look like an opener here, and the
-    text after it, outside any fence, would go through unneutralised."""
+    An opener that isn't sure ends that for the rest of the text, which is then just `inert`, fence or not, with
+    every run that could open a fence split, so GitHub opens none either and none swallows the bot's text after the
+    report: one indented under what may be a list item (the item's end also ends the fence, so the next line is
+    outside it), one in the HTML block a bare tag opens (no fence at all), one GitHub draws instead of showing.
+    Skipping only that line wouldn't do: if GitHub does read it as a fence, GitHub's closing line would look like an
+    opener here, and the text after it, outside any fence, would go through unneutralised."""
     lines, fence, sure, listed, html = [], "", True, False, False
     for line in LINE.findall(text):
         body, code = line.rstrip("\r\n"), bool(fence)
@@ -199,7 +203,7 @@ def report_blocks(text):
                     fence, code = opener[2] or opener[4], True
             listed = listed or bool(LIST_ITEM.match(body))
             html = bool(BARE_TAG.search(body)) or (html and body.strip(" \t") != "")
-        lines.append((line, code))
+        lines.append((line if sure else FENCE_RUN.sub("\\1\u200b", line), code))
     return [("".join(line for line, _ in run), code) for code, run in itertools.groupby(lines, lambda x: x[1])], fence
 
 
@@ -207,12 +211,13 @@ def inert_report(text):
     """The box's report as `inert` makes it, except what GitHub shows as written anyway: its fenced code (so a command
     in one still copies) and the exact tags `<details>`, `</details>`, `<summary>` and `</summary>`. A fence can't
     ping, link or load anything, but the bot reads its markers from a comment's raw text, so `<!--` is split there
-    too. A second pass changes nothing."""
+    too. Leading byte order marks go first: GitHub skips one at the start of a comment, and a fence after it would
+    open there and not here. A second pass changes nothing."""
     def neutral(m):
         return m[0] if m[0] == "<" and BARE_TAG.match(m.string, m.start()) else m[0] + "\u200b"
 
     return "".join(piece.replace("<!--", "<\u200b!--") if code else MARKUP.sub(neutral, piece)
-                   for piece, code in report_blocks(text)[0])
+                   for piece, code in report_blocks(text.lstrip("\ufeff"))[0])
 
 
 def report_closers(text):
