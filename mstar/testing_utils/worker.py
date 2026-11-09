@@ -36,11 +36,15 @@ _LAYOUT = frozenset(WorkerLayout.__dataclass_fields__)
 
 def tp_sharding(*workers: str, tp_rank: int | None = None, nodes=frozenset({"node"})) -> ShardingConfig:
     """A request's sharding config whose one TP group, of ``workers`` in rank
-    order, serves every node and walk; no group when no worker is named."""
-    group = ShardingGroup(nodes=set(nodes), tp_size=max(len(workers), 1), _tp_rank=tp_rank)
-    if workers:
-        group.register_workers(list(workers))
-    config = ShardingConfig(groups=[group] if workers else [], tp_enabled_nodes=set(), shard_dim={})
+    order, serves every node and walk; with no worker named, no group, and no
+    node mapped, as the runtime answers for a node it has no mapping for."""
+    if not workers:
+        config = ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
+        config.get_sharding_group = lambda node, walk: None
+        return config
+    group = ShardingGroup(nodes=set(nodes), tp_size=len(workers), _tp_rank=tp_rank)
+    group.register_workers(list(workers))
+    config = ShardingConfig(groups=[group], tp_enabled_nodes=set(), shard_dim={})
     config.get_sharding_group = lambda node, walk: group
     return config
 
