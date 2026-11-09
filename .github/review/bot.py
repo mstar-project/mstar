@@ -607,12 +607,9 @@ def post_inline(repo, pr, head_sha, review, exact=()):
 
 
 def job_token_forms(token):
-    """The job's token as a read of it could carry it: as is, and base64, alone or as actions/checkout stores it
-    (`x-access-token:<token>`). No padding, so a copy that drops it is caught too."""
-    if not token:
-        return ()
-    encoded = [base64.b64encode(v.encode()).decode().rstrip("=") for v in (token, f"x-access-token:{token}")]
-    return (token, *encoded)
+    """The job's token as a read of it could carry it: as is, and base64 with no padding, so a copy that drops it is
+    caught too."""
+    return (token, base64.b64encode(token.encode()).decode().rstrip("=")) if token else ()
 
 
 def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", job_token=""):
@@ -627,7 +624,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", job_to
         review = finished_review(runner_temp)
         post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
-        review = render_summary.carried(review, earlier_outside_diff(repo, pr))
+        # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
+        review = json.loads(redact(json.dumps(render_summary.carried(review, earlier_outside_diff(repo, pr))), exact))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"))
     except Exception as e:
         text = ""
@@ -690,12 +688,12 @@ def labels(out, repo, pr, runner_temp):
         gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", f"labels[]={label}")
 
 
-def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
+def handoff(out, pr, head_sha, mode, runner_temp, home, prev="", job_token=""):
     """A review that stopped before it finished: the handoff a `/review continue` starts from
     ($RUNNER_TEMP/handoff), from the execution file or, after a timeout, the transcript Claude Code writes
     as it goes. A continued run that stops too merges its handoff onto the one it started from (`prev`).
-    Model notes on the PR's own content, so redacted as the summary is; the artifact is public on a public
-    repo."""
+    Model notes on the PR's own content, so redacted as the summary is, the job's token too; the artifact is public
+    on a public repo."""
     previous = None
     if prev:
         try:
@@ -714,8 +712,9 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
         sys.exit("No Claude Code messages to hand off.")
     saved = Path(runner_temp, "handoff")
     saved.mkdir(parents=True, exist_ok=True)
-    (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
-    (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
+    exact = job_token_forms(job_token)
+    (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h}), exact))
+    (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode), exact))
     out["dir"] = str(saved)
 
 

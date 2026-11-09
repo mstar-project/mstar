@@ -387,7 +387,7 @@ def assistant(*content):
 
 
 class TestHandoff(unittest.TestCase):
-    def handoff(self, messages, previous=None):
+    def handoff(self, messages, previous=None, job_token=""):
         """bot.handoff after a run that left `messages`, continuing a run whose handoff.json is `previous`."""
         with tempfile.TemporaryDirectory() as temp, workspace():
             if messages is not None:
@@ -397,7 +397,8 @@ class TestHandoff(unittest.TestCase):
                 prev = str(Path(temp, "prev"))
                 Path(prev).mkdir()
                 Path(prev, "handoff.json").write_text(previous)
-            out, _ = step(bot.handoff, {}, pr="7", head_sha="abc", mode="light", runner_temp=temp, home=temp, prev=prev)
+            out, _ = step(bot.handoff, {}, pr="7", head_sha="abc", mode="light", runner_temp=temp, home=temp, prev=prev,
+                          job_token=job_token)
             saved = Path(temp, "handoff")
             return (out, json.loads((saved / "handoff.json").read_text()) if saved.exists() else None,
                     (saved / "handoff.md").read_text() if saved.exists() else "")
@@ -405,11 +406,13 @@ class TestHandoff(unittest.TestCase):
     def test_a_handoff_merges_onto_the_one_it_continued_and_keeps_leads_off_the_pr(self):
         earlier = json.dumps({"runs": 1, "comments": [], "reads": ["pr-head/z.py"], "note": "", "recent_text": ""})
         token = "ghp_" + "a" * 36
+        job_token = "ghs1234567890abcdef"  # not shaped like a credential, so only `exact` can catch it
         out, h, md = self.handoff([
-            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token}"}),
-        ], earlier)
+            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token} {job_token}"}),
+        ], earlier, job_token)
         self.assertEqual((h["pr"], h["runs"], h["reads"]), ("7", 2, ["pr-head/z.py"]))
-        self.assertIn("**Progress:** P1 `b.py:7` unverified [REDACTED]", md, "a token would reach a public artifact")
+        self.assertIn("**Progress:** P1 `b.py:7` unverified [REDACTED] [REDACTED]", md,
+                      "a token would reach a public artifact")
         self.assertEqual(self.handoff(None, json.dumps({"runs": 1, "comments": [], "reads": [],
                                                         "note": "Progress: a.py done", "recent_text": ""}))[1]["note"],
                          "Progress: a.py done", "a continued run that said nothing would drop the handoff it had")
@@ -524,7 +527,8 @@ class TestAfterTheReview(unittest.TestCase):
         token = "ghs1234567890abcdef"  # not shaped like a credential, so only `exact` can catch it
         basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         posted, summaries = [], []
-        review = {"outside_diff": [], "since_last": f"plain {token}, stored {basic}", "description_problems": [],
+        review = {"outside_diff": [{"priority": "P2", "claim": f"c {token}", "location": "b.py:1", "detail": basic}],
+                  "since_last": f"plain {token}, stored {basic}", "description_problems": [],
                   "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
                   "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
                       {"path": "a.py", "line": 3, "body": f"**[P1]** x {basic.rstrip('=')} y"}]}
@@ -539,6 +543,8 @@ class TestAfterTheReview(unittest.TestCase):
         for text in (posted[0]["body"], summaries[0]):
             self.assertNotIn(token, text, "the token itself would be posted")
             self.assertNotIn(basic.rstrip("="), text, "the token as actions/checkout stores it would be posted")
+        state = json.dumps(render_summary.saved_state(summaries[0]))
+        self.assertNotIn(token, state, "the summary's hidden state would give the token back")
 
     def test_a_refused_comment_cant_start_a_workflow_command(self):
         review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],

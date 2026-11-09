@@ -423,6 +423,7 @@ jobs:
         id: save
         continue-on-error: true
         env:
+          JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.pr.outputs.mode }}
           PREV: ${{ steps.pr.outputs.dir }}
