@@ -17,7 +17,7 @@ from mstar.graph.runtime.base import SpeculationOutput
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
-from mstar.worker.worker import SpeculationTarget
+from mstar.worker.speculation import SpeculationTarget
 
 
 class _Preparer:
@@ -46,10 +46,12 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
             ), []),
         ),
     )
-    worker._spec_preparer = _Preparer()
+    worker.speculator._spec_preparer = _Preparer()
     target = SpeculationTarget(SpeculationOutput(node_name="decoder", graph_walk="walk"), [1, 2, 3])
 
     batch = ScheduledBatch(node_name="audio_encoder", graph_walk="walk")
-    worker._try_speculate_next(SimpleNamespace(batch=batch), target)
+    worker.speculator._try_speculate_next(SimpleNamespace(batch=batch), target)
 
-    assert worker._spec_preparer.prepped == [1, 3], "a request the decoder would not run was carried onto it anyway"
+    assert worker.speculator._spec_preparer.prepped == [1, 3], (
+        "a request the decoder would not run was carried onto it anyway"
+    )

@@ -758,9 +758,40 @@ pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
     ))
 }
 
+/// Is `response_format` one this frontend can stream — `media_io.audio_formats
+/// (stream=True)`, which is `("wav", "pcm")` on both frontends? Read by the
+/// speech route to answer Python's `stream_format` rule: the switch only forces
+/// streaming for a format that is actually streamable, so the SDK's default mp3
+/// still falls back to one whole body.
+pub fn is_streamable_audio_format(fmt: &str) -> bool {
+    let fmt = if fmt.is_empty() { "wav".to_string() } else { fmt.to_lowercase() };
+    matches!(fmt.as_str(), "wav" | "pcm")
+}
+
+/// A client's rejected JSON value named by its type, for a refusal that cannot
+/// quote it. The Python frontend's `describe_rejected` says the same words.
+///
+/// Both frontends quote a string, which is easy to agree on. Reading any other
+/// type back would mean reproducing Python's `repr` of it, and serde_json's
+/// number model does not allow that: an integer outside `i64`/`u64` arrives as
+/// an `f64`, so does `-0`, a float whose decimal needs 17 digits can land one
+/// ULP off without `float_roundtrip`, and an object's keys come out sorted,
+/// `Value` being a `BTreeMap` without `preserve_order`. A client that sent the
+/// wrong type does not need its value read back, so name the type instead.
+pub fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
 /// the Python frontend's does.
-fn py_repr(s: &str) -> String {
+pub fn py_repr(s: &str) -> String {
     static UNPRINTABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let unprintable = UNPRINTABLE
         .get_or_init(|| regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]").unwrap());
@@ -1264,5 +1295,16 @@ mod tests {
     fn connection_failure_does_not_echo_transport_details() {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         refused(&format!("http://127.0.0.1:{port}/a.png"), &local(), "connection failed");
+    }
+    /// `media_io.audio_formats(stream=True)` is `("wav", "pcm")`; an unset
+    /// `response_format` reads as `wav`, as `(req.response_format or "wav")` does.
+    #[test]
+    fn only_wav_and_pcm_can_be_streamed() {
+        for fmt in ["wav", "WAV", "pcm", "PCM", ""] {
+            assert!(is_streamable_audio_format(fmt), "{fmt:?}");
+        }
+        for fmt in ["mp3", "MP3", "flac", "opus", "aac", "ogg", "nonsense"] {
+            assert!(!is_streamable_audio_format(fmt), "{fmt:?}");
+        }
     }
 }

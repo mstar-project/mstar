@@ -722,6 +722,13 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3.config import H3Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3Config())
+    return model
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
@@ -892,6 +899,7 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
+    "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,
     "RippleModel": _ripple,
     "OrpheusModel": _orpheus,

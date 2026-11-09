@@ -32,6 +32,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
+    "minimax_h3": ("mstar.model.minimax_h3.minimax_h3_model", "H3Model"),
     "muse_glimmer": ("mstar.model.muse.glimmer_model", "MuseGlimmerModel"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
@@ -109,6 +110,9 @@ HF_MODELS: dict[str, dict] = {
     # Lightricks LTX-2.5: 22B joint audio-video DiT (distilled), Gemma-4 12B text
     # encoder, video + audio VAEs and a 48 kHz vocoder. Gated on Hugging Face.
     "ltx2_5": {"model_path_hf": "Lightricks/LTX-2.5-Diffusers"},
+    # MiniMax-H3 (FL2VA): 33B packed-sequence audio-video DiT, CFG-distilled, Qwen3-VL-32B
+    # conditioner, ViT video VAE decoder, 32 kHz stereo audio VAE. MiniMax H3 Community License.
+    "minimax_h3": {"model_path_hf": "MiniMaxAI/MiniMax-H3"},
     # Meta's 30B dense agentic VLM (text + image in). Apache-2.0.
     "muse_glimmer": {"model_path_hf": "meta-models/Muse-Glimmer-30B"},
     "ripple_65b": {"model_path_hf": "ricursiveAI/Ripple-65B-Preview"},
