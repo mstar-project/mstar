@@ -119,12 +119,6 @@ def text_tokens(modality: str, tensor: torch.Tensor) -> int:
     return tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0
 
 
-def prompt_tokens(tensors: NameToTensorList) -> int:
-    """The ids in the ``text_inputs`` that ``process_prompt`` returned: the
-    prompt's tokens, but not the positions its media take."""
-    return sum(text_tokens("text", t) for t in tensors.get("text_inputs", ()) if torch.is_tensor(t))
-
-
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -673,6 +667,8 @@ class PreparedInput(NamedTuple):
     tensors: NameToTensorList
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # for the response's usage (``Model.prompt_tokens``)
+    prompt_tokens: int
 
 
 class PreparingInput(NamedTuple):
@@ -954,6 +950,7 @@ class PreprocessWorkerThread:
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
             model_kwargs.pop(name, None)
+        num_prompt_tokens = 0
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -970,6 +967,7 @@ class PreprocessWorkerThread:
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             layouts = model_kwargs.pop("kv_layout", {})
+            num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
                 for key, by_label in layouts.items()
@@ -989,14 +987,13 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs)
+        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
 
     def _finish_input(
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs = prepared
-        num_prompt_tokens = prompt_tokens(tensors)
+        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the

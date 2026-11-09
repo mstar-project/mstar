@@ -1003,6 +1003,14 @@ class Model(ABC):
         """
         pass
 
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        """A response's ``usage.prompt_tokens``: the positions the prompt fills,
+        attachments included, as OpenAI and vLLM count them. ``tensors`` and
+        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``text_inputs``, which hold each attachment's pads in place; a model
+        that splits ``text_inputs`` around its attachments adds theirs."""
+        return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before

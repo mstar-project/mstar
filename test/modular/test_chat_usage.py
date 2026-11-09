@@ -1,7 +1,8 @@
 """A chat reply's ``usage`` and ``finish_reason``.
 
-The data worker counts the prompt's tokens and each text chunk's, the
-conductor returns the prompt count and the output cap it resolved on
+The data worker counts the prompt's positions (``Model.prompt_tokens``) and
+each text chunk's tokens, the conductor returns the prompt count and the
+output cap it resolved on
 ``request_complete``, and the API server ends a ``report_usage`` submission
 with a ``usage`` chunk the chat handlers turn into OpenAI's ``usage`` and
 ``finish_reason``. The Rust frontend's side is in ``rust/server/src/main.rs``
@@ -44,8 +45,11 @@ def _tokenize(text: str) -> list[int]:
 # -- the data worker ----------------------------------------------------------
 
 
+IMAGE_PADS = 3
+
+
 class _Model:
-    """Tokenizes by word and splits the ids around a media span, as Qwen3.5 does."""
+    """Tokenizes by word and expands an image's pad in place, as the shared VLM scaffold (Qwen3.5) does."""
 
     def get_partition_topology(self):
         from mstar.streaming.topology import PartitionTopology
@@ -56,8 +60,10 @@ class _Model:
 
     def process_prompt(self, prompt, *args, **kwargs):
         ids = torch.tensor(_tokenize(prompt), dtype=torch.long)
-        return {"text_inputs": [ids[:2], ids[2:]], "pixel_values": [torch.rand(4, 3)]}
+        pads = torch.full((IMAGE_PADS,), 99)
+        return {"text_inputs": [torch.cat([ids[:2], pads, ids[2:]])], "pixel_values": [torch.rand(4, 3)]}
 
+    prompt_tokens = Model.prompt_tokens
     postprocess_inline = Model.postprocess_inline
     text_output = Model.text_output
 
@@ -78,6 +84,7 @@ class _Comm:
 
 class _TensorManager:
     def store_and_return_tensor_info(self, request_id, tensors, **kwargs):
+        self.stored = tensors
         return {}
 
     def register_for_send(self, request_id, tensor_infos, **kwargs):
@@ -87,25 +94,67 @@ class _TensorManager:
         pass
 
 
-def _data_worker() -> PreprocessWorkerThread:
+def _data_worker(model=None) -> PreprocessWorkerThread:
     return PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
         profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=threading.Event(),
-        communicator=_Comm(), tensor_manager=_TensorManager(), model=_Model(),
+        communicator=_Comm(), tensor_manager=_TensorManager(), model=model or _Model(),
     )
 
 
-def test_the_conductor_is_sent_the_tokenized_prompts_length():
-    worker = _data_worker()
+def _sent_prompt_tokens(worker, modalities, file_paths=None) -> int:
     worker._process_input(PreprocessInput(
-        request_id="r", text=PROMPT, file_paths=None,
-        input_modalities=["text"], output_modalities=["text"], model_kwargs={},
+        request_id="r", text=PROMPT, file_paths=file_paths,
+        input_modalities=modalities, output_modalities=["text"], model_kwargs={},
     ))
     [msg] = worker.communicator.sent
     assert isinstance(msg.body, NewRequestConductor)
-    assert msg.body.prompt_tokens == len(_tokenize(PROMPT))
+    return msg.body.prompt_tokens
+
+
+def test_an_image_prompts_pads_count_as_its_tokens():
+    assert _sent_prompt_tokens(_data_worker(), ["image", "text"]) == len(_tokenize(PROMPT)) + IMAGE_PADS
+
+
+def _qwen3_omni():
+    pytest.importorskip("transformers")
+    from test_qwen3_omni_prefix_cache import _Processor, _Tokenizer
+
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.tokenizer, model._processor, model.config = _Tokenizer(), _Processor(), Qwen3OmniModelConfig()
+    # a 64x96 image is a 4x6 patch grid, 2x3 after the merge
+    return model, 6
+
+
+def _bagel():
+    from test_model_kv_layouts import _bagel
+
+    from mstar.model.bagel.submodules import vit_patches, vit_preprocess
+
+    model = _bagel()
+    cfg = model.config.vit_config.patch_size, model.config.vit_max_num_patch_per_side
+    return model, vit_patches(64, 96, vit_preprocess("default"), *cfg)
+
+
+@pytest.mark.parametrize("build", [_qwen3_omni, _bagel], ids=["qwen3_omni", "bagel"])
+def test_a_prompt_split_around_its_image_counts_the_images_positions(build, tmp_path):
+    """As OpenAI and vLLM count it: the text, the image's two sentinels and a position per image token."""
+    from PIL import Image
+
+    model, image_tokens = build()
+    path = tmp_path / "image.png"
+    Image.new("RGB", (96, 64)).save(path)
+    worker = _data_worker(model)
+
+    sent = _sent_prompt_tokens(worker, ["image", "text"], {"image": [str(path)]})
+
+    text = sum(ids.numel() for ids in worker.tensor_manager.stored["text_inputs"])
+    assert sent == text + 2 + image_tokens
 
 
 def test_each_text_chunk_carries_its_token_count():
