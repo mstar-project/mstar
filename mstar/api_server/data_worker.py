@@ -699,6 +699,8 @@ class PreprocessWorkerThread:
     worker_metrics_requested: threading.Event | None = None
     # class-level so a thread built without __init__ has nothing to send
     conductor_outbox: queue.Queue | None = None
+    # likewise, no bound on a prompt
+    _max_prompt_chars: int | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
     # class-level so a thread built without __init__ stamps no read times
