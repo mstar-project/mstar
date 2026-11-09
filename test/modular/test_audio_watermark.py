@@ -122,7 +122,7 @@ def _batch(rids):
         inputs=[f"in-{rid}" for rid in rids],
         per_request_info_wrapped={rid: None for rid in rids},
         failed_requests=failures,
-        register_failure=lambda rid, error: failures.__setitem__(rid, str(error)),
+        register_failure=lambda rid, error, **_: failures.__setitem__(rid, str(error)),
         step_context=SimpleNamespace(graph_walk="codec_chunk"),
     )
 
