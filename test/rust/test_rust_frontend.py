@@ -1136,6 +1136,36 @@ def test_streaming_speech_wav_and_pcm():
         assert (code, ctype, raw) == (200, "audio/pcm", pcm)
 
 
+def test_speech_forwards_only_a_sent_speed_as_python_does():
+    """A sent speed reaches the model as pydantic parses it (a number, or None
+    for an explicit null), read or logged as ignored there; an unsent one does not."""
+    stub = _AudioStub()
+    with _model_stack("orpheus", stub) as (port, _up):
+        for extra in ({"speed": "1.5"}, {"speed": None}, {}):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/audio/speech",
+                data=json.dumps({"model": "orpheus", "input": "hi", "voice": "tara", **extra}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                assert r.status == 200
+    sent, null, unsent = (sub["mk"] for sub in stub.submitted)
+    assert sent["speed"] == 1.5 and null["speed"] is None and "speed" not in unsent
+
+
+def test_speech_refuses_a_non_finite_speed():
+    """``"inf"`` parses as a number but is refused, as the Python route's normalizer refuses it."""
+    stub = _AudioStub()
+    with _model_stack("orpheus", stub) as (port, _up):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/audio/speech",
+            data=json.dumps({"model": "orpheus", "input": "hi", "voice": "tara", "speed": "inf"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=15)
+    assert exc.value.code == 400 and b"finite" in exc.value.read()
+    assert stub.submitted == []
+
+
 def test_streaming_speech_aborts_the_body_on_a_late_error():
     """A cleanly ended stream would pass for a complete answer, so the read
     must fail: a truncated body, or a dropped connection when the error lands

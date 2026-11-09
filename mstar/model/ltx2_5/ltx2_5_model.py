@@ -31,6 +31,7 @@ The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
@@ -320,10 +321,11 @@ class LTX25Model(Model):
 
         def integer(name: str, default: int) -> int:
             raw = model_kwargs.get(name)
-            try:
-                value = int(default if raw is None else raw)
-            except (TypeError, ValueError):
-                raise ValueError(f"LTX-2.5 {name} must be an integer; got {raw!r}") from None
+            value = default if raw is None else raw
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"LTX-2.5 {name} must be an integer; got {raw!r}")
             if value <= 0:
                 raise ValueError(f"LTX-2.5 {name} must be positive; got {value}")
             return value
@@ -354,10 +356,10 @@ class LTX25Model(Model):
                 f"{lower + geo.temporal_compression}"
             )
         raw_fps = model_kwargs.get("fps")
-        try:
-            fps = float(cfg.default_fps if raw_fps is None else raw_fps)
-        except (TypeError, ValueError):
-            raise ValueError(f"LTX-2.5 fps must be a number; got {raw_fps!r}") from None
+        fps = cfg.default_fps if raw_fps is None else raw_fps
+        if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps):
+            raise ValueError(f"LTX-2.5 fps must be a number; got {raw_fps!r}")
+        fps = float(fps)
         if fps <= 0:
             raise ValueError(f"LTX-2.5 fps must be positive; got {raw_fps!r}")
         if geo.audio_frames(num_frames, fps) < 1:
@@ -383,6 +385,10 @@ class LTX25Model(Model):
                 f"LTX-2.5 generates video and/or audio; got output modalities {sorted(wanted)}"
             )
         return walk
+
+    def request_kwargs(self) -> frozenset[str]:
+        # num_inference_steps and guidance_scale are read only to warn that the fixed schedule ignores them
+        return frozenset({"height", "width", "num_frames", "fps", "recipe", "num_inference_steps", "guidance_scale"})
 
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],

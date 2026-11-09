@@ -370,13 +370,9 @@ class MultimodalDecoderModel(Model):
         admission (a 400), not dropped."""
         return SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
             enable_min_p=bool(self.sampling_defaults.get("min_p")),
         )
-
-    def request_kwargs(self) -> frozenset[str]:
-        # enable_thinking: what each subclass's chat template reads
-        return frozenset(SAMPLING_KEYS) | {"enable_thinking"}
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
@@ -387,6 +383,10 @@ class MultimodalDecoderModel(Model):
             if model_kwargs.get(k) is not None:
                 sampling[k] = model_kwargs[k]
         return {SAMPLER: SamplingReqConfig(**sampling)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # enable_thinking: what each subclass's chat template reads
+        return frozenset({"max_output_tokens", "enable_thinking", *SAMPLING_KEYS})
 
     # -----------------------------------------------------------------------
     # Walk plan

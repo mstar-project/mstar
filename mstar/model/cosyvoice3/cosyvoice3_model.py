@@ -140,6 +140,13 @@ _FLOW_KNOBS = ("n_cfm_timesteps",)
 # them from step_metadata instead of from device tensors
 _LM_FACTS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY)
 _FLOW_FACTS = (VOICE_KEY,)
+# Every model_kwargs key a request may carry, the speech adapter's included
+# (it maps ``instructions`` onto ``instruct``). ``ref_audio`` is read only to
+# refuse it: the adapter turns it into an upload. ``speed`` is not read.
+REQUEST_KWARGS = frozenset({
+    *_LM_KNOBS, *_FLOW_KNOBS, "max_new_tokens", "max_output_tokens", "seed",
+    "voice", "instruct", "ref_text", "ref_audio",
+})
 # the cloning mode process_prompt built the prompt for; the conductor picks the
 # LM walk from it rather than deciding again from the caller's input_modalities
 PROMPT_MODE = "prompt_mode"
@@ -484,7 +491,7 @@ class CosyVoice3Model(Model):
         if mk.get("ref_audio") is not None:
             # only the OpenAI adapter turns a ref_audio string into an upload
             raise ValueError("ref_audio cannot be a model kwarg; upload the clip as a file")
-        for key in ("ref_text", "instruct"):
+        for key in ("ref_text", "instruct", "voice"):
             if mk.get(key) is not None and not isinstance(mk[key], str):
                 raise ValueError(f"{key} must be a string")
         return knobs
@@ -498,6 +505,9 @@ class CosyVoice3Model(Model):
         if model_kwargs.get(MAX_SPEECH_TOKENS) is not None:
             budget = min(budget, int(model_kwargs[MAX_SPEECH_TOKENS]))
         return {DECODE_LOOP: max(1, budget - 1)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         labels = {LM_KV: {LM_LABEL: KVLabel(growth=(("decode", DECODE_LOOP),))}}
@@ -685,7 +695,7 @@ class CosyVoice3Model(Model):
             return "instruct", None
         transcript = mk.get("ref_text")
         if not transcript and not uploaded and mk.get("voice") not in (None, ""):
-            transcript = self._preset_paths(str(mk["voice"]))[1]
+            transcript = self._preset_paths(mk["voice"])[1]
         if transcript and transcript.strip():
             return "zero_shot", transcript.strip()
         return "cross_lingual", None
@@ -723,7 +733,7 @@ class CosyVoice3Model(Model):
         if uploaded:
             wav = uploaded[0]
         elif kwargs.get("voice") not in (None, ""):
-            wav = self.load_audio(str(self._preset_paths(str(kwargs["voice"]))[0]), "cpu").data
+            wav = self.load_audio(str(self._preset_paths(kwargs["voice"])[0]), "cpu").data
         else:
             raise ValueError(
                 "CosyVoice3 needs a reference voice: upload one (ref_audio, with its transcript in "
