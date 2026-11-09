@@ -304,6 +304,7 @@ class Worker:
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
         )
+        self._graph_runtime.set_inline_streams(self.engine_manager.inline_stream_keys)
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
 
         self.request_state = RequestStateManager(

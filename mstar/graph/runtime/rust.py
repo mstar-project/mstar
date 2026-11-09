@@ -302,6 +302,9 @@ class RustGraphRuntime(GraphRuntime):
 
     supports_inline_emit = True
 
+    def set_inline_streams(self, keys: frozenset[tuple[str, str]]) -> None:
+        self._rust.set_inline_streams(sorted(keys))
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(

@@ -1564,6 +1564,7 @@ def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibli
     with nothing staged. A row that also stored a tensor keeps the tensor
     path locally, which is what the consumer would read anyway."""
     rt, book, store = streams_to_sibling
+    rt.set_inline_streams(frozenset({("LLM", "new_token")}))
     rids = [
         rt.add_request(
             request_id=f"r{i}", partition="default", graph_walk=WALK,

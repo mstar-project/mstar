@@ -850,6 +850,12 @@ class GraphRuntime(PhasedPostprocess, ABC):
     # per-request tensor path, which stays correct.
     supports_inline_emit: bool = False
 
+    def set_inline_streams(self, keys: "frozenset[tuple[str, str]]") -> None:
+        """The (node, signal) pairs whose streamed items go as values when the
+        route carries the signal inline (``EngineManager.inline_stream_keys``).
+        A runtime without inline emit sends every item as a tensor."""
+        del keys
+
     # --------- Bookkeeping ----------
     @abstractmethod
     def set_node_metadata(

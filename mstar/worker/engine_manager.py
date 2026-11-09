@@ -182,15 +182,19 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
-def _refuse_uninlinable_streams(submodules: dict, model: Model) -> None:
-    """A signal a node sends down its streams inline
-    (``NodeSubmodule.inline_stream_signals``) may have no tensor to fall back
-    on: a step that keeps its rows on the device stores none. So each of its
-    streams must be one whose items can ride a frame as values: not joined
-    from a chunked producer's pieces, and not driving its consumer's walk,
-    which only a tensor's descriptor carries."""
+def _inline_stream_keys(submodules: dict, model: Model) -> frozenset[tuple[str, str]]:
+    """The (node, signal) pairs whose streamed items the route sends as values
+    (``NodeSubmodule.inline_stream_signals``), for the graph runtime; any other
+    signal's stream keeps its tensors, even one that rides inline to the client.
+
+    Such a signal may have no tensor to fall back on: a step that keeps its
+    rows on the device stores none. So each of its streams must be one whose
+    items can ride a frame as values: not joined from a chunked producer's
+    pieces, and not driving its consumer's walk, which only a tensor's
+    descriptor carries. Startup refuses any other."""
     topology = model.get_partition_topology()
     conns = {c.edge_name: c for c in (topology.connections if topology else [])}
+    keys = set()
     for walk, section in model.get_graph_walk_graphs().items():
         for name, node in section.get_nodes().items():
             submodule = submodules.get(name)
@@ -204,6 +208,8 @@ def _refuse_uninlinable_streams(submodules: dict, model: Model) -> None:
                         f"{type(model).__name__}: {name!r} sends {edge.name!r} inline in walk {walk!r}, "
                         "but its stream joins its items or drives its consumer's walk"
                     )
+                keys.add((name, edge.name))
+    return frozenset(keys)
 
 
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
@@ -331,6 +337,8 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
+    # (node, signal) pairs whose streamed items go as values (``_inline_stream_keys``)
+    inline_stream_keys: frozenset[tuple[str, str]] = frozenset()
 
     @classmethod
     def build(
@@ -406,7 +414,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
-        _refuse_uninlinable_streams(submodules, model)
+        inline_stream_keys = _inline_stream_keys(submodules, model)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
@@ -445,7 +453,10 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
+        return cls(
+            engine=engine, node_names=set(node_names), side_keys=side_keys,
+            inline_stream_keys=inline_stream_keys,
+        )
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

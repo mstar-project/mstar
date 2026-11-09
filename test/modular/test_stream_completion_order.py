@@ -282,6 +282,7 @@ def test_done_before_the_last_inline_item_waits_for_it(tmp_path):
     """An item sent as its value counts as one item sent, so a done signal
     that overtakes it still waits for it."""
     producer = _Producer(tmp_path)
+    producer.rt.set_inline_streams(frozenset({("LLM", EDGE)}))
     descriptor, wgd = producer.step(uuid=11, inline=True)
     assert isinstance(descriptor, EdgeItems) and descriptor.values == [11]
     done = _conduct(_conductor(), [wgd])

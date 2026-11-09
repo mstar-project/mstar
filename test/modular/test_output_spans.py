@@ -34,7 +34,7 @@ from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.engine_manager import (  # noqa: E402
     _refuse_speculated_spans,
-    _refuse_uninlinable_streams,
+    _inline_stream_keys,
     _refuse_unroutable_withholds,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
@@ -385,9 +385,9 @@ def test_startup_refuses_an_inline_stream_whose_items_cannot_go_as_values(conn, 
     talker = {NODE: SimpleNamespace(inline_stream_signals=lambda walk: {"token": "token"})}
     if refused:
         with pytest.raises(ValueError, match="sends 'token' inline"):
-            _refuse_uninlinable_streams(talker, model)
+            _inline_stream_keys(talker, model)
     else:
-        _refuse_uninlinable_streams(talker, model)
+        assert _inline_stream_keys(talker, model) == {(NODE, "token")}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages a CUDA span to pinned host memory")

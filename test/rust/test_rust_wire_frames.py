@@ -1122,6 +1122,7 @@ def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_t
     the frame decodes to the one EdgeItemsBuilder.add_values makes. It counts
     as one item sent, as a descriptor would."""
     mesh = _stream_mesh(tmp_path)
+    mesh.rt.set_inline_streams([("only", "out")])
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     if with_tensor:
         _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
@@ -1131,6 +1132,18 @@ def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_t
     assert builder.add_values("r1", "out", "remote", None, [7], ("", ME, "only", 1, 0))
     assert frame == _sent(WorkerMessage(message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build()))
     assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
+
+
+def test_a_signal_inline_to_the_client_keeps_its_streams_tensors(tmp_path):
+    """A signal the route carries inline goes down a stream as a value only for
+    a node that streams it inline; for any other (one that rides inline to the
+    client, say) its stream keeps the tensor's descriptor."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
+    (frame,) = mesh.run(rid, uuids=[1], route={"inline_signal": "out", "inline_values": [7]})[PEER]
+    assert frame.message_type == WorkerMessageType.EDGE_ITEMS
+    assert frame.body.values == [] and frame.body.uuids == [1]
 
 
 def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):

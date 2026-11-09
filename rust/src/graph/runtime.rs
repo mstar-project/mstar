@@ -184,6 +184,10 @@ pub struct GraphRuntime {
     /// (`Connection.consumer_walk`): they keep INPUT_SIGNALS, whose request
     /// info carries that walk; EDGE_ITEMS has no room for it.
     walk_driven_signals: FxHashSet<String>,
+    /// (node, signal) pairs whose streamed items go as values when the route
+    /// carries the signal inline (`NodeSubmodule.inline_stream_signals`); any
+    /// other stream keeps its tensors, whatever rides inline to the client.
+    inline_streams: FxHashSet<(String, String)>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -1673,6 +1677,7 @@ impl GraphRuntime {
             spec_counter: 0,
             combined_walk_of,
             walk_driven_signals: FxHashSet::default(),
+            inline_streams: FxHashSet::default(),
             postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
@@ -1683,6 +1688,12 @@ impl GraphRuntime {
     /// `walk_driven_signals`). Set once, at construction.
     fn set_walk_driven_signals(&mut self, signals: Vec<String>) {
         self.walk_driven_signals = signals.into_iter().collect();
+    }
+
+    /// The (node, signal) pairs whose streamed items go as values (see
+    /// `inline_streams`). Set once, when the worker's submodules have loaded.
+    fn set_inline_streams(&mut self, keys: Vec<(String, String)>) {
+        self.inline_streams = keys.into_iter().collect();
     }
 
     /// The three sets are node NAMES. A name this worker does not host is
@@ -2724,11 +2735,16 @@ impl GraphRuntime {
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
-        // A streamed edge of the inline signal carries its value too, unless
-        // its consumer's walk follows the producer's (a walk-driven stream
-        // tags every item with it), which only a tensor's descriptor carries.
+        // A streamed edge of the inline signal carries its value too, when the
+        // node streams that signal inline, unless its consumer's walk follows
+        // the producer's (a walk-driven stream tags every item with it), which
+        // only a tensor's descriptor carries.
         let inline_streams = inline_on
-            && inline_sym.is_some_and(|s| !self.walk_driven_signals.contains(self.interner.name(s)));
+            && inline_sym.is_some_and(|s| {
+                let signal = self.interner.name(s);
+                !self.walk_driven_signals.contains(signal)
+                    && self.inline_streams.contains(&(input.node_name.clone(), signal.to_string()))
+            });
         let mut stream_inline: FxHashMap<(u32, Sym), i64> = FxHashMap::default();
         let logprobs: FxHashMap<u32, f64> = input
             .rids
