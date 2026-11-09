@@ -1,4 +1,4 @@
-// B1 VoxCPM2 solve: library contractions and fused consumers, captured by M*'s engine.
+// B1/B8 VoxCPM2 solve: library contractions and fused consumers, captured by M*'s engine.
 #include "gate.cuh"
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -18,8 +18,8 @@ struct Params {
     Element const *cond, *noise, *span;
     float const *cfg, *cos, *sin;
     Element *x, *cond_in, *x_in, *embedding, *time_hidden, *delta_embedding,
-            *delta_hidden, *time, *delta, *hidden, *normed, *qkv, *attn, *up,
-            *activated, *slice, *velocity, *mu0, *mu1, *cond_out, *x_out, *output;
+            *delta_hidden, *time, *delta, *hidden, *normed, *qkv, *attn,
+            *activated, *slice, *mu0, *mu1, *cond_out, *x_out, *output;
     float* partial;
     int batch;
     float eps;
@@ -69,6 +69,39 @@ __global__ __launch_bounds__(384) void key_parallel_attention(__grid_constant__ 
         p.attn[(sample * SEQ + q) * 2048 + head * DIM + tid] = Element(acc);
     }
 }
+// B8 supplies enough heads for one CTA per head; each warp owns a query.
+__global__ __launch_bounds__(352) void warp_query_attention(__grid_constant__ const Params p) {
+    int q = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int head = blockIdx.x % HEADS, sample = blockIdx.x / HEADS, kv = head / 8;
+    float score = -INFINITY;
+    #pragma unroll
+    for (int key = 0; key < SEQ; ++key) {
+        float dot = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int d = lane + 32 * j;
+            dot += float(p.qkv[(sample * SEQ + q) * 2560 + head * DIM + d]) *
+                   float(p.qkv[(sample * SEQ + key) * 2560 + 2048 + kv * DIM + d]);
+        }
+        float value = warp_sum(dot) * 0.08838834764831845f;
+        if (lane == key) score = value;
+    }
+    float maximum = score;
+    #pragma unroll
+    for (int d = 16; d; d /= 2) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, d));
+    float ex = lane < SEQ ? expf(score - maximum) : 0.f;
+    float probability = bf(ex) / warp_sum(ex);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float acc = 0.f;
+        #pragma unroll
+        for (int key = 0; key < SEQ; ++key)
+            acc += __shfl_sync(0xffffffff, probability, key) *
+                   float(p.qkv[(sample * SEQ + key) * 2560 + 2304 + kv * DIM + lane + 32*j]);
+        p.attn[(sample * SEQ + q) * 2048 + head * DIM + lane + 32*j] = Element(acc);
+    }
+}
+
 __global__ __launch_bounds__(128) void phase(__grid_constant__ const Params p, int kind, int step) {
     int rows = 2 * p.batch;
     if (kind == 0) {
@@ -130,7 +163,7 @@ __global__ __launch_bounds__(256) void assemble_norm(__grid_constant__ const Par
     reinterpret_cast<uint2*>(p.normed)[i / 4] = *reinterpret_cast<uint2*>(&normalized);
 }
 // Final projection's BF16 velocity publication is consumed in-register by
-// the original FP32 CFG/Euler equation. One warp owns one B1 sample.
+// the original FP32 CFG/Euler equation. One warp owns one sample.
 __global__ __launch_bounds__(32) void finish_cfg_euler(
     __grid_constant__ const Params p, float const* partial, int step) {
     int b = blockIdx.x, lane = threadIdx.x;
@@ -140,7 +173,7 @@ __global__ __launch_bounds__(32) void finish_cfg_euler(
     for (int j = 0; j < 8; ++j) {
         int i = lane + j * 32;
         float bias = float(p.linear[8].bias[i % 64]);
-        // match finish_contract epilogue=1, followed by phase5 bias addition
+        // Publish the projected velocity in BF16 before adding its bias.
         pos[j] = bf(partial[b * 256 + i]) + bias;
         neg[j] = bf(partial[(b + p.batch) * 256 + i]) + bias;
         dot += pos[j] * neg[j];
@@ -256,22 +289,35 @@ __global__ __launch_bounds__(128) void paired_gate_contract(
     vox::gated_tile(linear, activated, blockIdx.y, blockIdx.x, smem);
 }
 
+// The packed weight rows are eight gate rows followed by their eight up rows.
+__global__ void finish_packed_gate(float const* projected, Element* activated, int rows) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * 4096) return;
+    int row = i / 4096, col = i % 4096;
+    int packed = row * 8192 + (col / 8) * 16 + col % 8;
+    float gate = bf(projected[packed]), up = bf(projected[packed + 8]);
+    activated[i] = Element(gate / (1.f + expf(-gate)) * up);
+}
+
 namespace {
 constexpr size_t WORKSPACE_BYTES = 16 * 1024 * 1024;
 struct Shape { int m, n, k; };
-Shape shape(int i) {
+Shape shape(int i, int batch) {
     constexpr Shape outer[] = {{1,1024,2048}, {1,1024,2048}, {8,1024,64},
         {8,1024,64}, {18,1024,1024}, {18,1024,1024}, {2,1024,1024},
         {2,1024,1024}, {8,64,1024}};
     constexpr Shape block[] = {{22,2560,1024}, {22,1024,2048},
         {22,8192,1024}, {22,1024,4096}};
-    return i < 9 ? outer[i] : block[(i - 9) % 4];
+    auto result = i < 9 ? outer[i] : block[(i - 9) % 4];
+    result.m *= batch;
+    return result;
 }
 bool gate(int i) { return i >= 9 && (i - 9) % 4 == 2; }
 bool direct(int i) { return i == 0 || i == 1 || i == 2 || i == 3 || i == 5 || i == 7; }
-int partitions(int i) {
+int partitions(int i, int batch) {
     if (i < 9) return 1;
     constexpr int parts[] = {2,8,1,8};
+    if (batch == 8 && ((i-9)%4 == 1 || (i-9)%4 == 3)) return 4;
     return parts[(i-9)%4];
 }
 void blas(cublasStatus_t status) { TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "Vox solve cuBLASLt status ", int(status)); }
@@ -292,7 +338,7 @@ struct Contraction {
 struct Algorithms {
     std::array<Contraction,57> contraction;
     int blocks;
-    Algorithms() {
+    explicit Algorithms(int batch) {
         auto prop = at::cuda::getCurrentDeviceProperties();
         TORCH_CHECK(prop->major == 9 && prop->minor == 0, "Vox solve requires Hopper");
         blocks = prop->multiProcessorCount;
@@ -309,8 +355,8 @@ struct Algorithms {
         blas(cublasLtMatmulPreferenceSetAttribute(pref.value,
             CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &bytes, sizeof(bytes)));
         for (int i=0; i<57; ++i) {
-            if (gate(i)) continue;
-            auto [m,n,k] = shape(i);
+            if (gate(i) && batch == 1) continue;
+            auto [m,n,k] = shape(i, batch);
             auto& q = contraction[i];
             blas(cublasLtMatmulDescCreate(&q.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
             cublasOperation_t trans = CUBLAS_OP_T;
@@ -321,7 +367,7 @@ struct Algorithms {
                 blas(cublasLtMatmulDescSetAttribute(q.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &ep, sizeof(ep)));
                 blas(cublasLtMatmulDescSetAttribute(q.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)));
             }
-            int parts = partitions(i), inner = k / parts;
+            int parts = partitions(i, batch), inner = k / parts;
             blas(cublasLtMatrixLayoutCreate(&q.a, CUDA_R_16BF, inner, n, k));
             blas(cublasLtMatrixLayoutCreate(&q.b, CUDA_R_16BF, inner, m, k));
             blas(cublasLtMatrixLayoutCreate(&q.c, direct(i) ? CUDA_R_16BF : CUDA_R_32F, n, m, n));
@@ -341,15 +387,15 @@ struct Algorithms {
         }
     }
 };
-Algorithms& algorithms() {
-    static thread_local std::unordered_map<int,std::unique_ptr<Algorithms>> cache;
+Algorithms& algorithms(int batch) {
+    static thread_local std::unordered_map<int,std::array<std::unique_ptr<Algorithms>,2>> cache;
     int device = c10::cuda::current_device();
-    auto& entry=cache[device];
+    auto& entry=cache[device][batch == 8];
     if (!entry) {
         cudaStreamCaptureStatus status;
         C10_CUDA_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &status));
         TORCH_CHECK(status==cudaStreamCaptureStatusNone, "Warm up Vox solve on the capture thread before capture");
-        entry=std::make_unique<Algorithms>();
+        entry=std::make_unique<Algorithms>(batch);
     }
     return *entry;
 }
@@ -367,29 +413,33 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
     at::Tensor cosine, at::Tensor sine, double eps) {
     TORCH_CHECK(lm.is_cuda(), "Vox solve requires CUDA tensors");
     c10::cuda::CUDAGuard guard(lm.device());
-    check_tensor(lm,lm,{1,2048}); check_tensor(res,lm,{1,2048});
-    check_tensor(cond,lm,{1,4,64}); check_tensor(noise,lm,{1,64,4});
-    check_tensor(cfg,lm,{1},at::kFloat); check_tensor(span,lm,{11});
+    TORCH_CHECK(lm.dim()==2 && (lm.size(0)==1 || lm.size(0)==8), "Vox solve requires B1 or B8");
+    int batch = int(lm.size(0));
+    int tokens = 2 * batch * SEQ;
+    check_tensor(lm,lm,{batch,2048}); check_tensor(res,lm,{batch,2048});
+    check_tensor(cond,lm,{batch,4,64}); check_tensor(noise,lm,{batch,64,4});
+    check_tensor(cfg,lm,{batch},at::kFloat); check_tensor(span,lm,{11});
     TORCH_CHECK(weights.size()==57 && biases.size()==9 && norms.size()==25, "Invalid Vox weight count");
     for (int i=0;i<57;++i) {
-        auto d=shape(i); check_tensor(weights[i],lm,{d.n,d.k});
+        auto d=shape(i, batch); check_tensor(weights[i],lm,{d.n,d.k});
         if(i<9) check_tensor(biases[i],lm,{d.n});
     }
     for(auto const& w:norms) check_tensor(w,lm,{1024});
     check_tensor(cosine,lm,{11,128},at::kFloat); check_tensor(sine,lm,{11,128},at::kFloat);
-    auto& alg=algorithms();
+    auto& alg=algorithms(batch);
     auto st=at::cuda::getCurrentCUDAStream();
     auto lt=at::cuda::getCurrentCUDABlasLtHandle();
     // Allocator-backed invocation storage: captured by the engine's graph pool,
     // stream-ordered in eager execution, and never shared across graphs.
     std::vector<at::Tensor> scratch;
+    // Sizes below describe one request; scale every scratch allocation together.
     auto buffer=[&](int64_t size) {
-        scratch.push_back(at::empty({size},lm.options())); return bfptr(scratch.back());
+        scratch.push_back(at::empty({batch*size},lm.options())); return bfptr(scratch.back());
     };
-    auto output=at::empty({1,4,64},lm.options());
-    auto partial=at::empty({8*22*1024},lm.options().dtype(at::kFloat));
+    auto output=at::empty({batch,4,64},lm.options());
+    auto partial=at::empty({8*tokens*1024},lm.options().dtype(at::kFloat));
     auto workspace=at::empty({int64_t(WORKSPACE_BYTES)},lm.options().dtype(at::kByte));
-    Params p{}; p.batch=1; p.eps=float(eps);
+    Params p{}; p.batch=batch; p.eps=float(eps);
     p.cond=bfptr(cond); p.noise=bfptr(noise); p.span=bfptr(span); p.cfg=cfg.data_ptr<float>();
     p.cos=cosine.data_ptr<float>(); p.sin=sine.data_ptr<float>();
     p.x=buffer(256); p.cond_in=buffer(8*64); p.x_in=buffer(8*64);
@@ -412,17 +462,17 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
     for(int l=0;l<12;++l) {
         proj[9+4*l]={p.normed,p.qkv,nullptr}; proj[10+4*l]={p.attn,p.hidden,p.hidden};
         proj[11+4*l]={p.normed,p.activated,nullptr}; proj[12+4*l]={p.activated,p.hidden,p.hidden};
-        auto a=cute::make_tensor(static_cast<Element const*>(p.normed),cute::make_shape(22,1024),cute::make_stride(1024,cute::_1{}));
+        auto a=cute::make_tensor(static_cast<Element const*>(p.normed),cute::make_shape(tokens,1024),cute::make_stride(1024,cute::_1{}));
         auto b=cute::make_tensor(static_cast<Element const*>(bfptr(weights[11+4*l])),cute::make_shape(8192,1024),cute::make_stride(1024,cute::_1{}));
         gates[l]={cute::make_tma_atom(cute::SM90_TMA_LOAD{},b,vox::SmemLayout{}(cute::_,cute::_,0),cute::Shape<cute::_64,cute::_64>{}),
-                  cute::make_tma_atom(cute::SM90_TMA_LOAD{},a,vox::TokenSmemLayout{}(cute::_,cute::_,0),cute::Shape<cute::_32,cute::_64>{}),22,8192,1024};
+                  cute::make_tma_atom(cute::SM90_TMA_LOAD{},a,vox::TokenSmemLayout{}(cute::_,cute::_,0),cute::Shape<cute::_32,cute::_64>{}),tokens,8192,1024};
     }
     auto mm=[&](int i) {
-        if(gate(i)) {
-            paired_gate_contract<<<dim3(128,1,1),128,sizeof(vox::SharedGated),st>>>(gates[(i-9)/4],p.activated);
+        if(gate(i) && batch == 1) {
+            paired_gate_contract<<<dim3(128,(tokens+31)/32,1),128,sizeof(vox::SharedGated),st>>>(gates[(i-9)/4],p.activated);
             return;
         }
-        auto d=shape(i); auto const& v=proj[i]; auto& q=alg.contraction[i];
+        auto d=shape(i, batch); auto const& v=proj[i]; auto& q=alg.contraction[i];
         auto bias=i<9 ? bfptr(biases[i]) : nullptr;
         if(i<2) blas(cublasLtMatmulDescSetAttribute(q.op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias,sizeof(bias)));
         float alpha=1.f,beta=0.f;
@@ -430,12 +480,19 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
         blas(cublasLtMatmul(lt,q.op,&alpha,bfptr(weights[i]),q.a,v.input,q.b,&beta,dst,q.c,dst,q.c,
             &q.algo,workspace.data_ptr(),WORKSPACE_BYTES,st));
         if(direct(i) || i==8) return;
-        if(i>=9 && (i-9)%4==0) {
+        if (gate(i)) {
+            finish_packed_gate<<<(d.m*4096+255)/256,256,0,st>>>(p.partial,p.activated,d.m);
+        } else if(i>=9 && (i-9)%4==0) {
             finish_qkv_rope<<<(d.m*640+127)/128,128,0,st>>>(p.partial,v.output,d.m,p.cos,p.sin);
         } else if(i>=9) {
             int ni=2*((i-9)/4)+((i-9)%4==1 ? 1 : 2);
-            finish_residual_norm<8><<<d.m,256,0,st>>>(p.partial,v.output,nullptr,v.residual,
-                p.norms[ni],p.normed,p.eps,d.m*d.n,ni==24 ? p.slice : nullptr);
+            if (batch == 8) {
+                finish_residual_norm<4><<<d.m,256,0,st>>>(p.partial,v.output,nullptr,v.residual,
+                    p.norms[ni],p.normed,p.eps,d.m*d.n,ni==24 ? p.slice : nullptr);
+            } else {
+                finish_residual_norm<8><<<d.m,256,0,st>>>(p.partial,v.output,nullptr,v.residual,
+                    p.norms[ni],p.normed,p.eps,d.m*d.n,ni==24 ? p.slice : nullptr);
+            }
         } else {
             finish_contract<<<(d.m*d.n+255)/256,256,0,st>>>(p.partial,v.output,bias,nullptr,d.m,d.n,2);
         }
@@ -443,13 +500,14 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
     phase<<<alg.blocks,128,0,st>>>(p,0,0); mm(0); mm(1); mm(2);
     phase<<<alg.blocks,128,0,st>>>(p,7,0); mm(4); mm(5); mm(6); mm(7);
     for(int step=1;step<10;++step) {
-        mm(3); assemble_norm<<<22,256,0,st>>>(p,step);
+        mm(3); assemble_norm<<<tokens,256,0,st>>>(p,step);
         for(int layer=0;layer<12;++layer) {
             mm(9+4*layer);
-            key_parallel_attention<<<2*HEADS*SEQ,384,0,st>>>(p);
+            if (batch == 8) warp_query_attention<<<2*batch*HEADS,352,0,st>>>(p);
+            else key_parallel_attention<<<2*batch*HEADS*SEQ,384,0,st>>>(p);
             mm(10+4*layer); mm(11+4*layer); mm(12+4*layer);
         }
-        mm(8); finish_cfg_euler<<<1,32,0,st>>>(p,p.partial,step);
+        mm(8); finish_cfg_euler<<<batch,32,0,st>>>(p,p.partial,step);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;

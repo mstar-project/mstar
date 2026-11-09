@@ -1465,10 +1465,10 @@ VoxCPM2 notes
   (zero-shot), a voice description in ``instructions`` (voice design), a
   ``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
   ``ref_text`` (continuation). Output is 48 kHz.
-- H200 can use the native BF16 batch-one patch solve described in
+- H200 can use the native BF16 B1/B8 patch solve described in
   :ref:`voxcpm2-h200-solve`. It runs inside the same engine-owned
   prefill, decode and piecewise-tail graphs; the capture buckets, replay path,
-  request state and streaming behavior are unchanged. Larger batches and
+  request state and streaming behavior are unchanged. Other batches and
   schedules other than ten steps retain the standard solve.
 - The Talker's decode step (both LMs, the local DiT solve, the stop head) is
   ``torch.compile``'d and captured as CUDA graphs at start-up, so a first

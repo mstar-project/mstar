@@ -41,29 +41,36 @@ def test_worker_dtype_cast_preserves_materialized_rotary_values():
     assert torch.equal(obj.cosine, table) and torch.equal(obj.sine, table)
 
 
-def test_dispatch_uses_actual_tensor_layout_and_batch():
+@pytest.mark.parametrize("batch", [1, 8])
+def test_dispatch_uses_actual_tensor_layout_and_batch(batch):
     with FakeTensorMode():
         obj = PatchSolve.__new__(PatchSolve)
         torch.nn.Module.__init__(obj)
         obj.register_buffer("w0", torch.empty((1024, 2048), device="cuda", dtype=torch.bfloat16))
         inputs = [torch.empty(s, device="cuda", dtype=torch.bfloat16)
-                  for s in ((1, 2048), (1, 2048), (1, 4, 64), (1, 64, 4), (1,), (11,))]
+                  for s in ((batch, 2048), (batch, 2048), (batch, 4, 64), (batch, 64, 4), (batch,), (11,))]
         inputs[4] = inputs[4].float()
         assert obj.supports(*inputs)
         changed = list(inputs)
         changed[0] = torch.empty((2, 2048), device="cuda", dtype=torch.bfloat16)
         assert not obj.supports(*changed)
         changed = list(inputs)
-        changed[2] = torch.empty((1, 64, 4), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        changed[2] = torch.empty((batch, 64, 4), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
         assert not obj.supports(*changed)
         changed = list(inputs)
-        changed[5] = inputs[5][:9]
+        changed[5] = torch.empty((9,), device="cuda", dtype=torch.bfloat16)
         assert not obj.supports(*changed)
         changed = list(inputs)
         changed[4] = inputs[4].bfloat16()
         assert not obj.supports(*changed)
+        changed = list(inputs)
+        changed[0] = inputs[0].cpu()
+        assert not obj.supports(*changed)
+        changed = list(inputs)
+        changed[0] = torch.empty((), device="cuda", dtype=torch.bfloat16)
+        assert not obj.supports(*changed)
         output = solve(*inputs, [], [], [], inputs[0], inputs[0], 1e-5)
-        assert output.shape == (1, 4, 64)
+        assert output.shape == (batch, 4, 64)
         assert output.dtype == torch.bfloat16 and output.device == inputs[0].device
         assert output.is_contiguous()
 
@@ -74,7 +81,7 @@ def test_dispatch_uses_actual_tensor_layout_and_batch():
     reason="needs H200, pinned CUTLASS_ROOT and cached VOXCPM2_PATH",
 )
 @torch.inference_mode()
-def test_real_weights_compile_capture_and_fallback():
+def test_real_weights_compile_capture_and_fallback(monkeypatch):
     from mstar.model.voxcpm2.components.local import cfm_t_span
     from mstar.model.voxcpm2.config import VoxCPM2Config
     from mstar.model.voxcpm2.voxcpm2_model import load_generator
@@ -93,11 +100,10 @@ def test_real_weights_compile_capture_and_fallback():
         return (
             *(torch.randn(shape, generator=rng, device="cuda", dtype=torch.bfloat16)
               for shape in ((batch, 2048), (batch, 2048), (batch, 4, 64), (batch, 64, 4))),
-            torch.full((batch,), 2.0, device="cuda", dtype=torch.float32),
+            torch.linspace(0.0, 3.0, batch, device="cuda", dtype=torch.float32),
             cfm_t_span(steps, "cuda", torch.bfloat16),
         )
 
-    xs = inputs(1)
     compiled = torch.compile(model.predict_patch, fullgraph=True)
     # Capture on a warmed stream, exactly as the engine does. Both invocations
     # remain live; a shared mutable output/scratch buffer would fail this check.
@@ -105,9 +111,9 @@ def test_real_weights_compile_capture_and_fallback():
     stream.wait_stream(torch.cuda.current_stream())
     graphs, outputs, expected = [], [], []
     with torch.cuda.stream(stream):
-        for _ in range(2):
-            ys = tuple(x.clone() for x in xs)
-            ys[3].normal_(generator=rng)
+        # Interleaving batches exercises the per-device, per-batch BLAS cache.
+        for batch in (1, 8, 1, 8):
+            ys = inputs(batch)
             expected.append(model.predict_patch(*ys).clone())
             for _ in range(2):
                 compiled(*ys)
@@ -122,6 +128,19 @@ def test_real_weights_compile_capture_and_fallback():
     torch.cuda.current_stream().wait_stream(stream)
     assert all(torch.equal(a, b) for a, b in zip(outputs, expected, strict=True))
 
+    # Replays must read current inputs, including each row's CFG, without
+    # recapture. Keep every graph/output live while refreshing its inputs.
+    with torch.cuda.stream(stream):
+        expected = []
+        for graph, ys in graphs:
+            for dst, src in zip(ys, inputs(ys[0].shape[0]), strict=True):
+                dst.copy_(src)
+            ys[4].add_(0.25)
+            expected.append(model.predict_patch(*ys).clone())
+            graph.replay()
+    torch.cuda.current_stream().wait_stream(stream)
+    assert all(torch.equal(a, b) for a, b in zip(outputs, expected, strict=True))
+
     # Unsupported batches and schedules still execute the original function.
     solver = model.patch_solver
     for case in (inputs(2), inputs(1, 8)):
@@ -131,3 +150,34 @@ def test_real_weights_compile_capture_and_fallback():
         reference = model.predict_patch(*case)
         model.patch_solver = solver
         assert torch.equal(actual, reference)
+
+    # Compare the logical solve in FP32, starting from the same BF16 weights.
+    # Shared norm's CUDA fallback otherwise rounds FP32 inputs back to BF16.
+    from mstar.model.components import norm
+
+    cases = [inputs(1), inputs(8)]
+    actual = [model.predict_patch(*case).clone() for case in cases]
+    model.patch_solver = None
+    model.float()
+
+    def fp32_norm(x, weight, eps=1e-6, rms_norm_dtype=None):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight
+
+    def fp32_add_norm(hidden, residual, weight, eps, gemma_mode=False):
+        assert not gemma_mode
+        summed = hidden + residual
+        return fp32_norm(summed, weight, eps), summed
+
+    monkeypatch.setattr(norm, "run_rms_norm", fp32_norm)
+    monkeypatch.setattr(norm, "add_rms_norm", fp32_add_norm)
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for case, output in zip(cases, actual, strict=True):
+            reference = model.predict_patch(*(x.float() for x in case)).double().flatten(1)
+            delta = output.double().flatten(1) - reference
+            rms = reference.square().mean(1).sqrt().clamp_min(1e-30)
+            assert (delta.square().mean(1).sqrt() / rms).max() < 0.03
+            assert (delta.abs().amax(1) / rms).max() < 0.12
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32

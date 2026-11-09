@@ -1,4 +1,4 @@
-"""H200 B1 VoxCPM2 solve. The engine owns compilation, capture and replay."""
+"""H200 B1/B8 VoxCPM2 solve. The engine owns compilation, capture and replay."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def solve(
 
 @solve.register_fake
 def _solve_fake(lm, residual, cond, noise, cfg, span, weights, biases, norms, cosine, sine, eps):
-    return lm.new_empty((1, 4, 64))
+    return lm.new_empty((lm.shape[0], 4, 64))
 
 
 def pack_gate(weight: torch.Tensor) -> torch.Tensor:
@@ -65,7 +65,7 @@ class PatchSolve(nn.Module):
     """Immutable inference weights; all invocation storage lives inside the op.
 
     Nonpersistent buffers keep device moves coherent without changing checkpoint
-    names. The original weights remain available for larger batches and fallback.
+    names. The original weights remain available for unsupported shapes and fallback.
     """
 
     def __init__(self, model):
@@ -103,10 +103,12 @@ class PatchSolve(nn.Module):
         return self
 
     def supports(self, lm, residual, cond, noise, cfg, span) -> bool:
+        batch = lm.shape[0] if lm.ndim == 2 else 0
         return (
-            lm.shape == (1, 2048) and residual.shape == (1, 2048)
-            and cond.shape == (1, 4, 64) and noise.shape == (1, 64, 4)
-            and cfg.shape == (1,) and span.shape == (11,)
+            batch in (1, 8)
+            and lm.shape == (batch, 2048) and residual.shape == (batch, 2048)
+            and cond.shape == (batch, 4, 64) and noise.shape == (batch, 64, 4)
+            and cfg.shape == (batch,) and span.shape == (11,)
             and all(x.dtype == torch.bfloat16 for x in (lm, residual, cond, noise, span))
             and cfg.dtype == torch.float32 and self.w0.dtype == torch.bfloat16
             and lm.device.type == "cuda" and lm.device == self.w0.device
@@ -140,5 +142,5 @@ def prepare(model) -> PatchSolve | None:
         logger.info("VoxCPM2 H200 solve unavailable: set CUTLASS_ROOT as documented in installation.rst")
         return None
     load_native()
-    logger.info("VoxCPM2: H200 B1 native solve; other shapes retain the standard path")
+    logger.info("VoxCPM2: H200 B1/B8 native solve; other shapes retain the standard path")
     return PatchSolve(model)
