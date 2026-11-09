@@ -641,6 +641,12 @@ class Engine:
         # Only a TP leader drains this, to replicate its resident set onto the
         # rest of the instance; see ``ScheduleTPNode``.
         self._resident_delta: dict[str, OffloadDelta] = {}
+        # resource key -> the resident planner its tables are bound to, which a
+        # node sharing the resource without a planner of its own must reach
+        self._resource_planners: dict[str, ResidentPlanner] = {}
+        # node without a planner -> the planners of the resources it shares,
+        # fixed once every planner is built (`_bind_foreign_planners`)
+        self._foreign_planners: dict[str, tuple[ResidentPlanner, ...]] = {}
         # Nodes this rank leads (journals its moves for the others) and nodes it
         # follows (may not move pages at all — see ``offload_request``). A node
         # that is not sharded is in neither: it owns its own eviction.
@@ -803,14 +809,33 @@ class Engine:
         if not walks:
             return
         resources = submodule_mgmt.resources
+        # from the config, so every rank decides alike whatever the build order
+        resident_nodes = {
+            node for node, mgmt in self._submodules.items()
+            if node != node_name and mgmt.submodule is not None and mgmt.submodule.resident_walks()
+        }
         submodule_mgmt.resident, refused = build_planner(
             node_name, walks,
             {key: resources[key] for key in self._runner.order if key in resources},
             self._resource_nodes, self._device, runner.max_capture_bs(walks),
+            resident_nodes=resident_nodes,
+            sharded_nodes=self._tp_leader_nodes | self._tp_follower_nodes,
         )
         if submodule_mgmt.resident is None:
             logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        else:
+            self._resource_planners.update(dict.fromkeys(resources, submodule_mgmt.resident))
         runner.bind_resident(submodule_mgmt.resident)
+
+    def _bind_foreign_planners(self) -> None:
+        """For each node without a planner, the planners of the resources it
+        shares, once: a host-planned step of every model looks them up."""
+        self._foreign_planners = {
+            node: planners
+            for node, mgmt in self._submodules.items() if mgmt.resident is None
+            if (planners := tuple({self._resource_planners[key] for key in mgmt.resources
+                                   if key in self._resource_planners}))
+        }
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -945,6 +970,7 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+        self._bind_foreign_planners()
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -2227,6 +2253,10 @@ class Engine:
                 batch.committed = step
                 if submodule_mgmt.resident is not None:
                     submodule_mgmt.resident.commit(step, ctx)
+                else:
+                    # a node sharing a resident node's resources moves its rows on the host
+                    for planner in self._foreign_planners.get(batch.node_name, ()):
+                        planner.note_foreign_step(step, ctx)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -3314,9 +3344,14 @@ class Engine:
         return freed
 
     def _release_resident_slot(self, node_name: str, request_id: int) -> None:
-        """An offloaded request needs no slot: a reload is written whole anyway."""
-        planner = self._submodules[node_name].resident
-        if planner is not None:
+        """An offloaded request needs no slot: a reload is written whole anyway.
+        On every planner holding tables of the node's resources, not only the
+        node's own: a node sharing a resident node's pool, without a planner of
+        its own, can offload that node's requests (eviction picks victims
+        worker-wide), and the row would still name the freed pages."""
+        planners = {self._submodules[node_name].resident}
+        planners.update(self._resource_planners.get(key) for key in self._submodules[node_name].resources)
+        for planner in planners - {None}:
             planner.release(request_id)
 
     def reload_request(self, node_name: str, request_id: int) -> bool:

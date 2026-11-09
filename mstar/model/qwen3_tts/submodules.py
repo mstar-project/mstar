@@ -597,6 +597,10 @@ class TalkerSubmodule(ARNodeSubmodule):
             for item in inputs
         ], dim=0)
 
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; `preprocess` reads no planned position or KV location
+        return frozenset({"talker_decode"})
+
     def declare_step(
         self,
         graph_walk: str,

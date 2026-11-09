@@ -688,7 +688,7 @@ Declaring the work also lets the worker handle a cache that is full. If a step c
 
 Returning `None` means that the submodule manages its own resources. This is the legacy path, kept for submodules that have not been migrated.
 
-A walk named in `resident_walks()` runs its captured steps off per-request tables on the device instead of a plan rebuilt per step (`mstar/engine/resources/resident.py`). The walk must declare, for each resource, one stream that takes one token per row, or one it only reads at span 0 (a cross-attention context), with no forks, retention or sink, and its `preprocess` must read no planned position or KV location, because the captured graph fills those in first. Each KV pool of the node keeps its own block table and lengths; positions read the pool their `PositionConfig.kv_cache` names. Capture raises on a declaration that breaks this. The engine turns it on only if every resource of the node can (`Resource.resident_refusal`) and the deployment left `knobs: resident_planning` at `auto`; the worker log says why otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row stale, so the first resident step after them writes it. The sampler takes part on its own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells of the row, so a resident step stages none of them, while the RNG offset, the last token and the repetition-penalty mask stay by the sampler's own row of each request.
+A walk named in `resident_walks()` runs its captured steps off per-request tables on the device instead of a plan rebuilt per step (`mstar/engine/resources/resident.py`). The walk must declare, for each resource, one stream that takes one token per row, or one it only reads at span 0 (a cross-attention context), with no forks, retention or sink, and its `preprocess` must read no planned position or KV location, because the captured graph fills those in first. Each KV pool of the node keeps its own block table and lengths; positions read the pool their `PositionConfig.kv_cache` names. Capture raises on a declaration that breaks this. The engine turns it on only if every resource of the node can (`Resource.resident_refusal`) and the deployment left `knobs: resident_planning` at `auto`; the worker log says why otherwise. A resource the node shares with other nodes is fine while they plan on the host (a sharer's host step marks the rows it moved, and an offload it causes frees the slot on every planner bound to the resource); it is refused if another sharer names resident walks too, or runs in lockstep. Steps of other walks, and eager steps, keep the host plan and leave the row stale, so the first resident step after them writes it. The sampler takes part on its own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells of the row, so a resident step stages none of them, while the RNG offset, the last token and the repetition-penalty mask stay by the sampler's own row of each request.
 
 A `SubmoduleStep` contains a list of `Segment` objects and one `ResourceStep` per resource key:
 
@@ -1206,7 +1206,7 @@ To support it in a model:
     )
     ```
 
-2.  **Build the MoE layers with** `instantiate_moe_block`. Accept `moe_parallel` in `get_submodule` and pass it, with the node's `tp_group`, down to each MoE layer. The helper returns a `ParallelSparseMoeBlock` or an `ExpertParallelSparseMoeBlock`, whose weight loaders keep only the rank's slice or its own experts. `moe_parallel=None` gives TP.
+2.  **Build the MoE layers with** `instantiate_moe_block`. Accept `moe_parallel` in `get_submodule` and pass it, with the node's `tp_group`, down to each MoE layer. The helper returns a `ParallelSparseMoeBlock`, with `expert_parallel=True` under EP. It keeps its experts in a `FusedExperts` (`block.experts`), which owns the `gate_up_proj` / `down_proj` parameters, the weight loaders that keep only the rank's slice or its own experts, and the dispatch. `moe_parallel=None` gives TP.
 
     ```python
     self.mlp = instantiate_moe_block(
@@ -1225,7 +1225,7 @@ To support it in a model:
     - `maybe_log_expert_load(synthetic)`, which implements `log_expert_load_every`. Call it from eager code before each forward, usually from `preprocess`, with `synthetic=engine_inputs.synthetic` so capture and warmup routing are discarded.
     - `moe_token_valid(hidden_states, num_valid_tokens)`, which implements `mask_padding`. It returns the `token_valid` mask for the MoE blocks, or `None` when masking is off. Pass the mask only to MoE layers, not dense MLPs. `num_valid_tokens` must be a `(1,)` device tensor that `preprocess` returns as a static input, so a replay can update it; fill it from `engine_inputs.real_seq_len`. `ThinkerSubmodule.preprocess` shows the wiring.
 
-The shared-expert block (`ParallelSparseMoeBlockWithSharedExpert`) has no EP variant, so a node built from it stays TP-only.
+`instantiate_moe_block` builds no shared-expert block. A node with one (`ParallelSparseMoeBlock(shared_expert=...)`, the Qwen3-Omni Talker's) builds it directly and stays TP-only.
 
 ### Tuned kernel configs {#tuned-kernel-configs}
 

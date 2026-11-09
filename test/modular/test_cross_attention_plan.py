@@ -263,6 +263,21 @@ def test_an_unchanged_step_is_not_planned_again():
     assert wrapper.plans == 2
 
 
+
+def test_a_dropped_preplan_leaves_no_plan_to_skip_to():
+    """A preplan that never runs is dropped: the step that runs in its place on
+    the same slot, over the same pages, plans again rather than reusing a plan
+    whose copies went on the plan stream with nothing ordering them."""
+    manager = _manager()
+    pre = _ctx(("r0", "r1"), _query([1, 1]))
+    pre.is_preplan = True
+    manager.plan(AttentionStep(causal=False), pre)
+    wrapper = manager._preplan_states["main"]
+    assert wrapper.plans == 1
+    manager.clear_preplan()
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    assert manager._current_plan_states["main"] is wrapper and wrapper.plans == 2
+
 def test_a_captured_key_keeps_its_kind():
     manager = _manager()
     manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))

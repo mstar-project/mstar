@@ -1849,7 +1849,10 @@ captured graph fills those in first. Each KV pool of the node keeps its own bloc
 and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
 turns it on only if every resource of the node can (``Resource.resident_refusal``) and
 the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
-otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+otherwise. A resource the node shares with other nodes is fine while they plan on the host (a
+sharer's host step marks the rows it moved, and an offload it causes frees the slot on
+every planner bound to the resource); it is refused if another sharer names resident
+walks too, or runs in lockstep. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
 of the row, so a resident step stages none of them, while the RNG offset, the last token
@@ -2881,9 +2884,10 @@ To support it in a model:
 
 2. **Build the MoE layers with** ``instantiate_moe_block``. Accept ``moe_parallel`` in
    ``get_submodule`` and pass it, with the node's ``tp_group``, down to each MoE layer.
-   The helper returns a ``ParallelSparseMoeBlock`` or an ``ExpertParallelSparseMoeBlock``,
-   whose weight loaders keep only the rank's slice or its own experts. ``moe_parallel=None``
-   gives TP.
+   The helper returns a ``ParallelSparseMoeBlock``, with ``expert_parallel=True`` under EP.
+   It keeps its experts in a ``FusedExperts`` (``block.experts``), which owns the
+   ``gate_up_proj`` / ``down_proj`` parameters, the weight loaders that keep only the rank's
+   slice or its own experts, and the dispatch. ``moe_parallel=None`` gives TP.
 
    .. code-block:: python
 
@@ -2910,8 +2914,9 @@ To support it in a model:
      as a static input, so a replay can update it; fill it from
      ``engine_inputs.real_seq_len``. ``ThinkerSubmodule.preprocess`` shows the wiring.
 
-The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
-a node built from it stays TP-only.
+``instantiate_moe_block`` builds no shared-expert block. A node with one
+(``ParallelSparseMoeBlock(shared_expert=...)``, the Qwen3-Omni Talker's) builds it directly and
+stays TP-only.
 
 Tuned kernel configs
 ~~~~~~~~~~~~~~~~~~~~
