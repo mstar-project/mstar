@@ -181,6 +181,7 @@ class _Recording:
 
     supports_preplan = False
     force_double_buffer = False
+    lean_capture = False
 
     def __init__(self):
         self.calls = []
@@ -404,7 +405,8 @@ def test_a_rebuild_policy_on_a_node_with_a_resource_that_cant_drop_is_refused_at
     _boot_engine({"kv": _manager()})._check_rebuild_policies(_model())
 
     with pytest.raises(ValueError, match=r"\['bounded'\] can't drop"):
-        bounded = SimpleNamespace(supports_drop=False, supports_preplan=False, force_double_buffer=False)
+        bounded = SimpleNamespace(supports_drop=False, supports_preplan=False, force_double_buffer=False,
+                                  lean_capture=False)
         engine = _boot_engine({"kv": _manager(), "bounded": bounded})
         engine._check_rebuild_policies(_model())
 
