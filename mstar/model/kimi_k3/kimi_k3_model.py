@@ -44,6 +44,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import SAMPLING_KEYS
 from mstar.model.kimi_k3.config import (
     ATTN,
     DSA,
@@ -274,7 +275,7 @@ class KimiK3Model(Model):
                     kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER_MLA, sm_scale=cfg.softmax_scale),
             ),
             SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=cfg.vocab_size,
-                        enable_repetion_penalty=True),
+                        enable_repetition_penalty=True),
             RecurrentStateSpec(
                 resource_key=KDA_STATE,
                 nodes={"LLM"},
@@ -328,12 +329,17 @@ class KimiK3Model(Model):
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        params = {k: model_kwargs.get(k, getattr(self.config, k))
-                  for k in ("temperature", "top_p", "repetition_penalty", "ignore_eos")}
-        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
-            if k in model_kwargs:
-                params[k] = cast(model_kwargs[k])
+        # the config's defaults under the knobs the request sets; the sampler refuses one it
+        # was built without (min_p) at ingest
+        params = {
+            **{k: getattr(self.config, k) for k in ("temperature", "top_p", "repetition_penalty", "ignore_eos")},
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
+        }
         return {SAMPLER: SamplingReqConfig(**params)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS,
+                          "enable_thinking", "reasoning_effort", "chat_template_kwargs"})
 
     # -- graph ----------------------------------------------------------------------
 
@@ -384,8 +390,6 @@ class KimiK3Model(Model):
         kwargs = normalize_generation_kwargs(kwargs)
         self.get_request_resource_configs([], [], kwargs)
         self.get_max_output_tokens(**kwargs)
-        if kwargs.get("min_p", 0) > 0:
-            raise ValueError(f"Kimi K3 is served without min_p (min_p={kwargs['min_p']}); send none")
         if kwargs.get("return_logprobs"):
             raise ValueError("Kimi K3 does not report logprobs; leave return_logprobs unset")
         if self._tokenizer_mode == "byte":

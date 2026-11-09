@@ -161,6 +161,15 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
                 )
 
 
+def _flat(value):
+    """Leaves of a nested list/tuple."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flat(item)
+    else:
+        yield value
+
+
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
@@ -535,6 +544,7 @@ class Pi05Model(Model):
         configured, ``robot_state`` is the raw state and is normalized first,
         as openpi's policy does; without, it is binned as given.
         """
+        robot_state = self._robot_state(kwargs.get("robot_state"))
         if self.tokenizer is None:
             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
@@ -546,12 +556,8 @@ class Pi05Model(Model):
             return {}
 
         state_bins = None
-        robot_state = kwargs.get("robot_state")
         if robot_state is not None:
-            state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
-            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
-            if not torch.isfinite(state).all():
-                raise ValueError("robot_state must be finite; it holds NaN or inf")
+            state = robot_state
             if self.norm_stats is not None:
                 state = self.norm_stats.normalize_state(state)
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
@@ -585,6 +591,35 @@ class Pi05Model(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
+
+    def _robot_state(self, raw) -> torch.Tensor | None:
+        """The client's ``robot_state`` as a float64 vector of at most ``state_dim``
+        finite values; anything else is a ``ValueError``. A value outside [-1, 1]
+        (after ``norm_stats``, when configured) bins as openpi's (``discretize_state``)."""
+        if raw is None:
+            return None
+        limit = self.config.state_dim
+        if isinstance(raw, torch.Tensor):
+            state = raw.to(torch.float64)
+        else:
+            if isinstance(raw, (str, bytes)) or any(isinstance(v, (bool, str, bytes)) for v in _flat(raw)):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}")
+            try:
+                state = torch.tensor(raw, dtype=torch.float64)
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}") from None
+        if state.dim() != 1 or not 1 <= state.numel() <= limit:
+            raise ValueError(
+                f"robot_state must be a list of 1 to {limit} numbers; got shape {tuple(state.shape)}"
+            )
+        if not torch.isfinite(state).all():
+            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
+            raise ValueError("robot_state must be finite; it holds NaN or inf")
+        return state
+
+    def request_kwargs(self) -> frozenset[str]:
+        # flow steps and the rest come from the deployment YAML, not the request
+        return frozenset({"robot_state"})
 
     def max_input_files(self) -> dict[str, int]:
         # one image per camera slot the SigLIP capture holds

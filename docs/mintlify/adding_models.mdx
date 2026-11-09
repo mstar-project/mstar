@@ -160,7 +160,7 @@ get_request_resource_configs(
 
 The returned dict is keyed by `resource_key`. The conductor calls this method once per request, with the request's modalities and kwargs as `walk_plan` gets them, and the engine passes each config to its resource when the request is ingested. There are two `ResourceReqConfig` subclasses:
 
-- `SamplingReqConfig` holds `temperature`, `top_k`, `top_p`, `repetition_penalty`, `min_p` and `ignore_eos`. The conductor fills in the per-request seed. `min_p` follows the HF processor order (after the penalty and temperature, before top-k/top-p) and needs `enable_min_p=True` on the node's `SamplerSpec`, which adds the filter to that node's captured sampler only. Further knobs, each needing a `SamplerSpec` capability (CUDA only):
+- `SamplingReqConfig` holds `temperature`, `top_k`, `top_p`, `repetition_penalty`, `min_p`, `penalize_prompt` and `ignore_eos`. The conductor fills in the per-request seed, derived per resource key so each sampler of a request draws its own stream. `min_p` follows the HF processor order (after the penalty and temperature, before top-k/top-p) and needs `enable_min_p=True` on the node's `SamplerSpec`, which adds the filter to that node's captured sampler only. Further knobs, each needing a `SamplerSpec` capability (CUDA only):
 
   - `repetition_window` (`max_repetition_window`): the penalty counts a token's occurrences in the last N generated tokens, `repetition_penalty ** n`.
   - `min_tokens` (`min_tokens_stop_ids`): those ids are barred until `min_tokens` tokens exist; applied after top-k/top-p.
@@ -178,7 +178,8 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
 ```python
 def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-    keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+    keys = ("temperature", "top_p", "top_k", "min_p",
+            "repetition_penalty", "penalize_prompt", "ignore_eos")
     return {
         SAMPLER: SamplingReqConfig(
             **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
@@ -187,6 +188,14 @@ def get_request_resource_configs(self, input_modalities, output_modalities, mode
 ```
 
 BAGEL (`bagel_model.py`) returns both config types. A BAGEL request uses classifier-free guidance or does not, and that choice determines which cache labels the request reads.
+
+Sampling knobs mean the same thing on every model ([Generation parameters](/clients#generation-parameters)), and the server range-checks them before your model sees them. A model's part of that contract:
+
+- Default each knob the request leaves unset from the checkpoint's own `generation_config.json` (`mstar.model.utils.load_generation_defaults`), falling back to your config only when the checkpoint ships none.
+- Raise `ValueError` (a 400) for an input you cannot serve; never clamp, coerce, or fall back silently. A `SamplerSpec` without `enable_repetition_penalty` or `enable_min_p` refuses those knobs at admission, so do not default a penalty onto it.
+- Declare every `model_kwargs` key you read in `request_kwargs()`; any other key a client sends is logged as ignored by the server. `test_model_contracts.py` fails for a registered model that does not override it.
+- Bound a request's length, or a denoise loop's step count, through `get_loop_caps`: the conductor refuses a cap past the loop's `max_iters` instead of cutting the request short, so do not clamp it, or check it against a typed-in limit, yourself.
+- Draw any model-local randomness from the request's seed (`random_seed` on the forward-pass info), never the global RNG.
 
 A spec can also build its own request's config from `model_kwargs` (`NodeResourceSpec.request_config`), which the conductor adds beside the model's. That is how a resource the deployment declares, such as a LoRA pool, takes per-request settings without model code. A row with no config under a resource's key may let that resource run lean for the step; see **Lean captures** under the resources table.
 
@@ -319,7 +328,7 @@ The spec types are:
 | `RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...), block_size=...)` | Block-causal self-attention within each span (`AttentionStep(causal=False)`): causal between `block_size`-token blocks, bidirectional within one. Same config. See [Block-causal attention within spans](/adding_models#block-causal-attention-within-spans). |
 | `BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)` | The same mask over a paged KV cache: a row's new tokens attend its cached blocks and their own, and a step runs only new tokens. FlashInfer only. See [Block-causal attention over a KV cache](#block-causal-attention-over-a-kv-cache). |
 | `PositionSpec(config=PositionConfig(kv_cache=...))` | Position tracking and RoPE. `scheme` is `PosScheme.SEQUENTIAL` or `PosScheme.BLOCK`. The RoPE parameters are set here: `rope_theta`, `rope_scale`, and the Llama-3.1 parameters `low_freq_factor`, `high_freq_factor` and `old_context_len`. Layers rotate with `apply_qk(q, k, label)`. `pos_ids=` rotates at positions the model passes instead of the label's plan, and `k=None` rotates one tensor. `interleave` selects GPT-J pairing, `rotary_dim` a partial rotation, and `rope_table_dtype` a cos/sin table built once (GLM-5.2 uses float32). A model with learned position embeddings also declares this spec, because it needs the position counter. Such a model never applies RoPE. |
-| `SamplerSpec(vocab_size=..., enable_repetion_penalty=...)` | A sampler with its own per-request parameter buffers, philox stream, and optional seen-token mask. `enable_repetion_penalty` declares a capability, not an intention. It selects which kernel variant is recorded into the captured graph. Whether the penalty runs on a given step is decided from the `repetition_penalty` values of the resident requests. `enable_min_p`, `max_repetition_window`, `min_tokens_stop_ids` and `enable_top_p_first` are capabilities of the same kind. See `SamplingReqConfig` above. `loopback_state` declares per-request state a decode loop keeps on the device beside its last sampled token. See [Device loop-back](/adding_models#device-loop-back). |
+| `SamplerSpec(vocab_size=..., enable_repetition_penalty=...)` | A sampler with its own per-request parameter buffers, philox stream, and optional seen-token mask. `enable_repetition_penalty` declares a capability, not an intention. It selects which kernel variant is recorded into the captured graph. Whether the penalty runs on a given step is decided from the `repetition_penalty` values of the resident requests. `enable_min_p`, `max_repetition_window`, `min_tokens_stop_ids` and `enable_top_p_first` are capabilities of the same kind. See `SamplingReqConfig` above. `loopback_state` declares per-request state a decode loop keeps on the device beside its last sampled token. See [Device loop-back](/adding_models#device-loop-back). |
 | `RecurrentStateSpec(config=RecurrentStateConfig(...))` | Fixed-size per-request state that carries between steps (an LSTM's `h` and `c`, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM state, a streaming encoder's caches): one slot per request and label, `labels` naming every label a request's steps address or fork into (`("main",)` by default) so that admission reserves a slot for each, `blocks` naming a shape and dtype for each piece (dtype None: the engine's compute dtype, what its KV caches store), `num_layers` copies of each, `max_slots` slots (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent kernel reads the step's `addressing`. `declare_step` gives each row a `RecurrentStep` segment with span &gt;= 1. The forward reads its rows with `pool.gather(name, start=...)` and writes them back with `pool.scatter_(name, value)`; both follow the step's plan, so there is no addressing to fetch, and eager and captured steps reach the same slots. A row with no saved state (a request's first step, or a padding row) reads `start`, zeros when none is given. `gather` / `scatter_` need the sink, so leave `disable_sink_slot` unset. Parakeet's transducer decode is the example. |
 | `LoraSpec` (built by `module_lora_spec`) | Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device slots, a pinned host tier, and the per-step addressing a LoRA kernel reads. Opt-in (`NodeResourceSpec.opt_in`): declared in this list, built only when the serving YAML has a `resources: lora:` block. One spec spans every node adapters reach, with a pool per node. See [Per-request LoRA adapters](/adding_models#per-request-lora-adapters). |
 
@@ -350,7 +359,7 @@ def get_node_resources(self) -> list[NodeResourceSpec]:
         SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"},
             vocab_size=self.config.vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
         ),
         PositionSpec(
             resource_key=ROPE, nodes={"LLM"},
@@ -385,10 +394,10 @@ If a node's forward samples more than once per step with different parameters, d
 ```python
 SamplerSpec(resource_key=TALKER_SAMPLER, nodes={"Talker"},
             vocab_size=self.config.talker_text.vocab_size,
-            enable_repetion_penalty=True),
+            enable_repetition_penalty=True),
 SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
             vocab_size=self.config.code_predictor.vocab_size,
-            enable_repetion_penalty=False),
+            enable_repetition_penalty=False),
 ```
 
 The forward looks up each sampler by key and calls `.sample()` on it:
@@ -1401,7 +1410,7 @@ BAGEL also supports a CFG-parallel mode. When the config names the extra `LLM_cf
 
 Whisper (`mstar/model/whisper/`) is the reference for encoder-decoder models. It is the smallest complete example of cross-attention over a fixed context.
 
-It has two nodes. `audio_encoder` declares no resources. `decoder` declares six: its own KV cache and attention, a second KV cache for the encoder context, a `CrossAttentionSpec` over that second cache, a `PositionSpec`, and a `SamplerSpec`. The `PositionSpec` exists only for the position counter. Whisper uses learned position embeddings, so the planned ids index an `embed_positions` table instead of driving RoPE. The `SamplerSpec` sets `enable_repetion_penalty=False`, because ASR transcription decodes greedily.
+It has two nodes. `audio_encoder` declares no resources. `decoder` declares six: its own KV cache and attention, a second KV cache for the encoder context, a `CrossAttentionSpec` over that second cache, a `PositionSpec`, and a `SamplerSpec`. The `PositionSpec` exists only for the position counter. Whisper uses learned position embeddings, so the planned ids index an `embed_positions` table instead of driving RoPE. The `SamplerSpec` sets `enable_repetition_penalty=False`, because ASR transcription decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the default. Both caches use 128-token pages and hold `WhisperModel.MAX_CONCURRENT_REQUESTS` (64) requests at full length, plus the sink page that every `KVManager` keeps out of circulation. A sequence is at most `max_target_positions` (448) tokens, which is 4 pages per request, so the self-attention cache has 64 \* 4 + 1 = 257 pages, about 5 GiB for large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context window is `max_source_positions` (1500) tokens, which is 12 pages per request held from prefill to the last token, so the context cache has 64 \* 12 + 1 = 769 pages, about 15 GiB. Sizing the caches is only half of it: `configs/whisper_large.yaml` also sets `max_concurrent_requests: 64`, so the conductor queues further requests instead of the worker offloading decoding requests to admit them. `WhisperModel.validate_config_yaml` refuses at startup a cap that either cache cannot hold after the YAML's `resources:` overrides, through `mstar.model.utils.check_kv_pools_fit`, which any model with KV caches can call the same way.
 
