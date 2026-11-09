@@ -176,7 +176,8 @@ class StopLoops(MessageBody):
 
 @dataclass
 class OffloadDelta:
-    """A rank's offloads and reloads, in the order it made them.
+    """A rank's offloads and reloads, and the verify settles of offloads that moved
+    nothing, in the order it made them.
 
     Ordered so the follower replays the leader's decisions in the same order: a
     sequence that worked for the leader works for the followers too.

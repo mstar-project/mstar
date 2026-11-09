@@ -4635,9 +4635,12 @@ class KVManager(AttentionResource):
     def take_back(self, rids: Sequence[int], counts: Sequence[int], label: str) -> None:
         """Lower each of ``rids``' ``label`` stream by ``counts`` tokens, the
         rejected drafts of a verify step it committed whole. A length, never
-        pages: the next step overwrites the rejected slots, so this commutes
-        with offload, reload and teardown, and no rank needs to journal it.
-        Raises, never clamps, on anything that says the ledger is wrong."""
+        pages: the next step overwrites the rejected slots, so no page move has
+        to be ordered against it. The ranks' lengths still have to agree at each
+        admit. The ledger makes a take-back due at the same step on every rank,
+        and one made outside an admit (an offload's settle) reaches the followers
+        through the resident delta. Raises, never clamps, on anything that says
+        the ledger is wrong."""
         resident = self._resident
         planner = None if resident is None else resident.planner
         touched = False

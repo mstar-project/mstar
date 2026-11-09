@@ -8,10 +8,12 @@ of a later admit (`StepRunner._take_back`), lowering each resource by
 
 Steps are numbered by the node's commits, which every rank of a lockstep
 instance runs in the same order, so the ranks apply the same results at the
-same step without a collective. Only the admitted step's own rows are taken
-back: theirs are the lengths the step reads, and a row a step holds can't be
-torn down under the pass. A row that isn't running keeps its results until it
-next runs, is offloaded (`settle`) or is torn down. Postprocess of step S
+same step without a collective. A settle outside an admit is rank 0's alone, so
+it reaches the followers through the resident delta (`OffloadDelta`). Only the
+admitted step's own rows are taken back: theirs are the lengths the step reads,
+and a row a step holds can't be torn down under the pass. A row that isn't
+running keeps its results until it next runs, is picked as an offload's victim
+(`settle`) or is torn down. Postprocess of step S
 precedes the admit of step S + 2 on every worker path (the worker arms S + 2
 only after S's postprocess), so a row's result is due two steps on
 (asynchronous mode); in synchronous mode the step's rows were post-processed
