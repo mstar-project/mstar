@@ -66,8 +66,10 @@ logger = logging.getLogger(__name__)
 # ignore_eos) reach a model. Two tiers:
 #   - Dynamo router/frontend envelope fields: never model input.
 #   - OpenAI-standard fields with no M* mapping: stripped so they don't
-#     pollute model_kwargs. When a model starts consuming one of these
-#     from model_kwargs, delete it here and it flows through.
+#     pollute model_kwargs. When a model starts consuming min_tokens or
+#     eos_token_ids, delete it here and it flows through. The rest are
+#     ``adapters.CHAT_ENVELOPE_KEYS``, which every chat adapter drops as
+#     well; this strips them from every body, image and video too.
 _STRIP_KEYS = {
     # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",

@@ -386,7 +386,9 @@ Endpoints and model coverage:
        the ``audio`` extra (Python frontend only); streamed audio is ``pcm16``. ``n`` or
        ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
        ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
-       other than text are refused.
+       other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
+       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
+       sends no usage chunk.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise
