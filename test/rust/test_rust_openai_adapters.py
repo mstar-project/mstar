@@ -51,6 +51,7 @@ ROUTES = {
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED = {
     ("LTX25Adapter", "videos"),
+    ("MiniMaxH3Adapter", "videos"),
     ("Wan22Adapter", "videos"),
 }
 

@@ -337,6 +337,10 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # torch.compile mode for the region; None takes the deployment's compile
     # level (mstar serve -O), a mode opts the config out of it
     compile_mode: str | None = None
+    # Every shape is captured or the worker refuses to start: for a region with no
+    # eager path, whose state lives only where its captures read and write it, a shape
+    # left out (for memory, or failed) would fail its requests at serving time instead.
+    required: bool = False
 
     def __post_init__(self):
         check_compile_mode(self.compile_mode)
