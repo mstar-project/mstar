@@ -270,8 +270,9 @@ class SpeculationBuilder:
         per_request_inputs = prep.per_request_inputs
         request_to_worker_graph = prep.request_to_worker_graph
         if prep.rows_wg_id is not None:
-            # the columns can't carry a fresh row (above): the general
-            # assembly, with the continuing rows ahead of the fresh ones
+            # a fresh row brought what the columns can't carry (above), or runs
+            # another walk: the general assembly, with the continuing rows
+            # ahead of the fresh ones
             per_request_inputs = {**{r: {} for r in prep.ready_rids}, **per_request_inputs}
             request_to_worker_graph = {
                 **dict.fromkeys(prep.ready_rids, prep.rows_wg_id), **request_to_worker_graph,
