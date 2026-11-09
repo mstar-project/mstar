@@ -225,7 +225,7 @@ def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows, c
 
 
 def test_a_ulysses_ragged_attention_divides_its_heads_by_the_nodes_head_shards():
-    """Not by every rank of the node's instance: CFG ranks run whole branches, so they don't divide heads."""
+    """Not by the instance's rank count, which main's CFG axis makes wider than TP x SP (here TP 1, SP 2, CFG 2)."""
     shards = []
     spec = types.SimpleNamespace(
         config=types.SimpleNamespace(shard=shards.append, dtype=torch.float16),
