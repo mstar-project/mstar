@@ -985,7 +985,7 @@ server does, and with <code class="docutils literal notranslate"><span class="pr
 (what the client sends for <code class="docutils literal notranslate"><span class="pre">api_key</span></code>) as well as <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. Every other route still
 takes only <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. A server without the block has none of this: it refuses the
 handshake and has no <code class="docutils literal notranslate"><span class="pre">/healthz</span></code>. Only the Python frontend serves this route;
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> logs a warning and serves without it.</p>
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> and the Dynamo worker log a warning and serve without it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">openpi_client</span></code> sets no size limit on its messages, but the server does:
 <code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code> (by default <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A larger
 observation closes the socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> and no error frame, so a deployment whose robots
@@ -1123,7 +1123,14 @@ naming the base model; see the Qwen3.5 notes in <a class="reference internal" hr
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/chat/completions</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
-<td><p>Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.</p></td>
+<td><p>Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
+<code class="docutils literal notranslate"><span class="pre">audio.format</span></code> <code class="docutils literal notranslate"><span class="pre">wav</span></code> (default), <code class="docutils literal notranslate"><span class="pre">pcm16</span></code>, or <code class="docutils literal notranslate"><span class="pre">mp3</span></code> / <code class="docutils literal notranslate"><span class="pre">flac</span></code> / <code class="docutils literal notranslate"><span class="pre">opus</span></code> with
+the <code class="docutils literal notranslate"><span class="pre">audio</span></code> extra; streamed audio is <code class="docutils literal notranslate"><span class="pre">pcm16</span></code>. <code class="docutils literal notranslate"><span class="pre">n</span></code> or
+<code class="docutils literal notranslate"><span class="pre">best_of</span></code> above 1, <code class="docutils literal notranslate"><span class="pre">stop</span></code>, <code class="docutils literal notranslate"><span class="pre">stop_token_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">logprobs</span></code>, <code class="docutils literal notranslate"><span class="pre">top_logprobs</span></code>,
+<code class="docutils literal notranslate"><span class="pre">logit_bias</span></code>, <code class="docutils literal notranslate"><span class="pre">presence_penalty</span></code> / <code class="docutils literal notranslate"><span class="pre">frequency_penalty</span></code> and a <code class="docutils literal notranslate"><span class="pre">response_format</span></code>
+other than text are refused. <code class="docutils literal notranslate"><span class="pre">stream_options</span></code>, <code class="docutils literal notranslate"><span class="pre">parallel_tool_calls</span></code>, <code class="docutils literal notranslate"><span class="pre">user</span></code>,
+<code class="docutils literal notranslate"><span class="pre">store</span></code>, <code class="docutils literal notranslate"><span class="pre">metadata</span></code> and <code class="docutils literal notranslate"><span class="pre">service_tier</span></code> are accepted and have no effect; a stream
+sends no usage chunk.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>, <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/unload_lora_adapter</span></code></p></td>
 <td><p>any LoRA model whose <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block sets <code class="docutils literal notranslate"><span class="pre">runtime_updates:</span> <span class="pre">true</span></code>;
@@ -1170,11 +1177,14 @@ detection is null (client commits), <code class="docutils literal notranslate"><
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
-<td><p>Image editing (image + prompt → image).</p></td>
+<td><p>Image editing (image + prompt → image). One <code class="docutils literal notranslate"><span class="pre">image</span></code> (or <code class="docutils literal notranslate"><span class="pre">image[]</span></code>), edited
+whole: a <code class="docutils literal notranslate"><span class="pre">mask</span></code>, a second image and <code class="docutils literal notranslate"><span class="pre">n</span></code> &gt; 1 are refused.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p>Image and video results come back inline as <code class="docutils literal notranslate"><span class="pre">b64_json</span></code>; <code class="docutils literal notranslate"><span class="pre">response_format:</span> <span class="pre">&quot;url&quot;</span></code> is
+refused (there is no media store to serve one from).</p>
 <p>Models without an OpenAI surface (<code class="docutils literal notranslate"><span class="pre">pi05</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code>, <code class="docutils literal notranslate"><span class="pre">waypoint</span></code>)
 return <code class="docutils literal notranslate"><span class="pre">404</span></code> on <code class="docutils literal notranslate"><span class="pre">/v1/*</span></code>; use <code class="docutils literal notranslate"><span class="pre">/generate</span></code> or the SDK for them. In particular,
 Waypoint emits live RGB frame chunks and is not routed through the encoded-video
@@ -1214,31 +1224,34 @@ residual codec groups use <code class="docutils literal notranslate"><span class
 <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
 Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">code_predictor_top_p</span></code>) go through
 <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
-<li><p><strong>Whisper / Higgs-Audio</strong> — <code class="docutils literal notranslate"><span class="pre">language</span></code> (ISO-639-1) skips language detection,
-<code class="docutils literal notranslate"><span class="pre">prompt</span></code> conditions the decoder on prior text (it reaches the model as
-<code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code>), and <code class="docutils literal notranslate"><span class="pre">response_format</span></code>
-<code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> (or <code class="docutils literal notranslate"><span class="pre">timestamp_granularities[]</span></code>) asks the
-model for timestamps. Whisper’s language and timestamp tokens travel in the
-text stream and are lifted into <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">segments</span></code> by the server;
-Higgs-Audio emits no timestamps, so its <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> get
-one segment per window, timed to the windows. A
-streaming client receives only the spoken words. Uploads longer than the
-model’s clip (30 s for Whisper) are cut into fixed windows, each at the quietest
-moment before its boundary, and submitted at once. <code class="docutils literal notranslate"><span class="pre">long_form=&quot;sequential&quot;</span></code> in
-<code class="docutils literal notranslate"><span class="pre">extra_body</span></code> runs them in order instead, openai-whisper style: each window gets
-the transcript so far as <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> and the first window’s detected
-language, is decoded with timestamps so the next window can start where its last
-closed segment ended (no word is split by a boundary), and is decoded again when
-its text is a repetition loop (gzip compression ratio above 2.4): first without
-the conditioning text, then at rising temperatures, after which the transcript so
-far stops conditioning later windows. Leave <code class="docutils literal notranslate"><span class="pre">temperature</span></code> at 0 to get that
-fallback; a pinned temperature is used as is. It is several times slower, and only
-it has that repetition guard. Segment timestamps
-are offset to the whole file. For Whisper, <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>
-(5 to 30) sets the window length for one request, and an upload longer than it
-is windowed. An upload, like any audio a request attaches, is refused once it
-decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
-worker). The decode up to that point still runs, so this bounds memory, not
+<li><p><strong>Whisper / Higgs-Audio</strong> — for Whisper, <code class="docutils literal notranslate"><span class="pre">language</span></code> (ISO-639-1) skips language
+detection and <code class="docutils literal notranslate"><span class="pre">prompt</span></code> conditions the decoder on prior text (it reaches the model
+as <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code>); for Higgs-Audio, <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is the transcription instruction
+(the model has a default) and <code class="docutils literal notranslate"><span class="pre">language</span></code> does not reach the decoder: nothing
+detects the language, and <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code>’s <code class="docutils literal notranslate"><span class="pre">language</span></code> is the request’s
+<code class="docutils literal notranslate"><span class="pre">language</span></code> as given, or null. <code class="docutils literal notranslate"><span class="pre">response_format</span></code> <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> /
+<code class="docutils literal notranslate"><span class="pre">vtt</span></code> (or <code class="docutils literal notranslate"><span class="pre">timestamp_granularities[]</span></code>) asks the model for timestamps. Whisper’s
+language and timestamp tokens travel in the text stream and are lifted into
+<code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">segments</span></code> by the server; Higgs-Audio emits no timestamps, so its
+<code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> get one segment per window, timed to the
+windows. A streaming client receives only the spoken words. Uploads longer than 30 s
+are cut into fixed windows, each at the quietest moment before its boundary, and
+submitted at once. <code class="docutils literal notranslate"><span class="pre">long_form=&quot;sequential&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code> runs them in order
+instead; Whisper’s then run openai-whisper style: each window gets the transcript so
+far as <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> and the first window’s detected language, is decoded with
+timestamps so the next window can start where its last closed segment ended (no word
+is split by a boundary), and is decoded again when its text is a repetition loop
+(gzip compression ratio above 2.4): first without the conditioning text, then at
+rising temperatures, after which the transcript so far stops conditioning later
+windows. Higgs-Audio’s windows run at fixed cuts with no conditioning text, but get
+the same retry at rising temperatures. Leave <code class="docutils literal notranslate"><span class="pre">temperature</span></code> at 0 to get that
+fallback; a pinned temperature is used as is. Sequential mode is several times
+slower, and only it has that repetition guard.
+Segment timestamps are offset to the whole file. <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code> in
+<code class="docutils literal notranslate"><span class="pre">extra_body</span></code> (5 to 30) sets the window length for one request, and an upload
+longer than it is windowed. An upload, like any audio a request attaches, is refused
+once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
+data worker). The decode up to that point still runs, so this bounds memory, not
 time: refusing a 31 min file takes about as long as decoding it.</p></li>
 <li><p><strong>Omnilingual ASR</strong> (<code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code>): no language code is needed for any of
 its 1,600+ languages, and <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">prompt</span></code> / <code class="docutils literal notranslate"><span class="pre">temperature</span></code> have no effect. A

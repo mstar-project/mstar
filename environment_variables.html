@@ -1159,8 +1159,9 @@ sets it from <code class="docutils literal notranslate"><span class="pre">--api-
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUEST_TIMEOUT_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
 <td><p>Per-request budget in the Rust frontend, in seconds; on expiry the
-client gets an error and the request is aborted in the backend.
-<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">--rust-frontend</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
+client gets an error and the request is aborted in the backend. <code class="docutils literal notranslate"><span class="pre">0</span></code>
+times every request out; a negative, non-finite or unreadable value is
+the default. <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">--rust-frontend</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
 (<code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLE_RATE</span></code></p></td>

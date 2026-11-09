@@ -1233,8 +1233,9 @@ binds, so no client pays a shape’s first-request cost (torch.compile of a step
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
 <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>, <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, and <code class="docutils literal notranslate"><span class="pre">files</span></code>, a list of media
 inputs in prompt order (text follows them). A file is a path or
-<code class="docutils literal notranslate"><span class="pre">hf://&lt;owner&gt;/&lt;repo&gt;/&lt;path&gt;</span></code> (a file in a model’s HF repo); its modality
-comes from the extension, or give <code class="docutils literal notranslate"><span class="pre">{path:</span> <span class="pre">...,</span> <span class="pre">modality:</span> <span class="pre">...}</span></code>.
+<code class="docutils literal notranslate"><span class="pre">hf://&lt;owner&gt;/&lt;repo&gt;/&lt;path&gt;</span></code> (a file in a model’s HF repo, fetched into
+<code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code>); its modality comes from the extension, or give
+<code class="docutils literal notranslate"><span class="pre">{path:</span> <span class="pre">...,</span> <span class="pre">modality:</span> <span class="pre">...}</span></code>.
 <code class="docutils literal notranslate"><span class="pre">repeat:</span> <span class="pre">N</span></code> sends <code class="docutils literal notranslate"><span class="pre">text</span></code> N times over, a long prompt for a path only
 long prompts take (a long-context prefill). Each entry is sent as many
 times at once as the most data-parallel replicas any of the model’s worker
