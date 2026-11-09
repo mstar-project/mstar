@@ -815,7 +815,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
     # they are still there, unchanged.
-    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}}), exact)
+    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}},
+                                  ensure_ascii=False), exact)
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
