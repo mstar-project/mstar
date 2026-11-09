@@ -890,6 +890,43 @@ def test_a_request_that_samples_a_pad_id_is_never_dropped():
     assert list(rebuilds._kept[NODE][A].sampled) == [5], "a request that sampled text would stop being droppable"
 
 
+@pytest.mark.parametrize("last, forgotten", [(VISION, True), (PREFILL, False)])
+def test_a_pad_id_sampled_after_several_steps_forgets_the_log_only_when_the_last_step_read_more_than_ids(
+    last, forgotten,
+):
+    """The samples go in the rebuild row of a request's last prefill step. A pad there reads an encoder row only
+    when that step read an encoder's output, whatever the steps before it read."""
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=frozenset({91}))}, _graphs(), pool, StepAllowance(), DTYPES)
+    media = RowRecord({"text_inputs": [torch.tensor([1])], "embeds": [torch.zeros(1, 2)]}, {"is_prefill": True})
+    steps = [(VISION, media), (PREFILL, _record((2, 3, 4)))]
+    if last == VISION:
+        steps.reverse()
+    rebuilds._kept[NODE][R] = KeptIds(tuple(LayoutRow(walk, 3) for walk, _ in steps), [r for _, r in steps])
+
+    forgot = rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": torch.tensor([91])}))
+
+    assert (forgot == [R]) == forgotten and (R not in rebuilds._kept[NODE]) == forgotten, (
+        "a rebuild row would give the pad an encoder row" if forgotten else "a request whose rebuild is exact was "
+        "never dropped again"
+    )
+
+
+def test_a_request_of_ids_alone_that_samples_a_pad_id_stays_droppable():
+    """A walk of ids alone runs with no encoder output, so a pad in its rebuild row is embedded as the decode step
+    embedded it. Forgetting its ids left a request its pool admitted as droppable with nothing that could move it."""
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=frozenset({91}))}, _graphs(), pool, StepAllowance(), DTYPES)
+    assert _ingest(rebuilds, R, (PrefixSpan(3, 3, PREFILL),))
+    rebuilds.record(_ran(PREFILL, _rows(R)))
+
+    forgot = rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": torch.tensor([91])}))
+
+    assert not forgot and rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None) is None, (
+        "a text request whose rebuild would write the KV it holds was never dropped again"
+    )
+
+
 @pytest.mark.parametrize("why, node, walk, sampled, iters", [
     ("declares no rebuild policy", "vocoder", DECODE, 1, 0),
     ("keeps no log", NODE, DECODE, None, 0),

@@ -5,7 +5,7 @@ outlives a call."""
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -116,6 +116,12 @@ class Preemption:
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` a row of ``rid``'s rebuild on ``node_name`` ran."""
         self.counts[node_name].rebuild_tokens += tokens
+
+    def refuse_drops(self, rids: Collection[int], node_name: str) -> None:
+        """Tell each paged KV cache of ``node_name`` that no drop can free ``rids``, whose ids the node forgot."""
+        for rid in rids:
+            for key in self._keys[node_name]:
+                self._caches[key].cache.refuse_drops(rid)
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)

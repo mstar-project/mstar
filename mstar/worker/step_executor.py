@@ -840,9 +840,10 @@ class StepExecutor:
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=batch_N.batch.incomplete_node_rids,
         )
-        self._rebuilds.keep_samples(
+        forgot = self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
+        self.preemption.refuse_drops(forgot, batch_N.node_name)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None

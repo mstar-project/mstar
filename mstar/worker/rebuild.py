@@ -473,20 +473,21 @@ class Rebuilds:
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None, skip_rids: Collection[int] = (),
-    ) -> None:
+    ) -> list[int]:
         """Append each kept row's sample, from the stop check's host copy, to its log, once its log holds every
-        prefill step, or forget the log when the sample is one of the policy's ``pad_ids``. ``skip_rids`` are rows
-        whose sample is not real, as for `Engine.step_finished`."""
+        prefill step, or forget the log when the sample is one of the policy's ``pad_ids`` and the last step, whose
+        rebuild row carries the samples, read more than the ids. Returns the requests whose logs it forgot.
+        ``skip_rids`` are rows whose sample is not real, as for `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
-            return
+            return []
         name = self._policies[node].sample_output
         ctx = node_batch.step_context
         if host_rows is not None:
             tokens = host_rows.buffers.get(name)
             if not torch.is_tensor(tokens) or tokens.dim() == 0:
-                return
+                return []
             if tokens.dim() > 1 and tokens[0].numel() != 1:
                 raise ValueError(self._not_one_id(node, name, tokens[0].numel()))
             # the sampler's [B] output skips the reshape, which costs more than the rest of this method
@@ -502,7 +503,7 @@ class Rebuilds:
                 if sample.numel() != 1:
                     raise ValueError(self._not_one_id(node, name, sample.numel()))
                 pairs.append((rid, int(sample)))
-        prefilling, pads = self._prefilling[node], self._policies[node].pad_ids
+        policy, prefilling, forgot = self._policies[node], self._prefilling[node], []
         for rid, token in pairs:
             kept = kept_ids.get(rid)
             # The host rows are the forward's, which can hold a row the worker has since taken out of the step. A
@@ -511,10 +512,12 @@ class Rebuilds:
                 kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids
                 and rid not in prefilling
             ):
-                if token in pads:
+                if token in policy.pad_ids and any(name != policy.ids_input for name in kept.records[-1].inputs):
                     self.forget(rid, node)
+                    forgot.append(rid)
                 else:
                     kept.sampled.append(token)
+        return forgot
 
     @staticmethod
     def _not_one_id(node: str, name: str, count: int) -> str:
