@@ -561,6 +561,16 @@ def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s
     )
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_no_rank_above_one_marks_a_request_undroppable_after_admission_on_its_own(rank):
+    """No move tells the other ranks that a request lost its log after admission, so a rank that marked it alone
+    would reserve host room or guarantee it where the others don't, and their counts would part."""
+    kv = _manager(rank)
+    _ingest(kv, "r", _tokens(PAGE_SIZE, 1))
+
+    with pytest.raises(AssertionError, match="above one rank"):
+        kv.refuse_drops("r")
+
 def _write(kv: KVManager, rid: str, length: int, walk: str) -> None:
     step, ctx = KVStep(segments=(Segment(rid, "main", length),)), _ctx(rid, walk)
     assert kv.admit(step, ctx).ok
