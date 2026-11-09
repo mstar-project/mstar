@@ -85,7 +85,9 @@ class CPUPagePool:
         # {request_id: {label: OffloadedStream}}
         self.offloaded: dict[str, dict[str, OffloadedStream]] = {}
         # request -> the pages set aside for its move here, for a request that no drop can free
+        # `_unmoved` sums the pages set aside that no request has moved into yet.
         self.reserved: dict[str, int] = {}
+        self._unmoved = 0
 
         # copies run here so they don't serialize with compute
         self._stream: torch.cuda.Stream | None = None
@@ -120,11 +122,14 @@ class CPUPagePool:
         the room isn't there."""
         if pages > self.arena.num_free + len(self.index.evictable()) - self._set_aside(rid):
             return False
+        unmoved = self._unmoved_by(rid)
         self.reserved[rid] = pages
+        self._unmoved += self._unmoved_by(rid) - unmoved
         self._keep_free(0)
         return True
 
     def unreserve(self, rid: str) -> None:
+        self._unmoved -= self._unmoved_by(rid)
         self.reserved.pop(rid, None)
 
     def count_guaranteed(self, rid: str) -> None:
@@ -141,10 +146,13 @@ class CPUPagePool:
 
     def _set_aside(self, rid: str | None) -> int:
         """The reserved pages no request has moved into yet, other than ``rid``'s."""
-        return sum(
-            max(0, pages - sum(len(state.host_pages) for state in self.offloaded.get(other, {}).values()))
-            for other, pages in self.reserved.items() if other != rid
-        )
+        return self._unmoved - (0 if rid is None else self._unmoved_by(rid))
+
+    def _unmoved_by(self, rid: str) -> int:
+        pages = self.reserved.get(rid)
+        if pages is None:
+            return 0
+        return max(0, pages - sum(len(state.host_pages) for state in self.offloaded.get(rid, {}).values()))
 
     def _keep_free(self, n: int, rid: str | None = None) -> int:
         """Evict cached pages until ``n`` pages are free past the pages set aside for requests other than ``rid``, and
@@ -181,12 +189,14 @@ class CPUPagePool:
             self.arena.release(cpu_pages + found)
             self._log_refusal(rid, label, n_pages)
             return None
+        unmoved = self._unmoved_by(rid)
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
             groups=on_pages(groups, found + cpu_pages),
             position=position,
             protected_prefix=protected_prefix,
             keys=list(keys),
         )
+        self._unmoved += self._unmoved_by(rid) - unmoved
         return PageCopies(gpu=gpu_pages[len(found):], cpu=cpu_pages)
 
     def insert_keys(self, rid: str, label: str) -> None:
@@ -291,9 +301,11 @@ class CPUPagePool:
         return event
 
     def pop(self, rid: str, label: str) -> OffloadedStream | None:
+        unmoved = self._unmoved_by(rid)
         state = self.offloaded.get(rid, {}).pop(label, None)
         if state is not None and not self.offloaded[rid]:
             del self.offloaded[rid]
+        self._unmoved += self._unmoved_by(rid) - unmoved
         return state
 
     def discard(self, rid: str, label: str) -> None:
@@ -315,9 +327,9 @@ class CPUPagePool:
             torch.cuda.current_stream().wait_stream(self._stream)
 
     def remove_request(self, rid: str) -> None:
+        self.unreserve(rid)
         for state in self.offloaded.pop(rid, {}).values():
             self.arena.release(state.host_pages)
-        self.unreserve(rid)
 
     @property
     def num_free_pages(self) -> int:

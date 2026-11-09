@@ -202,9 +202,9 @@ class Rebuilds:
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
         # node -> the handles whose log hasn't recorded every prefill step yet
         self._prefilling: dict[str, set[int]] = {node: set() for node in policies}
-        # node -> the handles whose pages a drop there can free, each with the slice of the pool its log takes. Only
-        # these keep a log.
-        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
+        # node -> the handles that keep their ids, those whose pages a drop there can free, each with the slice of
+        # the pool its log takes
+        self._keeps_ids: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         assert allowance is not None or not any(names for walks in self._copied.values() for names in walks.values()), (
@@ -307,7 +307,7 @@ class Rebuilds:
         }
         for node, piece in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = piece
+                self._keeps_ids[node][rid] = piece
                 self._kept[node][rid] = KeptIds(tuple(
                     LayoutRow(step[0].walk, sum(span.length for span in step))
                     for layout in written[node] for step in layout.steps()
@@ -351,7 +351,7 @@ class Rebuilds:
             # which the step fails.
             if not inputs or walk not in walks or not (chunk is None or chunk.is_first):
                 continue
-            kept, piece = self._kept[node][rid], self._droppable[node][rid]
+            kept, piece = self._kept[node][rid], self._keeps_ids[node][rid]
             row = kept.rows[len(kept.records)]
             names = sorted({*([ids_input] if walk in self._ids_walks[node] else ()), *self._copied[node][walk]})
             tensors = [
@@ -429,10 +429,10 @@ class Rebuilds:
 
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
-        piece = self._droppable[node][rid]
+        piece = self._keeps_ids[node][rid]
         if used < piece.nbytes:
             self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
-            self._droppable[node][rid] = HostSlice(piece.offset, used)
+            self._keeps_ids[node][rid] = HostSlice(piece.offset, used)
 
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
@@ -441,7 +441,7 @@ class Rebuilds:
             # its slice goes back to the pool, so no copy may start into it
             records = {id(record) for record in kept.records}
             self._queued = deque(queued for queued in self._queued if id(queued.record) not in records)
-        piece = self._droppable[node].pop(rid, None)
+        piece = self._keeps_ids[node].pop(rid, None)
         if piece is not None:
             self._pool.give(piece)
 

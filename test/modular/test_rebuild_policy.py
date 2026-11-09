@@ -339,7 +339,7 @@ def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
     """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     assert _ingest(rebuilds, R, (PrefixSpan(5, 5, PREFILL),))
-    assert rebuilds._droppable[NODE][R].nbytes == 40, "keeping the prompt would overflow its slice"
+    assert rebuilds._keeps_ids[NODE][R].nbytes == 40, "keeping the prompt would overflow its slice"
 
     rebuilds.record(_ran(PREFILL, {R: {"text_inputs": [torch.arange(5)]}}))
 
@@ -446,7 +446,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance(), DTYPES)
 
     # an id at 8 B for each of the eleven slots, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 88 + 48)
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._keeps_ids[NODE][R] == HostSlice(0, 88 + 48)
     assert not _ingest(rebuilds, A, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
     # the image's four rows, without its two sentinels
@@ -456,7 +456,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.record(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].nbytes == 40 + 32, (
+    assert rebuilds._keeps_ids[NODE][R].nbytes == 40 + 32, (
         "the image's room for ids and its sentinels' room would stay taken for the request's life"
     )
     assert rebuilds._kept[NODE][R].records[0].inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
