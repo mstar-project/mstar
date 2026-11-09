@@ -162,6 +162,7 @@ def test_config_reads_turbo_and_v3_checkpoints(repo, decoder_layers, alignment_h
 def test_prompt_ids_cover_forced_detected_timestamped_and_prev():
     cfg = _tiny_config()
     assert cfg.decoder_prompt_ids("en") == [SOT, EN, TRANSCRIBE, NOTS]
+    assert cfg.decoder_prompt_len() == len(cfg.decoder_prompt_ids("en"))
     assert cfg.decoder_prompt_ids("de", task="translate", timestamps=True) == [SOT, DE, TRANSLATE]
     # detection stops at <|startoftranscript|>, the tail follows the sampled language
     assert cfg.decoder_prompt_ids(None) == [SOT]
@@ -889,10 +890,17 @@ def test_process_prompt_builds_window_and_prompts():
         model.process_prompt(*args, language="xx")
     with pytest.raises(ValueError, match="task"):
         model.process_prompt(*args, language="en", task="sing")
-    coerced = model.process_prompt(*args, language="en", temperature="0.2").new_input_tensors
-    assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
-    assert model.get_max_output_tokens(max_output_tokens="40") == 40
-    assert model.get_request_resource_configs([], [], {"temperature": "0.5"})["sampler"].temperature == 0.5
+    # the API normalizes numeric strings before a model sees them; the model coerces nothing
+    with pytest.raises(ValueError, match="temperature"):
+        model.process_prompt(*args, language="en", temperature="0.2")
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        model.get_max_output_tokens(max_output_tokens="40")
+    with pytest.raises(ValueError, match="temperature"):
+        model.get_request_resource_configs([], [], {"temperature": "0.5"})
+    out = model.process_prompt(*args, language="en", temperature=0.2).new_input_tensors
+    assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
+    assert model.get_max_output_tokens(max_output_tokens=40) == 40
+    assert model.get_request_resource_configs([], [], {"temperature": 0.5})["sampler"].temperature == 0.5
 
 
 def test_postprocess_renders_language_and_timestamps_only():

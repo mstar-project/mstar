@@ -61,7 +61,7 @@ from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.qwen3_tts.submodules import text_stream_start
 from mstar.model.submodule_base import ModelInputsFromEngine
 
-GREEDY_KWARGS = {"do_sample": False, "subtalker_dosample": False}
+GREEDY_KWARGS = {"temperature": 0.0, "code_predictor_temperature": 0.0}
 
 
 # ---------------------------------------------------------------------------
