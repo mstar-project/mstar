@@ -42,7 +42,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
+from mstar.api_server.openai._util import check_inline_result
+from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -72,21 +73,21 @@ logger = logging.getLogger(__name__)
 # ignore_eos) reach a model. Two tiers:
 #   - Dynamo router/frontend envelope fields: never model input.
 #   - OpenAI-standard fields with no M* mapping: stripped so they don't
-#     pollute model_kwargs. When a model starts consuming one of these
-#     from model_kwargs, delete it here and it flows through.
+#     pollute model_kwargs. When a model starts consuming min_tokens or
+#     eos_token_ids, delete it here and it flows through. The rest are
+#     ``adapters.CHAT_ENVELOPE_KEYS``, which every chat adapter drops as
+#     well; this strips them from every body, image and video too.
 _STRIP_KEYS = {
     # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",
     "token_ids", "batch_token_ids", "bootstrap_info", "multi_modal_data",
-    "guided_decoding", "chat_template_kwargs", "chat_template_args",
+    "guided_decoding",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
-    # OpenAI-standard, no M* mapping today
-    "min_tokens", "eos_token_ids",
-    "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
-    "logprobs", "top_logprobs", "parallel_tool_calls",
-    "response_format", "user", "store", "metadata", "service_tier",
+    # OpenAI-standard, no M* mapping today. Not tools, tool_choice, the
+    # penalties, logit_bias, logprobs, top_logprobs or response_format: the chat
+    # adapter refuses a chat that sets one of them on.
+    "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);
@@ -106,11 +107,19 @@ def _clean(request: dict) -> dict:
     return {k: v for k, v in request.items() if k not in _STRIP_KEYS}
 
 
+def _inline_result(response_format, n=1) -> None:
+    """``check_inline_result``, refused as a client error."""
+    try:
+        check_inline_result(response_format, n)
+    except ValueError as exc:
+        raise _BadRequestError(str(exc)) from exc
+
+
 def _image_body(request: dict) -> dict:
     """NvCreateImageRequest -> body for the native image request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    _inline_result(request.get("response_format"))  # n is served, as on the native route
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _IMAGE_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -120,11 +129,11 @@ def _image_body(request: dict) -> dict:
 
 def _video_body(request: dict) -> dict:
     """NvCreateVideoRequest -> body for the native video request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    _inline_result(request.get("response_format"))
     if request.get("output_format") not in (None, "mp4"):
         raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _VIDEO_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -146,8 +155,7 @@ def _speech_body(request: dict) -> dict:
     """NvCreateAudioSpeechRequest -> body for the native speech request model."""
     if request.get("data_source") == "url":
         raise ValueError("data_source 'url' needs a media store; use 'b64_json'")
-    # For speech, response_format is the audio codec (wav/mp3/...), not the
-    # chat-style field _clean strips — reattach it after cleaning.
+    # For speech, response_format is the audio codec (wav/mp3/...); null is the default.
     fmt = (request.get("response_format") or "wav").lower()
     body = _clean(request)
     body.pop("data_source", None)
@@ -200,6 +208,10 @@ class RequestBridge:
 
     async def _chat(self, request: dict, context):
         body = _clean(request)
+        # Dynamo reads a client's chat_template_kwargs into chat_template_args and
+        # forwards it under that name; Qwen3.5 and Cosmos3-Edge read enable_thinking from it
+        if "chat_template_args" in body:
+            body.setdefault("chat_template_kwargs", body.pop("chat_template_args"))
         modalities = body.get("modalities")
         if modalities and set(modalities) != {"text"}:
             # Dynamo's chat stream delta carries no audio/image fields, so
@@ -266,13 +278,14 @@ class RequestBridge:
         reference = body.get("input_reference")
         if reference:
             from mstar.api_server import media_io
+            # one engine request, as on the native route, which refuses an n it would drop
+            _inline_result(None, req.n)
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
             # seed is a declared field, so model_extra never carries it; the
             # edit adapter expects it in extra_kwargs (the native multipart
-            # route feeds it from a form field). Edits are single-submit on
-            # the native path too, so n does not apply here.
+            # route feeds it from a form field).
             if req.seed is not None:
                 extra.setdefault("seed", req.seed)
             submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
@@ -375,6 +388,7 @@ class RequestBridge:
         started = time.monotonic()
         body = _video_body(request)
         req = VideoGenerationRequest.model_validate(body)
+        _inline_result(req.response_format, req.n)  # one engine request, one video
         args = self.adapter.video_to_request(req, self.server.upload_dir)
 
         rid = self._submit(args, prefix="vid")
@@ -405,7 +419,9 @@ class RequestBridge:
                 from mstar.api_server import media_io
                 audio = audios[i]
                 try:
-                    video = media_io.mux_mp4_with_pcm16(
+                    # ffprobe + ffmpeg, up to minutes: off the event loop every request shares
+                    video = await asyncio.to_thread(
+                        media_io.mux_mp4_with_pcm16,
                         video,
                         audio.data,
                         sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),

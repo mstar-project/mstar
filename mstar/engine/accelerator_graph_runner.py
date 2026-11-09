@@ -12,12 +12,13 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine import with_recompile_limit
+from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
@@ -25,6 +26,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
+    apply_token_ladders,
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
@@ -45,9 +47,6 @@ from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 # torch.compile arguments per compile level (``mstar serve -O``), for a captured
@@ -690,7 +689,13 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        token_ladders: Mapping[str, Any] | None = None,
+        step_tokens: Callable[[str, int], int | None] = lambda walk, max_rows: None,
     ):
+        """``token_ladders``: the serving config's ``prefill_token_buckets``
+        for this node, applied to its packed captures under ``step_tokens``
+        ((walk, the capture's widest batch) -> the most tokens the scheduler
+        gives such a step, None for no budget; `apply_token_ladders`)."""
         self._submodule_name = submodule_name
         self._capture_stream = capture_stream
         self._submodule = submodule
@@ -702,6 +707,10 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
+        if token_ladders:
+            apply_token_ladders(
+                submodule_name, self._capture_configs, token_ladders, step_tokens, self._batch_sizes,
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
@@ -768,6 +777,7 @@ class AcceleratorGraphRunner:
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
         )
+        self.recompile_limit = self._recompile_limit()
 
     @property
     def any_graphs(self):
@@ -775,6 +785,19 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def _recompile_limit(self) -> int | None:
+        """The dynamo recompile limit this node's compiled calls run under, None where the
+        engine's holds: ``compiled_entries_per_shape`` entries per compiled bucket the runner
+        captures (each batch size, token count and key traces apart; a LoRA node's base-only
+        twin is a key), and some for the engine's compiled forward, which shares the code
+        objects. A capture past the limit would run uncompiled inside its graph."""
+        shapes = {
+            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info)
+            for spec in self._get_slot_specs() if spec.config.compile
+        }
+        need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
+        return need if need > recompile_limit() else None
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
@@ -1267,7 +1290,7 @@ class AcceleratorGraphRunner:
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        ), self._submodule)
+        ), self.recompile_limit)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,

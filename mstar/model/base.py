@@ -634,7 +634,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -1219,9 +1219,10 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads, including the ones an
-        OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key logged as ignored. None (the default) declares nothing, so
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
         return None

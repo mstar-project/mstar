@@ -146,6 +146,8 @@ class VoxCPM2Model(Model):
     * ``compile_talker`` (true): ``torch.compile`` the decode step before its
       CUDA graphs are captured. ``false`` captures the eager step: start-up in
       seconds instead of 10 to 30 minutes cold, at a lower decode rate.
+    * ``compile_vae`` (true): ``torch.compile`` the streaming VAE decoder,
+      about a quarter faster per window batch; ``false`` decodes eagerly.
     * ``max_text_tokens`` (``max_len / MAX_PATCHES_PER_TEXT_TOKEN``, 1365):
       longest text one request may speak; past it the ``max_len`` patch
       budget would end the audio before the text.
@@ -194,6 +196,9 @@ class VoxCPM2Model(Model):
         self.compile_talker = kwargs.get("compile_talker", True)
         if not isinstance(self.compile_talker, bool):
             raise ValueError(f"VoxCPM2 compile_talker must be true or false, got {self.compile_talker!r}")
+        self.compile_vae = kwargs.get("compile_vae", True)
+        if not isinstance(self.compile_vae, bool):
+            raise ValueError(f"VoxCPM2 compile_vae must be true or false, got {self.compile_vae!r}")
         limit = kwargs.get("max_text_tokens", int(self.config.max_len / self.MAX_PATCHES_PER_TEXT_TOKEN))
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError(f"VoxCPM2 max_text_tokens must be a positive int, got {limit!r}")
@@ -672,6 +677,7 @@ class VoxCPM2Model(Model):
                     window_buckets=stream_window_widths(
                         self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
                     ),
+                    compile_decoder=self.compile_vae,
                 )
             self._submodule_cache[node_name] = submodule
         return self._submodule_cache[node_name]

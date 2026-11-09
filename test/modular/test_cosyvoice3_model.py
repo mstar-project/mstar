@@ -204,6 +204,19 @@ def test_registry_yaml_and_adapter_agree(model):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 64}, str(CONFIG_PATH))
     # a pool left at its declared page size
     model.validate_config_yaml({**deployment, "resources": {"lm_kv": {"max_num_pages": 1792}}}, str(CONFIG_PATH))
+    # the flow packs its rows and sizes its cache by its frame buckets, so the region
+    # ladder that mirrors them isn't the key's
+    with pytest.raises(ValueError, match="flow_new_frame_buckets"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": {"solve_new_frames": [64]}}}, str(CONFIG_PATH),
+        )
+    # a malformed key is EngineManager's to report, and the pool checks still run past it
+    for malformed in ([64], {"flow": "solve_new_frames_x"}):
+        model.validate_config_yaml({**deployment, "prefill_token_buckets": malformed}, str(CONFIG_PATH))
+    with pytest.raises(ValueError, match="pages"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": 64}, "max_concurrent_requests": 64}, str(CONFIG_PATH),
+        )
     assert isinstance(adapters.get_adapter("cosyvoice3"), adapters.CosyVoice3Adapter)
 
 
@@ -1402,8 +1415,27 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
     prefill = sub.get_accelerator_graph_configs(torch.device("cpu"))[1]
     assert prefill.replay_graph_walks == ["prefill", "prefill_voice"]
-    assert prefill.capture_token_lengths == list(cfg.lm_prefill_token_buckets)
+    assert prefill.capture_token_lengths == {1: sub.LM_PREFILL_TOKEN_BUCKETS}
     assert sub.resident_walks() == {"decode"}
+    # no prefill batch sizes is the switch that captures no prefill
+    sub, _ = _lm(_tiny_config(lm_prefill_batch_sizes=()))
+    assert [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
+
+
+def test_the_serving_configs_ladder_reaches_the_lm_prefill_capture():
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+
+    sub, _ = _lm(_tiny_config())
+
+    def ladders(walk_ladders):
+        configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+        apply_token_ladders("llm", configs, walk_ladders, lambda walk, rows: None, lambda c: c.capture_batch_sizes)
+        return configs[1].capture_token_lengths
+
+    assert ladders({"prefill_voice": [96, 32]}) == {1: [32, 96]}
+    # `prefill` steps replay the `prefill_voice` capture, which the refusal names
+    with pytest.raises(ValueError, match="prefill_voice"):
+        ladders({"prefill": [32]})
 
 
 # -- flow -----------------------------------------------------------------------------

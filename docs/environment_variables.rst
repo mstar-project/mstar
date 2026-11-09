@@ -213,13 +213,9 @@ model, so they are named for it.
        BAGEL defaults this option to true (see :doc:`models`).
        Off by default: capture costs one graph per (batch size, token bucket)
        and the eager flash-attn path is already fast. The win is removing
-       per-layer launch overhead on small images.
-   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS``
-     - ``512,1024,2048,4096,4900``
-     - Comma-separated token-count buckets to capture, when
-       ``MSTAR_VIT_ACCELERATOR_GRAPH=1``. A batch longer than the largest bucket runs
-       eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
-       preprocess option emits.
+       per-layer launch overhead on small images. The serving config's
+       ``prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}`` sets
+       the token buckets (see :doc:`serving`).
    * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
@@ -359,8 +355,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend, in seconds; on expiry the
-       client gets an error and the request is aborted in the backend.
-       ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       client gets an error and the request is aborted in the backend. ``0``
+       times every request out; a negative, non-finite or unreadable value is
+       the default. ``mstar serve --rust-frontend`` sets it from ``--timeout``
        (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``

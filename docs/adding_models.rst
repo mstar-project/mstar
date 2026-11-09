@@ -506,6 +506,11 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   boundary when that is past what it restored. A shared prefix is then served from the third request
   that shares it. A step longer than the largest captured bucket checkpoints less often, so that
   its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+- A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
+  more of its prompt to come keeps its own end), so a resend restores past its first chunk,
+  and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
+  Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
+  ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
 - A decode step that ends a page keeps the state there, so a later turn that re-sends the
   reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
@@ -1502,10 +1507,11 @@ methods are:
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
    prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
-   ``marks_dynamic_dims = True`` and compiles as any other submodule. A submodule whose
-   captures keep more compiled entries per frame than ``MSTAR_RECOMPILE_LIMIT`` allows
-   returns the number from ``dynamo_recompile_limit()``; the engine raises the limit
-   around that submodule's compiled calls only. Keep the compiled
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. The engine raises
+   the recompile limit around a node's compiled calls, past ``MSTAR_RECOMPILE_LIMIT``, to
+   hold an entry per bucket its compiled captures take (each batch size and token count);
+   a submodule whose frames keep several entries per bucket (GLM-5.2's decoder layers are
+   traced once per layer kind) declares how many as ``compiled_entries_per_shape``. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``. A submodule that disables the
@@ -1659,7 +1665,11 @@ and ends at the prompt's length. To opt a walk in:
 
   - ``chunkable=True`` lets the walk's rows be cut.
   - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
-    chunked rows sets one too, since its steps run under it.
+    chunked rows sets one too, since its steps run under it. Its step may pass it
+    beside a speculation chain's decode rows, by at most those rows' tokens, and the
+    engine trims a serving config's ``prefill_token_buckets`` assuming each such row
+    runs one token. A walk whose decode rows run more (an MTP verify row's k+1)
+    passes that bound, and its steps past a trimmed ladder's top run eagerly.
   - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
     one item per chunk, all when the prompt finishes.
   - ``per_chunk_outputs``: streaming edges sent on every chunk as it runs, for a consumer
@@ -1671,6 +1681,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+
+  A resource that keeps state only on a grid counted from a chunk's start declares
+  ``Resource.chunk_alignment``, and a cut chunk of the node's rows is then a multiple of
+  every alignment its resources declare (``Engine.chunk_alignment``). The chunk floor rounds
+  up to it, and a budget under it fails loading.
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
@@ -2184,11 +2199,11 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
            ),
        ]
 
-An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
-replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
-deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
-token counts, or the submodule raises ``ValueError`` when it is built.
+A deployment replaces a packed capture's ``capture_token_lengths`` with the serving
+config's ``prefill_token_buckets`` (node -> capture walk -> ladder, see :doc:`serving`).
+The engine applies it to the configs ``get_accelerator_graph_configs`` returns, so a
+model plumbs nothing. A ``PiecewisePackedConfig`` region's ``total_tokens`` takes the
+ladder its label names the same way.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
@@ -3205,8 +3220,7 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
-``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
+``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
 or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through

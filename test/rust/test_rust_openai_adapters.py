@@ -159,8 +159,9 @@ CHAT = {
     "temperature": 0.5, "top_p": 0.8, "max_completion_tokens": 16, "max_tokens": 64, "seed": 3,
     "modalities": ["text", "audio"], "audio": {"voice": "Ethan"},
     "repetition_penalty": 1.05, "top_k": 20,
-    "chat_template_kwargs": {"enable_thinking": False},
-    "tools": [], "tool_choice": "auto",
+    # a template key named like a refused field reaches the model, as the flat off one is dropped first
+    "chat_template_kwargs": {"enable_thinking": False, "current_date": "2026-11-08", "logprobs": True},
+    "tools": [], "tool_choice": "auto", "logprobs": False,
 }
 
 # ChatCompletionRequest's declared fields; the rest is model_extra.
@@ -333,6 +334,8 @@ PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
+    "json-mode": ({"messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}},
+                  False),
     "bad-role": ({"messages": [{"role": "tool", "content": "42"}]}, False),
     # remote fetch is off unless MSTAR_ALLOW_REMOTE=1, and a server path never reads
     "remote-image": (_image_chat("https://example.com/page.png"), False),

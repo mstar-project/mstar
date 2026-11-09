@@ -66,7 +66,6 @@ class Glm52Model(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -109,13 +108,9 @@ class Glm52Model(Model):
             if not isinstance(kwargs["graph_compile"], bool):
                 raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
             self.config.graph_compile = kwargs["graph_compile"]
-        if prefill_token_buckets is not None:
-            # as given: the submodule checks it as Qwen3.5's, and int() would read 64.5 as 64
-            # and "64" as [6, 4]
-            self.config.prefill_token_buckets = prefill_token_buckets
-        for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         if "mtp_num_draft_tokens" in kwargs:
             k = kwargs["mtp_num_draft_tokens"]
             if isinstance(k, bool) or not isinstance(k, int) or k < 0:
