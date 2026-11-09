@@ -1212,6 +1212,8 @@ class AcceleratorGraphRunner:
                 capture=True,
                 slot_lease=lease,
                 force_prefill=_is_packed(config),
+                # a lean twin records none of its lean resources' kernels
+                lean=spec.bucket.lean,
             ))
 
         engine_inputs.step = step

@@ -261,3 +261,31 @@ def test_a_blocked_config_reports_its_plain_buckets_alone():
     assert {(b.graph_walk, b.bs, b.lean) for b in runner.dropped_buckets} == {
         (WALK, 1, frozenset()), (WALK, 4, frozenset()),
     }
+
+
+def test_a_twin_is_captured_with_its_resources_lean():
+    """The capture's step names the twin's lean set, as a replay's does, so each
+    resource records its lean kernels there and its full ones in the plain bucket."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    planned = []
+    runner = object.__new__(AcceleratorGraphRunner)
+    runner._dummy_rows = SimpleNamespace(
+        ensure=lambda key, bs: list(range(-bs, 0)), reset=lambda rids, free=False: None,
+    )
+    runner._dummy_engine_inputs = lambda rids, walk: SimpleNamespace(per_request_info={})
+    runner._submodule = SimpleNamespace(
+        declare_step=lambda **kwargs: SubmoduleStep(steps={}, segments=None), preprocess=lambda **kwargs: {},
+    )
+    runner._step_runner = SimpleNamespace(
+        admit=lambda step: SimpleNamespace(ok=True),
+        plan=lambda step: planned.append((step.ctx.capture, step.ctx.lean)),
+    )
+    runner._forward_for = lambda spec: lambda **kwargs: None
+    runner._resident = None
+    runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
+    config = SimpleNamespace(get_node_inputs=lambda bs, tokens: None, get_config_type=lambda: None)
+    for lean in (frozenset(), frozenset({"sampler"}), frozenset({"lora", "sampler"})):
+        with runner._warmed(CGSlotSpec(_bucket(4, *lean), 0, config, 0), forwards=0):
+            pass
+    assert planned == [(True, frozenset()), (True, frozenset({"sampler"})), (True, frozenset({"lora", "sampler"}))]
