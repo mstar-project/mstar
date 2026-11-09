@@ -16,6 +16,8 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_kv_layout_intake import _Model as _IntakeModel
+from test_kv_layout_intake import _preprocess
 from test_state_calls import (
     TOKENS,
     _add,
@@ -45,13 +47,14 @@ from mstar.engine.state import (
     Attend,
     Bidirectional,
     Causal,
+    KVEntry,
     Read,
     Window,
     at_last_token,
 )
 from mstar.engine.state.adapters import _leader, _read_specs, build_specs, check_capture, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
-from mstar.model.base import LabelLayout
+from mstar.model.base import KVLabel, LabelLayout, PrefixKeys
 from mstar.model.utils import check_kv_pools_fit
 
 LABELS = ("main", "uncond")
@@ -341,7 +344,7 @@ def test_a_kept_step_that_ends_with_an_add_unread_is_refused():
 def _keyed_worker(mask) -> SimpleNamespace:
     return SimpleNamespace(
         _keyed_labels={"kv": {"main": None}},
-        _whole_reads={"kv": {"prefill_vit": "attn_image"}} if mask is Bidirectional else {"kv": {}},
+        _whole_reads={"kv": {"prefill_vit": "attn_image"}} if mask is Bidirectional else {},
     )
 
 
@@ -372,6 +375,31 @@ def test_a_keyed_span_a_hit_could_end_inside_a_whole_step_of_fails_the_request(s
 
 def test_a_keyed_ids_span_on_a_causal_walk_passes():
     PreprocessWorkerThread._check_whole_steps(_keyed_worker(Causal), _layout(_TEXT, Span("ids", "decode", 4, 4, "x")))
+
+
+class _WholeReadModel(_IntakeModel):
+    """Reads its declared cache as a whole and returns its own ``kv_layout``."""
+
+    def __init__(self):
+        super().__init__(layout={"kv": {"main": LabelLayout(spans=(Span("ids", "prefill", 100, 100, "text_inputs"),))}})
+
+    def get_node_resources(self):
+        return []
+
+    def declare_state(self):
+        return [Array("kv", nodes={"llm"}, layers=frozenset({0}), entry=KVEntry(heads=1, head_dim=8), max_len=4096,
+                      reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=1))})]
+
+    def kv_labels(self):
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("caption_ids", ("prefill",)))}}
+
+
+def test_a_model_that_lays_out_its_own_prompt_is_checked_per_request_too():
+    """The load check leaves a keyed walk whose node doesn't take the keyed tensor to the preprocess worker, which
+    checked only a ``state_layout``: a model that returned ``kv_layout`` itself had neither check."""
+    with pytest.raises(RuntimeError, match=r"Array 'kv'\.reads\['attn'\] reads walk 'prefill' as a whole, and span 0 "
+                                           r"of 'main' is an ids span"):
+        _preprocess(_WholeReadModel(), {})
 
 
 # The node that admits for a pool on several nodes
