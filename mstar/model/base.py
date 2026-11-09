@@ -38,7 +38,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import (
@@ -631,7 +631,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -1026,7 +1026,9 @@ class Model(ABC):
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 
@@ -1054,20 +1056,22 @@ class Model(ABC):
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, 16000, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)
@@ -1194,9 +1198,10 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads, including the ones an
-        OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key logged as ignored. None (the default) declares nothing, so
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
         return None
@@ -1216,6 +1221,16 @@ class Model(ABC):
         speech codecs used by the audio models here.
         """
         return 24000
+
+    # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
+    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    turn_tokens: tuple[int, int] | None = None
+    # A model whose replies may never get their end mark: a reply ends after this many
+    # steps with no text, no mark and no audio above ``turn_silence_rms`` (the RMS of
+    # samples in [-1, 1]), and text outside a reply opens one; None: only the marks end
+    # and open them.
+    turn_idle_steps: int | None = None
+    turn_silence_rms: float = 0.005
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

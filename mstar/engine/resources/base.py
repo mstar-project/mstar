@@ -182,6 +182,12 @@ class Resource(ResidentHooks, ABC):
         resource that holds only some lengths."""
         return prefix
 
+    @property
+    def chunk_alignment(self) -> int:
+        """Tokens a cut prefill chunk is a multiple of, so that each chunk starts on a
+        position this resource can keep state at (`Engine.chunk_alignment`). 1 cuts anywhere."""
+        return 1
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
         inputs: Any, prefix: CachedPrefix | None,

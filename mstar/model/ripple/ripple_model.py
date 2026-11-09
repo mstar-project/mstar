@@ -36,13 +36,10 @@ class RippleModel(MultimodalDecoderModel):
         "config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
     )
 
-    def __init__(
-        self, model_path_hf: str, cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
-    ):
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None):
         from transformers import AutoTokenizer
 
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+        super().__init__(model_path_hf, cache_dir)
         self.config = RippleConfig.from_hf(self.local_dir)
         # the checkpoint ships no generation_config.json; the vendor's server samples at 1.0
         self.sampling_defaults = {"temperature": 1.0, **self.sampling_defaults}
@@ -126,4 +123,4 @@ class RippleModel(MultimodalDecoderModel):
         )
         model.requires_grad_(False).eval()
         logger.info("Loaded Ripple-65B onto %s", device)
-        return RippleLLMSubmodule(model, self.config, prefill_token_buckets=self.prefill_token_buckets)
+        return RippleLLMSubmodule(model, self.config)

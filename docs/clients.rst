@@ -162,8 +162,8 @@ streaming back:
 Every field of the record is optional, but an append needs text, files or ``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
 name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
-reach only the model's ``process_stream_chunk``, so they mean what that model reads from
-them, and the opening message's still hold for the request (its sampling settings, say).
+reach only the model's ``process_stream_chunk`` (a model whose streams all declare their
+audio has none and ignores them), so they mean what that model reads from them, and the opening message's still hold for the request (its sampling settings, say).
 ``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
 in an append is its own. An append of text alone that the model turns into no stream item
 is rejected; text sent with files reaches the model, and if it ignores the text, the text
@@ -200,13 +200,14 @@ not the end of a request, and the call goes on. A live call that opens while the
 is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
-Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
-The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
-CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
-audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
-multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
-the call off the graph for the rest of its life. Other sizes are served the same, more
-slowly (see :doc:`models`).
+Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
+or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
+VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
+whole frame of an append goes on as a step of its own and the rest waits for the next
+append, or goes with the stream's end, so appends of any size keep the call on the steps
+Nemotron runs as one CUDA graph (see :doc:`models`). The part of a frame that waits costs
+latency: with one call, 20 ms appends put a frame's step about 60 ms later and 100 ms
+appends about 100 ms later (H200), while 80 ms appends, whole frames, cost nothing.
 
 .. code-block:: python
 
@@ -252,7 +253,7 @@ server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
 handshake and has no ``/healthz``. Only the Python frontend serves this route;
-``--rust-frontend`` logs a warning and serves without it.
+``--rust-frontend`` and the Dynamo worker log a warning and serve without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
@@ -381,7 +382,14 @@ Endpoints and model coverage:
        naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
      - ``bagel``, ``qwen3_omni``
-     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
+     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
+       ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
+       the ``audio`` extra; streamed audio is ``pcm16``. ``n`` or
+       ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
+       ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
+       other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
+       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
+       sends no usage chunk.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise
@@ -399,20 +407,32 @@ Endpoints and model coverage:
        ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
+   * - ``WS /v1/realtime``
+     - ``nemotron_duplex`` (full-duplex models)
+     - A spoken conversation in OpenAI's GA Realtime events: microphone audio in,
+       each agent reply out as one response (audio and its transcript). The model
+       decides when to speak; see below.
    * - ``WS /v1/realtime?intent=transcription``
      - models whose adapter can continue a hypothesis
-     - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
+     - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
-       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
+       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (PCM16 at 16 kHz,
+       the default; OpenAI reads it as 24 kHz, so an OpenAI client at 24 kHz declares
+       ``{"type": "audio/pcm", "rate": 24000}``), ``"g711_ulaw"``, ``"g711_alaw"`` or
+       a GA format object at the rates a conversation takes (below). Audio is
+       resampled to 16 kHz. Turn
        detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
    * - ``POST /v1/images/edits``
      - ``bagel``
-     - Image editing (image + prompt → image).
+     - Image editing (image + prompt → image). One ``image`` (or ``image[]``), edited
+       whole: a ``mask``, a second image and ``n`` > 1 are refused.
+
+Image and video results come back inline as ``b64_json``; ``response_format: "url"`` is
+refused (there is no media store to serve one from).
 
 Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
 return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,
@@ -455,31 +475,34 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
-- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
-  ``prompt`` conditions the decoder on prior text (it reaches the model as
-  ``initial_prompt``), and ``response_format``
-  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
-  model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server;
-  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
-  one segment per window, timed to the windows. A
-  streaming client receives only the spoken words. Uploads longer than the
-  model's clip (30 s for Whisper) are cut into fixed windows, each at the quietest
-  moment before its boundary, and submitted at once. ``long_form="sequential"`` in
-  ``extra_body`` runs them in order instead, openai-whisper style: each window gets
-  the transcript so far as ``initial_prompt`` and the first window's detected
-  language, is decoded with timestamps so the next window can start where its last
-  closed segment ended (no word is split by a boundary), and is decoded again when
-  its text is a repetition loop (gzip compression ratio above 2.4): first without
-  the conditioning text, then at rising temperatures, after which the transcript so
-  far stops conditioning later windows. Leave ``temperature`` at 0 to get that
-  fallback; a pinned temperature is used as is. It is several times slower, and only
-  it has that repetition guard. Segment timestamps
-  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
-  (5 to 30) sets the window length for one request, and an upload longer than it
-  is windowed. An upload, like any audio a request attaches, is refused once it
-  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
-  worker). The decode up to that point still runs, so this bounds memory, not
+- **Whisper / Higgs-Audio** — for Whisper, ``language`` (ISO-639-1) skips language
+  detection and ``prompt`` conditions the decoder on prior text (it reaches the model
+  as ``initial_prompt``); for Higgs-Audio, ``prompt`` is the transcription instruction
+  (the model has a default) and ``language`` does not reach the decoder: nothing
+  detects the language, and ``verbose_json``'s ``language`` is the request's
+  ``language`` as given, or null. ``response_format`` ``verbose_json`` / ``srt`` /
+  ``vtt`` (or ``timestamp_granularities[]``) asks the model for timestamps. Whisper's
+  language and timestamp tokens travel in the text stream and are lifted into
+  ``language`` / ``segments`` by the server; Higgs-Audio emits no timestamps, so its
+  ``verbose_json`` / ``srt`` / ``vtt`` get one segment per window, timed to the
+  windows. A streaming client receives only the spoken words. Uploads longer than 30 s
+  are cut into fixed windows, each at the quietest moment before its boundary, and
+  submitted at once. ``long_form="sequential"`` in ``extra_body`` runs them in order
+  instead; Whisper's then run openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded with
+  timestamps so the next window can start where its last closed segment ended (no word
+  is split by a boundary), and is decoded again when its text is a repetition loop
+  (gzip compression ratio above 2.4): first without the conditioning text, then at
+  rising temperatures, after which the transcript so far stops conditioning later
+  windows. Higgs-Audio's windows run at fixed cuts with no conditioning text, but get
+  the same retry at rising temperatures. Leave ``temperature`` at 0 to get that
+  fallback; a pinned temperature is used as is. Sequential mode is several times
+  slower, and only it has that repetition guard.
+  Segment timestamps are offset to the whole file. ``window_seconds`` in
+  ``extra_body`` (5 to 30) sets the window length for one request, and an upload
+  longer than it is windowed. An upload, like any audio a request attaches, is refused
+  once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
+  data worker). The decode up to that point still runs, so this bounds memory, not
   time: refusing a 31 min file takes about as long as decoding it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
@@ -497,6 +520,54 @@ Per-model notes:
   Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
   model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
   parallel windows.
+- **Realtime conversation** (``WS /v1/realtime``, a model that declares an audio client
+  stream, such as ``nemotron_duplex``) speaks OpenAI's GA Realtime events, not the beta
+  ones. The whole call is one engine request, opened by the first append the client
+  sends (an ``input_audio_buffer.append``, or a ``conversation.item.create`` of
+  ``input_audio`` parts) with the session's ``instructions`` as its prompt; the
+  instructions, audio formats and voice are fixed from then on. ``audio.input.format``
+  and ``audio.output.format`` are ``{"type": "audio/pcm", "rate": N}`` (24 kHz when left
+  out; 8, 11.025, 16, 22.05, 32, 44.1 or 48 kHz too, an mstar extension, since OpenAI
+  takes only 24 kHz), ``{"type": "audio/pcmu"}`` or ``{"type": "audio/pcma"}`` (G.711,
+  8 kHz). Input is resampled to the model's rate and sent on in its frames (80 ms for
+  Nemotron); a partial frame waits for the next append, and one append (or one item's
+  parts together) holds at most 300 s. The model hears and answers frame by frame, so the
+  server keeps time: once a client's audio falls more than 200 ms (an allowance for
+  network jitter) and a frame behind real time (a muted mic, a client waiting for the
+  reply), whole frames of silence are appended for it, at most 30 s a pause and
+  counted against the call's length cap, so a client that stops sending past that stops
+  the agent. A client that stops sending hears the reply about 0.35 s later (the
+  allowance, a frame and the clock's tick; measured on H200); one that streams its mic,
+  silence included, doesn't. Each reply
+  is one response, ``response.created`` through ``response.done``, with
+  ``response.output_audio.delta`` and ``response.output_audio_transcript.delta`` in
+  between; audio between replies is silence and is not sent. A reply ends at the
+  model's end mark, where the next reply starts, or, for a model that declares
+  ``turn_idle_steps``, once that long has passed with neither text nor audible audio
+  (Nemotron: 2 s, since it often sends no end mark and its audio runs behind its text).
+  The count follows the audio: text that arrives before a pause's audio has played stays
+  in the open reply, so where two replies split depends on how far the text runs ahead,
+  and text after the reply ended opens the next one. ``turn_detection`` ``server_vad``
+  and ``semantic_vad`` both mean "the model decides", and their knobs are not used;
+  null, or ``create_response`` / ``interrupt_response`` false, are refused.
+  ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only
+  what the server holds before the model (half a PCM16 sample, the resampler's few
+  milliseconds), since the model hears audio as it comes; and ``conversation.item.create`` takes a user message of ``input_audio``
+  parts, all of them or none. ``response.create``, ``response.cancel``,
+  ``output_audio_buffer.clear`` and the item-editing events are answered with an
+  ``unsupported`` error, and the call goes on. Input transcription and tools are not
+  supported, nor are ``max_output_tokens`` and ``audio.output.speed`` other than their
+  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). A ``session.update``
+  asking for one of these gets an ``unsupported`` error for it, keeps the served value,
+  and applies the rest, as ``session.updated`` shows. One response is in
+  progress at a time: a reply that starts while the previous one is still speaking is
+  its own response, sent once that one is done. If the call ends (its length cap, say),
+  the server sends an ``error``, ends a reply still in progress with ``response.done``
+  (``failed``, or ``incomplete`` when the call ended without an error), and closes the
+  socket; events sent after that get no answer. Over ``/generate``, the same models
+  mark the text chunk where a reply starts or ends with ``metadata.turn`` (``["start"]``
+  / ``["end"]``, every turn token's mark in order), and each text and audio chunk with
+  ``metadata.step``, the model step it came from.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``

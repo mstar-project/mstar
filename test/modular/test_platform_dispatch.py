@@ -225,6 +225,7 @@ def fake_compile(monkeypatch):
 
 class _GraphRunner:
     _forward_for = AcceleratorGraphRunner._forward_for
+    recompile_limit = None
 
     def __init__(self):
         self._submodule = _Submodule()

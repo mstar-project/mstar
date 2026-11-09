@@ -5,7 +5,6 @@ The router is mounted on a FastAPI app with a stubbed APIServer, like
 """
 
 import asyncio
-import functools
 import json
 import re
 import sys
@@ -249,6 +248,14 @@ def test_transcription_json(client_and_stub):
     assert saved.endswith("_speech.wav") and not Path(saved).exists()
 
 
+@pytest.mark.parametrize("prompt", ["2024", "true", "null"])
+def test_a_text_form_field_is_not_parsed_as_json(client_and_stub, prompt):
+    client, stub = client_and_stub
+    stub.next_chunks = _text("<|en|>", " Hello")
+    r = _post(client, {"model": "whisper_large", "prompt": prompt})
+    assert r.status_code == 200 and stub.last_submit["model_kwargs"]["initial_prompt"] == prompt
+
+
 def test_transcription_text_format(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _text(" Plain", " words")
@@ -407,6 +414,16 @@ def test_plan_windows_cuts_only_bounded_models(tmp_path):
     assert len(short) == 1
 
 
+def test_higgs_audio_windows_a_long_upload(tmp_path):
+    """Higgs-Audio drops or repeats text on long audio; a long upload was sent whole, with a 200."""
+    sf = pytest.importorskip("soundfile")
+    import numpy as np
+
+    path = tmp_path / "long.wav"
+    sf.write(path, np.zeros(16_000 * 45, dtype="float32"), 16_000)
+    assert len(serving_transcriptions.planner_for(adapters.HiggsAudioAdapter(), str(path), tmp_path).fixed()) > 1
+
+
 def test_plan_windows_drops_a_tail_too_short_to_hold_speech(tmp_path):
     sf = pytest.importorskip("soundfile")
     import numpy as np
@@ -480,6 +497,21 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
     assert stub.submits[2]["model_kwargs"]["initial_prompt"] == "First window. Second window."
     # each window is its own upload
     assert len({s["file_paths"]["audio"][0] for s in stub.submits}) == 3
+
+
+@requires_audio_duration
+def test_sequential_long_form_keeps_higgs_audios_instruction(client_and_stub):
+    """Higgs-Audio takes no previous text, so every window keeps the client's instruction."""
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+
+    client, stub = client_and_stub
+    stub.model_name = "higgs_audio"
+    stub.model = object.__new__(HiggsAudioModel)
+    stub.queued_chunks = [_text(" one"), _text(" two"), _text(" three")]
+    r = _post(client, {"model": "higgs_audio", "long_form": "sequential", "prompt": "Q"},
+              filename="long.wav", content=_wav_bytes(65))
+    assert r.json() == {"text": "one two three"}
+    assert [s["text"] for s in stub.submits] == ["Q", "Q", "Q"]
 
 
 @requires_audio_duration
@@ -1013,12 +1045,6 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
     decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=True))
-    # a fresh FFmpeg check, so this host's torchcodec and the fake don't answer for each other
-    from mstar.model.components import audio_features
-
-    check = audio_features._ffmpeg_decoder_loads
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))
     data = {"model": "whisper_large", "long_form": "parallel"}
     r = _post(client, data, filename="long.wav", content=_wav_bytes(61))
     assert r.status_code == 400 and "could not decode" in r.text and "torchcodec" not in r.text
