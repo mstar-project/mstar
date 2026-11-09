@@ -944,7 +944,7 @@ class PreprocessWorkerThread:
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             if _prefix_cache(model_kwargs):
-                if state_layout is not None:
+                if self._whole_reads:
                     self._check_whole_steps(layouts)
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
@@ -1324,13 +1324,14 @@ class PreprocessWorkerThread:
 
     @cached_property
     def _whole_reads(self) -> dict[str, dict[str | None, str]]:
-        """Each declared array's Block and Bidirectional reads, by the walks they name, or None for every walk."""
+        """Each declared array's Block and Bidirectional reads, by the walks they name, or None for every walk. An
+        array with neither, or with no keyed label, is left out."""
         return {
-            array.name: {
+            array.name: whole for array in self._declarations
+            if isinstance(array, Array) and array.name in self._keyed_labels and (whole := {
                 walk: key for key, read in array.reads.items() if isinstance(read.mask, Block | Bidirectional)
                 for walk in read.walks or (None,)
-            }
-            for array in self._declarations if isinstance(array, Array)
+            })
         }
 
     def _page_layout(
