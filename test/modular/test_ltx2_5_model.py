@@ -376,6 +376,8 @@ def test_declare_step_spans_and_pairs():
     step = _dit(cfg).declare_step("generate_av", [11, 12], inputs)
     video, audio = step.steps[VIDEO_ATTN], step.steps[AUDIO_ATTN]
     assert isinstance(video, AttentionStep) and not video.causal and not audio.causal
+    # the bucket's LTXShape gives every row its spans
+    assert video.fixed_layout and audio.fixed_layout
     assert {s.label for s in video.segments} == {"video"} and {s.label for s in audio.segments} == {"audio"}
     video_x, audio_x = step.steps[VIDEO_XATTN], step.steps[AUDIO_XATTN]
     assert isinstance(video_x, RaggedCrossAttentionStep) and video_x.pairs == (("video", "text"),)

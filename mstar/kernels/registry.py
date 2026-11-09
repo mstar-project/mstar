@@ -38,6 +38,7 @@ _OP_MODULES = {
     "moe_gemm": "mstar.utils.fused_moe.kernels",
     "moe_decode": "mstar.utils.fused_moe.decode",
     "fp8_linear": "mstar.utils.dense_fp8",
+    "ragged_attention": "mstar.engine.resources.attn.ragged.kernels",
 }
 
 _OPS: dict[str, KernelOp] = {}
