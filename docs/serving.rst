@@ -496,7 +496,7 @@ that moves can let in moves newer requests that wait holding pages, to the host 
 above. A request on the host returns once its pages and one more page fit, or every page its
 grant needed when it moved itself, and its pages are then copied back. A dropped request returns
 once its prompt, or its history and one more page if that is larger, fits, then recomputes its KV
-in prefill chunks cut by its walk's chunk budget, and isn't taken again until it writes a token past
+in prefill chunks cut by its walk's chunk budget, and isn't dropped again until it writes a token past
 that. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
