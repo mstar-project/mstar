@@ -16,6 +16,7 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
+    FUSED_SAMPLE_MAX_VOCAB,
     AcceleratorGraphableSampler,
     FusedDrawArgs,
     GenerationHistory,
@@ -23,6 +24,7 @@ from mstar.engine.resources.sampler.utils import (
     SamplerBuffers,
     SamplingConfig,
     _rng_offset_stride,
+    samples_greedy,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
@@ -56,6 +58,7 @@ class SamplerResource(Resource):
         enable_top_p_first: bool = False,
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
+        greedy_capture: bool | None = None,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
@@ -63,6 +66,13 @@ class SamplerResource(Resource):
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
+        # A step whose rows all sample greedily runs lean, taking each row's argmax
+        # (`lean_for`). By default only where the full sampler is the multi-kernel
+        # one: a narrower vocabulary draws in one kernel already.
+        self.lean_capture = (
+            vocab_size is not None and vocab_size > FUSED_SAMPLE_MAX_VOCAB
+            if greedy_capture is None else greedy_capture
+        )
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
         if max_repetition_window < 0:
@@ -119,6 +129,12 @@ class SamplerResource(Resource):
         # Resident requests that asked for log-probs: with none, no step's
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
+        # Resident requests that don't sample greedily (`samples_greedy`), so
+        # a step over the rest runs lean. Kept like the two sets above, and read
+        # per step only when it isn't empty.
+        self._sampled_rids: set[str] = set()
+        # whether the step planned last runs lean, taking each row's argmax
+        self._greedy_this_step = False
         self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
@@ -185,6 +201,7 @@ class SamplerResource(Resource):
             enable_top_p_first=spec.enable_top_p_first,
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
+            greedy_capture=spec.greedy_capture,
         )
 
     def build_accelerator_graph_buffers(
@@ -262,6 +279,11 @@ class SamplerResource(Resource):
             self._penalty_rids.add(rid)
         if resolved.return_logprobs:
             self._logprob_rids.add(rid)
+        if samples_greedy(resolved):
+            # a re-ingest replaces the request's config
+            self._sampled_rids.discard(rid)
+        else:
+            self._sampled_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
         if self._cg_buffers is not None and not self._cg_buffers.ingraph_scatter:
@@ -344,6 +366,7 @@ class SamplerResource(Resource):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
         self._logprob_rids.discard(rid)
+        self._sampled_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
         if self._history is not None:
             self._history.unregister(rid)
@@ -397,6 +420,35 @@ class SamplerResource(Resource):
             if __debug__ and self._apply_penalty_this_step \
                     and not self._penalty_needed_this_step:
                 self._assert_penalty_inert(ctx)
+
+    def lean_for(self, rids) -> bool:
+        """Whether every one of ``rids`` samples greedily (``samples_greedy``),
+        so a step over them may take each row's argmax. From the configs set at
+        ingest, which are the same on every rank of a lockstep instance."""
+        return not self._sampled_rids or self._sampled_rids.isdisjoint(rids)
+
+    def lean_captures(self, config_type) -> bool:
+        """Batched captures only: there a row is a token, and the sampler a
+        sizeable share of the step."""
+        from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+
+        return config_type == AcceleratorGraphConfigType.BASIC_BATCHED
+
+    def _set_greedy_flag(self, ctx: StepContext) -> None:
+        """Whether this step takes each row's argmax: the engine names this
+        sampler lean in it, from `lean_for`. Such a step also skips the
+        seen-token traffic, as its rows' penalties are all 1.0."""
+        self._greedy_this_step = greedy = self.resource_key in ctx.lean
+        if not greedy:
+            return
+        if not ctx.capture and not self.lean_for(ctx.request_ids):
+            # its sampled rows would take the argmax silently
+            raise RuntimeError(
+                f"sampler: a greedy step "
+                f"({ctx.slot_lease.bucket if ctx.slot_lease is not None else 'eager'}) has rows that don't "
+                f"sample greedily: {sorted(self._sampled_rids.intersection(ctx.request_ids))}"
+            )
+        self._penalty_needed_this_step = False
 
     def _assert_penalty_inert(self, ctx: StepContext) -> None:
         """Skipping the mask is sound only while every penalty in the step is 1.0.
@@ -511,6 +563,7 @@ class SamplerResource(Resource):
         laps = PhaseLaps(f"{ctx.plan_phase}.sampler.")
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
+            self._set_greedy_flag(ctx)
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
         if not ctx.is_preplan and self._penalty_live:
@@ -696,6 +749,7 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
+                greedy=self._greedy_this_step,
             )
         bufs = self._cg_buffers
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
@@ -706,7 +760,7 @@ class SamplerResource(Resource):
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
             apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
-            rand_offset=offsets,
+            rand_offset=offsets, greedy=self._greedy_this_step,
         )
         if by_slot:
             kept = self._kept_rids
@@ -751,7 +805,8 @@ class SamplerResource(Resource):
         """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
         on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
         `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
-        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with `advance_offsets`."""
+        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with
+        `advance_offsets`."""
         if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
             return None
         return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
