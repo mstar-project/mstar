@@ -926,6 +926,9 @@ def _transfers(samples):
     return out
 
 
+LINKS = {("enc", "llm"), ("llm", "api_server")}
+
+
 def test_transfers_reach_metrics_from_the_conductor_and_the_data_worker(served, tmp_path, monkeypatch):
     """Real SHM reads on two workers (two TP ranks reading the same edge) go
     through their WorkerStatus into a real conductor's status; the data
@@ -959,7 +962,9 @@ def test_transfers_reach_metrics_from_the_conductor_and_the_data_worker(served, 
 
     served.conductor.inbox.put(wire.decode(wire.encode(
         APIServerMessage("conductor_status", conductor._status()))))
-    samples = _scrape_until(served, _transfers)
+    # both links: the data worker's read is summed in at once, the workers' only once
+    # the message thread has applied the conductor's status
+    samples = _scrape_until(served, lambda s: {(k[1], k[2]) for k in _transfers(s)} >= LINKS)
     got = _transfers(samples)
     sums = [v for k, v in got.items() if k[0] == "mstar_transfer_seconds_sum"]
     assert len(sums) == 2 and all(s > 0 for s in sums)
