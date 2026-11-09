@@ -423,8 +423,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker

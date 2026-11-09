@@ -394,9 +394,12 @@ impl Bridge {
     /// `(status, message)`, as the Python adapter refuses it. A refused clip is
     /// deleted there.
     pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
+        let start = std::time::Instant::now();
         match self.round_trip("check_ref_audio", None, Some(check), timeout).await {
             Some(StreamItem::Done) => Ok(()),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
+            // the request's budget ran out, as the Python frontend's request would
+            None if start.elapsed() >= timeout => Err((500, "Request timed out".to_string())),
             _ => Err((500, "the server could not check ref_audio".to_string())),
         }
     }

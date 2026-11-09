@@ -22,7 +22,7 @@ from mstar.api_server.openai import (
     serving_transcriptions,
     serving_videos,
 )
-from mstar.api_server.openai._util import MediaJSONResponse, error_type, now
+from mstar.api_server.openai._util import MediaJSONResponse, check_inline_result, error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -35,11 +35,16 @@ from mstar.api_server.openai.protocol import (
     UnloadLoraAdapterRequest,
     VideoGenerationRequest,
 )
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import client_error_text, scrub_paths
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# a transcription form's declared text fields stay text: a prompt of "2024" is not a number
+_TRANSCRIPTION_TEXT_FIELDS = frozenset(
+    name for name, f in TranscriptionRequest.model_fields.items() if f.annotation in (str, str | None)
+)
 
 
 def _api():
@@ -69,19 +74,24 @@ def _exception_error(e: Exception, route: str) -> JSONResponse:
     """The error envelope for an exception a route's handler raised.
 
     An ``HTTPException`` was raised on purpose and keeps its status and
-    detail. Anything else goes through :func:`client_error_text`: a
-    ``ValueError`` or ``TypeError`` is the request's fault, a 400 with server
-    paths cut to base names, and any other error is a 500 that shows the
-    client only an error id, with the full error logged under it. An
-    exception class that names its own ``status_code`` (``AudioTooLongError``
-    is a 413) keeps that status.
+    detail. A ``ValueError`` is a refusal: a 400 with server paths cut to
+    base names, logged as one INFO line, since the client reads why (a
+    client that sends ``stop`` on every call would otherwise log a traceback
+    per request). Anything else goes through :func:`client_error_text`: a
+    ``TypeError`` is a 400 too, but may be a bug in the route, so it keeps its
+    traceback; any other error is a 500 that shows the client only an error
+    id, with the full error logged under it. An exception class that names
+    its own ``status_code`` (``AudioTooLongError`` is a 413) keeps that status.
     """
     status, detail = getattr(e, "status_code", None), getattr(e, "detail", None)
     if isinstance(status, int) and detail is not None:
         return _error(status, str(detail))
+    if isinstance(e, ValueError):
+        logger.info("%s request refused: %s", route, e)
+        return _error(status if isinstance(status, int) else 400, scrub_paths(str(e)))
     text, _ = client_error_text(e, f"{route} request failed", log=logger, type_name=False)
     if not isinstance(status, int):
-        status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        status = 400 if isinstance(e, TypeError) else 500
     return _error(status, text)
 
 
@@ -192,6 +202,9 @@ async def audio_transcriptions(request: Request):
             if key.endswith("[]"):
                 fields.setdefault(key[:-2], []).append(value)
                 continue
+            if key in _TRANSCRIPTION_TEXT_FIELDS:
+                fields[key] = value
+                continue
             try:
                 fields[key] = json.loads(value)
             except (json.JSONDecodeError, TypeError):
@@ -296,15 +309,28 @@ async def images_edits(request: Request):
         return err
     try:
         form = await request.form()
-        image = form.get("image")
-        if image is None or not hasattr(image, "read"):
+        # One image, edited whole: a mask or a second image would be dropped. ``image[]``
+        # is how OpenAI clients name the image list.
+        images = []
+        for key, value in form.multi_items():
+            if not hasattr(value, "filename"):
+                continue
+            if key not in ("image", "image[]"):
+                return _error(400, f"images/edits does not take a {key!r} upload; the whole image is edited")
+            images.append(value)
+        if len(images) > 1:
+            return _error(400, f"images/edits takes one image, got {len(images)}")
+        image = images[0] if images else None
+        if image is None:
             return _error(400, "images/edits requires an 'image' file upload")
+        n = form.get("n")
+        check_inline_result(form.get("response_format"), int(n) if n else None)
         limit = max_body_bytes()
         if (getattr(image, "size", None) or 0) > limit:
             return _error(413, f"images/edits accepts files up to {limit // 2**20} MiB (MSTAR_MAX_BODY_MB)")
         image_bytes = await image.read()
         prompt = form.get("prompt") or ""
-        known = {"image", "prompt", "model", "n", "size", "response_format"}
+        known = {"image", "image[]", "prompt", "model", "n", "size", "response_format"}
         extra: dict = {}
         for key, value in form.multi_items():
             if key in known or hasattr(value, "filename"):
