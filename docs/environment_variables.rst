@@ -375,6 +375,13 @@ Read by the ``mstar-server`` binary and its bridge
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
+   * - ``MSTAR_SERVED_MODELS``
+     - unset
+     - The names a Rust-frontend request's ``model`` may carry, as JSON: the
+       base model's names and the served LoRA adapters
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
+       Unset serves the base model alone. Not for deployments to set:
+       ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -442,16 +449,6 @@ Rust frontend limitations
 The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
-
-It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
-surface degrades:
-
-* ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
-  request sets ``generate_sound``, Cosmos3 generates a separate audio track that
-  mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
-  the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
-  the Rust frontend (it spends compute on a track the client won't receive), or
-  run the Python frontend for sound video.
 
 Request media
 -------------
