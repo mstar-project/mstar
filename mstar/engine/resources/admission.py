@@ -298,7 +298,7 @@ class Admission:
             else:
                 return None
         # The KV cache lends a passer the pages a first request it didn't refuse would fit in, so ``rid`` passes a
-        # first request only if it also passes, or takes nothing, at the resource that refused that request.
+        # first request only if it also passes, or takes nothing, at the resource ``blocked`` names for that request.
         if any(blocked[self._queues[key][0]] not in passing + reserved for key in passing):
             return None
         nodes = self._reserve(rid, published_of, passing)
@@ -307,10 +307,14 @@ class Admission:
         return nodes
 
     def _blocked(self, rids: Iterable[str]) -> dict[str, str]:
-        """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource that refused
-        it, first in its queue or passing, and hasn't grown since."""
+        """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource whose queue
+        the oldest return holds back, or that refused it, first in its queue or passing, and hasn't grown since."""
+        back = self._held_back()
         blocked = {}
         for rid in rids:
+            if key := next((key for key in self._waiting[rid].asked if key in back), None):
+                blocked[rid] = key
+                continue
             held = self._refused.get(rid) or next(
                 ((key, mark) for key, mark in self._short.items() if self._queues[key][0] == rid), None,
             )
