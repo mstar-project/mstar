@@ -13,6 +13,7 @@ through ``Conductor.__init__`` (workers and sockets stubbed, no weights) so
 none of them trips the new checks.
 """
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -653,9 +654,11 @@ def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
-    # The tiny test config stands in for the pinned checkpoint metadata; the graph doesn't depend on its sizes.
+    # Keep the fixture tiny while supporting the shipped TP8 head geometry.
     fixture = ROOT / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
-    (tmp_path / "config.json").write_text(fixture.read_text())
+    config = json.loads(fixture.read_text())
+    config["text_config"].update(num_attention_heads=8, hidden_size=64)
+    (tmp_path / "config.json").write_text(json.dumps(config))
     return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 

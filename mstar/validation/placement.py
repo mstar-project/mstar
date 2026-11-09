@@ -4,6 +4,7 @@ that pick a request's replica among them."""
 
 import math
 from collections.abc import Iterator, Mapping, Sequence
+from copy import copy
 from typing import Any
 
 from mstar.conductor.routing import RoutingWeights
@@ -551,6 +552,20 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same parallel shape across replicas"
             )
+        if isinstance(spec, KVSpec):
+            # the head split each worker shards the KV config by (EngineResourceInfo.head_shards):
+            # TP x SP ranks, as CFG ranks run whole branches, every head
+            head_shards = {
+                group.tp_group.world_size * group.sp_group.world_size
+                for wid, nodes in deployed.items() for node in spec.nodes & nodes
+                for group in (per_worker[wid].get_joint_group_for_node(node),)
+            }
+            for shards in sorted(head_shards):
+                try:
+                    # a copy: the workers shard the model's own declaration
+                    copy(spec.config).shard(shards)
+                except ValueError as exc:
+                    yield f"Resource {spec.resource_key}: {exc}"
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
