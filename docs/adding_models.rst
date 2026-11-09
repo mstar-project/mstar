@@ -872,12 +872,14 @@ engine captures a twin for each set of them, keyed by that set (``BucketKey.lean
 replays the twin of every resource its rows let run lean, else one with fewer of them
 (largest set first, ties in declaration order), else the plain bucket; the engine names the
 set in ``StepContext.lean``, eager steps included, and each resource checks its rows again
-at plan. Twins are sized, planned and captured after every plain bucket, and a twin left
-out (under the capture budget, say) is logged at INFO and is not a dropped bucket: its
-steps replay the plain bucket. Lean resources: the LoRA pool, for steps none of whose rows
-names an adapter, in every kind of capture; and a sampler (see ``SamplingReqConfig``), for
-steps whose rows all sample greedily, in batched captures. A model declares nothing for
-these.
+at plan. A resource whose callers read its plan inside the forward also overrides
+``Resource.outside_step``, which the engine enters around compile warm-ups outside any step
+(the LoRA pool's runs them lean). Twins are sized, planned and captured after every plain
+bucket, and a twin left out (under the capture budget, say) is logged at INFO and is not a
+dropped bucket: its steps replay the plain bucket. Lean resources: the LoRA pool, for
+steps none of whose rows names an adapter, in every kind of capture; and a sampler (see
+``SamplingReqConfig``), for steps whose rows all sample greedily, in batched captures. A
+model declares nothing for these.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
