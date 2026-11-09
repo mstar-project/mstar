@@ -179,18 +179,38 @@ fn raw_result_stream(
     request_id: &str,
     streaming: bool,
 ) -> Result<OutStream, (u16, String)> {
+    submitted_stream(state, args, request_id, streaming, Some(state.request_timeout)).map(|(stream, _)| stream)
+}
+
+/// A `/generate/ws` live call's result stream and its submission's `sub`, which
+/// its appends name. It keeps no deadline of its own: the API server's stream
+/// times out from the call's last input, which an append moves.
+pub fn live_result_stream(state: &AppState, args: &SubmitArgs, request_id: &str) -> Result<(OutStream, Option<u64>), (u16, String)> {
+    submitted_stream(state, args, request_id, true, None)
+}
+
+fn submitted_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+    timeout: Option<Duration>,
+) -> Result<(OutStream, Option<u64>), (u16, String)> {
+    let mut submission = None;
     let stream: OutStream = match &state.bridge {
         Some(b) => {
             let (sub, rx) = b
                 .submit(args, request_id, streaming)
                 .map_err(|message| (409, message))?;
+            submission = Some(sub);
             let guard = AbortGuard {
                 bridge: b.clone(),
                 rid: request_id.to_string(),
                 sub,
                 done: false,
             };
-            let deadline = Instant::now() + state.request_timeout;
+            // no deadline of its own: ten years on
+            let deadline = Instant::now() + timeout.unwrap_or(Duration::from_secs(10 * 365 * 86_400));
             // finished: a terminal item was yielded — end on the next poll.
             let st = (rx, guard, deadline, false);
             Box::pin(futures::stream::unfold(
@@ -238,7 +258,7 @@ fn raw_result_stream(
         )),
     };
     mark_submitted();
-    Ok(stream)
+    Ok((stream, submission))
 }
 
 /// Gather a non-streaming request's chunks; the first error wins (mstar's

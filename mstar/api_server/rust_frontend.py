@@ -16,6 +16,7 @@ protocol are untouched):
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
                        | {t:"voices", rid, sub}
                        | {t:"windows", rid, sub, op, plan, ...}
+                       | {t:"live", rid, sub, op, call, ...}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
@@ -24,6 +25,13 @@ protocol are untouched):
                        | {t:"checked", rid, sub, error?, status?}
                        | {t:"voices", rid, sub, metadata:{voices?}}
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
+                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
+
+A ``live`` request is one operation on a ``/generate/ws`` live call, the
+submission ``call`` names: ``taking`` (``taking_input``), ``append``
+(``stream_input``) or ``reject`` (``reject_input``). An append the model finds
+late is sent later as a ``chunk`` (modality ``late``) on the socket's
+``notice`` route, its ``tag`` echoed in the metadata.
 
 A ``windows`` request is one operation on a transcription upload's
 ``WindowPlanner`` (``serving_transcriptions``), kept here under the frontend's
@@ -192,6 +200,8 @@ TRANSCRIPTION_ENV = "MSTAR_TRANSCRIPTION"
 OPENPI_ENV = "MSTAR_OPENPI"
 #: The largest WebSocket message, in bytes (the config's ``ws_max_message_mb``).
 WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
+#: The model's client streams, as JSON: a request to a model with any is a live call.
+CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
 
 
 class WindowOp(StrEnum):
@@ -285,14 +295,14 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                        api_key: str | None = None, timeout_s: float | None = None,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
-                       ws_max_bytes: int | None = None) -> subprocess.Popen:
+                       ws_max_bytes: int | None = None, client_streams=()) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
     request's ``model`` selects; ``None`` serves the base model alone.
     ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
-    ``openpi_facts``' for its policy, and ``ws_max_bytes`` the config's WebSocket
-    message limit."""
+    ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
+    message limit, and ``client_streams`` the model's (``APIServer.client_streams``)."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -318,6 +328,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(WS_MAX_BYTES_ENV, None)
     if ws_max_bytes is not None:
         env[WS_MAX_BYTES_ENV] = str(int(ws_max_bytes))
+    env[CLIENT_STREAMS_ENV] = json.dumps(sorted(client_streams))
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -548,6 +559,49 @@ class RustFrontendBridge:
 
         self.loop.create_task(answer())
 
+    def _live(self, msg: dict) -> None:
+        """One operation on a ``/generate/ws`` live call, answered as the Python
+        route's ``append_one`` would act on it. The call is the submission its
+        ``call`` names; one that has ended has no key and takes nothing."""
+        op, key = msg.get("op"), self._keys.get(msg.get("call"))
+        reply = {"t": "live", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+        try:
+            if op == "taking":
+                meta = {"taking": key is not None and self.server.taking_input(key)}
+            elif op == "reject":
+                meta = {"rejected": key is not None and self.server.reject_input(key, msg["error"], int(msg["status"]))}
+            elif key is None:
+                meta = {"accepted": False}
+            else:
+                notice, tag, loop = msg.get("notice"), msg.get("tag") or {}, self.loop
+
+                def on_late(error: str) -> None:
+                    # from the preprocess thread: sent from this loop
+                    late = {"t": "chunk", "rid": "", "sub": notice, "modality": "late",
+                            "data": error.encode("utf-8"), "metadata": tag}
+                    try:
+                        loop.call_soon_threadsafe(self._send, late)
+                    except RuntimeError:
+                        pass  # the loop has closed, and the frontend with it
+
+                try:
+                    accepted = self.server.stream_input(
+                        key, msg.get("file_paths") or None, end_input=msg.get("end_input", False),
+                        text=msg.get("text"), file_streams=msg.get("file_streams"),
+                        model_kwargs=msg.get("model_kwargs"), on_late=on_late if notice is not None else None,
+                    )
+                    meta = {"accepted": accepted}
+                except ValueError as exc:  # the client's fault
+                    meta = {"error": scrub_paths(str(exc)), "status": 400}
+                except Exception as exc:  # noqa: BLE001 — the append fails, the bridge goes on
+                    text, _ = client_error_text(exc, "generate/ws append failed", log=logger, type_name=False)
+                    meta = {"error": text, "status": 500}
+        except Exception as exc:  # noqa: BLE001
+            text, _ = client_error_text(exc, f"generate/ws {op} failed", log=logger, type_name=False)
+            meta = {"error": text, "status": 500}
+        reply["metadata"] = meta
+        self._send(reply)
+
     def _in_uploads(self, path: Path) -> bool:
         return path.resolve().is_relative_to(Path(self.server.upload_dir).resolve())
 
@@ -664,6 +718,8 @@ class RustFrontendBridge:
             self._voices(msg)
         elif t == "windows":
             self._windows(msg)
+        elif t == "live":
+            self._live(msg)
         else:
             logger.warning("bridge: unknown message type %r", t)
 

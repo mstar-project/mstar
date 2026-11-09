@@ -28,6 +28,7 @@
 mod adapters;
 mod auth;
 mod bridge;
+mod client_errors;
 mod generation_kwargs;
 mod media;
 mod protocol;
@@ -41,6 +42,8 @@ mod transcription;
 mod unicode_marks;
 mod utf8;
 mod ws;
+
+use client_errors::scrub_paths;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -213,6 +216,7 @@ async fn main() {
         // long-lived sockets: outside the admission cap, as on the Python frontend
         .route("/", get(ws::openpi::openpi_ws))
         .route("/healthz", get(ws::openpi::healthz))
+        .route("/generate/ws", get(ws::generate::generate_ws))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
