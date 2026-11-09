@@ -72,6 +72,7 @@ import os
 import re
 import reprlib
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 
 import anyio
@@ -138,6 +139,10 @@ _EXCERPT_REPR = _ExcerptRepr(
 )
 
 
+def _new_item_id() -> str:
+    return f"item_{uuid.uuid4().hex[:12]}"
+
+
 @dataclass
 class RealtimeSession:
     """One WebSocket's transcription state (the SDK's ``ASRStreamingState``)."""
@@ -153,7 +158,10 @@ class RealtimeSession:
     chunk_id: int = 0
     raw_hypothesis: str = ""   # the model's raw output for the audio so far
     emitted: str = ""          # clean text already sent as deltas
-    item_id: str = field(default_factory=lambda: f"item_{uuid.uuid4().hex[:12]}")
+    item_id: str = field(default_factory=_new_item_id)
+    # items cut by a commit and not finished yet: their last audio (the rest of
+    # ``pending`` at the commit) and the id of the item after each
+    commits: deque[tuple[np.ndarray | None, str]] = field(default_factory=deque)
     # error ids of this item's distinct step failures (at most
     # MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item
     failures: tuple[str, dict] = ("", {})
@@ -229,11 +237,13 @@ class RealtimeSession:
         self.add(self.resample(audio))
 
     def item_samples(self, extra: int = 0) -> int:
-        """SAMPLE_RATE samples in the item once ``extra`` more input samples
-        arrive, rounded once over the whole item (not per append), so the cap
-        does not depend on how the audio was split."""
+        """SAMPLE_RATE samples in the item audio is arriving for, once ``extra``
+        more input samples arrive, rounded once over the whole item (not per
+        append), so the cap does not depend on how the audio was split. While a
+        commit is finishing, ``heard`` is the committed item's and doesn't count."""
         held = self.resampler.held(extra) if self.resampler is not None else extra
-        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
+        heard = 0 if self.commits else sum(int(a.size) for a in self.heard)
+        return self.pending_samples + held + heard
 
     def take_chunk(self) -> np.ndarray | None:
         """Every full chunk of pending audio as one array, or None until
@@ -263,11 +273,25 @@ class RealtimeSession:
     def audio_so_far(self) -> np.ndarray:
         return np.concatenate(self.heard) if self.heard else np.zeros(0, dtype=np.float32)
 
+    @property
+    def intake_item_id(self) -> str:
+        """The item arriving audio belongs to: past any commit still finishing."""
+        return self.commits[-1][1] if self.commits else self.item_id
+
+    def cut_item(self) -> None:
+        """A commit: what is pending ends this item, and audio after it is the next one's."""
+        self.commits.append((self.flush(), _new_item_id()))
+        self.short = 0
+
+    def finish_item(self, next_id: str) -> None:
+        """Forget the item just decoded. ``pending`` is the next one's already."""
+        self.heard, self.chunk_id, self.raw_hypothesis, self.emitted = [], 0, "", ""
+        self.item_id = next_id
+
     def clear(self) -> None:
         """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
-        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
-        self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
-        self.item_id = f"item_{uuid.uuid4().hex[:12]}"
+        self.pending, self.pending_samples, self.short = [], 0, 0
+        self.finish_item(_new_item_id())
 
 
 def pcm16_to_float(payload: str, carry: bytes = b"") -> tuple[np.ndarray, bytes]:
@@ -605,7 +629,7 @@ class RealtimeTranscription:
 
     async def handle(self, event: dict) -> None:
         kind = event.get("type")
-        if kind != "input_audio_buffer.append":
+        if kind not in ("input_audio_buffer.append", "input_audio_buffer.commit"):
             # these act on the whole item, so a running step has to finish first
             await self._steps_settled()
         if kind == "transcription_session.update":
@@ -658,7 +682,7 @@ class RealtimeTranscription:
                 if ops and ops[-1] == ("commit",):
                     # the drained tail ended a turn: that commit was this one
                     return
-            await self.commit()
+            await self._commit()
         elif kind == "input_audio_buffer.clear":
             s = self.session
             s.clear()
@@ -684,18 +708,21 @@ class RealtimeTranscription:
                 if i == len(ops) - 1:
                     self._start_steps()
             elif op[0] == "commit":
-                await self._steps_settled()
-                await self.commit()
+                await self._commit()
             elif op[0] == "speech_started":
-                await self.send(_event("input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.item_id))
+                await self.send(_event(
+                    "input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.intake_item_id,
+                ))
             else:
-                await self.send(_event("input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.item_id))
+                await self.send(_event(
+                    "input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.intake_item_id,
+                ))
 
     def _start_steps(self) -> None:
-        """Decode the pending chunks, off the consumer: a step can wait on the
-        engine for tens of seconds, and appends must keep landing meanwhile.
-        One runner at a time, so steps stay ordered; ``take_chunk`` coalesces
-        what arrived during the last one."""
+        """Decode the pending chunks and finish the cut items, off the consumer:
+        a step can wait on the engine for tens of seconds, and appends must keep
+        landing meanwhile. One runner at a time, so steps stay ordered;
+        ``take_chunk`` coalesces what arrived during the last one."""
         if self._steps_end is None:
             self._steps_end = asyncio.Event()
             self._group.start_soon(self._run_steps)
@@ -703,8 +730,15 @@ class RealtimeTranscription:
     async def _run_steps(self) -> None:
         s = self.session
         try:
-            while (chunk := s.take_chunk()) is not None:
-                await self.step(chunk)
+            while True:
+                # commits first: anything pending is past the oldest cut
+                if s.commits:
+                    await self._finish_commit(*s.commits[0])
+                    s.commits.popleft()
+                elif (chunk := s.take_chunk()) is not None:
+                    await self.step(chunk)
+                else:
+                    return
         except WebSocketDisconnect:
             self._group.cancel_scope.cancel()
         finally:
@@ -732,10 +766,20 @@ class RealtimeTranscription:
             kind="server_error", code="end_of_turn_failed",
         ))
 
-    async def commit(self) -> None:
-        """Finish the item: decode what is left, report it, start a new one."""
+    async def _commit(self) -> None:
+        """Cut the item here and leave its finish to the step runner. Past a
+        full item's worth of cut audio this waits, so a client that outruns the
+        engine backs up into the inbox and its bound."""
         s = self.session
-        tail = s.flush()
+        queued = sum(int(tail.size) if tail is not None else 0 for tail, _ in s.commits)
+        if queued + len(s.commits) * s.chunk_samples > s.max_item_seconds * SAMPLE_RATE:
+            await self._steps_settled()
+        s.cut_item()
+        self._start_steps()
+
+    async def _finish_commit(self, tail: np.ndarray | None, next_id: str) -> None:
+        """Finish a cut item: decode what is left, report it, start the next one."""
+        s = self.session
         if tail is not None and tail.size:
             await self.step(tail, final=True)
         else:
@@ -746,7 +790,7 @@ class RealtimeTranscription:
             "conversation.item.input_audio_transcription.completed",
             item_id=s.item_id, transcript=self.current_text(),
         ))
-        s.clear()
+        s.finish_item(next_id)
 
     def update(self, session: dict) -> None:
         """Apply a session update, all or nothing."""

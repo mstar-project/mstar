@@ -899,9 +899,9 @@ def test_24khz_chunk_boundaries_stay_on_the_item_timeline(client_and_stub):
         ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
             "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5}}}))
         ws.receive_text()
-        # each append that passes a boundary (the first and third) is decoded
-        # before the next is sent, so the steps run one at a time
-        for n, passes_boundary in ((12000, True), (11964, False), (11964, True), (11964, False)):
+        # each append that passes a boundary is decoded before the next event,
+        # so the steps run one at a time (a commit would coalesce a pending chunk)
+        for n, passes_boundary in ((12000, True), (11964, False), (11964, True), (11964, True)):
             _append_bytes(ws, _tone(n).tobytes())
             if passes_boundary:
                 _recv_until(ws, "mstar.transcription.partial")
@@ -1159,4 +1159,51 @@ def test_appends_keep_landing_while_a_step_waits_for_the_engine():
         assert ws.closed is None
         assert len(api.submits) == 2
         assert api.audio_sizes[1] > 20 * api.audio_sizes[0]
+    asyncio.run(exercise())
+
+
+def test_a_commit_keeps_intake_open_and_the_audio_after_it_in_the_next_item():
+    """A commit behind a step that waits past the 1024-message inbox, with 20 ms
+    frames still arriving: the session stays open, the commit finishes the old
+    item, and the frames are decoded as the next item without the old audio."""
+    import asyncio
+
+    async def exercise():
+        release, second_step = asyncio.Event(), asyncio.Event()
+        class WaitingAPI(_StubAPI):
+            calls = 0
+            async def collect_results(self, request_id, raw_request=None):
+                self.calls += 1
+                if self.calls == 1:
+                    await release.wait()
+                else:
+                    second_step.set()
+                return await super().collect_results(request_id, raw_request)
+            def release_request(self, request_id):
+                pass
+
+        api = WaitingAPI()
+        frames = [json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2)})]
+        frames += [json.dumps({"type": "input_audio_buffer.commit"})]
+        frames += [json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.02)})] * 2000
+        class Socket(_ScriptedWS):
+            closed = None
+            async def receive(self):
+                if not self.inbox:
+                    release.set()
+                    await second_step.wait()
+                return await super().receive()
+            async def close(self, code, reason):
+                self.closed = code
+
+        ws = Socket(frames)
+        rt = serving_realtime.RealtimeTranscription(api, "rt_test", _ContinuingAdapter(), ws)
+        await asyncio.wait_for(rt.run(), 60)
+        assert ws.closed is None
+        committed = next(e for e in ws.sent if e["type"] == "input_audio_buffer.committed")
+        partials = [e for e in ws.sent if e["type"] == "mstar.transcription.partial"]
+        assert partials[0]["item_id"] == committed["item_id"]
+        assert rt.session.item_id != committed["item_id"]
+        # 40 s of frames, cut to whole 2 s chunks; the committed item's 2 s stay out of it
+        assert 38 * 32000 < api.audio_sizes[1] <= 40 * 32000 + 44
     asyncio.run(exercise())
