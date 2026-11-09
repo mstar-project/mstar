@@ -7,6 +7,7 @@ compare declarations, so it can't rest on Python's ``hash``, which randomizes st
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -566,6 +567,49 @@ def test_the_digest_matches_across_processes_with_different_hash_seeds():
         for seed in ("0", "1", "2024")
     }
     assert digests == {str(declaration_digests(_declarations()))}, "the digest moved with PYTHONHASHSEED"
+
+
+# Every model a port test builds on the CPU, by that test's own builder, Bagel placed by a CFG-parallel YAML. Each
+# process digests them as startup does.
+_PORTED_DIGESTS = """
+import json, sys, tempfile
+from pathlib import Path
+import pytest
+sys.path[:0] = ["test/modular", "."]
+from mstar.engine.state.analysis import declaration_digests
+from test_chatterbox_model import _make_model as chatterbox
+from test_state_bagel_port import CFG_PARALLEL, _bagel
+from test_state_chatterbox_port import VARIANTS
+from test_state_diffusion_ports import MODELS as DIFFUSION, _ltx
+from test_state_omni_port import _model as omni
+from test_state_ports import QWEN3_5, _command_a_plus, _qwen3_5, _qwen3_5_vision
+from test_state_read_ports import _ac, _canary, _masked, _pi05
+from test_state_value_ports import MODELS
+from test_state_whisper_port import GEOMETRY, _model as whisper
+with pytest.MonkeyPatch.context() as monkeypatch:
+    models = {name: build() for name, (build, _) in {**MODELS, **DIFFUSION}.items()}
+    models |= {"ltx2_5": _ltx(), "pi05": _pi05(), "vjepa2_ac": _ac(), "vjepa2_masked": _masked(), "canary": _canary()}
+    models |= {f"qwen3_5_{size}": _qwen3_5(**geometry) for size, geometry in QWEN3_5.items()}
+    models["qwen3_5_vision"] = _qwen3_5_vision(monkeypatch)
+    models["command_a_plus"] = _command_a_plus(Path(tempfile.mkdtemp()))
+    models |= {"qwen3_omni": omni(), "bagel_cfg_parallel": _bagel(CFG_PARALLEL)}
+    models |= {f"chatterbox_{variant}": chatterbox(variant) for variant in VARIANTS}
+    models |= {name: whisper(name) for name in GEOMETRY}
+    print(json.dumps({name: declaration_digests(m.declare_state(), m.kernel_settings()) for name, m in models.items()}))
+"""
+
+
+def test_every_port_tested_model_digests_alike_in_processes_with_different_hash_seeds():
+    """Every process of a deployment builds its own declarations, and startup fails on any digest that differs from the
+    conductor's. A set kept in its iteration order differs from one process to the next."""
+    outputs = []
+    for seed in ("0", "1"):
+        done = subprocess.run([sys.executable, "-c", _PORTED_DIGESTS], env={**os.environ, "PYTHONHASHSEED": seed},
+                              capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-2000:]
+        outputs.append(json.loads(done.stdout))
+    assert len(outputs[0]) == 30, f"the script built {sorted(outputs[0])}"
+    assert outputs[0] == outputs[1], "a deployment of one of these models would fail its startup check"
 
 
 @dataclass(frozen=True)
