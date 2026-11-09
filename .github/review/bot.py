@@ -151,6 +151,12 @@ def graphql(query, repo, pr=None):
                "-f", f"query={query}")
 
 
+def log_value(value):
+    """Untrusted `value` for a log line, where it can't run a workflow command: on one line, as JSON (a newline would
+    start a new command), and without `##[`, which the runner's older command parser finds anywhere in a line."""
+    return json.dumps(value).replace("##[", "# #[")
+
+
 def write(path, text):
     """Write `text` as `gh` printed it, bytes that aren't UTF-8 included."""
     Path(path).write_text(text, encoding="utf-8", errors="surrogateescape")
@@ -300,7 +306,7 @@ def reply(repo, pr, text):
     try:
         comment(repo, pr, text)
     except RuntimeError as e:
-        print(f"::warning::Couldn't reply: {e}")
+        print(f"::warning::Couldn't reply: {log_value(str(e))}")
 
 
 # ---------------------------------------------------------------- review job: before the review
@@ -311,7 +317,7 @@ def react(out, repo, comment_id):
     try:
         gh("api", "-X", "POST", f"repos/{repo}/issues/comments/{comment_id}/reactions", "-f", "content=eyes")
     except RuntimeError as e:
-        print(f"::warning::Couldn't react to the comment: {e}")
+        print(f"::warning::Couldn't react to the comment: {log_value(str(e))}")
 
 
 def resolve(out, repo, pr, mode, runner_temp, non_write=""):
@@ -708,7 +714,7 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_step_summa
         record.update(session.usage(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")])))
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
-        print(f"::warning::Couldn't read the review's usage: {record['error']}")
+        print(f"::warning::Couldn't read the review's usage: {log_value(record['error'])}")
     try:
         with open(github_step_summary, "a") as f:
             f.write(session.usage_table(record))
@@ -768,9 +774,9 @@ def post_inline(repo, pr, head_sha, review):
             new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
                                 input=json.dumps(fields)).stdout)
             posted[str(new["id"])] = tag[1] if tag else "P2"
-        except UNREADABLE as e:  # json.dumps: a newline in the model's path or gh's echo would start a command
+        except UNREADABLE as e:  # the model's path and gh's echo are untrusted
             where = f"{c['path']}:{c['line']}"
-            print(f"::warning::Couldn't post the inline comment on {json.dumps(where)}: {json.dumps(str(e))}")
+            print(f"::warning::Couldn't post the inline comment on {log_value(where)}: {log_value(str(e))}")
             claim, _, detail = body[tag.end() if tag else 0:].strip().partition("\n")
             review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": claim, "location": where,
                                            "detail": session.shorten(detail.strip(), 2000)})
@@ -792,7 +798,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
                                      salvaged == "true")
     except Exception as e:
         text = ""
-        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {json.dumps(str(e))}")
+        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")
     text = redact(text)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
@@ -812,7 +818,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
             gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{cid}", "--input", "-",
                input=json.dumps({"body": body}))
         except RuntimeError as e:
-            print(f"::warning::Couldn't mark comment {cid} resolved: {e}")
+            print(f"::warning::Couldn't mark comment {cid} resolved: {log_value(str(e))}")
 
 
 def hide(out, repo, pr, new_id):
