@@ -487,16 +487,16 @@ gets the pages freed, up to its shortage. When the newer requests can't cover it
 host if the host pool can hold all of its pages, and otherwise waits holding its pages. A request
 on the host, a dropped one and one waiting for pages wait outside the queue, so a new prompt that
 fits still starts, unless one of them is the oldest request in its pool, which no newer prompt
-passes. They are tried oldest first, before the queue. The oldest refused request that moves can let in moves newer
-requests that wait holding pages, to the host or by a drop as above. A request on the host returns
-once its pages and one more page fit, or every page its grant needed when it moved itself, and its
-pages are then copied back. A dropped request returns once its prompt, or its history and one more
-page if that is larger, fits, counting no prompt page another request holds, then recomputes its KV
-in prefill chunks cut by its walk's chunk budget. A request that streams an output in
-``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
-and is never dropped or moved to the host. Voice requests then queue when the pool is short and are
-never preempted mid-stream. A request no drop can free, because it holds KV made from media or
-another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
+passes. They are tried oldest first, before the queue. The oldest refused request that moves can let
+in moves newer requests that wait holding pages, to the host or by a drop as above. A request on the
+host returns once its pages and one more page fit, or every page its grant needed when it moved
+itself, and its pages are then copied back. A dropped request returns once its prompt, or its
+history and one more page if that is larger, fits, counting no prompt page another request holds,
+then recomputes its KV in prefill chunks cut by its walk's chunk budget. A request that streams an
+output in ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit
+counted, and is never dropped or moved to the host. Voice requests then queue when the pool is short
+and are never preempted mid-stream. A request no drop can free, because it holds KV made from media
+or another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
 when it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt.
 The room grows with each page the request takes after that, so its move always fits. When the host
 pool has no room for it at admission, or later once the device has room for the rest of its
