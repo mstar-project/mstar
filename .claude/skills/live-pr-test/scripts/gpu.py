@@ -212,7 +212,7 @@ def slurm_run(sl: dict, command: str, check: bool = True) -> str:
     """One shell command on the Slurm node `sl`'s login host; stdout."""
     r = subprocess.run(slurm_ssh(sl) + [command], capture_output=True, text=True, check=False, timeout=120)
     if check and r.returncode != 0:
-        raise ApiError(r.returncode, f"slurm: {command.split(maxsplit=1)[0]}: {ssh_error(sl, r)}")
+        raise ApiError(r.returncode, f"slurm: {command.split(maxsplit=1)[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
     return r.stdout
 
 
@@ -220,14 +220,6 @@ def tail_lines(text: str, limit: int) -> str:
     """The last whole lines of `text` that fit in `limit` characters; one longer line is clipped."""
     text = text.strip()
     return text if len(text) <= limit else text[-limit:].partition("\n")[2] or text[-limit:]
-
-
-def ssh_error(sl: dict, r: subprocess.CompletedProcess) -> str:
-    """Why ssh failed. For a pinned node whose key changed, not ssh's own advice: `ssh-keygen -R` drops the pin."""
-    if sl.get("host_key") and r.returncode == 255 and "Host key verification failed" in r.stderr:
-        return ("the node's SSH host key changed. Confirm the real key through a trusted channel, then update "
-                "`host_key` in the node's config (`REVIEW_SLURM_NODES` for the review bot).")
-    return tail_lines(r.stderr or r.stdout, 400)
 
 
 def slurm_cancel(sl: dict, job: str, jobdir: str | None) -> None:
@@ -1258,14 +1250,8 @@ def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
 
 
 def release_by_name(cfg: dict, pr: int, tag: str) -> None:
-    """End whatever this tool launched for `pr` and `tag`, by its name on every Slurm node and on Eras,
-    for a launch cancelled before its instance was recorded. Keeps going past a node it can't reach."""
-    for p in slurm_providers(cfg):
-        name = p.job_name(pr, tag)
-        try:
-            slurm_cancel(p.sl, f"--name={shlex.quote(name)}", p.job_dir(name))
-        except (ApiError, subprocess.TimeoutExpired) as err:
-            print(f"{p.label}: {err}")
+    """End whatever this tool launched on Eras for `pr` and `tag`, by its name, for a launch cancelled
+    before its instance was recorded."""
     eras_cloud = Eras(cfg)
     if eras_cloud.enabled():
         for iid in eras_cloud.named(eras_cloud.job_name(pr, tag)):

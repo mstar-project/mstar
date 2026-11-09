@@ -199,15 +199,15 @@ def permission(repo, login):
     return (read(api, f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission", "none")
 
 
-def head_trusted(repo, pull, listed=None):
+def head_trusted(repo, pull):
     """Whether the PR's code is held by someone `repo` trusts: a branch of `repo` itself, or a fork whose owner has
-    write access (or is in `listed`, when given). An author with write access can open a PR from anyone's fork, so
-    the author alone doesn't say. A head repository GitHub no longer shows means no."""
+    write access. An author with write access can open a PR from anyone's fork, so the author alone doesn't say. A
+    head repository GitHub no longer shows means no."""
     head = (pull.get("head") or {}).get("repo") or {}
     owner = (head.get("owner") or {}).get("login")
     if head.get("full_name") == repo:
         return True
-    return bool(owner) and (owner in listed if listed is not None else permission(repo, owner) in WRITE)
+    return bool(owner) and permission(repo, owner) in WRITE
 
 
 def redact(text, exact=()):
@@ -611,7 +611,9 @@ GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|
 def touched_files(diff_text):
     """Every file a diff touches, on either side: changed, added, deleted (`+++ /dev/null`), renamed from or to,
     and binary or mode-only changes, by their `diff --git` line. Unlike session.diff_paths, the files a review
-    can open, a file that is gone counts. Lines end only at \\n, as in session.diff_paths."""
+    can open, a file that is gone counts. Lines end only at \\n, as in session.diff_paths. A binary or mode-only
+    change to a path with a space isn't caught (git doesn't quote spaces in its `diff --git` line, so the line can't
+    be split), which fails closed: its finding reads as untouched."""
     lines = diff_text.split("\n")
     paths = set()
     for before, line in zip([""] + lines, lines, strict=False):
