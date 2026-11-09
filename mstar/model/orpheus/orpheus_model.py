@@ -22,6 +22,7 @@ the SNAC decoder emits the audio of each window's own frames.
 
 import dataclasses
 import logging
+from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
