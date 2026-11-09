@@ -358,6 +358,25 @@ def test_a_victim_whose_move_fails_comes_off_the_earmark():
     assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
 
 
+def test_a_request_dropped_before_its_victim_lands_returns_with_what_its_drop_recorded():
+    """b runs short and moves v, then o runs short and moves b before v lands. v's move then admitted b for the
+    shortage b ran short by, not the history b returns with."""
+    kv = _pool()
+    _running(kv, "o", 2, arrival=0)
+    _running(kv, "b", 3, arrival=1)
+    _running(kv, "v", 4, arrival=2)
+    assert _preempt(kv, "b", _step(kv, "b", 3 * PAGE_SIZE).reason.pages_short, lambda rid: True).to_drop == ["v"]
+    short = _step(kv, "o", 3 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "o", short, droppable=lambda rid: rid == "b").to_drop == ["b"]
+
+    _drop(kv, "b")
+    _drop(kv, "v")
+
+    assert "b" not in kv._allotments or kv._allotments["b"].pages >= kv._dropped["b"].returns, (
+        "v's move admitted b with the shortage it ran short by, not what it returns with"
+    )
+
+
 @pytest.mark.parametrize("then", ["waits", "waits, then is dropped"])
 def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
     """A request that ran short with nothing newer to move dropped itself. Nothing older waited for the room, so it
@@ -1285,6 +1304,20 @@ def test_the_room_the_host_sets_aside_grows_with_each_page_a_request_takes():
     assert kv._cpu_pool.reserved == {"r": 3}, "the room set aside isn't the pages r holds"
 
 
+def test_the_host_counts_no_room_set_aside_once_a_request_that_moved_into_it_reloads_and_is_removed(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    assert _step(kv, "r", PAGE_SIZE).ok and kv._cpu_pool.reserved == {"r": 3}
+    assert _offload(kv, "r") == 3 and kv._cpu_pool._unmoved == 0
+    assert kv.can_reload("r") and kv.reload("r")
+
+    _remove(kv, "r")
+
+    assert kv._cpu_pool._unmoved == 0, "the host still counts room set aside for a request that is gone"
+
+
 def test_a_request_the_full_host_cant_cover_turns_guaranteed_at_that_page_and_is_counted(caplog):
     kv = _pool()
     kv._cpu_pool = host._HostPool(3)
@@ -1422,10 +1455,13 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitt
     assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
 
 
-def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim():
+def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim(
+    monkeypatch,
+):
     """q's end grows the room to p's 2-page prompt, so the runner admits p, the host has no room to set aside for it,
     and p asks for its 6-page footprint. Its earmark still asked for the prompt, so z2's drop then admitted p,
     guaranteed, with 2 pages."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _pool()
     kv._cpu_pool = host._HostPool(0)
     _running(kv, "o", 5, arrival=0)
