@@ -17,7 +17,7 @@ sys.path.insert(0, ".")
 import pytest
 import test_kv_host_index as host
 import torch
-from test_kv_admission import _remove, _runner
+from test_kv_admission import _RUNNERS, _remove, _runner
 from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
     _admitted,
@@ -36,12 +36,14 @@ from test_kv_preemption import (  # noqa: F401
     _stub_transfer,
 )
 from test_kv_prefix_lease import WALK, _manager
+from test_runner_admission import _StubPool
 
 from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import Victims
+from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
@@ -495,6 +497,38 @@ def test_a_request_its_moves_admitted_starts_while_an_older_return_holds_its_poo
     started = _runner(kv).admit_waiting(lambda rid, node: None)
 
     assert (NODE, "b") in started, "b waited behind a, and a for the pages b's allotment holds"
+
+
+def test_an_older_return_moves_a_request_its_moves_admitted_while_it_waits_for_another_resource():
+    """make_room dropped w for b, and the drop admitted b. a, older than b, was dropped after that and waits to return
+    into the pages b's allotment holds. b waits at the LoRA pool behind f, and a holds f back at the KV pool. b holds
+    pages it hasn't started on, but it wasn't counted as waiting holding pages, so make_room never moved it and
+    nothing ran with pages free."""
+    kv = _pool()
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "lora": _StubPool(8)}, node_resources={NODE: ["kv", "lora"]}))
+    _running(kv, "x", 1, arrival=0)
+    _running(kv, "a", 6, arrival=1)
+    _running(kv, "w", 3, arrival=4)
+    assert _preempt(kv, "w", _short(kv, "w"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("w", NODE)
+    _request(kv, "b", 3, arrival=3)
+    assert not _admitted(kv, "b")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["w"] = _kept(3 * PAGE_SIZE)
+    w._preemption.make_room()
+    assert kv.residency("w") is Residency.DROPPED and "b" in kv._allotments
+    _drop(kv, "a")
+    _remove(kv, "x")
+    _remove(kv, "w")
+    _request(kv, "f", 1, arrival=2)
+    assert _runner(kv).admit_request("f", NODE, WALK).queued
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+    w._preemption.make_room()
+    started += _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "a") in started and (NODE, "f") in started, "a waited for b's pages, b for f, and f for a"
+    assert "b" in kv._asks, "b gave back its allotment and asks again"
 
 
 def test_make_room_walks_again_only_once_a_refusal_or_a_request_it_could_move_changes():

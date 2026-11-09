@@ -4188,8 +4188,9 @@ class KVManager(AttentionResource):
             for rid in self._victims:
                 assert rid not in self._guaranteed, f"{rid} is guaranteed and was chosen as a victim"
             stalled = {rid for rid in self._asks if rid in self._allotments}
-            assert self._stalled == stalled, (
-                f"`_stalled` lists {sorted(self._stalled)}, but {sorted(stalled)} wait holding"
+            assert stalled <= self._stalled <= self._allotments.keys(), (
+                f"`_stalled` lists {sorted(self._stalled)}, but {sorted(stalled)} wait holding "
+                f"and {sorted(self._allotments)} hold an allotment"
             )
             if self._cpu_pool is not None:
                 self._assert_host_pages_conserved()
@@ -4332,6 +4333,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if rid not in self._asks:
                 # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
+                self._stalled.discard(rid)
                 return None
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room or not self._admit(rid, pages):
@@ -4681,7 +4683,8 @@ class KVManager(AttentionResource):
         grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
         victim that asks again at once is then measured against the room without it. A waiting request the moves
         were for takes the room as soon as it covers all it asks for, before a victim can take it back, and the moves
-        that land after that add nothing."""
+        that land after that add nothing. It waits holding that room until it starts, so an older request can move
+        it."""
         self._hosted.discard(rid)
         earmark = self._victims.pop(rid, None)
         if earmark is None:
@@ -4696,7 +4699,8 @@ class KVManager(AttentionResource):
                 mark.rid, mark.node_name, mark.graph_walk, mark.published,
             )
             if pages <= self._room():
-                self._admit(earmark.rid, pages)
+                if self._admit(earmark.rid, pages):
+                    self._stalled.add(earmark.rid)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
