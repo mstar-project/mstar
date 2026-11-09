@@ -1506,12 +1506,13 @@ forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
 <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> (all pre-sharding, as in <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>), an <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> that
 defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code>, the
-default, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code>),
-<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, the
+default, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.CUDNN</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, the
 two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> (<code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>
 for a <code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> region) and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and
-<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
+<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code>. <code class="docutils literal notranslate"><span class="pre">CUDNN</span></code> runs torch’s cuDNN SDPA over
+equal-length segments (see <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>). <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) and falls back to FlashInfer if that kernel is
 missing. By default the heads are split across all TP × SP ranks of the node;
 <code class="docutils literal notranslate"><span class="pre">shard_over_sp=False</span></code> splits them across the TP ranks only, for an attention
@@ -1795,7 +1796,28 @@ outside the graph, into buffers whose addresses do not change, and the captured 
 attends through them. A kernel that reads <code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> as an argument, or builds its
 mask from it, cannot be captured this way.</p>
 <p><code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code> (and an explicit <code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code>) plan through FlashInfer’s
-ragged prefill wrapper. <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code> plans the same layouts into static
+ragged prefill wrapper. For a self-attention whose config names neither a backend nor a
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">None</span></code>, the default; an explicit <code class="docutils literal notranslate"><span class="pre">auto</span></code> is FlashInfer’s own choice), <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> first reads the <code class="docutils literal notranslate"><span class="pre">ragged_attention</span></code> kernel table
+(<code class="docutils literal notranslate"><span class="pre">mstar/kernels/tables/ragged_attention/</span></code>, see <a class="reference internal" href="#tuned-kernel-configs">Tuned kernel configs</a>) for the rank’s head
+geometry on the GPU. An eager plan runs the row its layout’s longest query segment falls in, so
+one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
+the layout that first plans it. On <code class="docutils literal notranslate"><span class="pre">sm_103</span></code> the table names torch’s cuDNN SDPA (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.CUDNN</span></code>) for
+klein 4B / 9B and Z-Image’s geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B’s 24 heads read
+klein 4B’s entry, LTX-2.5’s 32-head video self-attention klein 9B’s): under a CUDA graph FlashInfer’s
+<code class="docutils literal notranslate"><span class="pre">auto</span></code> stays on FA2 there (its cutlass plan can’t be replanned in graph mode, and its cuDNN path needs
+cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
+has run bounds them with a numeric last row and a <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code> row naming <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>, the resource’s own
+default. A GPU of the architecture reads the file
+whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
+segments, a DiT batch’s, as one dense <code class="docutils literal notranslate"><span class="pre">[segments,</span> <span class="pre">S,</span> <span class="pre">H,</span> <span class="pre">D]</span></code> call. A captured one replays only
+the layout it was planned with, so a captured bucket takes it only when the step that plans it
+declares <code class="docutils literal notranslate"><span class="pre">AttentionStep(fixed_layout=True)</span></code>, and stays on FlashInfer otherwise. The DiT
+scaffold’s denoise step declares it (<code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.attention_step</span></code>): every row of a
+denoise bucket, padding rows included, spans the bucket’s tokens. An eager layout of unequal
+segments runs FlashInfer. It is self-attention only. A config that names <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">cudnn</span></code>
+fails at build where cuDNN can’t run it: on a cross-attention or block-causal resource, under
+GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
+geometry, <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> is FlashInfer with its own <code class="docutils literal notranslate"><span class="pre">auto</span></code> choice. <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code> plans the same layouts into static
 <code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> buffers and runs FA3 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) instead, with
 no page scatter. If that kernel is not importable, or the spec is a
 <code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code> (whose overlapping prefixes varlen cannot express),
@@ -3206,8 +3228,10 @@ slot for a request is refused at startup.</p></td>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
-(<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">cudnn</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
+(unset by default: a self-attention reads the <code class="docutils literal notranslate"><span class="pre">ragged_attention</span></code> kernel table; any name,
+<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code> / <code class="docutils literal notranslate"><span class="pre">cudnn</span></code> / <code class="docutils literal notranslate"><span class="pre">cutlass</span></code>, runs that FlashInfer backend and no
+table), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The ceilings size CUDA-graph
 buckets, which is a memory-against-coverage trade the deployment makes, not the model.
 A resource sized per step refuses <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, which it would ignore.</p></td>
@@ -3481,7 +3505,10 @@ per process and keeps the default config where no table has it, and the server l
 command for that shape (<code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">table:</span> <span class="pre">no</span> <span class="pre">moe_gemm</span> <span class="pre">bfloat16</span> <span class="pre">E=128,N=1536,K=2048,top_k=8</span> <span class="pre">...</span></code>).
 A block-fp8 dense linear (<code class="docutils literal notranslate"><span class="pre">fp8_linear</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar/utils/dense_fp8.py</span></code>) takes its kernel per token
 count the same way: the w8a16 Triton kernel, FlashInfer’s or cuBLAS’s block-scale GEMM, where the
-GPU’s row names one that runs there.</p>
+GPU’s row names one that runs there. A cacheless self-attention (<code class="docutils literal notranslate"><span class="pre">ragged_attention</span></code>) takes its
+kernel per head geometry and longest query segment: torch’s cuDNN SDPA or one of FlashInfer’s
+ragged backends. A table can also be named for an architecture (<code class="docutils literal notranslate"><span class="pre">sm_103.json</span></code>) rather than one
+GPU model, for rows that hold on every GPU of it; the sweep’s <code class="docutils literal notranslate"><span class="pre">--arch</span></code> writes that file.</p>
 <p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.kernels.sweep</span></code> times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.
 <code class="docutils literal notranslate"><span class="pre">--out</span> <span class="pre">DIR</span></code> with <code class="docutils literal notranslate"><span class="pre">MSTAR_KERNEL_TABLES=DIR</span></code> serves a sweep before it is committed;

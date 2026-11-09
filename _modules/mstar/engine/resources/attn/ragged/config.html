@@ -1042,7 +1042,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">AUTO</span> <span class="o">=</span> <span class="s2">"auto"</span>
     <span class="n">FLASHINFER</span> <span class="o">=</span> <span class="s2">"flashinfer"</span>
     <span class="c1"># FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE</span>
-    <span class="n">DENSE</span> <span class="o">=</span> <span class="s2">"dense"</span></div>
+    <span class="n">DENSE</span> <span class="o">=</span> <span class="s2">"dense"</span>
+    <span class="c1"># torch's cuDNN SDPA over equal-length segments, FlashInfer for any other</span>
+    <span class="c1"># layout; self-attention only, and refused at build where cuDNN can't run</span>
+    <span class="c1"># the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)</span>
+    <span class="n">CUDNN</span> <span class="o">=</span> <span class="s2">"cudnn"</span></div>
 
 
 
@@ -1097,7 +1101,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">max_tokens_per_request</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">backend</span><span class="p">:</span> <span class="n">RaggedAttnBackend</span> <span class="o">=</span> <span class="n">RaggedAttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
-    <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
+    <span class="c1"># None: under AUTO a self-attention runs the `ragged_attention` kernel</span>
+    <span class="c1"># table's pick, and FlashInfer's own "auto" where no table applies. A name,</span>
+    <span class="c1"># "auto" included, runs that FlashInfer backend and reads no table.</span>
+    <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Whether a compiled caller keeps the attention in its graph, as the</span>
     <span class="c1"># ``mstar::ragged_attention`` op, rather than breaking there per layer. For</span>

@@ -1298,7 +1298,13 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># (a draft block over the context the target has produced so far); the step's own</span>
     <span class="c1"># `segments` then carry the query counts, the cache's segments the appended counts.</span>
     <span class="c1"># Only the MLA backend reads it; the others refuse it (`refuse_context_only`).</span>
-    <span class="n">context_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
+    <span class="n">context_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># The step's layout follows from its capture bucket alone, so every replay of a</span>
+    <span class="c1"># bucket plans the layout the bucket was captured with (a DiT's denoise step,</span>
+    <span class="c1"># where every row, padding rows included, spans its bucket's tokens). Lets a</span>
+    <span class="c1"># ragged resource capture a kernel that bakes the layout into the graph; the</span>
+    <span class="c1"># other attention resources ignore it.</span>
+    <span class="n">fixed_layout</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 
