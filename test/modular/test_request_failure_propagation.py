@@ -21,7 +21,7 @@ The neighbouring pieces are covered elsewhere:
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -177,6 +177,47 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
     w.pipeline._handle_error(RuntimeError("boom"), (None, None), scheduled)
     assert set(w.sent[0][1].body.errors) == {"r1", "r2"}
 
+
+
+@pytest.mark.parametrize("where", ["forward", "main loop"])
+def test_a_failed_step_frees_its_tensors_without_waiting_for_gc(where):
+    """An OOM's smaller retry needs the failed forward's memory back at once;
+    its traceback's frames would keep those tensors until the next gc."""
+    import gc
+    import weakref
+
+    import torch
+
+    held = []
+
+    def forward():
+        tensor = torch.zeros(4)
+        held.append(weakref.ref(tensor))
+        raise torch.OutOfMemoryError("out of memory")
+
+    w = _worker()
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    try:
+        if where == "forward":
+            future = Future()
+            try:
+                forward()
+            except torch.OutOfMemoryError as exc:
+                future.set_exception(exc)
+            pending = _pending_batch(["r1"], future=future)
+            pending.node_batch = SimpleNamespace(failed_requests={})
+            w.pipeline._step_result(pending)
+            assert held[0]() is None
+        else:
+            try:
+                forward()
+            except torch.OutOfMemoryError as exc:
+                w.pipeline._handle_error(exc, (None, None), None)
+                assert held[0]() is None
+    finally:
+        if gc_was_on:
+            gc.enable()
 
 # ── api server ─────────────────────────────────────────────────────────────
 

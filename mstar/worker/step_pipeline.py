@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
+import traceback
 from collections.abc import Collection, Iterable, Mapping
 from functools import partial
 from types import MappingProxyType
@@ -54,6 +55,15 @@ logger = logging.getLogger(__name__)
 # How often the admit fence reports the step it is waiting for. The fence itself
 # never gives up; see ``StepPipeline._await_admit_settled``.
 _ADMIT_FENCE_WARN_S = 10.0
+
+
+def _failure_text(exc: BaseException, what: str) -> str:
+    """The client's text for a failed step, after which the traceback's frames
+    are cleared: a raised forward's locals hold its tensors, and the next step
+    (an OOM's smaller retry, say) needs that memory now, not at the next gc."""
+    err, _ = client_error_text(exc, what, log=logger)
+    traceback.clear_frames(exc.__traceback__)
+    return err
 
 
 class StepPipeline:
@@ -515,7 +525,7 @@ class StepPipeline:
         """Fail a side step's rows alone: the chain's rows in flight have nothing
         to do with it, so this doesn't go through ``_handle_error``."""
         self.executor.clear_in_flight(batch)
-        err, _ = client_error_text(exc, f"Worker {self.worker_id} error in a side step", log=logger)
+        err = _failure_text(exc, f"Worker {self.worker_id} error in a side step")
         self._fail_requests(dict.fromkeys(batch.request_to_worker_graph, err))
 
     def _launch_side(self) -> None:
@@ -695,9 +705,8 @@ class StepPipeline:
         try:
             return pending.future.result()
         except Exception as exc:
-            err, _ = client_error_text(
+            err = _failure_text(
                 exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
-                log=logger,
             )
             failed = pending.node_batch.failed_requests
             for rid in pending.batch.request_to_worker_graph:
@@ -787,9 +796,7 @@ class StepPipeline:
         """
         # Report the leaf exception to the client and keep the full chain in
         # the log. A forward's own raise doesn't come here (``_step_result``).
-        err, _ = client_error_text(
-            exc, f"Worker {self.worker_id} error in main loop", log=logger,
-        )
+        err = _failure_text(exc, f"Worker {self.worker_id} error in main loop")
 
         # the chain's rows: a side lane's step fails on its own (``_fail_side``)
         failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
