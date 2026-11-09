@@ -368,6 +368,8 @@ Higgs Audio notes
   to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
+- The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
+  cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
 - Decode keeps each request's last token in the sampler's slot master and
@@ -384,6 +386,10 @@ Orpheus notes
   renormalizes over the custom tokens: the reference samples the full
   vocabulary, where a text token's probability during speech is negligible but
   not zero, so sampled output is not identical to the reference's.
+- ``/v1/audio/speech`` input of 250+ characters is synthesized as sentence chunks of
+  about 200: the default 2,048 output tokens are about 25 s of speech, and a longer
+  input would be cut off there (``sentence_chunking: false`` opts out). An input of
+  more than 32 chunks (some 6,400 characters) is a 400.
 
 Omnilingual ASR notes
 ~~~~~~~~~~~~~~~~~~~~~
@@ -516,7 +522,9 @@ unless the checkpoint's generation_config sets a ``min_p``, which turns the
 sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
-still reasons, at the template's lowest strength. The reply
+still reasons, at the template's lowest strength. Either, or the template's own
+``reasoning_strength`` and ``current_date``, may also come in
+``chat_template_kwargs``; a flat key wins. The reply
 is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
@@ -625,8 +633,9 @@ c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
-``enable_thinking`` (default true; the template opens a ``<think>`` block) are
-read by the model but are not OpenAI fields — pass them via ``extra_body``.
+``enable_thinking`` (default true; the template opens a ``<think>`` block;
+``chat_template_kwargs.enable_thinking`` also works) are read by the model but
+are not OpenAI fields — pass them via ``extra_body``.
 Sampling defaults to the checkpoint's generation_config, under whatever the
 request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
 and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
@@ -791,7 +800,7 @@ the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
-client sends.
+client sends, and a request that sends one is logged as ignoring it.
 
 Command A+ (``command_a_plus``)
 -------------------------------

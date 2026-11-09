@@ -806,7 +806,7 @@ pub fn pcm16_to_container(pcm: &[u8], sample_rate: u32, fmt: &str) -> Result<(Ve
 /// `media_io.audio_formats`: a stream carries an open-ended WAV or bare PCM;
 /// otherwise the compressed containers too, when libsndfile is loaded, and opus
 /// only at one of its native rates.
-fn audio_formats(stream: bool, sample_rate: u32, compressed: bool) -> Vec<&'static str> {
+pub(crate) fn audio_formats(stream: bool, sample_rate: u32, compressed: bool) -> Vec<&'static str> {
     let mut formats = vec!["wav", "pcm"];
     if !stream && compressed {
         formats.extend(["mp3", "flac"]);
