@@ -883,6 +883,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from mstar.engine.resources.step import Segment
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.executing_batch import build_executing_batch
     from mstar.worker.host_pool import HostPool
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.rebuild import NodeWrites, Rebuilds
@@ -936,11 +937,10 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     held = (stream.stored_len, len(stream.page_indices), rope.position(R, "main"))
     kv.drop(R, held[0])
     rope.drop(R, held[0])
-    w, eng = _worker()
-    w._rebuilds = Rebuilds(
+    w, eng = _worker(rebuilds=Rebuilds(
         model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 20, torch.device("cpu")),
         StepAllowance(), {NODE: torch.float32},
-    )
+    ))
     writes = {"kv": {NODE: NodeWrites(frozenset({step.walk, "decode"}), frozenset({"decode_loop"}))}}
     assert w._rebuilds.ingest_request(R, writes, {"kv": config.kv_layout.values()}, unpausable=False)["kv"], (
         "a chat with images or video would be guaranteed"
@@ -958,7 +958,9 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     eng.dropped.append(R)
     assert w._rebuilds.tokens(R, NODE, None) == held[0], "the drop would refuse the request"
     kv.prepare_rebuild(R, w._rebuilds.start(R, NODE, None))
-    batch = w._build_executing_batch(ScheduledBatch(NODE, step.walk, {R: 0}, rebuild_rids=frozenset({R})))
+    batch = build_executing_batch(
+        w.pipeline._services, ScheduledBatch(NODE, step.walk, {R: 0}, rebuild_rids=frozenset({R})),
+    )
     # the stub worker registers no rid handles, and the rope pool here is keyed by the request id
     batch.per_request_info[R].rid_handle = R
     rebuilt = llm._media_inputs(batch.per_request_info[R], batch.per_request_input_tensors[R])
@@ -995,7 +997,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 

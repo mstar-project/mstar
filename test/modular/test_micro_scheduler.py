@@ -13,6 +13,8 @@ backlog. Three things have to hold across that split:
 
 from __future__ import annotations
 
+import collections
+import itertools
 import sys
 from types import SimpleNamespace
 
@@ -360,6 +362,13 @@ def _scheduler(engine: _Engine) -> MicroScheduler:
     )
 
 
+def _admitted(sched: MicroScheduler, *rids) -> MicroScheduler:
+    """``sched`` with ``rids`` admitted, as only an admitted request can fail."""
+    for rid in rids:
+        sched.lifecycle.add(rid, rid)
+    return sched
+
+
 def _clear(rid, sched: MicroScheduler) -> None:
     """A teardown's four clears, by rid in a test where handle and wire id are one."""
     sched.lifecycle.removed(rid, rid)
@@ -384,7 +393,7 @@ def _chain(
     mid_prefill=(), seq_lens=None,
 ):
     """A speculation chain's step at ``target``: the pick, then the waiting
-    rows it takes, as ``Worker._try_speculate_next`` drives the two.
+    rows it takes, as ``Speculator._try_speculate_next`` drives the two.
     ``seq_lens`` estimates the chain's rows' spans for a token budget."""
     bound(sched, runtime=manager.runtime)
     manager.runtime.combined_walk_of = sched.combined_walk_of
@@ -499,9 +508,9 @@ def test_a_raising_scheduling_pass_fails_the_rows_it_took(path, monkeypatch):
     their requests hang, as a rebuild the log would offer again does. The scan
     raises before it pops the queued row, the chain's step after; a rejection
     recorded earlier stands."""
-    sched = _scheduler(_Engine(max_bs=5))
+    sched = _admitted(_scheduler(_Engine(max_bs=5)), "r2", "r3", "r4", "r5")
     sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
-    sched.admission.admit_errors["r2"] = "unservable"
+    sched.lifecycle.fail({"r2": "unservable"})
     manager = _Manager(["r4"])
     monkeypatch.setattr(sched, "_rebuild_rows", lambda *a, **kw: [MidPrefillRow("r5", 0, WALK, 0, 4)])
     manager.per_request_info["r5"] = object()
@@ -517,7 +526,7 @@ def test_a_raising_scheduling_pass_fails_the_rows_it_took(path, monkeypatch):
             monkeypatch.setattr(sched, "_build_step", blow_up)
             _chain(sched, manager, ["c0"])
 
-    errors = sched.admission.take_admit_errors()
+    errors = sched.lifecycle.take_failures()
     assert set(errors) == {"r2", "r3", "r4", "r5"} and errors["r2"] == "unservable"
     assert {"r2", "r3", "r4", "r5"} <= sched.lifecycle.failed_rids
 
@@ -1416,46 +1425,44 @@ def test_split_off_first_accepts_an_empty_exclusion(exclude):
 # ── terminal admit failures ─────────────────────────────────────────────
 
 
-def test_an_unservable_rid_is_parked_for_the_worker_to_fail():
+def test_an_unservable_rid_fails_for_the_worker_to_report():
     """A resource that rejects a request outright (a failed KV transfer) must
-    not leave it rescanned forever: the rid is dropped from scheduling and
-    handed to the worker, which reports it to the conductor."""
-    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+    not leave it rescanned forever: the rid fails, which drops it from
+    scheduling, and the worker reports it to the conductor."""
+    sched = _admitted(_scheduler(_Engine(max_bs=4, unservable={"r0"})), "r0", "r1")
 
     batch = _next_batch(sched, _Manager(["r0", "r1"]))
 
     assert list(batch.request_to_worker_graph) == ["r1"]
-    assert "r0" in sched.admission.held_until, "scans leave it out until the worker fails it"
-    errors = sched.admission.take_admit_errors()
+    assert sched.lifecycle.failed_rids == {"r0"}, "a scan would take it again"
+    errors = sched.lifecycle.take_failures()
     assert set(errors) == {"r0"}
     assert "r0 is doomed" in errors["r0"]
-    # drained exactly once, so the worker does not re-report it every iteration
-    assert sched.admission.take_admit_errors() == {}
-    assert "r0" not in sched.admission.held_until
+    # taken exactly once, so the worker does not re-report it every iteration
+    assert sched.lifecycle.take_failures() == {}
 
 
 def test_an_unservable_rid_leaves_the_backlog_when_the_worker_fails_it():
-    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+    sched = _admitted(_scheduler(_Engine(max_bs=4, unservable={"r0"})), "r0", "r1")
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
     batch = _next_batch(sched, _Manager([]))
 
     assert list(batch.request_to_worker_graph) == ["r1"]
-    errors = sched.admission.take_admit_errors()
+    errors = sched.lifecycle.take_failures()
     assert set(errors) == {"r0"}
-    # what ``Worker._fail_requests`` does with them, at the top of the next pass
-    sched.lifecycle.failed_rids.update(errors)
+    # what ``StepPipeline._report_failures`` does with them
     sched.drop_backlogged(errors)
     assert sched.backlog == {}
 
 
-def test_clearing_a_rid_forgets_its_undelivered_admit_error():
-    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+def test_clearing_a_rid_forgets_its_unreported_failure():
+    sched = _admitted(_scheduler(_Engine(max_bs=4, unservable={"r0"})), "r0")
     _next_batch(sched, _Manager(["r0"]))
 
     _clear("r0", sched)
 
-    assert sched.admission.take_admit_errors() == {}
+    assert sched.lifecycle.take_failures() == {}
     assert sched.lifecycle.failed_rids == set()
 
 
@@ -2337,8 +2344,12 @@ class _SizedEngine(_Engine):
         del node_name, graph_walk
         return self._max_batch_tokens
 
-    def min_chunk_tokens(self, budget):
-        return self._chunking.min_chunk_tokens(budget)
+    def min_chunk_tokens(self, budget, align=1):
+        return self._chunking.min_chunk_tokens(budget, align)
+
+    def chunk_alignment(self, node_name):
+        del node_name
+        return 1
 
     def walk_token_caps(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -2453,6 +2464,24 @@ class _ChunkingEngine(_SizedEngine):
         return InputSeqLenInfo(10 - cached, cached_prefix=cached)
 
 
+class _AlignedEngine(_ChunkingEngine):
+    """``_ChunkingEngine`` with rows of ``lengths``, a floor of ``floor`` and a node whose
+    resources declare a chunk alignment of ``align``."""
+
+    def __init__(self, align, floor, lengths, **kw):
+        super().__init__(**kw)
+        self.align, self.lengths = align, lengths
+        self._chunking.set_budgets({}, set(), min_chunk_tokens=floor)
+
+    def chunk_alignment(self, node_name):
+        del node_name
+        return self.align
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        del node_name, graph_walk, request_info, inputs
+        return InputSeqLenInfo(self.lengths[rid])
+
+
 def _chunking_scheduler(engine, mixes=None) -> MicroScheduler:
     """A scheduler whose node runs ``prefill`` in a chunk Loop."""
     sched = _combined_scheduler(engine, mixes)
@@ -2526,6 +2555,69 @@ def test_a_prompt_finishes_before_the_next_one_starts():
     queue["p0"] = {NODE}
     third = _next_batch(sched, manager)
     assert third.chunk_ranges == {"p0": (8, 10, 10, 2), "p1": (0, 2, 10, 2)}, "p1 takes what p0 leaves"
+
+
+def test_short_prompts_cannot_starve_a_prompt_mid_prefill_under_an_alignment():
+    """The prompt mid-prefill keeps the floor of each step, rounded up to the node's alignment:
+    a floor of 2 under an alignment of 4 would leave it 2 tokens, too few to cut, while short
+    prompts take the rest of the step."""
+    rids = ["old", "s0", "s1", "s2"]
+    engine = _AlignedEngine(align=4, floor=2, lengths={"old": 40, "s0": 3, "s1": 3, "s2": 3}, max_bs=8, budget=8)
+    sched = _chunking_scheduler(engine)
+    manager = _Manager(rids, walks=dict.fromkeys(rids, "prefill"))
+    queue = manager.queues["wg0"]._ready
+    shorts = {rid: queue.pop(rid) for rid in rids[1:]}
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"old": (0, 8, 40, 8)}
+
+    manager.land(first)
+    queue["old"] = {NODE}
+    queue.update(shorts)
+    second = _next_batch(sched, manager)
+    assert second.chunk_ranges.get("old") == (8, 12, 40, 4)
+
+
+def test_short_prompts_arriving_every_step_cannot_starve_a_prompt_that_has_not_started():
+    """Short prompts that each fit leave less than the floor, rounded up to the node's
+    alignment, in every step, as a KV page_size of 256 does at a 512-token budget. The first
+    prompt in line keeps the floor whether it has started or not: queued behind them, the
+    long prompt never got its first chunk."""
+    lengths = collections.defaultdict(lambda: 3, old=40)
+    sched = _chunking_scheduler(_AlignedEngine(align=4, floor=2, lengths=lengths, max_bs=64, budget=8))
+    manager = _Manager([])
+    queue = manager.queues["wg0"]._ready
+    shorts = (f"s{i}" for i in itertools.count())
+
+    def arrive(rid):
+        manager.per_request_info[rid] = object()
+        manager.walks[rid] = "prefill"
+        queue[rid] = {NODE}
+
+    arrive(next(shorts))
+    arrive("old")
+    ran = []
+    for _ in range(20):
+        for _ in range(3):
+            arrive(next(shorts))
+        batch = _next_batch(sched, manager)
+        manager.land(batch)
+        chunk = batch.chunk_ranges.get("old")
+        if chunk is not None:
+            ran.append(chunk.stride)
+            if not chunk.is_final:
+                queue["old"] = {NODE}
+    assert sum(ran) == 40, f"the long prompt ran {sum(ran)} of its 40 tokens in 20 steps"
+
+
+def test_a_walk_cap_under_the_floor_cuts_its_rows_to_the_alignment():
+    """A walk capped under the chunk floor takes the cap as its floor, rounded down to the
+    node's alignment: a cap between two multiples would cut nothing while another row shares it."""
+    engine = _AlignedEngine(
+        align=4, floor=8, lengths={"p0": 40, "s0": 1}, max_bs=8, budget=16, walk_caps={"prefill": 7},
+    )
+    sched = _chunking_scheduler(engine)
+    first = _next_batch(sched, _Manager(["p0", "s0"], walks={"p0": "prefill", "s0": "prefill"}))
+    assert first.chunk_ranges == {"p0": (0, 4, 40, 4)}
 
 
 @pytest.mark.usefixtures("no_chunk_floor")

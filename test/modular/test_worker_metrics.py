@@ -278,18 +278,20 @@ def test_a_step_with_no_forward_or_on_a_followed_node_is_not_recorded(clock):
 
 
 class _StopLoopError(BaseException):
-    """Ends ``Worker.run``, whose loop handles only ``Exception``."""
+    """Ends ``StepPipeline.run``, whose loop handles only ``Exception``."""
 
 
-def _looping_worker(monkeypatch, schedule, speculate, refuse):
-    """A worker whose real ``run`` loop drives these steps; everything it
-    calls on the worker is stubbed except the loop itself. ``schedule`` is
+def _looping_worker(monkeypatch, schedule, speculate, refuse, metrics_on=True):
+    """A worker whose real ``run`` loop drives these steps; what the loop calls
+    on the other components is stubbed, except the loop itself. ``schedule`` is
     what the micro-scheduler hands out per call, ``speculate`` maps a loop
     iteration to the yield-away step it speculates, and ``refuse`` names the
-    steps whose admit fails."""
+    steps whose admit fails. Returns the metrics even with ``metrics_on`` off,
+    when the worker isn't given them."""
+    import mstar.worker.step_pipeline as pipeline_mod
     import mstar.worker.worker as worker_mod
     from mstar.worker.micro_scheduler import ScheduledBatch
-    from mstar.worker.worker import Speculation
+    from mstar.worker.speculation import Speculation
 
     monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "0")
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
@@ -301,7 +303,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
         return ScheduledBatch(node_name=NODE, graph_walk=name,
                               request_to_worker_graph={f"{name}.{i}": 0 for i in range(rows)})
 
-    def executing(batch):
+    def executing(_services, batch):
         return ExecutingBatch(
             node_name=NODE,
             per_request_info={rid: SimpleNamespace(rid=rid, n=1) for rid in batch.request_to_worker_graph},
@@ -323,14 +325,14 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
             node_batch.launch_started_event.set()
         return {}
 
-    def build_speculation(pending, consecutive, fair):
+    def build_speculation(pending):
         iteration[0] += 1
         step = speculate.get(iteration[0])
         if step is None:
             return None, None
         batch = scheduled(*step)
         return Speculation(
-            scheduled_batch=batch, node_batch=executing(batch), consumed_edges=set(),
+            scheduled_batch=batch, node_batch=executing(None, batch), consumed_edges=set(),
             continuing_rids=set(), partition="p", is_new_iter=False, is_same_node=False,
             is_yield_away=True,
         ), None
@@ -338,8 +340,12 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     def stub(*a, **k):
         return None
 
+    metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
+                            SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
+                            enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={})
+    metrics.start_counting()
     w = make_worker(
-        worker_id="worker_0",
+        worker_id="worker_0", metrics=metrics if metrics_on else None,
         parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
         engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng),
         communicator=SimpleNamespace(send=stub, wait_for_work=stub),
@@ -347,27 +353,24 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
         request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
         scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    for name in ("_init_engine_thread", "_await_admit_settled",
-                 "_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
-                 "_set_in_flight_flag", "_clear_in_flight_flag",
-                 "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
-        setattr(w, name, stub)
+    for name in ("_await_admit_settled", "_apply_removes", "_fail_requests", "_apply_drains",
+                 "_report_failures", "_teardown", "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
+        setattr(w.pipeline, name, stub)
     for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
         setattr(w.ingest, name, stub)
-    w._build_executing_batch = executing
-    w._build_speculation = build_speculation
-    w._execute_on_gpu_thread = gpu
-    w._postprocess_batch = lambda pending, outputs, **_: postprocessed.append(pending.graph_walk)
+    for name in ("_init_engine_thread", "_set_in_flight"):
+        setattr(w.executor, name, stub)
+    w.speculator.settle = stub
+    w.speculator.build = build_speculation
+    monkeypatch.setattr(pipeline_mod, "build_executing_batch", executing)
+    w.executor._body = gpu
+    w.executor.postprocess = lambda pending, outputs, **_: postprocessed.append(pending.graph_walk)
 
     def fail_loudly(error, *args):
         raise error
 
-    w._handle_main_loop_error = fail_loudly
-    w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
-                               SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
-                               enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={})
-    w._metrics.start_counting()
-    return w, sent, postprocessed, iteration
+    w.pipeline._handle_error = fail_loudly
+    return w, metrics, sent, postprocessed, iteration
 
 
 def test_the_run_loop_records_each_step_that_ran_once_on_both_submit_paths(monkeypatch):
@@ -375,15 +378,15 @@ def test_the_run_loop_records_each_step_that_ran_once_on_both_submit_paths(monke
     # speculates the yield-away step "b" (three rows) and postprocesses "a";
     # iteration 3 postprocesses "b" and submits "c", whose admit is refused
     # in iteration 4, so it never postprocesses
-    w, sent, postprocessed, iteration = _looping_worker(
+    w, metrics, sent, postprocessed, iteration = _looping_worker(
         monkeypatch, schedule=[("a", 2), ("c", 1), None], speculate={2: ("b", 3)}, refuse={"c"},
     )
     with pytest.raises(_StopLoopError):
         w.run()
 
     assert postprocessed == ["a", "b"]
-    steps = _hist(w._metrics.snapshot(), "mstar_step_seconds")
-    sizes = _hist(w._metrics.snapshot(), "mstar_batch_size")
+    steps = _hist(metrics.snapshot(), "mstar_step_seconds")
+    sizes = _hist(metrics.snapshot(), "mstar_batch_size")
     assert sorted(steps) == [(NODE, "a"), (NODE, "b")]
     assert {walk: (counts[-1], total) for (_, walk), (counts, total) in sizes.items()} == {
         "a": (1, 2), "b": (1, 3)}
@@ -393,10 +396,9 @@ def test_the_run_loop_records_each_step_that_ran_once_on_both_submit_paths(monke
 
 
 def test_with_metrics_off_the_run_loop_records_and_sends_nothing(monkeypatch):
-    w, sent, postprocessed, _ = _looping_worker(
-        monkeypatch, schedule=[("a", 2), None], speculate={}, refuse=set(),
+    w, metrics, sent, postprocessed, _ = _looping_worker(
+        monkeypatch, schedule=[("a", 2), None], speculate={}, refuse=set(), metrics_on=False,
     )
-    metrics, w._metrics = w._metrics, None
     with pytest.raises(_StopLoopError):
         w.run()
     assert postprocessed == ["a"]
@@ -494,7 +496,7 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
 
 
 def test_the_worker_starts_counting_on_enable_metrics(clock):
-    w = make_worker(_metrics=_metrics(counting=False))
+    w = make_worker(metrics=_metrics(counting=False))
     clock.now = 1.0
     w.ingest._dispatch([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     clock.now = 1.25

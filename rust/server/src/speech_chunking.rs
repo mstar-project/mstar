@@ -234,6 +234,96 @@ pub fn split_sentences(text: &str, max_chars: usize, min_chars: usize) -> Vec<St
     chunks.into_iter().map(|c| c.into_iter().collect()).collect()
 }
 
+/// How an adapter cuts long input (its `split_speech_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Splitter {
+    /// `split_sentences(text, max_chars=speech_chunk_max_chars)`.
+    Sentences,
+    /// `CosyVoice3Adapter.split_speech_text`.
+    CosyVoice3,
+}
+
+/// `CosyVoice3Adapter.split_speech_text`: Chinese text as the reference's
+/// `split_paragraph(lang="zh")` cuts it, anything else as sentences sized by
+/// an estimate of its BPE tokens.
+fn cosyvoice3_split(text: &str, max_chars: usize) -> Vec<String> {
+    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return cosyvoice3_split_chinese(text);
+    }
+    // `_estimated_tokens`: an upper estimate of the Qwen2 BPE token count
+    let tokens: f64 = text
+        .chars()
+        .map(|c| if (c as u32) < 0x80 { 0.25 } else if (c as u32) < 0x800 { 0.5 } else { 1.0 })
+        .sum();
+    let chars_per_token = text.chars().count() as f64 / tokens.max(1.0);
+    let max = max_chars.min(80usize.max((80.0 * chars_per_token) as usize));
+    split_sentences(text, max, (20.0 * chars_per_token) as usize)
+}
+
+/// `re.findall` of `CosyVoice3Adapter._ZH_SENTENCE` (or, with `commas`,
+/// `_ZH_CLAUSE`): the shortest run up to a CJK sentence or clause mark (with
+/// one closing quote), or a Latin one before whitespace or the end, then the
+/// rest; and the empty match at the end that `findall` also returns.
+fn cosyvoice3_findall(text: &[char], commas: bool) -> Vec<Vec<char>> {
+    let cjk = |c: char| "。？！；：、".contains(c) || (commas && c == '，');
+    let latin = |c: char| ".?!;".contains(c) || (commas && c == ',');
+    let n = text.len();
+    let mut found = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let mut end = n;
+        for i in start..n {
+            if cjk(text[i]) {
+                end = i + 1 + usize::from(text.get(i + 1).is_some_and(|&q| q == '"' || q == '”'));
+                break;
+            }
+            if latin(text[i]) && (i + 1 == n || is_space(text[i + 1])) {
+                end = i + 1;
+                break;
+            }
+        }
+        found.push(text[start..end].to_vec());
+        start = end;
+    }
+    found.push(Vec::new());
+    found
+}
+
+/// `CosyVoice3Adapter._group_chinese`.
+fn cosyvoice3_group(sentences: Vec<Vec<char>>) -> Vec<Vec<char>> {
+    let mut pieces: Vec<Vec<char>> = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+    for sentence in sentences {
+        if current.len() + sentence.len() > 80 && current.len() > 60 {
+            pieces.push(std::mem::take(&mut current));
+        }
+        current.extend(sentence);
+    }
+    if !strip(&current).is_empty() {
+        match pieces.last_mut() {
+            Some(last) if current.len() < 20 => last.extend(current),
+            _ => pieces.push(current),
+        }
+    }
+    pieces.into_iter().map(|p| strip(&p).to_vec()).collect()
+}
+
+/// `CosyVoice3Adapter._split_chinese`: a piece over 300 characters is cut again
+/// at commas, after its clauses are cut evenly into at most 80.
+fn cosyvoice3_split_chinese(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces = Vec::new();
+    for piece in cosyvoice3_group(cosyvoice3_findall(&chars, false)) {
+        if piece.len() <= 300 {
+            pieces.push(piece);
+            continue;
+        }
+        let clauses = cosyvoice3_findall(&piece, true);
+        pieces.extend(cosyvoice3_group(clauses.iter().flat_map(|c| cut_evenly(c, 80)).collect()));
+    }
+    pieces.into_iter().map(|p| p.into_iter().collect()).collect()
+}
+
 /// `_plan_chunks`: the texts to synthesize, in playback order (`[input]` when
 /// unchunked). `requested` is the request's `sentence_chunking`: `false`
 /// never splits, any other value always does, and absent or `null` splits
@@ -256,7 +346,10 @@ pub fn plan_chunks(
     if chunking.max_chars == 0 {
         return Err("max_chars must be positive".to_string());
     }
-    let chunks = split_sentences(input, chunking.max_chars, 24);
+    let chunks = match chunking.splitter {
+        Splitter::Sentences => split_sentences(input, chunking.max_chars, 24),
+        Splitter::CosyVoice3 => cosyvoice3_split(input, chunking.max_chars),
+    };
     if chunks.len() > chunking.max_pieces {
         return Err(format!(
             "input splits into {} sentence chunks; at most {} are allowed",
@@ -287,7 +380,7 @@ mod tests {
     use serde_json::json;
 
     const CHUNKED: SpeechChunking =
-        SpeechChunking { min_chars: Some(600), max_chars: 400, lookahead: 2, max_pieces: 32 };
+        SpeechChunking { min_chars: Some(600), max_chars: 400, lookahead: 2, max_pieces: 32, splitter: Splitter::Sentences };
 
     fn sentence(i: usize) -> String {
         format!("Sentence number {i} goes on for a little while, so that it has some length to it.")

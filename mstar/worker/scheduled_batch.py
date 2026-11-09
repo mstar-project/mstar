@@ -127,7 +127,7 @@ class ScheduledBatch:
     # kept ids, which the graph runtime holds no node of.
     rebuild_rids: frozenset[int] = frozenset()
     # This node's walks that run as a chunk Loop on this worker, stamped when
-    # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
+    # the step is submitted (``StepExecutor._submit_gpu_step``): the graphs say,
     # not the scheduler, and every step that runs passes through there.
     chunk_loop_walks: frozenset[str] = frozenset()
 
@@ -206,6 +206,14 @@ class ScheduledBatch:
                     groups.setdefault(self.request_walks[rid], []).append(rid)
                 self._by_walk = groups
         return self._by_walk
+
+    def wg_ids(self) -> list[int]:
+        """``set_in_flight``'s worker graphs: one id for a step of one walk
+        (a node in a walk lives in one worker graph), else one per rid."""
+        rid_to_wg = self.graph_rows()
+        if self.request_walks or not rid_to_wg:
+            return list(rid_to_wg.values())
+        return [next(iter(rid_to_wg.values()))]
 
     def discard_rid(self, rid: int) -> None:
         """Drop ``rid``'s row. Every removal goes through here, so the walk
