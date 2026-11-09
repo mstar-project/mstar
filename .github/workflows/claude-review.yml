@@ -646,8 +646,7 @@ jobs:
         run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
-      # everything below that posts or approves uses it. Reading REVIEW_APPROVALS
-      # takes the app's token (the job's own can't read variables), right before approving.
+      # everything below that posts uses it.
       - name: Mint the review app's token
         if: always() && vars.REVIEW_APP_CLIENT_ID != ''
         id: app
@@ -659,6 +658,21 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+
+      # The approval's own token, the only one on this repository with contents write: GitHub
+      # counts an app's approval only when the app can push (README, One-time setup). The step
+      # it feeds runs no model and no PR code. Reading REVIEW_APPROVALS takes an app token too
+      # (the job's own can't read variables), right before approving.
+      - name: Mint the approval's token
+        if: always() && vars.REVIEW_APP_CLIENT_ID != '' && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
+        id: approver
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
           permission-actions-variables: read
 
       - name: Decide approval
@@ -666,7 +680,7 @@ jobs:
         id: approve
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.approver.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
           SINCE: ${{ steps.carry.outputs.since }}
         run: python3 .github/review/gpu_review.py approve

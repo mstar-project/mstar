@@ -207,8 +207,9 @@ def newest(texts, limit):
 
 def diff_paths(diff_text):
     """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
-    nothing to open)."""
-    lines = diff_text.splitlines()
+    nothing to open). Lines end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on
+    those) could start a line that looks like a header."""
+    lines = diff_text.split("\n")
     paths = []
     for before, line in zip(lines, lines[1:], strict=False):
         if not (before.startswith("--- ") and line.startswith("+++ ")):
