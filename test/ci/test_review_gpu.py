@@ -652,8 +652,10 @@ class TestApprove(unittest.TestCase):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             self.approve({"value": "on"}, verdict="fail", untestable="x\n::add-mask::y")
+            self.approve({"value": "on"}, verdict="fail", untestable="##[add-mask]x")
         self.assertFalse([x for x in stdout.getvalue().splitlines() if x.startswith("::add-mask")],
                          "a newline in the model's text would run as a workflow command")
+        self.assertNotIn("##[", stdout.getvalue(), "the runner's older parser finds `##[` anywhere in a log line")
         self.assertNotIn("Not approved", text)
         text, _, _ = self.approve({"value": "off"}, verdict="fail")
         self.assertIn("By the rule this would not be approved.\n\n#### What's left for you\n- [ ] the live test's",

@@ -322,7 +322,7 @@ def unavailable(out, lt, text):
     """Say why the live test can't run, in lt/unavailable.md, and stop the step, exit 3 with `unavailable`
     set."""
     (lt / "unavailable.md").write_text(text + "\n")
-    print(text.split("\n")[0])
+    print(bot.log_value(text.split("\n")[0]))
     out["unavailable"] = "true"
     sys.exit(3)
 
@@ -476,7 +476,7 @@ def wait(out, runner_temp, start_timeout="30"):
         try:
             st, host, port = gpu_py.status(e, cfg)
         except Exception as err:  # a flaky ssh or API call is not an outcome
-            print(f"status: {err}", flush=True)
+            print("status: " + bot.log_value(str(err)), flush=True)
             time.sleep(60)
             continue
         state = st.lower()
@@ -505,7 +505,7 @@ def wait(out, runner_temp, start_timeout="30"):
     if e["provider"] != "slurm":
         gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
-    print(f"collected: {sorted(p.name for p in results.iterdir())}")
+    print("collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))
     box_cost(results / "claude.json")
     if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
         unavailable(out, lt, f"The GPU box ended with no results: {st}.\n"
@@ -721,8 +721,7 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
                             f"{'not ' if outcome.why else ''}be approved.\n\n{left_for_you(pr, review, outcome)}\n")
         return
     if outcome.why:
-        # json.dumps: the model's text and file names, so a newline can't start a workflow command.
-        print("not approved: " + json.dumps("; ".join(outcome.why)))
+        print("not approved: " + bot.log_value("; ".join(outcome.why)))  # the model's text and file names
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
