@@ -290,6 +290,13 @@ def test_duplex_refuses_a_checkpoint_its_resources_were_not_sized_for(monkeypatc
         _make_model()._json_config("/nonexistent")
 
 
+def test_duplex_refuses_a_checkpoint_dir_with_no_config(tmp_path):
+    """Serving the dataclass defaults in place of a missing config.json hid a
+    broken checkpoint, and left the resources nothing to be checked against."""
+    with pytest.raises(FileNotFoundError):
+        _make_model()._json_config(str(tmp_path))
+
+
 def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):
     """The encoder KV's declaration from the defaults equals the one from a
     checkpoint of the same shape (its retention is a SinkWindow, equal by value), and

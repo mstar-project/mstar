@@ -930,17 +930,9 @@ class NemotronDuplexModel(Model):
         return None
 
     def _json_config(self, local_dir: str) -> NemotronDuplexConfig:
-        """Config populated from the checkpoint's ``config.json`` (cached).
-
-        Falls back to dataclass defaults if the file is absent (e.g. when
-        ``local_dir`` is an unresolved repo id).
-        """
+        """Config populated from the checkpoint's ``config.json`` (cached)."""
         if getattr(self, "_json_config_cache", None) is None:
-            try:
-                cfg = NemotronDuplexConfig.from_pretrained(local_dir)
-            except (FileNotFoundError, KeyError) as e:
-                logger.warning("Could not read config.json (%s); using config defaults.", e)
-                cfg = self.config
+            cfg = NemotronDuplexConfig.from_pretrained(local_dir)
             self._refuse_resources_sized_otherwise(cfg)
             self._json_config_cache = cfg
         return self._json_config_cache
