@@ -350,13 +350,14 @@ class Allotment:
     asks for once it gives the allotment back, which `unreserve` puts back in `_asks`: its prompt in pages,
     or what its grant needed once it has waited for a shortage. An allotment for a request on the host
     covers its reload, and ``returning`` is set while the request returns from the host: the pages it
-    may take beyond its reload. ``grown`` is what `reserve` last added to an allotment its request waited
-    holding, which `unreserve` takes back."""
+    may take beyond its reload. ``grown`` is the shortage `reserve` last granted an allotment its request
+    waited holding, and ``grown_from`` the allotment's pages before, which `unreserve` puts back."""
     pages: int
     remaining: int = 0
     asks_again: int = 0
     returning: int | None = None
     grown: int = 0
+    grown_from: int = 0
 
 
 class Dropped(NamedTuple):
@@ -4301,7 +4302,7 @@ class KVManager(AttentionResource):
         if rid in self._allotments:
             self._stalled.discard(rid)
             allotment = self._allotments[rid]
-            allotment.grown = self._asks.pop(rid)
+            allotment.grown, allotment.grown_from = self._asks.pop(rid), allotment.pages
             self._allot(rid, allotment.grown)
             return
         returning = self._return_pages(rid) if self._on_host(rid) else None
@@ -4313,7 +4314,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments[rid]
             if allotment.grown:
                 # it waits holding its allotment again, for the same shortage
-                allotment.pages -= allotment.grown
+                allotment.pages = allotment.grown_from
                 self._asks[rid], allotment.grown = allotment.grown, 0
                 self._stalled.add(rid)
                 self._recount(rid)
