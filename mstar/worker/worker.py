@@ -838,7 +838,7 @@ class Worker:
             self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
             kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
 
-    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> frozenset[str]:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
         layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
@@ -846,8 +846,7 @@ class Worker:
         for key, rebuildable in ingested.rebuildable.items():
             if key in configs:
                 configs[key].rebuildable = rebuildable
-        for node in ingested.unheld:
-            self.engine_manager.get_engine(node).keeps_no_ids(node, request_id)
+        return ingested.unheld
 
     def _apply_drains(self, in_flight: Collection[int]) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling a rid, then ACK

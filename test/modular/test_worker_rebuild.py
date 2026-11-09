@@ -339,17 +339,37 @@ def test_a_follower_of_a_lockstep_node_takes_room_past_its_pool_for_every_log():
     )
 
 
-def test_ingest_journals_each_node_whose_log_rank_0s_pool_couldnt_hold():
-    """A follower takes room for every log, so rank 0 journals each one its pool refused, ahead of any move of the
-    request, and the follower gives that room back."""
-    w, eng = _worker(_rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu"))))
-    journaled = []
+@pytest.mark.parametrize("engine_add", ["holds a", "refuses a"])
+def test_intake_journals_each_log_rank_0s_pool_couldnt_hold_once_the_engine_holds_the_request(engine_add):
+    """A follower takes room for every log, so rank 0 journals each one its pool refused, and the follower takes the
+    request in as one no drop frees. When the engine refused a, a journaled refusal reached a follower whose KV had
+    rolled a back, and the follower stopped."""
+    w, eng = _worker(
+        _rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu"))),
+        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
+    )
+    journaled, held = [], []
     eng.keeps_no_ids = lambda node, rid: journaled.append((node, rid))
 
-    for rid in (R, A):
-        w._set_rebuildable(rid, _config())
+    def add_request(rid, configs, info=None):
+        if rid == A and engine_add == "refuses a":
+            raise RuntimeError("over capacity")
+        held.append(rid)
+    w.engine_manager.add_request = add_request
+    w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
+    w._graph_runtime.register_stop_limits = lambda rid, info: None
+    w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
+    w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
 
-    assert journaled == [(NODE, A)], "a follower keeps a log rank 0's pool couldn't hold, or gives back one it held"
+    for rid in (R, A):
+        info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=_config(), stream_lead_items={})
+        w.ingest._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
+                                                  worker_graph_to_workers={}, initial_inputs=[], request_info=info))
+
+    assert journaled == ([(NODE, A)] if A in held else []), (
+        "a follower keeps a log rank 0's pool couldn't hold, or replays a refusal for a request no KV holds"
+    )
 
 
 def test_rebuild_host_mb_0_rebuilds_no_request_there():

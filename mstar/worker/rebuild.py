@@ -307,28 +307,29 @@ class Rebuilds:
                     written[node] += laid_out
                     writers[key].append(node)
         refused = {node for node, laid_out in written.items() if not self.can_rebuild(node, laid_out)}
-        taken, unheld = {}, set()
+        taken, unheld = [], set()
         if not unpausable:
             for node in written.keys() - refused:
                 piece = self._log_room(node, written[node])
                 if piece is None:
                     unheld.add(node)
                 else:
-                    taken[node] = piece
+                    # ``rid`` holds the slice from here, so the teardown of an intake that fails gives it back
+                    self._keeps_ids[node][rid] = piece
+                    taken.append(node)
         refused |= unheld
         rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
-        for node, piece in taken.items():
+        for node in taken:
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._keeps_ids[node][rid] = piece
                 self._kept[node][rid] = KeptIds(tuple(
                     LayoutRow(step[0].walk, sum(span.length for span in step))
                     for layout in written[node] for step in layout.steps()
                 ))
                 self._prefilling[node].add(rid)
             else:
-                self._pool.give(piece)
+                self._pool.give(self._keeps_ids[node].pop(rid))
         if not self._followed.isdisjoint(written):
             self._verdicts[rid] = (dict(writers), dict(rebuildable))
         return Ingested(rebuildable, frozenset(unheld))
