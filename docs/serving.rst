@@ -489,25 +489,25 @@ be rebuilt from its token ids. The request that ran short gets the pages freed, 
 When the newer requests can't cover it, it moves to the host if the host pool can hold all of its
 pages, and otherwise waits holding its pages. A request on the host, a dropped one and one waiting
 for pages wait outside the queue, so a new prompt that fits still starts, unless one of them is the
-oldest request in its pool, which no newer prompt passes. They are tried oldest first, before the
-queue. The oldest refused request that moves can let in moves newer requests that wait holding
-pages, to the host or by a drop as above. A request on the host returns once its pages and one more
-page fit, or every page its grant needed when it moved itself, and its pages are then copied back. A
-dropped request returns once its prompt, or its history and one more page if that is larger, fits,
-counting no prompt page another request holds, then recomputes its KV in prefill chunks cut by its
-walk's chunk budget. A request that streams an output in ``unpausable_outputs`` reserves its whole
-footprint in every pool, with every cache hit counted, and is never dropped or moved to the host.
-Voice requests then queue when the pool is short and are never preempted mid-stream. A request no
-drop can free, because it holds KV made from media or another node's outputs or a node that keeps no
-token ids writes its KV, moves only to the host: when it is admitted the host pool sets room aside
-for its prompt, and it reserves only its prompt. The room grows with each page the request takes
-after that, so its move always fits. When the host pool has no room for it at admission, or later
-once the device has room for the rest of its footprint, the request reserves its whole footprint in
-that pool, as a voice request does, and the host pool logs it. While the device has no room for that
-either, nothing is logged: newer requests move for it as for any request that runs short, and
-otherwise it moves to the host, into the room set aside for it, and returns once its whole footprint
-fits. So ``cpu_offload_pages`` also sets how many pages such requests can hold with only their
-prompt reserved.
+oldest request in its pool, which no newer prompt passes unless its room is already allotted. They
+are tried oldest first, before the queue. The oldest refused request that moves can let in moves
+newer requests that wait holding pages, to the host or by a drop as above. A request on the host
+returns once its pages and one more page fit, or every page its grant needed when it moved itself,
+and its pages are then copied back. A dropped request returns once its prompt, or its history and
+one more page if that is larger, fits, counting no prompt page another request holds, then
+recomputes its KV in prefill chunks cut by its walk's chunk budget. A request that streams an output
+in ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
+and is never dropped or moved to the host. Voice requests then queue when the pool is short and are
+never preempted mid-stream. A request no drop can free, because it holds KV made from media or
+another node's outputs or a node that keeps no token ids writes its KV, moves only to the host: when
+it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The
+room grows with each page the request takes after that, so its move always fits. When the host pool
+has no room for it at admission, or later once the device has room for the rest of its footprint,
+the request reserves its whole footprint in that pool, as a voice request does, and the host pool
+logs it. While the device has no room for that either, nothing is logged: newer requests move for it
+as for any request that runs short, and otherwise it moves to the host, into the room set aside for
+it, and returns once its whole footprint fits. So ``cpu_offload_pages`` also sets how many pages
+such requests can hold with only their prompt reserved.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the step
 that follows, so every rank admits each step from the same reservations. On a node with a second

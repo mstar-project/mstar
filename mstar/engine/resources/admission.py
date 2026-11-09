@@ -41,7 +41,7 @@ class Admission:
     asked reserves for it, all or nothing. A request that asks again (`readmit`) waits in no queue, and
     `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown. It holds up no newer request
     unless it is the oldest request that has asked a resource it waits for, when that resource's queue admits no
-    one, so newer prompts can't keep passing it.
+    one it hasn't already reserved for, so newer prompts can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -117,7 +117,7 @@ class Admission:
             return None
         entry.nodes[node_name] = graph_walk
         entry.published[node_name] = published
-        held = self._held_back()
+        held = self._held_back(rid)
         tried = rid not in self._returns and all(
             self._queues[key][0] == rid and key not in self._short and key not in held for key in entry.asked
         )
@@ -179,7 +179,6 @@ class Admission:
             nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
             if nodes:
                 started.extend((node, rid) for node in nodes)
-        held = self._held_back()
         admitted = True
         while admitted:
             admitted = False
@@ -188,6 +187,7 @@ class Admission:
                     continue
                 rid = queue[0]
                 entry = self._waiting[rid]
+                held = self._held_back(rid)
                 if any(self._queues[key][0] != rid or key in self._short or key in held for key in entry.asked):
                     continue
                 nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
@@ -258,11 +258,14 @@ class Admission:
         self._admitted.setdefault(rid, {}).update(entry.nodes)
         return entry.nodes
 
-    def _held_back(self) -> set[str]:
-        """The resources whose oldest asker waits for them as a return."""
+    def _held_back(self, rid: str) -> set[str]:
+        """The resources waiting ``rid`` asked whose oldest asker waits for them as a return, other than those that
+        have already reserved for ``rid`` and so ask nothing more of it."""
+        asked = self._waiting[rid].asked
         return {
-            key for key, askers in self._askers.items()
-            if askers and askers[0] in self._returns and key in self._waiting[askers[0]].asked
+            key for key, (node_name, graph_walk) in asked.items()
+            if (askers := self._askers[key]) and askers[0] in self._returns and key in self._waiting[askers[0]].asked
+            and self._resources[key].ask(rid, node_name, graph_walk) is not None
         }
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:
