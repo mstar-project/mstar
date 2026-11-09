@@ -298,6 +298,44 @@ def test_a_capture_replayed_on_walks_of_two_masks_is_refused(walks, refused):
         check_capture({"kv": h}, walks)
 
 
+class _Named(_StubAttn):
+    """Returns its own name from `select_last_hidden`, so a test sees which resource's plan was read."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def select_last_hidden(self, x, label="main"):
+        return self.name
+
+
+def _two_spec_handle() -> ArrayHandle:
+    """Two reads that build different specs over different layers, each on its own walk, and walk ``c`` with none."""
+    array = _per_walk(causal=Read(mask=Causal(), op=Attend(q_heads=2), walks={"a"}, layers={0, 1}),
+                      local=Read(mask=Window(16), op=Attend(q_heads=2), walks={"b"}, layers={2, 3}))
+    _, spec_of = _read_specs(array)
+    resources = {"kv": _StubKV(), **{key: _Named(key) for key in set(spec_of.values())}}
+    return ArrayHandle(array, resources, None, read_resources=spec_of)
+
+
+def _at_last_token_on(h: ArrayHandle, walk: str):
+    step = _step(h, segments=[Segment(1, "main", TOKENS)])
+    step.set_ctx(StepContext(request_ids=(1,), graph_walk=walk, slot=0, capture=False))
+    h.begin_step(step)
+    return at_last_token(h, torch.zeros(TOKENS, 1))
+
+
+@pytest.mark.parametrize("walk", ["a", "b"])
+def test_at_last_token_selects_through_the_read_its_walk_planned(walk):
+    """A walk plans only its own reads' resources, so the other resource holds another step's plan."""
+    expected = {"a": "causal", "b": "local"}[walk]
+    assert _at_last_token_on(_two_spec_handle(), walk) == expected, "at_last_token read a plan its walk didn't make"
+
+
+def test_at_last_token_on_a_walk_that_runs_no_read_is_refused():
+    _refused(r"Array 'kv': at_last_token on walk 'c', which runs no read of this array",
+             lambda: _at_last_token_on(_two_spec_handle(), "c"))
+
+
 def test_a_read_on_a_layer_no_read_covers_on_the_walk_raises():
     h = _per_walk_handle(_per_walk(attn=Read(mask=Causal(), op=Attend(q_heads=2), walks=TEXT, layers={0, 1})))
     step = _step(h, segments=[Segment(1, "main", TOKENS)])
