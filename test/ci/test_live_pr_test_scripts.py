@@ -238,25 +238,33 @@ class TestBootstrap(unittest.TestCase):
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
 
-    def test_an_arm_that_conflicts_with_the_pins_installs_without_them_and_says_so(self):
-        home = Path(tempfile.mkdtemp())
-        fake, log = home / "bin", home / "uv.log"
-        fake.mkdir()
-        (home / "w/pr/.git").mkdir(parents=True)
-        (home / "w/pr/.venv/bin").mkdir(parents=True)
-        (home / "w/pr/.venv/bin/activate").write_text("")
-        scripts = {"uv": f'#!/bin/sh\necho "${{UV_CONSTRAINT:-none}}" >> {log}\n[ -z "$UV_CONSTRAINT" ]\n',
-                   "git": "#!/bin/sh\nexit 0\n", "cargo": "#!/bin/sh\nexit 0\n",
-                   "nvidia-smi": "#!/bin/sh\nexit 1\n", "maturin": "#!/bin/sh\nexit 1\n"}  # stops after the install
-        for tool, text in scripts.items():
-            (fake / tool).write_text(text)
-            (fake / tool).chmod(0o755)
-        r = subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), "1", "--no-main", "--ref", "a" * 40, "--workdir",
-                            f"{home}/w", "--hf-home", f"{home}/vol/hf"], capture_output=True, text=True, check=False,
-                           env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
-        self.assertEqual(log.read_text().split(), [f"{home}/w/constraints.txt", "none"],
-                         "a PR that moves torch past the pins would kill bootstrap instead of installing unpinned")
-        self.assertIn("not on that family", r.stderr, "the run wouldn't say this arm is off the pinned family")
+    def test_only_a_resolution_conflict_with_the_pins_installs_without_them_and_says_so(self):
+        conflict = "x No solution found when resolving dependencies:\n  your requirements are unsatisfiable."
+        for error, code, retries in ((conflict, 1, True), ("error: connection timed out", 3, False)):
+            with self.subTest(error):
+                home = Path(tempfile.mkdtemp())
+                fake, log = home / "bin", home / "uv.log"
+                fake.mkdir()
+                (home / "w/pr/.git").mkdir(parents=True)
+                (home / "w/pr/.venv/bin").mkdir(parents=True)
+                (home / "w/pr/.venv/bin/activate").write_text("")
+                uv = (f'#!/bin/sh\necho "${{UV_CONSTRAINT:-none}}" >> {log}\n[ -z "$UV_CONSTRAINT" ] && exit 0\n'
+                      f"echo '{error}' >&2\nexit {code}\n")
+                scripts = {"uv": uv, "git": "#!/bin/sh\nexit 0\n", "cargo": "#!/bin/sh\nexit 0\n",
+                           "nvidia-smi": "#!/bin/sh\nexit 1\n", "maturin": "#!/bin/sh\nexit 1\n"}  # stops after install
+                for tool, text in scripts.items():
+                    (fake / tool).write_text(text)
+                    (fake / tool).chmod(0o755)
+                r = subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), "1", "--no-main", "--ref", "a" * 40,
+                                    "--workdir", f"{home}/w", "--hf-home", f"{home}/vol/hf"], capture_output=True,
+                                   text=True, check=False, env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+                pins = f"{home}/w/constraints.txt"
+                self.assertEqual(log.read_text().split(), [pins, "none"] if retries else [pins],
+                                 "only a conflict with the pins may leave an arm off the pinned family")
+                self.assertEqual("not on that family" in r.stderr, retries, r.stderr)
+                self.assertIn(error, r.stderr, "uv's own error would be hidden")
+                if not retries:
+                    self.assertEqual(r.returncode, code, "a failed install must stop bootstrap with uv's status")
 
     def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
         home = Path(tempfile.mkdtemp())
