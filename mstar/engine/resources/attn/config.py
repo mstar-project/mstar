@@ -255,6 +255,12 @@ class AttentionStep(ResourceStep):
     # `segments` then carry the query counts, the cache's segments the appended counts.
     # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+    # The step's layout follows from its capture bucket alone, so every replay of a
+    # bucket plans the layout the bucket was captured with (a DiT's denoise step,
+    # where every row, padding rows included, spans its bucket's tokens). Lets a
+    # ragged resource capture a kernel that bakes the layout into the graph; the
+    # other attention resources ignore it.
+    fixed_layout: bool = False
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:

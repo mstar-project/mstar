@@ -1687,7 +1687,7 @@ class TextChatAdapter(OpenAIAdapter):
         mk = normalize_generation_kwargs(mk)
         return SubmitArgs(
             text=text,
-            input_modalities=["text"],
+            input_modalities=modalities,
             output_modalities=["text"],
             model_kwargs=mk,
             prompt_parts=parts,
@@ -1782,6 +1782,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "glm5_next": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
+    "ripple_65b": TextChatAdapter(),
     # image_url and text parts in, text out, like Qwen3.5's chat
     "deepseek_ocr": Qwen3_5Adapter(),
 }

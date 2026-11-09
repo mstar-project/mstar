@@ -1088,6 +1088,82 @@ class GenerationHistory:
 GREEDY_TEMPERATURE = 1e-5
 
 
+@triton.jit
+def _argmax_partials_kernel(logits_ptr, max_ptr, arg_ptr, V, CHUNK, stride_b, NSPLIT, BLOCK: tl.constexpr):
+    """Each (row, chunk)'s max and its first index. Every lane keeps its own
+    first maximum (a strict ``>`` over rising offsets), so the lowest index
+    of the lanes at the chunk's max is the chunk's first."""
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    lo = split * CHUNK
+    hi = tl.minimum(lo + CHUNK, V)
+    lanes = tl.arange(0, BLOCK)
+    best = tl.full([BLOCK], -float("inf"), tl.float32)
+    arg = lo + lanes
+    for start in range(lo, hi, BLOCK):
+        offs = start + lanes
+        vals = tl.load(logits_ptr + row * stride_b + offs, mask=offs < hi, other=-float("inf")).to(tl.float32)
+        up = vals > best
+        best = tl.where(up, vals, best)
+        arg = tl.where(up, offs, arg)
+    top = tl.max(best, axis=0)
+    tl.store(max_ptr + row * NSPLIT + split, top)
+    tl.store(arg_ptr + row * NSPLIT + split, tl.min(tl.where(best == top, arg, 2147483647), axis=0))
+
+
+@triton.jit
+def _argmax_combine_kernel(max_ptr, arg_ptr, out_ptr, NSPLIT, BLOCK_N: tl.constexpr):
+    """A row's first index at its max, from its chunks'."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < NSPLIT
+    cmax = tl.load(max_ptr + row * NSPLIT + offs, mask=mask, other=-float("inf"))
+    carg = tl.load(arg_ptr + row * NSPLIT + offs, mask=mask, other=2147483647)
+    top = tl.max(cmax, axis=0)
+    tl.store(out_ptr + row, tl.min(tl.where(cmax == top, carg, 2147483647), axis=0).to(tl.int64))
+
+
+def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
+    """``[B]`` int64: each row's argmax, the lowest index among equal maxima,
+    which is the token the full sampler's one-hot puts a greedy row on. On
+    CUDA a split over the vocab in two launches; at B300 248k-vocab rows it
+    took 5 / 9 / 13 us for 16 / 64 / 128 rows against torch's 16 / 29 / 43."""
+    if logits.device.type != "cuda" or logits.stride(-1) != 1:
+        return torch.argmax(logits, dim=-1)
+    batch, vocab = logits.shape
+    # about a thousand blocks at decode widths: a narrow batch needs finer chunks to fill the GPU
+    chunk = 4096 if batch <= 16 else 8192
+    nsplit = triton.cdiv(vocab, chunk)
+    cmax = torch.empty((batch, nsplit), device=logits.device, dtype=torch.float32)
+    carg = torch.empty((batch, nsplit), device=logits.device, dtype=torch.int32)
+    out = torch.empty(batch, device=logits.device, dtype=torch.int64)
+    with torch.cuda.device(logits.device):
+        _argmax_partials_kernel[(batch, nsplit)](
+            logits, cmax, carg, vocab, chunk, logits.stride(0), nsplit, BLOCK=1024, num_warps=4,
+        )
+        _argmax_combine_kernel[(batch,)](
+            cmax, carg, out, nsplit, BLOCK_N=triton.next_power_of_2(nsplit), num_warps=1,
+        )
+    return out
+
+
+def samples_greedy(cfg: "SamplingConfig") -> bool:
+    """Whether the full sampler's token for ``cfg`` is always its row's argmax.
+
+    Greedy is temperature 0 as ``canonical_sampling_values`` reads it (below
+    ``GREEDY_TEMPERATURE``), not top-k 1, which breaks exact ties by the seed.
+    Its filters are then written off: the argmax is the first token any
+    top-k, top-p or min-p filter keeps, so a greedy row with top_p < 1 draws
+    the same token. What does move it is a penalty (the seen-token mask or the
+    window) or the min-tokens floor, both applied to the logits first, and a
+    row asking for log-probs needs the full sampler's scoring.
+    """
+    temperature = canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)[0]
+    return (
+        temperature == 0 and cfg.repetition_penalty == 1 and cfg.min_tokens == 0 and not cfg.return_logprobs
+    )
+
+
 def canonical_sampling_values(
     temperature, top_k, top_p, min_p,
 ) -> tuple[float, int, float, float]:
@@ -1334,7 +1410,7 @@ class Sampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
         kept_rids: "frozenset | None" = None,
-        rand_offset: torch.Tensor | None = None, **kwargs
+        rand_offset: torch.Tensor | None = None, greedy: bool = False, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1349,9 +1425,22 @@ class Sampler(BaseSampler):
 
         ``rand_offset`` ([B], on the device) draws at the caller's offsets
         instead of ``_step_offset``, and leaves advancing them to the caller.
+
+        ``greedy``: every row samples greedily (``samples_greedy``), so each
+        takes its row's argmax, as the captured sampler's lean step does. The
+        offsets and history move as on a full step.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         history, rows = self._gather_history(request_ids, configs)
+        if greedy:
+            tokens = self._broadcast_tokens(greedy_tokens(logits))
+            # no row of a greedy step asked for one
+            self.logprobs = None
+            if history is not None:
+                self._write_history(history, rows, tokens, request_ids, kept_rids)
+            if rand_offset is None:
+                self._advance_offsets(request_ids, kept_rids, logits)
+            return tokens
         order = self._gather_filter(configs)
         temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
         top_k = torch.tensor([c.top_k if apply_filters else 0 for c in configs],
@@ -1437,23 +1526,29 @@ class Sampler(BaseSampler):
             self.logprobs = torch.where(torch.tensor(want, device=logits.device), chosen, torch.nan)
 
         if history is not None:
-            advance_history(history, tokens)
-            new_tokens, count = history.tokens, history.count
-            if kept_rids is not None:
-                # only the kept rows' draws count
-                sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
-                                   dtype=torch.long, device=rows.device)
-                rows, count = rows.index_select(0, sel), count.index_select(0, sel)
-                new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
-            self.history.write(rows, new_tokens, count)
+            self._write_history(history, rows, tokens, request_ids, kept_rids)
 
         if any_rep_pen:
             for i, rid in enumerate(request_ids):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        if not own_offsets:
-            return tokens
+        if own_offsets:
+            self._advance_offsets(request_ids, kept_rids, logits)
+        return tokens
+
+    def _write_history(self, history, rows, tokens, request_ids, kept_rids) -> None:
+        advance_history(history, tokens)
+        new_tokens, count = history.tokens, history.count
+        if kept_rids is not None:
+            # only the kept rows' draws count
+            sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
+                               dtype=torch.long, device=rows.device)
+            rows, count = rows.index_select(0, sel), count.index_select(0, sel)
+            new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
+        self.history.write(rows, new_tokens, count)
+
+    def _advance_offsets(self, request_ids, kept_rids, logits: torch.Tensor) -> None:
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
         # would make consecutive decode steps reuse overlapping RNG regions.
@@ -1466,8 +1561,6 @@ class Sampler(BaseSampler):
             self._step_offset[rid] = (
                 self._step_offset.get(rid, 0) + offset_stride
             )
-
-        return tokens
 
     def _stage(self, rows: list[list[float]]) -> torch.Tensor:
         """Per-request settings ``[len(rows), B]`` on the device in one pinned H2D
@@ -2029,7 +2122,14 @@ class AcceleratorGraphableSampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = False,
         apply_filters: bool = True,
+        greedy: bool = False,
     ):
+        """``greedy``: every row samples greedily (``samples_greedy``), so the
+        draw is each row's argmax. The offsets, history and masters move as
+        on a full step; the seen-token rows don't, as no row of the step
+        reads its mask."""
+        if greedy:
+            return self._sample_greedy(logits)
         top_k, top_p = self.top_k_buf, self.top_p_buf
         if not apply_filters:
             # top-k 0 is "off"; captured, these are constant fills
@@ -2077,6 +2177,22 @@ class AcceleratorGraphableSampler(BaseSampler):
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+        return codes
+
+    def _sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.ingraph_scatter:
+            self.gather_in_graph()
+        codes = self._broadcast_tokens(greedy_tokens(logits))
+        self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
+        if self.logprob_buf is not None:
+            # no row of a greedy step asked for one
+            self.logprob_buf.fill_(torch.nan)
+        if self.history is not None:
+            advance_history(self.history, codes)
+        if self.last_token_buf is not None:
+            self.last_token_buf.copy_(codes)
+        if self.ingraph_scatter:
+            self.scatter_in_graph(codes)
         return codes
 
     @torch.compiler.disable

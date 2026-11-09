@@ -325,6 +325,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        closes its socket with ``1009`` before any handler sees it, so the client gets no
        error frame. Raise it for clients that send big uncompressed frames, such as several
        raw camera images in one openpi observation.
+   * - ``scheduling``
+     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
+       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
+       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
+       may go without running before it goes first, for every key its entry leaves unbounded.
+       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
+       a node, a walk or both, which replaces the model's list; the most specific entry for a
+       pair decides. An entry naming nothing the model runs, a negative priority, a
+       ``max_wait`` under 1, two entries for the same target or an unknown field fail
+       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
+       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -343,11 +354,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
        graph capture is taken at, in place of the model's. A name is a walk the
        node runs, for its packed captures on that walk (the model's
-       ``capture_token_lengths``; Orpheus's ``mixed`` steps replay its ``prefill``
-       capture, so name ``prefill``), or the label of one of its piecewise packed
-       regions, for that region's ``total_tokens`` (BAGEL's ``vit_block_loop``,
-       OmniVoice's ``backbone_layers``). A step pads to the smallest rung that
-       holds it, and a longer one runs eagerly. A walk's ladder is a list, or a
+       ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
+       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of
+       one of its piecewise packed regions, for that region's ``total_tokens``
+       (BAGEL's ``vit_block_loop``, OmniVoice's ``backbone_layers``). A step
+       pads to the smallest rung that holds it, and a longer one runs eagerly.
+       A walk's ladder is a list, or a
        mapping of min batch size -> list for a ladder per range of batch sizes:
        ``{1: [...], 2: [...]}`` captures one request on the first and every larger
        batch on the second (a larger batch size's ladder must reach at least as
@@ -505,12 +517,20 @@ them by that name:
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     sampler:
+       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
+argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
+whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
+:doc:`adding_models`), so a deployment that never samples greedily can save their capture
+memory and time this way.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's

@@ -1097,15 +1097,15 @@ def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_
     monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: model)
     monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
     monkeypatch.setattr(worker.cpus, "install", lambda plan: None)
-    monkeypatch.setattr(entrypoint, "APIServer", lambda **kw: seen.setdefault(
-        "server", SimpleNamespace(lora_adapter_digests={"style": b"\x01"}, **kw)))
+    monkeypatch.setattr(entrypoint, "APIServer", lambda **kw: seen.setdefault("server", SimpleNamespace(**kw)))
     monkeypatch.setattr(worker.mp, "get_context", lambda method: SimpleNamespace(Process=lambda **kw: seen.setdefault(
         "conductor", SimpleNamespace(start=lambda: None, pid=1, **kw))))
     worker.build_server(SimpleNamespace(
         config=str(path), cache_dir=None, socket_path_prefix="p", upload_dir="u", timeout=1,
         tensor_comm_protocol="TCP", log_level="INFO"))
     assert seen["server"].model_config == config
-    assert seen["conductor"].kwargs == {"lora_adapter_digests": {"style": "01"}}
+    # the conductor reads the same config, which the server resolved (``resolve_lora_spec``)
+    assert seen["conductor"].kwargs == {"model_config": config}
 
 
 def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
@@ -1115,7 +1115,7 @@ def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
 
     events = []
     server = SimpleNamespace(
-        _model_config={"model": "whisper_large", "warmup_requests": [{"text": "hi"}]}, model=None,
+        model_config={"model": "whisper_large", "warmup_requests": [{"text": "hi"}]}, model=None,
         fatal_error=None, cleanup=lambda: None, finalize_setup=lambda: events.append("setup"))
     monkeypatch.setattr(worker, "build_server", lambda args: (server, None, "whisper_large"))
     monkeypatch.setattr(entrypoint, "_data_parallel_replicas",

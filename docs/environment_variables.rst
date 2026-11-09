@@ -223,14 +223,15 @@ model, so they are named for it.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables denoise, prefill and reasoner
-       decode capture. The deployment option
+       captures. The deployment option
        ``model_kwargs.accelerator_graph: false`` also disables all these
        captures and cannot be overridden by this variable.
    * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables only the understanding-tower
-       prefill capture. Denoise and reasoner decode captures remain eligible
-       when ``model_kwargs.accelerator_graph`` is true.
+       prefill captures: the DiT's prompt prefill and the reasoner's text,
+       mixed and vision prefills. Denoise and reasoner decode captures remain
+       eligible when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -375,6 +376,13 @@ Read by the ``mstar-server`` binary and its bridge
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
+   * - ``MSTAR_SERVED_MODELS``
+     - unset
+     - The names a Rust-frontend request's ``model`` may carry, as JSON: the
+       base model's names and the served LoRA adapters
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
+       Unset serves the base model alone. Not for deployments to set:
+       ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -442,16 +450,6 @@ Rust frontend limitations
 The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
-
-It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
-surface degrades:
-
-* ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
-  request sets ``generate_sound``, Cosmos3 generates a separate audio track that
-  mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
-  the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
-  the Rust frontend (it spends compute on a track the client won't receive), or
-  run the Python frontend for sound video.
 
 Request media
 -------------
@@ -653,7 +651,9 @@ Worker scheduling
        the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
-       Qwen3.5 alone.
+       Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio
+       and Command A+ pin their own, so it reaches Qwen3.5, Glimmer and the
+       Cosmos3 reasoner (which defaults to ``1,2,4,8,16,24,32,48,64``).
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -737,9 +737,11 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
-       Whisper, which also keeps its timestamp rule state in the sampler's
-       declared loop-back state) and only when the sampler has graph
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Glimmer, Higgs Audio,
+       Qwen3-ASR, the Cosmos3 reasoner, Qwen3-Omni's text-only Thinker and Whisper, which also keeps its timestamp rule state in
+       the sampler's declared loop-back state; the other
+       ``SampledTokenDecoder`` nodes turn it off with
+       ``device_loopback = None``) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
        node that takes its tokens on the host does not pay the eager-step
        master write. ``0`` keeps every node on the per-request tensor path.
@@ -763,9 +765,9 @@ Worker scheduling
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
        one. Only for a node that reads its tokens back on the device
-       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-       rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       (Qwen3.5, Qwen3-ASR, Whisper, the Cosmos3 reasoner) with the device
+       loop-back on, on one rank: above one, where admission doesn't decide,
+       the masters grow and the scatter runs after the replay, as with ``0``.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
