@@ -1581,7 +1581,8 @@ def test_capture_refuses_two_labels_on_one_resource():
 class _Fmha:
     """A captured fmha decode wrapper's gather, recorded."""
 
-    supports_gather_resident = True
+    plans_in_graph = True
+    supports_gather_resident = False
 
     def __init__(self):
         self.calls = []
@@ -2044,3 +2045,15 @@ def test_cross_attention_schedules_a_context_once_per_lengths():
     assert planned == [[1500, 1500, 1]]
     plan([1500, 1, 1])
     assert planned == [[1500, 1500, 1], [1500, 1, 1]]
+
+
+def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
+    """A cross attention whose query side keeps no KV cache has no stream on the
+    resident step to read: it stays host planned rather than looking one up."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    manager._query_kv_cache_name, manager._kv_cache_name, manager._cg_plan_states = None, "ctx", {}
+    step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
+    manager.resident_gather(step)
+    assert step.host_planned and not step.lengths_only

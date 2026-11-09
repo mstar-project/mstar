@@ -154,6 +154,9 @@ class FlashInferCrossManager(CrossAttentionManager):
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # the host still plans FlashInfer's schedule
         step.host_planned = True
+        if self._query_kv_cache_name is None:
+            # its query packing comes off the step's rows, and it plans on the host whole
+            return
         pool, query = self._kv_cache_name, step.streams[self._query_kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=query.label))
         if wrapper is not None and wrapper.supports_gather_resident:

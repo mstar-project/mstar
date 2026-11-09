@@ -113,7 +113,7 @@ class FlashInferManager(AttentionManager):
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
-        if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
+        if wrapper is not None and wrapper.plans_in_graph and not stream.reads:
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
             step.reads_tables = True

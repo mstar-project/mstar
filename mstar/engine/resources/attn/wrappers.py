@@ -148,7 +148,8 @@ class FlashInferPrefillWrapper:
         accelerator_graph: if True, pre-allocate static buffers for graph capture
     """
 
-    # planned on the host: a resident step can't fill its paged arrays in its graph
+    # planned on the host: a resident step fills nothing of it in its graph
+    plans_in_graph = False
     supports_gather_resident = False
 
     def __init__(
@@ -464,6 +465,9 @@ class FlashInferDecodeWrapper:
         accelerator_graph: if True, pre-allocate static buffers for graph capture
     """
 
+    # the host still plans FlashInfer's schedule (`supports_gather_resident`)
+    plans_in_graph = False
+
     def __init__(
         self,
         workspace_buffer: Workspace,
@@ -764,8 +768,10 @@ class FmhaDecodeWrapper:
     and ``max_seq_len`` pick the kernel. There is no per-step FlashInfer plan.
     """
 
-    # a resident step fills its table and lengths in its graph, with no plan (`gather_resident`)
-    supports_gather_resident = True
+    # a resident step fills its table and lengths in its graph (`gather_resident`), with no
+    # host plan at all; `supports_gather_resident` is the paged wrappers' half-way case
+    plans_in_graph = True
+    supports_gather_resident = False
 
     def __init__(
         self,
@@ -931,7 +937,8 @@ class FlashInferMixedWrapper:
     tensor-core half's in theirs (``_stage_pinned``).
     """
 
-    # planned on the host: a resident step can't fill its paged arrays in its graph
+    # planned on the host: a resident step fills nothing of it in its graph
+    plans_in_graph = False
     supports_gather_resident = False
 
     def __init__(
