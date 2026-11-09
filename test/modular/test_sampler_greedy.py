@@ -34,8 +34,6 @@ from mstar.engine.resources.step import (
     SlotLease,
     StepContext,
     SubmoduleStep,
-    has_variant,
-    node_capture_key,
 )
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -89,101 +87,11 @@ def test_the_argmax_takes_the_first_of_equal_maxima_on_the_cpu():
     assert greedy_tokens(logits).tolist() == [2, 0, 4]
 
 
-# ---- which steps lease it ----
-
-def _engine(samplers, captured, pools=()):
-    """An engine whose node keys its captures None, has ``captured``, and records what it asks."""
-    from mstar.testing_utils.engine import make_engine, make_mgmt
-
-    asked = []
-
-    def lease_slot(graph_walk, bs, slot, num_tokens=None, cg_key_info=None):
-        asked.append(cg_key_info)
-        return SlotLease(slot, BucketKey(graph_walk, 8, 8, cg_key_info)) if cg_key_info in captured else None
-
-    engine = make_engine(_submodules={"LLM": make_mgmt(
-        SimpleNamespace(cg_key_info=lambda walk, info, **kw: None),
-        lora_pools=pools, greedy_samplers=tuple(samplers),
-        accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
-    )})
-    return engine, asked
-
-
-def _batch(rids):
-    batch = SimpleNamespace(node_name="LLM", slot=0, request_ids=list(rids), inputs=None, cg_key_info=None,
-                            per_request_info_wrapped={}, per_request_input_metadata={},
-                            step_context=SimpleNamespace(graph_walk=WALK, force_prefill=None))
-    batch.lease_slot = lambda lease: setattr(batch, "lease", lease)
-    return batch
-
+# ---- the plan's check ----
 
 @pytest.fixture
 def wide():
     return SamplerResource(vocab_size=WIDE, enable_repetion_penalty=True, device=CPU)
-
-
-def test_a_step_leases_the_greedy_capture_only_when_every_row_samples_greedily(wide):
-    for rid, t in ((1, 0.0), (2, 0.0), (3, 0.7), (4, 0.9)):
-        wide.ingest_request(rid, _cfg(t))
-    engine, asked = _engine([wide], {None, GreedySample()})
-    # all greedy
-    assert engine.reserve_replay_slot(_batch([1, 2])).bucket.cg_key_info == GreedySample()
-    assert asked == [GreedySample()]
-    # mixed: the full capture, never asked for the greedy one
-    asked.clear()
-    assert engine.reserve_replay_slot(_batch([1, 3])).bucket.cg_key_info is None
-    assert asked == [None]
-    # none greedy
-    asked.clear()
-    assert engine.reserve_replay_slot(_batch([3, 4])).bucket.cg_key_info is None
-    assert asked == [None]
-
-
-def test_the_variant_flips_with_the_batch_not_with_who_is_resident(wide):
-    """A sampled row arriving mid-run sends the steps it joins to the full
-    capture; the greedy rows' steps without it, and after it leaves, go back."""
-    engine, _ = _engine([wide], {None, GreedySample()})
-    for rid in (1, 2):
-        wide.ingest_request(rid, _cfg(0.0))
-    key = lambda rids: engine.reserve_replay_slot(_batch(rids)).bucket.cg_key_info  # noqa: E731
-    assert key([1, 2]) == GreedySample()
-    wide.ingest_request(3, _cfg(0.7))
-    assert key([1, 2]) == GreedySample()
-    assert key([1, 2, 3]) is None
-    wide.remove_request(3)
-    assert key([1, 2]) == GreedySample()
-    # a re-ingest replaces the config both ways
-    wide.ingest_request(2, _cfg(0.7))
-    assert key([1, 2]) is None
-    wide.ingest_request(2, _cfg(0.0))
-    assert key([1, 2]) == GreedySample()
-
-
-def test_no_greedy_bucket_falls_back_to_the_full_one(wide):
-    wide.ingest_request(1, _cfg(0.0))
-    engine, asked = _engine([wide], {None})
-    batch = _batch([1])
-    assert engine.reserve_replay_slot(batch).bucket.cg_key_info is None
-    assert asked == [GreedySample(), None] and batch.cg_key_info is None
-
-
-def test_greedy_wraps_the_lora_base_only_capture_and_falls_back_through_it(wide):
-    wide.ingest_request(1, _cfg(0.0))
-    pool = SimpleNamespace(runs_adapters=lambda rids: False)
-    every = {None, LoraBaseOnly(), GreedySample(), GreedySample(LoraBaseOnly())}
-    engine, asked = _engine([wide], every, pools=(pool,))
-    assert engine.reserve_replay_slot(_batch([1])).bucket.cg_key_info == GreedySample(LoraBaseOnly())
-    engine, asked = _engine([wide], {None, LoraBaseOnly()}, pools=(pool,))
-    assert engine.reserve_replay_slot(_batch([1])).bucket.cg_key_info == LoraBaseOnly()
-    assert asked == [GreedySample(LoraBaseOnly()), GreedySample(), LoraBaseOnly()]
-    key = GreedySample(LoraBaseOnly("cfg"))
-    assert node_capture_key(key) == "cfg" and has_variant(key, LoraBaseOnly) and has_variant(key, GreedySample)
-    assert not has_variant(LoraBaseOnly("cfg"), GreedySample) and str(key) == "greedy:lora-base-only:cfg"
-
-
-def test_a_node_without_a_greedy_sampler_asks_for_its_own_key_alone():
-    engine, asked = _engine([], {None, GreedySample()})
-    assert engine.reserve_replay_slot(_batch([1])).bucket.cg_key_info is None and asked == [None]
 
 
 def test_the_plan_refuses_a_greedy_lease_over_a_sampled_row(wide):

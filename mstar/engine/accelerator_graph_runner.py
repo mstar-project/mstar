@@ -708,6 +708,8 @@ class AcceleratorGraphRunner:
         self._num_slots = num_slots
 
         self._buckets: dict[BucketKey, AcceleratorGraphBucket] = {}
+        # plain bucket -> its captured lean twins, by lean set (`lease_slot`)
+        self._twins: dict[BucketKey, dict[frozenset[str], BucketKey]] = {}
 
         self._memory_pool: AcceleratorGraphPool | None = None
         # buckets that failed to capture (here or on a peer rank) and run eagerly
@@ -1095,6 +1097,8 @@ class AcceleratorGraphRunner:
             bucket = self._buckets[spec.bucket] = AcceleratorGraphBucket(
                 config=spec.config, config_idx=spec.config_idx,
             )
+            if spec.bucket.lean:
+                self._twins.setdefault(replace(spec.bucket, lean=frozenset()), {})[spec.bucket.lean] = spec.bucket
         # the caller registers a bucket's slots in index order, and only once
         # all of them captured, so append keeps list position == slot index
         bucket.slots.append(slot)
@@ -1364,7 +1368,8 @@ class AcceleratorGraphRunner:
         self, graph_walk: str, bs: int, num_tokens: int,
         cg_key_info: Any | None = None,
     ) -> BucketKey | None:
-        """Tightest captured bucket that fits this batch, or None for eager.
+        """Tightest captured plain bucket that fits this batch, or None for eager
+        (``lease_slot`` takes its lean twin).
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
@@ -1374,7 +1379,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.lean:
                 continue
             needed = num_tokens * bucket.config.total_tokens_multiplier
             if key.bs < bs or key.num_tokens < needed or not bucket.slots:
@@ -1400,7 +1405,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.lean:
                 continue
             if key.bs < bs or not bucket.slots:
                 continue
@@ -1453,6 +1458,7 @@ class AcceleratorGraphRunner:
         slot: int,
         num_tokens: int | None = None,
         cg_key_info: Any | None = None,
+        lean: Sequence[frozenset[str]] = (),
     ) -> SlotLease | None:
         """Pick the bucket and double-buffer slot an upcoming step replays on.
 
@@ -1462,6 +1468,11 @@ class AcceleratorGraphRunner:
         ``slot=None`` advances the bucket's counter so the next lease lands on
         the other slot; a caller that already reserved one (pre-plan) passes it
         back so both submissions target the same slot.
+
+        ``lean`` lists the lean sets the step allows, in the order to try them:
+        the tightest plain bucket's first captured twin among them is leased, the
+        plain bucket when none is. A twin has its plain bucket's batch size and token
+        count, so it pads no more.
         """
         key = (
             self.select_batched_bucket(graph_walk, bs, cg_key_info)
@@ -1470,6 +1481,13 @@ class AcceleratorGraphRunner:
         )
         if key is None:
             return None
+        twins = self._twins.get(key) if lean else None
+        if twins:
+            for subset in lean:
+                twin = twins.get(subset)
+                if twin is not None:
+                    key = twin
+                    break
         bucket = self._buckets[key]
 
         # Hand back the bucket the capture ran under, not the alias this walk
