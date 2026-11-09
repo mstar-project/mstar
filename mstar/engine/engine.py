@@ -1,6 +1,7 @@
 
 
 import logging
+import math
 import os
 import threading
 import time
@@ -573,6 +574,8 @@ class Engine:
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
+        # node -> `chunk_alignment`, filled on first ask
+        self._chunk_alignment: dict[str, int] = {}
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
@@ -2815,9 +2818,41 @@ class Engine:
             overrides, walks, combined_walk_of, override_mixed, no_chunking,
             min_chunk_tokens,
         )
+        self._check_chunk_alignment()
 
-    def min_chunk_tokens(self, budget: int) -> int:
-        return self._chunking.min_chunk_tokens(budget)
+    def _check_chunk_alignment(self) -> None:
+        """Refuse a budget under its node's `chunk_alignment`, and warn under three of
+        them: a cut chunk is a whole number of alignments, so every cut would run past
+        a smaller budget, and up to an alignment less one of each step goes unused."""
+        for (node, walk), budget in sorted(self._chunking.cut_budgets().items()):
+            if node not in self._submodules:
+                continue
+            align = self.chunk_alignment(node)
+            if budget < align:
+                raise ValueError(
+                    f"max_batch_tokens for {node}/{walk}: {budget} is under the {align}-token chunk "
+                    f"alignment {node}'s resources declare (`Resource.chunk_alignment`), so every cut "
+                    f"chunk would run over it; set at least {align}"
+                )
+            if budget < 3 * align:
+                logger.warning(
+                    "max_batch_tokens for %s/%s: %d is under three %d-token chunk alignments; a cut "
+                    "chunk is a multiple of %d tokens, so up to %d of a step's budget can go unused",
+                    node, walk, budget, align, align, align - 1,
+                )
+
+    def min_chunk_tokens(self, budget: int, align: int = 1) -> int:
+        return self._chunking.min_chunk_tokens(budget, align)
+
+    def chunk_alignment(self, node_name: str) -> int:
+        """What a cut chunk of a ``node_name`` row is a multiple of: the alignments its
+        resources declare (`Resource.chunk_alignment`). Set once the caches are open."""
+        align = self._chunk_alignment.get(node_name)
+        if align is None:
+            mgmt = self._submodules.get(node_name)
+            align = math.lcm(1, *(r.chunk_alignment for r in mgmt.resources.values())) if mgmt else 1
+            self._chunk_alignment[node_name] = align
+        return align
 
     def set_chunking_policies(
         self, policies: Mapping[tuple[str, str], ChunkingPolicy],

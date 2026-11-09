@@ -167,11 +167,30 @@ class ChunkingManagement:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._overrides[(node, walk)] = budget
 
-    def min_chunk_tokens(self, budget: int) -> int:
+    def min_chunk_tokens(self, budget: int, align: int = 1) -> int:
         """The fewest tokens the scheduler cuts a row to under ``budget``, or
         the whole budget when that is smaller. Without a floor, decode rows
-        that fill the budget leave a prompt a token or two a step."""
-        return min(self._min_chunk_tokens, budget)
+        that fill the budget leave a prompt a token or two a step. A cut is a
+        multiple of ``align`` (`Engine.chunk_alignment`), so the floor rounds up
+        to one, within the budget: a floor between two multiples would leave the
+        oldest prompt's share of a step too small to cut."""
+        floor = min(self._min_chunk_tokens, budget)
+        if align > 1:
+            floor = max(align, min(-(-floor // align) * align, budget - budget % align))
+        return floor
+
+    def cut_budgets(self) -> dict[tuple[str, str], int]:
+        """(node, walk) -> budget, for each budget that cuts a prompt: a chunkable
+        walk's own, and that of the combined walk it runs in."""
+        out: dict[tuple[str, str], int] = {}
+        for node, walk in self._policies:
+            if not self.chunkable(node, walk):
+                continue
+            for key in ((node, walk), (node, self._combined_walk_of.get((node, walk)))):
+                budget = self.max_batch_tokens(*key) if key[1] is not None else None
+                if budget is not None:
+                    out[key] = budget
+        return out
 
     def walk_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
         """Under a combined walk on a node with ``can_override_mixed_max_tokens``:

@@ -506,6 +506,11 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   boundary when that is past what it restored. A shared prefix is then served from the third request
   that shares it. A step longer than the largest captured bucket checkpoints less often, so that
   its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+- A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
+  more of its prompt to come keeps its own end), so a resend restores past its first chunk,
+  and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
+  Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
+  ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
 - A decode step that ends a page keeps the state there, so a later turn that re-sends the
   reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
@@ -1671,6 +1676,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+
+  A resource that keeps state only on a grid counted from a chunk's start declares
+  ``Resource.chunk_alignment``, and a cut chunk of the node's rows is then a multiple of
+  every alignment its resources declare (``Engine.chunk_alignment``). The chunk floor rounds
+  up to it, and a budget under it fails loading.
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
