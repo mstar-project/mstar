@@ -592,15 +592,41 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
 
 def untouched(earlier):
     """The locations of the earlier review's findings outside the diff (`earlier`, what render_summary.carried
-    carried over) whose file no commit since that review touched, by the files since.diff or interdiff.diff changes
+    carried over) whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
     (rereview_inputs; not interdiff's dropped part, which holds the old patches as written, unnumbered). With
     neither (no last-review.json, or a /review continue) every one counts as untouched, since that is unknown. Such a
     finding has no thread to show its lines changed, so the approval reads a re-review's `fixed` or `moot` on it as
     `disputed` (gpu_review.for_approval)."""
     since = next((Path(p) for p in ("since.diff", "interdiff.diff") if Path(p).exists()), None)
-    touched = set(session.diff_paths(since.read_text().partition(DROPPED)[0])) if since else set()
+    # As bytes: the diff holds what the commits hold, which needn't be UTF-8, and a CR in a line isn't its end.
+    text = since.read_bytes().decode("utf-8", "replace") if since else ""
+    touched = touched_files(text.partition(DROPPED)[0])
     return [f["location"] for f in (earlier or {}).get("outside_diff", [])
             if f["location"].partition(":")[0] not in touched]
+
+
+GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)')
+
+
+def touched_files(diff_text):
+    """Every file a diff touches, on either side: changed, added, deleted (`+++ /dev/null`), renamed from or to,
+    and binary or mode-only changes, by their `diff --git` line. Unlike session.diff_paths, the files a review
+    can open, a file that is gone counts. Lines end only at \\n, as in session.diff_paths."""
+    lines = diff_text.split("\n")
+    paths = set()
+    for before, line in zip([""] + lines, lines, strict=False):
+        sides = ()
+        if before.startswith("--- ") and line.startswith("+++ "):
+            sides = ((before[len("--- "):], "a/"), (line[len("+++ "):], "b/"))
+        elif line.startswith(("rename from ", "rename to ")):
+            sides = ((line.split(" ", 2)[2], ""),)
+        elif m := GIT_HEADER.fullmatch(line):
+            sides = ((m[1], "a/"), (m[2], "b/"))
+        for raw, prefix in sides:
+            path = session.unquoted(raw)
+            if path and path.startswith(prefix):
+                paths.add(path[len(prefix):])
+    return paths
 
 
 def last_live_test(comments):

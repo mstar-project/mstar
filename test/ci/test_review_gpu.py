@@ -679,7 +679,7 @@ class TestApprove(unittest.TestCase):
             with workspace() as ws:
                 (ws / "last-review.json").write_text(json.dumps({"head": "2" * 40, "outside_diff": [item]}))
                 if since is not None:
-                    (ws / "since.diff").write_text(since)
+                    (ws / "since.diff").write_bytes(since)
                 out, _ = step(bot.post, {"POST graphql": pages[0], "pr comment": "https://github.com/o/r/pull/7#c-9",
                                          "GET repos/o/r/issues/7/comments": []},
                               repo="o/r", pr="7", runner_temp=finished(review), head_sha="1" * 40, mode="full",
@@ -687,9 +687,17 @@ class TestApprove(unittest.TestCase):
             judged = gpu_review.for_approval(json.loads(out["result"]), pages)
             return blocking(judged, pages, []), render_summary.checklist(judged, pages, [])
 
-        self.assertEqual(left("diff --git a/mstar/a.py b/mstar/a.py\n--- a/mstar/a.py\n+++ b/mstar/a.py\n")[0], [],
-                         "a finding fixed in its file couldn't be cleared by a re-review")
-        for name, since in (("its file untouched", "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n"),
+        for name, since in (("changed", b"diff --git a/mstar/a.py b/mstar/a.py\n--- a/mstar/a.py\n+++ b/mstar/a.py\n"),
+                            ("deleted", b"diff --git a/mstar/a.py b/mstar/a.py\n--- a/mstar/a.py\n+++ /dev/null\n"),
+                            ("renamed", b"diff --git a/mstar/a.py b/mstar/b.py\nsimilarity index 100%\n"
+                                        b"rename from mstar/a.py\nrename to mstar/b.py\n"),
+                            ("binary", b"diff --git a/mstar/a.py b/mstar/a.py\nBinary files differ\n")):
+            self.assertEqual(left(since)[0], [], f"{name}: a finding in that file couldn't be cleared by a re-review")
+        hunk = b"diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n |+x"
+        for name, since in (("its file untouched", b"diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n"),
+                            ("not UTF-8", hunk + b"caf\xe9\n"),
+                            ("a CR forging a header", hunk + b"\r--- a/mstar/a.py\r+++ b/mstar/a.py\r"
+                                                       b"diff --git a/mstar/a.py b/mstar/a.py\n"),
                             ("unknown", None)):
             found, text = left(since)
             self.assertEqual(found, ["earlier mstar/a.py:3 (P1)"], f"{name}: the model's word alone would clear it")
