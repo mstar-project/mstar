@@ -644,7 +644,7 @@ def check_kv_pools_fit(
     model, config: dict, config_path: str, log: logging.Logger,
     request_tokens: Mapping[str, Sequence[int]] | None = None,
 ) -> None:
-    """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
+    """Refuse a ``max_concurrent_requests`` the model's KV caches or recurrent pools cannot hold.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
     prefill batch is refused and the worker offloads decoding requests to
@@ -652,9 +652,12 @@ def check_kv_pools_fit(
     at full length must fit each cache next to its sink page; the conductor
     queues the rest. Warnings go to the model's ``log``. ``request_tokens``
     gives a pool the tokens each of a request's streams holds at full length,
-    by default one stream of the pool's ``max_seq_len``.
+    by default one stream of the pool's ``max_seq_len``. A recurrent pool must
+    hold a slot for each label of each of the cap's requests, since a request
+    keeps them until it is torn down, and offloading frees none.
     """
     from mstar.engine.resources import KVSpec, PagedKVConfig
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
     from mstar.model.base import serving_resources
 
     cap = config.get("max_concurrent_requests")
@@ -673,6 +676,16 @@ def check_kv_pools_fit(
     except ValueError:
         return  # a `resources:` block the validation's resource checks report
     for spec in specs:
+        if isinstance(spec, RecurrentStateSpec):
+            state = spec.config
+            if cap * len(state.labels) > state.usable_slots:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need "
+                    f"{cap * len(state.labels)} slots of resources.{spec.resource_key} ({len(state.labels)} per "
+                    f"request), which leaves {state.usable_slots} of its {state.max_slots} to requests; raise "
+                    "max_slots or lower max_concurrent_requests"
+                )
+            continue
         # paged caches only: a ring buffer is sized by its window, not by requests
         if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
             continue
