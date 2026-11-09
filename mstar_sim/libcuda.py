@@ -149,7 +149,7 @@ class LibCudart:
 
 
 # the native libraries mstar may load through ctypes, and what the emulator does
-# (read by the contract test in tests/test_device.py)
+# (read by the optional compatibility audit in audits/test_compatibility.py)
 LIBRARIES = {
     "libcuda": "this stand-in (graph introspection, contexts)",
     "libcudart": "this stand-in's host registration and cudaMemcpyAsync (LibCudart), priced as the emulator's copies",

@@ -522,7 +522,7 @@ def _noop_ctx(*_, **__):
 
 
 # the CUDA names mstar may reach that are not stand-ins, and why that is right on
-# the emulated GPU (read by the contract test in tests/test_device.py)
+# the emulated GPU (read by the optional compatibility audit in audits/test_compatibility.py)
 PASSTHROUGH = {
     "torch.cuda.OutOfMemoryError": "an exception class, nothing to emulate",
     "torch.cuda.nvtx": "a namespace; install() makes its range and mark functions no-ops",

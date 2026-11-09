@@ -1459,7 +1459,7 @@ _ALLOCATORS = {torch.empty, torch.zeros, torch.ones, torch.full, torch.randn, to
 
 
 # The ``torch.ops`` namespaces mstar may call and how each runs on the emulated GPU
-# (read by the contract test in tests/test_device.py)
+# (read by the optional compatibility audit in audits/test_compatibility.py)
 OPS_NAMESPACES = {
     "aten": "dispatched and priced",
     "prims": "dispatched and priced",
