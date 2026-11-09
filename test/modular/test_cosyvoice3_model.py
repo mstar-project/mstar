@@ -1402,8 +1402,24 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
     prefill = sub.get_accelerator_graph_configs(torch.device("cpu"))[1]
     assert prefill.replay_graph_walks == ["prefill", "prefill_voice"]
-    assert prefill.capture_token_lengths == list(cfg.lm_prefill_token_buckets)
+    assert prefill.capture_token_lengths == {1: sub.LM_PREFILL_TOKEN_BUCKETS}
     assert sub.resident_walks() == {"decode"}
+
+
+def test_the_serving_configs_ladder_reaches_the_lm_prefill_capture():
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+
+    sub, _ = _lm(_tiny_config())
+
+    def ladders(walk_ladders):
+        configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+        apply_token_ladders("llm", configs, walk_ladders, lambda walk, rows: None, lambda c: c.capture_batch_sizes)
+        return configs[1].capture_token_lengths
+
+    assert ladders({"prefill_voice": [96, 32]}) == {1: [32, 96]}
+    # `prefill` steps replay the `prefill_voice` capture, which the refusal names
+    with pytest.raises(ValueError, match="prefill_voice"):
+        ladders({"prefill": [32]})
 
 
 # -- flow -----------------------------------------------------------------------------

@@ -191,7 +191,6 @@ class CosyVoice3Model(Model):
         flow_capture_batch_frames: int | None = None,
         hift_capture_frame_buckets: list[int] | None = None,
         hift_capture_batch_sizes: list[int] | None = None,
-        lm_prefill_token_buckets: list[int] | None = None,
         lm_prefill_batch_sizes: list[int] | None = None,
         flow_max_batch_size: int | None = None,
         hift_max_batch_size: int | None = None,
@@ -252,8 +251,6 @@ class CosyVoice3Model(Model):
                 f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
                 "tail and pending mel"
             )
-        if lm_prefill_token_buckets is not None:
-            cfg.lm_prefill_token_buckets = _sizes("lm_prefill_token_buckets", lm_prefill_token_buckets)
         if lm_prefill_batch_sizes is not None:
             cfg.lm_prefill_batch_sizes = _sizes("lm_prefill_batch_sizes", lm_prefill_batch_sizes)
         if flow_cache_frames is not None:
