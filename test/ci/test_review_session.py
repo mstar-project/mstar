@@ -23,18 +23,10 @@ def tool(tid, name, **inp):
     return {"type": "tool_use", "id": tid, "name": name, "input": inp}
 
 
-def result(tid, error=None, out='{"success": true, "comment_id": 1}'):
-    block = {"type": "tool_result", "tool_use_id": tid, "content": error or [{"type": "text", "text": out}]}
-    if error:
-        block["is_error"] = True
-    return {"type": "user", "message": {"content": [block]}}
-
-
 def text(t):
     return {"type": "text", "text": t}
 
 
-COMMENT = "mcp__github_inline_comment__create_inline_comment"
 # As Claude Code writes it: this system message's "message" is a string, not an object.
 DENIED = {"type": "system", "subtype": "permission_denied", "tool_name": "Glob",
           "message": "Claude requested permissions to read from /tmp/x, but you haven't granted it yet."}
@@ -92,26 +84,15 @@ class TestHandoff(unittest.TestCase):
             assistant("m1", text("Reading the diff."), tool("r1", "Read", file_path=f"{ROOT}/pr-head/mstar/a.py")),
             assistant("m2", text("Progress:\n- P1 `mstar/a.py:10` drops a token, verified"),
                       tool("r2", "Read", file_path=f"{ROOT}/pr-head/mstar/b.py", offset=100, limit=50)),
-            assistant("m3", tool("c1", COMMENT, path="mstar/a.py", line=10, body="**[P1]** drops a token\n\nmore")),
-            result("c1"),
-            assistant("m4", tool("c2", COMMENT, path="mstar/b.py", line=5, body="**[P2]** stale comment")),
-            result("c2", error="line 5 is not in the diff"),
             assistant("m5", text("subagent text"), parent="task1"),
-            assistant("m6", tool("c3", COMMENT, path="mstar/c.py", line=1, body="**[P2]** buffered")),
-            result("c3", out='{"success": true, "buffered": true}'),
         ]
 
-    def test_records_comments_reads_and_the_latest_progress_note(self):
+    def test_records_reads_and_the_latest_progress_note(self):
         h = handoff(self.run_messages(), ROOT, ["mstar/a.py", "mstar/b.py", "mstar/c.py"])
-        status = {c["path"]: c["status"] for c in h["comments"]}
-        self.assertEqual(status, {"mstar/a.py": "posted", "mstar/b.py": "failed", "mstar/c.py": "unknown"},
-                         "a buffered comment, which may never post, would be listed as on the PR")
         self.assertEqual(h["reads"], ["pr-head/mstar/a.py", "pr-head/mstar/b.py"])
         self.assertEqual(h["not_opened"], ["mstar/c.py"])
         self.assertTrue(h["note"].startswith("Progress:"))
         self.assertEqual(h["recent_text"], "", "a subagent's text would read as the reviewer's own")
-        md = SESSION["handoff_md"](h, "568", "abc", "light")
-        self.assertIn("## Inline comments already posted\n\n- `mstar/a.py:10` **[P1]** drops a token", md)
 
     def test_a_continued_run_merges_onto_its_handoff(self):
         after_note = assistant("m7", text("Candidate P1 `mstar/b.py:40`, verifying.\n\nNext: c.py"))
@@ -120,7 +101,6 @@ class TestHandoff(unittest.TestCase):
                                     tool("r3", "Read", file_path=f"{ROOT}/pr-head/mstar/c.py"))],
                          ROOT, ["mstar/a.py", "mstar/c.py"], first)
         self.assertEqual(second["runs"], 2)
-        self.assertEqual(len(second["comments"]), 3, "the first run's inline comments would be forgotten")
         self.assertEqual(second["not_opened"], [])
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
         self.assertEqual(second["recent_text"], "Candidate P1 `mstar/b.py:40`, verifying.\n\nNext: c.py\nNo note here",

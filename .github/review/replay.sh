@@ -82,7 +82,7 @@ cp -r "$ROOT/.claude/skills" "$WORK/base/.claude/skills"
 cd "$WORK/base"
 # The prompt goes before the flags: --disallowedTools takes a variadic list and
 # would otherwise swallow it as one more tool name. The tools are the workflow's
-# review step's, less the inline-comment tool: no shell, web reads only from its sites.
+# review step's: no shell, web reads only from its sites.
 claude -p "Read .github/review/review-prompt.md from the repository root and follow it exactly.
    It defines your trust boundary, your method, your reporting bar and your output format.
 
@@ -91,10 +91,9 @@ claude -p "Read .github/review/review-prompt.md from the repository root and fol
    pr.diff is $lines lines.
    Turn cap: $MAX_TURNS.
 
-   DRY RUN: nothing will be posted, and you have no posting tools. Where the prompt
-   says to call create_inline_comment, print the call instead as a fenced json block
-   with keys path, line, startLine, side and body. Where it says to return the summary
-   fields, print them as one fenced json block instead. Print nothing else." \
+   DRY RUN: nothing will be posted. Where the prompt says to return the summary
+   fields, inline_comments included, print them as one fenced json block instead.
+   Print nothing else." \
   --model "$MODEL" \
   --max-turns "$MAX_TURNS" \
   --permission-mode dontAsk \

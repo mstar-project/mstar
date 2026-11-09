@@ -18,9 +18,9 @@ MARKER = "<!-- claude-review-summary -->"
 # What a re-review starts from (head, findings outside the diff, risk), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
 STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
-# Every login the bot posts as: the app, and github-actions, the job's own token, for what the app token
-# can't reach (a team run's inline comments outlast its hour) and everything before the app. Enough for
-# something a forged post can only add to, such as an inline finding.
+# Every login the bot posts as: the app, and github-actions, the job's own token, when the app has no token to
+# give (bot.post falls back to it, and everything before the app). Enough for something a forged post can only
+# add to, such as an inline finding.
 POSTING_BOTS = ("mstar-review", "github-actions")
 # Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
 # workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
@@ -41,6 +41,18 @@ STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
     "properties": {
+        # Findings on lines of pr.diff, posted by the workflow (bot.post_inline), never by the model.
+        "inline_comments": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "line": {"type": "integer", "minimum": 1, "description": "the line, or the last line of a range"},
+                "start_line": {"type": "integer", "minimum": 1, "description": "the first line, for a range"},
+                "side": {"type": "string", "enum": ["RIGHT", "LEFT"], "description": "LEFT for a deleted line"},
+                "body": {"type": "string"},
+            },
+            "required": ["path", "line", "body"],
+        }},
         "outside_diff": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -104,8 +116,8 @@ SCHEMA = {
             }, "required": ["location", "why"]}},
         }, "required": ["level", "reason", "look_at"]},
     },
-    "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
-                 "prior_findings", "design", "latent", "risk"],
+    "required": ["inline_comments", "outside_diff", "since_last", "description_problems", "questions", "checked",
+                 "skipped", "types", "prior_findings", "design", "latent", "risk"],
 }
 FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 

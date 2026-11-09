@@ -18,6 +18,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import render_summary
@@ -555,15 +556,45 @@ def earlier_outside_diff(repo, pr):
     return (state or {}).get("outside_diff") or []
 
 
+def post_inline(repo, pr, head_sha, review):
+    """Post the review's inline comments (`inline_comments`, taken out of `review`), anchored to the reviewed commit:
+    model output from untrusted input, so redacted and unable to open an HTML comment. One call each, a second
+    apart, since one line GitHub refuses fails a whole batched review, and a batch doesn't say which comment got
+    which id. GitHub also decides whether a line is in the diff. One it won't take goes on the review's
+    `outside_diff`, as the summary's own, so no finding is lost. {id: priority tag} of what posted."""
+    posted = {}
+    for i, c in enumerate(review.pop("inline_comments", [])):
+        if i:
+            time.sleep(1)
+        body = redact(c["body"]).replace("<!--", "&lt;!--")
+        side, tag = c.get("side", "RIGHT"), render_summary.TAG.match(body)
+        fields = {"commit_id": head_sha, "path": c["path"], "line": c["line"], "side": side, "body": body}
+        if c.get("start_line", c["line"]) < c["line"]:
+            fields.update(start_line=c["start_line"], start_side=side)
+        try:
+            new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
+                                input=json.dumps(fields)).stdout)
+            posted[str(new["id"])] = tag[1] if tag else "P2"
+        except UNREADABLE as e:
+            print(f"::warning::Couldn't post the inline comment on {c['path']}:{c['line']}: {e}")
+            text = body[tag.end() if tag else 0:].strip()
+            review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": text.split("\n")[0],
+                                           "location": f"{c['path']}:{c['line']}",
+                                           "detail": session.shorten(text, 2000)})
+    return posted
+
+
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
-    """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
-    untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
-    counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
-    doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
+    """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
+    redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
+    status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
+    re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
-    pages = graphql(THREADS, repo, pr)
     try:
-        review = render_summary.carried(json.loads(output), earlier_outside_diff(repo, pr))
+        review = json.loads(output)
+        post_inline(repo, pr, head_sha, review)
+        pages = graphql(THREADS, repo, pr)
+        review = render_summary.carried(review, earlier_outside_diff(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"))
     except Exception as e:
         text = ""
@@ -629,9 +660,9 @@ def labels(out, repo, pr, output):
 def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
     """A review that stopped before it finished: the handoff a `/review continue` starts from
     ($RUNNER_TEMP/handoff), from the execution file or, after a timeout, the transcript Claude Code writes
-    as it goes, and partial.md, what the "didn't complete" comment shows. A continued run that stops too
-    merges its handoff onto the one it started from (`prev`). Model notes on the PR's own content, so
-    redacted as the summary is; the artifact is public on a public repo."""
+    as it goes. A continued run that stops too merges its handoff onto the one it started from (`prev`).
+    Model notes on the PR's own content, so redacted as the summary is; the artifact is public on a public
+    repo."""
     previous = None
     if prev:
         try:
@@ -652,29 +683,26 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
     saved.mkdir(parents=True, exist_ok=True)
     (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
     (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
-    Path("partial.md").write_text(redact(session.partial_md(h)))
     out["dir"] = str(saved)
 
 
 def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_continue="false", refused="false"):
-    """Anything failed: say so on the PR rather than leaving silence, with what the run had so far
-    (partial.md). Repeated failures update one comment, found by its marker, so retries don't stack up
-    comments. A refused /review continue has a marker of its own, so it never writes over a stopped
-    review's comment (its partial results, and that it can still be continued by someone else)."""
+    """Anything failed: say so on the PR rather than leaving silence. Repeated failures update one comment,
+    found by its marker, so retries don't stack up comments. A refused /review continue has a marker of its
+    own, so it never writes over a stopped review's comment (that it can still be continued by someone
+    else). A stopped review posted nothing: its findings are in its notes, and the comment says so."""
     if refused == "true":
         # A /review continue that had nothing usable to continue from; `why` says what to do.
         marker = REFUSED
         text = f"{marker}\n`/review continue` didn't run: {why}. [Log]({run_url}).\n"
     else:
         marker = INCOMPLETE
-        then = ("Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or the "
-                "same `/review` command to start over." if can_continue == "true"
+        then = ("Its findings post only when a review finishes, so they aren't on the PR yet; they are in the notes "
+                "`/review continue` starts from. Comment `/review continue` to carry on in a fresh session (kept for "
+                "7 days), or the same `/review` command to start over." if can_continue == "true"
                 else "Comment the same `/review` command to retry.")
         text = (f"{marker}\nThe automated review didn't complete: {why}{f' ({detail})' if detail else ''}. "
                 f"[Log]({run_url}). {then}\n")
-    partial = Path("partial.md")
-    if partial.is_file() and partial.stat().st_size:
-        text += "\nWhat it had so far:\n\n" + partial.read_text()
     earlier = marked(read(api_list, f"repos/{repo}/issues/{pr}/comments") or [], marker)
     if earlier:
         gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{earlier[-1]}", "--input", "-",

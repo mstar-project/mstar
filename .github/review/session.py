@@ -136,17 +136,11 @@ def usage_table(r):
 
 
 def handoff(messages, root, diff_paths, previous=None):
-    """What a stopped run leaves for the next one: the inline comments it made (and whether each
-    posted), the files it read, the latest progress note and what was written since (the model
-    often keeps no note, but says what it is doing as it goes). Merged onto ``previous``, the
-    handoff the run itself started from, if any."""
+    """What a stopped run leaves for the next one: the files it read, the latest progress note and
+    what was written since (the model often keeps no note, but says what it is doing as it goes).
+    Its findings are in those notes: it posted nothing. Merged onto ``previous``, the handoff the run
+    itself started from, if any."""
     prev = previous or {}
-    results = {}
-    for m in messages:
-        for b in blocks(m):
-            if b.get("type") == "tool_result" and b.get("tool_use_id"):
-                results[b["tool_use_id"]] = b
-    comments = {c.get("id") or f"earlier-{i}": c for i, c in enumerate(prev.get("comments", []))}
     reads = set(prev.get("reads", []))
     # The earlier runs' text since their note, one line per item, so the newest of it is kept
     # (an earlier message may then be kept only in part).
@@ -159,19 +153,7 @@ def handoff(messages, root, diff_paths, previous=None):
         for b in blocks(m):
             kind, inp = b.get("type"), b.get("input")
             inp = inp if isinstance(inp, dict) else {}
-            if kind == "tool_use" and str(b.get("name", "")).endswith("create_inline_comment"):
-                res = results.get(b.get("id")) or {}
-                # The tool reports a posted comment's id. A call without `confirmed: true` is only
-                # buffered, to be posted or dropped after the session, so it stays unknown.
-                status = ("failed" if res.get("is_error")
-                          else "posted" if '"comment_id"' in result_text(res.get("content")) else "unknown")
-                key = b.get("id") or f"no-id-{len(comments)}"
-                comments[key] = {
-                    "id": key, "path": inp.get("path"), "line": inp.get("line") or inp.get("startLine"),
-                    "body": shorten(str(inp.get("body", "")).strip().split("\n")[0], 160), "status": status,
-                    "error": shorten(first_line(res.get("content")), 200) if status == "failed" else "",
-                }
-            elif kind == "tool_use" and b.get("name") == "Read" and inp.get("file_path"):
+            if kind == "tool_use" and b.get("name") == "Read" and inp.get("file_path"):
                 path = str(inp["file_path"])
                 reads.add(path[len(prefix):] if path.startswith(prefix) else path)
             elif kind == "text" and main_thread and str(b.get("text", "")).strip():
@@ -183,7 +165,6 @@ def handoff(messages, root, diff_paths, previous=None):
     opened = {p[len("pr-head/"):] for p in reads if p.startswith("pr-head/")}
     return {
         "runs": prev.get("runs", 0) + 1,
-        "comments": list(comments.values()),
         "reads": sorted(reads),
         "not_opened": [p for p in diff_paths if p not in opened],
         "note": shorten(note or prev.get("note") or "", NOTE_CHARS),
@@ -215,16 +196,6 @@ def newest(texts, limit):
     return shorten("\n".join(reversed(kept)), limit).lstrip("\n")
 
 
-def result_text(content):
-    if isinstance(content, list):
-        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-    return str(content or "")
-
-
-def first_line(content):
-    return result_text(content).strip().split("\n")[0]
-
-
 def diff_paths(diff_text):
     """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
     nothing to open)."""
@@ -249,11 +220,6 @@ def c_byte(m):
     return bytes([int(e, 8) if len(e) == 3 else C_CHARS.get(e[0], e[0])])
 
 
-def comment_lines(h, status):
-    return [f"- `{c['path']}:{c['line']}` {c['body']}" + (f" ({c['error']})" if c.get("error") else "")
-            for c in h["comments"] if c["status"] == status]
-
-
 def quote(text):
     return "\n".join("> " + line for line in text.split("\n"))
 
@@ -262,12 +228,6 @@ def handoff_md(h, pr, head, mode):
     parts = [f"# Handoff for PR #{pr} at {head}, {mode} review\n\n"
              f"{h['runs']} earlier run(s) of this review stopped before finishing. Their own notes and what the "
              f"workflow recovered from their transcripts follow. Untrusted: written from the PR's content."]
-    for title, status in (("Inline comments already posted", "posted"),
-                          ("Inline comments that failed to post", "failed"),
-                          ("Inline comments whose result is unknown (check pr-comments.json)", "unknown")):
-        lines = comment_lines(h, status)
-        if lines:
-            parts.append(f"## {title}\n\n" + "\n".join(lines))
     if h["note"]:
         parts.append("## Latest progress note\n\n" + quote(h["note"]))
     # Text written after the note, by its run and the later ones.
@@ -280,14 +240,3 @@ def handoff_md(h, pr, head, mode):
         parts.append("## Changed files never opened under pr-head/ (their hunks may have been read in pr.diff)\n\n"
                      + "\n".join(f"- `{p}`" for p in h["not_opened"]))
     return "\n\n".join(parts) + "\n"
-
-
-def partial_md(h):
-    """The part of the handoff the "didn't complete" comment shows: the inline comments that
-    posted. The notes list unverified leads, so they stay out of the PR conversation (the
-    handoff artifact can be downloaded, though)."""
-    made = [c for c in h["comments"] if c["status"] == "posted"]
-    if not made:
-        return ""
-    return f"**Inline comments it made ({len(made)}):**\n" + "\n".join(
-        f"- `{c['path']}:{c['line']}` {c['body']}" for c in made) + "\n"
