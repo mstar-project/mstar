@@ -863,7 +863,6 @@ class CosyVoice3Model(Model):
         speaker-encoder and flow nodes share them when colocated."""
         key = f"reference_encoder:{device}"
         if key not in self._shared:
-
             from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
             from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
             from mstar.model.components.audio_features import MatchaLogMel

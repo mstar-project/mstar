@@ -1082,7 +1082,6 @@ def test_the_lm_partition_carries_what_its_stop_policy_reads(model):
 
 @pytest.mark.parametrize("seconds", [0.5, 1.0 + 1 / SR, 7.3, 30.0])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(seconds):
-
     from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
     from mstar.model.components.audio_features import MatchaLogMel
     from mstar.model.cosyvoice3.submodules import ReferenceEncoder, reference_tokens
