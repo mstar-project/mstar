@@ -242,6 +242,25 @@ class TestBootstrap(unittest.TestCase):
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
 
+    def test_a_cache_refresh_starts_from_an_empty_compile_directory(self):
+        for flags, restored in (([], True), (["--no-restore"], False)):
+            home = Path(tempfile.mkdtemp())
+            fake = home / "bin"
+            fake.mkdir()
+            for tool in ("git", "uv", "cargo", "curl", "nvidia-smi"):  # nothing is installed or fetched
+                (fake / tool).write_text("#!/bin/sh\nexit 1\n")
+                (fake / tool).chmod(0o755)
+            (home / "seed/compile").mkdir(parents=True)
+            (home / "seed/compile/old").write_text("")
+            (home / "vol/live-pr-compile-cache").mkdir(parents=True)
+            tarball = home / "vol/live-pr-compile-cache/smunknown.tar"
+            subprocess.run(["tar", "-C", str(home / "seed"), "-cf", str(tarball), "compile"], check=True)
+            subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), "1", *flags, "--workdir", f"{home}/w", "--hf-home",
+                            f"{home}/vol/hf"], capture_output=True, check=False,
+                           env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+            self.assertEqual((home / ".cache/compile/old").exists(), restored,
+                             "a refresh would keep kernels for mains and torches no box runs any more")
+
     def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
         home = Path(tempfile.mkdtemp())
         fake = home / "bin"

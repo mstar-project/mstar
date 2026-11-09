@@ -8,7 +8,8 @@
 # file that finished, and the next refresh downloads what is missing, and no new model starts once
 # the volume has under 100 GB free; without, they go to the box's own disk and each model's are
 # deleted once its server exits. The compile caches are saved to the volume every 5 models and at
-# the end.
+# the end. A refresh starts from an empty compile directory, so the tarball holds only what this
+# main builds, and writes the main commit and torch version beside it (<tarball>.info).
 #
 # Inputs in /run/live-pr: box_common.sh, and run.json (repo, main_sha, models: "all" or names, skip: names,
 # weights: "true" or "false").
@@ -37,11 +38,15 @@ fi
 
 MAIN_SHA=$(field main_sha)
 clone_main "$MAIN_SHA"
-bash "$W/main/.claude/skills/live-pr-test/scripts/bootstrap.sh" 0 --ref "$MAIN_SHA" --no-main \
+bash "$W/main/.claude/skills/live-pr-test/scripts/bootstrap.sh" 0 --ref "$MAIN_SHA" --no-main --no-restore \
   --workdir "$W/live-pr" --hf-home "$HF_HOME" || finish "bootstrap failed"
 # shellcheck disable=SC1091
 source "$W/live-pr/env.sh" && arm pr
 export HF_HOME=$HF_PERSIST  # servers download where the weights are kept, even where bootstrap would serve a copy
+save_and_stamp() {
+  save_caches && printf 'main %s\ntorch %s\n' "$MAIN_SHA" "$(python -c 'import torch; print(torch.__version__)')" \
+    > "$CACHE_TAR.info"
+}
 
 models=$(field models)
 [ "$models" = all ] && models=$(python -c "from mstar.cli.main import DEFAULT_CONFIGS as d; print(' '.join(d))")
@@ -62,9 +67,9 @@ for m in $models; do
   kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null
   [ "$weights" = true ] || rm -rf "$HF_HOME"/hub/models--*  # the box's disk holds one model's at a time
   n=$((n + 1))
-  [ $((n % 5)) -ne 0 ] || save_caches
+  [ $((n % 5)) -ne 0 ] || save_and_stamp
 done
 [ -z "$left" ] || echo "left out, under 100 GB free on the volume:$left"
-save_caches || finish "couldn't save the compile caches"
+save_and_stamp || finish "couldn't save the compile caches"
 df -h /cache
 finish "refresh done"

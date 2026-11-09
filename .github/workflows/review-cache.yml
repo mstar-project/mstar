@@ -20,12 +20,12 @@ on:
         description: Names to leave out (checkpoints too big for the box's disk, or with `weights`, for the volume)
         default: glm52 glm5_next
       weights:
-        description: Keep the weights on the volumes too, not only the compile caches (whether that makes a live test faster is not yet measured)
+        description: Keep the weights on the volumes too, not only the compile caches (measured on one model, a warm start was 543 s against 704 s cold, from the compile caches; weights on the volume didn't help)
         type: boolean
         default: false
       gpus:
-        description: GPUs for the box (the largest default config needs 8)
-        default: "8"
+        description: "GPUs for the box (empty: 1, or 8 when models is `all`; the default models are 1-GPU configs)"
+        default: ""
       hours:
         description: The box's deadline, in hours
         default: "10"
@@ -80,7 +80,7 @@ jobs:
           MODELS: ${{ inputs.models }}
           SKIP: ${{ inputs.skip }}
           WEIGHTS: ${{ inputs.weights }}
-          GPUS: ${{ inputs.gpus }}
+          GPUS: ${{ inputs.gpus || (inputs.models == 'all' && '8' || '1') }}
           HOURS: ${{ inputs.hours }}
         run: |
           # gpu.py's ledger, for this run only
