@@ -40,7 +40,7 @@ from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
-from mstar.worker.worker import PendingBatch
+from mstar.worker.step_executor import PendingBatch
 
 # ── worker ─────────────────────────────────────────────────────────────────
 
@@ -74,7 +74,7 @@ def _worker(known_rids=("r1", "r2")):
     scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda entity_id, msg: sent.append((entity_id, msg))),
-        request_state=request_state, _graph_runtime=runtime,
+        request_state=request_state, graph_runtime=runtime,
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
@@ -85,7 +85,7 @@ def _worker(known_rids=("r1", "r2")):
 
 def test_fail_requests_reports_per_rid_errors_once():
     w = _worker()
-    w._fail_requests({"r1": RequestError("boom"), "r2": RequestError("bang")})
+    w.pipeline._fail_requests({"r1": RequestError("boom"), "r2": RequestError("bang")})
     assert len(w.sent) == 1
     entity, msg = w.sent[0]
     assert entity == "conductor"
@@ -99,7 +99,7 @@ def test_fail_requests_ignores_rids_the_worker_already_dropped():
     start one for a request it no longer tracks, so reporting an unknown rid
     would pin it in failed_rids forever."""
     w = _worker(known_rids=("r1",))
-    w._fail_requests({"gone": RequestError("boom")})
+    w.pipeline._fail_requests({"gone": RequestError("boom")})
     assert w.sent == []
     assert w.lifecycle.failed_rids == set()
 
@@ -110,7 +110,7 @@ def _pending_batch(rids, future=None):
             node_name="node", graph_walk="walk",
             request_to_worker_graph={rid: "wg" for rid in rids},
         ),
-        # _handle_main_loop_error works off the ScheduledBatch alone; the
+        # _handle_error works off the ScheduledBatch alone; the
         # ExecutingBatch is never touched on this path.
         node_batch=None, node_name="node",
         partition="default", graph_walk="walk", future=future,
@@ -123,12 +123,12 @@ def test_crashed_forward_fails_the_whole_batch():
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         w = _worker()
-        w._hold_rows(CHAIN_LANE, {"r1"})
+        w.pipeline._hold_rows(CHAIN_LANE, {"r1"})
         pending = _pending_batch(["r1"], future=executor.submit(lambda: 1 / 0))
         try:
             pending.future.result()
         except ZeroDivisionError as exc:
-            w._handle_main_loop_error(exc, (pending, None), None)
+            w.pipeline._handle_error(exc, (pending, None), None)
 
         assert len(w.sent) == 1
         errors = w.sent[0][1].body.errors
@@ -155,11 +155,10 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
     try:
         w = _worker()
-        w._in_flight_rids = set()
         spec = _pending_batch(["r2"], future=executor.submit(_slow))
         started.wait(10)
         release.set()
-        w._handle_main_loop_error(RuntimeError("boom"), (None, spec), None)
+        w.pipeline._handle_error(RuntimeError("boom"), (None, spec), None)
 
         assert spec.future.done()
         assert set(w.sent[0][1].body.errors) == {"r2"}
@@ -170,12 +169,12 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
 def test_error_handler_also_fails_the_batch_built_this_iteration():
     w = _worker()
-    w._hold_rows(CHAIN_LANE, {"r1"})
+    w.pipeline._hold_rows(CHAIN_LANE, {"r1"})
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r2": "wg"},
     )
-    w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)
+    w.pipeline._handle_error(RuntimeError("boom"), (None, None), scheduled)
     assert set(w.sent[0][1].body.errors) == {"r1", "r2"}
 
 

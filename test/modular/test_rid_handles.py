@@ -128,11 +128,12 @@ def _worker(
     scheduler = make_scheduler(graph_runtime=runtime, request_state=request_state)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
-        _graph_runtime=runtime, request_state=request_state,
+        graph_runtime=runtime, request_state=request_state,
         tensor_manager=tensor_manager, engine_manager=engine_manager or SimpleNamespace(),
         streams=StreamBufferManager(request_state, tensor_manager, list(connections)),
         wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
+        profile_info=SimpleNamespace(pop_request=lambda h: None),
     )
     w.sent = sent
     w.removed_in_runtime = []
@@ -158,7 +159,7 @@ def _worker(
 
 def test_failures_leave_the_worker_as_wire_strings():
     w, t = _worker("req-a", "req-b")
-    w._fail_requests({t.handle("req-a"): "boom"})
+    w.pipeline._fail_requests({t.handle("req-a"): "boom"})
     [(entity, msg)] = w.sent
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
@@ -173,11 +174,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
     a, b = t.handle("req-a"), t.handle("req-b")
-    w._in_flight_rids = set()
     w._rebuilds._kept = {"n": {a: None, b: None}}
     w._rebuilds._cursors[("n", a)] = None
     w.streams._rids.add(a)
-    w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.admission.held_until[a] = float("inf")
 
     deliver(w, WorkerMessage(
@@ -199,7 +198,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 def test_remove_for_an_unknown_request_is_a_no_op():
     w, _ = _worker("req-a")
     w.ingest._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
-    w._teardown(set())
+    w.pipeline._teardown(set())
     assert len(w.request_state.per_request_info) == 1
 
 

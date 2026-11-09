@@ -63,7 +63,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
 
     request_state.add_request = add_info
     w = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             add_request=lambda **kw: (
                 _raise(RuntimeError("registration failed")) if raises_in == "runtime_add" else 5
             ),
@@ -84,6 +84,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         communicator=SimpleNamespace(send=lambda destination, msg: sent.append(msg)),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             register_request=lambda rid, sharding: (
                 _raise(RuntimeError("registration failed")) if raises_in == "tensor_register"
                 else registered.append(rid)

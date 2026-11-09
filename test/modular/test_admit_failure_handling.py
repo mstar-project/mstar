@@ -157,7 +157,7 @@ def _refusal_worker(sched=None, runtime=None, **overrides):
     bound(sched, runtime=runtime)
     return make_worker(
         scheduler=sched, admission=sched.admission, lockstep=sched.lockstep,
-        engine_manager=sched.engine_manager, _graph_runtime=runtime, **overrides,
+        engine_manager=sched.engine_manager, graph_runtime=runtime, **overrides,
     )
 
 
@@ -198,7 +198,7 @@ def _refused(batch, reason, failed_resource="kv"):
 
 def test_offloading_requeues_without_evicting():
     worker = _evicting_worker(["holder"])
-    worker._handle_admit_failure(*_batches(_offloading()))
+    worker.pipeline._handle_admit_failure(*_batches(_offloading()))
 
     assert sorted(worker._graph_runtime.pushed_back) == ["r0", "r1"]
     # nothing to evict: the rid is already on its way to the host, and
@@ -210,8 +210,8 @@ def test_offloading_requeues_without_evicting():
 def test_allocation_failure_still_evicts():
     worker = _evicting_worker(["holder"])
     spared = []
-    worker._teardown = spared.append
-    worker._handle_admit_failure(
+    worker.pipeline._teardown = spared.append
+    worker.pipeline._handle_admit_failure(
         *_batches(_alloc_failed()), referenced_rids=frozenset({"spec_rid"}),
     )
 
@@ -241,8 +241,8 @@ def test_a_refused_new_iteration_does_not_push_back_a_row_whose_loop_stopped(new
     batch, node_batch = _batches(_alloc_failed())
     pending = SimpleNamespace(batch=batch, speculative_new_iter=new_iter, loop_name="loop")
 
-    worker._drop_rows_whose_loop_stopped(pending)
-    worker._handle_admit_failure(batch, node_batch)
+    worker.pipeline._drop_rows_whose_loop_stopped(pending)
+    worker.pipeline._handle_admit_failure(batch, node_batch)
 
     assert sorted(worker._graph_runtime.pushed_back) == (["r0"] if new_iter else ["r0", "r1"])
 
@@ -251,7 +251,7 @@ def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
     monkeypatch.setattr(admission_mod, "time", SimpleNamespace(monotonic=lambda: at))
     batch, node_batch = _batches(_alloc_failed())
     batch.graph_walk = walk
-    worker._handle_admit_failure(batch, node_batch)
+    worker.pipeline._handle_admit_failure(batch, node_batch)
 
 
 def _hold_lines(caplog) -> list[str]:
@@ -290,7 +290,7 @@ def test_a_rid_prepare_dropped_is_not_requeued(reason):
     worker = _refusal_worker()
     batch, node_batch = _batches(reason, prepared=["r0"])
 
-    worker._handle_admit_failure(batch, node_batch)
+    worker.pipeline._handle_admit_failure(batch, node_batch)
 
     assert worker._graph_runtime.pushed_back == ["r0"]
     assert "r1" not in worker.admission.held_until
@@ -303,7 +303,7 @@ def test_a_rid_the_cache_served_is_requeued(reason):
     worker = _refusal_worker()
     batch, node_batch = _batches(reason, prepared=["r0"], cached=["r1"])
 
-    worker._handle_admit_failure(batch, node_batch)
+    worker.pipeline._handle_admit_failure(batch, node_batch)
 
     assert sorted(worker._graph_runtime.pushed_back) == ["r0", "r1"], (
         "a row the cache served left the refused step, so its walk never completes"
@@ -347,7 +347,7 @@ def _refusing_loop(fits: int, ready: int, cap: int, passes: int, sized: bool = T
         if len(rids) <= fits:
             return sched, refused, rids
         refused.append(len(rids))
-        worker._handle_admit_failure(
+        worker.pipeline._handle_admit_failure(
             batch, _refused(batch, _sized_refusal(rids[fits], fits if sized else None)),
         )
     return sched, refused, None
@@ -412,7 +412,7 @@ def test_a_refused_batch_below_its_cap_is_not_limited():
     rids = list(batch.request_to_worker_graph)
     assert len(rids) == 9
 
-    worker._handle_admit_failure(
+    worker.pipeline._handle_admit_failure(
         batch, _refused(batch, _sized_refusal(rids[6], rows_fit=6, rows_fit_alone=9)),
     )
     sched.admission.held_until.clear()  # the backoff ran out
@@ -437,7 +437,7 @@ def test_a_mixed_step_held_under_its_cap_by_row_caps_is_limited():
     rids = list(batch.request_to_worker_graph)
     assert batch.graph_walk == MIXED and len(rids) == 2
 
-    worker._handle_admit_failure(
+    worker.pipeline._handle_admit_failure(
         batch, _refused(batch, _sized_refusal(rids[1], rows_fit=1, rows_fit_alone=2)),
     )
 
@@ -472,7 +472,7 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
         free = usable - row * 4
         if row * len(rids) <= free:
             break
-        worker._handle_admit_failure(batch, _refused(batch, _sized_refusal(
+        worker.pipeline._handle_admit_failure(batch, _refused(batch, _sized_refusal(
             rids[free // row], rows_fit=free // row, rows_fit_alone=usable // row,
         )))
         evicted += _engine(worker).offloaded
@@ -500,7 +500,7 @@ def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     node_batch.failed_resource = "kv"
     batch.node_name = node_batch.node_name = SCHED_NODE
 
-    worker._handle_admit_failure(batch, node_batch)
+    worker.pipeline._handle_admit_failure(batch, node_batch)
 
     assert _engine(worker).offloaded == ["r1"], "an outside request was evicted for a batch it cannot help"
 
@@ -514,7 +514,7 @@ def test_a_refused_step_offloads_the_row_last_in_its_line(order, victim):
     worker = _evicting_worker([f"r{i}" for i in range(4)], _scheduler(_SchedEngine(order=order)))
     batch = _sched_batch(["r4"])
 
-    worker._handle_admit_failure(batch, _refused(batch, _alloc_failed("r4")))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, _alloc_failed("r4")))
 
     assert _engine(worker).offloaded == [victim]
 
@@ -773,7 +773,7 @@ def test_per_request_admits_every_rid_before_running_any():
 
     assert [e for e in engine.events if e[0] != "declare"] == [
         # the launch signal lands after BOTH admits, not after its own rid's.
-        # ``Worker._await_admit_settled`` fences on it and then reads
+        # ``StepPipeline._await_admit_settled`` fences on it and then reads
         # ``admit_error``, so anything that could still refuse has to have run.
         ("admit", "a"), ("admit", "b"), ("launch", "a"), ("run", "a"),
         ("run", "b"),
@@ -817,7 +817,7 @@ def test_a_refused_batch_never_signals_the_launch():
 
     Here nothing signals at all — the refusal returns from the admit loop before
     the drive loop is reached, and the step's completion does it instead
-    (``Worker._submit_gpu_step``), well after ``register_admit_error``. If a
+    (``StepExecutor._submit_gpu_step``), well after ``register_admit_error``. If a
     future change signals from inside the admit loop, the worker reads
     ``admit_error=None``, builds and broadcasts a yield-away batch for N+1, and
     then evicts underneath it — the asymmetry that guard exists to prevent.
@@ -882,7 +882,7 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
         sizes.append(len(rids))
         if len(rids) <= alone:
             break
-        worker._handle_admit_failure(
+        worker.pipeline._handle_admit_failure(
             batch, _refused(batch, _sized_refusal(rids[alone], rows_fit=alone, rows_fit_alone=alone)),
         )
 

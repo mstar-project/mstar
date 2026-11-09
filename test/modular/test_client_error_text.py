@@ -112,20 +112,20 @@ def _worker(rids=("r1",)):
     scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda entity, msg: sent.append(msg)),
-        request_state=request_state, _graph_runtime=runtime,
+        request_state=request_state, graph_runtime=runtime,
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
     for rid in rids:
         w.lifecycle.add(rid, rid)
-    w._hold_rows(CHAIN_LANE, rids)
+    w.pipeline._hold_rows(CHAIN_LANE, rids)
     return w
 
 
 def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1_audio.pt"
     w = _worker()
-    w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
+    w.pipeline._handle_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
 
     (message,) = w.sent
     text = message.body.errors["r1"].message

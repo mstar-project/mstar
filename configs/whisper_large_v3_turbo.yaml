@@ -11,6 +11,10 @@ max_concurrent_requests: 64
 # and not a changed default.
 knobs:
   pre_plan: false
+  # A schedutil host keeps split work near its lowest clock. Turbo's threads
+  # give no real overlap, so one thread loses at most 5% at a held clock and
+  # gains about 60% at the default one (docs/asr.rst).
+  step_threads: serial
 resources:
   kv_cache:
     cpu_offload_pages: 128

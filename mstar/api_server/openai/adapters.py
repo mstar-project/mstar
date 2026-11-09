@@ -1273,9 +1273,12 @@ class WhisperAdapter(OpenAIAdapter):
     """
 
     supports_transcriptions = True
-    # Whisper hears one 30 s window. The route cuts longer uploads into them,
-    # each starting where the previous window's last segment closed.
+    # Whisper hears one 30 s window. The route cuts longer uploads into them and
+    # runs them at once; ``long_form="sequential"`` asks for openai-whisper's
+    # loop instead, each window starting where the previous one's last segment
+    # closed.
     max_audio_seconds = 30.0
+    long_form = "parallel"
     seeks_by_timestamps = True
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
@@ -1351,13 +1354,18 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
 
 class Qwen3ASRAdapter(OpenAIAdapter):
     """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
-    (or the text alone when the language is forced). Hears up to 20 minutes
-    per request, longer uploads are windowed at that; continues a hypothesis through
-    ``assistant_prefix``, which is what the realtime session needs."""
+    (or the text alone when the language is forced). Hears up to 20 minutes per
+    request, but the route cuts an upload into 30 s windows and runs them at once,
+    which is several times faster and needs far fewer KV pages;
+    ``window_seconds=1200`` asks for the whole file as one request. Continues a
+    hypothesis through ``assistant_prefix``, which is what the realtime session
+    needs."""
 
     supports_transcriptions = True
     supports_realtime_transcription = True
     max_audio_seconds = 1200.0
+    window_seconds = 30.0
+    long_form = "parallel"
     # 2.4 is Whisper's bound for a 30 s window. The ratio grows with length,
     # so a 20 minute transcript of ordinary speech can pass it.
     compression_ratio_threshold = None

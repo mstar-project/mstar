@@ -222,13 +222,14 @@ def test_the_worker_fails_a_request_once_when_its_input_read_fails(tmp_path):
         tensor_manager=mgr,
         wakeup_event=SimpleNamespace(drain=lambda: None),
         scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+        graph_runtime=SimpleNamespace(get_rid_string=lambda rid: rid),
     )
     w.lifecycle.add("r1", "r1")
 
     w.ingest.check_ready_tensors()
-    w._report_failures()
+    w.pipeline._report_failures()
     w.ingest.check_ready_tensors()
-    w._report_failures()
+    w.pipeline._report_failures()
 
     (sent,) = sent
     assert sent[1].message_type == ConductorMessageType.FAIL_REQUESTS
