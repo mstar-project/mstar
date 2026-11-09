@@ -233,6 +233,32 @@ def test_a_single_user_message_arrives_as_one_user_part(stack):
     ], "a one-message chat did not arrive as the one user turn it renders as"
 
 
+def _multipart(fields: dict, files: list[tuple[str, bytes]]) -> tuple[bytes, str]:
+    """A multipart/form-data body of ``fields`` and ``files`` uploads, and its content type."""
+    boundary = "----mstarparity"
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        for k, v in fields.items()
+    )
+    for name, data in files:
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\n'
+                 f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+def _frames(body: bytes) -> list[tuple[str, bytes, dict]]:
+    """The items of a ``application/vnd.mstar.frames`` body: a JSON header line
+    naming ``nbytes``, then that many bytes of payload, per chunk."""
+    items, i = [], 0
+    while i < len(body):
+        end = body.index(b"\n", i)
+        header = json.loads(body[i:end])
+        start = end + 1
+        items.append((header["modality"], body[start:start + header["nbytes"]], header["metadata"]))
+        i = start + header["nbytes"]
+    return items
+
+
 class _GeneratePython:
     """What the Python ``/generate`` calls on ``APIServer``, recording the submit."""
 
@@ -267,7 +293,6 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
     with repeats, and an explicit layout taken as given except that a text slot
     is added for the text and dropped without it, as Python's ``/generate``."""
     pytest.importorskip("fastapi")
-    import requests
     from fastapi.testclient import TestClient
 
     from mstar.api_server import entrypoint
@@ -283,10 +308,12 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
     stub = _StubAPIServer()
     with _model_stack("qwen3_omni", stub) as (port, _upload):
         if uploads:
-            r = requests.post(f"http://127.0.0.1:{port}/generate", data=form, files=uploads, timeout=30)
+            body, ctype = _multipart(form, files)
         else:
-            r = requests.post(f"http://127.0.0.1:{port}/generate", data=form, timeout=30)
-        assert r.status_code == 200, r.text
+            body, ctype = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=body, headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            assert r.status == 200
         (sub,) = stub.submitted
         got_files = {m: [Path(p).read_bytes() for p in ps] for m, ps in (sub["files"] or {}).items()}
 
@@ -1395,11 +1422,11 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     """The bytes each frontend writes for the same chunks parse to the same
     items: NDJSON lines, or ``Accept: application/vnd.mstar.frames`` frames,
     and a failure after the 200 as Python's in-band ``error`` chunk."""
-    import io
-    import urllib.parse
-
-    from mstar.api_server.entrypoint import _chunk_to_binary_frame, _chunk_to_ndjson_payload
-    from mstar.client.media import BINARY_STREAM_MEDIA_TYPE, iter_binary_frames
+    from mstar.api_server.entrypoint import (
+        BINARY_STREAM_MEDIA_TYPE,
+        _chunk_to_binary_frame,
+        _chunk_to_ndjson_payload,
+    )
 
     stub = _FailsAfterTwoChunksStub()
     sent = [
@@ -1414,8 +1441,7 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
 
     def items(body: bytes):
         if binary:
-            return [(f["modality"], f["bytes"], f["metadata"])
-                    for f in iter_binary_frames(io.BytesIO(body))]
+            return _frames(body)
         return [(m["modality"], m["data"], m["metadata"]) for m in map(json.loads, body.splitlines())]
 
     data = urllib.parse.urlencode({"text": "hi", "output_modalities": "text,audio"}).encode()
