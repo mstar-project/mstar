@@ -177,13 +177,17 @@ def _make_rebuilds(
     followed: frozenset[str] = frozenset(),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
-    runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
+
+    A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
+    rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
     host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
         raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-    return Rebuilds(policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, followed)
+    nbytes = host_mb << (21 if followed & policies.keys() else 20)
+    return Rebuilds(policies, graphs, HostPool(nbytes, device) if host_mb and policies else None, followed)
 
 
 def _wait_ms(raw: str) -> float:
