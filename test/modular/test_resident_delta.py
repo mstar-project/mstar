@@ -1199,7 +1199,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
-        self.node_batch = SimpleNamespace(commit_done=threading.Event())
+        self.node_batch = SimpleNamespace(commit_done=threading.Event(), request_ids=["r0"])
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():
@@ -1239,6 +1239,33 @@ def test_the_async_follow_path_waits_for_ns_commit_to_replay_a_reload():
 
     assert worker._try_follow_speculation(parent) is None
     assert parent.node_batch.commit_done.waited and parent.reads == 1, "the follower polled instead of waiting"
+
+
+@pytest.mark.parametrize("kind", [MoveKind.DROP, MoveKind.OFFLOAD], ids=["drop", "offload"])
+def test_the_async_follow_path_waits_for_ns_commit_to_move_a_request_in_n(kind):
+    """N's commit clears the marks of its rows, so a drop or an offload of a request in N waits for it, as a reload
+    does. Polling for it waited up to 20 ms past the commit."""
+    worker = _follow_spec(replay_refuses=False)
+    worker.engine_manager.get_engine("node").apply_resident_delta = lambda delta, rebuilding, caught_up: caught_up
+    worker.head.resident_delta.kinds[0], worker.head.resident_delta.rids[0] = kind, "r0"
+    parent = _SpecParent()
+    parent.node_batch.commit_done = _Commit()
+
+    assert worker._try_follow_speculation(parent) is None
+    assert parent.node_batch.commit_done.waited and parent.reads == 1, "the follower polled instead of waiting"
+
+
+def test_a_follower_whose_step_raised_stops_on_rank_0s_drop_of_a_request_in_that_step():
+    """The follower's forward of N raised, so N never commits and its rows stay marked in it, while the exit still
+    releases N's waiters. A drop of a request in N then waited on the mark behind a warning every 2 s, and rank 0
+    waited alone in its next collective."""
+    worker = _follow_spec(replay_refuses=True)
+    worker.head.resident_delta.kinds[0], worker.head.resident_delta.rids[0] = MoveKind.DROP, "r0"
+    parent = _SpecParent()
+    parent.node_batch.commit_done.set()
+
+    with pytest.raises(SystemExit, match="after it committed"):
+        worker._try_follow_speculation(parent)
 
 
 def test_the_async_follow_path_proceeds_once_the_replay_lands():
@@ -1973,7 +2000,7 @@ def test_a_follower_takes_rank_0s_reload_into_the_pages_its_window_gives_back_on
     scheduler.lockstep.enqueue_follow(ScheduleTPNode(NODE, "decode", [], spec_seq=0, resident_delta=delta))
 
     assert not scheduler.lockstep.settle_delta(caught_up=False), "the follower reloaded v before its commit"
-    assert scheduler.lockstep.awaits_commit() and follower.residency("v") is Residency.ON_HOST
+    assert scheduler.lockstep.awaits_commit(()) and follower.residency("v") is Residency.ON_HOST
 
     follower.commit(step, ctx)
     assert scheduler.lockstep.settle_delta(caught_up=True)

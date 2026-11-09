@@ -3506,7 +3506,9 @@ class Engine:
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
             elif not caught_up:
-                # Rank 0 reloads after its commit of the step before, which can give back the pages the reload takes.
+                # Rank 0 can reload before or after its commit of the step before. A commit only gives pages back,
+                # to the end of the free list, so with nothing evicted the reload takes rank 0's pages once this
+                # rank has committed too.
                 logger.debug("Replay: %s's reload on %s waits for this rank's last commit", wire_rid, node_name)
                 return False
             elif not all(

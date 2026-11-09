@@ -372,9 +372,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        still move to the host with ``cpu_offload_pages``. Every rank of a TP, SP or CFG node keeps the ids,
        since each rank rebuilds the requests its first rank drops, and every rank but the first sets aside twice
        this, since it also holds the ids of requests the first rank has torn down until it tears them down too.
-       A non-negative int, and 0 sets no pool
-       aside, so no request is dropped there and the node preempts as one with no rebuild policy does. The
-       pool is rounded up to a power of two, as the pinned allocator would round it anyway.
+       A non-negative int, and 0 sets no pool aside, so no request is dropped there and the node preempts as
+       one with no rebuild policy does. The pool is rounded up to a power of two, as the pinned allocator would
+       round it anyway.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,

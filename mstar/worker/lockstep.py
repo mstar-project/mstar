@@ -516,10 +516,16 @@ class Lockstep:
 
         return self._engine_manager.get_engine(node_name).apply_resident_delta(delta, self._rebuilds, caught_up)
 
-    def awaits_commit(self) -> bool:
-        """Whether the replay stopped on a reload, which waits for this rank's commit of the step before."""
+    def awaits_commit(self, step_rids: Collection[int]) -> bool:
+        """Whether the replay stopped on what the commit of the step holding ``step_rids`` lets land: a reload, a drop
+        or an offload of one of ``step_rids``, or rank 0's leases once every move has landed."""
         move = self._pending_delta.peek_left()
-        return move is not None and move.kind == MoveKind.RELOAD
+        if move is None:
+            return True
+        rid = self._runtime.get_rid_handle(move.rid)
+        return rid is not None and (
+            move.kind == MoveKind.RELOAD or move.kind in (MoveKind.DROP, MoveKind.OFFLOAD) and rid in step_rids
+        )
 
     def _apply_delta_from_message(self, message: ScheduleTPNode, caught_up: bool = True) -> bool:
         new_delta = None

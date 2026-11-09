@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from array import array
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +15,7 @@ import yaml
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
+from test_resident_delta import _Commit
 from test_tp_async_teardown_order import _rank, _Stop
 from test_tp_rebuild_land import _Rank
 from test_worker_rebuild import _kept
@@ -398,14 +398,14 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
     worker.lockstep.enqueue_follow(head)
+    commit = _Commit()
     step_n = SimpleNamespace(
-        tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=threading.Event()),
+        tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=commit, request_ids=[]),
     )
 
-    assert worker._try_follow_speculation(step_n) is None, "a page N could still index was called lost"
-    step_n.node_batch.commit_done.set()
     with pytest.raises(SystemExit, match=r"here \(1\)"):
         worker._try_follow_speculation(step_n)
+    assert commit.waited, "a page N could still index was called lost"
 
 
 @pytest.mark.parametrize("cache_open", [True, False])
@@ -442,10 +442,12 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
 
 
-def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts():
+def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts(monkeypatch):
     """Owner counts can differ between ranks, since above one rank a page is filed under a parent only its
     stream holds. A follower that worked out the lent pages from its own evictable set would then count other room
     than rank 0 and could refuse a grant rank 0 makes. Here a cached page has one more owner on the follower."""
+    # the extra owner belongs to no stream, which the debug checks would stop on first
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
