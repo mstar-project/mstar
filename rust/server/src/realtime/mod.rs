@@ -11,7 +11,7 @@ mod vad;
 
 use std::sync::OnceLock;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::{Query, State};
 use axum::response::Response;
 use serde_json::{json, Map, Value};
@@ -310,6 +310,13 @@ fn stable_prefix(raw: &str, tok: Option<&tokenizers::Tokenizer>, unfixed: i64) -
 
 // ── the session ──────────────────────────────────────────────────────────────
 
+/// The error ids handed out for one item's failures, keyed by type and message.
+#[derive(Default)]
+struct ItemFailures {
+    item_id: String,
+    ids: Vec<((String, String), String)>,
+}
+
 /// One WebSocket's transcription state (the SDK's `ASRStreamingState`).
 struct Session {
     id: String,
@@ -325,7 +332,7 @@ struct Session {
     raw_hypothesis: String,
     emitted: String,
     item_id: String,
-    failures: (String, Vec<((String, String), String)>),
+    failures: ItemFailures,
     odd_byte: Option<u8>,
     input_rate: usize,
     resampler: Option<StreamResampler>,
@@ -468,7 +475,7 @@ fn pcm16_to_float(payload: &Value, carry: Option<u8>) -> Result<(Vec<f32>, Optio
     let mut raw: Vec<u8> = carry.into_iter().collect();
     raw.extend(decoded);
     let odd = (raw.len() % 2 == 1).then(|| raw[raw.len() - 1]);
-    let samples = raw.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
+    let samples = raw.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32768.0).collect();
     Ok((samples, odd))
 }
 
@@ -822,16 +829,16 @@ impl Realtime {
     /// distinct failure is logged once per item.
     async fn step_failed(&mut self, e: StepError) {
         let s = &mut self.s;
-        if s.failures.0 != s.item_id {
-            s.failures = (s.item_id.clone(), Vec::new());
+        if s.failures.item_id != s.item_id {
+            s.failures = ItemFailures { item_id: s.item_id.clone(), ids: Vec::new() };
         }
         let key = (e.type_name.to_string(), e.message.clone());
-        let error_id = match s.failures.1.iter().find(|(k, _)| *k == key) {
+        let error_id = match s.failures.ids.iter().find(|(k, _)| *k == key) {
             Some((_, id)) => id.clone(),
             None => {
                 let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-                if s.failures.1.len() < MAX_FAILURES_PER_ITEM {
-                    s.failures.1.push((key, id.clone()));
+                if s.failures.ids.len() < MAX_FAILURES_PER_ITEM {
+                    s.failures.ids.push((key, id.clone()));
                 }
                 eprintln!(
                     "realtime step failed (error id {id}, session {}, {}); repeats in this item are not logged: {}",
@@ -909,8 +916,12 @@ async fn run_step(
 pub async fn realtime(
     State(st): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
-    ws: WebSocketUpgrade,
+    ws: crate::ws::Upgrade,
 ) -> Response {
+    let ws = match crate::ws::upgrade(ws) {
+        Ok(ws) => ws,
+        Err(not_found) => return not_found,
+    };
     let refusal = match crate::resolve_message(&st, crate::Surface::RealtimeTranscription) {
         Err(message) => Some(message),
         Ok(_) => match query.get("intent").map(String::as_str).unwrap_or("transcription") {
@@ -941,7 +952,7 @@ pub async fn realtime(
         raw_hypothesis: String::new(),
         emitted: String::new(),
         item_id: item_id(),
-        failures: (String::new(), Vec::new()),
+        failures: ItemFailures::default(),
         odd_byte: None,
         input_rate: SAMPLE_RATE,
         resampler: None,
