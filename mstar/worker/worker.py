@@ -442,7 +442,7 @@ class Worker:
         if keys:
             engine.never_publish(keys)
 
-    def _set_kv_writes(self, model: Model | None, my_walks: set[tuple[str, str]]) -> None:
+    def _set_kv_writes(self, model: Model | None, my_walks: frozenset[tuple[str, str]]) -> None:
         """Record what each node of each paged KV cache writes here, and give each cache the loops that grow it
         in a walk this worker runs on one of its nodes."""
         labels = model.kv_labels() if model is not None else {}
