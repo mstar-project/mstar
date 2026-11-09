@@ -28,6 +28,7 @@ mstar.engine.resources.attn
    :recursive:
 
    base
+   block_causal
    config
    cross
    dense

@@ -28,6 +28,7 @@ mstar.engine.resources.attn.config
       AttentionSpec
       AttentionStep
       AttnBackend
+      BlockCausalAttentionSpec
       CrossAttentionConfig
       CrossAttentionSpec
    

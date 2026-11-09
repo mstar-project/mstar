@@ -15,6 +15,7 @@ mstar.model.cosyvoice3.components.dit
    
       apply_partial_rotary
       chunk_attention_mask
+      plan_order
    
    
 
@@ -31,6 +32,7 @@ mstar.model.cosyvoice3.components.dit
       DiT
       DiTBlock
       InputEmbedding
+      PackedRows
       TimestepEmbedding
    
    

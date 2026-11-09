@@ -1044,6 +1044,19 @@ window.runMermaid = runMermaid;</script>
 <span class="n">LM_POS</span> <span class="o">=</span> <span class="s2">"lm_pos"</span>
 <span class="n">LM_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
 
+<span class="c1"># Resource keys (vocoder node)</span>
+<span class="n">HIFT_STATE</span> <span class="o">=</span> <span class="s2">"hift_state"</span>
+<span class="n">HIFT_STATE_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
+<span class="c1"># Resource keys (flow node): what a request's streamed solves keep between hops</span>
+<span class="n">FLOW_KV</span> <span class="o">=</span> <span class="s2">"flow_kv"</span>
+<span class="n">FLOW_ATTN</span> <span class="o">=</span> <span class="s2">"flow_attn"</span>
+<span class="n">FLOW_TAILS</span> <span class="o">=</span> <span class="s2">"flow_tails"</span>
+<span class="n">FLOW_COND_LABEL</span> <span class="o">=</span> <span class="s2">"cond"</span>
+<span class="n">FLOW_UNCOND_LABEL</span> <span class="o">=</span> <span class="s2">"uncond"</span>
+<span class="n">FLOW_CFG_LABEL</span> <span class="o">=</span> <span class="s2">"cfg"</span>
+<span class="n">FLOW_TAILS_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
+<span class="n">FLOW_KV_PAGE_FRAMES</span> <span class="o">=</span> <span class="mi">64</span>
+
 <span class="c1"># Node names</span>
 <span class="n">SPEAKER_ENCODER_NODE</span> <span class="o">=</span> <span class="s2">"speaker_encoder"</span>
 <span class="n">LM_NODE</span> <span class="o">=</span> <span class="s2">"llm"</span>
@@ -1186,6 +1199,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">noise_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">300.0</span>
 
     <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">f0_left_history</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Frames the F0 predictor reads before the first it predicts: its four causal</span>
+<span class="sd">        convolutions of kernel 3."""</span>
+        <span class="k">return</span> <span class="mi">8</span>
+
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">stream_holdback_frames</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Mel frames at the end of a non-final call whose audio is not final yet:</span>
 <span class="sd">        the F0 predictor's and the pre-convolution's look-ahead, plus the frame</span>
@@ -1258,7 +1277,35 @@ window.runMermaid = runMermaid;</script>
         <span class="mi">100</span><span class="p">,</span> <span class="mi">150</span><span class="p">,</span> <span class="mi">200</span><span class="p">,</span> <span class="mi">250</span><span class="p">,</span> <span class="mi">300</span><span class="p">,</span> <span class="mi">350</span><span class="p">,</span> <span class="mi">400</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">600</span><span class="p">,</span> <span class="mi">700</span><span class="p">,</span> <span class="mi">850</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="mi">1200</span><span class="p">,</span> <span class="mi">1400</span><span class="p">,</span> <span class="mi">1700</span><span class="p">,</span> <span class="mi">2000</span><span class="p">,</span> <span class="mi">2400</span><span class="p">,</span> <span class="mi">2800</span><span class="p">,</span> <span class="mi">3400</span><span class="p">,</span> <span class="mi">4200</span>
     <span class="p">)</span>
     <span class="n">flow_capture_batch_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
-    <span class="n">flow_capture_batch_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8192</span></div>
+    <span class="n">flow_capture_batch_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8192</span>
+    <span class="c1"># Streaming vocoder steps replayed as CUDA graphs: one per frame bucket (a window's</span>
+    <span class="c1"># frames) and batch size, a stream's tail and phase in ``HIFT_STATE``. A longer chunk</span>
+    <span class="c1"># runs as several steps. No buckets, or a whole-history vocoder</span>
+    <span class="c1"># (``hift_context_frames = 0``), runs ``stream_vocode`` eagerly instead.</span>
+    <span class="n">hift_capture_frame_buckets</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">192</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">320</span><span class="p">,</span> <span class="mi">400</span><span class="p">)</span>
+    <span class="n">hift_capture_batch_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
+    <span class="c1"># A streamed row keeps its solved frames' K/V per Euler step and CFG branch</span>
+    <span class="c1"># (about 1.8 MB a frame) and solves only new frames each hop, which attention's</span>
+    <span class="c1"># block-causal mask makes exact. Past this many frames a row goes back to</span>
+    <span class="c1"># re-solving all of them, which keeps the pool's size bounded. 0 re-solves every hop.</span>
+    <span class="n">flow_cache_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">768</span>
+    <span class="c1"># Captured incremental solves: one per total new frames of a batch and batch size.</span>
+    <span class="c1"># The largest must hold a row's whole budget.</span>
+    <span class="n">flow_new_frame_buckets</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">192</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">320</span><span class="p">,</span> <span class="mi">384</span><span class="p">,</span> <span class="mi">448</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">576</span><span class="p">,</span> <span class="mi">640</span><span class="p">,</span> <span class="mi">704</span><span class="p">,</span> <span class="mi">768</span><span class="p">,</span> <span class="mi">896</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">1152</span><span class="p">,</span> <span class="mi">1280</span><span class="p">,</span> <span class="mi">1408</span><span class="p">,</span> <span class="mi">1536</span><span class="p">,</span> <span class="mi">1792</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">2304</span><span class="p">,</span>
+        <span class="mi">2560</span><span class="p">,</span> <span class="mi">3200</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">flow_new_batch_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">hift_captured</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">hift_context_frames</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hift_capture_frame_buckets</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">hift_tail_frames</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Frames a stream keeps: a window's context and F0 history, and the frames</span>
+<span class="sd">        still held back from emitting."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">hift_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">hift</span><span class="o">.</span><span class="n">f0_left_history</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">hift</span><span class="o">.</span><span class="n">stream_holdback_frames</span></div>
 
 </pre></div>
 

@@ -727,6 +727,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention"><code class="docutils literal notranslate"><span class="pre">Attention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention.forward"><code class="docutils literal notranslate"><span class="pre">Attention.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention.forward_packed"><code class="docutils literal notranslate"><span class="pre">Attention.forward_packed()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.CausalConvPositionEmbedding"><code class="docutils literal notranslate"><span class="pre">CausalConvPositionEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -735,15 +736,25 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT"><code class="docutils literal notranslate"><span class="pre">DiT</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.forward"><code class="docutils literal notranslate"><span class="pre">DiT.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.forward_new_frames"><code class="docutils literal notranslate"><span class="pre">DiT.forward_new_frames()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.rotary_freqs"><code class="docutils literal notranslate"><span class="pre">DiT.rotary_freqs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock"><code class="docutils literal notranslate"><span class="pre">DiTBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock.forward"><code class="docutils literal notranslate"><span class="pre">DiTBlock.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock.forward_packed"><code class="docutils literal notranslate"><span class="pre">DiTBlock.forward_packed()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.InputEmbedding"><code class="docutils literal notranslate"><span class="pre">InputEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.InputEmbedding.forward"><code class="docutils literal notranslate"><span class="pre">InputEmbedding.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows"><code class="docutils literal notranslate"><span class="pre">PackedRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.last_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.last_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.positions"><code class="docutils literal notranslate"><span class="pre">PackedRows.positions</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.real"><code class="docutils literal notranslate"><span class="pre">PackedRows.real</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.seq_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.seq_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.tail_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.tail_at</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.TimestepEmbedding"><code class="docutils literal notranslate"><span class="pre">TimestepEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -752,6 +763,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.apply_partial_rotary"><code class="docutils literal notranslate"><span class="pre">apply_partial_rotary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.chunk_attention_mask"><code class="docutils literal notranslate"><span class="pre">chunk_attention_mask()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.plan_order"><code class="docutils literal notranslate"><span class="pre">plan_order()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -792,6 +804,9 @@ paths match <code class="docutils literal notranslate"><span class="pre">flow.pt
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.chunk_attention_mask" title="mstar.model.cosyvoice3.components.dit.chunk_attention_mask"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_attention_mask</span></code></a>(valid, total, chunk, ...)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">T,</span> <span class="pre">T]</span></code> bool attention mask (True = attend).</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.plan_order" title="mstar.model.cosyvoice3.components.dit.plan_order"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_order</span></code></a>(real)</p></td>
+<td><p>Permutations between the two CFG branches stacked as buffers, <code class="docutils literal notranslate"><span class="pre">[cond</span> <span class="pre">T</span> <span class="pre">|</span> <span class="pre">uncond</span> <span class="pre">T]</span></code>, and the KV and attention plan's order, <code class="docutils literal notranslate"><span class="pre">[cond</span> <span class="pre">R</span> <span class="pre">|</span> <span class="pre">uncond</span> <span class="pre">R</span> <span class="pre">|</span> <span class="pre">padding]</span></code>, where <code class="docutils literal notranslate"><span class="pre">R</span></code> is the real tokens (<code class="docutils literal notranslate"><span class="pre">real</span></code>'s <code class="docutils literal notranslate"><span class="pre">True</span></code> prefix).</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -819,7 +834,10 @@ paths match <code class="docutils literal notranslate"><span class="pre">flow.pt
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.InputEmbedding" title="mstar.model.cosyvoice3.components.dit.InputEmbedding"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputEmbedding</span></code></a>(config)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.TimestepEmbedding" title="mstar.model.cosyvoice3.components.dit.TimestepEmbedding"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TimestepEmbedding</span></code></a>(dim, freq_dim)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.PackedRows" title="mstar.model.cosyvoice3.components.dit.PackedRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PackedRows</span></code></a>(positions, seq_at, tail_at, ...)</p></td>
+<td><p>Where a step's new frames sit, for a DiT pass over them alone.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.TimestepEmbedding" title="mstar.model.cosyvoice3.components.dit.TimestepEmbedding"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TimestepEmbedding</span></code></a>(dim, freq_dim)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -931,6 +949,26 @@ registered hooks while the latter silently ignores them.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.Attention.forward_packed">
+<span class="sig-name descname"><span class="pre">forward_packed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attend</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">freqs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#Attention.forward_packed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.Attention.forward_packed" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">x</span></code> <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">N,</span> <span class="pre">C]</span></code> of packed rows. <code class="docutils literal notranslate"><span class="pre">attend</span></code> writes the K/V to the cache
+and reads the rows’ prefixes; <code class="docutils literal notranslate"><span class="pre">real</span></code> <code class="docutils literal notranslate"><span class="pre">[N]</span></code> is False on a bucket’s padded
+tail, which the kernel leaves unwritten.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>real</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>freqs</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -1007,6 +1045,23 @@ the solve’s float32 time grid, not a rounded one.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.DiT.forward_new_frames">
+<span class="sig-name descname"><span class="pre">forward_new_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cond</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mu</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tails</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attend</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_base</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#DiT.forward_new_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.DiT.forward_new_frames" title="Link to this definition">#</a></dt>
+<dd><p>One classifier-free-guided evaluation of new frames, over the cached K/V of
+the frames before them: the conditional half of <code class="docutils literal notranslate"><span class="pre">x</span></code>/<code class="docutils literal notranslate"><span class="pre">cond</span></code>/<code class="docutils literal notranslate"><span class="pre">mu</span></code>/<code class="docutils literal notranslate"><span class="pre">spks</span></code>
+<code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">80]</span></code>, the unconditional half with zero <code class="docutils literal notranslate"><span class="pre">cond</span></code>/<code class="docutils literal notranslate"><span class="pre">mu</span></code>/<code class="docutils literal notranslate"><span class="pre">spks</span></code>. Returns
+(velocities <code class="docutils literal notranslate"><span class="pre">[2,</span> <span class="pre">T,</span> <span class="pre">80]</span></code>, next tails).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rows</strong> (<a class="reference internal" href="#mstar.model.cosyvoice3.components.dit.PackedRows" title="mstar.model.cosyvoice3.components.dit.PackedRows"><em>PackedRows</em></a>)</p></li>
+<li><p><strong>layer_base</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.DiT.rotary_freqs">
 <span class="sig-name descname"><span class="pre">rotary_freqs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seq_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#DiT.rotary_freqs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.DiT.rotary_freqs" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">T,</span> <span class="pre">dim_head]</span></code>: each frequency repeated for its pair.</p>
@@ -1045,6 +1100,11 @@ registered hooks while the latter silently ignores them.</p>
 </div>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.DiTBlock.forward_packed">
+<span class="sig-name descname"><span class="pre">forward_packed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attend</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">freqs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#DiTBlock.forward_packed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.DiTBlock.forward_packed" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -1073,6 +1133,60 @@ registered hooks while the latter silently ignores them.</p>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosyvoice3.components.dit.</span></span><span class="sig-name descname"><span class="pre">PackedRows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">positions</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_at</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tail_at</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">last_at</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#PackedRows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>Where a step’s new frames sit, for a DiT pass over them alone.</p>
+<p>Tokens are packed row by row in a branch’s buffer; the blocks see every row’s
+conditional frames then, in the same order, its unconditional ones (<code class="docutils literal notranslate"><span class="pre">plan_order</span></code>).
+A row’s two causal convolutions run over a sequence that lays its kept tail right
+before its new frames, so each new frame reads what a whole-utterance convolution
+would. Position 0 of that sequence is
+scratch: what a padded buffer leaves at zero (padding rows and tokens) lands there.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>positions</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>seq_at</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>tail_at</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>last_at</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>real</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows.last_at">
+<span class="sig-name descname"><span class="pre">last_at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows.last_at" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows.positions">
+<span class="sig-name descname"><span class="pre">positions</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows.positions" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows.real">
+<span class="sig-name descname"><span class="pre">real</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows.real" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows.seq_at">
+<span class="sig-name descname"><span class="pre">seq_at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows.seq_at" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.PackedRows.tail_at">
+<span class="sig-name descname"><span class="pre">tail_at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.PackedRows.tail_at" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
 </dd></dl>
 
 </dd></dl>
@@ -1154,6 +1268,24 @@ size and all left chunks).</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosyvoice3.components.dit.plan_order">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosyvoice3.components.dit.</span></span><span class="sig-name descname"><span class="pre">plan_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">real</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosyvoice3/components/dit.html#plan_order"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosyvoice3.components.dit.plan_order" title="Link to this definition">#</a></dt>
+<dd><p>Permutations between the two CFG branches stacked as buffers, <code class="docutils literal notranslate"><span class="pre">[cond</span> <span class="pre">T</span> <span class="pre">|</span> <span class="pre">uncond</span> <span class="pre">T]</span></code>,
+and the KV and attention plan’s order, <code class="docutils literal notranslate"><span class="pre">[cond</span> <span class="pre">R</span> <span class="pre">|</span> <span class="pre">uncond</span> <span class="pre">R</span> <span class="pre">|</span> <span class="pre">padding]</span></code>, where <code class="docutils literal notranslate"><span class="pre">R</span></code>
+is the real tokens (<code class="docutils literal notranslate"><span class="pre">real</span></code>’s <code class="docutils literal notranslate"><span class="pre">True</span></code> prefix). Returns <code class="docutils literal notranslate"><span class="pre">(to_plan,</span> <span class="pre">to_stacked)</span></code>:
+<code class="docutils literal notranslate"><span class="pre">stacked[to_plan]</span></code> is in plan order, <code class="docutils literal notranslate"><span class="pre">planned[to_stacked]</span></code> back in buffer order.
+Built on the device, so a captured graph follows each replay’s <code class="docutils literal notranslate"><span class="pre">R</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>real</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1213,6 +1345,7 @@ size and all left chunks).</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention"><code class="docutils literal notranslate"><span class="pre">Attention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention.forward"><code class="docutils literal notranslate"><span class="pre">Attention.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.Attention.forward_packed"><code class="docutils literal notranslate"><span class="pre">Attention.forward_packed()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.CausalConvPositionEmbedding"><code class="docutils literal notranslate"><span class="pre">CausalConvPositionEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1221,15 +1354,25 @@ size and all left chunks).</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT"><code class="docutils literal notranslate"><span class="pre">DiT</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.forward"><code class="docutils literal notranslate"><span class="pre">DiT.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.forward_new_frames"><code class="docutils literal notranslate"><span class="pre">DiT.forward_new_frames()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiT.rotary_freqs"><code class="docutils literal notranslate"><span class="pre">DiT.rotary_freqs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock"><code class="docutils literal notranslate"><span class="pre">DiTBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock.forward"><code class="docutils literal notranslate"><span class="pre">DiTBlock.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.DiTBlock.forward_packed"><code class="docutils literal notranslate"><span class="pre">DiTBlock.forward_packed()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.InputEmbedding"><code class="docutils literal notranslate"><span class="pre">InputEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.InputEmbedding.forward"><code class="docutils literal notranslate"><span class="pre">InputEmbedding.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows"><code class="docutils literal notranslate"><span class="pre">PackedRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.last_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.last_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.positions"><code class="docutils literal notranslate"><span class="pre">PackedRows.positions</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.real"><code class="docutils literal notranslate"><span class="pre">PackedRows.real</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.seq_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.seq_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.PackedRows.tail_at"><code class="docutils literal notranslate"><span class="pre">PackedRows.tail_at</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.TimestepEmbedding"><code class="docutils literal notranslate"><span class="pre">TimestepEmbedding</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1238,6 +1381,7 @@ size and all left chunks).</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.apply_partial_rotary"><code class="docutils literal notranslate"><span class="pre">apply_partial_rotary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.chunk_attention_mask"><code class="docutils literal notranslate"><span class="pre">chunk_attention_mask()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosyvoice3.components.dit.plan_order"><code class="docutils literal notranslate"><span class="pre">plan_order()</span></code></a></li>
 </ul>
   </nav></div>
 
