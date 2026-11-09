@@ -1341,7 +1341,7 @@ def test_an_offload_another_node_causes_gives_the_slot_up():
 def test_a_host_step_of_another_node_over_a_held_row_marks_it():
     """A node sharing the resident node's pool, without a planner, runs a host
     step: over a row the planner holds it marks the row as the node's own host
-    step would and makes a staged pre-plan stale; over other rows nothing."""
+    step would; over other rows nothing."""
     live, ref, planner = _setup({1: 9, 2: 9})
     del ref
     _captured_step(live, planner, [1, 2], slot=0, bs=2)
@@ -1352,7 +1352,7 @@ def test_a_host_step_of_another_node_over_a_held_row_marks_it():
     assert planner._commits == commits and not planner._moved and not planner._stale
     step, ctx = _host_step(live, [1, 2], [1, 4])
     planner.note_foreign_step(step, ctx)
-    assert planner._commits == commits + 1
+    assert planner._commits == commits
     assert planner._moved == {1} and planner._stale == {2}
 
 

@@ -603,6 +603,9 @@ class Engine:
         # resource key -> the resident planner its tables are bound to, which a
         # node sharing the resource without a planner of its own must reach
         self._resource_planners: dict[str, ResidentPlanner] = {}
+        # node without a planner -> the planners of the resources it shares,
+        # fixed once every planner is built (`_bind_foreign_planners`)
+        self._foreign_planners: dict[str, tuple[ResidentPlanner, ...]] = {}
         # Nodes this rank leads (journals its moves for the others) and nodes it
         # follows (may not move pages at all — see ``offload_request``). A node
         # that is not sharded is in neither: it owns its own eviction.
@@ -786,6 +789,16 @@ class Engine:
             self._resource_planners.update(dict.fromkeys(resources, submodule_mgmt.resident))
         runner.bind_resident(submodule_mgmt.resident)
 
+    def _bind_foreign_planners(self) -> None:
+        """For each node without a planner, the planners of the resources it
+        shares, once: a host-planned step of every model looks them up."""
+        self._foreign_planners = {
+            node: planners
+            for node, mgmt in self._submodules.items() if mgmt.resident is None
+            if (planners := tuple({self._resource_planners[key] for key in mgmt.resources
+                                   if key in self._resource_planners}))
+        }
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager
@@ -920,6 +933,7 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+        self._bind_foreign_planners()
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -2200,7 +2214,7 @@ class Engine:
                     submodule_mgmt.resident.commit(step, ctx)
                 else:
                     # a node sharing a resident node's resources moves its rows on the host
-                    for planner in {self._resource_planners.get(key) for key in submodule_mgmt.resources} - {None}:
+                    for planner in self._foreign_planners.get(batch.node_name, ()):
                         planner.note_foreign_step(step, ctx)
             finally:
                 phase_end("engine.commit", t0)

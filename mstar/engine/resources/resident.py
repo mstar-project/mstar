@@ -220,6 +220,11 @@ class CapturedResidentStep:
     lengths_only: set[str] = field(default_factory=set)
 
 
+def _step_segments(step: SubmoduleStep) -> list:
+    """A step's rows: its own segments, else its resources' steps'."""
+    return step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
+
+
 class ResidentPlanner:
     """One node's request slots, tables and per-step rows.
 
@@ -558,16 +563,13 @@ class ResidentPlanner:
         self._committed_seq = plan.seq
 
     def note_foreign_step(self, step: SubmoduleStep, ctx) -> None:
-        """A host-planned step of another node sharing these tables' resources.
-        A row of this planner's that it moved is marked as one of this node's
-        own host steps would mark it, and a pre-plan staged before it is no
-        longer current; a step over no held row changes nothing here."""
-        held = self._slot_of
-        segments = step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
-        if not held or not any(seg.request_id in held for seg in segments):
-            return
-        self._commits += 1
-        self._note_host_step(step, ctx)
+        """A host-planned step of another node sharing these tables' resources:
+        a row of this planner's that it moved is marked as one of this node's
+        own host steps would mark it. No pre-plan can be staged here, since the
+        step commits before its commit event, and the plan thread pre-plans the
+        next step only after that event."""
+        if self._slot_of:
+            self._note_host_step(step, ctx)
 
     def _note_host_step(self, step: SubmoduleStep, ctx) -> None:
         """A host-planned step moved its rows without their tables. A
@@ -576,7 +578,7 @@ class ResidentPlanner:
         held = self._slot_of
         if not held:
             return
-        segments = step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
+        segments = _step_segments(step)
         one = [seg.request_id for seg in segments if seg.span == 1 and seg.request_id in held]
         rest = [seg.request_id for seg in segments if seg.span != 1 and seg.request_id in held]
         with self._lock:
