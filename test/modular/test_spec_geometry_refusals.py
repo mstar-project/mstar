@@ -153,14 +153,23 @@ def test_deployment_context_default_and_resource_override(limit):
         assert second.config.max_seq_len == 128
 
 
-_QWEN_CONFIGS = sorted(Path(__file__).parents[2].glob("configs/qwen3_[58]_*.yaml"))
+# The context each family declares (its HF config's max_position_embeddings), where a
+# low top-level max_seq_len would refuse prompts it can hold. CI has no checkpoints or HF
+# configs, so this can't ask the models themselves.
+_SHIPPED_CONTEXTS = {
+    "qwen3_[58]_*": 262_144, "qwen3omni*": 65_536, "muse_glimmer*": 131_072, "nemotron_duplex*": 131_072,
+}
+_SHIPPED_CONFIGS = [
+    (path, context) for family, context in _SHIPPED_CONTEXTS.items()
+    for path in sorted(Path(__file__).parents[2].glob(f"configs/{family}.yaml"))
+]
 
 
-@pytest.mark.parametrize("path", _QWEN_CONFIGS, ids=lambda p: p.name)
-def test_shipped_qwen_configs_keep_the_models_context(path):
+@pytest.mark.parametrize("path, context", _SHIPPED_CONFIGS, ids=[p.name for p, _ in _SHIPPED_CONFIGS])
+def test_shipped_configs_keep_the_models_context(path, context):
     from mstar.engine.resources.kv.config import KVSpec
     from mstar.engine.resources.spec import apply_yaml_overrides
 
-    spec = KVSpec(resource_key="kv", nodes={"node"}, config=_paged(max_seq_len=262_144))
+    spec = KVSpec(resource_key="kv", nodes={"node"}, config=_paged(max_seq_len=context))
     apply_yaml_overrides([spec], {"max_seq_len": yaml.safe_load(path.read_text())["max_seq_len"]})
-    assert spec.config.max_seq_len == 262_144
+    assert spec.config.max_seq_len == context

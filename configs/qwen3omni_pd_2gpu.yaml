@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (65,536 tokens)
 # qwen3omni_pd_disaggregated.yaml on two GPUs: the Talker shares rank 0 with the
 # encoders, Code2Wav and the prefill Thinker; rank 1 decodes.
 resources:

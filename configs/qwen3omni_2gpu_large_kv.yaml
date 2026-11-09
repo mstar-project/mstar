@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (65,536 tokens)
 # The 2-GPU placement for H200-class GPUs: qwen3omni_2gpu.yaml with the Thinker's KV
 # pool at its default 2,048 pages (256k tokens, 24 GiB at 12 MiB a page) and no host
 # pages, for workloads whose concurrent requests hold more than 128k tokens of Thinker

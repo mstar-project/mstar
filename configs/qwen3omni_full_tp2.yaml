@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (65,536 tokens)
 node_groups:
   # Thinker LLM (text + audio + vision) on 2 GPUs, TP=2.
   # ParallelAttention + ParallelSparseMoeBlock (no shared expert) shard

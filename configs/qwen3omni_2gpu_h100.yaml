@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (65,536 tokens)
 # qwen3omni_2gpu.yaml adapted to 80 GB GPUs such as the H100. The Thinker's GPU holds
 # every prefill capture bucket. 512 pages were sized on an H100 when the encoders shared
 # the Thinker's GPU and its text ladder ran to 8192: beside 1,024 pages 27 Thinker

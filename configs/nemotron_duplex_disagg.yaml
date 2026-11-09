@@ -13,7 +13,7 @@
 #   rank 0: conformer_encoder (Encoder) + nano_llm (LLM)
 #   rank 1: eartts_talker     (Talker, with the codec)
 model: "nemotron_duplex"
-max_seq_len: 12288
+max_seq_len: null  # keep the model's context limit (131,072 tokens)
 
 # Sessions at once; a live call past it gets a 503 (only one-shot requests
 # queue). Each session holds a slot in

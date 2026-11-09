@@ -7,7 +7,7 @@
 # (configs/nemotron_duplex_disagg.yaml), which instead puts each
 # stream-consuming loop on its own GPU thread for pipeline parallelism.
 model: "nemotron_duplex"
-max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
+max_seq_len: null  # keep the model's context limit (131,072 tokens)
 
 # Sessions at once; a live call past it gets a 503 (only one-shot requests
 # queue). Each session holds a slot in

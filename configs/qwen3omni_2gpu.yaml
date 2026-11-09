@@ -1,5 +1,5 @@
 model: "qwen3_omni"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (65,536 tokens)
 # The Thinker's KV pool holds 1,024 GPU pages (128k tokens; its default 2,048, 24 GiB at
 # 12 MiB a page, doesn't fit beside the weights on an 80 GB GPU) plus 1,024 host pages
 # that give a full pool a request to move. Its text prefill ladder stays at the default
