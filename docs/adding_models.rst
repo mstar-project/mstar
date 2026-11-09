@@ -310,8 +310,9 @@ engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
-  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  ``repetition_penalty``, ``min_p``, ``penalize_prompt`` and ``ignore_eos``. The
+  conductor fills in the per-request seed, derived per resource key so each sampler of a
+  request draws its own stream. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
   Further knobs, each needing a ``SamplerSpec`` capability (CUDA only):
@@ -362,7 +363,8 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 .. code-block:: python
 
    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-       keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+       keys = ("temperature", "top_p", "top_k", "min_p",
+               "repetition_penalty", "penalize_prompt", "ignore_eos")
        return {
            SAMPLER: SamplingReqConfig(
                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
@@ -372,6 +374,25 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 BAGEL (``bagel_model.py``) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.
+
+Sampling knobs mean the same thing on every model (:ref:`generation-parameters`), and
+the server range-checks them before your model sees them. A model's part of that
+contract:
+
+- Default each knob the request leaves unset from the checkpoint's own
+  ``generation_config.json`` (``mstar.model.utils.load_generation_defaults``),
+  falling back to your config only when the checkpoint ships none.
+- Raise ``ValueError`` (a 400) for an input you cannot serve; never clamp, coerce, or
+  fall back silently. A ``SamplerSpec`` without ``enable_repetition_penalty`` or
+  ``enable_min_p`` refuses those knobs at admission, so do not default a penalty onto it.
+- Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
+  client sends is logged as ignored by the server. ``test_model_contracts.py`` fails for a
+  registered model that does not override it.
+- Bound a request's length, or a denoise loop's step count, through ``get_loop_caps``: the
+  conductor refuses a cap past the loop's ``max_iters`` instead of cutting the request short,
+  so do not clamp it, or check it against a typed-in limit, yourself.
+- Draw any model-local randomness from the request's seed (``random_seed`` on the
+  forward-pass info), never the global RNG.
 
 A spec can also build its own request's config from ``model_kwargs``
 (``NodeResourceSpec.request_config``), which the conductor adds beside the model's. That
@@ -844,9 +865,9 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
-   * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
+   * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
-       seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
+       seen-token mask. ``enable_repetition_penalty`` declares a capability, not an
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
@@ -941,7 +962,7 @@ appears in no spec, so it receives no resources:
            SamplerSpec(
                resource_key=SAMPLER, nodes={"LLM"},
                vocab_size=self.config.vocab_size,
-               enable_repetion_penalty=True,
+               enable_repetition_penalty=True,
            ),
            PositionSpec(
                resource_key=ROPE, nodes={"LLM"},
@@ -1000,10 +1021,10 @@ to N-1, using its own vocabulary size and no repetition penalty:
 
    SamplerSpec(resource_key=TALKER_SAMPLER, nodes={"Talker"},
                vocab_size=self.config.talker_text.vocab_size,
-               enable_repetion_penalty=True),
+               enable_repetition_penalty=True),
    SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                vocab_size=self.config.code_predictor.vocab_size,
-               enable_repetion_penalty=False),
+               enable_repetition_penalty=False),
 
 The forward looks up each sampler by key and calls ``.sample()`` on it::
 
@@ -3223,7 +3244,7 @@ own KV cache and attention, a second KV cache for the encoder context, a
 ``CrossAttentionSpec`` over that second cache, a ``PositionSpec``, and a ``SamplerSpec``.
 The ``PositionSpec`` exists only for the position counter. Whisper uses learned position
 embeddings, so the planned ids index an ``embed_positions`` table instead of driving RoPE.
-The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcription
+The ``SamplerSpec`` sets ``enable_repetition_penalty=False``, because ASR transcription
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the

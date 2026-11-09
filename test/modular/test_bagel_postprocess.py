@@ -53,7 +53,7 @@ def test_an_edit_whose_output_is_under_one_latent_patch_fails_at_intake(hw, size
     width/height), so an aspect the cap squeezes under 16 pixels (5000x50 ->
     1024x10) is refused like a tiny requested size."""
     model = _model()
-    with pytest.raises(ValueError, match="16 pixels"):
+    with pytest.raises(ValueError, match="16 pixels|multiple of 16"):
         model.process_prompt(None, ["image"], ["image"], tensors={"image_inputs": [torch.zeros(3, *hw)]}, **size)
 
 
@@ -74,7 +74,7 @@ def test_an_edit_input_is_downsized_as_pil_does():
     """The reference resizes an edit's input with PIL, which filters before it
     downsamples; plain bilinear sampling aliases a large photo's fine texture."""
     pixels = torch.randint(0, 256, (3, 400, 600), generator=torch.Generator().manual_seed(0), dtype=torch.uint8)
-    ours = BagelModel._resize_to_fit(pixels.float() / 255, max_width=150, max_height=150)
+    ours = BagelModel._resize_to_fit(pixels.float() / 255, max_width=150, max_height=150, max_side=1024)
     reference = PIL.fromarray(pixels.permute(1, 2, 0).numpy()).resize((150, 100), PIL.BILINEAR)
     expected = torch.from_numpy(np.asarray(reference)).permute(2, 0, 1).float() / 255
     assert ours.shape == expected.shape

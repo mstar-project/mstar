@@ -84,7 +84,7 @@ def test_none_keeps_the_current_value():
 
 
 def test_validate_refuses_what_the_node_cannot_do():
-    plain = SamplerSpec(resource_key="s", nodes={"n"}, vocab_size=10, enable_repetion_penalty=False)
+    plain = SamplerSpec(resource_key="s", nodes={"n"}, vocab_size=10, enable_repetition_penalty=False)
     SamplingReqConfig(repetition_penalty=1, min_p=0.0).validate(plain)
     with pytest.raises(ValueError, match="repetition_penalty"):
         SamplingReqConfig(repetition_penalty=1.2).validate(plain)
