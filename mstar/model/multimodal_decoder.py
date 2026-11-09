@@ -370,7 +370,7 @@ class MultimodalDecoderModel(Model):
         admission (a 400), not dropped."""
         return SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
             enable_min_p=bool(self.sampling_defaults.get("min_p")),
         )
 

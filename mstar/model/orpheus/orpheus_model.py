@@ -377,7 +377,7 @@ class OrpheusModel(Model):
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
                 # on only when the recipe sets min_p (the checkpoint's file can't: it is read
                 # switch_only); otherwise a request min_p > 0 is refused
                 enable_min_p=self.config.min_p > 0,

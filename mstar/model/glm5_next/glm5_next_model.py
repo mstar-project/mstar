@@ -208,7 +208,7 @@ class Glm5NextModel(Model):
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
                 enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
             RecurrentStateSpec(

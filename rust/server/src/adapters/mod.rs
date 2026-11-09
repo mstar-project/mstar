@@ -131,15 +131,6 @@ fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
-/// A client-sent `speed` into `model_kwargs` for a model with no speed
-/// control, so the server logs it as ignored (`_forward_sent_speed`). An
-/// unsent one stays out; it would warn on every request.
-fn forward_sent_speed(mk: &mut Map<String, Value>, req: &SpeechRequest) {
-    if let Some(speed) = req.speed {
-        set_default(mk, "speed", speed.map_or(Value::Null, json_num));
-    }
-}
-
 /// A speech request's submission, and the reference clip it carries for the API
 /// server to check before anything is submitted (`_resolve_ref_audio`'s check).
 #[derive(Debug)]
