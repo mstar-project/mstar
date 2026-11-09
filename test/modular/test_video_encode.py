@@ -22,20 +22,20 @@ av = pytest.importorskip("av")
 from mstar.model.components import video_encode  # noqa: E402
 from mstar.model.components.video_encode import converted_frames, encode_mp4  # noqa: E402
 
-# 30000/1001 to a denominator of 1001, 19001/634 to one of 1000
+# 30000/1001 exactly, as encode_mp4 writes it
 NTSC = 30000 / 1001
 # LTX-2.5's settings, and Cosmos3's PyAV path at its default preset
 ULTRAFAST = {"crf": "18", "preset": "ultrafast", "threads": "0"}
 
 
-def _plain(frames: np.ndarray, fps, options, rate_denominator: int = 1001, pad_even: bool = False) -> bytes:
+def _plain(frames: np.ndarray, fps, options, pad_even: bool = False) -> bytes:
     """The models' writer before ``encode_mp4``: their own stream setup and a plain
     ``stream.encode`` loop."""
     if pad_even and (frames.shape[1] % 2 or frames.shape[2] % 2):
         frames = np.pad(frames, ((0, 0), (0, frames.shape[1] % 2), (0, frames.shape[2] % 2), (0, 0)), mode="edge")
     buffer = io.BytesIO()
     container = av.open(buffer, mode="w", format="mp4")
-    stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(rate_denominator))
+    stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
     stream.height, stream.width = frames.shape[1], frames.shape[2]
     stream.pix_fmt = "yuv420p"
     if options:
@@ -85,18 +85,18 @@ def test_the_encoder_gets_the_frames_its_own_conversion_makes(height, width):
     assert stored == _stored_frames(clip, height, width, converted=False)
 
 
-@pytest.mark.parametrize(("fps", "rate_denominator"), [(24, 1001), (NTSC, 1001), (NTSC, 1000), (12.0, 1000)])
+@pytest.mark.parametrize("fps", [24, NTSC, 12.0])
 @pytest.mark.parametrize(("frames", "height", "width"), [(1, 16, 16), (9, 48, 64), (17, 66, 98)])
-def test_encode_mp4_writes_the_plain_loops_bytes(frames, height, width, fps, rate_denominator):
+def test_encode_mp4_writes_the_plain_loops_bytes(frames, height, width, fps):
     clip = _clip(frames, height, width)
-    new = encode_mp4(clip, fps, options=ULTRAFAST, rate_denominator=rate_denominator)
-    assert new == _plain(clip, fps, ULTRAFAST, rate_denominator)
+    new = encode_mp4(clip, fps, options=ULTRAFAST)
+    assert new == _plain(clip, fps, ULTRAFAST)
 
 
 def test_odd_sizes_pad_to_even_ones():
     clip = _clip(5, 47, 63)
-    new = encode_mp4(clip, 24, options=ULTRAFAST, rate_denominator=1000, pad_even=True)
-    assert new == _plain(clip, 24, ULTRAFAST, 1000, pad_even=True)
+    new = encode_mp4(clip, 24, options=ULTRAFAST, pad_even=True)
+    assert new == _plain(clip, 24, ULTRAFAST, pad_even=True)
     with av.open(io.BytesIO(new)) as container:
         assert (container.streams.video[0].width, container.streams.video[0].height) == (64, 48)
 
@@ -142,7 +142,7 @@ def test_wan22_writes_the_old_bytes(monkeypatch):
     monkeypatch.setattr(wan22_model, "encode_mp4", functools.partial(video_encode.encode_mp4, options=ULTRAFAST))
     clip = _clip(9, 48, 64)
     data = _wan22().postprocess(torch.from_numpy(clip), "video", {"fps": NTSC})
-    assert data == _plain(clip, NTSC, ULTRAFAST, 1001)
+    assert data == _plain(clip, NTSC, ULTRAFAST)
 
 
 def test_wan22_keeps_libx264s_defaults():
@@ -160,11 +160,11 @@ def test_ltx2_5_writes_the_old_bytes():
     model.set_config(LTX25Config())
     clip = _clip(9, 48, 64)
     data = model.postprocess(torch.from_numpy(clip), "video", {"fps": NTSC})
-    assert data == _plain(clip, NTSC, ULTRAFAST, 1001)
+    assert data == _plain(clip, NTSC, ULTRAFAST)
 
 
 @pytest.mark.parametrize(("height", "width"), [(48, 64), (47, 63)])
-def test_cosmos3_pyav_path_writes_the_old_bytes(monkeypatch, height, width):
+def test_cosmos3_pyav_path_writes_an_exact_ntsc_rate(monkeypatch, height, width):
     import sys
 
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -178,5 +178,5 @@ def test_cosmos3_pyav_path_writes_the_old_bytes(monkeypatch, height, width):
     monkeypatch.delenv("COSMOS3_X264_PRESET", raising=False)
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     clip = _clip(9, height, width)
-    data = model.postprocess(torch.from_numpy(clip).permute(0, 3, 1, 2), "video", {"fps": 12.0})
-    assert data == _plain(clip, 12.0, ULTRAFAST, 1000, pad_even=True)
+    data = model.postprocess(torch.from_numpy(clip).permute(0, 3, 1, 2), "video", {"fps": NTSC})
+    assert data == _plain(clip, NTSC, ULTRAFAST, pad_even=True)

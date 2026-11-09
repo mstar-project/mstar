@@ -114,9 +114,6 @@ class LoraAdapterResult:
     op_id: str
     error_message: str | None = None
     status: int = 200
-    # whether the conductor serves the name once the operation is over, so the API
-    # server's selection follows it whatever the outcome; None when it has no LoRA
-    served: bool | None = None
 
 
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
@@ -172,6 +169,10 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    # what the prompt's prefix-cache key chains hang from: the root of the LoRA adapter
+    # the API server selected (``ServedModels.select``), empty for the base model. Set
+    # in process, never from the client's kwargs.
+    prefix_root: bytes = b""
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
     # Inputs the API server already holds decoded, by modality and in order,

@@ -25,12 +25,11 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
@@ -502,12 +501,7 @@ class H3Model(Model):
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {DENOISE_LOOP: h3_schedule(*self.resolve_schedule(model_kwargs)).num_steps}
 
-    # --------------------------------------------------------- state machine
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        # The request's facts live under their own key: the conductor merges each pass's
-        # step metadata into ``metadata.kwargs``.
-        return {"is_prefill": metadata.is_prefill, **metadata.kwargs["request"]}
-
+    # --------------------------------------------------------------- plan
     def request_layout(self, request: dict, text_len: int, anchors: tuple[str, ...] = ()) -> H3Layout:
         vae = self.config.video_vae
         return H3Layout(
@@ -519,10 +513,12 @@ class H3Model(Model):
             anchors=anchors,
         )
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """Encode the prompt (and any keyframes), then denoise; both steps carry the
+        request's resolved facts, which every node reads its layout from."""
         # Backstops: process_prompt rejected these already, where a raise is a 400.
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("MiniMax-H3 requires a text prompt (text_inputs)")
@@ -551,56 +547,12 @@ class H3Model(Model):
             )
         final_walk = self._generate_walk_for(output_modalities, keyframes=bool(anchors))
         first_walk = ENCODE_KEYFRAMES_WALK if anchors else ENCODE_TEXT_WALK
-        kwargs = {"walk_schedule": [first_walk, final_walk], "walk_step": 0, "request": request}
         logger.info(
             "MiniMax-H3 request: %dx%d frames=%d steps=%d prompt=%d tokens rows=%d outputs=%s seed=%s",
             request["width"], request["height"], request["num_frames"], request["num_inference_steps"], text_len,
             layout.total_rows, output_modalities, model_kwargs.get("seed", "auto"),
         )
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=first_walk, is_prefill=True, kwargs=kwargs,
-        )
-        routes = [(TEXT_ENCODER_NODE, TEXT_INPUTS)]
-        if anchors:
-            routes += [(TEXT_ENCODER_NODE, VISION_PIXELS), (VAE_ENCODER_NODE, KEYFRAME_PIXELS)]
-        edges = []
-        for node, name in routes:
-            edge = GraphEdge(next_node=node, name=name)
-            edge.tensor_info = input_signals[name]
-            edges.append(edge)
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=edges, unpersist_tensors=[t for e in edges for t in e.tensor_info],
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        request_done = step >= len(schedule)
-        inputs: list[GraphEdge] = []
-        unpersist: list[TensorPointerInfo] = []
-        if not request_done:
-            metadata.kwargs["walk_step"] = step
-            metadata.graph_walk = schedule[step]
-            metadata.is_prefill = False
-            persisted = [TEXT_EMBEDS] + ([COND_LATENTS] if schedule[step].endswith(KEYFRAMES_SUFFIX) else [])
-            for name in persisted:
-                edge = GraphEdge(next_node=DIT_NODE, name=name)
-                edge.tensor_info = persist_signals.get(name, [])
-                unpersist += edge.tensor_info
-                inputs.append(edge)
-            # the loop-back edges arrive empty; the dit seeds them at iteration 0
-            inputs += [GraphEdge(next_node=DIT_NODE, name=LATENTS), GraphEdge(next_node=DIT_NODE, name=AUDIO_LATENTS)]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs, unpersist_tensors=unpersist,
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
-        )
+        return [WalkStep(first_walk, step_metadata=request), WalkStep(final_walk, step_metadata=request)]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """``video``: uint8 ``[F, H, W, 3]`` -> H.264 mp4 at 24 fps. ``audio``: ``[2, samples]``

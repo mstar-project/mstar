@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from api_server_helpers import make_test_api_server
-from test_ingest_unpersist import _conductor, _edge, _fwd, _info, _msg, _run, _ToyModel
+from test_ingest_unpersist import _conductor, _info, _msg, _run, _ToyModel
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
 from mstar.api_server.request_types import (
@@ -29,7 +29,9 @@ from mstar.api_server.request_types import (
     RequestComplete,
     ResultChunk,
 )
+from mstar.api_server.served_models import Selected
 from mstar.communication.event import EventWakeup
+from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS, Model
@@ -153,7 +155,9 @@ def test_a_prompt_split_around_its_image_counts_the_images_positions(build, tmp_
 
     sent = _sent_prompt_tokens(worker, ["image", "text"], {"image": [str(path)]})
 
-    text = sum(ids.numel() for ids in worker.tensor_manager.stored["text_inputs"])
+    # each text segment is a signal of its own (``split_spans``)
+    text = sum(ids.numel() for name, segments in worker.tensor_manager.stored.items()
+               if name.startswith("text_inputs") for ids in segments)
     assert sent == text + 2 + image_tokens
 
 
@@ -185,10 +189,7 @@ def test_request_complete_returns_the_prompt_count_and_the_resolved_cap(tmp_path
         GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
     ])}
 
-    def initial(partition, signals):
-        return _fwd("prefill", [_edge("llm", "text_inputs", signals["text_inputs"])])
-
-    c = _conductor(_ToyModel(walks, initial, lambda metadata, persist: _fwd("prefill", done=True)),
+    c = _conductor(_ToyModel(walks, {"default": [WalkStep("prefill")]}),
                    [{"node_names": ["llm"], "ranks": [0]}], tmp_path, monkeypatch)
     wg = c.node_walk_to_wg[("llm", "prefill")].worker_graph_id
     _run(c, [
@@ -199,7 +200,7 @@ def test_request_complete_returns_the_prompt_count_and_the_resolved_cap(tmp_path
         ))],
         [_msg(ConductorMessageType.WORKER_GRAPHS_DONE, WorkerGraphsDone(
             request_id="r", worker_graph_ids=[wg], is_first_tp_rank=True,
-            partition_name="default", output_signal_names=["new_token"],
+            partition_name="default", output_signal_names=["new_token"], graph_walk="prefill",
         ))],
     ])
     [done] = [m.body for e, m in c.comm.sent if e == "api_server" and m.message_type == "request_complete"]
@@ -341,7 +342,7 @@ class _ChatAPI:
         self.submitted = {}
 
     def lora_kwargs(self, model, model_kwargs):
-        return model_kwargs
+        return Selected(model_kwargs)
 
     def submit_request(self, **kwargs):
         self.submitted = kwargs

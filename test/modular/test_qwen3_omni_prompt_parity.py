@@ -30,6 +30,7 @@ from mstar.api_server.openai.adapters import flatten_messages
 
 # Qwen3OmniModel imports transformers at module level.
 pytest.importorskip("transformers")
+from mstar.model.multimodal import span_name  # noqa: E402
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (
@@ -159,9 +160,15 @@ def _old_process_prompt(model, prompt, input_modalities):
 
 
 def _new_text_inputs(model, prompt, input_modalities, prompt_parts=None):
-    return model.process_prompt(
+    tensors = model.process_prompt(
         prompt, input_modalities, ["text"], prompt_parts=prompt_parts,
-    ).new_input_tensors["text_inputs"]
+    ).new_input_tensors
+    # one signal per Thinker step, and a step may hold no text
+    spans, k = [], 0
+    while (name := f"text_inputs.{k}") in tensors:
+        spans += tensors[name]
+        k += 1
+    return spans
 
 
 def _ids(segments):
@@ -360,15 +367,15 @@ def test_ignore_eos_keeps_every_end_token(model):
 def test_schedule_matches_the_spans(model):
     """One media walk per attachment, in order, and every span in one of them."""
     mods = ["image", "text", "image"]
-    spans = _new_text_inputs(model, "Between.", mods)
-    signals = {
-        "text_inputs": [f"t{i}" for i in range(len(spans))],
-        "pixel_values": ["px0", "px1"],
-        "image_grid_thw": ["g0", "g1"],
-    }
-    schedule = model._build_thinker_prefill_schedule(mods, signals)
-    assert [walk for walk, _ in schedule] == ["prefill_vision", "prefill_vision"]
-    assert [text for _, entry in schedule for text in entry["text_inputs"]] == signals["text_inputs"]
+    tensors = model.process_prompt("Between.", mods, ["text"]).new_input_tensors
+    schedule = model._build_thinker_prefill_schedule(mods)
+    assert [walk for walk, _, _ in schedule] == ["prefill_vision", "prefill_vision"]
+    # each step binds its own text signal, and the signals hold every span
+    texts = [name for name in tensors if name.startswith("text_inputs.")]
+    assert [bind["text_inputs"] for _, bind, _ in schedule] == texts
+    assert sum(len(tensors[bind["text_inputs"]]) for _, bind, _ in schedule) == len(
+        _new_text_inputs(model, "Between.", mods)
+    )
 
 
 @pytest.mark.skipif(
@@ -415,5 +422,7 @@ def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, heig
     model._kv_layout = lambda *args: {}  # reads the checkpoint config; not what this checks
     image = torch.randint(0, 256, (3, height, 128), dtype=torch.uint8)
     out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
-    (_, rows, cols), = (g.tolist() for g in out.new_input_tensors["image_grid_thw"])
+    # each attachment is a signal of its own (`split_spans`)
+    (grid,) = out.new_input_tensors[span_name("image_grid_thw", 0)]
+    _, rows, cols = grid.tolist()
     assert rows < cols, "a wide image's patch grid is wide"

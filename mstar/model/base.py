@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING, NamedTuple, Type
 import torch
 import yaml
 
+from mstar.api_server import media_io
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
-    StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import (
     PARALLEL_AXES,
@@ -26,7 +26,7 @@ from mstar.distributed.base import (
 )
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -142,7 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.lora.config import LoraSpec
+    from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -539,46 +539,53 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-@dataclass
-class ForwardPassArgs:
-    # full_metadata is at the conductor level
-    full_metadata: CurrentForwardConductorMetadata
-    inputs: list[GraphEdge]
-
-    # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph nodes
-    unpersist_tensors: list[TensorPointerInfo]
-
-    # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool = False
-
-    # step_metadata is at the engine / worker level; and
-    # is passed into the fwd pass
-    step_metadata: dict = field(default_factory=dict)
-
-    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
-    # partition's consumer streams
-    stream_lead_items: dict[str, int] = field(default_factory=dict)
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = next(
+        (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
+    )
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
+    return {
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
+    }
 
 
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
-    (``mstar.engine.resources.lora.serving``)."""
-    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
+    its ``resources:`` block does not name."""
+    named = (model_config.get("resources") or {}).keys()
+    return [
+        spec for spec in model.get_node_resources() or []
+        if not spec.opt_in or spec.resource_key in named
+    ]
 
-    specs = list(model.get_node_resources() or [])
-    lora = declared_lora_specs(model, model_config)
-    size_lora_specs(lora, model_config)
-    return specs + lora
+
+def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
+    overrides applied. A ``per_node`` spec is whole here, as the API server checks
+    requests and adapters against it; ``serving_resources`` splits it."""
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return specs
 
 
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
-    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
-    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
-    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
-
-    return drop_lora_specs_without_targets(specs)
+    """The specs a deployment builds of its declared ones: each ``per_node`` spec as its
+    instances (``NodeResourceSpec.for_node``)."""
+    built: list[NodeResourceSpec] = []
+    for spec in specs:
+        if not spec.per_node:
+            built.append(spec)
+            continue
+        instances = (spec.for_node(node) for node in sorted(spec.nodes))
+        built.extend(instance for instance in instances if instance is not None)
+    return built
 
 
 def parse_autocast_dtype(value) -> torch.dtype | None:
@@ -593,18 +600,15 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
 
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
-    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
-    ``resources:`` overrides applied, as ``built_resources``.
+    """The resource specs a deployment builds: ``declared_resources``, as
+    ``built_resources``.
 
     Every process that reads specs resolves them here, so the conductor validates
-    requests against what the workers built. ``validate_deployment`` takes the same
-    steps, reporting every problem rather than the first.
+    requests against what the workers built, under the same keys.
+    ``validate_deployment`` takes the same steps, reporting every problem rather than
+    the first.
     """
-    from mstar.engine.resources.spec import apply_yaml_overrides
-
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
-    return built_resources(specs)
+    return built_resources(declared_resources(model, model_config))
 
 
 class Model(ABC):
@@ -631,7 +635,9 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = (
+        "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+    )
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -648,6 +654,12 @@ class Model(ABC):
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
 
+    # The rate the default ``load_audio`` decodes an upload to, and the longest
+    # clip it decodes (default 30 min). The request's audio budget
+    # (``media_limits``) holds on top of that.
+    AUDIO_INPUT_RATE: int = 16_000
+    MAX_AUDIO_SECONDS: float = media_io.MAX_AUDIO_SECONDS
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,
@@ -663,22 +675,12 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = DEFAULT_PARTITION
-        for part in self.get_partitions():
-            if graph_walk in part.graph_walks:
-                partition = part.name
-                break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
-            if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
-
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams,
+            input_streams={name for name, _ in streamed_inputs(self, graph_walk, graph)},
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -771,23 +773,11 @@ class Model(ABC):
 
         The whole declaration: a KV cache's shape, the attention backend over
         it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it.
+        hands each node the subset naming it. An opt-in spec (per-request LoRA
+        adapters) is declared here too, and built only for a deployment whose
+        ``resources:`` block names it.
         """
         pass
-
-    def get_lora_specs(self) -> list["LoraSpec"]:
-        """The per-request LoRA adapters this model can serve: a spec per node they
-        reach (none for a model that serves none), the first keyed
-        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
-        and the conductor opens a request with the same adapter on each.
-
-        Built only when the deployment's YAML has a ``resources: lora:`` block (see
-        ``serving_resources``): a deployment without one builds exactly what it did
-        before. Usually by ``module_lora_spec`` from each node's weights root, whose
-        LoRA-capable modules the node then binds itself. The conductor opens each
-        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
-        """
-        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -807,6 +797,19 @@ class Model(ABC):
         whose preprocessing changes shape between versions overrides this.
         """
         return type(self).__name__
+
+    def get_walk_priorities(self) -> "list[WalkPriority]":
+        """Entries naming a node, a walk, or one (node, walk), each with a priority and
+        optionally a ``max_wait``: keys a worker serves before others while they have
+        ready rows, higher first, unlisted 0, and the most steps a key may go without
+        running while ready before it goes first. Where entries overlap, the most
+        specific decides. A speculation chain gives way to a ready key above its own,
+        or one past its bound, at once. Empty, the default, keeps round robin; a
+        deployment's ``scheduling`` block can replace the list or turn it off. Declare
+        a priority for a walk whose steps are short and latency-sensitive, such as a
+        TTS prompt's prefill: a higher key that stays ready holds the rest back up to
+        their ``max_wait``, or indefinitely without one."""
+        return []
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
@@ -855,16 +858,18 @@ class Model(ABC):
 
     def get_request_resource_configs(
         self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
-        CFG, retention. The conductor resolves this once per request and the
+        CFG, retention. The conductor resolves this once per request, from the
+        request's modalities and kwargs as `walk_plan` gets them, and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs, partition_fwd_args
+        del input_modalities, output_modalities, model_kwargs
         return {}
 
     def get_sampling_config(
@@ -953,15 +958,35 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        pass
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The walks ``partition_name`` runs for this request, in order, decided
+        at ingest; ``[]`` when the request doesn't use the partition.
+
+        The conductor runs the plan: it sends each step's inputs from the walk's
+        graph (see `WalkStep`), releases a persisted tensor once no later step
+        reads it, and ends the partition after the last step reports. The step
+        that samples the reply's first token sets `FINAL_PREFILL` in its
+        ``step_metadata``. A step whose
+        walk a stream feeds, and that runs no Loop but chunk loops, runs
+        once per chunk until the worker reports the stream's final chunk, its
+        inputs' tensors sent with the first chunk only. A
+        ``ValueError`` refuses the request with a 400, and so does a plan of
+        ``[]`` for every partition. A plan the conductor can't run is a model
+        bug, refused with a 500: a step whose walk is not the partition's, a
+        ``bind`` key that is not an input of the step's walk, a step after one
+        that runs once per chunk, or a later step whose walk takes no input
+        the conductor sends. In a partition a stream
+        moves, the conductor moves past a step on its first report when it is
+        the last step or the next step takes inputs it sends, so such a step
+        must run once.
+        """
 
     @abstractmethod
     def process_prompt(
@@ -1069,12 +1094,13 @@ class Model(ABC):
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
-        # video-only one); torchcodec for the other containers.
-        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        # video-only one); torchcodec for the other containers. When FFmpeg
+        # loads, an upload neither decodes is the client's error (400).
         from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_speech_file(filepath, 16000, MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
+        rate = self.AUDIO_INPUT_RATE
+        audio = load_speech_file(filepath, rate, self.MAX_AUDIO_SECONDS)
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=rate, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
@@ -1113,8 +1139,9 @@ class Model(ABC):
     ) -> bytes:
         """
         Given an output of a certain modality, encode and return as bytes.
-        Text follows ``text_output`` when the model declares it; any other
-        modality will likely need model-specific behavior.
+        Text follows ``text_output`` when the model declares it, and audio is
+        encoded below; the default refuses any other modality, which needs
+        model-specific behavior.
         ``request_kwargs`` is the request's model_kwargs, so encoders can honor
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
@@ -1127,12 +1154,22 @@ class Model(ABC):
         - text: utf-8; a chunk may end inside a character, since the API
           server joins a request's text chunks before decoding them
         - image: png
+        - audio: headerless 16-bit PCM at ``get_output_sample_rate``. The
+          default encodes mono: a float waveform in [-1, 1] is scaled and
+          truncated, integer samples are cast. A model with more channels
+          overrides it.
         """
         text = self.text_output() if modality == TEXT else None
         if text is not None:
             ids = drop_stop_tokens(output, text.stop_token_ids, request_kwargs)
             return text.detokenizer.to_bytes(ids)
-        return output.cpu().numpy().tobytes()
+        if modality == "audio":
+            pcm = output.detach().cpu()
+            if pcm.is_floating_point():
+                # in fp32: bf16 and fp16 round 32767 up to 32768, which wraps
+                pcm = pcm.float().clamp(-1, 1) * 32767
+            return pcm.to(torch.int16).numpy().tobytes()
+        raise ValueError(f"{type(self).__name__} has no {modality!r} output")
 
     def postprocess_inline(
         self,
@@ -1202,14 +1239,22 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
+    # The AR decode loop the token budget caps. Its prefill samples the reply's
+    # first token, so the default ``get_loop_caps`` runs it one fewer than
+    # ``get_max_output_tokens``.
+    DECODE_LOOP: str | None = None
+
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         """The iterations each named loop may run for this request, each at least 1.
 
         A loop runs the smaller of its graph ``max_iters`` and its cap. A model
-        whose stop check ends a loop at a count sets the cap to that count, so the
-        loop ends on the same iteration and never speculates past it.
+        whose request knows a loop's count sets the cap to that count, so the
+        loop ends on that iteration and never speculates past it. Default:
+        ``DECODE_LOOP``'s token budget, if the model declares one.
         """
-        return {}
+        if self.DECODE_LOOP is None:
+            return {}
+        return {self.DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
@@ -1313,27 +1358,5 @@ class Model(ABC):
             PartitionDefinition(
                 name=DEFAULT_PARTITION,
                 graph_walks=walks,
-                initial_walk=None,
-                producer_partitions=[],
             )
         ]
-
-    @abstractmethod
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> "ForwardPassArgs":
-        """Return the next forward pass arguments for a specific partition.
-
-        Called by the conductor after each completed forward pass to determine
-        the next graph walk, inputs, and whether the request is done.
-
-        ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions, one per stream from another
-        partition; a client stream has no entry. For single-partition models,
-        this will be ``None`` or an empty list.
-        """
-        pass

@@ -42,20 +42,16 @@ One vocabulary note for this page. A **tensor bundle** routed between nodes is a
 usually has length 1.
 
 The diagram below shows the request flow at the conductor and model level. Its
-granularity is one graph walk. The conductor is notified when a walk completes, and only
-then asks the model what to do next. Everything that happens inside a walk is described
-in later steps and is omitted here::
+granularity is one graph walk. The model decides at ingest which walks a request runs; the
+conductor runs them in order, moving on as each walk completes. Everything that happens
+inside a walk is described in later steps and is omitted here::
 
    process_prompt()              # text/media -> initial tensors
         │
         ▼
-   get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+   walk_plan()                   # per partition: the walks to run (e.g. prefill, decode)
         │
-        ▼   (conductor walks the graph, the engine runs each node)
-   get_partition_forward_pass_args() # asked after each graph walk completes:
-                                     #   what's next? done?
-        │
-        ▼
+        ▼   (conductor sends each walk its inputs, the engine runs each node)
    postprocess()                 # model output tensor -> bytes for the client
 
 What you will create
@@ -160,15 +156,39 @@ You must implement these abstract methods:
    separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
    that ``process_prompt`` and the schedule builder both work from.
 
-``get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None) -> ForwardPassArgs``
-   Build the first :class:`mstar.model.base.ForwardPassArgs` for a partition. It names
-   the graph walk to start on and the input edges that feed it.
-
-``get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals, incoming_connections=None) -> ForwardPassArgs``
-   The conductor calls this after each graph walk completes. It returns the next walk,
-   the inputs for that walk, and whether the request is finished
-   (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
-   once, then repeats the decode walk until EOS.
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+   The walks a partition runs for this request, in order, as
+   :class:`mstar.model.base.WalkStep` s; ``[]`` when the request doesn't use the
+   partition. A prefill-decode model returns
+   ``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+   The conductor derives each step's input edges from the walk's graph: every external
+   and loop-back input that no stream feeds gets the persisted signal of its own name,
+   the one ``bind`` names, or an empty edge (a denoise loop's seed, a chunk loop's tick).
+   A persisted tensor a step reads is released when the step is sent, unless a later step
+   of some partition reads it with no walk of that partition persisting the name in
+   between; anything else stays held until the request ends. ``step_metadata`` carries
+   request constants to every node of the step's walk. The step that samples the reply's
+   first token, the last prefill before decode, sets ``FINAL_PREFILL`` (from
+   ``mstar.conductor.request_info``) in its step metadata; ``media_prefill_step`` does
+   this for a ``MultimodalDecoderModel``.
+   A step whose walk a stream feeds and that runs no Loop but chunk loops runs once per
+   chunk until the worker reports the stream's final chunk, its inputs' tensors sent with
+   the first chunk only; any other step advances when its walk reports, and the partition
+   is done after its last step. A ``ValueError`` here refuses the request with a 400, and
+   so does a plan of ``[]`` for every partition (nothing would ever run). A plan the
+   conductor can't run is a model bug, refused with a 500: a step whose walk is not one of
+   its partition's, a ``bind`` key that is not an input of the step's walk, a step after
+   one that runs once per chunk (only the stream's end, which ends the partition, moves
+   past it), or a later step whose walk takes no input the conductor sends (it moves a
+   worker onto a step only by sending it inputs).
+   In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
+   many passes each step runs, but the conductor moves past a step on its first report
+   when it is the last step (the partition ends) or the next step takes inputs it sends,
+   so such a step must run once (a ``Loop``, say). Such a partition's plan must list every
+   walk the stream can move it to: before the partition's last pass, a report of a walk
+   the plan doesn't run fails the request.
+   Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus and Chatterbox are
+   references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -214,53 +234,61 @@ You must implement these abstract methods:
 .. note::
 
    The metadata ``process_prompt`` returns is laid over the request's own
-   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
-   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
-   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
-   lists its prompt layout, speaker, language, clip digest and codec stream lead.
+   ``model_kwargs``, so a key the model reads back there (a prompt layout) must be
+   set in every mode and listed in ``INTERNAL_KWARGS``: the data worker drops a
+   client's value for it before ``process_prompt``. Qwen3-TTS lists its prompt
+   layout, speaker, language and clip digest.
 
 .. note::
 
-   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
-   request's ``metadata.kwargs``, so a request fact stored under a key that a
-   later walk's step metadata also uses is overwritten by that walk's value. Keep
-   such facts under their own key: LTX-2.5 nests the request's geometry under
-   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+   A stream that starts with context-only items (a voice clone's reference frames)
+   says so in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a
+   streaming ``Connection``, and ``n``, at most that edge's policy's left context,
+   leads the first window as context and is never output. Leave the key out when
+   ``n`` is 0. The data worker drops a client's value, and the consumer partition's
+   workers prime the stream with it (Qwen3-TTS, VoxCPM2).
 
 The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
 ``load_video``, ``load_decoded_image``, and the partition methods described at the end
-of this page. ``load_decoded_image`` takes an image the API server already holds decoded
-(RGB uint8 ``[3, H, W]``, from the openpi WebSocket) and must return what ``load_image``
-returns for the same pixels in a file. The default refuses, so a model takes images only as
-files until it overrides this. pi0.5's ``load_image`` calls it, so the two paths cannot
-drift apart. A robot policy also overrides ``robot_io``, returning a ``RobotIO``: the
-``model_kwargs`` key its robot state goes under, and the ``[action_horizon, action_dim]``
-shape of the float32 actions its ``postprocess`` returns. The openpi WebSocket serves a
-model by these two hooks alone, so a new policy needs no change to the API server.
+of this page. The default ``load_audio`` decodes an upload to mono at the class attribute
+``AUDIO_INPUT_RATE`` (16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30
+minutes); set those rather than overriding it. ``load_decoded_image`` takes an image the
+API server already holds decoded (RGB uint8 ``[3, H, W]``, from the openpi WebSocket) and
+must return what ``load_image`` returns for the same pixels in a file. The default refuses,
+so a model takes images only as files until it overrides this. pi0.5's ``load_image`` calls
+it, so the two paths cannot drift apart. A robot policy also overrides ``robot_io``,
+returning a ``RobotIO``: the ``model_kwargs`` key its robot state goes under, and the
+``[action_horizon, action_dim]`` shape of the float32 actions its ``postprocess`` returns.
+The openpi WebSocket serves a model by these two hooks alone, so a new policy needs no
+change to the API server.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
    end a reply, which are dropped unless the request sets ``ignore_eos``.
    ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
    chunk may end inside a character, since the API server joins a request's text
-   chunks before decoding them, so a byte-level BPE model should declare
-   ``mstar.model.utils.TextChunkDetokenizer`` (or ``ByteLevelDetokenizer``), which
-   emits each token's raw bytes, rather than ``tokenizer.decode([id])``, which turns
-   a split character into U+FFFD.
+   chunks before decoding them, so declare a detokenizer from ``mstar.model.utils``
+   that emits each token's raw bytes (``TextChunkDetokenizer`` or
+   ``ByteLevelDetokenizer`` for byte-level BPE, ``SentencePieceDetokenizer`` for a
+   SentencePiece vocabulary) rather than ``tokenizer.decode([id])``, which turns a
+   split character into U+FFFD.
 
 ``postprocess(self, output, modality, request_kwargs=None) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on. Override it for any modality other than
-   text, and hand text to ``super().postprocess``.
+   images, and so on. The default encodes text through ``text_output`` and mono audio
+   as headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated;
+   integer samples are cast), and raises ``ValueError`` for any other modality. Override
+   it for those, or for audio with more than one channel, and hand the rest to
+   ``super().postprocess``.
 
 ``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
    ``postprocess`` for one decode step's inline values (one sampled token id per
    request), called once per step. With ``text_output`` declared, each id maps to
-   its memoized bytes; otherwise each value goes through ``postprocess`` as a
-   one-element tensor.
+   its bytes (the detokenizer's ``token_bytes``); otherwise each value goes through
+   ``postprocess`` as a one-element tensor.
 
 ``Model.nodes`` is a read-only property. It returns the sorted set of node names that
 appear in any graph walk.
@@ -273,12 +301,12 @@ differ per request, such as sampling parameters and the set of cache labels a re
 uses, come from a separate method::
 
    get_request_resource_configs(
-       self, partition_fwd_args: dict[str, ForwardPassArgs],
-       model_kwargs: dict | None = None,
+       self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
    ) -> dict[str, ResourceReqConfig]
 
 The returned dict is keyed by ``resource_key``. The conductor calls this method once per
-request, and the engine passes each config to its resource when the request is ingested.
+request, with the request's modalities and kwargs as ``walk_plan`` gets them, and the
+engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
@@ -313,6 +341,16 @@ There are two ``ResourceReqConfig`` subclasses:
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
+
+  A step whose every row samples greedily (``samples_greedy``: temperature 0, no
+  repetition penalty, no ``min_tokens`` and no log-probs) takes each row's argmax instead
+  of the full sampler's draw, eagerly or in a twin of each batched capture (see **Lean
+  captures** below); any other step runs the full sampler. By default only a sampler whose
+  ``vocab_size`` is past the one-kernel draw (4096) does this, since a narrower one draws
+  in one kernel already. ``SamplerSpec.greedy_capture`` overrides that: ``false`` turns it
+  off, and with it the twins' capture memory and time, for a deployment that never samples
+  greedily, and ``true`` turns it on whatever the vocabulary. A deployment sets it in its
+  ``resources:`` block. The model declares nothing for it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -323,8 +361,7 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
 .. code-block:: python
 
-   def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-       model_kwargs = model_kwargs or {}
+   def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
        return {
            SAMPLER: SamplingReqConfig(
@@ -335,6 +372,12 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 BAGEL (``bagel_model.py``) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.
+
+A spec can also build its own request's config from ``model_kwargs``
+(``NodeResourceSpec.request_config``), which the conductor adds beside the model's. That
+is how a resource the deployment declares, such as a LoRA pool, takes per-request
+settings without model code. A row with no config under a resource's key may let that
+resource run lean for the step; see **Lean captures** under the resources table.
 
 ``get_sampling_config(node_name, model_kwargs)`` still exists as a helper for assembling
 sampling parameters. The engine no longer reads it directly. Pass its result into a
@@ -410,15 +453,20 @@ BAGEL lays out its prompt:
 
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
    The iterations each named loop may run for this request. The conductor refuses a request
-   whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
+   whose cap is below 1 or past its loop's graph ``max_iters``, or whose layout at its caps holds more
    positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
-   the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
-   reads that length from ``request_info.max_tokens``, which carries the cut. A model that
-   reads a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
-   cap. A model whose stop
-   check ends a loop at a count returns that count, so the cap and the stop check end the
-   loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
-   every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+   the default ``max_output_tokens`` cut to the context its prompt leaves, and
+   ``request_info.max_tokens`` carries the cut. A model that reads a length from another key
+   lists it in ``LENGTH_KWARGS``. Speculation never runs past a cap, so the cap is the
+   loop's budget. A model with an AR decode loop names it in the class attribute
+   ``DECODE_LOOP``, and the default ``get_loop_caps`` caps it at ``max_output_tokens - 1``,
+   the prefill having sampled the first token; its stop check counts nothing. A model with
+   other loops whose count each request knows up front (denoise steps, rollout frames)
+   overrides ``get_loop_caps`` to add them, calling ``super()`` for the decode loop, and its
+   stop check counts nothing either. A model whose own stop check still ends a loop at a
+   count returns that count, so the two end the loop on the same iteration;
+   ``test/modular/test_model_kv_layouts.py`` checks caps per model. Growth on an uncapped
+   loop is counted to its graph ``max_iters``.
 
 Where ``process_prompt`` computes a length that a walk computes another way, such as a
 media item's rows, the walk asserts the two agree: BAGEL's ViT walk against
@@ -566,15 +614,19 @@ pages only up to its protected prefix, which the retention never releases.
 
 A request on a LoRA adapter fills different KV for the same tokens, so its keys chain from
 a root that names the adapter's weights: a SHA-256 over every module's A, B (with dtype
-and shape) and alpha, read once when the adapter is registered (``AdapterPrefixRoots`` in
-``mstar/engine/resources/lora/identity.py``, built by the preprocess worker at startup).
-The root travels with the request as ``KVReqConfig.prefix_root`` so that a page
+and shape) and alpha, read once when the adapter is registered (``adapter_prefix_root``
+in ``mstar/engine/resources/lora/identity.py``). The API server takes the root when it
+selects a request's adapter (``ServedModels.select``) and the preprocess worker keys the
+prompt from it. The root travels with the request as ``KVReqConfig.prefix_root`` so that a page
 generation fills is keyed under it too. The same tokens under two adapters, or under an
 adapter and the base model, never share pages; two names for identical weights do; and a
-name registered again with other weights misses everything the old weights filled. A
-base-model request chains from the empty root, so its keys are what they were before
-LoRA. A request whose adapter has no registered root is not keyed at all. Nothing on the
-model side is needed for this.
+name registered again with other weights misses everything the old weights filled; a
+request selected under the old weights carries their digest (``LoraReqConfig.digest``),
+and a pool serving the new ones refuses it at ingest. A base-model request chains from
+the empty root, so its keys are what they were before LoRA. Only a registered adapter
+can be selected, so every request on one has its root; one that arrives without is not
+cached.
+Nothing on the model side is needed for this.
 
 .. _Step 2a — Declare your resources:
 
@@ -748,12 +800,13 @@ The spec types are:
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
        defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
-       default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
-       ``flashinfer_backend``, the
+       default, ``RaggedAttnBackend.FLASHINFER``, ``RaggedAttnBackend.DENSE``, or
+       ``RaggedAttnBackend.CUDNN``), ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
        ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
-       ``workspace_mb``. ``DENSE`` runs FA3
+       ``workspace_mb``. ``CUDNN`` runs torch's cuDNN SDPA over
+       equal-length segments (see `Cacheless attention (encoder towers)`_). ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
        missing. By default the heads are split across all TP × SP ranks of the node;
        ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
@@ -840,17 +893,35 @@ The spec types are:
    * - ``LoraSpec`` (built by ``module_lora_spec``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
-       Returned from ``get_lora_specs`` (one per node), not this list, and built only
-       when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
-       adapters`_.
+       Opt-in (``NodeResourceSpec.opt_in``): declared in this list, built only when
+       the serving YAML has a ``resources: lora:`` block. One spec spans every node
+       adapters reach, with a pool per node. See `Per-request LoRA adapters`_.
+
+**Lean captures.** A resource whose kernels can be left out of a step whose rows all
+allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
+every rank of a lockstep instance sets alike (its ingests), and says which kinds of capture
+get its twin (``lean_captures``). Beside each bucket whose step drives such resources, the
+engine captures a twin for each set of them, keyed by that set (``BucketKey.lean``). A step
+replays the twin of every resource its rows let run lean, else one with fewer of them
+(largest set first, ties in declaration order), else the plain bucket; the engine names the
+set in ``StepContext.lean``, eager steps included, and each resource checks its rows again
+at plan. A resource whose callers read its plan inside the forward also overrides
+``Resource.outside_step``, which the engine enters around compile warm-ups outside any step
+(the LoRA pool's runs them lean). Twins are sized, planned and captured after every plain
+bucket, and a twin left out (under the capture budget, say) is logged at INFO and is not a
+dropped bucket: its steps replay the plain bucket. Lean resources: the LoRA pool, for
+steps none of whose rows names an adapter, in every kind of capture; and a sampler (see
+``SamplingReqConfig``), for steps whose rows all sample greedily, in batched captures. A
+model declares nothing for these.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
 
 .. code-block:: python
 
-   # mstar/model/orpheus/config.py
-   KV_CACHE, ATTN, SAMPLER, ROPE = "kv_cache", "attn", "sampler", "rope"
+   # mstar/model/orpheus/config.py: the keys its SampledTokenDecoder reads, and its attention's
+   KV_CACHE, SAMPLER, ROPE = keys.KV_CACHE, keys.SAMPLER, keys.ROPE
+   ATTN = "attn"
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -1017,7 +1088,28 @@ attends through them. A kernel that reads ``cu_seqlens`` as an argument, or buil
 mask from it, cannot be captured this way.
 
 ``RaggedAttnBackend.AUTO`` (and an explicit ``FLASHINFER``) plan through FlashInfer's
-ragged prefill wrapper. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
+ragged prefill wrapper. For a self-attention whose config names neither a backend nor a
+``flashinfer_backend`` (``None``, the default; an explicit ``auto`` is FlashInfer's own choice), ``AUTO`` first reads the ``ragged_attention`` kernel table
+(``mstar/kernels/tables/ragged_attention/``, see `Tuned kernel configs`_) for the rank's head
+geometry on the GPU. An eager plan runs the row its layout's longest query segment falls in, so
+one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
+the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
+klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B's 24 heads read
+klein 4B's entry, LTX-2.5's 32-head video self-attention klein 9B's): under a CUDA graph FlashInfer's
+``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs
+cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
+has run bounds them with a numeric last row and a ``"*"`` row naming ``flashinfer``, the resource's own
+default. A GPU of the architecture reads the file
+whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
+segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
+the layout it was planned with, so a captured bucket takes it only when the step that plans it
+declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
+scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
+denoise bucket, padding rows included, spans the bucket's tokens. An eager layout of unequal
+segments runs FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
+fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
+GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
+geometry, ``AUTO`` is FlashInfer with its own ``auto`` choice. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
 ``cu_seqlens`` buffers and runs FA3 ``flash_attn_varlen`` (AITER on ROCm) instead, with
 no page scatter. If that kernel is not importable, or the spec is a
 ``RaggedBlockCausalAttentionSpec`` (whose overlapping prefixes varlen cannot express),
@@ -1171,22 +1263,30 @@ model declares which linears adapters may touch; it never indexes the pool itsel
 
 A model declares LoRA from its own modules: the shared linears add the delta
 themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
-weights root. Orpheus is the reference (``OrpheusModel.get_lora_specs``):
+weights root. The spec is opt-in (``NodeResourceSpec.opt_in``), declared in
+``get_node_resources`` beside the model's other resources and built only when the
+serving YAML has a ``resources: lora:`` block. Orpheus is the reference
+(``OrpheusModel.get_node_resources``):
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
 
-   def get_lora_specs(self) -> list[LoraSpec]:
-       # the module the node's weight loader fills, at one rank, on the meta device
-       root = meta_root(lambda group: OrpheusForCausalLM(self.config, comm_group=group))
-       return [module_lora_spec(
-           root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"},
-           root_path="language_model",      # the root's attribute path in the node submodule
-           adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
-           rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
-           embeddings=True,                  # every embedding call is in the forward
-       )]
+   def get_node_resources(self) -> list[NodeResourceSpec]:
+       return [
+           ...,  # KV, attention, positions, sampler
+           module_lora_spec(
+               # builds the module the node's weight loader fills, at one rank, on the
+               # meta device: only once the spec is read, which a deployment without
+               # a `lora:` block never does
+               lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+               nodes={"LLM"},
+               root_path="model",               # the root's attribute path in the node submodule
+               adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
+               rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
+               embeddings=True,                  # every embedding call is in the forward
+           ),
+       ]
 
 The weights root states how the checkpoint lands on it once
 (``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
@@ -1228,23 +1328,24 @@ placed exactly as weights are.
   split projections adapters write, rewritten to the checkpoint's before the
   root's rules place them. ``ignore``: modules an adapter may carry that never run.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
-  encoder, which a TP config may put on different ranks) returns a spec per node, the
-  first keyed ``"lora"`` and the others apart, told about each other by
-  ``link_lora_specs``: a module belongs to the spec that places it (the one whose
-  ``adapter_roots`` claim it most specifically, when several do), and the others leave
-  it alone (``ignored_modules``), so one adapter file serves both. The one ``lora:`` block sizes them all, the conductor opens every request
-  with the same adapter on each, and the startup and runtime-load checks read an adapter
-  under every spec.
-- **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
-  under ``root_path``, after checking it is the declared target and that the pool's
-  shard is its rank-local shape (a module built whole on a TP node fails here, not in a
-  forward). The engine (``engine_step``) adds each pool's ``LoraStep`` to the node's
-  step from its segments, which are, in order, the rows its linears see (a request may
-  have several: Chatterbox's cond and uncond copies; Qwen3.5's vision encoder: one
-  segment per frame, the merger's rows folding them). A step that lays its rows out
-  otherwise declares its own ``LoraStep`` under the pool's key, which the engine keeps. A
-  step that is ``None`` or declares no segments gets none, and an adapted module it runs
-  refuses, so a node serving adapters returns a step with its segments wherever one runs.
+  encoder, which a TP config may put on different ranks) builds a spec per node with
+  ``module_lora_spec`` and declares one, ``join_lora_specs(llm, vision)``: its targets
+  name their nodes, a checkpoint module belongs to the node that places it (the one whose
+  ``adapter_roots`` claim it most specifically, when several do), so one adapter file
+  serves both, and each node gets a pool of its own (``LoraSpec.per_node``, keyed
+  ``lora@<node>``). The one ``lora:`` block sizes them all.
+- **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every module placed
+  on its node under ``root_path``, after checking it is the declared target and that the
+  pool's shard is its rank-local shape (a module built whole on a TP node fails here,
+  not in a forward). The pool's step is the node's own segments
+  (``Resource.steps_from_segments``): the engine (``engine_step``) adds a
+  ``ResourceStep`` of them under the pool's key, the rows its linears see, in order (a
+  request may have several: Chatterbox's cond and uncond copies; Qwen3.5's vision
+  encoder: one segment per frame, the merger's rows folding them). A step that lays its
+  rows out otherwise declares its own step under the pool's key, which the engine keeps.
+  A step that is ``None`` or declares no segments gets none, and an adapted module it
+  runs refuses, so a node serving adapters returns a step with its segments wherever one
+  runs.
 - **Only inside the step.** The pool holds a step's addressing from its plan to its
   commit (or rollback), for the thread that planned it, so a delta called outside a step
   (``prepare_inputs``, which the async worker runs on the main thread while the GPU
@@ -1256,9 +1357,9 @@ placed exactly as weights are.
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
   replayed as one row per step (``one_row_per_step``) addresses every row to the first
-  request's adapter, so the engine captures it base-only (``LoraBaseOnly``) and leases it
-  only for a step none of whose rows runs an adapter; a step with one runs the region
-  eagerly under the node's step.
+  request's adapter, so the engine captures it with the pool lean (``BucketKey.lean``
+  names the pool) and leases it only for a step none of whose rows runs an adapter; a
+  step with one runs the region eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -1289,15 +1390,19 @@ placed exactly as weights are.
   the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
   a deployment with ``runtime_updates`` off keeps the targets its configured adapters
-  touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
-  every worker with that list, so every process builds the same pools; an adapter it
-  cannot read fails the deployment.
-- **Requests.** Nothing per model. The conductor opens every request with a
-  ``LoraReqConfig`` from the ``lora_adapter`` request kwarg (``None`` for the base
-  model), which the OpenAI ``model`` field maps onto. ``validate`` refuses, with a 400, an
-  unknown adapter, one whose rank exceeds ``max_rank``, and one that touches a module the
-  model did not declare as a target. A request on an adapter is prefix-cached in its
-  adapter's own namespace (see **Cross-request prefix reuse**).
+  touch (a node left with none gets no pool): the API server reads them once at startup
+  (``resolve_lora_adapters``) and the conductor, handed that config, spawns every worker
+  with the list, so every process builds the same pools; an adapter it cannot read fails
+  the deployment.
+- **Requests.** Nothing per model. ``LoraSpec.request_config`` opens a request that
+  names an adapter in the ``lora_adapter`` kwarg, which the OpenAI ``model`` field maps
+  onto, with a ``LoraReqConfig``, which each node's pool takes; a base-model request
+  carries none. The API server refuses, with a 400, an adapter it does not serve
+  (``ServedModels``), and the conductor, with a 409, one a runtime load or unload is in
+  flight for; an adapter is checked when it is registered (rank within
+  ``max_rank``, only declared targets, shapes that fit), not per request. A request on an
+  adapter is prefix-cached in its adapter's own namespace (see **Cross-request prefix
+  reuse**).
 - **Capture and compile.** Nothing per model: a node serving adapters captures the same
   buckets and compiles the same as one that does not. A capture plans every row on the
   zero adapter; a replay's plan writes each row's slot into the buffers that capture
@@ -1305,13 +1410,13 @@ placed exactly as weights are.
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
   latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
-  the slot count alone. The engine captures every bucket of a node serving adapters a
-  second time, keyed ``LoraBaseOnly(<the node's own key>)``, with no LoRA kernel in it: a
-  step none of whose rows names an adapter replays that one (or runs its deltas as
-  ``y`` untouched, eagerly), and falls back to the LoRA capture when its twin was not
-  captured. The choice reads only which adapter each request named, the same on every
-  rank, and the pool checks it again at plan; ``cg_key_info`` and ``declare_step`` still
-  state only the node's own key.
+  the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
+  **Lean captures** under the resources table), so the engine captures every bucket whose
+  step drives it a second time with no LoRA kernel in it: a step none of whose rows names
+  an adapter replays that twin (or runs its deltas as ``y`` untouched, eagerly), and the
+  LoRA capture when the twin was not captured. The choice reads only which adapter each
+  request named, the same on every rank, and the pool checks it again at plan;
+  ``cg_key_info`` and ``declare_step`` still state only the node's own key.
 - **dtype.** The slot weights take the nodes' compute dtype (the serving config's
   ``autocast_dtype``, e.g. ``float16``). A node that runs outside autocast sets
   ``LoraSpec.dtype`` to its weights' dtype.
@@ -1338,7 +1443,7 @@ once, and its admit fails it before handing out any slot, so it takes none that 
 request needs. A reservation counts slots and pins none: which slot an admit takes follows
 from the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
-takes no slot there and runs no delta (its steps can replay the base-only capture): the
+takes no slot there and runs no delta (its steps can replay the lean capture; see **Lean captures**): the
 pool knows it from the file's header at startup, or from a runtime load's read, and its
 rows address the zero adapter. Only the
 rank that chooses batches admits: on a lockstep instance the leader, whose choice the
@@ -1575,12 +1680,13 @@ methods are:
    reports the partition done with that pass, and the conductor ends it rather than start
    decode. Return it only from a row outside any loop; from inside one the request fails.
    ``TokenStop`` does this for the walks in its ``prefill_walks``, whose token counts toward
-   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. A
-   model that prefills a prompt over several passes sets ``last_prefill_flag`` to the
-   ``step_metadata`` flag of its last pass, or a stop id sampled on its first pass ends
-   the request. It suits a partition with nothing left to run once generation stops: a model that runs
-   another walk after its loop (an ``align`` walk, or image generation after thinking) or
-   publishes final-only state at the loop's stop needs its own transition instead. Keep
+   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. Its
+   ``last_prefill_flag`` names the ``step_metadata`` flag of the pass whose token is the
+   reply's first, so a stop id sampled on an earlier pass ends nothing. ``SampledTokenDecoder``
+   names ``FINAL_PREFILL``, which the model's walk plan sets on that step. It suits a partition with nothing left to run once
+   generation stops: ``END_PARTITION`` ends the partition whatever its plan has left, so a
+   model that runs another walk after its loop (an ``align`` walk, or image generation after
+   thinking) or publishes final-only state at the loop's stop must not return it there. Keep
    ``check_stop_batched``, if you write one, in agreement.
    To also keep some of this step's outputs from being routed, return
    ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
@@ -1743,7 +1849,10 @@ captured graph fills those in first. Each KV pool of the node keeps its own bloc
 and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
 turns it on only if every resource of the node can (``Resource.resident_refusal``) and
 the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
-otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+otherwise. A resource the node shares with other nodes is fine while they plan on the host (a
+sharer's host step marks the rows it moved, and an offload it causes frees the slot on
+every planner bound to the resource); it is refused if another sharer names resident
+walks too, or runs in lockstep. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
 of the row, so a resident step stages none of them, while the RNG offset, the last token
@@ -1925,8 +2034,10 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.
+the prefill) still brings it routed, and that read puts it over the slot's.
+``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
+and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
+Qwen3-Omni's Thinker declare their own.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
@@ -2063,6 +2174,27 @@ into one GPU call. A submodule controls this behavior with these methods:
   every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
   last in that same line.
 
+**Walk priorities.** Which (node, walk) a worker's next step goes to is a
+``SchedulingPolicy`` (``mstar/worker/scheduling_policy.py``). By default it is round robin:
+the least recently scheduled key first, and a speculation chain keeps its first step before
+it gives way to other ready work. A model that returns ``WalkPriority`` entries from
+``Model.get_walk_priorities`` gets ``Priority`` instead. An entry names a node (all its
+walks), a walk (all its nodes) or one (node, walk), and where entries overlap the most
+specific decides: a pair over a walk over a node. Keys with ready rows go in priority order,
+round robin among equals, and a chain gives way at once when a key above its own has a row
+the engine would take. That trades the other keys' steps for the listed one's latency, so it
+suits a walk whose steps are short, such as a TTS model's prefill, whose first audio waits on
+it while decode streams have time to spare: list the walk, and every node on it is covered.
+A key that stays ready holds lower ones back for as long as it does, unless they have a
+``max_wait``: a ready key that has gone that many of the worker's chain steps (every step on
+its main chain, side-lane steps not counted) since it last ran goes
+first, longest waiting first, and a chain gives it its next step. A priority on one walk of a
+combined walk lifts the whole combined key in that order, its other walks' rows included, and
+a backlogged key, split over several steps, still finishes first whatever its priority. A
+deployment replaces the entries, sets a default ``max_wait`` or turns priorities off with the
+serving config's ``scheduling`` (see :doc:`serving`). An entry naming nothing the model runs,
+a negative priority, or two entries for the same target refuse the worker's start.
+
 .. _combined-walks:
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
@@ -2161,6 +2293,11 @@ Both types share the base ``CudaGraphConfig`` fields:
   scaffold's ``compile_blocks`` and Cosmos3's denoise step do. Building the config refuses
   an unknown mode, and one that turns on Inductor's own CUDA graphs (``reduce-overhead``,
   ``max-autotune``), which fail inside the runner's capture.
+- ``inductor_options`` are Inductor config entries the compile runs under, over the mode's
+  or the compile level's own, e.g. ``{"max_autotune_gemm_backends": "ATEN"}`` to keep
+  max-autotune's fusion choices but cuBLAS for the GEMMs (autotune's timings of decode-width
+  GEMMs can vary between processes). Building the config
+  refuses an entry Inductor doesn't have, and ``triton.cudagraphs``.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
@@ -2171,8 +2308,9 @@ in batched guidance that packs the conditional and unconditional sequences toget
 static buffer must hold all of them, and this field scales the buffer independently of the
 per-label span.
 
-For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a packed
-``prefill`` graph:
+For example, a token decoder that captures a batched ``decode`` graph and a packed
+``prefill`` graph declares the following (``SampledTokenDecoder`` builds these, and a
+mixed one, for its subclasses):
 
 .. code-block:: python
 
@@ -2496,6 +2634,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``SamplerSpec``
+     - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
+       ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
+       draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
+       each batched capture)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
@@ -2508,8 +2651,10 @@ that a misspelled setting is never silently ignored:
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``cudnn``), ``flashinfer_backend``
+       (unset by default: a self-attention reads the ``ragged_attention`` kernel table; any name,
+       ``auto`` / ``fa2`` / ``fa3`` / ``cudnn`` / ``cutlass``, runs that FlashInfer backend and no
+       table), ``max_segments_per_request``,
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
@@ -2519,13 +2664,12 @@ that a misspelled setting is never silently ignored:
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
        targets to allocate; by default, with ``runtime_updates`` off, the targets the
-       configured adapters touch, and every target with it on; a secondary node's spec
-       left with none builds no pool, while a YAML list leaving the model's first spec
-       (its LLM's) none is an error), ``runtime_updates`` (default false: serve
+       configured adapters touch, and every target with it on; a node left with none
+       gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
        ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
-       worker to answer one before giving up on it). One ``lora:`` block sizes every LoRA spec of the
-       model
+       worker to answer one before giving up on it). The one ``lora:`` block sizes the
+       pool of every node the model's spec reaches
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
@@ -2708,9 +2852,9 @@ its partial sum, and hand the norm the comm group: ``RMSNorm.forward_residual(x,
 comm_group)`` reduces, adds and norms, and ``RMSNorm.forward(x, comm_group)`` reduces and
 norms (a post-norm before the residual add). The two go together, since a norm called
 without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
-the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
-``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
-TP node.
+the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel``,
+``MuseGlimmerTextModel`` and ``RippleTextModel`` do. ``MultimodalDecoderModel`` builds the
+kernel's workspace for its TP node.
 
 .. _Guidance (CFG) parallelism:
 
@@ -2766,9 +2910,10 @@ To support it in a model:
 
 2. **Build the MoE layers with** ``instantiate_moe_block``. Accept ``moe_parallel`` in
    ``get_submodule`` and pass it, with the node's ``tp_group``, down to each MoE layer.
-   The helper returns a ``ParallelSparseMoeBlock`` or an ``ExpertParallelSparseMoeBlock``,
-   whose weight loaders keep only the rank's slice or its own experts. ``moe_parallel=None``
-   gives TP.
+   The helper returns a ``ParallelSparseMoeBlock``, with ``expert_parallel=True`` under EP.
+   It keeps its experts in a ``FusedExperts`` (``block.experts``), which owns the
+   ``gate_up_proj`` / ``down_proj`` parameters, the weight loaders that keep only the rank's
+   slice or its own experts, and the dispatch. ``moe_parallel=None`` gives TP.
 
    .. code-block:: python
 
@@ -2795,8 +2940,9 @@ To support it in a model:
      as a static input, so a replay can update it; fill it from
      ``engine_inputs.real_seq_len``. ``ThinkerSubmodule.preprocess`` shows the wiring.
 
-The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
-a node built from it stays TP-only.
+``instantiate_moe_block`` builds no shared-expert block. A node with one
+(``ParallelSparseMoeBlock(shared_expert=...)``, the Qwen3-Omni Talker's) builds it directly and
+stays TP-only.
 
 Tuned kernel configs
 ~~~~~~~~~~~~~~~~~~~~
@@ -2809,7 +2955,10 @@ per process and keeps the default config where no table has it, and the server l
 command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
 A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
 count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
-GPU's row names one that runs there.
+GPU's row names one that runs there. A cacheless self-attention (``ragged_attention``) takes its
+kernel per head geometry and longest query segment: torch's cuDNN SDPA or one of FlashInfer's
+ragged backends. A table can also be named for an architecture (``sm_103.json``) rather than one
+GPU model, for rows that hold on every GPU of it; the sweep's ``--arch`` writes that file.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.
@@ -2847,9 +2996,10 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``.
-``get_submodule`` builds either the Llama LLM submodule, which is an ``ARNodeSubmodule``,
-or the SNAC decoder submodule, and caches the result. ``postprocess`` returns the raw
-bytes of the audio tensor for the ``audio`` modality.
+``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
+declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+decoder submodule, and caches the result. The SNAC submodule emits int16
+PCM, which the default ``postprocess`` passes through as raw bytes.
 
 Orpheus also demonstrates the async partition API, described in the next section. The LLM
 and the SNAC decoder run as two partitions connected by a streaming edge. Audio is
@@ -2905,9 +3055,10 @@ config never routes requests to them.
 **Per-request resources.** Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL's ``get_request_resource_configs`` therefore returns a ``KVReqConfig`` that names
-the active labels per node and walk, together with a ``SamplingReqConfig``. A request with
-guidance disabled names only ``"main"``, so a PD-disaggregated transfer copies only that
-stream.
+the active labels per node and walk, together with a ``SamplingReqConfig``. It settles
+guidance from the request's modalities and kwargs as its ``walk_plan`` does (an edit, image
+in and image out, defaults to image guidance). A request with guidance disabled names only
+``"main"``, so a PD-disaggregated transfer copies only that stream.
 
 The ``LLM`` node is deliberately coarse. It contains the text embedding, the lm_head and
 the flow projection. These always run on the same GPU, so splitting them into separate
@@ -2978,15 +3129,19 @@ KV cache, but samples no token, so it does not produce ``new_token``. The edge i
 in the graph because understanding requests need it. Treat declared edges as the possible
 outputs, and let the submodule decide which of them are produced on each step.
 
-**Choosing the walk per request.** BAGEL's transitions are driven by a schedule, unlike
-those of Orpheus. The output modality is known in advance from the request's
-``output_modalities``. ``get_initial_forward_pass_args`` therefore builds a prefill
-schedule, by iterating over the interleaved text and image inputs, and
-``get_partition_forward_pass_args`` advances through that schedule. It then transitions to
-``decode`` for text output, or to ``image_gen`` for image output. In ``think_mode``, the
-model first decodes a reasoning trace, and the EOS token then triggers the transition to
-``image_gen``. These are the same two methods that Orpheus implements. BAGEL only encodes
-a more complex state machine in them.
+**Choosing the walks per request.** BAGEL's plan follows a schedule, unlike Orpheus's two
+fixed steps. The output modality is known in advance from the request's
+``output_modalities``, so ``walk_plan`` builds the prefill schedule by iterating over the
+interleaved text and image inputs, one walk per text span or image, and then adds
+``decode`` for text output or ``image_gen`` for image output. In ``think_mode`` the model
+first decodes a reasoning trace, so the plan runs ``decode`` and then ``image_gen``.
+
+Each prefill walk reads one span, so ``process_prompt`` hands every span over as a signal
+of its own with :func:`mstar.model.multimodal.split_spans` (``text_inputs.0``,
+``image_inputs.0``, ...), and each step binds its walk's input to one:
+``WalkStep("prefill_text", bind={"text_inputs": "text_inputs.1"})``. An ids span keys the
+entry its ``source`` names, so ``split_spans`` renames the KV layout's ids-span sources to
+match. This is the same method Orpheus implements; BAGEL's plan is only longer.
 
 **Step 4 — Submodules.** Each node maps to a ``NodeSubmodule`` in ``bagel/submodules.py``:
 ``ViTEncoderSubmodule``, ``VAEEncoderSubmodule``, ``LLMSubmodule`` and
@@ -3087,11 +3242,13 @@ overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model wit
 can call the same way.
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
-Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``);
-Whisper's declares its own, since it writes the context eagerly and captures prefill. The
-context segments have a non-zero span in the prefill step that writes them, and a span of
-0 in every later step. The ``commit`` in the prefill step converts the reservation into
-resident pages that the later steps read.
+Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),
+a ``SampledTokenDecoder`` that adds only the cross-attention part: the context segments,
+and the encoder output on the prefill row, which its decoder writes into the context
+before its layers read it. Whisper's declares its own, since it writes the context eagerly
+and captures prefill. The context segments have a non-zero span in the prefill step that
+writes them, and a span of 0 in every later step. The ``commit`` in the prefill step
+converts the reservation into resident pages that the later steps read.
 
 Worked example: an image DiT on the diffusion scaffold
 ------------------------------------------------------
@@ -3117,9 +3274,13 @@ iteration. The step index is the engine's loop counter
 
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
-step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
-``bucket_key`` with the Euler update inside the graph — and asks the model for:
+batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
+``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
+the graph — and asks the model for the hooks below. The loop ends on its iteration count:
+a model whose request picks its step count returns it from ``get_loop_caps``
+(``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
+stage that always runs its graph ``max_iters`` declares nothing. The scaffold refuses an
+iteration past the schedule. The hooks:
 
 .. code-block:: python
 
@@ -3207,8 +3368,8 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
 
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
 which declares the walks (``media_walks(max_iters, encoders)`` and
-``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
-through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
+``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
+and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
 request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
@@ -3223,8 +3384,9 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
-or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
-its sliding-window pool. ``media`` holds a
+or the engine refuses to start; Muse Glimmer and Ripple-65B return ``{}`` until a drop has run
+through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = False``) has no
+``prefill_text`` walk, so the scaffold returns ``{}`` for it. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
@@ -3254,9 +3416,9 @@ the encoders' outputs into the prompt's embeddings inside the forward
 (``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
-loop; a stop id on the prefill row, or a one-token budget, ends the partition before
-decode runs. The loop's cap, ``max(1, max_output_tokens - 1)``, is the only budget.
-A media row's tensor holds exactly the pads in its
+loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
+a one-token budget, ends the partition before decode runs. The loop's cap,
+``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
 ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
@@ -3275,10 +3437,19 @@ writes:
 
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
-``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
-position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
-``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, and ``MIXED_MAX_PREFILL_ROWS``
-caps a mixed step's prompt rows.
+``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
+``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
+(``ROPE`` unless the model's layers name another ``pos_key``). ``MSTAR_DECODE_BUCKETS``
+sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt
+rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
+takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
+only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
+calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
+``prefill``). A graph that names its other walks otherwise sets
+``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
+It reports a text prompt's length and a decode row's one token
+(``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
+prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): up to ``MAX_BATCH_SIZE`` requests per
@@ -3294,8 +3465,8 @@ buffers may round, and widens a narrower one, so a declaration wider than ``embe
 output replays the loop in more precision than the eager loop runs. A step whose spans
 under some label exceed the ragged resource's ``max_segments_per_step`` takes no lease and
 runs eagerly. On a node serving LoRA adapters a leased step still declares its spans, with
-no attention step, so the engine plans the LoRA rows of the bound modules around the loop
-(``lora_rows``). Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns
+no attention step, so the engine adds the pool's step of them for the bound modules around
+the loop (``engine_step``). Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns
 the deepstack taps (its ``_capture_block_loop``), which its own ``forward_batched`` reads
 off the replay.
 A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
@@ -3304,7 +3475,14 @@ A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
 through the node's dtype cast) and ``VisionBlock``, whose attention runs over the packed
 patches through the ragged resource under the block's ``label`` (Qwen3.5's frames;
 Muse Glimmer's windows and frames), q, k and v as one projection a split checkpoint
-loads by stacked-param rules.
+loads by stacked-param rules. An encoder of another medium need only send its ``MediaEncoder.output``,
+a row per pad in prompt order: Higgs-Audio's audio tower and Qwen3-ASR's packed AuT
+encoder are plain ``NodeSubmodule`` s on the audio walk. That walk is ``prefill_audio``
+unless the lone encoder's ``MediaEncoder.walk`` names it: Qwen3-ASR's keeps ``prefill``,
+the name its configs and metrics read. A model whose graph is not
+``MultimodalDecoderModel``'s (Canary-Qwen's LLM node is ``llm``) writes its own walks and
+hands its LLM node its ``MediaEncoder`` s and ``text_prompts`` itself, with
+``MEDIA_LAYOUT`` on the prefill step.
 
 Advanced: async partitions and streaming
 ----------------------------------------
@@ -3319,16 +3497,17 @@ Override these methods:
 - ``get_partition_topology()`` declares the partitions and the streaming ``Connection``
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
-- ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it. Every walk belongs to exactly one
-  partition.
+- ``get_partitions()`` declares each ``PartitionDefinition``: its name and its walks.
+  Every walk belongs to exactly one partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
-The consuming partition's ``get_partition_forward_pass_args`` reads
-``incoming_connections``, which provides token counts and a ``producer_done`` flag for
-each stream from another partition, and uses them to decide when to run. A stream from the
-client (below) has no entry there.
+A consuming partition's plan needs nothing about the stream. A step whose walk a stream
+feeds, and that runs no Loop but chunk loops, runs once per chunk the stream brings,
+and the partition ends when the worker reports the pass that consumed the stream's final
+chunk. For a stream from another partition, the conductor tells the consumer
+``producer_done`` once the producer partition is done; the data worker ends a stream from
+the client (below) itself.
 
 The consumer receives each chunk as its items stacked along a new leading dimension, or as
 the item itself when the chunk holds one. Don't write into a streamed input in place: a
@@ -3366,8 +3545,9 @@ context is reused across calls, so a hook must not keep it.
 
 Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
 ``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+ones run ``talker_decode``. Its plan lists the three walks. The conductor follows the walk
+each pass reports and enters the next step only to send it something, so it feeds
+``talker_decode`` its first input once ``talker_last_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -3387,7 +3567,8 @@ producer ``CLIENT``:
 ``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
 ``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
 chunk policy, exactly as it would a stream from another partition. Its partition
-self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
 that the model implements ``process_stream_chunk`` unless each client stream declares
 ``ClientAudio`` (below). A partition may take several client
@@ -3488,8 +3669,7 @@ Checklist
          [ ] get_node_resources
          [ ] get_graph_walk_graphs
          [ ] process_prompt
-         [ ] get_initial_forward_pass_args
-         [ ] get_partition_forward_pass_args
+         [ ] walk_plan
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs

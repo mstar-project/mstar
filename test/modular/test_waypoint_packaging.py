@@ -12,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - the project requires Python 3.
 
 import pytest
 from packaging.requirements import Requirement
+from setuptools.config.pyprojecttoml import read_configuration
 
 from mstar.cli.main import DEFAULT_CONFIGS, _resolve_config
 from mstar.model.waypoint.checkpoint import (
@@ -44,6 +45,12 @@ def test_published_metadata_contains_no_direct_url_dependencies():
         if Requirement(raw).url is not None
     ]
     assert direct == [], "PyPI rejects distributions that declare direct-URL dependencies"
+
+
+def test_wheel_package_discovery_excludes_the_checkout_emulator():
+    packages = read_configuration(str(ROOT_PYPROJECT))["tool"]["setuptools"]["packages"]
+    assert "mstar" in packages
+    assert not any(package == "mstar_sim" or package.startswith("mstar_sim.") for package in packages)
 
 
 def test_alias_packages_forward_the_waypoint_extra():

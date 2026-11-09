@@ -124,8 +124,15 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
+        # the lengths a resident step's wrapper last scheduled, by wrapper key
+        self._scheduled_lens: dict = {}
+        # a resident step's query indptr, by row count
+        self._resident_qo_indptr: dict[int, torch.Tensor] = {}
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
+        # the wrapper keys a pending preplan planned, whose cached plans a
+        # dropped preplan leaves naming workspaces it filled on the plan stream
+        self._preplan_keys: list = []
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
         self._last_plans: dict[Any, _LastPlan] = {}
 
@@ -148,8 +155,21 @@ class FlashInferCrossManager(CrossAttentionManager):
         return None
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        # the context pool's row is read only, and this plans its views on the host
+        # the host still plans FlashInfer's schedule
         step.host_planned = True
+        if self._query_kv_cache_name is None:
+            # its query packing comes off the step's rows, and it plans on the host whole
+            return
+        pool, query = self._kv_cache_name, step.streams[self._query_kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=query.label))
+        if wrapper is not None and wrapper.supports_gather_resident:
+            # the context's paged arrays come off the tables
+            table = step.block_tables[pool]
+            wrapper.gather_resident(
+                step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col,
+                appends=not step.streams[pool].reads,
+            )
+            step.lengths_only.add(pool)
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -189,6 +209,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._preplan_keys = []
             return
 
         laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
@@ -211,6 +232,19 @@ class FlashInferCrossManager(CrossAttentionManager):
                 plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
             request_ids = tuple(packing.request_ids)
+            if ctx.is_preplan:
+                self._preplan_keys.append(state_key)
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
+                # FlashInfer's schedule reads only the lengths, which a context keeps
+                indptrs = context_out.cpu_indptrs
+                lens = indptrs.kv_lens.numpy().tobytes()
+                if self._scheduled_lens.get(state_key) != lens:
+                    wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+                    self._scheduled_lens[state_key] = lens
+                laps.lap("schedule")
+                plan_states[plan_label] = wrapper
+                continue
+            self._scheduled_lens.pop(state_key, None)
             last = self._last_plans.get(state_key)
             if (
                 last is not None and last.context is context_out
@@ -255,6 +289,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
+        # a step run in its place on the same slot must plan again rather than
+        # skip to a schedule whose copies nothing ordered before its replay
+        for key in self._preplan_keys:
+            self._scheduled_lens.pop(key, None)
+            self._last_plans.pop(key, None)
+        self._preplan_keys = []
 
     def _context_output(self, ctx: StepContext):
         """The context label's KV plan output (its views are each request's
@@ -280,6 +320,15 @@ class FlashInferCrossManager(CrossAttentionManager):
     ) -> dict[str, QueryPacking]:
         if self._query_kv_cache_name is None:
             return self._step_query_packings(step)
+        if ctx.resident is not None:
+            # one query token a row, in the step's row order; the query pool's
+            # plan of a resident step may carry no views
+            rids = ctx.padded_request_ids
+            qo = self._resident_qo_indptr.get(len(rids))
+            if qo is None:
+                qo = self._resident_qo_indptr[len(rids)] = torch.arange(len(rids) + 1, dtype=torch.int32)
+            label = ctx.resident_plan.writes.streams[self._query_kv_cache_name].label
+            return {label: QueryPacking(request_ids=list(rids), qo_indptr=qo)}
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._query_kv_cache_name
