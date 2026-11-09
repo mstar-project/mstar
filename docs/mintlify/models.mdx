@@ -242,7 +242,7 @@ lora: {max_slots: 4, max_rank: 16, adapters: {tcg: <heftyTuna/qwen35-27b-tcg-lor
 
 Under TP the LLM's targets split as its linears do (the 27B's single K/V head per rank at TP4, and the DeltaNet `a` gate padded per rank, included); the vision encoder runs on one GPU in every shipped config.
 
-LoRA needs the Python frontend (`--rust-frontend` refuses to start with a `lora` block).
+Both frontends serve LoRA: a request's `model` names the adapter it runs under (`ServedModels`), and `/v1/models` lists the adapters beside the base model. Runtime updates (below) are the Python frontend's only for now: `mstar-server` reads the served adapters once at launch and has neither route, so `mstar serve` refuses `--rust-frontend` with `runtime_updates: true`.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's endpoints and bodies. They make the server read paths a client names, so they are off unless the `lora` block opts in, and answer 404 otherwise (as vLLM's do without `VLLM_ALLOW_RUNTIME_LORA_UPDATING`). The block may name no adapters at all (`resources: {lora: {max_slots: 4, runtime_updates: true}}`):
 

@@ -49,11 +49,7 @@ ROUTES = {
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
-NOT_PORTED = {
-    ("LTX25Adapter", "videos"),
-    ("MiniMaxH3Adapter", "videos"),
-    ("Wan22Adapter", "videos"),
-}
+NOT_PORTED: set[tuple[str, str]] = set()
 
 
 def _classes() -> dict[str, object]:
@@ -467,3 +463,40 @@ def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path)
     assert normalize_generation_kwargs(sub["mk"]) == want.model_kwargs
     assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
     assert not sub["files"]
+
+
+# ── an image request reaches the backend as the Python adapter builds it ────
+
+IMAGE_CASES = {
+    "size": {"prompt": "a cat", "size": "512x256"},
+    "size-spaced": {"prompt": "a cat", "size": " 512 X 256 "},
+    "size-underscored": {"prompt": "a cat", "size": "1_024x512"},
+    "size-empty": {"prompt": "a cat", "size": ""},
+    "bad-size": {"prompt": "a cat", "size": "big"},
+    "three-sides": {"prompt": "a cat", "size": "1x2x3"},
+    "seeded": {"prompt": "a cat", "seed": 3, "guidance_scale": 4.0},
+}
+
+
+@pytest.mark.parametrize("case", sorted(IMAGE_CASES))
+@pytest.mark.parametrize("cls", sorted(c for c, a in _classes().items() if a.supports_images))
+def test_an_image_request_is_submitted_or_refused_as_the_python_adapter_does(cls, case, tmp_path):
+    from mstar.api_server.openai.protocol import ImageGenerationRequest
+
+    model = _model_of(cls)
+    body = {"model": model, **IMAGE_CASES[case]}
+    try:
+        want = ADAPTER_REGISTRY[model].image_to_request(ImageGenerationRequest(**body), tmp_path)
+        refusal = None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        status, data = _post(port, "/v1/images/generations", body)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        return
+    assert status == 200, data
+    sub = stub.submitted[0]
+    assert (sub["text"], sub["in"], sub["out"], sub["mk"] or {}) == (
+        want.text, want.input_modalities, want.output_modalities, want.model_kwargs)
