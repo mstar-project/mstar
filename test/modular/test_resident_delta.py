@@ -729,7 +729,7 @@ def _oom(rank, referenced_rids=frozenset()):
     rank.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name="node", failed_resource=None,
         admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
-        request_ids=["r0", "r1"], cached_rids=set(),
+        request_ids=["r0", "r1"], cached_rids=set(), no_forward_rids=set(),
     ), referenced_rids)
 
 

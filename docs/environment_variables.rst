@@ -355,8 +355,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend, in seconds; on expiry the
-       client gets an error and the request is aborted in the backend.
-       ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       client gets an error and the request is aborted in the backend. ``0``
+       times every request out; a negative, non-finite or unreadable value is
+       the default. ``mstar serve --rust-frontend`` sets it from ``--timeout``
        (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``

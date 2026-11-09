@@ -395,7 +395,8 @@ class ExecutingBatch:
     # submodule's ``uniform_row_inputs``
     uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
-    # flow step for a request already past its own max iters
+    # flow step for a request already past its own max iters. One that takes
+    # its stream's final chunk still completes its node (see ``drop_rids``).
     skipped_rids: set[int] = field(default_factory=set)
     # rids whose whole walk this node's resources already hold. They run no
     # forward, but their node still completes so the request reaches its next walk.
@@ -485,6 +486,12 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
+    @property
+    def no_forward_rids(self) -> set:
+        """Rows that ran no forward but still complete their node: the ones
+        the cache served, and the ones that declined their stream's final chunk."""
+        return self.cached_rids | (self.final_stream_rids - set(self.request_ids))
+
     def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
         self._seq_lens = None
@@ -523,10 +530,15 @@ class ExecutingBatch:
         if not rids:
             return
         self.request_ids = [rid for rid in self.request_ids if rid not in rids]
-        # A row that does not run this step must not end its streams on it:
-        # the worker would stop its loop and finalize a row it no longer has.
-        self.final_stream_rids.difference_update(rids)
-        self.partition_done_rids.difference_update(rids)
+        # A row that failed must not end its streams on this step: the worker
+        # would stop its loop and finalize a row it no longer has. A declined
+        # row still does: it completes its node without a forward, so a
+        # consumer needs no dummy step to end on an empty final chunk. A row
+        # the cache served does not: its walk completes without one (its chunk
+        # Loop's stride, ``complete_cached_walk``).
+        ended = rids - (self.skipped_rids - self.cached_rids)
+        self.final_stream_rids.difference_update(ended)
+        self.partition_done_rids.difference_update(ended)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
@@ -2473,8 +2485,9 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
-        # A row that ran nothing this step -- one the prefix cache served whole
-        # -- has no iteration here to publish, though its loop still stops.
+        # A row that ran nothing this step -- one the prefix cache served whole,
+        # or one that declined its final chunk -- has no iteration here to
+        # publish, though its loop still stops.
         request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
         if not request_ids:
             return

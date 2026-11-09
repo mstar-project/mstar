@@ -20,7 +20,7 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
 import msgpack
 import torch
@@ -82,6 +82,9 @@ from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
 from mstar.validation import positive_int
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +420,19 @@ def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
     return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
 
 
+def _json_bytes(value: dict | None) -> int:
+    """``value``'s size as JSON; a binary value (a msgpack frame's) counts its length."""
+    binary = 0
+
+    def as_empty_string(v):
+        nonlocal binary
+        if not isinstance(v, (bytes, bytearray)):
+            raise ValueError(f"model_kwargs carry a {type(v).__name__}, which has no JSON size")
+        binary += len(v)
+        return ""
+    return len(json.dumps(value, default=as_empty_string)) + binary if value else 0
+
+
 def _check_raw_inputs(
     raw_inputs: dict[str, list[torch.Tensor]], file_paths: dict[str, list[str]] | None,
 ) -> None:
@@ -489,6 +505,8 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # only a model with turn marks reads its chunks' loop steps (metadata.step)
+        self.reads_turns = getattr(model, "turn_tokens", None) is not None
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(model_name, model_config)
         # The openpi WebSocket at `/`, when the config maps robot observations to this model.
@@ -509,10 +527,11 @@ class APIServer:
         )
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
-        self.client_streams = frozenset(
-            conn.edge_name for conn in model.get_partition_topology().client_connections()
-        ) if model is not None else frozenset()
+        connections = model.get_partition_topology().client_connections() if model is not None else []
+        self.client_streams = frozenset(conn.edge_name for conn in connections)
         self.takes_stream_input = bool(self.client_streams)
+        # the streams that declare their audio; a /v1/realtime conversation feeds one
+        self.client_audio = [conn for conn in connections if conn.audio is not None]
         self._model_config = model_config
         # the conductor's cap; the transcription route splits it between uploads
         self.max_concurrent_requests = (model_config or {}).get("max_concurrent_requests")
@@ -939,13 +958,16 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         model_kwargs: dict | None = None,
         on_late: Callable[[str], None] | None = None,
+        samples: "dict[str, np.ndarray] | None" = None,
     ) -> bool:
         """Append text and files to a running request's client streams, then
         end them: all of them if ``end_input`` is True, or the client streams
         it names. The preprocess worker deletes the files once loaded.
         ``file_streams`` names, per modality in ``file_paths``' order, the
         client stream each file is for (None: the model decides);
-        ``model_kwargs`` are this append's own. ``on_late`` answers the
+        ``model_kwargs`` are this append's own. ``samples`` appends decoded
+        mono float32 audio to ``ClientAudio`` streams, at each one's declared
+        rate, without a file. ``on_late`` answers the
         append as late if the model routes any of it to a stream that has
         ended (by the client, or with its consuming partition), which only
         the preprocess worker can tell.
@@ -961,8 +983,11 @@ class APIServer:
         """
         named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
-        )
+        ) | self._check_streams(samples or ())
+        if not_audio := set(samples or ()) - {conn.edge_name for conn in self.client_audio}:
+            raise ValueError(f"samples go only to a ClientAudio stream, not {sorted(not_audio)}")
         ending = None if end_input is True else self._check_streams(end_input or ())
+        kwargs_bytes = _json_bytes(model_kwargs)
         with self.request_lock:
             req = self.pending_requests.get(key)
             if req is None or not req.open_streams or req.event.is_set():
@@ -971,7 +996,8 @@ class APIServer:
                 ending = req.open_streams
             if (named | ending) - req.open_streams:
                 return False  # late for a stream the client already ended
-            size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
+            size = (req.input_bytes + _file_bytes(file_paths) + len((text or "").encode()) + kwargs_bytes
+                    + sum(audio.nbytes for audio in (samples or {}).values()))
             self._check_call_input(size)
             req.input_bytes = size
             req.last_input_time = time.monotonic()
@@ -979,7 +1005,7 @@ class APIServer:
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
                 key, file_paths=file_paths, ends=ending, text=text,
-                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late,
+                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late, samples=samples,
             ))
         return True
 
@@ -1151,12 +1177,16 @@ class APIServer:
                             pending = self.pending_requests
                             if all(rid in pending for rid in body.request_ids):
                                 rids, values, logprobs = body.request_ids, body.values, body.logprobs
+                                loops = body.loop_indices if self.reads_turns else None
                             else:
                                 rids, values, logprobs = [], [], []
+                                loops = [] if self.reads_turns else None
                                 for i, (rid, value) in enumerate(zip(body.request_ids, body.values, strict=True)):
                                     if rid in pending:
                                         rids.append(rid)
                                         values.append(value)
+                                        if loops is not None:
+                                            loops.append(body.loop_indices[i])
                                         if body.logprobs:
                                             logprobs.append(body.logprobs[i])
                                     elif rid not in self.recently_completed:
@@ -1165,7 +1195,7 @@ class APIServer:
                                         )
                             if rids:
                                 self.preprocess_worker.new_result_tokens(
-                                    rids, values, body.signal, body.modality, logprobs or None,
+                                    rids, values, body.signal, body.modality, logprobs or None, loops,
                                 )
                         continue
 
@@ -1887,9 +1917,10 @@ class APIServer:
             self._msg_thread.join(timeout=2)
 
 
-def _resolve_warmup_path(path: str) -> str:
+def _resolve_warmup_path(path: str, cache_dir: str | None = None) -> str:
     """A warmup file is a local path, or ``hf://<owner>/<repo>/<path>`` for a
-    file shipped with a model (its example inputs), taken from the HF cache."""
+    file shipped with a model (its example inputs), taken from the HF cache
+    (``--cache-dir``, as the weights are)."""
     if not path.startswith("hf://"):
         return path
     parts = path[len("hf://"):].split("/", 2)
@@ -1897,7 +1928,7 @@ def _resolve_warmup_path(path: str) -> str:
         raise ValueError(f"hf:// path needs <owner>/<repo>/<path>, got {path!r}")
     from huggingface_hub import hf_hub_download
 
-    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2])
+    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2], cache_dir=cache_dir)
 
 
 @dataclass
@@ -1964,7 +1995,7 @@ class WarmupRequest:
             model_kwargs=model_kwargs,
         )
 
-    def submit(self, server: APIServer, request_id: str) -> str:
+    def submit(self, server: APIServer, request_id: str, cache_dir: str | None = None) -> str:
         """Submit to ``server`` the way ``/generate`` would, ``hf://`` files
         resolved from the cache."""
         file_paths: dict[str, list[str]] = {}
@@ -1972,7 +2003,7 @@ class WarmupRequest:
         for media in self.files:
             paths = file_paths.setdefault(media.modality, [])
             parts.append(PromptPart(modality=media.modality, index=len(paths)))
-            paths.append(_resolve_warmup_path(media.path))
+            paths.append(_resolve_warmup_path(media.path, cache_dir))
         if self.text:
             parts.append(PromptPart(modality="text", text=self.text))
         return server.submit_request(
@@ -2009,6 +2040,7 @@ def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
 
 def _run_warmup_requests(
     server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
+    cache_dir: str | None = None,
 ) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
@@ -2034,7 +2066,7 @@ def _run_warmup_requests(
         return
 
     async def _one(request: WarmupRequest, request_id: str) -> None:
-        await server.collect_results(request.submit(server, request_id))
+        await server.collect_results(request.submit(server, request_id, cache_dir))
 
     async def _all(request: WarmupRequest, base_id: str, n: int) -> None:
         # every copy runs to its end before a failure is reported, so none is
@@ -2259,12 +2291,14 @@ def _ws_is_append(message: dict) -> bool:
     return "append" in message or (ends and not _WS_INPUT_FIELDS & message.keys())
 
 
-def _ws_end_input(message: dict) -> bool | list[str]:
+def _ws_end_input(message: dict, absent: bool = False) -> bool | list[str]:
     """A message's ``end_input``: true for all of the call's client streams,
-    or a list of the ones it ends; absent or null is false."""
+    or a list of the ones it ends; ``absent`` when it is absent or null."""
     value = message.get("end_input")
-    if value is None or isinstance(value, bool):
-        return bool(value)
+    if value is None:
+        return absent
+    if isinstance(value, bool):
+        return value
     if isinstance(value, list) and all(isinstance(name, str) for name in value):
         return value
     raise ValueError("end_input must be true, false or a list of client stream names")
@@ -2338,14 +2372,15 @@ async def generate_ws(websocket: WebSocket):
     order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
 
-    A request to a model with client streams keeps its input open until the
-    client ends it: ``{"request_id", "append": {"text", "files",
-    "model_kwargs"}}`` feeds the request's streams (each file may name its
-    ``stream``; ``"append": [files]`` is short for ``{"files": [files]}``), and
-    ``{"request_id", "end_input": true}`` (alone or on an append, or on the
-    opening message) ends them, or a list of stream names only those. A live call
-    needs a ``request_id``, and only the socket that opened it can append to
-    it. A message with ``append``, or with ``end_input`` (true or a list) and
+    A request to a model with client streams ends its input at open, as on
+    ``/generate``, unless the opening carries ``"end_input": false`` (or a list
+    of the streams it ends): then the input stays open until the client ends
+    it. ``{"request_id", "append": {"text", "files", "model_kwargs"}}`` feeds
+    the request's streams (each file may name its ``stream``; ``"append":
+    [files]`` is short for ``{"files": [files]}``), and ``{"request_id",
+    "end_input": true}`` (alone or on an append) ends them, or a list of
+    stream names only those. A live call needs a ``request_id``, and only the
+    socket that opened it can append to it. A message with ``append``, or with ``end_input`` (true or a list) and
     no ``text`` or ``files``, is an append; one that opens a request under a live call's
     id is refused with a 409. A null field counts as absent. A rejected
     append ends the call with its error (``status`` 400) and no finish; an
@@ -2416,9 +2451,12 @@ async def generate_ws(websocket: WebSocket):
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
-            end_input = _ws_end_input(message)
+            # an opening is one-shot unless it says otherwise
+            end_input = _ws_end_input(message, absent=True)
             if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
-                raise ValueError("message carries neither text nor files")
+                # a one-shot opening: the client may have meant a live one
+                hint = " (open a live call with end_input: false)" if api_server.takes_stream_input else ""
+                raise ValueError("message carries neither text nor files" + hint)
             file_paths, parts = await _decode_ws_files_off_loop(
                 message.get("files"), api_server.upload_dir,
             )
@@ -2542,8 +2580,8 @@ async def generate_ws(websocket: WebSocket):
                 record.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(record.get("files"), parts)
-            if not file_paths and not text and not end_input:
-                raise ValueError("an append needs text, files or end_input")
+            if not file_paths and not text and not model_kwargs and not end_input:
+                raise ValueError("an append needs text, files, model_kwargs or end_input")
             loop = asyncio.get_running_loop()
 
             def on_late(error: str) -> None:
@@ -2634,7 +2672,7 @@ async def generate_ws(websocket: WebSocket):
                        "status": 409}, binary)
                 continue
             call = None
-            if api_server.takes_stream_input and message.get("end_input") is not True:
+            if api_server.takes_stream_input and message.get("end_input") not in (None, True):
                 # a live call: appends find it by id, from the moment it is read
                 if request_id is None:
                     reply({"request_id": None, "error": "a live call needs a request_id"}, binary)
@@ -2806,7 +2844,7 @@ async def generate(
         except json.JSONDecodeError:
             raise   # a downstream parse failure, not a bad request (a 500 below)
         except ValueError as e:   # submit_request's refusals are the client's fault
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            raise HTTPException(status_code=400, detail=scrub_paths(str(e))) from e
 
         if streaming:
             # Substring match, not RFC 7231 q-value parsing: the value is a
@@ -3178,7 +3216,7 @@ def main(argv: list[str] | None = None):
                 "Running %d warmup request(s) before binding, %s%d copies at a time (one per replica)",
                 len(warmups), "each once alone, then " if replicas.fewest < replicas.most else "", replicas.most,
             )
-            _run_warmup_requests(api_server, warmups, replicas)
+            _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
