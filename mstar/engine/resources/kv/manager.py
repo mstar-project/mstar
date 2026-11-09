@@ -4671,8 +4671,8 @@ class KVManager(AttentionResource):
                 mark.rid, mark.node_name, mark.graph_walk, mark.published,
             )
             if pages <= self._room():
-                self._admit(earmark.rid, pages)
-                self._stalled.add(earmark.rid)
+                if self._admit(earmark.rid, pages):
+                    self._stalled.add(earmark.rid)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
