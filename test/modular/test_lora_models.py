@@ -425,11 +425,12 @@ def _vision_pool(paths, max_slots=2):
 
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
+    from test_lora_pool import engine_lean
+
     lora_pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter=adapter))
-    # idle as the engine sets it: a leased step as its bucket was captured, an eager one
-    # when its row names no adapter
-    idle = lease.bucket.idle if lease is not None else adapter is None
-    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease, idle=idle)
+    # lean as the engine sets it: a lease's bucket's, or what an eager step's rows allow
+    lean = engine_lean(lora_pool, [rid]) if lease is None else lease.bucket.lean
+    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease, lean=lean)
     lora = step.steps[VISION_POOL]
     assert lora_pool.admit(lora, ctx).ok
     lora_pool.plan(lora, ctx)
@@ -440,10 +441,10 @@ def _encode_leased(sub, lora_pool):
     """As the leased path runs it, for a step whose rows run no adapter (``can_lease``
     leases a one-row region to no other): the outer step plans only the LoRA rows of the
     patch embed and merger (attention is the region's), and the block loop's region plans
-    its own, both idle."""
+    its own, both lean."""
     region_cfg = sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), H.DTYPE)[VISION_BLOCK_LOOP]
     bucket = 32
-    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP, idle=True))
+    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP, frozenset({VISION_POOL})))
     inp = _prompt(sub)
     outer = engine_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
     assert set(outer.steps) == {VISION_POOL}

@@ -654,10 +654,6 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
 class _FakeMgmt(SubmoduleManagement):
     """``SubmoduleManagement``'s slot rotation from a chosen slot, recording what the forward was pointed at."""
 
-    # no idle-capable resource
-    idle_keys = ()
-    rows_idle = SubmoduleManagement.rows_idle
-
     def __init__(
         self, submodule, num_slots: int, next_slot: int, seen: list,
         slot_raise_at: int | None = None,

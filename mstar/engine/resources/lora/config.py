@@ -458,8 +458,8 @@ class LoraSpec(NodeResourceSpec):
 
     def request_config(self, model_kwargs: dict | None) -> "LoraReqConfig | None":
         """The adapter the ``lora_adapter`` kwarg names, and the digest it was selected
-        under; None for a base-model request, which leaves the pool idle
-        (``Resource.idle_capture``)."""
+        under; None for a base-model request, which lets the pool run lean
+        (``Resource.lean_capture``)."""
         kwargs = model_kwargs or {}
         adapter = kwargs.get(LORA_ADAPTER_KWARG)
         return None if adapter is None else LoraReqConfig(adapter=adapter, digest=kwargs.get(LORA_DIGEST_KWARG))

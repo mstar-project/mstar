@@ -34,6 +34,7 @@ from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     AllocationFailed,
+    BucketKey,
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
@@ -58,6 +59,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
+    lean_subsets,
 )
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -102,6 +104,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# the lean set of a step that runs every resource plain
+_NOT_LEAN: frozenset[str] = frozenset()
+
 # Block the GPU thread on its step's outputs before returning (1-step launch
 # bound vs the worker's default 2-step). Off by default: it kills the
 # GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA
@@ -139,10 +144,10 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
 
 @contextmanager
 def _outside_steps(submodule_mgmt) -> Iterator[None]:
-    """A node's forwards run outside any step (compile warm-ups), with its idle-capable
-    resources sitting them out (``Resource.outside_step``)."""
+    """A node's forwards run outside any step (compile warm-ups), with its lean-capable
+    resources as in a step that runs them lean (``Resource.outside_step``)."""
     with ExitStack() as stack:
-        for key in submodule_mgmt.idle_keys:
+        for key in submodule_mgmt.lean_keys:
             stack.enter_context(submodule_mgmt.resources[key].outside_step())
         yield
 
@@ -219,14 +224,16 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
-    # the keys of the node's idle-capable resources (`Resource.idle_capture`)
-    idle_keys: tuple[str, ...] = field(init=False, default=())
+    # the keys of the node's resources that can run lean (`Resource.lean_capture`),
+    # in declaration order
+    lean_keys: tuple[str, ...] = field(init=False, default=())
+    # a lean set -> the twins a step of it tries (`lean_candidates`)
+    _lean_candidates: dict[frozenset[str], tuple[frozenset[str], ...]] = field(
+        init=False, default_factory=dict, repr=False,
+    )
 
     def __post_init__(self):
-        self.idle_keys = tuple(key for key, res in self.resources.items() if res.idle_capture)
-        if len(self.idle_keys) > 1:
-            # a step is idle or not as a whole, so one idle twin can't serve two resources
-            raise ValueError(f"a node takes at most one idle-capable resource; got {list(self.idle_keys)}")
+        self.lean_keys = tuple(key for key, res in self.resources.items() if res.lean_capture)
         # Two hazards want a second slot, both of them the host running ahead of
         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
         # reading, and ``force_double_buffer`` is the same for a resource
@@ -282,19 +289,25 @@ class SubmoduleManagement:
             self._next_slot = (self._next_slot + 1) % self._num_slots
             return slot
 
-    def rows_idle(self, rids) -> bool:
-        """Whether none of ``rids`` uses the node's idle-capable resources, which then sit
-        the step out (``Resource.idle_for``). False at once for a node with none. Each
-        resource answers from the ingests of ``rids``, the same on every rank for the same
-        rows: a remove waits until no step holds its row
-        (``StepPipeline._await_admit_settled``, ``RequestLifecycle.removes_ready``). The
-        rows can differ: a rank whose pre-plan was skipped (its commit wait timed out)
-        leases at exec over the rows the step kept, while another replays the lease its
-        pre-plan took (``reset_pre_plan_for_batch`` keeps it). One rank can then replay the
-        idle graph and another the plain one. The twins differ only in the idle resources'
-        kernels, so those must hold no collective (``Resource.idle_capture``)."""
-        keys = self.idle_keys
-        return bool(keys) and all(self.resources[key].idle_for(rids) for key in keys)
+    def lean_of(self, rids) -> frozenset[str]:
+        """The keys of the node's resources that every one of ``rids`` lets run lean
+        (``Resource.lean_for``); empty at once for a node with none."""
+        keys = self.lean_keys
+        if not keys:
+            return _NOT_LEAN
+        resources = self.resources
+        return frozenset(key for key in keys if resources[key].lean_for(rids))
+
+    def lean_candidates(self, lean: frozenset[str]) -> tuple[frozenset[str], ...]:
+        """The lean twins a step that leaves ``lean`` lean may replay, in the order
+        it tries them: ``lean`` itself, then its subsets by decreasing size, ties in
+        declaration order. The plain bucket comes after all of them."""
+        candidates = self._lean_candidates.get(lean)
+        if candidates is None:
+            candidates = self._lean_candidates[lean] = lean_subsets(
+                [key for key in self.lean_keys if key in lean]
+            )
+        return candidates
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -1066,10 +1079,13 @@ class Engine:
             )
         for pool, costs in pools.items():
             if costs:
+                # a piecewise pool keys its regions' buckets (label, bucket), and has no twins
+                twins = [bucket for bucket in costs if isinstance(bucket, BucketKey) and bucket.lean]
                 logger.info(
-                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted, %.0f outside the allocator",
-                    self._device, pool, len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
-                    plan.outside[pool] / 2**20,
+                    "CapturePlan[%s] %s: %d of %d buckets%s, %.0f MiB predicted, %.0f outside the allocator",
+                    self._device, pool, len(plan.buckets[pool]), len(costs),
+                    f" ({len(plan.buckets[pool].intersection(twins))} of {len(twins)} lean twins)" if twins else "",
+                    plan.predicted[pool] / 2**20, plan.outside[pool] / 2**20,
                 )
         return plan
 
@@ -1862,9 +1878,9 @@ class Engine:
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
-                idle=submodule_mgmt.rows_idle((rid,)),
                 rebuild_rids=batch.step_context.rebuild_rids,
                 request_walks={rid: walks[rid]} if rid in walks else {},
+                lean=submodule_mgmt.lean_of((rid,)),
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
@@ -3006,8 +3022,11 @@ class Engine:
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
-        idle = submodule_mgmt.rows_idle(batch.request_ids)
-        batch.step_context.idle = idle
+        # The resources this batch's rows let run lean. An eager step runs them lean
+        # as they are; a lease runs whatever its bucket was captured with.
+        lean = submodule_mgmt.lean_of(batch.request_ids)
+        ctx = batch.step_context
+        ctx.lean = lean
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             return None
@@ -3024,21 +3043,21 @@ class Engine:
             None if batch.inputs is None
             else sum(inp.input_seq_len for inp in batch.inputs)
         )
-        batch.cg_key_info = key
-        # an idle step replays the bucket's twin captured without the idle resources'
-        # kernels, else the plain one, under which they run on rows that address nothing
+        # the tightest plain bucket, or its leanest captured twin this batch allows;
+        # every resource checks its rows again at plan
         lease = cg_runner.lease_slot(
-            graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-            slot=batch.slot, num_tokens=num_tokens, cg_key_info=key, idle=idle,
+            graph_walk=ctx.graph_walk, bs=len(batch.request_ids),
+            slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
+            lean=submodule_mgmt.lean_candidates(lean) if lean else (),
         )
+        batch.cg_key_info = key
         planner = submodule_mgmt.resident
-        ctx = batch.step_context
         ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
         ctx.resident_plan = None
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
-            ctx.idle = lease.bucket.idle
+            ctx.lean = lease.bucket.lean
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:

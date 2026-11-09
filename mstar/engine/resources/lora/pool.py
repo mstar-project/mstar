@@ -182,8 +182,9 @@ class LoraLayerDelta:
 
     A layer computes its base output, then calls this before anything consumes ``y`` —
     for a row-parallel linear, before its all-reduce. Rows on the base model address the
-    zero adapter, which the kernels skip; an idle step (``StepContext.idle``: no row names
-    an adapter) returns ``y`` untouched (``LoraAdapterPool.active``). The layer's slot
+    zero adapter, which the kernels skip; a step that runs the pool lean
+    (``StepContext.lean``: no row names an adapter) returns ``y`` untouched
+    (``LoraAdapterPool.active``). The layer's slot
     weights are views resolved once, here; a call reads only the step's addressing.
     """
 
@@ -224,7 +225,7 @@ class LoraLayerDelta:
         if self.experts > 1:
             raise ValueError("an experts target's delta is per (token, top-k) row: add it with `grouped_`")
         if not self._active():
-            # an idle step: no row names an adapter, so nothing is launched
+            # a lean step: no row names an adapter, so nothing is launched
             return y
         if self._embedding:
             x = x.reshape(-1)
@@ -256,7 +257,7 @@ class LoraLayerDelta:
     def expert_rows(self, topk_ids: torch.Tensor, others: Sequence[LoraLayerDelta] = ()) -> ExpertRows | None:
         """The rows of ``topk_ids`` (``[tokens, top_k]``, this rank's expert ids) for this
         experts delta and ``others``, the same MoE layer's other experts deltas; None on
-        an idle step.
+        a lean step.
 
         Each row addresses its token's slot's A and B for its expert through one combined
         id ``(slot - 1) * experts + expert``. A row on the zero adapter, on a slot whose
@@ -346,9 +347,9 @@ class LoraAdapterPool(Resource):
     # holds no per-token state, so a request whose prompt prefix was served from the cache
     # runs here exactly as one that computed it
     prefix_skip_safe = True
-    # a base-model request carries no config here (`LoraSpec.request_config`), so a step
-    # of them runs a graph captured without the deltas
-    idle_capture = True
+    # a step none of whose rows names an adapter runs no delta (`lean_for`), so each
+    # bucket, piecewise regions' included, has a twin with no LoRA kernel
+    lean_capture = True
     # a node's rows are its segments' tokens, so it declares nothing for the pool
     steps_from_segments = True
     # a dropped request keeps its adapter and slot, and its rebuild runs under that adapter
@@ -397,6 +398,7 @@ class LoraAdapterPool(Resource):
         chooses batches, and so admits requests (``ask``): False on a lockstep instance's
         followers."""
         self.spec = spec
+        self.resource_key = spec.resource_key
         self._device = torch.device(device)
         self.dtype = spec.dtype or dtype
         if self.dtype is None:
@@ -558,8 +560,8 @@ class LoraAdapterPool(Resource):
 
     @contextmanager
     def outside_step(self) -> Iterator[None]:
-        """A forward outside any step (a compile's warm-up) on this thread, as an idle
-        step: its deltas add nothing. A compile traced here takes the idle branch, so the
+        """A forward outside any step (a compile's warm-up) on this thread, as a lean
+        step: its deltas add nothing. A compile traced here takes the lean branch, so the
         first step with an adapter row compiles its own."""
         saved = self._current, self._plan_thread, self.active
         self._current, self._plan_thread, self.active = {}, threading.get_ident(), False
@@ -1055,14 +1057,32 @@ class LoraAdapterPool(Resource):
 
     # Addressing
 
-    def idle_for(self, rids) -> bool:
-        """Whether no row of ``rids`` names an adapter with something for this pool
-        (``Resource.idle_for``): set at ingest and from the adapters' files, so the same
-        on every rank of a lockstep instance."""
+    def runs_adapters(self, rids) -> bool:
+        """Whether any of ``rids`` names an adapter with something for this pool: set at
+        ingest and from the adapters' files, so the same on every rank of a lockstep
+        instance."""
         if not self._live:
-            return True
+            return False
         get, empty = self._adapter_of.get, self._empty
-        return not any((name := get(rid)) is not None and name not in empty for rid in rids)
+        return any((name := get(rid)) is not None and name not in empty for rid in rids)
+
+    def lean_for(self, rids) -> bool:
+        """A step runs base-only when none of its rows names an adapter with something
+        for this pool (``runs_adapters``)."""
+        return not self.runs_adapters(rids)
+
+    def _adds_deltas(self, segments, ctx: StepContext) -> bool:
+        """Whether this step's deltas run: unless the step runs this pool lean
+        (``StepContext.lean``), a capture recording none and an eager step skipping them."""
+        if self.resource_key not in ctx.lean:
+            return True
+        if not ctx.capture and self.runs_adapters(seg.request_id for seg in segments):
+            # its rows would lose their deltas silently
+            raise RuntimeError(
+                f"LoRA resource {self.spec.resource_key!r}: a base-only step "
+                f"({ctx.slot_lease.bucket if ctx.slot_lease is not None else 'eager'}) has rows that name an adapter"
+            )
+        return False
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> LoraAddressing | None:
         self._plan_thread = threading.get_ident()
@@ -1070,12 +1090,7 @@ class LoraAdapterPool(Resource):
             # before the memoized return below, which a region's repeat plan takes too
             self._enclosing = (self._current, self.active)
         segments = step.segments or ()
-        self.active = not ctx.idle
-        if not self.active and not ctx.capture and not self.idle_for(seg.request_id for seg in segments):
-            # its rows would lose their deltas silently
-            raise RuntimeError(
-                f"LoRA resource {self.spec.resource_key!r}: an idle step's rows name an adapter"
-            )
+        self.active = self._adds_deltas(segments, ctx)
         if not self.active:
             # no delta reads an addressing, so none is staged
             self._current = {}

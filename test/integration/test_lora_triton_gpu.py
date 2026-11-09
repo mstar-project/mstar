@@ -131,9 +131,7 @@ def eager_step(pool, rows, walk="prefill_text", ingest=True):
     for rid, name, _ in rows if ingest else ():
         pool.ingest_request(rid, None if name is None else LoraReqConfig(adapter=name))
     step = ResourceStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
-    # idle as the engine sets it: no row names an adapter
-    ctx = StepContext(request_ids=[rid for rid, *_ in rows], graph_walk=walk, slot=0, capture=False,
-                      idle=all(name is None for _, name, _ in rows))
+    ctx = StepContext(request_ids=[rid for rid, *_ in rows], graph_walk=walk, slot=0, capture=False)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
     return step, ctx
