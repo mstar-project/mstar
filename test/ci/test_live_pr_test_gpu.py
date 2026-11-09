@@ -220,6 +220,8 @@ class TestEras(unittest.TestCase):
         calls = self.eras_launch(max_running=0)
         self.assertEqual([c[:2] for c in calls if c[0] in ("POST", "exit")], [("exit", 4)],
                          "a refused launch would leave an ssh key in the organization")
+        self.assertIn(("POST", "/instances"), [c[:2] for c in self.eras_launch(max_running=1, held=())],
+                      "a launch under budget.max_running would be refused")
 
 
 if __name__ == "__main__":
