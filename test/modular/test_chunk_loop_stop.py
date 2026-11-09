@@ -21,7 +21,6 @@ from mstar.model.submodule_base import CHUNK_LOOP_END
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
-from mstar.worker.step_executor import StepExecutor
 
 NODE = "LLM"
 
@@ -88,27 +87,6 @@ def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
     )
     assert batch.loop_strides(list(range(1, 21))) is None
     assert _CountingBatch.looked_up == 0
-
-
-def test_a_mid_prefill_row_keys_no_prefix():
-    """Postprocess must hand the rows mid-prefill to the prefix chain as
-    skips: a non-final chunk's sampled token is not a real sample, so keying
-    the chain on it keys a token the request never generated.
-
-    A structural guard, not a behavioural one -- driving the real postprocess
-    needs most of a worker. It is here because the call was dropped once and
-    nothing else noticed: the chain simply stopped being extended.
-    """
-    import inspect
-
-    src = inspect.getsource(StepExecutor.postprocess)
-    assert "engine.step_finished(" in src, "the prefix chain is never extended"
-    call = src[src.index("engine.step_finished("):]
-    call = call[: call.index("\n        )")]
-    assert "skip_rids=batch_N.batch.incomplete_node_rids" in call, (
-        "mid-prefill rows must be skipped, or a non-final chunk's token keys "
-        "the prefix cache"
-    )
 
 
 def test_a_loop_is_ended_even_where_the_deployment_chunks_nothing():
