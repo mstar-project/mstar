@@ -31,13 +31,17 @@ class _Model(StubModel):
 
     def __init__(self):
         self.gates: dict[str, threading.Event] = {}
+        self.opened = False  # the test is over: every gate, even one made later, is open
         self.threads: dict[str, str] = {}
         self.overlap = 0
         self._running = 0
         self._lock = threading.Lock()
 
     def gate(self, text: str) -> threading.Event:
-        return self.gates.setdefault(text, threading.Event())
+        event = self.gates.setdefault(text, threading.Event())
+        if self.opened:
+            event.set()
+        return event
 
     def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
         self.threads[text] = threading.current_thread().name
@@ -132,8 +136,10 @@ def _close_threads():
     yield
     while _threads:
         wt = _threads.pop()
-        for gate in getattr(wt.model, "gates", {}).values():
-            gate.set()
+        if isinstance(wt.model, _Model):
+            wt.model.opened = True
+            for gate in list(wt.model.gates.values()):
+                gate.set()
         for pool in (wt._prepare_pool, wt._encode_pool):
             if pool is not None:
                 pool.shutdown(wait=True)
@@ -349,6 +355,8 @@ def test_the_run_loop_delivers_outputs_while_a_request_prepares(monkeypatch):
         wt.model.gate("slow").set()
         wt.stop_event.set()
         thread.join(timeout=5)
+        if thread.is_alive():
+            _threads.remove(wt)  # its loop may still flush to the eventfds; leave them open
     assert not thread.is_alive()
 
 
