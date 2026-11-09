@@ -214,13 +214,16 @@ environment, and so does a variable that expands to nothing (``--api-key "$UNSET
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
 ``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`. The standalone Nemotron realtime server
-(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
-variable.
+:doc:`clients`.
 
 Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
+
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
@@ -284,7 +287,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
-       message's included.
+       message's included, and of decoded audio samples a route appends
+       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
+       included).
        A live call's opening message past it is refused, and an append that would pass
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
@@ -427,8 +432,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker

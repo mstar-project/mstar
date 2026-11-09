@@ -62,6 +62,11 @@ impl OpenAIAdapter for Orpheus {
     fn supports_speech(&self) -> bool {
         true
     }
+    fn speech_chunking(&self) -> SpeechChunking {
+        // 2,048 output tokens are about 25 s of speech (some 350 characters),
+        // and a longer input is cut off there
+        SpeechChunking { min_chars: Some(250), max_chars: 200, ..SPEECH_CHUNKING }
+    }
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk = speech_kwargs(req, "temperature", "top_p");
         forward_sent_speed(&mut mk, req);
@@ -204,6 +209,8 @@ impl OpenAIAdapter for OmniVoice {
     }
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        // OpenAI's field is `instructions`; the model reads `instruct`.
+        instructions_as_instruct(&mut mk);
         // is-not-None, so an empty voice reaches the model and is refused there
         if let Some(voice) = &req.voice {
             if mk.get("instruct").is_none_or(Value::is_null) {

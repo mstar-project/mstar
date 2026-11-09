@@ -1141,7 +1141,7 @@ def _refused_worker(engine, line):
 def _refused(batch, outcome_reason, failed_resource):
     return SimpleNamespace(
         node_name=batch.node_name, admit_error=outcome_reason, failed_resource=failed_resource,
-        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(), no_forward_rids=set(),
     )
 
 

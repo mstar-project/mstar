@@ -351,6 +351,9 @@ class HiggsAudioModel(Model):
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"temperature", "top_p", "ignore_eos", "enable_thinking"})
+
     def process_prompt(
         self,
         prompt: str | None,

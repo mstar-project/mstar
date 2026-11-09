@@ -29,6 +29,15 @@ def test_the_timeout_and_the_models_sample_rate_win_over_the_environment(launche
     assert env["MSTAR_OPENAI_ADAPTER"] == "Qwen3_5Adapter"
 
 
+# inf and nan never time out on the Python frontend, and a timeout at or below 0 times
+# every request out; the Rust frontend reads a finite number of seconds at least 0
+@pytest.mark.parametrize(("timeout", "seconds"), [(float("inf"), "1000000000.0"), (float("nan"), "1000000000.0"),
+                                                  (-5.0, "0.0"), (float("-inf"), "0.0")])
+def test_a_timeout_the_rust_frontend_cannot_read_is_sent_as_its_effect(launched, timeout, seconds):
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u", timeout_s=timeout)
+    assert launched["env"]["MSTAR_REQUEST_TIMEOUT_S"] == seconds
+
+
 def test_unset_settings_leave_the_frontends_defaults(launched, monkeypatch):
     monkeypatch.delenv("MSTAR_REQUEST_TIMEOUT_S", raising=False)
     monkeypatch.delenv("MSTAR_SAMPLE_RATE", raising=False)
