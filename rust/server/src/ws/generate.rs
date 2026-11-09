@@ -9,8 +9,10 @@
 //! they are submitted in the order sent, and their replies may interleave.
 //! Closing the socket aborts what it submitted.
 //!
-//! A request to a model with client streams stays open as a live call until
-//! the client ends its input: `append` feeds it, `end_input` ends it. The
+//! A request to a model with client streams ends its input at open, as on
+//! `/generate`, unless the opening carries `end_input: false` (or a list of
+//! the streams it ends): then it stays open as a live call until the client
+//! ends its input. `append` feeds it, `end_input` ends it. The
 //! appends reach the API server over the bridge's `live` operations
 //! (`taking_input`, `stream_input`, `reject_input`); one the model finds late
 //! comes back on the socket's notice route.
@@ -225,10 +227,11 @@ fn ws_modalities(value: Option<&Val>, key: &str) -> Result<Option<Vec<String>>, 
     }
 }
 
-/// `_ws_end_input`: true for all of the call's client streams, or the ones named.
-fn ws_end_input(value: Option<&Val>) -> Result<Value, String> {
+/// `_ws_end_input`: true for all of the call's client streams, or the ones
+/// named; `absent` when the message has none.
+fn ws_end_input(value: Option<&Val>, absent: bool) -> Result<Value, String> {
     match value {
-        None => Ok(Value::Bool(false)),
+        None => Ok(Value::Bool(absent)),
         Some(Val::Bool(b)) => Ok(Value::Bool(*b)),
         Some(Val::List(items)) if items.iter().all(|v| matches!(v, Val::Str(_))) => {
             Ok(Value::Array(items.iter().map(Val::to_json).collect()))
@@ -422,10 +425,13 @@ async fn serve_one(
             Some(Val::Str(s)) => Some(s.clone()),
             Some(_) => return Err(refusal("text must be a string".into())),
         };
-        let end_input = ws_end_input(message.get("end_input")).map_err(refusal)?;
+        // an opening is one-shot unless it says otherwise
+        let end_input = ws_end_input(message.get("end_input"), true).map_err(refusal)?;
         let has_files = message.get("files").is_some_and(Val::truthy);
         if text.as_deref().is_none_or(str::is_empty) && !has_files && (end_input == Value::Bool(true) || !takes_stream_input()) {
-            return Err(refusal("message carries neither text nor files".into()));
+            // a one-shot opening: the client may have meant a live one
+            let hint = if takes_stream_input() { " (open a live call with end_input: false)" } else { "" };
+            return Err(refusal(format!("message carries neither text nor files{hint}")));
         }
         let files = message.get("files").cloned();
         let dir = upload_dir.clone();
@@ -585,7 +591,7 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
             }
         }
         let record = Val::Map(append_record(message.get("append"))?);
-        let end_input = ws_end_input(message.get("end_input"))?;
+        let end_input = ws_end_input(message.get("end_input"), false)?;
         let text = match record.get("text") {
             None => None,
             Some(Val::Str(s)) => Some(s.clone()),
@@ -598,8 +604,8 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
         file_paths = paths;
         let streams = file_streams(record.get("files"), &parts)?;
         let ends = end_input != Value::Bool(false) && end_input != Value::Array(Vec::new());
-        if file_paths.is_empty() && text.as_deref().is_none_or(str::is_empty) && !ends {
-            return Err("an append needs text, files or end_input".into());
+        if file_paths.is_empty() && text.as_deref().is_none_or(str::is_empty) && kwargs.as_ref().is_none_or(Map::is_empty) && !ends {
+            return Err("an append needs text, files, model_kwargs or end_input".into());
         }
         let mut op = Map::new();
         op.insert("file_paths".into(), serde_json::to_value(&file_paths).unwrap());
@@ -769,7 +775,7 @@ async fn serve(socket: WebSocket, st: AppState) {
             }
         }
         let mut call = None;
-        if takes_stream_input() && message.get("end_input") != Some(&Val::Bool(true)) {
+        if takes_stream_input() && !matches!(message.get("end_input"), None | Some(Val::Bool(true))) {
             // a live call: appends find it by id, from the moment it is read
             let Some(rid) = &request_id else {
                 sock.send(error_reply(None, "a live call needs a request_id", None, binary));
