@@ -34,6 +34,7 @@ from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     AllocationFailed,
+    BucketKey,
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
@@ -50,7 +51,6 @@ from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_re
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -59,6 +59,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
+    lean_subsets,
 )
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -104,6 +105,9 @@ if TYPE_CHECKING:
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
+
+# the lean set of a step that runs every resource plain
+_NOT_LEAN: frozenset[str] = frozenset()
 
 # Block the GPU thread on its step's outputs before returning (1-step launch
 # bound vs the worker's default 2-step). Off by default: it kills the
@@ -224,8 +228,16 @@ class SubmoduleManagement:
     )
     # the LoRA pools bound to the node's modules, set at bind
     lora_pools: tuple = ()
+    # the keys of the node's resources that can run lean (`Resource.lean_capture`),
+    # in declaration order
+    lean_keys: tuple[str, ...] = field(init=False, default=())
+    # a lean set -> the twins a step of it tries (`lean_candidates`)
+    _lean_candidates: dict[frozenset[str], tuple[frozenset[str], ...]] = field(
+        init=False, default_factory=dict, repr=False,
+    )
 
     def __post_init__(self):
+        self.lean_keys = tuple(key for key, res in self.resources.items() if res.lean_capture)
         # Two hazards want a second slot, both of them the host running ahead of
         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
         # reading, and ``force_double_buffer`` is the same for a resource
@@ -280,6 +292,26 @@ class SubmoduleManagement:
             slot = self._next_slot
             self._next_slot = (self._next_slot + 1) % self._num_slots
             return slot
+
+    def lean_of(self, rids) -> frozenset[str]:
+        """The keys of the node's resources that every one of ``rids`` lets run lean
+        (``Resource.lean_for``); empty at once for a node with none."""
+        keys = self.lean_keys
+        if not keys:
+            return _NOT_LEAN
+        resources = self.resources
+        return frozenset(key for key in keys if resources[key].lean_for(rids))
+
+    def lean_candidates(self, lean: frozenset[str]) -> tuple[frozenset[str], ...]:
+        """The lean twins a step that leaves ``lean`` lean may replay, in the order
+        it tries them: ``lean`` itself, then its subsets by decreasing size, ties in
+        declaration order. The plain bucket comes after all of them."""
+        candidates = self._lean_candidates.get(lean)
+        if candidates is None:
+            candidates = self._lean_candidates[lean] = lean_subsets(
+                [key for key in self.lean_keys if key in lean]
+            )
+        return candidates
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -1055,10 +1087,13 @@ class Engine:
             )
         for pool, costs in pools.items():
             if costs:
+                # a piecewise pool keys its regions' buckets (label, bucket), and has no twins
+                twins = [bucket for bucket in costs if isinstance(bucket, BucketKey) and bucket.lean]
                 logger.info(
-                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted, %.0f outside the allocator",
-                    self._device, pool, len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
-                    plan.outside[pool] / 2**20,
+                    "CapturePlan[%s] %s: %d of %d buckets%s, %.0f MiB predicted, %.0f outside the allocator",
+                    self._device, pool, len(plan.buckets[pool]), len(costs),
+                    f" ({len(plan.buckets[pool].intersection(twins))} of {len(twins)} lean twins)" if twins else "",
+                    plan.predicted[pool] / 2**20, plan.outside[pool] / 2**20,
                 )
         return plan
 
@@ -1855,6 +1890,7 @@ class Engine:
                 slot=slot, capture=False,
                 rebuild_rids=batch.step_context.rebuild_rids,
                 request_walks={rid: walks[rid]} if rid in walks else {},
+                lean=submodule_mgmt.lean_of((rid,)),
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
@@ -2100,7 +2136,7 @@ class Engine:
         rids = list(ctx.padded_request_ids)
 
         if step is not None:
-            if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
+            if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
                 # The slot was leased from `cg_key_info` before the step was
                 # declared. If the two disagree the replay runs a graph that
                 # was planned for a different declaration — silently wrong
@@ -3017,6 +3053,11 @@ class Engine:
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
+        # The resources this batch's rows let run lean. An eager step runs them lean
+        # as they are; a lease runs whatever its bucket was captured with.
+        lean = submodule_mgmt.lean_of(batch.request_ids)
+        ctx = batch.step_context
+        ctx.lean = lean
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             return None
@@ -3033,29 +3074,21 @@ class Engine:
             None if batch.inputs is None
             else sum(inp.input_seq_len for inp in batch.inputs)
         )
-        lease = None
-        pools = submodule_mgmt.lora_pools
-        if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
-            # no row names an adapter: the graph captured without LoRA kernels, when
-            # there is one (the pool checks the rows again at plan)
-            batch.cg_key_info = LoraBaseOnly(key)
-            lease = cg_runner.lease_slot(
-                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=batch.cg_key_info,
-            )
-        if lease is None:
-            batch.cg_key_info = key
-            lease = cg_runner.lease_slot(
-                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
-            )
+        # the tightest plain bucket, or its leanest captured twin this batch allows;
+        # every resource checks its rows again at plan
+        lease = cg_runner.lease_slot(
+            graph_walk=ctx.graph_walk, bs=len(batch.request_ids),
+            slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
+            lean=submodule_mgmt.lean_candidates(lean) if lean else (),
+        )
+        batch.cg_key_info = key
         planner = submodule_mgmt.resident
-        ctx = batch.step_context
         ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
         ctx.resident_plan = None
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
+            ctx.lean = lease.bucket.lean
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:

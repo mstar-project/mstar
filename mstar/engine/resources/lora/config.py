@@ -520,21 +520,3 @@ class LoraReqConfig(ResourceReqConfig):
 class LoraStep(ResourceStep):
     """One step's rows: a segment per request, its ``span`` the tokens that request puts
     through the LoRA'd linears this step, in the order they are packed."""
-
-
-@dataclass(frozen=True)
-class LoraBaseOnly:
-    """The capture key of a step none of whose rows names an adapter: the node's own
-    ``cg_key_info`` (``key``), wrapped. A node serving adapters captures each bucket under
-    both keys, and the base-only graph records no LoRA kernel: at decode width the
-    launches of a delta that adds zero cost about what the work does."""
-
-    key: Any = None
-
-    def __str__(self) -> str:
-        return "lora-base-only" if self.key is None else f"lora-base-only:{self.key}"
-
-
-def node_capture_key(key: Any) -> Any:
-    """The node's own ``cg_key_info`` in a capture key, without its ``LoraBaseOnly``."""
-    return key.key if isinstance(key, LoraBaseOnly) else key
