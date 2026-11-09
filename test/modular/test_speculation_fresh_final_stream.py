@@ -28,10 +28,12 @@ import torch  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
+    SpecRows,
     SpeculationOutput,
     SpeculationPrepOutput,
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
+from mstar.streaming.stream_buffer import StreamChunkInfo  # noqa: E402
 from mstar.testing_utils.worker import make_services  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.micro_scheduler import (  # noqa: E402
@@ -72,7 +74,8 @@ def _prep() -> SpeculationPrepOutput:
     )
 
 
-def _speculator(scheduler, runtime, lockstep=None):
+def _speculator(scheduler, runtime, lockstep=None, open_rids=(CONTINUING, FRESH), chunk=None):
+    """``chunk``: the stream chunk FRESH's inputs hold, if any."""
     def stream_state():
         sbuf = SimpleNamespace(policy=FixedChunkPolicy(chunk_size=1))
         return SimpleNamespace(stream_buffers={STREAM: sbuf}, ended_streams=set())
@@ -89,13 +92,16 @@ def _speculator(scheduler, runtime, lockstep=None):
     request_state = SimpleNamespace(
         per_request_info={rid: stream_state() for rid in fwd},
         get_fwd_info=lambda rid, partition: fwd[rid],
+        fwd_infos=lambda rids, partition: [fwd[r] for r in rids],
     )
     streams = StreamBufferManager(request_state, tensor_manager, [])
     streams.consumer_node = {STREAM: NODE}
     streams._partition = {STREAM: PART}
-    streams._open = {NODE: {CONTINUING, FRESH}}
+    streams._open = {NODE: set(open_rids)}
     streams.poll_for = lambda rid, node: []
-    streams.chunks_for = lambda rid, node, inputs: None
+    streams.chunks_for = lambda rid, node, inputs: (
+        {STREAM: chunk} if chunk and rid == FRESH and STREAM in inputs else None
+    )
     services = make_services(
         graph_runtime=runtime, streams=streams, tensor_manager=tensor_manager, request_state=request_state,
     )
@@ -113,6 +119,7 @@ def _runtime():
     )
     return SimpleNamespace(
         prep_spec_rids=lambda inp: _prep(),
+        prep_spec_rows=lambda *a: SpecRows([CONTINUING], 0, 0, None),
         prep_follow_spec_rids=lambda inp: _prep(),
         get_spec_target=lambda *a: target,
         get_consumed_edges=lambda *a: [("prev_text", NODE)],
@@ -129,7 +136,7 @@ def _pending():
     )
 
 
-def _leader_speculation(final: bool):
+def _leader_speculation(final: bool, **streams):
     fresh = ScheduledBatch(
         node_name=NODE, graph_walk=WALK, request_to_worker_graph={FRESH: 0},
         input_edges=_fresh_edges(final),
@@ -144,7 +151,7 @@ def _leader_speculation(final: bool):
         rebuilds=Rebuilds({}, {}),
     )
     runtime, target = _runtime()
-    speculator = _speculator(scheduler, runtime)
+    speculator = _speculator(scheduler, runtime, **streams)
     return speculator._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
 
 
@@ -192,3 +199,13 @@ def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
         assert FRESH in spec.scheduled_batch.request_to_worker_graph
         assert not spec.node_batch.final_stream_rids
         assert not spec.node_batch.partition_done_rids
+
+
+def test_fresh_rid_keeps_its_open_streams_chunk_when_continuing_rows_go_as_columns():
+    # CONTINUING's stream has ended (a latched node runs on), so its rows are
+    # prepped as columns; FRESH's stream is still open
+    chunk = StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=False)
+    spec = _leader_speculation(final=False, open_rids={FRESH}, chunk=chunk)
+
+    assert list(spec.scheduled_batch.request_to_worker_graph) == [CONTINUING, FRESH]
+    assert spec.node_batch.per_request_input_metadata[FRESH].stream_chunks == {STREAM: chunk}

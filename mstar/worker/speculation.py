@@ -255,10 +255,13 @@ class SpeculationBuilder:
         if (
             prep.rows_wg_id is not None and not other_walks and not fresh_final_edges
             and not chunk_ranges and not rebuild_rids
+            and self._ctx.streams.open_into(spec_target.node_name).isdisjoint(
+                prep.per_request_inputs)
         ):
-            # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk, a cut chunk, or a rebuild row's inputs from the log
-            # take the general assembly, which carries them
+            # the dicts hold only the fresh rows here; a fresh row's stream
+            # chunk (an open stream's, or a final one), a cut chunk, or a
+            # rebuild row's inputs from the log take the general assembly,
+            # which carries them
             return self.assemble_rows(
                 pending, spec_target, prep.ready_rids, prep.rows_wg_id,
                 fresh_request_to_worker_graph=prep.request_to_worker_graph,
