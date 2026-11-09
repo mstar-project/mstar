@@ -13,7 +13,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
-from mstar.model.components.moe import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlockWithSharedExpert
+from mstar.model.components.moe import ParallelSparseMoeBlock
 from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.loader import iter_safetensors_shards, load_weights_into
 from mstar.model.loader.base import CheckpointRules
@@ -30,10 +30,11 @@ LINEARS = QuantizableLinears(
 class Layer(nn.Module):
     def __init__(self, cg):
         super().__init__()
-        self.shared = ParallelSparseMoeBlockWithSharedExpert(
-            HIDDEN, EXPERTS, 2, INTER, ParallelGatedMLP(HIDDEN, INTER, cg, reduce_results=False), comm_group=cg,
+        self.shared = ParallelSparseMoeBlock(
+            HIDDEN, EXPERTS, 2, INTER, comm_group=cg,
+            shared_expert=ParallelGatedMLP(HIDDEN, INTER, cg, reduce_results=False),
         )
-        self.ep = ExpertParallelSparseMoeBlock(HIDDEN, EXPERTS, 2, INTER, comm_group=cg)
+        self.ep = ParallelSparseMoeBlock(HIDDEN, EXPERTS, 2, INTER, comm_group=cg, expert_parallel=True)
 
 
 class Root(nn.Module):

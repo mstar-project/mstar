@@ -26,11 +26,11 @@ except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 
-from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
     AdmitRuntimeError,
+    ResourceStep,
 )
 
 ADAPTERS = ("a1", "a2", "a3", "a4")
@@ -309,7 +309,7 @@ class _PicksSlotPerMiss(LoraAdapterPool):
 
     def admit(self, step, ctx):
         for seg in step.segments:
-            outcome = super().admit(LoraStep(segments=(seg,)), ctx)
+            outcome = super().admit(ResourceStep(segments=(seg,)), ctx)
             if not outcome.ok:
                 return outcome
         return ADMIT_OK

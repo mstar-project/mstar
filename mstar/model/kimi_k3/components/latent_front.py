@@ -1,7 +1,7 @@
 """Kimi K3.1's latent-MoE front on FlashInfer's generated Kimi-K3 program (``kimi_k3_latent_moe_front``, the
 experimental ``cake`` backend: SM100 / SM103 with 148 SMs, TP 1 or 8, up to ``MAX_TOKENS`` rows at decode).
 
-One launch reads the block's packed input weight (``_LatentMoE._in_weight``: router | latent down projection |
+One launch reads the block's packed input weight (``KimiLatentMoE._in_weight``: router | latent down projection |
 this rank's shared gate_up) once and writes the router's fp32 logits, the bf16 latent and the shared experts'
 bf16 SiTU activation (``4 tanh(g / 4) sigmoid(g) * 25 tanh(u / 25)`` in fp32 on the fp32 products, one rounding).
 It replaces the packed fp32 GEMM (cuBLAS split-K and its reduce on B300: 13.0 + 3.2 us at c=1), the cast of its

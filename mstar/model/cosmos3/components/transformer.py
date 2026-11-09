@@ -43,6 +43,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused, ParallelMLP
@@ -249,10 +250,16 @@ class Cosmos3PackedMoTAttention(nn.Module):
         q_dim = num_attention_heads * head_dim
         kv_dim = num_key_value_heads * head_dim
 
-        # Understanding pathway.
-        self.to_q = ColumnParallelLinear(comm_group, hidden_size, q_dim, bias=attention_bias)
-        self.to_k = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
-        self.to_v = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        # Understanding pathway. q, k and v are one GEMM: at decode widths the
+        # reasoner's step is latency-bound, and three narrow GEMMs cost more
+        # than one wide one. The loader stacks the checkpoint's to_q / to_k /
+        # to_v into it (``cosmos3.loader.TRANSFORMER_STACKED``).
+        self.to_qkv = QKVParallelLinear(
+            comm_group, hidden_size, head_dim, num_attention_heads, num_key_value_heads, bias=attention_bias,
+        )
+        # this rank's columns, as the fused layer shards (or replicates) heads
+        q_cols, kv_cols = self.to_qkv.num_heads * head_dim, self.to_qkv.num_kv_heads * head_dim
+        self._qkv_split = (q_cols, kv_cols, kv_cols)
         self.to_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         if qk_norm_for_text:
             self.norm_q = norm_cls(head_dim, eps=rms_norm_eps)
@@ -277,6 +284,12 @@ class Cosmos3PackedMoTAttention(nn.Module):
         self.to_add_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         self.norm_added_q = norm_cls(head_dim, eps=rms_norm_eps)
         self.norm_added_k = norm_cls(head_dim, eps=rms_norm_eps)
+
+    def _und_qkv(self, und_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The understanding pathway's q [N, H, D], raw k and v [N, Hkv, D]."""
+        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
+        q, k, v = self.to_qkv(und_seq).split(self._qkv_split, dim=-1)
+        return q.view(-1, H, D), k.view(-1, Hkv, D), v.view(-1, Hkv, D)
 
     @staticmethod
     def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -305,9 +318,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
 
-        q_und = self.to_q(und_seq).view(-1, H, D)
-        k_und = self.to_k(und_seq).view(-1, Hkv, D)
-        v_und = self.to_v(und_seq).view(-1, Hkv, D)
+        q_und, k_und, v_und = self._und_qkv(und_seq)
         q_gen = self.add_q_proj(gen_seq).view(-1, H, D)
         k_gen = self.add_k_proj(gen_seq).view(-1, Hkv, D)
         v_gen = self.add_v_proj(gen_seq).view(-1, Hkv, D)
@@ -371,11 +382,10 @@ class Cosmos3PackedMoTAttention(nn.Module):
         exactly what the fused reference concatenates. A reasoner (text
         decoding) prefill passes ``cache_gen_k=False`` and keeps the raw K.
         """
-        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
-        q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
-        k_raw = self.to_k(und_seq).view(-1, Hkv, D)
+        H, D = self.num_attention_heads, self.head_dim
+        q, k_raw, v = self._und_qkv(und_seq)
+        q = self.norm_q(q)
         k = self.norm_k(k_raw)
-        v = self.to_v(und_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
         k_gen = None
@@ -1014,7 +1024,19 @@ class Cosmos3OmniTransformer(nn.Module):
         hidden states [N, hidden]; ``lm_head`` turns the rows the caller picks
         into logits.
         """
-        cos, sin = self._rotary(position_ids, embeds.device, embeds.dtype)
+        cos, sin = self.build_cos_sin(position_ids.to(embeds.device), embeds.dtype)
+        return self.text_layers(embeds, cos, sin, label)
+
+    def build_cos_sin(self, position_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """The understanding tower's rotary tables ([N, head_dim]) for [3, N]
+        mRoPE ids."""
+        return self._rotary(position_ids, position_ids.device, dtype)
+
+    def text_layers(
+        self, embeds: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, label: str,
+    ) -> torch.Tensor:
+        """`text_forward` past the rotary tables: the understanding tower's
+        layers and final norm over ``embeds``."""
         attend = self._und_attend
         attend.bind_step(label)
         x = embeds

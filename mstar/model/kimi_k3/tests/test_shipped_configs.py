@@ -120,7 +120,7 @@ def test_the_openai_chat_endpoint_serves_kimi_with_the_benches_fields(name, tmp_
         args = adapter.chat_to_request(req, tmp_path)
         mk = args.model_kwargs
         assert model.get_max_output_tokens(**mk) == 7
-        assert model.get_request_resource_configs({}, mk)[SAMPLER].ignore_eos is True
+        assert model.get_request_resource_configs([], [], mk)[SAMPLER].ignore_eos is True
         model.process_prompt(args.text, ["text"], ["text"], prompt_parts=args.prompt_parts, **mk)
         assert template.calls[-1]["thinking"] is thinks, extra
 

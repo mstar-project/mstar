@@ -5,7 +5,7 @@ the experts of 7 ranks in 8 drop out of every MoE layer."""
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ExpertParallelSparseMoeBlock
+from mstar.model.components import ParallelSparseMoeBlock
 
 HIDDEN, INTER, NUM_EXPERTS, TOP_K, WORLD = 32, 16, 8, 2, 2
 
@@ -26,7 +26,8 @@ class _Group(CommGroup):
 
 def test_expert_parallel_block_returns_the_all_reduced_tensor():
     torch.manual_seed(0)
-    block = ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_Group(False)).double()
+    block = ParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_Group(False), expert_parallel=True).double()
     with torch.no_grad():
         for p in block.parameters():
             p.normal_(0, 0.1)

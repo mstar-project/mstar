@@ -599,7 +599,8 @@ def _budgeted_engine(align: int = 1):
     from mstar.model.submodule_base import ChunkingPolicy
     from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    state = SimpleNamespace(chunk_alignment=align, force_double_buffer=False, supports_preplan=False)
+    state = SimpleNamespace(chunk_alignment=align, force_double_buffer=False, supports_preplan=False,
+                            lean_capture=False)
     engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace(), resources={"state": state})})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
@@ -803,7 +804,7 @@ def _captured_buckets(submodule, walk, ladders, engine, bs=1) -> list[int]:
 
 
 def _orpheus_prefill_buckets(ladders) -> list[int]:
-    """Orpheus's ``prefill`` capture, which its ``prefill`` and ``mixed`` steps replay."""
+    """Orpheus's ``prefill`` capture."""
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
     engine = _mixed_engine()
@@ -879,15 +880,11 @@ def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the
     assert buckets(2048) == (2175, [1024, 2048, 2176], [1024, 2048])
 
 
-@pytest.mark.parametrize("walk, match", [
-    # Orpheus's ``mixed`` steps replay its ``prefill`` capture
-    ("mixed", "'prefill'"),
-    # and its ``decode`` capture takes a batch size, one token a row
-    ("decode", "batch size, not tokens"),
-])
-def test_a_walk_with_no_token_ladder_to_set_is_refused(walk, match):
-    with pytest.raises(ValueError, match=match):
-        _orpheus_prefill_buckets({walk: [64]})
+def test_a_walk_with_no_token_ladder_to_set_is_refused():
+    # Orpheus's ``decode`` capture takes a batch size, one token a row (a walk whose steps
+    # replay another's capture is refused in test_cosyvoice3_model)
+    with pytest.raises(ValueError, match="batch size, not tokens"):
+        _orpheus_prefill_buckets({"decode": [64]})
 
 
 def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):

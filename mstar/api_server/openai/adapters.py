@@ -1687,7 +1687,7 @@ class TextChatAdapter(OpenAIAdapter):
         mk = normalize_generation_kwargs(mk)
         return SubmitArgs(
             text=text,
-            input_modalities=["text"],
+            input_modalities=modalities,
             output_modalities=["text"],
             model_kwargs=mk,
             prompt_parts=parts,
@@ -1785,6 +1785,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "kimi_k31": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
+    "ripple_65b": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.

@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.model.kimi_k3.components.attention import KimiMLAAttention
-from mstar.model.kimi_k3.components.moe import _LatentMoE
+from mstar.model.kimi_k3.components.moe import KimiLatentMoE
 from mstar.model.kimi_k3.tests import engine_helpers as H
 
 
@@ -22,7 +22,7 @@ def test_packed_projections_view_one_weight_and_match_the_separate_gemms(monkeyp
     H.install_cpu_stubs(monkeypatch)
     _, sub, _, _ = H.build_engine(shared_experts_overlap=False)
     lm = sub.language_model
-    moes = [m for m in lm.modules() if isinstance(m, _LatentMoE)]
+    moes = [m for m in lm.modules() if isinstance(m, KimiLatentMoE)]
     mlas = [m for m in lm.modules() if isinstance(m, KimiMLAAttention)]
     assert moes and mlas
     torch.manual_seed(0)
@@ -60,7 +60,7 @@ def test_the_up_and_shared_down_projections_pack_along_k_into_one_gemm(monkeypat
     the packed one, and the sum matches the two GEMMs and the add (fp32 on the CPU: summation order apart)."""
     H.install_cpu_stubs(monkeypatch)
     _, sub, _, _ = H.build_engine(shared_experts_overlap=False)
-    moes = [m for m in sub.language_model.modules() if isinstance(m, _LatentMoE)]
+    moes = [m for m in sub.language_model.modules() if isinstance(m, KimiLatentMoE)]
     assert moes
     torch.manual_seed(1)
     for moe in moes:
@@ -81,7 +81,6 @@ def test_each_rank_packs_its_own_latent_slice():
     """At TP2 the up projection reads its rank's half of the (replicated) latent: the packed GEMM slices
     the same half, on either rank."""
     from mstar.distributed.communication import CommGroup
-    from mstar.model.kimi_k3.components.moe import KimiLatentMoE
     from mstar.model.kimi_k3.config import KimiK3ModelConfig
 
     cfg = KimiK3ModelConfig.reduced(latent_moe_use_norm=False, shared_experts_overlap=False)
@@ -110,10 +109,10 @@ def test_the_shared_experts_beside_the_routed_path_compute_the_same_block(monkey
     packed block's up to summation order (fp32)."""
     H.install_cpu_stubs(monkeypatch)
     _, packed_sub, _, _ = H.build_engine(shared_experts_overlap="off")
-    packed = [m for m in packed_sub.language_model.modules() if isinstance(m, _LatentMoE)]
+    packed = [m for m in packed_sub.language_model.modules() if isinstance(m, KimiLatentMoE)]
     for mode in ("shared", "routed"):
         _, beside_sub, _, _ = H.build_engine(shared_experts_overlap=mode)
-        beside = [m for m in beside_sub.language_model.modules() if isinstance(m, _LatentMoE)]
+        beside = [m for m in beside_sub.language_model.modules() if isinstance(m, KimiLatentMoE)]
         assert packed and len(packed) == len(beside) and all(b.moe_overlap == mode for b in beside)
         _check_overlapped(packed, beside)
 
@@ -140,7 +139,6 @@ def test_each_rank_adds_the_shared_partial_to_its_own_latent_slice():
     """At TP2, beside: the up projection's GEMM reads its rank's half of the latent and adds the rank's
     shared-experts partial (``_up_plus``), as the separate projections and the add do."""
     from mstar.distributed.communication import CommGroup
-    from mstar.model.kimi_k3.components.moe import KimiLatentMoE
     from mstar.model.kimi_k3.config import KimiK3ModelConfig
 
     cfg = KimiK3ModelConfig.reduced(latent_moe_use_norm=False)
@@ -173,10 +171,8 @@ def test_the_overlap_mode_reads_true_and_false_and_refuses_others():
     with pytest.raises(ValueError, match="routed, shared or off"):
         KimiK3ModelConfig.reduced(shared_experts_overlap="both")
     # expert parallel routing syncs over the group: the routed experts stay on the main stream
-    from mstar.model.kimi_k3.components.moe import KimiLatentMoEExpertParallel
-
     cfg = KimiK3ModelConfig.reduced(moe_expert_parallel=True)
-    assert KimiLatentMoEExpertParallel(cfg).moe_overlap == "shared"
+    assert KimiLatentMoE(cfg).moe_overlap == "shared"
 
 
 def test_a_padding_row_masked_out_of_the_routed_experts_leaves_the_real_rows_alone(monkeypatch):
@@ -186,7 +182,7 @@ def test_a_padding_row_masked_out_of_the_routed_experts_leaves_the_real_rows_alo
     H.install_cpu_stubs(monkeypatch)
     for mode in ("off", "shared", "routed"):
         _, sub, _, _ = H.build_engine(shared_experts_overlap=mode, moe_mask_padding=True)
-        moe = next(m for m in sub.language_model.modules() if isinstance(m, _LatentMoE))
+        moe = next(m for m in sub.language_model.modules() if isinstance(m, KimiLatentMoE))
         torch.manual_seed(3)
         x = torch.randn(4, moe.model_hidden_size)
         valid = torch.tensor([True, True, True, False])
@@ -215,7 +211,7 @@ def test_every_overlap_mode_leaves_routing_and_the_mxfp8_cast_to_a_kernel_that_r
     torch.manual_seed(3)
     for mode in ("off", "shared", "routed"):
         _, sub, _, _ = H.build_engine(shared_experts_overlap=mode)
-        blocks = [m for m in sub.language_model.modules() if isinstance(m, _LatentMoE)]
+        blocks = [m for m in sub.language_model.modules() if isinstance(m, KimiLatentMoE)]
         assert blocks
         for b in blocks:
             route = type(b.gate).route

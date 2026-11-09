@@ -256,6 +256,12 @@ The GPU model families depend on:
   (see `flash-attn (LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
+- **fa3-fwd** — FlashAttention-3 forward, the ``dense`` attention backend (Cosmos3's dense
+  passes, its reasoner's vision tower). The wheel is built against one CUDA major: 0.0.2 for a
+  CUDA 12 torch (``+cu12x``), 0.0.3 for CUDA 13 (``+cu130``). The extras take the latest, so next
+  to a CUDA 12 torch install ``fa3-fwd==0.0.2``. A mismatched wheel fails to import, and every
+  ``dense`` attention then runs on FlashInfer with a warning at startup; check with
+  ``python -c "import fa3_fwd_interface"``.
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
   multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
   (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
@@ -591,9 +597,9 @@ sources a build was made from.
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat, speech and images are served for every model the
-Python frontend serves them for. The Wan2.2 and LTX-2.5 video adapters, and the
-transcription and realtime routes, are not ported yet (``NOT_PORTED`` in
+ported class is served. Chat, speech, images and videos are served for every
+model the Python frontend serves them for. The transcription and realtime
+routes are not ported yet (``NOT_PORTED`` in
 ``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
 logs a warning at startup, and ``/generate`` still works.
 

@@ -480,7 +480,7 @@ all = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mstar*"]
-exclude = ["tests*", "benchmark*", "examples*"]
+exclude = ["tests*", "benchmark*", "examples*", "mstar_sim*"]
 
 # Ship the vendored CUDA source so it can be JIT-compiled on first use, the tuned
 # kernel-config tables, and the default deployment configs (copied from repo-root

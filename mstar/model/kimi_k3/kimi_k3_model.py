@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -43,7 +43,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
 from mstar.model.kimi_k3.config import (
     ATTN,
     DSA,
@@ -120,6 +120,7 @@ def thinking_requested(kwargs: dict) -> bool:
 class KimiK3Model(Model):
     """Kimi K3 (``moonshotai/Kimi-K3``): no DSA indexer, dense MLA at any length."""
 
+    DECODE_LOOP = "decode_loop"
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
 
@@ -323,9 +324,9 @@ class KimiK3Model(Model):
                                           keys=PrefixKeys("text_inputs", ("prefill",), growth=True))}}
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         params = {k: model_kwargs.get(k, getattr(self.config, k))
                   for k in ("temperature", "top_p", "repetition_penalty", "ignore_eos")}
@@ -356,37 +357,15 @@ class KimiK3Model(Model):
         )
         return dict(prefill=prefill, decode=decode)
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk="prefill", is_prefill=True)
-        edge = GraphEdge(next_node="LLM", name="text_inputs")
-        edge.tensor_info = input_signals.get("text_inputs", [])
-        return ForwardPassArgs(full_metadata=metadata, inputs=[edge],
-                               unpersist_tensors=list(edge.tensor_info),
-                               step_metadata={"is_prefill": True})
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]], incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # the decode loop ran to a stop (check_stop) or to max_iters: the request is done
-            metadata.kwargs["decode_finished"] = True
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[],
-                                   request_done=True)
-        edge = GraphEdge(next_node="LLM", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        return ForwardPassArgs(full_metadata=metadata, inputs=[edge],
-                               unpersist_tensors=list(edge.tensor_info),
-                               step_metadata={"is_prefill": metadata.is_prefill})
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -- prompts and budgets ----------------------------------------------------------
 
@@ -403,7 +382,7 @@ class KimiK3Model(Model):
             return {}
         # the conductor reads these; a bad one is the client's 400 before any rank sees it
         kwargs = normalize_generation_kwargs(kwargs)
-        self.get_request_resource_configs({}, kwargs)
+        self.get_request_resource_configs([], [], kwargs)
         self.get_max_output_tokens(**kwargs)
         if kwargs.get("min_p", 0) > 0:
             raise ValueError(f"Kimi K3 is served without min_p (min_p={kwargs['min_p']}); send none")
@@ -445,10 +424,6 @@ class KimiK3Model(Model):
         if budget is None:
             return self.max_decode_steps() + 1
         return min(budget, self.config.context_limit)
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality != "text":

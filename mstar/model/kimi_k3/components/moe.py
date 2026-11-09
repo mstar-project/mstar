@@ -4,10 +4,10 @@ The latent MoE routes each token on its hidden state (896 experts, top 16, sigmo
 projects it down into the routed experts' latent (``routed_expert_down_proj``, 7168 -> 3584),
 runs the experts there, normalizes their sum (``routed_expert_norm``) and projects it back up
 (``routed_expert_up_proj``); the two shared experts (one MLP twice as wide) read the hidden
-state. The block is the shared ``ParallelSparseMoeBlock`` (tensor parallel over the experts'
-intermediate dim) or ``ExpertParallelSparseMoeBlock`` (whole experts per rank) over the latent,
-so ``<block>.experts`` is the routed experts layer the quantization API sees, and the router
-is the shared ``NoAuxTcRouter``. After merceod's #257 (its ``KimiLatentMoE``) without its
+state. The block is the shared ``ParallelSparseMoeBlock`` over the latent (tensor parallel over
+the experts' intermediate dim, or whole experts per rank with ``moe_expert_parallel``), so
+``<block>.experts`` is the routed experts layer the quantization API sees, and the router is
+the shared ``NoAuxTcRouter``. After merceod's #257 (its ``KimiLatentMoE``) without its
 fused-kernel and collective rewrites, which main has its own versions of or lacks.
 """
 from __future__ import annotations
@@ -20,12 +20,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.engine import side_stream
 from mstar.model.components.distributed import ParallelGatedMLP, RowParallelLinear
-from mstar.model.components.moe import (
-    _MM_OUT_DTYPE,
-    ExpertParallelSparseMoeBlock,
-    NoAuxTcRouter,
-    ParallelSparseMoeBlock,
-)
+from mstar.model.components.moe import _MM_OUT_DTYPE, NoAuxTcRouter, ParallelSparseMoeBlock
 from mstar.model.components.norm import RMSNorm
 from mstar.model.kimi_k3.components import latent_front
 from mstar.model.kimi_k3.config import KimiK3ModelConfig
@@ -68,12 +63,13 @@ class KimiSiTUMLP(ParallelGatedMLP):
         return self.down_proj(self.situ(gate, up))
 
 
-class _LatentMoE:
-    """The latent MoE over a routed-experts block (``ParallelSparseMoeBlock`` or its expert
-    parallel twin, the next base in the MRO): this rank's partial of the layer's output, summed
-    in one all-reduce with the shared experts' partial. Two all-reduces a layer under TP/EP: the
-    routed experts' latent sum must be whole before ``routed_expert_norm`` (nonlinear), so it
-    cannot join the shared experts' partial; it is reduced in the norm's fused kernel."""
+class KimiLatentMoE(ParallelSparseMoeBlock):
+    """The latent MoE over the shared routed-experts block: this rank's partial of the layer's
+    output, summed in one all-reduce with the shared experts' partial. Two all-reduces a layer
+    under TP/EP: the routed experts' latent sum must be whole before ``routed_expert_norm``
+    (nonlinear), so it cannot join the shared experts' partial; it is reduced in the norm's fused
+    kernel. The routed experts are sharded over the group by intermediate dim (3072 / 8 = 384 at
+    TP8), or held as whole experts per rank with ``moe_expert_parallel`` (896 / 8 = 112 at EP8)."""
 
     def __init__(self, config: KimiK3ModelConfig, comm_group: CommGroup | None = None) -> None:
         comm_group = comm_group or CommGroup.trivial()
@@ -91,6 +87,7 @@ class _LatentMoE:
                 norm_topk_prob=config.moe_renormalize,
             ),
             comm_group=comm_group,
+            expert_parallel=config.moe_expert_parallel,
             activation=config.situ(),
         )
         self.model_hidden_size = config.hidden_size
@@ -554,14 +551,6 @@ class _LatentMoE:
         return out
 
 
-class KimiLatentMoE(_LatentMoE, ParallelSparseMoeBlock):
-    """Routed experts sharded over the TP group by intermediate dim (3072 / 8 = 384 at TP8)."""
-
-
-class KimiLatentMoEExpertParallel(_LatentMoE, ExpertParallelSparseMoeBlock):
-    """Routed experts as whole experts per rank (896 / 8 = 112 at EP8)."""
-
-
 def build_mlp(config: KimiK3ModelConfig, layer_idx: int, comm_group: CommGroup | None = None):
     """Layer ``layer_idx``'s MLP: the dense SiTU MLP below ``first_k_dense_replace``, else the
     latent MoE."""
@@ -569,5 +558,4 @@ def build_mlp(config: KimiK3ModelConfig, layer_idx: int, comm_group: CommGroup |
         return KimiSiTUMLP(
             hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
             comm_group=comm_group, situ=config.situ())
-    cls = KimiLatentMoEExpertParallel if config.moe_expert_parallel else KimiLatentMoE
-    return cls(config, comm_group=comm_group)
+    return KimiLatentMoE(config, comm_group=comm_group)
