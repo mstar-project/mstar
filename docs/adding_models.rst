@@ -2786,9 +2786,9 @@ its partial sum, and hand the norm the comm group: ``RMSNorm.forward_residual(x,
 comm_group)`` reduces, adds and norms, and ``RMSNorm.forward(x, comm_group)`` reduces and
 norms (a post-norm before the residual add). The two go together, since a norm called
 without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
-the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
-``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
-TP node.
+the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel``,
+``MuseGlimmerTextModel`` and ``RippleTextModel`` do. ``MultimodalDecoderModel`` builds the
+kernel's workspace for its TP node.
 
 .. _Guidance (CFG) parallelism:
 
@@ -3306,8 +3306,8 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
-or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
-its sliding-window pool. ``media`` holds a
+or the engine refuses to start; Muse Glimmer and Ripple-65B return ``{}`` until a drop has run
+through a sliding-window pool. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
