@@ -1291,6 +1291,20 @@ def test_the_room_the_host_sets_aside_grows_with_each_page_a_request_takes():
     assert kv._cpu_pool.reserved == {"r": 3}, "the room set aside isn't the pages r holds"
 
 
+def test_the_host_counts_no_room_set_aside_once_a_request_that_moved_into_it_reloads_and_is_removed(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    assert _step(kv, "r", PAGE_SIZE).ok and kv._cpu_pool.reserved == {"r": 3}
+    assert _offload(kv, "r") == 3 and kv._cpu_pool._unmoved == 0
+    assert kv.can_reload("r") and kv.reload("r")
+
+    _remove(kv, "r")
+
+    assert kv._cpu_pool._unmoved == 0, "the host still counts room set aside for a request that is gone"
+
+
 def test_a_request_the_full_host_cant_cover_turns_guaranteed_at_that_page_and_is_counted(caplog):
     kv = _pool()
     kv._cpu_pool = host._HostPool(3)
@@ -1428,10 +1442,13 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitt
     assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
 
 
-def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim():
+def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim(
+    monkeypatch,
+):
     """q's end grows the room to p's 2-page prompt, so the runner admits p, the host has no room to set aside for it,
     and p asks for its 6-page footprint. Its earmark still asked for the prompt, so z2's drop then admitted p,
     guaranteed, with 2 pages."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _pool()
     kv._cpu_pool = host._HostPool(0)
     _running(kv, "o", 5, arrival=0)
