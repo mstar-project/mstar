@@ -10,15 +10,13 @@ ChatML prompt between ``<|audio_bos|>`` and ``<|audio_eos|>``:
     <|im_start|>user\\n{prompt}<|audio_bos|>[audio embeds]<|audio_eos|><|im_end|>\\n
     <|im_start|>assistant\\n -> transcript
 
-Architecture (2 nodes, single partition):
-    audio_encoder  (enc_dec) — audio_tower + projector (checkpoint code)
-    LLM            (ar)      — dense Qwen3, paged KV cache
-
-Graph walks:
-    prefill_audio — audio_encoder -> LLM: the ChatML text around the audio
-                    and the audio embeddings, prefilled as one span that
-                    samples the first token
-    decode        — LLM loop
+Two nodes on the shared VLM scaffold (`MultimodalDecoderModel`):
+``audio_encoder`` (tower + projector) and ``LLM`` (dense Qwen3, paged KV).
+The ``prefill_audio`` walk encodes the clip and prefills the whole prompt
+as one row, its placeholder expanded to one pad per audio embedding; then
+the ``decode`` loop. Every request carries one clip, so the scaffold's
+text-only ``prefill_text`` walk, and its ``mixed`` step with decode, never
+run here.
 
 Not implemented from the reference pipeline: silero-VAD chunk
 boundaries (fixed 4 s chunks only) and the client-side n-gram loop fix
@@ -26,15 +24,10 @@ boundaries (fixed 4 s chunks only) and the client-side n-gram loop fix
 """
 
 import logging
-from pathlib import Path
+from dataclasses import asdict, replace
 
 import torch
 
-from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -43,50 +36,38 @@ from mstar.engine.resources import (
     PagedKVConfig,
     PositionConfig,
     PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
 )
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
-from mstar.model.higgs_audio.config import (
-    ATTN,
-    AUDIO_FEATURE_LENS_KEY,
-    KV_CACHE,
-    ROPE,
-    SAMPLER,
-    HiggsAudioModelConfig,
-)
+from mstar.engine.resources.lora import LoraSpec
+from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
+from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
+from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
+from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from HuggingFace: %s", str(e))
-        return repo_id
-    return str(Path(local_dir))
+def audio_encoder(pad_id: int) -> MediaEncoder:
+    """The ``audio_encoder`` node: a clip's mel chunks in, one LLM-space
+    row per audio pad out. Each chunk's mel frame count rides the walk's
+    ``MEDIA_LAYOUT`` as the clip's grid, so the node reads it on the host."""
+    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds", (pad_id,))
 
 
-class HiggsAudioModel(Model):
+class HiggsAudioModel(MultimodalDecoderModel):
     """Higgs-Audio STT: audio_tower + projector + dense Qwen3 LLM."""
 
-    INTERNAL_KWARGS = (AUDIO_FEATURE_LENS_KEY,)
-
+    NAME = "Higgs-Audio"
+    # every process fetches the whole snapshot, as before the scaffold
+    METADATA_FILES = ("*",)
     # The reference pipeline extracts mel features with the
     # whisper-large-v3 processor (not from the higgs checkpoint).
     WHISPER_PROCESSOR_ID = "openai/whisper-large-v3"
+    # every request carries its one clip
+    TEXT_PROMPTS = False
 
     def __init__(
         self,
@@ -94,33 +75,41 @@ class HiggsAudioModel(Model):
         cache_dir: str | None = None,
         **kwargs,
     ):
-        self.cache_dir = cache_dir
-        self.model_path_hf = model_path_hf
+        super().__init__(model_path_hf, cache_dir)
         # ``model_kwargs: {encoder_graphs: false}`` runs the audio tower eagerly
         self.encoder_graphs = bool(kwargs.get("encoder_graphs", True))
-
-        self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = HiggsAudioModelConfig.from_pretrained(self.local_dir)
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.local_dir, cache_dir=cache_dir,
-        )
-        whisper_dir = _resolve_local_hf_snapshot(
+        self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
             self.WHISPER_PROCESSOR_ID, cache_dir=cache_dir,
         )
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
-            whisper_dir, cache_dir=cache_dir,
-        )
-
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-
-        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        pad = self.config.audio_in_token_idx
+        self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
 
     # -------------------------------------------------------------------
-    # Model ABC: resources
+    # Resources
     # -------------------------------------------------------------------
+
+    def _lora_spec(self) -> LoraSpec:
+        """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
+        head (one row per request: the last token's), placed as the weight loader places
+        the checkpoint's own tensors. The embedding takes none (an adapter touching it is
+        refused). Adapters saved on a ``Qwen3ForCausalLM`` layout (``model.layers.*``) are
+        read as the flat checkpoint's."""
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return module_lora_spec(
+            self.build_llm, nodes={"LLM"}, root_path="model",
+            # Qwen3DenseLM.load_weights' rules, over the names _llm_remap gives it
+            rules=CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=self._llm_remap),
+            adapter_roots=[("model.", "")],
+            rows={"lm_head": PER_SEGMENT},
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -133,8 +122,7 @@ class HiggsAudioModel(Model):
             num_qo_heads=self.config.num_attention_heads,
             # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
             # transcript); 256 pages = 32k tokens ≈ 16 concurrent
-            # requests at ~3.7 GB, less whatever the decode capture's
-            # padding rows hold (one page each, on first use).
+            # requests at ~3.7 GB.
             max_num_pages=256,
         )
         return [
@@ -150,222 +138,83 @@ class HiggsAudioModel(Model):
                     rope_theta=self.config.rope_theta,
                 ),
             ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                # ASR transcription: the reference decodes greedily and
-                # exposes no penalty knob, so no seen-token buffers.
-                enable_repetion_penalty=False,
-            ),
+            # ASR transcription: the reference decodes greedily and exposes
+            # no penalty knob, so no seen-token buffers.
+            replace(self._sampler_spec(self.config.vocab_size), enable_repetion_penalty=False),
+            self._lora_spec(),
         ]
-
-    def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
-        model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # Reference eval decodes greedily (do_sample=False).
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
-        }
-
-    # -------------------------------------------------------------------
-    # Model ABC: graph walk definitions
-    # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
         # Reference transcribe.py generates up to 1024 new tokens.
         return model_kwargs.get("max_output_tokens", 1024)
 
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill samples the first of max_output_tokens
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
-    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(
-            growth=(("decode", "decode_loop"),),
-        )}}
-
-    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        llm_prefill_outputs = [
-            GraphEdge(
-                next_node=EMIT_TO_CLIENT,
-                name="new_token",
-                output_modality="text",
-                persist=True,
-            ),
-        ]
-
-        prefill_audio = Sequential([
-            GraphNode(
-                name="audio_encoder",
-                input_names=["audio_features"],
-                outputs=[GraphEdge(next_node="LLM", name="audio_embeds")],
-            ),
-            GraphNode(
-                name="LLM",
-                input_names=["text_pre", "audio_embeds", "text_post"],
-                outputs=[edge.clone() for edge in llm_prefill_outputs],
-            ),
-        ])
-
-        decode = Loop(
-            name="decode_loop",
-            section=GraphNode(
-                name="LLM",
-                input_names=["text_inputs"],
-                # one signal to the client and back into the loop, so a step
-                # can keep it on the device and send the client's copy inline
-                outputs=[
-                    GraphEdge(
-                        next_node="LLM",
-                        name="text_inputs",
-                    ),
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="text_inputs",
-                        output_modality="text",
-                    ),
-                ],
-            ),
-            max_iters=self.config.max_position_embeddings,
-            outputs=[],
-        )
-
-        return dict(
-            prefill_audio=prefill_audio,
-            decode=decode,
-        )
-
     # -------------------------------------------------------------------
-    # Model ABC: forward pass args
-    # -------------------------------------------------------------------
-
-    def get_initial_forward_pass_args(
-        self,
-        partition_name: str,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        """One ``prefill_audio`` step: the ChatML text before the audio, the
-        audio's mel features (to the encoder) and the text after it, prefilled
-        as one span. ``process_prompt`` emits the two ``text_inputs`` (the
-        prompt split at the audio splice point) and the per-chunk features."""
-        texts = input_signals.get("text_inputs", [])
-        audio_features = input_signals.get("audio_features", [])
-        if len(texts) != 2 or not audio_features:
-            raise ValueError(
-                "Higgs-Audio expects the prompt split around one audio input; got "
-                f"{len(texts)} text spans and {len(audio_features)} audio inputs."
-            )
-        inputs = []
-        for name, node, tensor_info in (
-            ("text_pre", "LLM", texts[0]),
-            ("audio_features", "audio_encoder", audio_features[0]),
-            ("text_post", "LLM", texts[1]),
-        ):
-            edge = GraphEdge(next_node=node, name=name)
-            edge.tensor_info = [tensor_info]
-            inputs.append(edge)
-
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill_audio",
-                is_prefill=True,
-            ),
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={
-                "is_prefill": True,
-                # the only prefill step: its token is the first one decoded
-                "is_last_prefill": True,
-                AUDIO_FEATURE_LENS_KEY: (model_kwargs or {}).get(AUDIO_FEATURE_LENS_KEY),
-            },
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Single-partition state machine: prefill -> decode -> done."""
-        metadata = partition_metadata
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # Decode loop returned to the conductor: EOS or max tokens.
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        edge = GraphEdge(next_node="LLM", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        inputs = [edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": False},
-        )
-
-    # -------------------------------------------------------------------
-    # Model ABC: prompt processing
+    # Intake
     # -------------------------------------------------------------------
 
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        **kwargs,
-    ) -> ProcessPromptOutput:
-        """Chunk the audio, extract per-chunk mels, and split the ChatML
-        prompt at the audio splice point.
+    def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
+        # the reference prompt has a place for the one clip only: other
+        # attachments are ignored, as they always were
+        keep = {TEXT, "audio"}
+        return super().intake(
+            prompt, [m for m in input_modalities if m in keep], tensors,
+            None if prompt_parts is None else [p for p in prompt_parts if p.modality in keep], **kwargs,
+        )
 
-        Matches the reference ``transcribe.py``: fixed
-        ``chunk_size_seconds`` chunks (no VAD), whisper-large-v3 mel
-        extraction padded to the longest chunk, and the transcription
-        prompt wrapped in ChatML with the audio between ``<|audio_bos|>``
-        and ``<|audio_eos|>``. ``enable_thinking=False`` (default)
-        appends the empty think block so the transcript starts
-        immediately.
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"temperature", "top_p", "ignore_eos", "enable_thinking"})
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, ResourceReqConfig]:
+        # the request knobs higgs has always read; the rest are ignored, as before
+        model_kwargs = model_kwargs or {}
+        return {SAMPLER: SamplingReqConfig(
+            # Reference eval decodes greedily (do_sample=False).
+            temperature=model_kwargs.get("temperature", 0.0),
+            top_p=model_kwargs.get("top_p", 1.0),
+            ignore_eos=model_kwargs.get("ignore_eos", False),
+        )}
+
+    def _prompt_ids(
+        self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
+    ) -> torch.Tensor:
+        """The reference ``transcribe.py``'s ChatML prompt: the transcription
+        instruction (the model's default when the request sends none), then
+        the clip between ``<|audio_bos|>`` and ``<|audio_eos|>``, each piece
+        tokenized on its own as there. The clip is one placeholder, which
+        intake expands to its tokens. ``enable_thinking=False`` (default)
+        appends the empty think block so the transcript starts immediately.
         """
-        raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
-        if len(raw_audio_inputs) != 1:
-            raise ValueError(
-                f"Higgs-Audio expects exactly one audio input per request; "
-                f"got {len(raw_audio_inputs)}."
-            )
+        clips = len(raw["audio"])
+        if clips != 1:
+            raise ValueError(f"{self.NAME} expects exactly one audio input per request; got {clips}.")
+        instruction = "".join(p.text or "" for p in parts if p.modality == TEXT) or self.config.default_prompt
 
-        waveform = raw_audio_inputs[0].reshape(-1).cpu().numpy()
-        chunk_samples = self.config.chunk_size_samples
-        chunks = [
-            waveform[i:i + chunk_samples]
-            for i in range(0, max(len(waveform), 1), chunk_samples)
+        def enc(s: str) -> list[int]:
+            return self.tokenizer.encode(s, add_special_tokens=False)
+
+        ids = [
+            *enc("<|im_start|>user\n"), *enc(instruction), *enc("<|audio_bos|>"),
+            self.config.audio_in_token_idx,
+            *enc("<|audio_eos|>"), *enc("<|im_end|>\n<|im_start|>assistant\n"),
         ]
+        if not kwargs.get("enable_thinking", False):
+            ids += enc("<think>\n\n</think>\n\n")
+        return torch.tensor(ids, dtype=torch.long)
 
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+        """The reference's front end: fixed ``chunk_size_seconds`` chunks (no
+        VAD), whisper-large-v3 mels padded to the longest chunk. The clip
+        fills a pad per row the projector keeps; its grid is each chunk's
+        mel frame count (the feature extractor's attention-mask sum), from
+        which the encoder masks and slices its chunks."""
+        waveform = clip.reshape(-1).cpu().numpy()
+        n = self.config.chunk_size_samples
+        chunks = [waveform[i:i + n] for i in range(0, max(len(waveform), 1), n)]
         feat = self.feature_extractor(
             chunks,
             sampling_rate=self.config.sampling_rate,
@@ -374,98 +223,43 @@ class HiggsAudioModel(Model):
             return_attention_mask=True,
             return_tensors="pt",
         )
-        audio_features = feat["input_features"]           # (num_chunks, mels, T)
-        audio_feature_lens = feat["attention_mask"].sum(-1).to(torch.long)
-
-        user_prompt = prompt or self.config.default_prompt
-
-        def enc(s: str) -> list[int]:
-            return self.tokenizer.encode(s, add_special_tokens=False)
-
-        pre_ids = (
-            enc("<|im_start|>user\n")
-            + enc(user_prompt)
-            + enc("<|audio_bos|>")
-        )
-        post_ids = enc("<|audio_eos|>") + enc("<|im_end|>\n<|im_start|>assistant\n")
-        if not kwargs.get("enable_thinking", False):
-            post_ids += enc("<think>\n\n</think>\n\n")
-
-        feature_lens = audio_feature_lens.tolist()
-        audio = sum(self.config.encoder_output_length(n) for n in feature_lens)
-        # One step writes the text around the audio and the audio together, so
-        # one span; it mixes text and audio, so nothing keys it.
-        prompt = len(pre_ids) + audio + len(post_ids)
-        layout = LabelLayout(
-            spans=(Span("rows", "prefill_audio", prompt, prompt, "audio_features"),),
-            growth=(("decode_loop", 1),),
-        )
-        return ProcessPromptOutput({
-            "text_inputs": [
-                torch.tensor(pre_ids, dtype=torch.long),
-                torch.tensor(post_ids, dtype=torch.long),
-            ],
-            "audio_features": [audio_features],
-        }, {"kv_layout": {KV_CACHE: {"main": layout}}, AUDIO_FEATURE_LENS_KEY: feature_lens})
-
-    # -------------------------------------------------------------------
-    # Model ABC: postprocess
-    # -------------------------------------------------------------------
+        lens = feat["attention_mask"].sum(-1).to(torch.long)
+        tokens = sum(self.config.encoder_output_length(int(m)) for m in lens.tolist())
+        return PreparedMedia({"audio_features": feat["input_features"]}, [tokens], [lens])
 
     def text_output(self) -> TextOutput:
+        # a transcript, its special tokens dropped
         return TextOutput(self._detokenizer)
 
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        **kwargs,
-    ) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, **kwargs)
-        raise ValueError(f"Unsupported modality for Higgs-Audio: {modality!r}")
-
     # -------------------------------------------------------------------
-    # Model ABC: submodule loading
+    # Submodules
     # -------------------------------------------------------------------
-
-    def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
-    ) -> NodeSubmodule | None:
-        if node_name in self._submodule_cache:
-            return self._submodule_cache[node_name]
-        submodule = self._create_submodule(
-            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
-        )
-        logger.info("Successfully loaded Higgs-Audio submodule for %s", node_name)
-        self._submodule_cache[node_name] = submodule
-        return submodule
 
     def _create_submodule(
-        self, node_name: str, device: str, tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         if node_name == "audio_encoder":
-            return self._create_encoder_submodule(device)
+            submodule = self._create_encoder_submodule(device)
         elif node_name == "LLM":
-            return self._create_llm_submodule(
-                device, tp_group=tp_group, autocast_dtype=autocast_dtype,
-            )
-        return None
+            submodule = self._create_llm_submodule(device, tp_group, dtype)
+        else:
+            return None
+        logger.info("Loaded Higgs-Audio %s onto %s", node_name, device)
+        return submodule
 
     def _create_encoder_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.higgs_audio.components.audio_tower import (
             HiggsAudioFeatureProjector,
             HiggsAudioTower,
         )
+        from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         audio_tower = HiggsAudioTower(self.config)
         projector = HiggsAudioFeatureProjector(self.config)
 
         load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
+            repo_dir=self._resolve_weights(),
             modules=[
                 ModuleAndPrefix(audio_tower, prefix="audio_tower"),
                 ModuleAndPrefix(projector, prefix="audio_encoder_proj"),
@@ -474,8 +268,6 @@ class HiggsAudioModel(Model):
         )
         audio_tower.eval()
         projector.eval()
-
-        from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
         return HiggsAudioEncoderSubmodule(
             audio_tower=audio_tower, projector=projector, config=self.config,
             graphs=self.encoder_graphs,
@@ -496,29 +288,32 @@ class HiggsAudioModel(Model):
             return None
         return name
 
+    def build_llm(self, comm_group) -> torch.nn.Module:
+        """The LLM, unloaded. The checkpoint's flat layout (embed_tokens.*,
+        layers.N.*, norm.*) is Qwen3DenseLM's; only the text head is renamed
+        (`_llm_remap`)."""
+        from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
+
+        return Qwen3DenseLM(
+            Qwen3LMConfig.from_hf(asdict(self.config)),
+            attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=comm_group,
+        )
+
     def _create_llm_submodule(
-        self, device: str, tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        self, device: str, tp_group, dtype: torch.dtype,
     ) -> NodeSubmodule:
-        from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
-        from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+        from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
         from mstar.model.loader.iterators import iter_safetensors_shards
 
         with torch.device("meta"):
-            llm = HiggsAudioLLM(self.config, comm_group=tp_group)
+            llm = self.build_llm(tp_group)
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            llm = llm.to(autocast_dtype)
+        llm = llm.to(dtype)
         llm.to_empty(device=device)
-
-        weights = iter_safetensors_shards(self.local_dir, device=device)
-        load_hf_weights(
-            llm, weights,
-            stacked_params=LLAMA_STACKED_PARAMS,
-            name_remapper=self._llm_remap,
+        weights = iter_safetensors_shards(self._resolve_weights(), device=device)
+        llm.load_weights(
+            (mapped, v) for k, v in weights if (mapped := self._llm_remap(k)) is not None
         )
         llm.eval()
-
-        from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-        return HiggsAudioLLMSubmodule(llm=llm, config=self.config)
+        return HiggsAudioLLMSubmodule(llm, self.config, self.encoders, text_prompts=self.TEXT_PROMPTS)

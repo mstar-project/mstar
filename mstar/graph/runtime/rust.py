@@ -702,7 +702,9 @@ class RustGraphRuntime(GraphRuntime):
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
         for (node, walk), policies in self._stop_policies.items():
-            if not policies:
+            # a node's limits come from its own partition's info: another partition's
+            # carries that partition's settings, which are not the node's
+            if not policies or self._node_to_partition.get(node, info.partition_name) != info.partition_name:
                 continue
             limits = [p.limits(info) for p in policies.values()]
             self._rust.set_stop_limits(
@@ -881,14 +883,6 @@ class RustGraphRuntime(GraphRuntime):
             ],
             ntc_rids=input.new_token_counts.keys,
             new_token_counts=input.new_token_counts.values,
-            consumed_rids=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.keys
-            ),
-            stream_tokens_consumed=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.values
-            ),
             prof_rids=[] if input.profiling is None else input.profiling.keys,
             # encode_fields, not encode: a bare tuple has no wire tag, so
             # encode would wrap it in a data envelope, which Rust cannot

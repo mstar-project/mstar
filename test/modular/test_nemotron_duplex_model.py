@@ -26,7 +26,6 @@ from mstar.engine.resources import (
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
-from mstar.model.base import ClientChunk
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
     ENCODER_FRONT,
@@ -353,7 +352,7 @@ def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
 
 def test_duplex_request_resource_configs():
     model = _make_model()
-    cfg = model.get_request_resource_configs({}, None)
+    cfg = model.get_request_resource_configs([], [], {})
     assert set(cfg) == {NANO_SAMPLER, TALKER_KV}
     assert isinstance(cfg[TALKER_KV], KVReqConfig)
     assert cfg[TALKER_KV].get_labels("eartts_talker", "talker_decode") == ["main", "uncond"]
@@ -361,16 +360,8 @@ def test_duplex_request_resource_configs():
     assert isinstance(text, SamplingReqConfig)
     assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
     # request knobs override the config defaults
-    greedy = model.get_request_resource_configs({}, {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
+    greedy = model.get_request_resource_configs([], [], {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.ignore_eos is True
-
-
-def test_duplex_partition_producer_chain():
-    parts = {p.name: p for p in _make_model().get_partitions()}
-    assert set(parts) == {"Encoder", "LLM", "Talker"}
-    assert parts["Encoder"].producer_partitions == []
-    assert parts["LLM"].producer_partitions == ["Encoder"]
-    assert parts["Talker"].producer_partitions == ["LLM"]
 
 
 def test_duplex_topology_routes():
@@ -405,42 +396,18 @@ def test_duplex_worker_graphs_derive_all_walks():
     assert by_walk["decode"].section.section.enable_async_scheduling is True
 
 
-def test_duplex_initial_partition_routing():
-    model = _make_model()
-    sig = {"text_inputs": ["t"], "has_prompt": ["h"], "prev_text": ["p"], "prev_func": ["f"]}
-    expected = {"Encoder": "encode", "LLM": "decode",
-                "Talker": "talker_decode"}
-    for pname, walk in expected.items():
-        fpa = model.get_initial_forward_pass_args(pname, ["audio"], ["audio", "text"], sig)
-        assert fpa.full_metadata.graph_walk == walk
-        if pname != "LLM":
-            # self-triggered: the Encoder by the client's audio stream
-            assert fpa.inputs == [] and fpa.request_done is False
+@pytest.mark.parametrize("prompt", [True, False])
+def test_duplex_plan_runs_each_partitions_loop_and_flags_a_prompt(prompt):
     # with a system prompt the LLM's first step is prompt + frame: flagged so the
-    # worker keeps it off the fixed-shape decode capture; the prompt rides the loop
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio", "text"], ["audio", "text"], sig)
-    assert fpa.step_metadata == {"prompt_pending": True} and fpa.full_metadata.is_prefill is True
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
-    # no system prompt -> same walk, nothing pending
-    no_prompt = {"text_inputs": ["s"]}
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], no_prompt)
-    assert fpa.full_metadata.graph_walk == "decode" and fpa.step_metadata == {"prompt_pending": False}
-
-
-def test_duplex_llm_after_the_first_step_nothing_is_pending():
+    # worker keeps it off the fixed-shape decode capture
     model = _make_model()
-    meta = model._meta(["audio", "text"], ["audio"], "decode", True)
-    fpa = model.get_partition_forward_pass_args("LLM", meta, {"prev_text": ["pt"], "prev_func": ["pf"]})
-    assert fpa.full_metadata.graph_walk == "decode"
-    assert fpa.full_metadata.is_prefill is False
-    assert fpa.step_metadata == {"prompt_pending": False}
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
-    # the decode node lists the prompt as a fed-back input, so a re-injected copy
-    # of the seed can never outrank the node's own sentinel
-    decode = model.get_graph_walk_graphs()["decode"]
-    node = next(iter(decode.section.get_nodes().values()))
-    assert "text_inputs" in node.input_names
-    assert any(e.name == "text_inputs" and e.next_node == "nano_llm" for e in node.outputs)
+    sig = {"text_inputs": ["t"], "prev_text": ["p"], "prev_func": ["f"], **({"has_prompt": ["h"]} if prompt else {})}
+    plans = {p: model.walk_plan(p, ["audio"], ["audio", "text"], sig, {}) for p in ("Encoder", "LLM", "Talker")}
+    assert {p: [(s.walk, dict(s.bind), dict(s.step_metadata)) for s in plan] for p, plan in plans.items()} == {
+        "Encoder": [("encode", {}, {})],
+        "LLM": [("decode", {}, {"prompt_pending": prompt})],
+        "Talker": [("talker_decode", {}, {})],
+    }
 
 
 def test_duplex_stream_connection_policies():
@@ -461,6 +428,16 @@ def test_duplex_stream_connection_policies():
         assert pol.continue_after_producer_done() is False
 
     assert set(conns) == {"audio_in", "audio_frame", "new_token"}
+
+
+def test_duplex_realtime_frames_audio_on_the_encoder_fronts_frame():
+    """audio_in's ClientAudio frame is the frame the encoder's front pool holds:
+    a larger one pads batched steps and a smaller one keeps every realtime call
+    off the whole-step graph."""
+    model = _make_model()
+    (client,) = model.get_partition_topology().client_connections()
+    front = {s.resource_key: s for s in model.get_node_resources()}[ENCODER_FRONT]
+    assert client.audio.frame_samples == front.config.blocks["sig"].shape[0]
 
 
 def test_duplex_process_prompt_seeds_frame0_feedback():
@@ -551,15 +528,6 @@ def test_duplex_process_prompt_scales_a_multi_file_upload_as_one():
     assert torch.allclose(torch.cat(out), torch.cat([wav, wav / 8.0]), atol=1e-6)
 
 
-def _append(tensors, input_metadata=None, text=None):
-    """An append of ``tensors`` as the data worker hands it to the hook."""
-    return ClientChunk(
-        text=text, tensors=tensors, input_metadata=input_metadata or {},
-        streams={key: [None] * len(items) for key, items in tensors.items()},
-        model_kwargs={}, request_kwargs={},
-    )
-
-
 def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     """The client stream, not the encoder, enforces the session cap, so a live
     call past it gets a 400 naming the limit; a deployment may lower the cap
@@ -578,40 +546,15 @@ def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     assert "may lower" in problem
 
 
-def test_duplex_appended_audio_becomes_stream_items_in_order():
-    """Each appended file streams as ``audio_in`` items, checked like an upload
-    but with no length limit of its own: a live chunk can be shorter than a frame,
-    and audio_in's max_items caps the call's samples as it grows."""
-    model = _make_model()
-    short, loud = torch.zeros(320), torch.full((1280,), 4.0)
-    items = model.process_stream_chunk(_append({"audio_inputs": [short, loud]}, {"audio_inputs": [{}, {}]}))["audio_in"]
-    assert [w.numel() for w in items] == [320, 1280]
-    assert float(items[1].abs().max()) == 1.0           # clamped, not rescaled: no seam
-    wav = torch.zeros(16)
-    wav[3] = float("nan")
-    with pytest.raises(ValueError, match="NaN or inf"):
-        model.process_stream_chunk(_append({"audio_inputs": [wav]}))
-    with pytest.raises(ValueError, match="16000 Hz"):
-        model.process_stream_chunk(_append({"audio_inputs": [short]},
-                                           {"audio_inputs": [{"source_sample_rate": 48000}]}))
-    with pytest.raises(ValueError, match="audio appends only"):
-        model.process_stream_chunk(_append({"image_inputs": [torch.zeros(3, 4, 4)]}))
-    with pytest.raises(ValueError, match="audio appends only; got text"):
-        model.process_stream_chunk(_append({}, text="hello"))
-
-
-def test_duplex_an_upload_or_append_is_one_stream_item():
+def test_duplex_an_upload_is_one_stream_item():
     """A file streams whole, so a one-file upload is one encoder step, as the
     offline encoder ran it (a long item is not batched with other calls')."""
     model = _make_model()
     long = torch.rand(20 * model.config.stt.sample_rate + 777) - 0.5
-    for items in (
-        model.process_prompt(
-            None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]},
-        ).new_input_tensors["audio_in"],
-        model.process_stream_chunk(_append({"audio_inputs": [long]}, {"audio_inputs": [{}]}))["audio_in"],
-    ):
-        assert len(items) == 1 and torch.equal(items[0], long)
+    (item,) = model.process_prompt(
+        None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]},
+    ).new_input_tensors["audio_in"]
+    assert torch.equal(item, long)
 
 
 def test_duplex_load_audio_refuses_a_file_longer_than_a_session_without_decoding_it_all(tmp_path, monkeypatch):
@@ -678,24 +621,6 @@ def test_duplex_load_audio_does_not_trust_the_header_length(tmp_path, monkeypatc
     frames = sf.SoundFile.frames
     monkeypatch.setattr(sf.SoundFile, "frames", property(lambda f: frames.fget(f) * 4))
     assert model.load_audio(path, "cpu").data.numel() == 16000
-
-
-def test_duplex_encoder_partition_ends_with_the_client_stream():
-    model = _make_model()
-    meta = model._meta(["audio"], ["audio", "text"], "encode", False)
-    fpa = model.get_partition_forward_pass_args("Encoder", meta, {})
-    assert fpa.request_done is False and fpa.inputs == []
-
-
-def test_duplex_no_prompt_seeds_initial_decode_inputs():
-    """Audio-only start (no system prompt): the LLM partition starts in the
-    decode loop and its initial inputs carry the seeded prev_text / prev_func
-    and the no-prompt text_inputs sentinel so iteration 0's readiness gate fires."""
-    model = _make_model()
-    sig = {"prev_text": ["pt"], "prev_func": ["pf"], "text_inputs": ["s"]}
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], sig)
-    assert fpa.full_metadata.graph_walk == "decode"
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
 
 
 def _live_client(monkeypatch):

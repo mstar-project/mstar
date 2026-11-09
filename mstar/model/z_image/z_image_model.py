@@ -25,11 +25,10 @@ from collections.abc import Hashable
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
@@ -193,9 +192,13 @@ class ZImageModel(Model):
         height = int(model_kwargs.get("height", self.config.default_height))
         width = int(model_kwargs.get("width", self.config.default_width))
         align = self.config.spatial_alignment
-        for name, value in (("height", height), ("width", width)):
+        # the rotary table has one row per token along each image axis (axes 1 and 2)
+        axes = self.config.transformer.axes_lens
+        for name, value, axis_len in (("height", height, axes[1]), ("width", width, axes[2])):
             if value <= 0 or value % align:
                 raise ValueError(f"Z-Image {name}={value} must be a positive multiple of {align}")
+            if value > axis_len * align:
+                raise ValueError(f"Z-Image {name}={value} exceeds the model's {axis_len * align} px")
         if height * width > self.max_image_area:
             raise ValueError(
                 f"Z-Image {width}x{height} exceeds this server's max_image_area of {self.max_image_area} pixels "
@@ -208,6 +211,10 @@ class ZImageModel(Model):
         if steps < 1:
             raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
         return min(steps, self.config.max_denoise_steps)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
@@ -226,63 +233,23 @@ class ZImageModel(Model):
             logger.info("guidance_scale is ignored: Z-Image-Turbo is distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 
-    # --------------------------------------------------------- state machine
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill, "height": kw["height"], "width": kw["width"],
-            "num_inference_steps": kw["num_inference_steps"], "text_len": kw["text_len"], "cap_len": kw["cap_len"],
-        }
-
-    def get_initial_forward_pass_args(
+    # ------------------------------------------------------------ walk plan
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("Z-Image requires a text prompt (text_inputs)")
         text_len = int(input_signals[TEXT_INPUTS][0].dims[0])
         height, width = self._resolve_size(model_kwargs)
-        kwargs = {
-            "walk_schedule": [ENCODE_TEXT_WALK, IMAGE_GEN_WALK], "walk_step": 0,
-            "height": height, "width": width, "num_inference_steps": self._resolve_steps(model_kwargs),
+        steps = self._resolve_steps(model_kwargs)
+        logger.info("Z-Image request: %dx%d steps=%d tokens=%d seed=%s", width, height,
+                    steps, text_len, model_kwargs.get("seed", "auto"))
+        request = {
+            "height": height, "width": width, "num_inference_steps": steps,
             "text_len": text_len, "cap_len": padded_length(text_len),
         }
-        logger.info("Z-Image request: %dx%d steps=%d tokens=%d seed=%s", width, height,
-                    kwargs["num_inference_steps"], text_len, model_kwargs.get("seed", "auto"))
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=ENCODE_TEXT_WALK, is_prefill=True, kwargs=kwargs,
-        )
-        edge = GraphEdge(next_node="text_encoder", name=TEXT_INPUTS)
-        edge.tensor_info = input_signals[TEXT_INPUTS]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info),
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        step = metadata.kwargs["walk_step"] + 1
-        schedule = metadata.kwargs["walk_schedule"]
-        inputs: list[GraphEdge] = []
-        request_done = step >= len(schedule)
-        if not request_done:
-            metadata.kwargs["walk_step"] = step
-            metadata.graph_walk = schedule[step]
-            metadata.is_prefill = False
-            edge = GraphEdge(next_node="dit", name=TEXT_EMBEDS)
-            edge.tensor_info = persist_signals.get(TEXT_EMBEDS, [])
-            inputs = [edge, GraphEdge(next_node="dit", name=LATENTS)]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
-        )
+        return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, IMAGE_GEN_WALK)]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "image":

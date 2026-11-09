@@ -19,6 +19,7 @@ from diffusers import AutoencoderKLWan  # noqa: E402
 
 from mstar.model.components.wan_vae import is_channels_last  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
+from mstar.model.cosmos3 import submodules as cosmos3_submodules  # noqa: E402
 from mstar.model.cosmos3.config import Cosmos3Config  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
     Cosmos3VAEDecoderARSubmodule,
@@ -377,7 +378,7 @@ def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
     fast_vae.load_state_dict(ref_vae.state_dict())
     cfg = Cosmos3Config()
     assert cfg.vae_decode_fast
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     fast = Cosmos3VAEDecoderSubmodule(fast_vae, cfg, fast=cfg.vae_decode_fast)
     assert is_channels_last(fast_vae)
     got = fast._decode_pixels(stream)

@@ -411,10 +411,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     tensors = out.new_input_tensors
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     assert step.walk == "prefill_vision"
-    # the encoder gets each image and video once, in prompt order
-    assert all(a is b for a, b in zip(
-        step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
-    ))
 
     media = out.metadata[MEDIA_LAYOUT]
     (prompt,) = tensors["text_inputs"]
@@ -427,9 +423,8 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0))}
-    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.metadata)
-    (ids,) = step.input_tensors[("LLM", "text_inputs")]
-    row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.step_metadata)
+    row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
@@ -776,6 +771,15 @@ def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_wit
         _ = model.video_processor
 
 
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
+    image = torch.randint(0, 256, (3, height, 64), dtype=torch.uint8)
+    out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
+    (_, rows, cols), = out.metadata[MEDIA_LAYOUT]["grid"]
+    assert rows < cols, "a wide image's patch grid is wide"
+
+
 def test_the_model_pickles_for_its_workers(model):
     """The server pickles the Model into every worker process it spawns."""
     import pickle
@@ -793,7 +797,7 @@ def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
 
@@ -871,7 +875,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 

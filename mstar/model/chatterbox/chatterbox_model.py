@@ -39,11 +39,7 @@ import torch
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -57,9 +53,10 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
@@ -76,6 +73,7 @@ from mstar.model.chatterbox.config import (
     ChatterboxConfig,
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
+from mstar.model.media_limits import decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -128,7 +126,9 @@ MIN_REPETITION_PENALTY = 1e-5
 
 class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
-    per-partition state machine. No GPU compute lives here."""
+    per-partition walk plans. No GPU compute lives here."""
+
+    DECODE_LOOP = "decode_loop"
 
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
@@ -188,6 +188,16 @@ class ChatterboxModel(Model):
             self.config.stream_chunk_growth = float(stream_chunk_growth)
         if stream_max_chunk_tokens is not None:
             self.config.stream_max_chunk_tokens = int(stream_max_chunk_tokens)
+        # the first streamed chunk vocodes its tokens past the look-ahead, and the next one
+        # crossfades the vocoder cache's worth of its tail
+        s3 = self.config.s3gen
+        first_frames = (self.config.stream_first_chunk_tokens - s3.encoder.pre_lookahead_len) * s3.token_mel_ratio
+        if self.config.stream_chunk_tokens > 0 and first_frames < self.config.stream_mel_cache_frames:
+            fewest = s3.encoder.pre_lookahead_len + -(-self.config.stream_mel_cache_frames // s3.token_mel_ratio)
+            raise ValueError(
+                f"stream_first_chunk_tokens={self.config.stream_first_chunk_tokens} is under the {fewest} tokens "
+                "the first streamed chunk needs to fill the vocoder cache"
+            )
         if s3gen_compile is not None:
             self.config.s3gen_compile = bool(s3gen_compile)
         if s3gen_compile_mode is not None:
@@ -301,6 +311,25 @@ class ChatterboxModel(Model):
         streams = 1 if self.config.is_turbo else 2
         return streams * -(-tokens // page_size)
 
+    def _lora_spec(self) -> LoraSpec | None:
+        """Per-request adapters on T3: every linear of its Llama backbone and the speech
+        head (one row per segment: each stream's last token). Under classifier-free
+        guidance a request's cond and uncond rows both run its adapter, as one model
+        would. The conditioning encoder takes none: it runs in ``prepare_inputs``.
+
+        Turbo serves none: its GPT-2 checkpoint fuses q, k and v into one ``c_attn``
+        tensor in Conv1D layout, which an adapter cannot be placed on per slice."""
+        if self.config.t3.backbone.is_gpt2:
+            return None
+        from mstar.model.chatterbox.components.t3 import T3Model
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+        return module_lora_spec(
+            lambda group: T3Model(self.config.t3, comm_group=group),
+            nodes={T3_NODE}, root_path="model",
+            rows={"speech_head": PER_SEGMENT},
+            exclude={"cond_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step"},
+        )
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3
         bb = t3.backbone
@@ -323,6 +352,7 @@ class ChatterboxModel(Model):
                 high_freq_factor=bb.rope_scaling["high_freq_factor"],
                 old_context_len=bb.rope_scaling["original_max_position_embeddings"],
             )
+        lora = self._lora_spec()
         return [
             KVSpec(resource_key=T3_KV, nodes={T3_NODE}, config=kv),
             AttentionSpec(
@@ -337,14 +367,13 @@ class ChatterboxModel(Model):
                 # the reference samples with min_p 0.05 (Turbo does not)
                 enable_min_p=not self.config.is_turbo,
             ),
+            *([lora] if lora is not None else []),
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         knobs = self.resolve_generation_kwargs(model_kwargs)
         labels = [COND_LABEL, UNCOND_LABEL] if knobs["cfg_weight"] > 0 else [COND_LABEL]
         return {
@@ -427,10 +456,6 @@ class ChatterboxModel(Model):
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         return self.resolve_generation_kwargs(model_kwargs)["max_new_tokens"]
 
-    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # The prefill samples the first token, so decode runs max_new_tokens - 1 iterations.
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         t3 = KVLabel(growth=(("decode", "decode_loop"),))
         return {T3_KV: {COND_LABEL: t3, UNCOND_LABEL: t3}}
@@ -504,14 +529,10 @@ class ChatterboxModel(Model):
             PartitionDefinition(
                 name=T3_PARTITION,
                 graph_walks={"prefill", "prefill_voice", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=S3GEN_PARTITION,
                 graph_walks={"s3gen_chunk", "s3gen_chunk_voice"},
-                initial_walk=None,
-                producer_partitions=[T3_PARTITION],
             ),
         ]
 
@@ -573,16 +594,8 @@ class ChatterboxModel(Model):
             raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            # an undecodable upload is the client's error (400); a missing
-            # decoder library above still surfaces as a server error
-            try:
+            with decoding_upload(filepath, "the reference audio", ffmpeg=True):
                 return decode_torchcodec_capped(filepath, S3GEN_SR).float()
-            except RuntimeError as decode_exc:
-                # the decoder's message names the server's upload path; the client gets none of it
-                logger.info("torchcodec could not decode %s: %s", filepath, decode_exc)
-                raise ValueError(
-                    "Could not decode the reference audio: not a format soundfile or torchcodec can read"
-                ) from None
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")
@@ -710,122 +723,32 @@ class ChatterboxModel(Model):
         return self.tokenizer(prompt)
 
     # -----------------------------------------------------------------------
-    # Conductor state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
-        step = {k: metadata.kwargs[k] for k in keys}
-        step["is_prefill"] = metadata.is_prefill
-        return step
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         knobs = self.resolve_generation_kwargs(model_kwargs)
         has_voice = bool(input_signals.get(REF_AUDIO))
-        wants_audio = "audio" in output_modalities
-
+        if "audio" not in output_modalities:
+            return []
         if partition_name == T3_PARTITION:
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill_voice" if has_voice else "prefill",
-                is_prefill=True,
-                kwargs={k: knobs[k] for k in _T3_KNOBS},
-            )
-            names = [TEXT_INPUTS] + ([REF_AUDIO, VOICE_KEY] if has_voice else [])
-            targets = {TEXT_INPUTS: T3_NODE, REF_AUDIO: VOICE_ENCODER_NODE, VOICE_KEY: VOICE_ENCODER_NODE}
-            inputs = []
-            for name in names:
-                edge = GraphEdge(next_node=targets[name], name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                # the text is read once; the reference clip stays persisted for S3Gen
-                unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])),
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _T3_KNOBS),
-            )
-
+            t3 = {k: knobs[k] for k in _T3_KNOBS}
+            return [
+                WalkStep("prefill_voice" if has_voice else "prefill", step_metadata=t3),
+                WalkStep("decode", bind={PREV_TOKEN: SPEECH_TOKENS}, step_metadata=t3),
+            ]
         if partition_name == S3GEN_PARTITION:
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="s3gen_chunk_voice" if has_voice else "s3gen_chunk",
-                is_prefill=False,
-                kwargs={k: knobs[k] for k in _S3GEN_KNOBS},
-            )
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=self._s3gen_voice_inputs(input_signals) if has_voice else [],
-                unpersist_tensors=[],
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _S3GEN_KNOBS),
-            )
-        raise ValueError(f"Unknown Chatterbox partition {partition_name!r}")
-
-    @staticmethod
-    def _s3gen_voice_inputs(
-        signals: dict[str, list[TensorPointerInfo]], with_tensors: bool = True,
-    ) -> list[GraphEdge]:
-        """The reference clip and its key for the S3Gen node. A stream consumer
-        with non-stream inputs fires once those are in, so the edges accompany
-        every chunk; the tensors themselves ride only with the first forward
-        (``with_tensors``), later chunks carry signal-only edges and the node
-        reuses the reference it conditioned on. Signal-only edges never touch
-        the transport, so the extra handshake the conductor issues after the
-        final chunk cannot race the request's teardown."""
-        inputs = []
-        for name in (REF_AUDIO, VOICE_KEY):
-            edge = GraphEdge(next_node=S3GEN_NODE, name=name)
-            edge.tensor_info = list(signals.get(name, [])) if with_tensors else []
-            inputs.append(edge)
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == T3_PARTITION:
-            if partition_metadata.is_prefill:
-                partition_metadata.is_prefill = False
-                partition_metadata.graph_walk = "decode"
-                edge = GraphEdge(next_node=T3_NODE, name=PREV_TOKEN)
-                edge.tensor_info = persist_signals.get(SPEECH_TOKENS, [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._step_metadata(partition_metadata, _T3_KNOBS),
-                )
-            if partition_metadata.graph_walk == "decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[],
-                    unpersist_tensors=[], request_done=True,
-                )
-            raise ValueError(f"T3 in unexpected walk {partition_metadata.graph_walk!r}")
-
-        if partition_name == S3GEN_PARTITION:
-            inputs = []
-            if partition_metadata.graph_walk == "s3gen_chunk_voice":
-                inputs = self._s3gen_voice_inputs(persist_signals, with_tensors=False)
-            return ForwardPassArgs(
-                full_metadata=partition_metadata,
-                inputs=inputs,
-                unpersist_tensors=[],
-                step_metadata=self._step_metadata(partition_metadata, _S3GEN_KNOBS),
-            )
+            # The voice walk's reference clip and key ride every chunk's pass, so
+            # the node is ready for it; the tensors only the first one's.
+            walk = "s3gen_chunk_voice" if has_voice else "s3gen_chunk"
+            return [WalkStep(walk, step_metadata={k: knobs[k] for k in _S3GEN_KNOBS})]
         raise ValueError(f"Unknown Chatterbox partition {partition_name!r}")
 
     # -----------------------------------------------------------------------
@@ -837,21 +760,6 @@ class ChatterboxModel(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
-
-    def postprocess(
-        self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,
-    ) -> bytes:
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported Chatterbox output modality {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        elif pcm.dtype != torch.int16:
-            pcm = pcm.to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
 
     # -----------------------------------------------------------------------
     # Submodules (worker side)

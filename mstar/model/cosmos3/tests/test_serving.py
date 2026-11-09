@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 
 import pytest
-import torch
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.tests.stubs import StubSampler
@@ -84,8 +83,12 @@ def test_gen_params_and_step_metadata() -> None:
     p = model._resolve_gen_params({"size": "480x256"}, ["text"], ["image"])
     assert (p["width"], p["height"]) == (480, 256)
     assert p["num_frames"] == 1 and p["has_image_condition"] is False
+    # under one latent pixel (16 px) a side had no latent and failed mid-pipeline
+    for size in ({"width": 4}, {"size": "480x8"}):
+        with pytest.raises(ValueError, match="at least 16"):
+            model._resolve_gen_params(size, ["text"], ["image"])
 
-    # The denoise loop stops per-request (check_stop), so a per-request
+    # The denoise loop's cap is per request, so a per-request
     # num_inference_steps is honored, clamped to [1, max_inference_steps];
     # guidance_scale is likewise per request.
     p = model._resolve_gen_params(
@@ -114,64 +117,21 @@ def test_gen_params_and_step_metadata() -> None:
     with pytest.raises(ValueError, match="image conditioning requires a video"):
         model._resolve_gen_params({"num_frames": 4}, ["image", "text"], ["video"])
 
-    fpa = model.get_initial_forward_pass_args(
-        "p0", ["text"], ["image"], {"text_inputs": []},
-        model_kwargs={"size": "256x256", "num_inference_steps": 7},
+    plan = model.walk_plan(
+        "default", ["text"], ["image"], {"text_inputs": []}, {"size": "256x256", "num_inference_steps": 7},
     )
-    sm = fpa.step_metadata
-    assert sm["is_prefill"] is True
-    assert sm["height"] == 256 and sm["width"] == 256
-    assert sm["num_inference_steps"] == 7
+    assert [step.walk for step in plan] == ["prefill", "image_gen"]
+    for step in plan:
+        sm = step.step_metadata
+        assert sm["height"] == 256 and sm["width"] == 256
+        assert sm["num_inference_steps"] == 7
 
 
-def test_dynamic_loop_check_stop_and_wasted_step() -> None:
-    """The denoise loop stops at each request's own step count, and a step
-    dispatched one past that count is a no-op — so the loop's single speculative
-    extra iteration can't index the scheduler out of range."""
-    import types
-
-    import torch
-
-    from mstar.model.cosmos3.submodules import (
-        ACTION_GEN_LOOP,
-        ACTION_GEN_WALK,
-        IMAGE_GEN_LOOP,
-        IMAGE_GEN_WALK,
-        Cosmos3DiTSubmodule,
-    )
-
-    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
-        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
-
-    n = 4
-    dit.request_state("r").add_all(scheduler=StubSampler(list(range(n))), raw_action_dim=2)
-
-    def info(walk, it):
-        return types.SimpleNamespace(
-            graph_walk=walk,
-            dynamic_loop_iter_counts={IMAGE_GEN_LOOP: it, ACTION_GEN_LOOP: it},
-        )
-
-    # Stops only on the last real step (iter n-1), not before; routes by walk.
-    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 2), {}) == set()
-    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 1), {}) == {IMAGE_GEN_LOOP}
-    assert dit.check_stop("r", info(ACTION_GEN_WALK, n - 1), {}) == {ACTION_GEN_LOOP}
-    # Unknown request -> no stop.
-    assert dit.check_stop("missing", info(IMAGE_GEN_WALK, 0), {}) == set()
-
-    # A forward one past the step count returns its inputs unchanged without
-    # touching the transformer or cache manager (both None here).
-    lat = torch.zeros(1, 4, 1, 2, 2)
-    solver = {"unipc_last_sample": torch.ones(1)}
-    out = dit._forward_image_gen(None, dit.request_states["r"], n, latents=lat, **solver)
-    assert torch.equal(out["latents"][0], lat) and out["unipc_last_sample"] == [solver["unipc_last_sample"]]
-
-    act = torch.zeros(1, 3, 5)
-    out = dit._forward_action_gen(None, dit.request_states["r"], n, latents=lat, action_latents=act)
-    assert torch.equal(out["latents"][0], lat)
-    # The action latents (the looped self-edge the loop emits on finish) pass
-    # through unchanged on the discarded extra step.
-    assert torch.equal(out["action_latents"][0], act)
+@pytest.mark.parametrize("fps", [0, -24, float("nan"), float("inf")])
+def test_gen_params_reject_a_bad_fps(fps) -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="fps must be positive"):
+        model._resolve_gen_params({"fps": fps}, ["text"], ["video"])
 
 
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
@@ -599,32 +559,17 @@ def test_vae_encoder_walk_and_signal_wiring() -> None:
         (loop,) = walks[walk].get_loops().values()
         assert ("cond_latents", DIT_NODE) in loop._external_inputs, walk
 
-    # The conditioning media edge targets the encoder node.
-    fpa = model.get_initial_forward_pass_args(
-        "p0", ["image", "text"], ["video"],
-        {"text_inputs": [], "image_inputs": [TensorPointerInfo(
-            dims=[3, 8, 8], dtype="float32", nbytes=768, address=0, stride=[64, 8, 1],
-            uuid="u-img", source_session_id="s", source_entity="api_server")]},
-    )
-    targets = {(e.name, e.next_node) for e in fpa.inputs}
-    assert ("image_inputs", VAE_ENCODER_NODE) in targets
-
-    # Prefill -> gen: the persisted latents ride the cond_latents edge and are
-    # unpersisted with this pass; without a persist signal the edge is empty.
-    info = TensorPointerInfo(
-        dims=[1], dtype=torch.bfloat16, nbytes=2, address=0, stride=[1],
-        uuid="u-lat", source_session_id="s", source_entity="worker",
-    )
-    fpa2 = model.get_partition_forward_pass_args(
-        "default", fpa.full_metadata, {"cond_latents": [info]},
-    )
-    cond_edges = [e for e in fpa2.inputs if e.name == "cond_latents"]
-    assert len(cond_edges) == 1 and cond_edges[0].tensor_info == [info]
-    assert info in fpa2.unpersist_tensors
-    fpa3 = model.get_initial_forward_pass_args("p1", ["text"], ["image"], {"text_inputs": []})
-    fpa4 = model.get_partition_forward_pass_args("default", fpa3.full_metadata, {})
-    (empty_edge,) = [e for e in fpa4.inputs if e.name == "cond_latents"]
-    assert empty_edge.tensor_info == []
+    # A conditioning image picks the conditioned prefill, whose encoder reads it;
+    # the denoise walk after it reads the latents that prefill persists.
+    image = TensorPointerInfo(
+        dims=[3, 8, 8], dtype="float32", nbytes=768, address=0, stride=[64, 8, 1],
+        uuid="u-img", source_session_id="s", source_entity="api_server")
+    plan = model.walk_plan("default", ["image", "text"], ["video"], {"text_inputs": [], "image_inputs": [image]}, {})
+    assert [step.walk for step in plan] == ["prefill_cond", "video_gen"]
+    assert ("image_inputs", VAE_ENCODER_NODE) in walks["prefill_cond"].get_inputs_outputs().ext_inputs
+    assert [step.walk for step in model.walk_plan("default", ["text"], ["image"], {"text_inputs": []}, {})] == [
+        "prefill", "image_gen",
+    ]
 
 
 def test_ingest_cond_latents_routing() -> None:
@@ -672,9 +617,7 @@ def test_ingest_cond_latents_routing() -> None:
 def test_postprocess_finishes_captured_step() -> None:
     """The submodule ``postprocess`` finishes a captured denoise step from the
     step's inputs (CFG combine + scheduler step) and passes eager outputs
-    through untouched. Steps past the request's count never reach it:
-    prepare_inputs vetoes the loop's extra dispatched step and the engine
-    prunes vetoed requests before postprocess."""
+    through untouched."""
     import types
 
     import torch
@@ -719,6 +662,8 @@ def test_a_step_outside_the_guidance_interval_keeps_the_conditional_branch(path)
     step inside the guidance_interval combines them, as the single eager path
     does, so the same seed gives the same image under any load."""
     import types
+
+    import torch
 
     from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
     from mstar.model.cosmos3.submodules import IMAGE_GEN_LOOP, VIDEO_SOUND_GEN_LOOP, Cosmos3DiTSubmodule
@@ -872,3 +817,46 @@ def test_vae_decode_fast_must_be_a_bool() -> None:
 
     with pytest.raises(ValueError, match="vae_decode_fast must be true or false"):
         Cosmos3Config(vae_decode_fast="false").check_streaming_decode()
+
+
+@pytest.mark.parametrize("kwargs, inputs, outputs", [
+    ({"size": "256x256", "num_inference_steps": 7}, ["text"], ["image"]),
+    ({"num_frames": 17, "flow_shift": 12.0}, ["image", "text"], ["video"]),
+    ({"window_mode": "chained", "num_frames": 189}, [], ["video"]),
+    ({"window_mode": "kv", "num_frames": 61}, ["text"], ["video"]),
+    ({"action_mode": "policy", "domain_id": 8, "raw_action_dim": 10}, ["image", "text"], ["action"]),
+], ids=["t2i", "i2v", "chained", "kv", "action"])
+def test_the_denoise_loops_cap_is_the_dits_step_count(kwargs, inputs, outputs) -> None:
+    """The loop's cap (``_denoise_cap``) and the DiT's schedule are computed apart; a loop past the
+    schedule indexes off its end mid-request, and one short of it returns noisy latents."""
+    from types import SimpleNamespace
+
+    from diffusers import UniPCMultistepScheduler
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.tests.test_dit_step_guard import EDGE_SCHEDULER
+    from mstar.model.cosmos3.tests.test_windowed import _stand_in
+
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    p = model._resolve_gen_params(kwargs, inputs, outputs)
+    ((loop, _),) = model._denoise_cap(outputs, p).items()
+    cap = model.get_loop_caps(**{model.DENOISE_CAP: model._denoise_cap(outputs, p)})[loop]
+    signals = {"text_inputs": [], **({"image_inputs": [object()]} if "image" in inputs else {})}
+    md = model.walk_plan("default", inputs, outputs, signals, kwargs)[-1].step_metadata
+    dit = Cosmos3DiTSubmodule(
+        transformer=None, config=model.config, scheduler=UniPCMultistepScheduler.from_config(EDGE_SCHEDULER),
+    )
+    sampler = dit._new_scheduler(
+        int(md["num_inference_steps"]), "cpu", flow_shift=md.get("flow_shift"),
+        use_karras_sigma=md.get("use_karras_sigma"),
+    )
+    if md.get("window_mode") is None:
+        assert cap == len(sampler.host_timesteps)
+        return
+    dit.transformer = _stand_in(dit)
+    fwd = SimpleNamespace(request_id="r", rid_handle="r")
+    dit._prepare_windowed_prefill(
+        fwd, md, [1, 2], [3], p["height"], p["width"], 24.0, 6.0, int(md["num_inference_steps"]), "cpu",
+    )
+    st = dit.request_states["r"]
+    assert len(st["scheduler"].host_timesteps) == st["ar_steps"] and cap == st["ar_total_iters"]

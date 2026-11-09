@@ -82,6 +82,8 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
 
+If the model gets OpenAI routes, its adapter lands in both frontends: the Python HTTP frontend is being retired, so the Rust port (`rust/server/src/adapters/`) is part of the adapter, not a follow-up (AGENTS.md invariant 15; [registration.md](references/registration.md) §5).
+
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 
 The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:82`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.
@@ -128,7 +130,6 @@ Each of these is a one-line convention that a reference implementation states so
 - **Under bf16, round rotary frequencies and timesteps after the sinusoid, not before.** `module.to(bfloat16)` (which the engine applies after `get_submodule`) rounds the rotary frequency buffers, and a timestep cast to the module's dtype before the sinusoid loses its low bits in `t * freq`. Keep the frequency buffers fp32 in `_apply`, compute the sinusoid in fp32 from an fp32 timestep, and cast only its output. In CosyVoice3's flow estimator both roundings moved the audio measurably.
 - **Keep an fp32 LM head out of autocast, and load it as fp32.** The engine's bf16 autocast recasts an fp32 head unless it runs outside autocast, and loading the checkpoint into a bf16 module before making the head fp32 rounds its weights first.
 - **Key per-request submodule state by `fwd_info.rid_handle` in `prepare_inputs`**, not `request_id`: the forward and the engine's cleanup use the handle.
-- **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
 ## Phase 5 — Batching and accelerator graphs
 
@@ -169,6 +170,8 @@ Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmu
 Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync` near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
 
 Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
+
+Phase 4's reuse note holds for tuning too, and for models already in the repo: before optimizing a layer, check `mstar/model/components/` for a shared version of it (for example `snake.py`, a codec decoder's Snake activation in one pass).
 
 If tuning pushes you into the worker or engine rather than your model, read the [async-worker skill](../async-worker/SKILL.md) first.
 

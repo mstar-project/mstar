@@ -14,14 +14,13 @@ Graph walks:
     image_gen     Loop("denoise_loop", dit{text_embeds, latents}) -> vae_decoder -> EMIT image
     image_edit    same, with ref_latents as an extra dit input
 
-The walk sequence is fixed at admission from the input modalities and stepped
-through ``metadata.kwargs["walk_step"]``:
+The walk plan (``walk_plan``) is fixed at admission from the input modalities:
 
     T2I:  encode_text -> image_gen
     edit: encode_text -> encode_image -> image_edit
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling and the
-request's ``num_inference_steps`` stops it through the dit's ``check_stop``.
+request's ``num_inference_steps`` is the loop's cap (``get_loop_caps``).
 
 Per-request knobs (``model_kwargs``): ``width``, ``height`` (multiples of 16),
 ``num_inference_steps`` (default 4), ``seed`` (honoured by the conductor). The
@@ -40,12 +39,11 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
@@ -77,7 +75,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -149,8 +147,8 @@ class Flux2KleinModel(Model):
         # loop counter) and merges requests that became ready meanwhile, so requests at different steps share a
         # forward. On by default since 2026-09-23: same-GPU rows put klein-4B at 0.365-0.372 s vs 0.377-0.390 s
         # lockstep at B=1 and +3% images/s at 4 and 16 concurrent requests (9B +2%), with the served images
-        # unchanged (>= 53 dB from the eager path on all 100 protocol prompts). One speculated step per request
-        # overshoots the schedule and is vetoed by the denoise loop before any forward. `false` restores lockstep
+        # unchanged (>= 53 dB from the eager path on all 100 protocol prompts). The loop's cap keeps speculation from
+        # running past a request's last step. `false` restores lockstep
         # (wait for the step, then batch everything ready), which is within a few percent.
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
@@ -273,13 +271,15 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``."""
+        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``, upright by its EXIF
+        orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
-        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
-            image = raw
+        with (
+            decoding_upload(filepath, "the reference image"),
+            open_upright_image(filepath, formats=PILLOW_IMAGE_FORMATS) as image,
+        ):
             width, height = image.size
             if width < 64 or height < 64:
                 raise ValueError(f"reference image too small: {width}x{height}; both sides must be >= 64 px")
@@ -326,9 +326,13 @@ class Flux2KleinModel(Model):
         if steps < 1:
             raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
         if steps > self.config.max_denoise_steps:
-            logger.info("clamping num_inference_steps %d to the loop ceiling %d", steps, self.config.max_denoise_steps)
+            logger.debug("clamping num_inference_steps %d to the loop ceiling %d", steps, self.config.max_denoise_steps)
             steps = self.config.max_denoise_steps
         return steps
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
@@ -356,32 +360,16 @@ class Flux2KleinModel(Model):
             logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 
-    # --------------------------------------------------------- state machine
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            "height": kw["height"], "width": kw["width"],
-            "num_inference_steps": kw["num_inference_steps"],
-            "ref_grids": kw["ref_grids"],
-            TEXT_LEN: kw[TEXT_LEN],
-        }
-
-    def get_initial_forward_pass_args(
+    # ------------------------------------------------------------ walk plan
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("FLUX.2 klein requires a text prompt (text_inputs)")
-        ref_infos = input_signals.get(IMAGE_INPUTS) or []
-        ref_dims = [(int(info.dims[-2]), int(info.dims[-1])) for info in ref_infos]
+        ref_dims = [(int(info.dims[-2]), int(info.dims[-1])) for info in input_signals.get(IMAGE_INPUTS) or []]
         height, width = self._resolve_size(model_kwargs, ref_dims)
-        edit = bool(ref_infos)
-        schedule = [ENCODE_TEXT_WALK] + ([ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK] if edit else [IMAGE_GEN_WALK])
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        request = {
             "height": height,
             "width": width,
             "num_inference_steps": self._resolve_steps(model_kwargs),
@@ -389,53 +377,11 @@ class Flux2KleinModel(Model):
             TEXT_LEN: int(input_signals[TEXT_INPUTS][0].dims[0]),
         }
         logger.info(
-            "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, kwargs["num_inference_steps"],
-            kwargs["ref_grids"] or "-", model_kwargs.get("seed", "auto"),
+            "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, request["num_inference_steps"],
+            request["ref_grids"] or "-", model_kwargs.get("seed", "auto"),
         )
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=schedule[0], is_prefill=True, kwargs=kwargs,
-        )
-        edge = GraphEdge(next_node="text_encoder", name=TEXT_INPUTS)
-        edge.tensor_info = input_signals[TEXT_INPUTS]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=[edge],
-            unpersist_tensors=list(edge.tensor_info),
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        inputs: list[GraphEdge] = []
-        request_done = step >= len(schedule)
-        if not request_done:
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk == ENCODE_IMAGE_WALK
-            if walk == ENCODE_IMAGE_WALK:
-                edge = GraphEdge(next_node="vae_encoder", name=IMAGE_INPUTS)
-                edge.tensor_info = persist_signals.get(IMAGE_INPUTS, [])
-                inputs.append(edge)
-            else:
-                persisted = [TEXT_EMBEDS] + ([REF_LATENTS] if walk == IMAGE_EDIT_WALK else [])
-                for name in persisted:
-                    edge = GraphEdge(next_node="dit", name=name)
-                    edge.tensor_info = persist_signals.get(name, [])
-                    inputs.append(edge)
-                # the loop-back edge arrives empty; the dit seeds it at iteration 0
-                inputs.append(GraphEdge(next_node="dit", name=LATENTS))
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
-        )
+        walks = [ENCODE_TEXT_WALK] + ([ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK] if ref_dims else [IMAGE_GEN_WALK])
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "image":

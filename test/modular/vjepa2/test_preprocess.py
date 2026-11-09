@@ -173,10 +173,10 @@ def test_ac_rollout_request_replays_the_encoder_capture(stream, monkeypatch):
         input_metadata={"video_inputs": [{"sampled_indices": list(range(16))}]}, **kwargs,
     ).new_input_tensors
     signals = {name: [_pointer(t) for t in tensors] for name, tensors in out.items()}
-    args = model.get_initial_forward_pass_args("p0", ["video"], ["embedding"], signals, kwargs)
-    walk = args.full_metadata.graph_walk
+    (step,) = model.walk_plan("p0", ["video"], ["embedding"], signals, kwargs)
+    walk = step.walk
     info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=0)
-    info.step_metadata.update(args.step_metadata)
+    info.step_metadata.update(step.step_metadata)
 
     encoder = VJepa2EncoderSubmodule(encoder=None, config=model.config)
     (capture,) = encoder.get_accelerator_graph_configs(torch.device("cpu"))

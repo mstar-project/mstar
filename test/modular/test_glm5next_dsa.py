@@ -375,8 +375,6 @@ def test_one_token_prompts_prefill_eager_in_long_mode():
 @pytest.mark.parametrize("change, page_size, match", [
     ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
     ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
-    ({"prefill_graphs": True, "prefill_token_buckets": [128, 2 * sparse_mla.MAX_ROWS]}, None,
-     "prefill buckets"),
 ])
 def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
     sub = object.__new__(Glm5NextLLMSubmodule)

@@ -20,6 +20,7 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import TensorAndMetadata
+from mstar.model.components.mrope import layout_extent
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -36,7 +37,6 @@ from mstar.model.multimodal_decoder import (
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -69,16 +69,18 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         "vocab.json",
         "tokenizer.json",
         "merges.txt",
+        # the tokenizer prefers it to tokenizer_config.json's template, and
+        # some fine-tunes (LightOnOCR-3, Surya) keep their template nowhere else
+        "chat_template.jinja",
     )
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+        super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -93,8 +95,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
         # the vision tower, whose output fills images' and videos' pads in
-        # prompt order
-        pad = self._pad_ids()
+        # prompt order. A text-only checkpoint's tokenizer still has the pad
+        # tokens, so the tower decides whether the model takes media.
+        pad = self._pad_ids() if self.vision_config is not None else {}
         tower = vision_encoder(tuple(pad.values())) if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
@@ -127,6 +130,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
         return [
@@ -176,6 +181,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             ),
             self._sampler_spec(self.config.vocab_size),
             *self._vision_resources(),
+            qwen3_5_lora_spec(self.config, self.vision_config),
         ]
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
@@ -201,8 +207,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                     max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
-                    # the tower's compiled block loop keeps attention in its graph
-                    compile_op=True,
                 ),
             ),
         ]
@@ -216,7 +220,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
         budget = LLMSubmodule.MAX_BATCH_TOKENS
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            ChunkingPolicy(walks=(LLMSubmodule.PREFILL_WALK,), chunkable=True, max_batch_tokens=budget),
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
         )}
@@ -389,6 +393,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         out = self.image_processor(
             images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
             do_rescale=False, do_normalize=False,
+            # inferred, a 1, 3 or 4 px tall image would be read as channels first
+            input_data_format="channels_last",
         )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
@@ -405,12 +411,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        merge = self.vision_config.spatial_merge_size
-        advance = length + sum(
-            vision_position_advance(torch.tensor(grid), merge) - tokens
-            for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
-        )
-        return super().kv_layout(layout, length, advance)
+        if not layout.get("grid"):  # a text prompt, the only kind a text-only checkpoint takes
+            return super().kv_layout(layout, length)
+        return super().kv_layout(layout, length, layout_extent(layout, self._merge(), length))
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -459,7 +462,4 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(
-            model, self.config, self.vision_config, self.encoders,
-            prefill_token_buckets=self.prefill_token_buckets,
-        )
+        return LLMSubmodule(model, self.config, self.vision_config, self.encoders)

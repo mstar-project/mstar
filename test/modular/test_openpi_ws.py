@@ -448,7 +448,7 @@ def test_an_observation_over_the_message_limit_closes_the_socket(served):
 
     big = _droid_obs()
     big["observation/exterior_image_1_left"] = np.zeros((1024, 1024, 3), np.uint8)  # 3 MiB
-    with _real_server({}) as port:  # under the default 16 MiB it is served
+    with _real_server({}) as port:  # under the default limit it is served
         client = _OpenpiClient("127.0.0.1", port)
         assert client.infer(big)["actions"].shape == (HORIZON, 8)
         client.close()
