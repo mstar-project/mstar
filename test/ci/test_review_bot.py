@@ -154,6 +154,9 @@ class TestPreflight(unittest.TestCase):
         out, replies = self.preflight("full", read)
         self.assertEqual(out, {"run": "false"}, "a contributor without write access could start a live test")
         self.assertIn("/review light", replies[0], "the contributor wouldn't be told what they can run")
+        self.assertEqual(self.preflight("continue", peer, actor="a-maintainer"),
+                         ({"run": "true", "mode": "", "turns": "2000"}, []),
+                         "a maintainer couldn't continue a light review of a first-timer's PR")
 
 
 HEAD, LAST = "1" * 40, "2" * 40
@@ -347,7 +350,8 @@ class TestMonitor(unittest.TestCase):
 
 
 class TestRestore(unittest.TestCase):
-    def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml", author_permission="write"):
+    def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml", author_permission="write",
+                through_resolve=False):
         """/review continue finding one stopped review whose saved handoff has `meta`."""
         def download(argv, stdin):
             saved = Path(argv[argv.index("-D") + 1])
@@ -356,16 +360,22 @@ class TestRestore(unittest.TestCase):
             (saved / "handoff.md").write_text("notes")
             return ""
 
+        routes = {
+            "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                 "body": bot.INCOMPLETE + "\nThe review didn't complete"}],
+            "GET repos/o/r/actions/artifacts?*": {"artifacts": [
+                {"expired": False, "created_at": "2026-11-01", "workflow_run": {"id": 9}}]},
+            "GET repos/o/r/actions/runs/9": {"path": path, "event": "issue_comment"},
+            "run download": download,
+            "GET repos/o/r/collaborators/an-author/permission": {"permission": author_permission},
+        }
         with tempfile.TemporaryDirectory() as temp:
-            return step(bot.restore, {
-                "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
-                                                     "body": bot.INCOMPLETE + "\nThe review didn't complete"}],
-                "GET repos/o/r/actions/artifacts?*": {"artifacts": [
-                    {"expired": False, "created_at": "2026-11-01", "workflow_run": {"id": 9}}]},
-                "GET repos/o/r/actions/runs/9": {"path": path, "event": "issue_comment"},
-                "run download": download,
-                "GET repos/o/r/collaborators/an-author/permission": {"permission": author_permission},
-            }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write, author="an-author")[0]
+            if through_resolve:
+                routes["GET repos/o/r/pulls/7"] = {"head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "title": "t",
+                                                   "user": {"login": "an-author"}}
+                return step(bot.resolve, routes, repo="o/r", pr="7", mode="", runner_temp=temp, non_write=non_write)[0]
+            return step(bot.restore, routes, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write,
+                        author="an-author")[0]
 
     def test_a_failure_nobody_expected_is_still_a_refusal(self):
         fake = FakeGh({
@@ -391,6 +401,9 @@ class TestRestore(unittest.TestCase):
         self.assertIn("write access", self.restore({"mode": "nogpu"}, author_permission="read")["why"],
                       "a nogpu review could continue on the PR of an author without write access")
         self.assertEqual(self.restore({"mode": "nogpu"})["mode"], "nogpu", "a writer's nogpu review couldn't continue")
+        self.assertIn("write access",
+                      self.restore({"mode": "nogpu"}, author_permission="read", through_resolve=True)["why"],
+                      "resolve wouldn't hold a nogpu continue to the PR's author")
         self.assertEqual(self.restore({"mode": "light"}, author_permission="read")["mode"], "light",
                          "continuing a light review would need more than a light review does")
 
