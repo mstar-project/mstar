@@ -4495,7 +4495,8 @@ class KVManager(AttentionResource):
         self._passers.discard(rid)
         earmark = self._earmarks.get(rid)
         if earmark is not None:
-            earmark.granted = earmark.pages
+            # A waiting request took the pages kept for it just now, so `_forget_earmark` gives none of them back.
+            earmark.granted, earmark.mark = earmark.pages, None
 
     def unreserve(self, rid: str) -> None:
         """`Resource.unreserve`, which also gives back the allotment the moves `make_room` chose for ``rid`` made
@@ -4804,6 +4805,10 @@ class KVManager(AttentionResource):
         earmark.victims = set(victims)
         for victim in victims:
             self._victims[victim] = earmark
+        previous = self._earmarks.get(earmark.rid)
+        if previous is not None and earmark.mark is not None:
+            # what `_kept` already keeps for the request counts toward the new earmark too
+            earmark.granted = previous.granted
         self._earmarks[earmark.rid] = earmark
         for victim in victims:
             if self._unwritten(victim):
@@ -4822,6 +4827,9 @@ class KVManager(AttentionResource):
         then asks for what its move recorded, not the shortage the earmark holds. Caller holds the lock."""
         earmark = self._earmarks.pop(rid, None)
         if earmark is not None:
+            if earmark.mark is not None:
+                # no request waits for the pages `_kept` keeps for ``rid`` any more
+                self._kept -= min(self._kept, earmark.granted)
             # its victims run on without being dropped
             for victim in earmark.victims:
                 del self._victims[victim]
