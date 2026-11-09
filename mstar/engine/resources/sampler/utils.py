@@ -1410,7 +1410,7 @@ class Sampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
         kept_rids: "frozenset | None" = None,
-        rand_offset: torch.Tensor | None = None, **kwargs
+        rand_offset: torch.Tensor | None = None, greedy: bool = False, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1425,9 +1425,22 @@ class Sampler(BaseSampler):
 
         ``rand_offset`` ([B], on the device) draws at the caller's offsets
         instead of ``_step_offset``, and leaves advancing them to the caller.
+
+        ``greedy``: every row samples greedily (``samples_greedy``), so each
+        takes its row's argmax, as the captured sampler's lean step does. The
+        offsets and history move as on a full step.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         history, rows = self._gather_history(request_ids, configs)
+        if greedy:
+            tokens = self._broadcast_tokens(greedy_tokens(logits))
+            # no row of a greedy step asked for one
+            self.logprobs = None
+            if history is not None:
+                self._write_history(history, rows, tokens, request_ids, kept_rids)
+            if rand_offset is None:
+                self._advance_offsets(request_ids, kept_rids, logits)
+            return tokens
         order = self._gather_filter(configs)
         temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
         top_k = torch.tensor([c.top_k if apply_filters else 0 for c in configs],
@@ -1513,23 +1526,29 @@ class Sampler(BaseSampler):
             self.logprobs = torch.where(torch.tensor(want, device=logits.device), chosen, torch.nan)
 
         if history is not None:
-            advance_history(history, tokens)
-            new_tokens, count = history.tokens, history.count
-            if kept_rids is not None:
-                # only the kept rows' draws count
-                sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
-                                   dtype=torch.long, device=rows.device)
-                rows, count = rows.index_select(0, sel), count.index_select(0, sel)
-                new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
-            self.history.write(rows, new_tokens, count)
+            self._write_history(history, rows, tokens, request_ids, kept_rids)
 
         if any_rep_pen:
             for i, rid in enumerate(request_ids):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        if not own_offsets:
-            return tokens
+        if own_offsets:
+            self._advance_offsets(request_ids, kept_rids, logits)
+        return tokens
+
+    def _write_history(self, history, rows, tokens, request_ids, kept_rids) -> None:
+        advance_history(history, tokens)
+        new_tokens, count = history.tokens, history.count
+        if kept_rids is not None:
+            # only the kept rows' draws count
+            sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
+                               dtype=torch.long, device=rows.device)
+            rows, count = rows.index_select(0, sel), count.index_select(0, sel)
+            new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
+        self.history.write(rows, new_tokens, count)
+
+    def _advance_offsets(self, request_ids, kept_rids, logits: torch.Tensor) -> None:
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
         # would make consecutive decode steps reuse overlapping RNG regions.
@@ -1542,8 +1561,6 @@ class Sampler(BaseSampler):
             self._step_offset[rid] = (
                 self._step_offset.get(rid, 0) + offset_stride
             )
-
-        return tokens
 
     def _stage(self, rows: list[list[float]]) -> torch.Tensor:
         """Per-request settings ``[len(rows), B]`` on the device in one pinned H2D

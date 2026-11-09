@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import CaptureVariant, ResourceStep
+from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -104,10 +104,20 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``logprobs_mode: "processed"``; the captured sampler then also
     # renorms every step's distribution again (CUDA only).
     enable_processed_logprobs: bool = False
+    # Whether a step whose rows all sample greedily may take each row's argmax
+    # (`SamplerResource.lean_for`), in a twin of each batched capture: None
+    # decides by the vocabulary (past the one-kernel draw), False never, True
+    # always. The twins cost capture memory and time, so a deployment that never
+    # samples greedily turns them off in its ``resources:`` block.
+    greedy_capture: bool | None = None
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
+        greedy_capture: bool | None = None,
     ) -> None:
+        if greedy_capture is not None:
+            check_bool_knob("greedy_capture", greedy_capture)
+            self.greedy_capture = greedy_capture
         if enable_logprobs is not None:
             check_bool_knob("enable_logprobs", enable_logprobs)
             self.enable_logprobs = enable_logprobs
@@ -208,18 +218,6 @@ def derive_seed(seed: int, stream: str) -> int:
     """
     digest = hashlib.blake2b(f"{seed}:{stream}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "little") & (2**63 - 1)
-
-
-@dataclass(frozen=True)
-class GreedySample(CaptureVariant):
-    """The capture key of a step whose every row samples greedily
-    (``SamplerResource.runs_greedy``): its sampler takes each row's argmax and
-    records no softmax, filter or draw. The engine captures it beside the full
-    sampler for a node whose vocabulary is too wide for the one-kernel draw,
-    and a step with any other row replays the full one."""
-
-    def __str__(self) -> str:
-        return "greedy" if self.key is None else f"greedy:{self.key}"
 
 
 @dataclass(frozen=True)

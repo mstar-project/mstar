@@ -1,7 +1,8 @@
-"""The greedy capture (`GreedySample`): which steps the engine leases it for,
-what its sampler draws, and that a node's rows keep their RNG offsets, last
-tokens and loop-back reads when its steps flip between it and the full
-capture, resident or host-planned, pre-planned or not.
+"""The sampler's lean step (`SamplerResource.lean_for`): which steps take each row's
+argmax, in the twin of a batched capture or eagerly, which buckets get that twin, the
+serving opt-out, what the lean step draws, and that a node's rows keep their RNG
+offsets, last tokens and loop-back reads when its steps flip between the twin and the
+plain capture, resident or host-planned, pre-planned or not.
 
 On the CPU the captured sampler's ops run eagerly, as a replay runs what its
 capture recorded, the full sampler's draw is replaced by one that returns a
@@ -11,14 +12,17 @@ argmax and its agreement with the full sampler run on CUDA.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
+from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.sampler import utils as sampler_utils
-from mstar.engine.resources.sampler.config import GreedySample, SamplerStep, SamplingReqConfig
-from mstar.engine.resources.sampler.resource import SamplerResource, greedy_samplers
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
     SamplingConfig,
@@ -26,6 +30,7 @@ from mstar.engine.resources.sampler.utils import (
     greedy_tokens,
     samples_greedy,
 )
+from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import (
     BucketKey,
     Segment,
@@ -33,12 +38,15 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import ARNodeInputs
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 CPU = torch.device("cpu")
 V = 64
 WIDE = FUSED_SAMPLE_MAX_VOCAB + 1
 WALK = "decode"
 STRIDE = _rng_offset_stride("cpu", V)
+GREEDY = frozenset({"sampler"})
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
@@ -46,6 +54,12 @@ def _cfg(temperature: float, seed: int = 0, **kw) -> SamplingReqConfig:
     cfg = SamplingReqConfig(temperature=temperature, **kw)
     cfg.apply_conductor_config(seed=seed)
     return cfg
+
+
+def _sampler(vocab_size=WIDE, **kw) -> SamplerResource:
+    """A sampler built as the engine builds it, under the key "sampler"."""
+    spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=vocab_size, **kw)
+    return build_resource(spec, EngineResourceInfo(device=CPU))
 
 
 # ---- what greedy means ----
@@ -69,11 +83,25 @@ def test_what_samples_greedily(kw, greedy):
     assert samples_greedy(SamplingConfig(**kw)) is greedy
 
 
-def test_only_a_vocabulary_past_the_one_kernel_draw_gets_a_greedy_capture():
-    wide = SamplerResource(vocab_size=WIDE, enable_repetion_penalty=True, device=CPU)
-    narrow = SamplerResource(vocab_size=FUSED_SAMPLE_MAX_VOCAB, enable_repetion_penalty=True, device=CPU)
-    unsized = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU)
-    assert greedy_samplers({"a": wide, "b": narrow, "c": unsized, "d": object()}) == {"a": wide}
+@pytest.mark.parametrize("vocab_size,greedy_capture,lean", [
+    (WIDE, None, True),
+    (FUSED_SAMPLE_MAX_VOCAB, None, False),
+    (None, None, False),
+    # the opt-out, and its opposite where the vocabulary alone wouldn't
+    (WIDE, False, False),
+    (FUSED_SAMPLE_MAX_VOCAB, True, True),
+])
+def test_a_sampler_runs_lean_by_its_vocabulary_unless_its_spec_says_otherwise(vocab_size, greedy_capture, lean):
+    sampler = _sampler(vocab_size, greedy_capture=greedy_capture, enable_repetion_penalty=vocab_size is not None)
+    assert sampler.lean_capture is lean and sampler.resource_key == "sampler"
+
+
+def test_a_serving_config_turns_the_greedy_twins_off():
+    spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=WIDE)
+    apply_yaml_overrides([spec], {"resources": {"sampler": {"greedy_capture": False}}})
+    assert spec.greedy_capture is False and not build_resource(spec, EngineResourceInfo(device=CPU)).lean_capture
+    with pytest.raises(ValueError, match="greedy_capture"):
+        apply_yaml_overrides([spec], {"resources": {"sampler": {"greedy_capture": "off"}}})
 
 
 def test_the_argmax_takes_the_first_of_equal_maxima_on_the_cpu():
@@ -84,28 +112,206 @@ def test_the_argmax_takes_the_first_of_equal_maxima_on_the_cpu():
     assert greedy_tokens(logits).tolist() == [2, 0, 4]
 
 
-# ---- the plan's check ----
+# ---- which steps lease the twin ----
+
+class _Lora(Resource):
+    """A stand-in for the LoRA pool: lean for rows that name no adapter."""
+    build = None
+    lean_capture = True
+
+    def __init__(self, adapter_rows=()):
+        self.adapter_rows = set(adapter_rows)
+
+    def lean_for(self, request_ids) -> bool:
+        return self.adapter_rows.isdisjoint(request_ids)
+
+
+def _bucket(*lean) -> BucketKey:
+    return BucketKey(WALK, 4, 4, None, frozenset(lean))
+
+
+def _engine(resources, captured):
+    """An engine whose node keys its captures None and holds ``captured``, leased by the runner's own code."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk=WALK, capture_batch_sizes=[4], single_request_inputs=ARNodeInputs(input_seq_len=1),
+    )
+    runner = object.__new__(AcceleratorGraphRunner)
+    runner._buckets, runner._twins = {}, {}
+    for bucket in captured:
+        for slot in range(2):
+            runner._register_slot(CGSlotSpec(bucket, slot, config, 0), object())
+    return make_engine(_submodules={"LLM": make_mgmt(
+        SimpleNamespace(cg_key_info=lambda walk, info, **kw: None), resources=resources,
+        accelerator_graph_runner=runner,
+    )})
+
+
+def _leased(engine, rids):
+    """The bucket a step of ``rids`` leases (None: eager), and what it runs lean."""
+    batch = SimpleNamespace(
+        node_name="LLM", slot=0, request_ids=list(rids), inputs=None, cg_key_info=None,
+        per_request_info_wrapped={}, per_request_input_metadata={},
+        step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False),
+    )
+    batch.lease_slot = lambda lease: setattr(batch.step_context, "slot_lease", lease)
+    lease = engine.reserve_replay_slot(batch)
+    return (None if lease is None else lease.bucket), batch.step_context.lean
+
 
 @pytest.fixture
 def wide():
-    return SamplerResource(vocab_size=WIDE, enable_repetion_penalty=True, device=CPU)
+    return _sampler()
 
 
-def test_the_plan_refuses_a_greedy_lease_over_a_sampled_row(wide):
+def test_a_step_takes_the_greedy_twin_only_when_every_row_samples_greedily(wide):
+    for rid, t in ((1, 0.0), (2, 0.0), (3, 0.7), (4, 0.9)):
+        wide.ingest_request(rid, _cfg(t))
+    engine = _engine({"sampler": wide}, [_bucket(), _bucket("sampler")])
+    assert _leased(engine, [1, 2]) == (_bucket("sampler"), GREEDY)
+    # some rows sample, or none is greedy: the plain bucket
+    assert _leased(engine, [1, 3]) == (_bucket(), frozenset())
+    assert _leased(engine, [3, 4]) == (_bucket(), frozenset())
+
+
+def test_the_twin_follows_the_batch_not_who_is_resident(wide):
+    """A sampled row arriving mid-run sends the steps it joins to the plain bucket; the
+    greedy rows' steps without it, and after it leaves, go back."""
+    engine = _engine({"sampler": wide}, [_bucket(), _bucket("sampler")])
+    for rid in (1, 2):
+        wide.ingest_request(rid, _cfg(0.0))
+    assert _leased(engine, [1, 2])[1] == GREEDY
+    wide.ingest_request(3, _cfg(0.7))
+    assert _leased(engine, [1, 2])[1] == GREEDY
+    assert _leased(engine, [1, 2, 3]) == (_bucket(), frozenset())
+    wide.remove_request(3)
+    assert _leased(engine, [1, 2])[1] == GREEDY
+    # a re-ingest replaces the config both ways
+    wide.ingest_request(2, _cfg(0.7))
+    assert _leased(engine, [1, 2])[1] == frozenset()
+    wide.ingest_request(2, _cfg(0.0))
+    assert _leased(engine, [1, 2])[1] == GREEDY
+
+
+def test_no_greedy_twin_falls_back_to_the_plain_bucket(wide):
+    wide.ingest_request(1, _cfg(0.0))
+    assert _leased(_engine({"sampler": wide}, [_bucket()]), [1]) == (_bucket(), frozenset())
+
+
+def test_greedy_and_base_only_nest_through_the_set(wide):
+    """Greedy rows with no adapter take the twin with both lean; an adapter row takes the
+    greedy one alone, and a sampled row the base-only one, each falling back through the
+    sets the node's declaration order ranks."""
+    for rid, t in ((1, 0.0), (2, 0.0), (3, 0.7)):
+        wide.ingest_request(rid, _cfg(t))
+    resources = {"lora": _Lora(adapter_rows=[2]), "sampler": wide}
+    every = [_bucket(), _bucket("lora"), _bucket("sampler"), _bucket("lora", "sampler")]
+    engine = _engine(resources, every)
+    assert _leased(engine, [1]) == (_bucket("lora", "sampler"), {"lora", "sampler"})
+    assert _leased(engine, [1, 2]) == (_bucket("sampler"), GREEDY)
+    assert _leased(engine, [1, 3]) == (_bucket("lora"), {"lora"})
+    assert _leased(engine, [2, 3]) == (_bucket(), frozenset())
+    # the nested twin not captured: the larger single set by declaration order, the pool's
+    assert _leased(_engine(resources, every[:3]), [1]) == (_bucket("lora"), {"lora"})
+    assert _leased(_engine(resources, every[:1] + every[2:3]), [1]) == (_bucket("sampler"), GREEDY)
+
+
+def test_a_node_whose_sampler_opted_out_never_runs_it_lean():
+    off = _sampler(greedy_capture=False)
+    off.ingest_request(1, _cfg(0.0))
+    assert _leased(_engine({"sampler": off}, [_bucket(), _bucket("sampler")]), [1]) == (_bucket(), frozenset())
+
+
+# ---- which buckets get the twin ----
+
+def _listed(resources, steps=None):
+    """The (walk, lean) of the buckets a runner over a decode and a prefill config captures,
+    whose steps drive ``steps[walk]`` (every resource by default)."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    configs = [
+        BatchedAcceleratorGraphConfig(capture_graph_walk=WALK, capture_batch_sizes=[1, 4],
+                                      single_request_inputs=ARNodeInputs(input_seq_len=1)),
+        PackedAcceleratorGraphConfig(capture_graph_walk="prefill", capture_token_lengths=[16],
+                                     capture_batch_sizes=[1], make_node_input=lambda n: ARNodeInputs(input_seq_len=n)),
+    ]
+
+    def declare_step(graph_walk, **kwargs):
+        keys = resources.keys() if steps is None else steps[graph_walk]
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+
+    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step)
+    for resource in resources.values():
+        # a CPU sampler can't capture; what is listed is the question here
+        resource.can_capture = lambda: True
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=submodule, resources=resources, step_runner=Mock(), device=CPU,
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+    )
+    return {(spec.bucket.graph_walk, spec.bucket.lean) for spec in runner.prepare_for_capture()}
+
+
+def test_only_batched_buckets_get_a_greedy_twin(wide):
+    plain = {(WALK, frozenset()), ("prefill", frozenset())}
+    assert _listed({"sampler": wide}) == plain | {(WALK, GREEDY)}
+    assert _listed({"sampler": _sampler(V)}) == plain, "a narrow vocabulary draws in one kernel already"
+    assert _listed({"sampler": _sampler(greedy_capture=False)}) == plain, "the opt-out"
+    # a step that doesn't run the sampler gets no twin of it
+    assert _listed({"sampler": wide}, steps={WALK: [], "prefill": []}) == plain
+    # beside the pool: every set on decode, the pool's alone on prefill
+    nested = _listed({"lora": _Lora(), "sampler": wide})
+    assert nested == plain | {(WALK, frozenset({"lora", "sampler"})), (WALK, frozenset({"lora"})), (WALK, GREEDY),
+                              ("prefill", frozenset({"lora"}))}
+
+
+# ---- the plan's check, and the eager step ----
+
+def test_the_plan_refuses_a_greedy_step_over_a_sampled_row(wide):
     wide.ingest_request(1, _cfg(0.0))
     wide.ingest_request(2, _cfg(0.7))
-    lease = SlotLease(0, BucketKey(WALK, 2, 2, GreedySample()))
-    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    lease = SlotLease(0, _bucket("sampler"))
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, slot_lease=lease, lean=GREEDY)
     with pytest.raises(RuntimeError, match="don't sample greedily"):
         wide.plan(SamplerStep(), ctx)
+    # eager too
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, lean=GREEDY)
+    with pytest.raises(RuntimeError, match=r"greedy step \(eager\)"):
+        wide.plan(SamplerStep(), ctx)
     # a capture's rows are padding rows, whatever their config
-    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=True, slot_lease=lease)
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=True, slot_lease=lease, lean=GREEDY)
     wide.plan(SamplerStep(), ctx)
     assert wide._greedy_this_step
-    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False,
-                      slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, slot_lease=SlotLease(0, _bucket()))
     wide.plan(SamplerStep(), ctx)
     assert not wide._greedy_this_step
+
+
+def test_an_eager_greedy_step_takes_the_argmax_and_moves_offsets_as_a_full_one(monkeypatch):
+    """With no capture to lease, the engine runs the sampler lean all the same: each row
+    takes its argmax, without a full draw, and its offset moves as a draw's would."""
+    sampler = _sampler(V, greedy_capture=True)
+    full = Mock(side_effect=AssertionError("drew in full"))
+    monkeypatch.setattr(sampler_utils, "sample_tokens", full)
+    for rid in (1, 2):
+        sampler.ingest_request(rid, _cfg(0.0))
+    sampler.ingest_request(3, _cfg(0.7))
+    engine = make_engine(_submodules={"LLM": make_mgmt(
+        SimpleNamespace(cg_key_info=lambda walk, info, **kw: None), resources={"sampler": sampler},
+    )})
+    assert _leased(engine, [1, 2]) == (None, GREEDY) and _leased(engine, [1, 3]) == (None, frozenset())
+
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, lean=GREEDY)
+    sampler.plan(SamplerStep(), ctx)
+    logits = torch.randn(2, V, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(sampler.sample([1, 2], logits), logits.argmax(-1))
+    assert [sampler._sampler._step_offset[rid] for rid in (1, 2, 3)] == [STRIDE, STRIDE, 0]
+    sampler.commit(SamplerStep(), ctx)
+    # with the sampled row in it, the full draw
+    ctx = StepContext(request_ids=(1, 3), graph_walk=WALK, slot=0, capture=False)
+    sampler.plan(SamplerStep(), ctx)
+    with pytest.raises(AssertionError, match="drew in full"):
+        sampler.sample([1, 3], logits)
 
 
 # ---- steps flipping between the two captures ----
@@ -137,7 +343,7 @@ class _Node:
 
     def __init__(self, planner: bool):
         # a wide vocabulary in name, so the node captures greedy; the logits stay V wide
-        self.sampler = SamplerResource(vocab_size=WIDE, enable_repetion_penalty=True, device=CPU)
+        self.sampler = _sampler()
         self.sampler.enable_device_loopback_reader()
         resources = {"sampler": self.sampler}
         self.planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=4) if planner else None
@@ -159,21 +365,23 @@ class _Node:
 
     def decode(self, rids, slot: int, bs: int = 4, preplan: bool = True):
         """One captured step on the bucket the engine's choice names."""
-        greedy = self.sampler.runs_greedy(rids)
+        greedy = self.sampler.lean_for(rids)
         padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
-        bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs, cg_key_info=GreedySample() if greedy else None)
+        bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs, lean=GREEDY if greedy else frozenset())
         lease = SlotLease(slot=slot, bucket=bucket)
         segments = tuple(Segment(r, "main", 1) for r in padded)
         smp = SamplerStep()
         step = SubmoduleStep(steps={"sampler": smp}, segments=list(segments))
-        ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
+        ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease,
+                          lean=bucket.lean)
         ctx.set_padded_rids(padded)
         key = (bucket, slot)
         if key not in self.captured:
             for rid in padded[len(rids):]:
                 if rid not in self.sampler._sampler._sampling_config:
                     self.sampler.ingest_capture_row(rid)
-            cap = StepContext(request_ids=padded, graph_walk=WALK, slot=slot, capture=True, slot_lease=lease)
+            cap = StepContext(request_ids=padded, graph_walk=WALK, slot=slot, capture=True, slot_lease=lease,
+                              lean=bucket.lean)
             self.sampler.plan(smp, cap)
             rec = self.planner.capture_step(bucket, slot, step) if self.planner is not None else None
             if rec is not None:

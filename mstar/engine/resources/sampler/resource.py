@@ -9,7 +9,6 @@ from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resour
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
-    GreedySample,
     LoopbackState,
     SamplerSpec,
     SamplerStep,
@@ -27,7 +26,7 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
     samples_greedy,
 )
-from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext, has_variant
+from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -59,6 +58,7 @@ class SamplerResource(Resource):
         enable_top_p_first: bool = False,
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
+        greedy_capture: bool | None = None,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
@@ -66,9 +66,13 @@ class SamplerResource(Resource):
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
-        # A greedy capture (`GreedySample`) only pays where the full sampler is
-        # the multi-kernel one; a narrower vocabulary draws in one kernel already.
-        self.greedy_capture = vocab_size is not None and vocab_size > FUSED_SAMPLE_MAX_VOCAB
+        # A step whose rows all sample greedily runs lean, taking each row's argmax
+        # (`lean_for`). By default only where the full sampler is the multi-kernel
+        # one: a narrower vocabulary draws in one kernel already.
+        self.lean_capture = (
+            vocab_size is not None and vocab_size > FUSED_SAMPLE_MAX_VOCAB
+            if greedy_capture is None else greedy_capture
+        )
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
         if max_repetition_window < 0:
@@ -126,10 +130,10 @@ class SamplerResource(Resource):
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
         # Resident requests that don't sample greedily (`samples_greedy`), so
-        # a step over the rest replays the greedy capture. Kept like the two
-        # sets above, and read per step only when it isn't empty.
+        # a step over the rest runs lean. Kept like the two sets above, and read
+        # per step only when it isn't empty.
         self._sampled_rids: set[str] = set()
-        # whether the step planned last runs the greedy capture
+        # whether the step planned last runs lean, taking each row's argmax
         self._greedy_this_step = False
         self._sampled_this_step = False
         self._device = device
@@ -197,6 +201,7 @@ class SamplerResource(Resource):
             enable_top_p_first=spec.enable_top_p_first,
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
+            greedy_capture=spec.greedy_capture,
         )
 
     def build_accelerator_graph_buffers(
@@ -408,29 +413,32 @@ class SamplerResource(Resource):
                     and not self._penalty_needed_this_step:
                 self._assert_penalty_inert(ctx)
 
-    def runs_greedy(self, rids) -> bool:
-        """Whether every one of ``rids`` samples greedily, so a step over
-        them may replay the greedy capture. From the configs set at ingest,
-        which are the same on every rank of a lockstep instance."""
+    def lean_for(self, rids) -> bool:
+        """Whether every one of ``rids`` samples greedily (``samples_greedy``),
+        so a step over them may take each row's argmax. From the configs set at
+        ingest, which are the same on every rank of a lockstep instance."""
         return not self._sampled_rids or self._sampled_rids.isdisjoint(rids)
 
+    def lean_captures(self, config_type) -> bool:
+        """Batched captures only: there a row is a token, and the sampler a
+        sizeable share of the step."""
+        from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+
+        return config_type == AcceleratorGraphConfigType.BASIC_BATCHED
+
     def _set_greedy_flag(self, ctx: StepContext) -> None:
-        """Whether this step runs the greedy capture: its lease's, picked by
-        the engine from `runs_greedy`. Such a step also skips the seen-token
-        traffic, as its rows' penalties are all 1.0."""
-        lease = ctx.slot_lease
-        # a sampler the capture doesn't serve (another of the node's) draws in full there too
-        self._greedy_this_step = greedy = (
-            self.greedy_capture and lease is not None and lease.bucket is not None
-            and has_variant(lease.bucket.cg_key_info, GreedySample)
-        )
+        """Whether this step takes each row's argmax: the engine names this
+        sampler lean in it, from `lean_for`. Such a step also skips the
+        seen-token traffic, as its rows' penalties are all 1.0."""
+        self._greedy_this_step = greedy = self.resource_key in ctx.lean
         if not greedy:
             return
-        if not ctx.capture and not self.runs_greedy(ctx.request_ids):
+        if not ctx.capture and not self.lean_for(ctx.request_ids):
             # its sampled rows would take the argmax silently
             raise RuntimeError(
-                f"sampler: leased greedy {lease.bucket} for a step with rows that don't sample greedily: "
-                f"{sorted(self._sampled_rids.intersection(ctx.request_ids))}"
+                f"sampler: a greedy step "
+                f"({ctx.slot_lease.bucket if ctx.slot_lease is not None else 'eager'}) has rows that don't "
+                f"sample greedily: {sorted(self._sampled_rids.intersection(ctx.request_ids))}"
             )
         self._penalty_needed_this_step = False
 
@@ -744,7 +752,7 @@ class SamplerResource(Resource):
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
             apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
-            rand_offset=offsets,
+            rand_offset=offsets, greedy=self._greedy_this_step,
         )
         if by_slot:
             kept = self._kept_rids
@@ -858,11 +866,3 @@ class SamplerResource(Resource):
         self._row_stager.copy_(index, rows)
         for dst, src in updates:
             dst.index_copy_(0, index, src.to(dst.dtype))
-
-
-def greedy_samplers(resources: Mapping[str, Resource]) -> dict[str, SamplerResource]:
-    """A node's samplers that a greedy capture (`GreedySample`) serves, by resource key."""
-    return {
-        key: resource for key, resource in resources.items()
-        if isinstance(resource, SamplerResource) and resource.greedy_capture
-    }

@@ -310,12 +310,15 @@ There are two ``ResourceReqConfig`` subclasses:
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
 
-  A sampler whose ``vocab_size`` is past the one-kernel draw (4096) also gets a greedy
-  capture of each batched bucket, keyed ``GreedySample(<the node's own key>)``, whose
-  sampler is an argmax. The engine leases it for a step whose every row samples
-  greedily: temperature 0, no repetition penalty, no ``min_tokens`` and no log-probs
-  (``samples_greedy``). Any other step replays the full sampler. The model declares
-  nothing for it.
+  A step whose every row samples greedily (``samples_greedy``: temperature 0, no
+  repetition penalty, no ``min_tokens`` and no log-probs) takes each row's argmax instead
+  of the full sampler's draw, eagerly or in a twin of each batched capture (see **Lean
+  captures** below); any other step runs the full sampler. By default only a sampler whose
+  ``vocab_size`` is past the one-kernel draw (4096) does this, since a narrower one draws
+  in one kernel already. ``SamplerSpec.greedy_capture`` overrides that: ``false`` turns it
+  off, and with it the twins' capture memory and time, for a deployment that never samples
+  greedily, and ``true`` turns it on whatever the vocabulary. A deployment sets it in its
+  ``resources:`` block. The model declares nothing for it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -849,7 +852,9 @@ set in ``StepContext.lean``, eager steps included, and each resource checks its 
 at plan. Twins are sized, planned and captured after every plain bucket, and a twin left
 out (under the capture budget, say) is logged at INFO and is not a dropped bucket: its
 steps replay the plain bucket. Lean resources: the LoRA pool, for steps none of whose rows
-names an adapter, in every kind of capture. A model declares nothing for these.
+names an adapter, in every kind of capture; and a sampler (see ``SamplingReqConfig``), for
+steps whose rows all sample greedily, in batched captures. A model declares nothing for
+these.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -2463,6 +2468,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``SamplerSpec``
+     - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
+       ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
+       draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
+       each batched capture)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
