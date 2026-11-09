@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import fnmatch
 import importlib
+import io
 import json
 import os
 import subprocess
@@ -96,6 +97,14 @@ def workspace():
             yield Path(d)
         finally:
             os.chdir(cwd)
+
+
+def finished(review):
+    """A runner temp directory with the action's execution file for a run that returned `review`."""
+    temp = tempfile.mkdtemp()
+    Path(temp, bot.EXECUTION).write_text(json.dumps([{"type": "result", "subtype": "success", "is_error": False,
+                                                      "num_turns": 3, "structured_output": review}]))
+    return temp
 
 
 def step(fn, routes, **env):
@@ -707,10 +716,10 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertIn("lastEditedAt", bot.THREADS, "an edited finding would read as the bot's own text")
 
     def test_a_gpu_ask_above_the_cap_reaches_the_saved_review(self):
-        output = json.dumps({"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
-                             "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
-                             "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []},
-                             "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
+                  "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                  "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []},
+                  "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}}
         with workspace():
             out, fake = step(bot.post, {
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
@@ -719,7 +728,8 @@ class TestAfterTheReview(unittest.TestCase):
                 ]}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
                 "GET repos/o/r/issues/7/comments": [],
-            }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="full", salvaged="false",
+               max_gpus="4")
         self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
         self.assertEqual(json.loads(out["result"])["inline"], {"4": "P1"},
                          "a later step couldn't tell an edited finding")
@@ -727,9 +737,9 @@ class TestAfterTheReview(unittest.TestCase):
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30
-        output = json.dumps({"outside_diff": [], "since_last": f"leaked {token}", "description_problems": [],
-                             "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [],
-                             "design": [], "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}})
+        review = {"outside_diff": [], "since_last": f"leaked {token}", "description_problems": [],
+                  "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [],
+                  "design": [], "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}}
         with workspace():
             out, fake = step(bot.post, {
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
@@ -737,7 +747,8 @@ class TestAfterTheReview(unittest.TestCase):
                 "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
                                                      "body": bot.INCOMPLETE + "\nstopped"}],
                 "PATCH repos/o/r/issues/comments/5": {},
-            }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="light", salvaged="true", detail="41 turns")
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="true",
+               detail="41 turns")
         (_, posted), (_, resolved) = fake.writes()
         self.assertEqual(out["id"], "99")
         self.assertNotIn(token, out["result"], "the raw summary would reach the live-test job unredacted")
@@ -769,7 +780,7 @@ class TestAfterTheReview(unittest.TestCase):
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
                 "GET repos/o/r/issues/7/comments": [],
-            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
         self.assertEqual([p["commit_id"] for p in posted], [HEAD] * 3, "a later push would shift the line numbers")
         self.assertEqual((posted[1]["start_line"], posted[1]["start_side"], posted[1]["side"]), (7, "LEFT", "LEFT"))
         self.assertNotIn("start_line", posted[0], "a single-line comment takes no range")
@@ -797,12 +808,44 @@ class TestAfterTheReview(unittest.TestCase):
                 "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99", "GET repos/o/r/issues/7/comments": [],
-            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
         for markup in ("@org", "!["):
             self.assertNotIn(markup, posted[0]["body"], "the model's text would ping a team or load an image")
         self.assertIn("```suggestion\nuse(@team)\n```", posted[0]["body"], "an applied suggestion would carry "
                       "zero-width spaces")
         self.assertTrue(posted[0]["body"].startswith("**[P1]** "), "the tag the bot counts findings by would be gone")
+
+    def test_a_refused_comment_cant_start_a_workflow_command(self):
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []},
+                  "inline_comments": [{"path": "a.py\n::add-mask::x", "line": 3, "body": "**[P1]** b"}]}
+        stdout = io.StringIO()
+        with workspace(), contextlib.redirect_stdout(stdout):
+            step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": Fail("HTTP 422\n::add-mask::y"),
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
+        self.assertFalse([x for x in stdout.getvalue().splitlines() if x.startswith("::add-mask")],
+                         "a newline in the model's path would run as a workflow command")
+
+    def test_a_review_too_long_for_an_env_var_still_posts(self):
+        posted = []
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []},
+                  "inline_comments": [{"path": "a.py", "line": 3, "body": "**[P1]** " + "x" * 200_000}]}
+        with workspace():
+            out, _ = step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99", "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
+        self.assertEqual((len(posted), out.get("id")), (1, "99"), "a finished review would be lost")
+        self.assertNotIn("OUTPUT:", (REPO_ROOT / ".github/workflows/claude-review.yml").read_text(),
+                         "over about 128 KB an env var stops the step from starting")
 
     def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
         item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
@@ -823,7 +866,7 @@ class TestAfterTheReview(unittest.TestCase):
                 "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
                 "GET repos/o/r/pulls/7/comments": [],
                 "GET repos/o/r/pulls/7/reviews*": [],
-            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
         (_, posted), = fake.writes()
         saved = render_summary.saved_state(posted)
         self.assertEqual(saved["outside_diff"], [item],
@@ -848,7 +891,7 @@ class TestAfterTheReview(unittest.TestCase):
     def test_only_the_fixed_type_labels_reach_the_api(self):
         out, fake = step(bot.labels, {"GET repos/o/r/issues/7/labels": [{"name": "type/docs"}, {"name": "area/x"}],
                                       "DELETE *": {}, "GET repos/o/r/labels/*": Fail(), "POST *": {}},
-                         repo="o/r", pr="7", output=json.dumps({"types": ["bug", "x; rm -rf /", "ci"]}))
+                         repo="o/r", pr="7", runner_temp=finished({"types": ["bug", "x; rm -rf /", "ci"]}))
         self.assertEqual([k for k, _ in fake.writes()],
                          ["DELETE repos/o/r/issues/7/labels/type%2Fdocs", "POST repos/o/r/labels",
                           "POST repos/o/r/issues/7/labels", "POST repos/o/r/labels", "POST repos/o/r/issues/7/labels"])

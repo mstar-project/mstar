@@ -137,7 +137,10 @@ class TestHandoff(unittest.TestCase):
 
     def test_a_long_note_keeps_its_end_and_cuts_between_words(self):
         token = "ghs_" + "A" * 36
-        note = "Progress: " + " ".join([token] * 400) + " left: b.py"
+        kept = "Progress: P1 a.py:3 verified. " + "x " * 10000
+        self.assertEqual(handoff([assistant("m1", text(kept))], ROOT, [])["note"], kept.rstrip(),
+                         "a stopped run's findings would be cut, and a finding not in the note is lost")
+        note = "Progress: " + " ".join([token] * 1000) + " left: b.py"
         h = handoff([assistant("m1", text(note))], ROOT, [])
         self.assertTrue(h["note"].endswith("left: b.py"), "what is left would be cut off")
         self.assertLessEqual(set(h["note"].split()), {"Progress:", token, "[...]", "left:", "b.py"},

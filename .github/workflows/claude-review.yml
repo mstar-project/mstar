@@ -410,18 +410,16 @@ jobs:
           OUTCOME: ${{ steps.review.outcome }}
         run: python3 .github/review/bot.py usage
 
-      # The inline comments and the summary are model output from untrusted input. They reach the script
-      # only through an env var; it renders the summary with main's render_summary.py, redacts
-      # credential-shaped strings and makes the text inert before it posts either (bot.py, post).
-      # Parsed by the script, not fromJSON(): a template error in `env` would
-      # fail the step outright, past continue-on-error.
+      # The inline comments and the summary are model output from untrusted input. The script reads them from
+      # the action's execution file (an env var would fail the step past about 128 KB); it renders the summary with
+      # main's render_summary.py, redacts credential-shaped strings and makes the text inert before it posts
+      # either (bot.py, post).
       - name: Post the summary
         if: steps.review.outcome == 'success' || steps.salvage.outputs.structured_output != ''
         id: post
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-          OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
@@ -446,7 +444,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-          OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
         run: python3 .github/review/bot.py labels
 
       # A review that stopped before it finished: write the handoff a

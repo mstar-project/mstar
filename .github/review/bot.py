@@ -646,6 +646,24 @@ def write_open_issues(repo, mode):
 
 # ---------------------------------------------------------------- review job: after the review
 
+def last_result(messages):
+    """The final `result` message of an execution file's messages, {} when there is none."""
+    return ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
+
+
+def returned(result):
+    """What a `result` message returned, when the run finished and returned a review; otherwise None."""
+    output = result.get("structured_output")
+    ok = result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict)
+    return output if ok else None
+
+
+def finished_review(runner_temp):
+    """The review a finished run returned, from the action's execution file; None if it returned none. Read here,
+    not passed through an env var: the kernel refuses to start a step with one over about 128 KB, which a review with
+    many inline findings can pass, and the finished review would be lost."""
+    return returned(last_result(json.loads(Path(runner_temp, EXECUTION).read_text())))
+
 
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
@@ -668,10 +686,10 @@ def salvage(out, repo, pr, runner_temp):
         out["billing"] = "true"
         comment(repo, pr, "The review didn't run: the API account for the review bot is out of credit.")
         return
-    result = ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
+    result = last_result(messages)
     out["detail"] = f"{result.get('num_turns', '?')} turns"
-    output = result.get("structured_output")
-    if result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict):
+    output = returned(result)
+    if output is not None:
         out["structured_output"] = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
     else:
         out["why"] = {"error_max_turns": "it ran out of turns",
@@ -749,23 +767,24 @@ def post_inline(repo, pr, head_sha, review):
             new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
                                 input=json.dumps(fields)).stdout)
             posted[str(new["id"])] = tag[1] if tag else "P2"
-        except UNREADABLE as e:
-            print(f"::warning::Couldn't post the inline comment on {c['path']}:{c['line']}: {e}")
+        except UNREADABLE as e:  # json.dumps: a newline in the model's path or gh's echo would start a command
+            where = f"{c['path']}:{c['line']}"
+            print(f"::warning::Couldn't post the inline comment on {json.dumps(where)}: {json.dumps(str(e))}")
             text = body[tag.end() if tag else 0:].strip()
             review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": text.split("\n")[0],
-                                           "location": f"{c['path']}:{c['line']}",
+                                           "location": where,
                                            "detail": session.shorten(text, 2000)})
     return posted
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4"):
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4"):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
     redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
     try:
-        review = render_summary.over_gpu_cap(json.loads(output), max_gpus)
+        review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
         posted = post_inline(repo, pr, head_sha, review)
         pages = graphql(THREADS, repo, pr)
         review = render_summary.carried(review, *earlier_review(repo, pr))
@@ -773,7 +792,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4
                                      salvaged == "true")
     except Exception as e:
         text = ""
-        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {e}")
+        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {json.dumps(str(e))}")
     text = redact(text)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
@@ -815,13 +834,13 @@ def hide(out, repo, pr, new_id):
                    "classifier: OUTDATED}) { clientMutationId } }", "-f", f"id={c['id']}")
 
 
-def labels(out, repo, pr, output):
+def labels(out, repo, pr, runner_temp):
     """The PR's type/* labels, from the review's structured output. Model output, so each is checked
     against the fixed list before it reaches the API; type/* labels the review no longer returns are
     removed. Area and size labels come from pr-labels.yml."""
     try:
-        types = json.loads(output).get("types") or []
-    except (ValueError, AttributeError):
+        types = finished_review(runner_temp).get("types") or []
+    except (OSError, ValueError, AttributeError):
         types = []
     wanted = [f"type/{t}" for t in (types if isinstance(types, list) else []) if t in TYPES]
     if not wanted:
