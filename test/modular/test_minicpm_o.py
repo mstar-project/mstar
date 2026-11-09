@@ -138,7 +138,7 @@ def test_min_p_is_served():
 
     model = a_bare_model(max_seq_len=4096)
     [spec] = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec)]
-    model.get_request_resource_configs({}, {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
+    model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
 
 
 def test_an_attachment_tag_in_the_users_text_is_refused():
@@ -307,9 +307,9 @@ def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
     )
     out = prompt.new_input_tensors
     signals = {name: [None] for name in out}
-    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, model_kwargs=prompt.metadata)
-    assert args.full_metadata.graph_walk == "prefill_omni"
-    info = SimpleNamespace(step_metadata=args.step_metadata)
+    prefill, _ = model.walk_plan("default", ["text"], ["text"], signals, prompt.metadata)
+    assert prefill.walk == "prefill_omni"
+    info = SimpleNamespace(step_metadata=prefill.step_metadata)
     vision = VisionEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
         "prefill_omni", info, {"pixel_values": out["pixel_values"]},
     )
@@ -349,16 +349,20 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
         ({"text_inputs", "pixel_values", "image_positions", "audio_features", "audio_positions"}, "prefill_omni"),
     ],
 )
-def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
+def test_the_plan_prefills_by_the_attachments_then_decodes_its_token(model, tensors, walk):
+    """The prefill walk the attachments pick, whose inputs the request's signals
+    all name (the conductor sends each input the signal of its name), then decode
+    fed the prefill's token."""
+    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.graph.base import TensorPointerInfo
 
     signals = {name: [TensorPointerInfo.__new__(TensorPointerInfo)] for name in tensors}
-    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals)
-    assert args.full_metadata.graph_walk == walk
-    fed = {(e.next_node, e.name) for e in args.inputs}
+    prefill, decode = model.walk_plan("default", ["text"], ["text"], signals, {})
+    assert (prefill.walk, prefill.step_metadata[FINAL_PREFILL]) == (walk, True)
+    assert (decode.walk, decode.bind) == ("decode", {"text_inputs": "new_token"})
     produced = {"vision_embeds", "audio_embeds"}
-    for name, node in model.get_graph_walk_graphs()[walk].get_nodes().items():
-        assert {(name, n) for n in node.input_names if n not in produced} <= fed
+    for node in model.get_graph_walk_graphs()[walk].get_nodes().values():
+        assert set(node.input_names) - produced <= tensors
 
 
 @needs_ckpt
