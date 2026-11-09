@@ -21,7 +21,8 @@ from mstar.model.components.distributed import (
 )
 from mstar.model.components.moe import ParallelSparseMoeBlock, TopKRouter
 from mstar.model.components.norm import RMSNorm
-from mstar.model.deepseek_ocr.config import ATTN, KV_CACHE, ROPE, DeepseekOCRTextConfig
+from mstar.model.deepseek_ocr.config import ATTN, DeepseekOCRTextConfig
+from mstar.model.keys import KV_CACHE, ROPE
 
 _EXPERT_KEY = re.compile(r"^(layers\.\d+\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj\.weight$")
 
@@ -107,6 +108,10 @@ class DeepseekOCRLanguageModel(nn.Module):
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.embed_tokens.weight.dtype
 
     def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.

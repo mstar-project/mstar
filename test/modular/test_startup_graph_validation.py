@@ -660,9 +660,15 @@ def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _deepseek_ocr(name, model_kwargs, tmp_path, monkeypatch):
-    # the checkpoint's config.json as the package's tests ship it; nothing is downloaded
+    # the checkpoint's config.json as the package's tests ship it, and a stand-in
+    # for its tokenizer; nothing is downloaded
+    import transformers
+
     fixture = ROOT / "mstar/model/deepseek_ocr/tests/fixtures/config.json"
     (tmp_path / "config.json").write_text(fixture.read_text())
+    tokenizer = types.SimpleNamespace(eos_token_id=1, convert_tokens_to_ids=lambda token: 128815)
+    monkeypatch.setattr(transformers.PreTrainedTokenizerFast, "from_pretrained",
+                        classmethod(lambda cls, path: tokenizer))
     return _constructed(name, model_kwargs, model_path_hf=str(tmp_path))
 
 

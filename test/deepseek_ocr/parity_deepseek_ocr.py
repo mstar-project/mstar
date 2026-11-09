@@ -198,7 +198,7 @@ class LLMDriver:
         """``rid`` is the request's worker handle, as the engine keys resources."""
         from mstar.conductor.request_info import CurrentForwardPassInfo
 
-        configs = self.model.get_request_resource_configs({}, {})
+        configs = self.model.get_request_resource_configs(["image", "text"], ["text"], {})
         for config in configs.values():
             config.apply_conductor_config(seed=0)
         self.runner.ingest_request(rid, configs)
@@ -231,9 +231,8 @@ class LLMDriver:
 
 @torch.no_grad()
 def run_mstar(args, snapshot: str) -> dict:
-    from mstar.model.deepseek_ocr.config import STEP_GRIDS_KEY
     from mstar.model.deepseek_ocr.deepseek_ocr_model import DeepseekOCRModel
-    from mstar.model.multimodal import PromptPart
+    from mstar.model.multimodal import MEDIA_LAYOUT, PromptPart
     from mstar.model.submodule_base import ModelInputsFromEngine
 
     device = torch.device("cuda")
@@ -244,8 +243,8 @@ def run_mstar(args, snapshot: str) -> dict:
     stop = set(model.text_output().stop_token_ids)
     # the logits of each step, as the node's forward hands them to the sampler
     logits_of_step = []
-    head = llm.language_model.logits
-    llm.language_model.logits = lambda hidden: logits_of_step.append(head(hidden)) or logits_of_step[-1]
+    head = llm.model.logits
+    llm.model.logits = lambda hidden: logits_of_step.append(head(hidden)) or logits_of_step[-1]
 
     out = {}
     for rid, path in enumerate(args.pages):
@@ -256,14 +255,15 @@ def run_mstar(args, snapshot: str) -> dict:
                                       tensors={"image_inputs": [model.load_image(path, "cpu").data]})
         signals, metadata = prompt.new_input_tensors, prompt.metadata
         ids = signals["text_inputs"][0]
-        fwd = driver.open(rid, name, {STEP_GRIDS_KEY: metadata["image_grids"]})
+        fwd = driver.open(rid, name, {MEDIA_LAYOUT: metadata[MEDIA_LAYOUT]})
         engine_inputs = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd})
-        node_inputs = vision.prepare_inputs("prefill_image", fwd, {"image_views": signals["image_views"]})
+        views = {key: signals.get(key, []) for key in ("global_views", "tiles")}
+        node_inputs = vision.prepare_inputs("prefill_vision", fwd, views)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            (rows,) = vision.forward("prefill_image", engine_inputs, [node_inputs])["image_embeds"]
+            (rows,) = vision.forward("prefill_vision", engine_inputs, [node_inputs])[vision.output]
         logits_of_step.clear()
         # on the device, as the transport hands a node its inputs
-        tokens = [driver.step("prefill_image", fwd, {"text_inputs": [ids.to(device)], "image_embeds": [rows]})]
+        tokens = [driver.step("prefill_vision", fwd, {"text_inputs": [ids.to(device)], vision.output: [rows]})]
         logits = logits_of_step[0][-1].float().cpu()
         while int(tokens[-1]) not in stop and len(tokens) < args.max_new:
             tokens.append(driver.step("decode", fwd, {"text_inputs": [tokens[-1]]}))

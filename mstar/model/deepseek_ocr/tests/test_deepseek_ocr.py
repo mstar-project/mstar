@@ -29,6 +29,29 @@ def _checkpoint_dir(tmp_path, **language):
     return tmp_path
 
 
+class _CharTokenizer:
+    """One id per character, enough for the prompt's encode; ``<image>`` is 7."""
+
+    eos_token_id = 1
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        for i, piece in enumerate(text.split("<image>")):
+            ids += [7] * (i > 0) + [ord(c) % 1000 + 10 for c in piece]
+        return ids
+
+    def convert_tokens_to_ids(self, token):
+        return 7
+
+
+@pytest.fixture(autouse=True)
+def _no_tokenizer_files(monkeypatch):
+    import transformers
+
+    monkeypatch.setattr(transformers.PreTrainedTokenizerFast, "from_pretrained",
+                        classmethod(lambda cls, path: _CharTokenizer()))
+
+
 @pytest.mark.parametrize("size,max_crops,grid", [
     ((1596, 2240), 9, (2, 3)),   # portrait page
     ((2240, 1596), 9, (3, 2)),   # landscape page
@@ -93,7 +116,7 @@ def test_encoder_captures_one_region_per_view_size():
 
     with torch.device("meta"):
         encoder = DeepEncoder(2048, 1280)
-    vision = DeepseekOCRVisionSubmodule(encoder, view_sizes=(GUNDAM.global_size, GUNDAM.image_size))
+    vision = DeepseekOCRVisionSubmodule(encoder, "vision_embeds", view_sizes=(GUNDAM.global_size, GUNDAM.image_size))
     configs = vision.get_piecewise_accelerator_graph_configs(torch.device("meta"), torch.bfloat16)
     assert set(configs) == {"views_640", "views_1024"}
     shape = PiecewiseCaptureShape(bs=3, seq_lens=[100] * 3, total_tokens=300)
@@ -104,12 +127,12 @@ def test_encoder_captures_one_region_per_view_size():
 def test_prompt_renders_images_before_the_text():
     from mstar.model.multimodal import PromptPart
 
-    render = DeepseekOCRModel._render
-    image, text = PromptPart("image"), PromptPart("text", text="Free OCR.")
+    render = DeepseekOCRModel.render
+    image, text = PromptPart("image"), PromptPart("text", text="Free OCR. ")
     # a chat may send the instruction first; the model reads the page first
-    assert render(None, [image, text], 1) == render(None, [text, image], 1) == "<image>\nFree OCR."
-    assert render("Free OCR. ", None, 1) == "<image>\nFree OCR."
-    assert render("Read <image> and <image>", None, 2) == "Read <image> and <image>"
+    assert render([image, text], 1) == render([text, image], 1) == "<image>\nFree OCR."
+    placed = PromptPart("text", text="Read <image> and <image>")
+    assert render([image, image, placed], 2) == "Read <image> and <image>"
 
 
 def _tiny_text_config(**overrides) -> DeepseekOCRTextConfig:
@@ -170,7 +193,7 @@ def test_decoder_refuses_a_checkpoint_missing_one_expert():
 def test_graph_and_resources(tmp_path):
     model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
     assert isinstance(model, Model)
-    assert set(model.get_graph_walk_graphs()) == {"prefill", "prefill_image", "decode"}
+    assert set(model.get_graph_walk_graphs()) == {"prefill_text", "prefill_vision", "decode"}
     resources = {spec.resource_key: spec for spec in model.get_node_resources()}
     assert set(resources) == {"kv_cache", "attn", "rope", "sampler"}
     assert all(spec.nodes == {"LLM"} for spec in resources.values())
@@ -183,17 +206,40 @@ def test_graph_and_resources(tmp_path):
     assert {(e.next_node, e.name) for e in decode.outputs} == {("LLM", "text_inputs"), (EMIT_TO_CLIENT, "text_inputs")}
 
 
-def test_image_prefill_sends_views_to_the_encoder_and_grids_as_step_metadata(tmp_path):
-    model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
-    signals = {"text_inputs": ["ids"], "image_views": ["global", "tiles"]}
-    args = model.get_initial_forward_pass_args(
-        "default", ["image", "text"], ["text"], signals, model_kwargs={"image_grids": [[2, 3]]},
-    )
-    assert args.full_metadata.graph_walk == "prefill_image"
-    assert {(e.next_node, e.name) for e in args.inputs} == {("LLM", "text_inputs"), ("vision_encoder", "image_views")}
-    assert args.step_metadata == {"step_image_grids": [[2, 3]]}
-    text_only = model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": ["ids"]})
-    assert text_only.full_metadata.graph_walk == "prefill" and not text_only.step_metadata
+def test_image_views_reach_the_encoder_with_their_grids(tmp_path):
+    """A page (tiled 2x3) and a small image (its global view only): the
+    prefill walk carries both views to the encoder, which reads each image's
+    grid off the walk's media layout, and the prompt holds one pad per row
+    the encoder will send."""
+    from types import SimpleNamespace
+
+    from mstar.model.deepseek_ocr.submodules import DeepseekOCRVisionSubmodule
+    from mstar.model.multimodal import MEDIA_LAYOUT
+
+    model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)), max_crops=6)
+    page = torch.full((3, 2240, 1596), 255, dtype=torch.uint8)
+    small = torch.zeros((3, 300, 400), dtype=torch.uint8)
+    modalities = ["image", "image", "text"]
+    out = model.process_prompt("Free OCR.", modalities, ["text"], tensors={"image_inputs": [page, small]})
+    signals = {k: v for k, v in out.new_input_tensors.items() if v}
+    assert set(signals) == {"text_inputs", "global_views", "tiles"}
+    ids = signals["text_inputs"][0]
+    assert int((ids == 7).sum()) == num_image_tokens(GUNDAM, 2, 3) + num_image_tokens(GUNDAM, 1, 1)
+
+    prefill, decode = model.walk_plan("default", modalities, ["text"], signals, out.metadata)
+    assert (prefill.walk, decode.walk) == ("prefill_vision", "decode")
+    encoder = model.encoder("vision_encoder")
+    assert set(encoder.inputs) == {"global_views", "tiles"}
+    with torch.device("meta"):
+        vision = DeepseekOCRVisionSubmodule(DeepEncoder(2048, 1280), encoder.output, view_sizes=(1024, 640))
+    fwd = SimpleNamespace(step_metadata={MEDIA_LAYOUT: prefill.step_metadata[MEDIA_LAYOUT]})
+    node = vision.prepare_inputs("prefill_vision", fwd, {name: signals[name] for name in encoder.inputs})
+    assert node.kwargs["grid"] == [(2, 3), (1, 1)]
+    assert node.tensor_inputs["global_views"].shape == (2, 3, 1024, 1024)
+    assert node.tensor_inputs["tiles"].shape == (6, 3, 640, 640)
+
+    text_only, _ = model.walk_plan("default", ["text"], ["text"], {"text_inputs": [ids]}, {})
+    assert text_only.walk == "prefill_text"
 
 
 @pytest.mark.parametrize("image_mode,max_crops", [
@@ -216,7 +262,7 @@ def test_min_p_reaches_the_samplers_refusal(tmp_path):
     # Qwen3_5Adapter documents min_p as refused; dropped here, a request would run without it
     model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == "sampler"]
-    config = model.get_request_resource_configs({}, {"min_p": 0.1})["sampler"]
+    config = model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.1})["sampler"]
     with pytest.raises(ValueError, match="min_p"):
         config.validate(spec)
 
@@ -237,28 +283,17 @@ def test_a_step_of_packed_page_prefills_fits_a_captured_graph(tmp_path, max_crop
     config = _tiny_text_config()
     with torch.device("meta"):
         llm = DeepseekOCRLLMSubmodule(
-            DeepseekOCRLanguageModel(config), config, image_token_id=5, stop_ids=frozenset({1}),
-            max_prompt_tokens=model.max_prompt_tokens(),
+            DeepseekOCRLanguageModel(config), config, model.encoders, max_prompt_tokens=model.max_prompt_tokens(),
         )
-    (packed,) = [c for c in llm.get_accelerator_graph_configs(torch.device("meta"))
-                 if c.capture_graph_walk == "prefill_image"]
+    configs = llm.get_accelerator_graph_configs(torch.device("meta"))
+    (packed,) = [c for c in configs if c.capture_graph_walk == "prefill_vision"]
     largest = max(num_image_tokens(model.image_mode, cols, rows)
                   for cols in range(1, max_crops + 1) for rows in range(1, max_crops + 1)
                   if 2 <= cols * rows <= max_crops)
-    pages = llm.max_batch_size("prefill_image")
+    pages = llm.max_batch_size("prefill_vision")
     # "<image>\nFree OCR." and the BOS are under 16 tokens
     assert 1 < pages <= max(packed.capture_batch_sizes)
     assert pages * (largest + 16) <= max(packed.get_total_tokens(pages))
-
-
-class _CharTokenizer:
-    """One id per character, enough for process_prompt's encode."""
-
-    def encode(self, text, add_special_tokens=False):
-        return [ord(c) % 1000 + 10 for c in text]
-
-    def convert_tokens_to_ids(self, token):
-        return 7
 
 
 def test_concurrent_prompts_match_one_at_a_time(tmp_path):
@@ -269,7 +304,6 @@ def test_concurrent_prompts_match_one_at_a_time(tmp_path):
 
     model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)), max_crops=6)
     assert model.PREPROCESS_PARALLEL
-    model._tokenizer = _CharTokenizer()
     gen = torch.Generator().manual_seed(0)
     images = [torch.randint(0, 256, (3, h, w), dtype=torch.uint8, generator=gen)
               for h, w in ((900, 700), (700, 1300), (500, 400), (1500, 1000))] * 2
@@ -282,29 +316,7 @@ def test_concurrent_prompts_match_one_at_a_time(tmp_path):
         parallel = list(pool.map(prepare, images))
     for (a, meta_a), (b, meta_b) in zip(serial, parallel, strict=True):
         assert torch.equal(a["text_inputs"][0], b["text_inputs"][0])
-        assert len(a["image_views"]) == len(b["image_views"])
-        assert all(torch.equal(x, y) for x, y in zip(a["image_views"], b["image_views"], strict=True))
+        for name in ("global_views", "tiles"):
+            assert len(a.get(name, [])) == len(b.get(name, []))
+            assert all(torch.equal(x, y) for x, y in zip(a.get(name, []), b.get(name, []), strict=True))
         assert meta_a == meta_b
-
-
-def test_concurrent_first_prompts_load_one_tokenizer(tmp_path, monkeypatch):
-    """The prepare pool's first requests reach the lazy tokenizer together."""
-    import threading
-    import time
-    from concurrent.futures import ThreadPoolExecutor
-
-    import transformers
-
-    loads = []
-
-    def slow_load(path):
-        loads.append(threading.get_ident())
-        time.sleep(0.05)
-        return _CharTokenizer()
-
-    monkeypatch.setattr(transformers.PreTrainedTokenizerFast, "from_pretrained", staticmethod(slow_load))
-    model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
-    with ThreadPoolExecutor(8) as pool:
-        tokenizers = list(pool.map(lambda _: model.tokenizer, range(8)))
-    assert len(loads) == 1
-    assert all(t is tokenizers[0] for t in tokenizers)

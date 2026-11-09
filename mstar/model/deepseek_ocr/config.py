@@ -9,20 +9,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-# Resource names shared by the decoder components and the LLM node.
-KV_CACHE = "kv_cache"
+# The decoder's attention resource; its KV cache, RoPE and sampler sit under
+# the scaffold's keys (``mstar.model.keys``).
 ATTN = "attn"
-ROPE = "rope"
-SAMPLER = "sampler"
-
-PREFILL_WALKS = ("prefill", "prefill_image")
 
 # The tokenizer's ``<image>``; every image position carries it.
 IMAGE_TOKEN = "<image>"
-
-# model_kwargs key: every image's [cols, rows] tile grid, from process_prompt;
-# STEP_GRIDS_KEY is the step_metadata key the vision node reads them from
-IMAGE_GRIDS_KEY, STEP_GRIDS_KEY = "image_grids", "step_image_grids"
 
 
 @dataclass(frozen=True)
@@ -49,6 +41,12 @@ class DeepseekOCRTextConfig:
     # Unlimited-OCR's R-SWA: generated tokens see the whole prompt plus this
     # many recent generated tokens (see ``DeepseekOCRModel``)
     sliding_window: int | None
+    # the tokenizer's EOS, where it is not ``eos_token_id``
+    extra_stop_token_ids: tuple[int, ...] = ()
+
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id, *self.extra_stop_token_ids})
 
     @property
     def head_dim(self) -> int:
