@@ -165,7 +165,7 @@ class DeepseekOCRLLMSubmodule(ARNodeSubmodule):
 
     def __init__(
         self, language_model: DeepseekOCRLanguageModel, config: DeepseekOCRTextConfig, image_token_id: int,
-        max_prompt_tokens: int | None = None,
+        stop_ids: frozenset[int], max_prompt_tokens: int | None = None,
     ):
         super().__init__()
         self.language_model = language_model
@@ -178,7 +178,7 @@ class DeepseekOCRLLMSubmodule(ARNodeSubmodule):
         self.prefill_image_max_batch_size = (
             most if max_prompt_tokens is None else max(1, min(most, top // max_prompt_tokens)))
         self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=frozenset({config.eos_token_id}),
+            loop="decode_loop", buffer="new_token", stop_ids=stop_ids,
             sampler=SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
         )
         # decode reads its last token off the sampler's slot masters, and its
@@ -240,7 +240,7 @@ class DeepseekOCRLLMSubmodule(ARNodeSubmodule):
         ids = ids.to(device=self.get_device(), dtype=torch.long)
         if graph_walk != "prefill_image":
             return ARNodeInputs(input_ids=ids, input_seq_len=ids.numel())
-        # Embedded here, so a chunked prefill cuts the embeddings with the ids.
+        # the captured image prefill reads embeddings, so the rows go in before it
         (image_embeds,) = inputs["image_embeds"]
         embeds = self.language_model.embed(ids)
         embeds = embeds.masked_scatter(

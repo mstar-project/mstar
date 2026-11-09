@@ -627,12 +627,14 @@ projector) and the ``LLM`` node a 3B DeepSeek-V2 MoE decoder (64 experts, top-6,
     mstar serve deepseek_ocr --gpus 0
     curl -s http://localhost:8000/generate -F 'text=Free OCR.' -F 'files=@page.png'
 
-``/v1/chat/completions`` takes ``image_url`` and text parts. An image goes before
-the text that follows it as ``<image>\n``, which gives the model card's prompts
-(``Free OCR.``, ``<|grounding|>Convert the document to markdown.``); text that
-already holds ``<image>`` is used as written. Decoding is greedy unless the request
-sets a temperature, and there is no n-gram repetition ban yet (the model card's
-``no_repeat_ngram_size``, vLLM's ``NGramPerReqLogitsProcessor``).
+``/v1/chat/completions`` takes ``image_url`` and text parts. The images go first,
+each as ``<image>\n``, then the text, in whatever order the parts arrive, which gives
+the model card's prompts (``Free OCR.``, ``<|grounding|>Convert the document to
+markdown.``); text that already holds ``<image>`` is used as written. Decoding is
+greedy unless the request sets a temperature, and there is no n-gram repetition ban
+yet (the model card's ``no_repeat_ngram_size``, vLLM's ``NGramPerReqLogitsProcessor``).
+``test/deepseek_ocr/parity_deepseek_ocr.py`` checks the encoder rows, prefill logits
+and greedy ids against the checkpoint's remote code.
 
 Views are cut on the API server with PIL, as the model card's ``infer`` cuts them:
 ``model_kwargs.image_mode`` is one of the card's modes (``tiny``, ``small``,

@@ -101,12 +101,13 @@ def test_encoder_captures_one_region_per_view_size():
     assert configs["views_640"].seq_len == GUNDAM.side_tokens(640) ** 2
 
 
-def test_prompt_renders_images_before_their_text():
+def test_prompt_renders_images_before_the_text():
     from mstar.model.multimodal import PromptPart
 
     render = DeepseekOCRModel._render
-    parts = [PromptPart("image"), PromptPart("text", text="Free OCR.")]
-    assert render(None, parts, 1) == "<image>\nFree OCR."
+    image, text = PromptPart("image"), PromptPart("text", text="Free OCR.")
+    # a chat may send the instruction first; the model reads the page first
+    assert render(None, [image, text], 1) == render(None, [text, image], 1) == "<image>\nFree OCR."
     assert render("Free OCR. ", None, 1) == "<image>\nFree OCR."
     assert render("Read <image> and <image>", None, 2) == "Read <image> and <image>"
 
@@ -236,7 +237,7 @@ def test_a_step_of_packed_page_prefills_fits_a_captured_graph(tmp_path, max_crop
     config = _tiny_text_config()
     with torch.device("meta"):
         llm = DeepseekOCRLLMSubmodule(
-            DeepseekOCRLanguageModel(config), config, image_token_id=5,
+            DeepseekOCRLanguageModel(config), config, image_token_id=5, stop_ids=frozenset({1}),
             max_prompt_tokens=model.max_prompt_tokens(),
         )
     (packed,) = [c for c in llm.get_accelerator_graph_configs(torch.device("meta"))

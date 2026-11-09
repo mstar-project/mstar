@@ -266,7 +266,7 @@ class DeepseekOCRModel(Model):
         language_model = language_model.to(dtype=dtype).to_empty(device=device)
         language_model.load_weights(weights)
         return DeepseekOCRLLMSubmodule(
-            language_model.eval(), self.config, self._get_image_token_id(),
+            language_model.eval(), self.config, self._get_image_token_id(), self.stop_token_ids(),
             max_prompt_tokens=self.max_prompt_tokens(),
         ).eval()
 
@@ -309,23 +309,21 @@ class DeepseekOCRModel(Model):
     def _render(prompt, prompt_parts, num_images: int) -> str:
         """The prompt with ``<image>`` where each image goes.
 
-        An image renders as ``<image>\\n`` before the text that follows it,
-        which gives the model card's prompts (``<image>\\nFree OCR.``); with no
-        parts, the images lead. Text that already places ``<image>`` is taken
-        as written.
+        Text that places ``<image>`` itself is taken as written. Otherwise the
+        images lead, each as ``<image>\\n``, then the text, whatever order a
+        chat sends its parts in: the model card's prompts
+        (``<image>\\nFree OCR.``), as vLLM places them. With the instruction
+        before the page the model mostly loops (olmOCR-bench 33% against 75%).
         """
         if prompt_parts is None:
             if not isinstance(prompt, str):
                 raise ValueError("Expected a text prompt")
-            if IMAGE_TOKEN in prompt:
-                return prompt.strip()
-            return (f"{IMAGE_TOKEN}\n" * num_images + prompt).strip()
-        texts = [p.text or "" for p in prompt_parts if p.modality == "text"]
-        if any(IMAGE_TOKEN in text for text in texts):
-            return "".join(texts).strip()
-        return "".join(
-            f"{IMAGE_TOKEN}\n" if p.modality == "image" else (p.text or "") for p in prompt_parts
-        ).strip()
+            text = prompt
+        else:
+            text = "\n".join(p.text or "" for p in prompt_parts if p.modality == "text")
+        if IMAGE_TOKEN in text:
+            return text.strip()
+        return (f"{IMAGE_TOKEN}\n" * num_images + text).strip()
 
     def process_prompt(
         self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, **kwargs,
@@ -373,11 +371,15 @@ class DeepseekOCRModel(Model):
         layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
         return ProcessPromptOutput(result, {**metadata, "kv_layout": {KV_CACHE: {"main": layout}}})
 
-    def text_output(self) -> TextOutput:
+    def stop_token_ids(self) -> frozenset[int]:
+        """The config's EOS and the tokenizer's, which a fine-tune may set apart."""
         stop = {self.config.eos_token_id}
         if self.tokenizer.eos_token_id is not None:
             stop.add(self.tokenizer.eos_token_id)
-        return TextOutput(self._chunk_detokenizer(), frozenset(stop))
+        return frozenset(stop)
+
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.stop_token_ids())
 
     def postprocess(self, output, modality, request_kwargs=None):
         if modality != "text":
