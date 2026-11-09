@@ -491,6 +491,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.scheduling_policy.html">mstar.worker.scheduling_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -2850,6 +2851,26 @@ applies to the rows a speculation chain continues, the backlog and the queued ro
 every ready row fits, it doesn’t matter. An admit that runs out of KV pages offloads the row
 last in that same line.</p></li>
 </ul>
+<p><strong>Walk priorities.</strong> Which (node, walk) a worker’s next step goes to is a
+<code class="docutils literal notranslate"><span class="pre">SchedulingPolicy</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/worker/scheduling_policy.py</span></code>). By default it is round robin:
+the least recently scheduled key first, and a speculation chain keeps its first step before
+it gives way to other ready work. A model that returns <code class="docutils literal notranslate"><span class="pre">WalkPriority</span></code> entries from
+<code class="docutils literal notranslate"><span class="pre">Model.get_walk_priorities</span></code> gets <code class="docutils literal notranslate"><span class="pre">Priority</span></code> instead. An entry names a node (all its
+walks), a walk (all its nodes) or one (node, walk), and where entries overlap the most
+specific decides: a pair over a walk over a node. Keys with ready rows go in priority order,
+round robin among equals, and a chain gives way at once when a key above its own has a row
+the engine would take. That trades the other keys’ steps for the listed one’s latency, so it
+suits a walk whose steps are short, such as a TTS model’s prefill, whose first audio waits on
+it while decode streams have time to spare: list the walk, and every node on it is covered.
+A key that stays ready holds lower ones back for as long as it does, unless they have a
+<code class="docutils literal notranslate"><span class="pre">max_wait</span></code>: a ready key that has gone that many of the worker’s chain steps (every step on
+its main chain, side-lane steps not counted) since it last ran goes
+first, longest waiting first, and a chain gives it its next step. A priority on one walk of a
+combined walk lifts the whole combined key in that order, its other walks’ rows included, and
+a backlogged key, split over several steps, still finishes first whatever its priority. A
+deployment replaces the entries, sets a default <code class="docutils literal notranslate"><span class="pre">max_wait</span></code> or turns priorities off with the
+serving config’s <code class="docutils literal notranslate"><span class="pre">scheduling</span></code> (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). An entry naming nothing the model runs,
+a negative priority, or two entries for the same target refuse the worker’s start.</p>
 <p id="combined-walks"><strong>Combined walks.</strong> By default a step holds one walk. A model lets several walks of a node
 share a step by returning <code class="docutils literal notranslate"><span class="pre">{node:</span> <span class="pre">{combined_walk:</span> <span class="pre">{walks}}}</span></code> from
 <code class="docutils literal notranslate"><span class="pre">get_combined_graph_walks</span></code>, for example decode rows beside a prompt’s prefill. The

@@ -44,6 +44,7 @@
    request_lifecycle
    rid_table
    scheduled_batch
+   scheduling_policy
    services
    spec_rows
    speculation

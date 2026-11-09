@@ -488,6 +488,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduling_policy.html">mstar.worker.scheduling_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -753,13 +754,16 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch" title="mstar.worker.scheduled_batch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduled_batch</span></code></a></p></td>
 <td><p>A step's rows as the scheduler hands them on, and the chunk arithmetic that goes with them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.scheduling_policy.html#module-mstar.worker.scheduling_policy" title="mstar.worker.scheduling_policy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduling_policy</span></code></a></p></td>
+<td><p>Which (node, walk) a worker's next step goes to.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
 <td><p>A speculative step's per-row objects, built as columns.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
 <td><p>Streaming edges on one worker, both sides.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
 <td><p>The engine worker's metrics, built only while metrics are on.</p></td>
 </tr>
 </tbody>

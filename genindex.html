@@ -845,6 +845,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.scheduling_policy.html">mstar.worker.scheduling_policy</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1725,6 +1726,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.batch_cap_varies">batch_cap_varies() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek.batch_number">batch_number (mstar.worker.scheduling_policy.ReadyPeek attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.batch_postprocess">batch_postprocess() (mstar.model.submodule_base.NodeSubmodule method)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuilderType">BatchBuilderType (class in mstar.worker.batch_builder)</a>
@@ -2139,6 +2142,18 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BaseBatchBuilder.chain_must_yield">chain_must_yield() (mstar.worker.batch_builder.BaseBatchBuilder method)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek.chain_step_of">chain_step_of (mstar.worker.scheduling_policy.ReadyPeek attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek.chain_steps">chain_steps (mstar.worker.scheduling_policy.ReadyPeek attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.Priority.chain_yields">chain_yields() (mstar.worker.scheduling_policy.Priority method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.RoundRobin.chain_yields">(mstar.worker.scheduling_policy.RoundRobin method)</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.SchedulingPolicy.chain_yields">(mstar.worker.scheduling_policy.SchedulingPolicy method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.chained_head_context_latents">chained_head_context_latents (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -5155,6 +5170,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.has_put_tensor_batch_columns">(mstar.communication.tensor_store.TensorStore property)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek.has_ready_excluding">has_ready_excluding() (mstar.worker.scheduling_policy.ReadyPeek method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.glm5_next.config.html#mstar.model.glm5_next.config.Glm5NextModelConfig.hc_eps">hc_eps (mstar.model.glm5_next.config.Glm5NextModelConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.glm5_next.config.html#mstar.model.glm5_next.config.Glm5NextModelConfig.hc_mult">hc_mult (mstar.model.glm5_next.config.Glm5NextModelConfig attribute)</a>
@@ -7135,6 +7152,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.max_video_pixels">max_video_pixels() (in module mstar.model.media_limits)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.WalkPriority.max_wait">max_wait (mstar.worker.scheduling_policy.WalkPriority attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.max_windows">max_windows (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -7986,6 +8005,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.worker.rid_table.html#module-mstar.worker.rid_table">mstar.worker.rid_table</a>
 </li>
         <li><a href="_autosummary/mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch">mstar.worker.scheduled_batch</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#module-mstar.worker.scheduling_policy">mstar.worker.scheduling_policy</a>
 </li>
         <li><a href="_autosummary/mstar.worker.spec_rows.html#module-mstar.worker.spec_rows">mstar.worker.spec_rows</a>
 </li>
@@ -9943,6 +9964,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.worker.scheduling_policy
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#module-mstar.worker.scheduling_policy">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.worker.spec_rows
 
       <ul>
@@ -10244,7 +10272,11 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.HostGpu.node">(mstar.utils.cpus.HostGpu attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.WalkPriority.node">(mstar.worker.scheduling_policy.WalkPriority attribute)</a>
+</li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek.node_and_walk_to_last_batch_num">node_and_walk_to_last_batch_num (mstar.worker.scheduling_policy.ReadyPeek attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.node_fp32_precision">node_fp32_precision() (in module mstar.engine.fp32_precision)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.node_name">node_name (mstar.graph.base.ReadySignals attribute)</a>
@@ -10339,10 +10371,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.normalize_lang_code">normalize_lang_code() (in module mstar.model.kokoro.g2p)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.normalize_lora_key">normalize_lora_key() (in module mstar.engine.resources.lora.checkpoint)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.normalize_lora_key">normalize_lora_key() (in module mstar.engine.resources.lora.checkpoint)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.normalize_lora_state_dict">normalize_lora_state_dict() (in module mstar.engine.resources.lora.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.ChatterboxConfig.normalize_reference_loudness">normalize_reference_loudness (mstar.model.chatterbox.config.ChatterboxConfig attribute)</a>
@@ -10823,10 +10855,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.opening_prefix_caches">opening_prefix_caches() (in module mstar.engine.resources.kv.config)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PrefixSpan.opens_step">opens_step (mstar.engine.resources.kv.config.PrefixSpan attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.utils.html#mstar.model.utils.Operation">Operation (class in mstar.model.utils)</a>
 </li>
       <li><a href="_autosummary/mstar.model.utils.html#mstar.model.utils.Operation.operation">operation (mstar.model.utils.Operation attribute)</a>
@@ -10847,6 +10879,14 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.StepRunner.order">(mstar.engine.resources.StepRunner property)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.Priority.order">order() (mstar.worker.scheduling_policy.Priority method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.RoundRobin.order">(mstar.worker.scheduling_policy.RoundRobin method)</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.SchedulingPolicy.order">(mstar.worker.scheduling_policy.SchedulingPolicy method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.StepPick.ordered">ordered (mstar.worker.batch_builder.StepPick attribute)</a>
@@ -11773,6 +11813,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.prime_context">prime_context() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.Priority">Priority (class in mstar.worker.scheduling_policy)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.WalkPriority.priority">priority (mstar.worker.scheduling_policy.WalkPriority attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.Priority.priority">priority() (mstar.worker.scheduling_policy.Priority method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.probe_audio_seconds">probe_audio_seconds() (in module mstar.model.media_limits)</a>
 </li>
       <li><a href="_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.probe_video">probe_video() (in module mstar.model.media_limits)</a>
@@ -12222,6 +12268,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.ready_names">ready_names (mstar.graph.base.ReadySignals attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ready_node_names">ready_node_names (mstar.graph.graph_io.WorkerGraphIO property)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.ReadyPeek">ReadyPeek (class in mstar.worker.scheduling_policy)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals">ReadySignals (class in mstar.graph.base)</a>
 </li>
@@ -12951,6 +12999,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.weight_loader.html#mstar.model.omnilingual_asr.weight_loader.resolve_tokenizer">resolve_tokenizer() (in module mstar.model.omnilingual_asr.weight_loader)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.resolve_walk_priorities">resolve_walk_priorities() (in module mstar.worker.scheduling_policy)</a>
+</li>
       <li><a href="_autosummary/mstar.model.waypoint.checkpoint.html#mstar.model.waypoint.checkpoint.resolve_waypoint_checkpoint">resolve_waypoint_checkpoint() (in module mstar.model.waypoint.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource">Resource (class in mstar.engine.resources)</a>
@@ -13363,6 +13413,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys">rotate_queries_or_keys() (in module mstar.model.vjepa2.components.rope_utils)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.RoundRobin">RoundRobin (class in mstar.worker.scheduling_policy)</a>
+</li>
       <li><a href="_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.route_template">route_template() (in module mstar.observability.metrics)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.stream_buffers.html#mstar.worker.stream_buffers.StreamBufferManager.route_tensor">route_tensor() (mstar.worker.stream_buffers.StreamBufferManager method)</a>
@@ -13692,6 +13744,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ScheduleTPNode">ScheduleTPNode (class in mstar.utils.ipc_format)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.SchedulingPolicy">SchedulingPolicy (class in mstar.worker.scheduling_policy)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionConfig.scheme">scheme (mstar.engine.resources.position.config.PositionConfig attribute)</a>
 
@@ -16082,6 +16136,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.RebuildCursor.walk">(mstar.worker.rebuild.RebuildCursor attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.WalkPriority.walk">(mstar.worker.scheduling_policy.WalkPriority attribute)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.StepCandidates.walk_caps">walk_caps (mstar.worker.batch_builder.StepCandidates attribute)</a>
 </li>
@@ -16116,6 +16172,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.StepCandidates.walk_row_caps">walk_row_caps (mstar.worker.batch_builder.StepCandidates attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.walk_tagged">walk_tagged (mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduling_policy.html#mstar.worker.scheduling_policy.WalkPriority">WalkPriority (class in mstar.worker.scheduling_policy)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.RoutingContext.walks">walks (mstar.engine.resources.spec.RoutingContext attribute)</a>
 
@@ -16219,14 +16277,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.VoiceEncoderConfig.win_size">(mstar.model.chatterbox.config.VoiceEncoderConfig attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.SinkWindow.window">window (mstar.engine.resources.kv.bounded.config.SinkWindow attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.SinkWindow.window">(mstar.engine.resources.kv.bounded.SinkWindow attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.windowing.html#mstar.engine.windowing.WindowSchedule.window">window() (mstar.engine.windowing.WindowSchedule method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVConfig.window_capacity">window_capacity (mstar.engine.resources.kv.bounded.BoundedKVConfig property)</a>
