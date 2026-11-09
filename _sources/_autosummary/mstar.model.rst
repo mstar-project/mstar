@@ -63,6 +63,7 @@
    qwen3_tts
    rebuild
    registry
+   ripple
    submodule_base
    utils
    vjepa2

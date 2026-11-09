@@ -403,6 +403,10 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.ripple.html">mstar.model.ripple</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.ripple.config.html">mstar.model.ripple.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -3414,9 +3418,9 @@ its partial sum, and hand the norm the comm group: <code class="docutils literal
 <span class="pre">comm_group)</span></code> reduces, adds and norms, and <code class="docutils literal notranslate"><span class="pre">RMSNorm.forward(x,</span> <span class="pre">comm_group)</span></code> reduces and
 norms (a post-norm before the residual add). The two go together, since a norm called
 without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
-the module whose <code class="docutils literal notranslate"><span class="pre">forward</span></code> calls the norms, as <code class="docutils literal notranslate"><span class="pre">Qwen3_5LanguageModel</span></code> and
-<code class="docutils literal notranslate"><span class="pre">MuseGlimmerTextModel</span></code> do. <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> builds the kernel’s workspace for its
-TP node.</p>
+the module whose <code class="docutils literal notranslate"><span class="pre">forward</span></code> calls the norms, as <code class="docutils literal notranslate"><span class="pre">Qwen3_5LanguageModel</span></code>,
+<code class="docutils literal notranslate"><span class="pre">MuseGlimmerTextModel</span></code> and <code class="docutils literal notranslate"><span class="pre">RippleTextModel</span></code> do. <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> builds the
+kernel’s workspace for its TP node.</p>
 </section>
 <section id="guidance-cfg-parallelism">
 <span id="id6"></span><h3>Guidance (CFG) parallelism<a class="headerlink" href="#guidance-cfg-parallelism" title="Link to this heading">#</a></h3>
@@ -3890,8 +3894,8 @@ submodule cache and where the files come from. A model sets <code class="docutil
 <code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>. The scaffold’s
 <code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a text request and reprefill its ids on
 <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>. A model whose LLM node holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>,
-or the engine refuses to start; Muse Glimmer returns <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run through
-its sliding-window pool. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
+or the engine refuses to start; Muse Glimmer and Ripple-65B return <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run
+through a sliding-window pool. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
 <code class="docutils literal notranslate"><span class="pre">MediaIntake</span></code> per attachment modality: its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> (modalities may share one),
 its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs</span></code>, one by default; a Qwen3.5 video fills one per
