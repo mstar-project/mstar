@@ -1028,6 +1028,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.media_limits</span><span class="w"> </span><span class="kn">import</span> <span class="n">VideoBudget</span><span class="p">,</span> <span class="n">decoding_upload</span><span class="p">,</span> <span class="n">ffmpeg_unavailable</span>
+
 
 <div class="viewcode-block" id="SampledVideo">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.SampledVideo">[docs]</a>
@@ -1055,24 +1057,6 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="ffmpeg_unavailable">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.ffmpeg_unavailable">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">ffmpeg_unavailable</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Why torchcodec can't decode video in this process, or None if it can."""</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">torchcodec</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">torchcodec.decoders</span>  <span class="c1"># noqa: F401</span>
-    <span class="k">except</span> <span class="p">(</span><span class="ne">ImportError</span><span class="p">,</span> <span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-        <span class="c1"># torchcodec 0.9 and earlier raise here when FFmpeg is missing</span>
-        <span class="k">return</span> <span class="sa">f</span><span class="s2">"it failed to load: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span>
-    <span class="c1"># 0.16 imports without FFmpeg and fails only at decode (0.8 has no</span>
-    <span class="c1"># ffmpeg_major_version, and has already raised above)</span>
-    <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torchcodec</span><span class="p">,</span> <span class="s2">"ffmpeg_major_version"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">"it found no FFmpeg shared libraries"</span>
-    <span class="k">return</span> <span class="kc">None</span></div>
-
-
-
 <div class="viewcode-block" id="sample_video">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.sample_video">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sample_video</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">video_processor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SampledVideo</span><span class="p">:</span>
@@ -1092,15 +1076,14 @@ window.runMermaid = runMermaid;</script>
     <span class="k">try</span><span class="p">:</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">transformers.video_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_video</span>
     <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Qwen3.5 video input needs transformers: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Qwen3.5 video input needs transformers: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">if</span> <span class="n">reason</span> <span class="o">:=</span> <span class="n">ffmpeg_unavailable</span><span class="p">():</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
             <span class="s2">"Qwen3.5 video input needs torchcodec with FFmpeg, the decoder "</span>
             <span class="sa">f</span><span class="s2">"transformers uses; </span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
 
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">video_metadata_dict</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.media_limits</span><span class="w"> </span><span class="kn">import</span> <span class="n">VideoBudget</span>
 
     <span class="n">budget</span> <span class="o">=</span> <span class="n">VideoBudget</span><span class="p">()</span>
 
@@ -1115,11 +1098,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">budget</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">metadata</span><span class="o">.</span><span class="n">height</span><span class="p">,</span> <span class="n">metadata</span><span class="o">.</span><span class="n">width</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">indices</span><span class="p">))</span>
         <span class="k">return</span> <span class="n">indices</span>
 
-    <span class="k">try</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">decoding_upload</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"the video"</span><span class="p">):</span>
         <span class="n">frames</span><span class="p">,</span> <span class="n">metadata</span> <span class="o">=</span> <span class="n">load_video</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="s2">"torchcodec"</span><span class="p">,</span> <span class="n">sample_indices_fn</span><span class="o">=</span><span class="n">sampler</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">RuntimeError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-        <span class="c1"># torchcodec's error for a corrupt or unsupported file: the client's input, a 400</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Qwen3.5 could not decode video </span><span class="si">{</span><span class="n">path</span><span class="si">!r}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">return</span> <span class="n">SampledVideo</span><span class="p">(</span><span class="n">frames</span><span class="p">,</span> <span class="n">video_metadata_dict</span><span class="p">(</span><span class="n">metadata</span><span class="p">))</span></div>
 
 

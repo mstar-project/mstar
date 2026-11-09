@@ -1044,6 +1044,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">client_error_text</span><span class="p">(</span>
     <span class="n">exc</span><span class="p">:</span> <span class="ne">BaseException</span><span class="p">,</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
     <span class="n">log</span><span class="p">:</span> <span class="n">logging</span><span class="o">.</span><span class="n">Logger</span> <span class="o">=</span> <span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">traceback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">refusal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Return ``(text, error_id)``: what a client may see for ``exc``.</span>
 
@@ -1053,13 +1054,17 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``internal error (error id &lt;id&gt;)``. Either way the full error and its</span>
 <span class="sd">    traceback (left out when ``traceback`` is False, for an error already</span>
 <span class="sd">    logged where it happened) go to ``log`` as ``&lt;what&gt; [error id &lt;id&gt;]``.</span>
+<span class="sd">    ``refusal`` overrides that type check, for a caller that knows whether</span>
+<span class="sd">    the request was refused.</span>
 <span class="sd">    """</span>
     <span class="n">error_id</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">6</span><span class="p">)</span>
     <span class="n">log</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
         <span class="s2">"</span><span class="si">%s</span><span class="s2"> [error id </span><span class="si">%s</span><span class="s2">]: </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">what</span><span class="p">,</span> <span class="n">error_id</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">exc</span><span class="p">,</span>
         <span class="n">exc_info</span><span class="o">=</span><span class="n">exc</span> <span class="k">if</span> <span class="n">traceback</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">)):</span>
+    <span class="k">if</span> <span class="n">refusal</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">refusal</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">refusal</span><span class="p">:</span>
         <span class="n">text</span> <span class="o">=</span> <span class="n">scrub_paths</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">type_name</span><span class="p">:</span>
             <span class="n">text</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">text</span><span class="si">}</span><span class="s2">"</span>

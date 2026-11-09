@@ -1022,6 +1022,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
@@ -1036,7 +1037,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">check_resample_rate</span><span class="p">,</span>
     <span class="n">torchcodec_samples_capped</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.media_limits</span><span class="w"> </span><span class="kn">import</span> <span class="n">decoding_upload</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.omnilingual_asr.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">MAX_AUDIO_SECONDS</span><span class="p">,</span> <span class="n">MIN_AUDIO_SAMPLES</span><span class="p">,</span> <span class="n">SAMPLE_RATE</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="decode_file">
@@ -1048,11 +1052,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    libsndfile through ``soundfile`` first; then, for a WAV file, a reader here</span>
 <span class="sd">    that scales samples as libsndfile does, so a server without soundfile still</span>
 <span class="sd">    decodes WAV exactly; then FFmpeg through ``torchcodec`` for the containers</span>
-<span class="sd">    neither reads. The two library decoders stop just past</span>
+<span class="sd">    neither reads. Only FFmpeg refusing the file blames the upload (a 400, see</span>
+<span class="sd">    :func:`decoding_upload`); no torchcodec, no FFmpeg or a failed allocation</span>
+<span class="sd">    is the server's error. The two library decoders stop just past</span>
 <span class="sd">    ``MAX_AUDIO_SECONDS`` and refuse a longer file with</span>
 <span class="sd">    :class:`~mstar.api_server.media_io.AudioTooLongError`, whatever its header</span>
 <span class="sd">    declares."""</span>
-    <span class="n">errors</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">sf</span>
 
@@ -1072,26 +1077,19 @@ window.runMermaid = runMermaid;</script>
     <span class="k">except</span> <span class="n">AudioRefusedError</span><span class="p">:</span>
         <span class="k">raise</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 (missing, or not a libsndfile container)</span>
-        <span class="n">errors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"soundfile: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"soundfile could not decode </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">); trying the next decoder"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"rb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
         <span class="n">head</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">12</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">head</span><span class="p">[:</span><span class="mi">4</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s2">"RIFF"</span> <span class="ow">and</span> <span class="n">head</span><span class="p">[</span><span class="mi">8</span><span class="p">:</span><span class="mi">12</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s2">"WAVE"</span><span class="p">:</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">_decode_pcm_wav</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-            <span class="n">errors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"wav: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-    <span class="k">try</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"the WAV reader could not decode </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">); trying torchcodec"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">decoding_upload</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"the audio"</span><span class="p">,</span> <span class="n">ffmpeg</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
         <span class="n">samples</span> <span class="o">=</span> <span class="n">torchcodec_samples_capped</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">MAX_AUDIO_SECONDS</span><span class="p">)</span>
-        <span class="n">data</span> <span class="o">=</span> <span class="n">samples</span><span class="o">.</span><span class="n">data</span>  <span class="c1"># (channels, time)</span>
-        <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">data</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-        <span class="k">return</span> <span class="n">data</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="nb">int</span><span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span>
-    <span class="k">except</span> <span class="n">AudioRefusedError</span><span class="p">:</span>
-        <span class="k">raise</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 (missing, or FFmpeg cannot read it)</span>
-        <span class="n">errors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torchcodec: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-    <span class="c1"># the decoders name the file; the client only needs to know it was theirs</span>
-    <span class="n">detail</span> <span class="o">=</span> <span class="s2">"; "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">errors</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="s2">"&lt;upload&gt;"</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="nb">repr</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">))[</span><span class="mi">1</span><span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="s2">"&lt;upload&gt;"</span><span class="p">)</span>
-    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cannot decode the audio file (</span><span class="si">{</span><span class="n">detail</span><span class="si">}</span><span class="s2">); install soundfile (mstar-ai[audio])"</span><span class="p">)</span></div>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">samples</span><span class="o">.</span><span class="n">data</span>  <span class="c1"># (channels, time)</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">data</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">data</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="nb">int</span><span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span></div>
 
 
 

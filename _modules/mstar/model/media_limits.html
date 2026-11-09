@@ -1013,12 +1013,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">A compressed image or video can be tiny on the wire and enormous once decoded</span>
 <span class="sd">(a flat PNG compresses about 1000:1, a still video far more), so the loaders</span>
 <span class="sd">check what a file will decode to, not how big it is. A refusal is a</span>
-<span class="sd">``ValueError``, which the data worker answers with a 400.</span>
+<span class="sd">``ValueError``, which the data worker answers with a 400, as is a file its</span>
+<span class="sd">decoder can't read (:func:`decoding_upload`).</span>
 
 <span class="sd">The pixel and audio caps hold for a whole request: while the data worker loads</span>
 <span class="sd">a request's files inside :class:`RequestMediaBudget`, every check also counts</span>
 <span class="sd">against what the request's earlier files used.</span>
 <span class="sd">"""</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">errno</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
@@ -1208,6 +1210,61 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"the request attaches </span><span class="si">{</span><span class="n">count</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">modality</span><span class="si">}</span><span class="s2"> files; this model takes at most </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="ffmpeg_unavailable">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.ffmpeg_unavailable">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">ffmpeg_unavailable</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why torchcodec can't decode in this process, or None if it can."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torchcodec</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torchcodec.decoders</span>  <span class="c1"># noqa: F401</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">ImportError</span><span class="p">,</span> <span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="c1"># torchcodec 0.9 and earlier raise here when FFmpeg is missing</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"it failed to load: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span>
+    <span class="c1"># 0.16 imports without FFmpeg and fails only at decode (0.8 has no</span>
+    <span class="c1"># ffmpeg_major_version, and has already raised above)</span>
+    <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torchcodec</span><span class="p">,</span> <span class="s2">"ffmpeg_major_version"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">"it found no FFmpeg shared libraries"</span>
+    <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="UndecodableMediaError">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.UndecodableMediaError">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">UndecodableMediaError</span><span class="p">(</span><span class="ne">ValueError</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A request file its decoder refused: the client's error, a 400."""</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_out_of_memory</span><span class="p">(</span><span class="n">exc</span><span class="p">:</span> <span class="ne">BaseException</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="c1"># torch's CPU allocator raises a plain RuntimeError; it and FFmpeg put</span>
+    <span class="c1"># ENOMEM's text in the message</span>
+    <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">)</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="o">.</span><span class="n">ENOMEM</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="decoding_upload">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.decoding_upload">[docs]</a>
+<span class="nd">@contextmanager</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">decoding_upload</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">what</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">ffmpeg</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Around a loader's decode call: the decoder refusing ``filepath`` is the</span>
+<span class="sd">    client's error, raised as :class:`UndecodableMediaError`.</span>
+
+<span class="sd">    Decoders raise RuntimeError (torchvision, torchcodec, libsndfile) or</span>
+<span class="sd">    OSError (Pillow) for a file they can't read, but also for the server's own</span>
+<span class="sd">    faults, which are re-raised: a failed allocation, an upload our cleanup</span>
+<span class="sd">    removed and, with ``ffmpeg``, a torchcodec that has no FFmpeg.</span>
+<span class="sd">    """</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">_out_of_memory</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">ffmpeg</span> <span class="ow">and</span> <span class="n">ffmpeg_unavailable</span><span class="p">()):</span>
+            <span class="k">raise</span>
+        <span class="c1"># the decoder's message can name the server path</span>
+        <span class="k">raise</span> <span class="n">UndecodableMediaError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"could not decode </span><span class="si">{</span><span class="n">what</span><span class="si">}</span><span class="s2">: the file is corrupt or truncated, or not a format this server reads"</span>
+        <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span></div>
 
 
 
@@ -1486,7 +1543,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.read_image">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">read_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">rgb</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A request image as uint8 ``[C, H, W]``, refused first if it is too large</span>
-<span class="sd">    (a ``ValueError``, as is a file that does not decode).</span>
+<span class="sd">    and then if it does not decode.</span>
 
 <span class="sd">    ``rgb`` forces three channels, with any transparency composited on white</span>
 <span class="sd">    as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha</span>
@@ -1501,24 +1558,22 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span>
 
     <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">pil_mode</span><span class="p">,</span> <span class="n">transparent</span><span class="p">,</span> <span class="n">orientation</span> <span class="o">=</span> <span class="n">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">IMAGE_FORMATS</span><span class="p">)</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="c1"># torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it</span>
-        <span class="n">trns_color</span> <span class="o">=</span> <span class="n">rgb</span> <span class="ow">and</span> <span class="n">transparent</span> <span class="ow">and</span> <span class="n">pil_mode</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"L"</span><span class="p">,</span> <span class="s2">"RGB"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"GIF"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">fmt</span> <span class="o">==</span> <span class="s2">"WEBP"</span> <span class="ow">and</span> <span class="p">(</span><span class="n">animated</span> <span class="ow">or</span> <span class="n">orientation</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">))</span> <span class="ow">or</span> <span class="n">trns_color</span><span class="p">:</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+    <span class="c1"># torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it</span>
+    <span class="n">trns_color</span> <span class="o">=</span> <span class="n">rgb</span> <span class="ow">and</span> <span class="n">transparent</span> <span class="ow">and</span> <span class="n">pil_mode</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"L"</span><span class="p">,</span> <span class="s2">"RGB"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"GIF"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">fmt</span> <span class="o">==</span> <span class="s2">"WEBP"</span> <span class="ow">and</span> <span class="p">(</span><span class="n">animated</span> <span class="ow">or</span> <span class="n">orientation</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">))</span> <span class="ow">or</span> <span class="n">trns_color</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 
-            <span class="k">with</span> <span class="n">open_upright_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">image</span><span class="p">:</span>
-                <span class="n">array</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">"RGBA"</span><span class="p">))</span>
-            <span class="k">return</span> <span class="n">_on_white</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">array</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">rgb</span><span class="p">:</span>
-            <span class="n">mode</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">UNCHANGED</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># only a file with transparency is read with alpha: a CMYK JPEG's</span>
-            <span class="c1"># four channels are not RGBA</span>
-            <span class="n">mode</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB_ALPHA</span> <span class="k">if</span> <span class="n">transparent</span> <span class="k">else</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB</span>
+        <span class="k">with</span> <span class="n">decoding_upload</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="s2">"the image"</span><span class="p">),</span> <span class="n">open_upright_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">image</span><span class="p">:</span>
+            <span class="n">array</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">"RGBA"</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">_on_white</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">array</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">rgb</span><span class="p">:</span>
+        <span class="n">mode</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">UNCHANGED</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># only a file with transparency is read with alpha: a CMYK JPEG's</span>
+        <span class="c1"># four channels are not RGBA</span>
+        <span class="n">mode</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB_ALPHA</span> <span class="k">if</span> <span class="n">transparent</span> <span class="k">else</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB</span>
+    <span class="k">with</span> <span class="n">decoding_upload</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="s2">"the image"</span><span class="p">):</span>
         <span class="n">image</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">decode_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">mode</span><span class="p">,</span> <span class="n">apply_exif_orientation</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># torchvision's decoders raise RuntimeError, Pillow's OSError</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"could not decode image: the file is corrupt or truncated"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">uint16</span><span class="p">:</span>
         <span class="c1"># a 16-bit PNG: its high byte, as Pillow reads a 16-bit RGB PNG</span>
         <span class="n">image</span> <span class="o">=</span> <span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>

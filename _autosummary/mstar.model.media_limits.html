@@ -723,6 +723,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.file"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.file()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.UndecodableMediaError"><code class="docutils literal notranslate"><span class="pre">UndecodableMediaError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.VideoBudget"><code class="docutils literal notranslate"><span class="pre">VideoBudget</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.VideoBudget.add"><code class="docutils literal notranslate"><span class="pre">VideoBudget.add()</span></code></a></li>
 </ul>
@@ -734,6 +735,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_image_size"><code class="docutils literal notranslate"><span class="pre">check_image_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_media_limits"><code class="docutils literal notranslate"><span class="pre">check_media_limits()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.count_sound_file_seconds"><code class="docutils literal notranslate"><span class="pre">count_sound_file_seconds()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.decoding_upload"><code class="docutils literal notranslate"><span class="pre">decoding_upload()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_audio_seconds"><code class="docutils literal notranslate"><span class="pre">max_audio_seconds()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_image_pixels"><code class="docutils literal notranslate"><span class="pre">max_image_pixels()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_media_files"><code class="docutils literal notranslate"><span class="pre">max_media_files()</span></code></a></li>
@@ -762,7 +765,8 @@
 <p>A compressed image or video can be tiny on the wire and enormous once decoded
 (a flat PNG compresses about 1000:1, a still video far more), so the loaders
 check what a file will decode to, not how big it is. A refusal is a
-<code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, which the data worker answers with a 400.</p>
+<code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, which the data worker answers with a 400, as is a file its
+decoder can’t read (<a class="reference internal" href="#mstar.model.media_limits.decoding_upload" title="mstar.model.media_limits.decoding_upload"><code class="xref py py-func docutils literal notranslate"><span class="pre">decoding_upload()</span></code></a>).</p>
 <p>The pixel and audio caps hold for a whole request: while the data worker loads
 a request’s files inside <a class="reference internal" href="#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">RequestMediaBudget</span></code></a>, every check also counts
 against what the request’s earlier files used.</p>
@@ -799,6 +803,12 @@ against what the request’s earlier files used.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.count_sound_file_seconds" title="mstar.model.media_limits.count_sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">count_sound_file_seconds</span></code></a>(filepath, max_seconds)</p></td>
 <td><p>The length of a libsndfile file whose header gives none, counted as it decodes and keeping no samples; stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's limit check refuses a longer clip without decoding all of it.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.decoding_upload" title="mstar.model.media_limits.decoding_upload"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decoding_upload</span></code></a>(filepath, what, *[, ffmpeg])</p></td>
+<td><p>Around a loader's decode call: the decoder refusing <code class="docutils literal notranslate"><span class="pre">filepath</span></code> is the client's error, raised as <a class="reference internal" href="#mstar.model.media_limits.UndecodableMediaError" title="mstar.model.media_limits.UndecodableMediaError"><code class="xref py py-class docutils literal notranslate"><span class="pre">UndecodableMediaError</span></code></a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.ffmpeg_unavailable" title="mstar.model.media_limits.ffmpeg_unavailable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ffmpeg_unavailable</span></code></a>()</p></td>
+<td><p>Why torchcodec can't decode in this process, or None if it can.</p></td>
+</tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_audio_seconds" title="mstar.model.media_limits.max_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_audio_seconds</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_AUDIO_SECONDS</span></code>: seconds a request's audio clips may decode to, summed over them.</p></td>
 </tr>
@@ -821,7 +831,7 @@ against what the request’s earlier files used.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">(num_frames,</span> <span class="pre">fps,</span> <span class="pre">height,</span> <span class="pre">width)</span></code> from the container header, or None when neither torchcodec nor PyAV can read it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
-<td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large (a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p></td>
+<td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large and then if it does not decode.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile.read(filepath,</span> <span class="pre">dtype=&quot;float32&quot;,</span> <span class="pre">always_2d=True)</span></code> for a header that gives no sample count, where <code class="docutils literal notranslate"><span class="pre">soundfile.read</span></code> would size its buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes block by block and stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's length check refuses a longer clip.</p></td>
@@ -843,6 +853,15 @@ against what the request’s earlier files used.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.VideoBudget" title="mstar.model.media_limits.VideoBudget"><code class="xref py py-obj docutils literal notranslate"><span class="pre">VideoBudget</span></code></a>()</p></td>
 <td><p>Counts decoded frames against <code class="docutils literal notranslate"><span class="pre">max_video_pixels()</span></code>, so a loader stops before it holds more than the cap whatever the container claims.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p class="rubric">Exceptions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.UndecodableMediaError" title="mstar.model.media_limits.UndecodableMediaError"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UndecodableMediaError</span></code></a></p></td>
+<td><p>A request file its decoder refused: the client's error, a 400.</p></td>
 </tr>
 </tbody>
 </table>
@@ -893,6 +912,13 @@ audio checks charge the request through it.</p>
 it, so a header estimate and the decode after it are not added up.</p>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py exception">
+<dt class="sig sig-object py" id="mstar.model.media_limits.UndecodableMediaError">
+<span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">UndecodableMediaError</span></span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#UndecodableMediaError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.UndecodableMediaError" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#ValueError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ValueError</span></code></a></p>
+<p>A request file its decoder refused: the client’s error, a 400.</p>
 </dd></dl>
 
 <dl class="py class">
@@ -1049,6 +1075,37 @@ caller’s limit check refuses a longer clip without decoding all of it.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.media_limits.decoding_upload">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">decoding_upload</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">what</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">ffmpeg</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#decoding_upload"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.decoding_upload" title="Link to this definition">#</a></dt>
+<dd><p>Around a loader’s decode call: the decoder refusing <code class="docutils literal notranslate"><span class="pre">filepath</span></code> is the
+client’s error, raised as <a class="reference internal" href="#mstar.model.media_limits.UndecodableMediaError" title="mstar.model.media_limits.UndecodableMediaError"><code class="xref py py-class docutils literal notranslate"><span class="pre">UndecodableMediaError</span></code></a>.</p>
+<p>Decoders raise RuntimeError (torchvision, torchcodec, libsndfile) or
+OSError (Pillow) for a file they can’t read, but also for the server’s own
+faults, which are re-raised: a failed allocation, an upload our cleanup
+removed and, with <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code>, a torchcodec that has no FFmpeg.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>filepath</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>what</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>ffmpeg</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.media_limits.ffmpeg_unavailable">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">ffmpeg_unavailable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#ffmpeg_unavailable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.ffmpeg_unavailable" title="Link to this definition">#</a></dt>
+<dd><p>Why torchcodec can’t decode in this process, or None if it can.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.media_limits.max_audio_seconds">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">max_audio_seconds</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#max_audio_seconds"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.max_audio_seconds" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_AUDIO_SECONDS</span></code>: seconds a request’s audio clips may decode
@@ -1147,7 +1204,7 @@ when neither torchcodec nor PyAV can read it.</p>
 <dt class="sig sig-object py" id="mstar.model.media_limits.read_image">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">read_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">rgb</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#read_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.read_image" title="Link to this definition">#</a></dt>
 <dd><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large
-(a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p>
+and then if it does not decode.</p>
 <p><code class="docutils literal notranslate"><span class="pre">rgb</span></code> forces three channels, with any transparency composited on white
 as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
 would turn a transparent background black); otherwise the file’s own
@@ -1278,6 +1335,7 @@ for fork-join ops a decode doesn’t run.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.file"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.file()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.UndecodableMediaError"><code class="docutils literal notranslate"><span class="pre">UndecodableMediaError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.VideoBudget"><code class="docutils literal notranslate"><span class="pre">VideoBudget</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.VideoBudget.add"><code class="docutils literal notranslate"><span class="pre">VideoBudget.add()</span></code></a></li>
 </ul>
@@ -1289,6 +1347,8 @@ for fork-join ops a decode doesn’t run.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_image_size"><code class="docutils literal notranslate"><span class="pre">check_image_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_media_limits"><code class="docutils literal notranslate"><span class="pre">check_media_limits()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.count_sound_file_seconds"><code class="docutils literal notranslate"><span class="pre">count_sound_file_seconds()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.decoding_upload"><code class="docutils literal notranslate"><span class="pre">decoding_upload()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_audio_seconds"><code class="docutils literal notranslate"><span class="pre">max_audio_seconds()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_image_pixels"><code class="docutils literal notranslate"><span class="pre">max_image_pixels()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_media_files"><code class="docutils literal notranslate"><span class="pre">max_media_files()</span></code></a></li>

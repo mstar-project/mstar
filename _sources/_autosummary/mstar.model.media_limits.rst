@@ -26,6 +26,8 @@ mstar.model.media\_limits
       check_image_size
       check_media_limits
       count_sound_file_seconds
+      decoding_upload
+      ffmpeg_unavailable
       max_audio_seconds
       max_image_pixels
       max_media_files
@@ -52,6 +54,12 @@ mstar.model.media\_limits
    
 
    
+   
+   .. rubric:: Exceptions
+
+   .. autosummary::
+   
+      UndecodableMediaError
    
    
 

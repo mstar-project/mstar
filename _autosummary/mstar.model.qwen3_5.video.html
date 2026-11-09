@@ -729,7 +729,6 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_pads"><code class="docutils literal notranslate"><span class="pre">expand_video_pads()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_timestamps"><code class="docutils literal notranslate"><span class="pre">group_timestamps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.sample_video"><code class="docutils literal notranslate"><span class="pre">sample_video()</span></code></a></li>
 </ul>
@@ -760,13 +759,10 @@ tested without Triton.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.expand_video_pads" title="mstar.model.qwen3_5.video.expand_video_pads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">expand_video_pads</span></code></a>(text, pad, start, end, ...)</p></td>
 <td><p>Replace the nth <code class="docutils literal notranslate"><span class="pre">pad</span></code> in <code class="docutils literal notranslate"><span class="pre">text</span></code> with the nth video's groups.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable" title="mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ffmpeg_unavailable</span></code></a>()</p></td>
-<td><p>Why torchcodec can't decode video in this process, or None if it can.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.group_timestamps" title="mstar.model.qwen3_5.video.group_timestamps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_timestamps</span></code></a>(frames_indices, fps, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.group_timestamps" title="mstar.model.qwen3_5.video.group_timestamps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_timestamps</span></code></a>(frames_indices, fps, ...)</p></td>
 <td><p>Seconds per temporal group: the mean of its first and last frame's time.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.sample_video" title="mstar.model.qwen3_5.video.sample_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sample_video</span></code></a>(path, video_processor)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.sample_video" title="mstar.model.qwen3_5.video.sample_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sample_video</span></code></a>(path, video_processor)</p></td>
 <td><p>Decode the frames the checkpoint's video processor would sample.</p></td>
 </tr>
 </tbody>
@@ -863,17 +859,6 @@ tested without Triton.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.video.ffmpeg_unavailable">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.video.</span></span><span class="sig-name descname"><span class="pre">ffmpeg_unavailable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/video.html#ffmpeg_unavailable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable" title="Link to this definition">#</a></dt>
-<dd><p>Why torchcodec can’t decode video in this process, or None if it can.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -980,7 +965,6 @@ decoder for the same reason.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_pads"><code class="docutils literal notranslate"><span class="pre">expand_video_pads()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_timestamps"><code class="docutils literal notranslate"><span class="pre">group_timestamps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.sample_video"><code class="docutils literal notranslate"><span class="pre">sample_video()</span></code></a></li>
 </ul>
