@@ -575,7 +575,8 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
     model.validate_config_yaml(cfg, str(path))
     # every request at the T3 table's 4096 tokens would not fit
     model.config.max_new_tokens_limit = None
-    with pytest.raises(ValueError, match="raise max_num_pages"):
+    with pytest.raises(ValueError, match="raise max_num_pages, or lower max_concurrent_requests or the tokens a "
+                                         "request may hold"):
         model.validate_config_yaml(cfg, str(path))
     # without a cap nothing bounds the pool: started, with a warning
     model.validate_config_yaml({k: v for k, v in cfg.items() if k != "max_concurrent_requests"}, str(path))
