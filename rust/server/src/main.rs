@@ -715,7 +715,7 @@ async fn chat_completions(
 /// A client that leaves meanwhile drops this future, and the stream's guard aborts.
 async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
     match base.next().await {
-        Some(Out::Error { status, message }) => Err((status, message)),
+        Some(Out::Error { status, message, .. }) => Err((status, message)),
         first => Ok(Box::pin(futures::stream::iter(first).chain(base))),
     }
 }
@@ -783,7 +783,7 @@ fn chat_sse_payloads(
             // Terminal mid-stream failure: an OpenAI error event, and suppress
             // the normal stop/[DONE] tail (mstar's generator exception drops the
             // connection; the explicit error event is strictly more informative).
-            Out::Error { status, message } => {
+            Out::Error { status, message, .. } => {
                 errored.store(true, std::sync::atomic::Ordering::SeqCst);
                 Some(sse_error_json(status, &message))
             }
@@ -1163,7 +1163,7 @@ async fn audio_speech(
                                 return Some((SpeechOut::Audio(c.data), Some((cur, pending, submitted))));
                             }
                             Some(Out::Chunk(_)) => {}
-                            Some(Out::Error { status, message }) => {
+                            Some(Out::Error { status, message, .. }) => {
                                 return Some((SpeechOut::Failure { status, message }, None));
                             }
                             None => {
@@ -1423,7 +1423,7 @@ fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, In
                     st.0 += 1;
                     ndjson_line(&c)
                 }
-                Out::Error { status, message } => {
+                Out::Error { status, message, .. } => {
                     st.1 = true;
                     ndjson_line(&ResultChunk {
                         modality: "error".to_string(),
@@ -1945,7 +1945,7 @@ async fn generate_finish(
                 Out::Chunk(c) => c,
                 // After the 200 the status travels in-band, as the error chunk
                 // Python's `errors_in_band` ends the stream with.
-                Out::Error { status, message } => ResultChunk {
+                Out::Error { status, message, .. } => ResultChunk {
                     modality: "error".to_string(),
                     data: message.into_bytes(),
                     metadata: json!({"status": status}),

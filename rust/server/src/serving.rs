@@ -59,8 +59,9 @@ pub enum Out {
     Chunk(ResultChunk),
     /// Terminal backend failure (worker exception, bad input, timeout).
     /// `status` is the HTTP status to return (carried in-band from the error
-    /// chunk's `metadata.status`; defaults to 500).
-    Error { status: u16, message: String },
+    /// chunk's `metadata.status`; defaults to 500). `refused`: `submit_request`
+    /// refused it, so it never had a request id.
+    Error { status: u16, message: String, refused: bool },
 }
 
 pub type OutStream = Pin<Box<dyn Stream<Item = Out> + Send>>;
@@ -94,7 +95,7 @@ pub fn result_stream(
     streaming: bool,
 ) -> OutStream {
     try_result_stream(state, args, request_id, streaming).unwrap_or_else(|(status, message)| {
-        Box::pin(futures::stream::once(async move { Out::Error { status, message } }))
+        Box::pin(futures::stream::once(async move { Out::Error { status, message, refused: false } }))
     })
 }
 
@@ -224,10 +225,10 @@ fn submitted_stream(
                         Ok(Some(StreamItem::Chunk(c))) => {
                             Some((Out::Chunk(c), (rx, guard, deadline, false)))
                         }
-                        Ok(Some(StreamItem::Error { status, message })) => {
+                        Ok(Some(StreamItem::Error { status, message, refused })) => {
                             guard.done = true; // conductor already cleaned up
                             Some((
-                                Out::Error { status, message },
+                                Out::Error { status, message, refused },
                                 (rx, guard, deadline, true),
                             ))
                         }
@@ -245,6 +246,7 @@ fn submitted_stream(
                                 Out::Error {
                                     status: 500,
                                     message: "Request timed out".to_string(),
+                                    refused: false,
                                 },
                                 (rx, guard, deadline, true),
                             ))
@@ -271,7 +273,7 @@ pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, (u16, String
     while let Some(item) = s.next().await {
         match item {
             Out::Chunk(c) => chunks.push(c),
-            Out::Error { status, message } => return Err((status, message)),
+            Out::Error { status, message, .. } => return Err((status, message)),
         }
     }
     Ok(chunks)
@@ -365,7 +367,7 @@ mod tests {
         let ids = tok.encode("中");
         let items = vec![
             token(ids[0]),
-            Out::Error { status: 500, message: "boom".to_string() },
+            Out::Error { status: 500, message: "boom".to_string(), refused: false },
         ];
         let base: OutStream = Box::pin(futures::stream::iter(items));
         let out = futures::executor::block_on(detokenize(base, tok).collect::<Vec<_>>());

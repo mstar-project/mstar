@@ -153,10 +153,10 @@ class _Duplex:
 
 
 @contextlib.contextmanager
-def _rust(server: _Duplex):
+def _rust(server: _Duplex, **extra_env):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_conv_")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MSTAR_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MSTAR_")} | extra_env
     env[REALTIME_ENV] = json.dumps(realtime_facts(server, None, bridge_dir))
     proc = subprocess.Popen([BINARY, server.model_name, str(port), bridge_dir, str(server.upload_dir)], env=env)
     bridge = RustFrontendBridge(server, bridge_dir)
@@ -499,3 +499,19 @@ def test_the_route_is_refused_as_pythons(stacks, monkeypatch, kind, query):
             ws.recv(timeout=10)
     assert (rust.value.rcvd.code, rust.value.rcvd.reason) == (py.value.code, py.value.reason)
     assert py.value.code == 1008
+
+
+
+# what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
+TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
+
+
+def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
+    with _rust(_Duplex(Path(tempfile.mkdtemp(prefix="mstar_conv_up_"))), MSTAR_WS_MAX_BYTES="1000") as port:
+        url = f"ws://127.0.0.1:{port}/v1/realtime"
+        with websockets.sync.client.connect(url, compression=None, max_size=None) as ws:
+            ws.recv(timeout=10)   # the greeting frame
+            ws.send("x" * 2000)
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                ws.recv(timeout=10)
+    assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG

@@ -4,7 +4,7 @@
 pub mod generate;
 pub mod openpi;
 
-use axum::extract::ws::{rejection::WebSocketUpgradeRejection, WebSocketUpgrade};
+use axum::extract::ws::{rejection::WebSocketUpgradeRejection, CloseFrame, Message, WebSocketUpgrade};
 use axum::response::Response;
 
 /// A socket route's upgrade, or the reason a request isn't one.
@@ -25,4 +25,16 @@ pub fn max_message_bytes() -> usize {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(crate::body_limit_mb() << 20)
+}
+
+/// The close a failed read gets: a message past [`max_message_bytes`] is 1009,
+/// with the reason uvicorn's `websockets` gives it. tungstenite answers that
+/// read with an error and queues no close, and it is not a dependency of this
+/// crate, so its capacity error is known by its text (`Message too long:
+/// {size} > {max}`). Any other failed read ends the socket without one.
+pub fn read_failure_close(err: &axum::Error) -> Option<Message> {
+    let text = err.to_string();
+    let (size, max) = text.split("Message too long: ").nth(1)?.split_once(" > ")?;
+    let reason = format!("frame with {} bytes exceeds limit of {} bytes", size.trim(), max.trim());
+    Some(Message::Close(Some(CloseFrame { code: 1009, reason: reason.into() })))
 }

@@ -23,6 +23,7 @@ np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 msgpack = pytest.importorskip("msgpack")
 
+import websockets.exceptions
 import websockets.sync.client
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -127,10 +128,10 @@ class _Server:
 
 
 @contextlib.contextmanager
-def _rust(server: _Server):
+def _rust(server: _Server, **extra_env):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_openpi_")
-    env = dict(os.environ, MSTAR_OPENPI=json.dumps(openpi_facts(server.openpi_policy)))
+    env = dict(os.environ, MSTAR_OPENPI=json.dumps(openpi_facts(server.openpi_policy)), **extra_env)
     proc = subprocess.Popen([BINARY, "pi05_droid", str(port), bridge_dir, server.upload_dir], env=env)
     bridge = RustFrontendBridge(server, bridge_dir)
     threading.Thread(target=bridge.run, daemon=True).start()
@@ -323,3 +324,19 @@ def test_healthz_answers_as_openpi_does(stack):
     _, port = stack
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as r:
         assert (r.status, r.read()) == (200, b"OK\n")
+
+
+
+# what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
+TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
+
+
+def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
+    with _rust(_Server(), MSTAR_WS_MAX_BYTES="1000") as port:
+        url = f"ws://127.0.0.1:{port}/"
+        with websockets.sync.client.connect(url, compression=None, max_size=None) as ws:
+            ws.recv(timeout=10)   # the greeting frame
+            ws.send(b"\x00" * 2000)
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                ws.recv(timeout=10)
+    assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG

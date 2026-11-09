@@ -121,6 +121,94 @@ fn clip(message: &str) -> String {
 }
 
 /// `{:g}` for the bounds an error names.
+/// `serving_realtime._scrub_paths`: `message` with the upload directory as
+/// `<upload>`, then each quoted absolute path (`_QUOTED_PATH`, whose
+/// directories may hold spaces) and each other one (`_ABS_PATH`) cut to its
+/// base name. Not `client_errors.scrub_paths`, whose rules differ. Rust's
+/// `regex` has neither the lookbehind nor the backreference, so this scans.
+fn scrub_paths(message: &str, upload_dir: &std::path::Path) -> String {
+    let message = message.replace(&*upload_dir.to_string_lossy(), "<upload>");
+    abs_paths(&quoted_paths(&message))
+}
+
+/// `(['"])/(?:[^'"\n/]*/)+([^'"\n/]+)\1` -> `\1\2\1`: the text up to the next
+/// quote or newline must close with the same quote, start with `/`, hold a
+/// second `/`, and end in a name.
+fn quoted_paths(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < c.len() {
+        let q = c[i];
+        if (q == '\'' || q == '"') && c.get(i + 1) == Some(&'/') {
+            let end = (i + 1..c.len()).find(|&k| matches!(c[k], '\'' | '"' | '\n'));
+            if let Some(end) = end.filter(|&k| c[k] == q) {
+                let inner = &c[i + 1..end];
+                let last = inner.iter().rposition(|&ch| ch == '/').unwrap();
+                if last > 0 && last + 1 < inner.len() {
+                    out.push(q);
+                    out.extend(&inner[last + 1..]);
+                    out.push(q);
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(q);
+        i += 1;
+    }
+    out
+}
+
+/// `(?<![\w./<>])/(?:[^\s/'"]+/)+([^\s/'"]+)` -> `\1`, as Python's backtracking
+/// matches it: the most whole directories it can, then a name.
+fn abs_paths(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let name_char = |ch: char| !(ch.is_whitespace() || matches!(ch, '/' | '\'' | '"'));
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < c.len() {
+        let free = i == 0 || !(c[i - 1].is_alphanumeric() || matches!(c[i - 1], '_' | '.' | '/' | '<' | '>'));
+        if c[i] == '/' && free {
+            // the components after the slash, up to whitespace or a quote
+            let mut comps: Vec<(usize, usize)> = Vec::new();
+            let mut k = i + 1;
+            loop {
+                let start = k;
+                while k < c.len() && name_char(c[k]) {
+                    k += 1;
+                }
+                comps.push((start, k));
+                if k < c.len() && c[k] == '/' {
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            // directories: nonempty components each followed by a slash
+            let mut dirs = 0;
+            while dirs + 1 < comps.len() && comps[dirs].1 > comps[dirs].0 {
+                dirs += 1;
+            }
+            let name = if dirs >= 1 && comps[dirs].1 > comps[dirs].0 {
+                Some(comps[dirs])
+            } else if dirs >= 2 {
+                Some(comps[dirs - 1]) // the last directory's slash starts no name: it is the name
+            } else {
+                None
+            };
+            if let Some((start, end)) = name {
+                out.extend(&c[start..end]);
+                i = end;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
 fn g(x: f64) -> String {
     if x.fract() == 0.0 && x.abs() < 1e16 {
         format!("{}", x as i64)
@@ -491,7 +579,17 @@ impl Realtime {
         if !self.send(created).await {
             return;
         }
-        while let Some(Ok(message)) = self.socket.recv().await {
+        loop {
+            let message = match self.socket.recv().await {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    if let Some(close) = crate::ws::read_failure_close(&e) {
+                        let _ = self.socket.send(close).await;
+                    }
+                    return;
+                }
+                None => return,
+            };
             let text = match message {
                 Message::Text(t) => t,
                 Message::Binary(_) => {
@@ -832,8 +930,7 @@ impl Realtime {
             }
         };
         if e.client {
-            let upload = self.st.upload_dir.to_string_lossy().into_owned();
-            let message = clip(&crate::scrub_paths(&e.message.replace(&upload, "<upload>")));
+            let message = clip(&scrub_paths(&e.message, &self.st.upload_dir));
             self.send(invalid(&message)).await;
         } else {
             let message = format!("realtime step failed (error id {error_id})");
@@ -977,6 +1074,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paths_are_scrubbed_as_serving_realtime_scrubs_them() {
+        // _scrub_paths' output for each, with the upload directory /srv/up
+        // (checked against it on 20,000 random strings too)
+        for (message, want) in [
+            ("failed reading /srv/up/rt-abc-1.wav", "failed reading <upload>/rt-abc-1.wav"),
+            ("no /models/ here", "no /models/ here"),
+            ("cd /tmp", "cd /tmp"),
+            ("open '/a dir/b c.json' failed", "open 'b c.json' failed"),
+            ("x/a/b and (/opt/x/y.json)", "x/a/b and (y.json)"),
+            ("/a/b/ then //c", "b/ then //c"),
+        ] {
+            assert_eq!(scrub_paths(message, std::path::Path::new("/srv/up")), want, "{message}");
+        }
+    }
+
+    #[test]
     fn excerpts_read_as_reprlib_cuts_them() {
         assert_eq!(excerpt(&json!("abc")), "'abc'");
         assert_eq!(excerpt(&json!([1, 2, 3, 4, 5])), "[1, 2, 3, 4, ...]");
@@ -985,3 +1098,4 @@ mod tests {
         assert_eq!(long.chars().count(), 100);
     }
 }
+
