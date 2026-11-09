@@ -726,7 +726,8 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
         return
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
     body = (f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and {tested}. "
-            "It covers this commit only.")
+            "It covers this commit only: a push leaves it visible, but a merge then needs a new `/review` or a "
+            "person's approval.")
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
            input=json.dumps({"commit_id": head_sha, "event": "APPROVE", "body": body}))
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
