@@ -468,13 +468,14 @@ def test_stream_format_is_not_forwarded_as_a_model_kwarg(tmp_path, monkeypatch):
 def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypatch):
     """Piece texts from both frontends over inputs built from the splitter's
     edge cases: terminators with and without closers, CJK ends, paragraph
-    breaks, clause marks, runs with no spaces, combining marks, and Python's
-    whitespace (U+001C and U+00A0 among it)."""
+    breaks, clause marks with and without a space after them, runs with no
+    spaces, combining marks, and Python's whitespace (U+001C and U+00A0 among
+    it)."""
     from mstar.api_server.openai.speech_chunking import split_sentences
 
     words = ["word", "longerword", "3.5", "end.", 'quote."', "aside!)", "really?'", "semi;", "海は広い。",
              "質問？", "clause,", "colon:", "，中文", "\n\n", "\n \t\n", " ", "\u001c", "áb́",
-             "x" * 120, "é" * 450, "e\u0301" * 300, "Done.”", "  "]
+             "$4,500,000", "9:45", "x" * 120, "é" * 450, "e\u0301" * 300, "Done.”", "  "]
     rng = random.Random(1234)
     texts = []
     while len(texts) < 120:
