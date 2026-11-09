@@ -60,10 +60,6 @@ jobs:
     concurrency:
       group: ${{ matrix.id }}-${{ github.event.pull_request.number || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-    env:
-      # One place for every test's compiles, whether or not it imports mstar.engine
-      # (which would otherwise default it under ~/.cache), so it can be cached.
-      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor-ci
     steps:
       - uses: actions/checkout@v4
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
@@ -73,21 +69,6 @@ jobs:
           workspaces: rust
           # A queue run's branch is deleted at once, so a cache saved there is never read.
           save-if: ${{ github.event_name != 'merge_group' }}
-      # Inductor's compile cache, carried between runs: compiling on a cold cache is
-      # most of the compiled tests' time. Inductor keys each entry on its graph, config
-      # and torch build, so an entry this code no longer matches is a miss, not a wrong
-      # kernel. The month in the key starts a fresh cache now and then, so entries for
-      # graphs nothing builds any more don't pile up.
-      - name: Name the compile cache
-        id: compile-cache
-        run: echo "prefix=inductor-${{ matrix.id }}-$(date -u +%Y-%m)-" >> "$GITHUB_OUTPUT"
-      - name: Restore the compile cache
-        uses: actions/cache/restore@v4
-        id: compile-cache-restore
-        with:
-          path: ${{ env.TORCHINDUCTOR_CACHE_DIR }}
-          key: ${{ steps.compile-cache.outputs.prefix }}none
-          restore-keys: ${{ steps.compile-cache.outputs.prefix }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -147,21 +128,6 @@ jobs:
         run: |
           python -m pytest -q -ra --strict-markers --durations=20 -p xdist \
             --junitxml=${{ matrix.id }}.xml ${{ matrix.args }}
-      # Keyed on the cache's file list, so a run that compiled nothing new saves
-      # nothing; a run whose tests failed still compiled valid entries.
-      - name: Key the compile cache by its contents
-        id: compile-cache-key
-        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
-        run: |
-          mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
-          listing=$(cd "$TORCHINDUCTOR_CACHE_DIR" && find . -type f | sort | sha1sum | cut -c1-16)
-          echo "key=${{ steps.compile-cache.outputs.prefix }}$listing" >> "$GITHUB_OUTPUT"
-      - name: Save the compile cache
-        uses: actions/cache/save@v4
-        if: ${{ !cancelled() && steps.compile-cache-key.outputs.key && steps.compile-cache-key.outputs.key != steps.compile-cache-restore.outputs.cache-matched-key }}
-        with:
-          path: ${{ env.TORCHINDUCTOR_CACHE_DIR }}
-          key: ${{ steps.compile-cache-key.outputs.key }}
       - name: Upload CPU test report
         if: always()
         uses: actions/upload-artifact@v4
