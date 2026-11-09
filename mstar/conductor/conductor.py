@@ -1287,16 +1287,7 @@ class Conductor:
             request_data = self.requests.get(body.request_id)
             if request_data is None or not request_data.dispatched:
                 self._drop_request(body.request_id)
-                if isinstance(exc, ValueError):
-                    self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
-                    return
-                if isinstance(exc, HTTPException):
-                    self._reject_request(body.request_id, exc.detail, status=exc.status_code)
-                    return
-                text, _ = client_error_text(
-                    exc, f"Ingest failed for request {body.request_id}", log=logger,
-                )
-                self._reject_request(body.request_id, f"Ingest failed: {text}", status=500)
+                self._refuse_undispatched(body.request_id, exc)
             elif body.request_id not in self.draining:
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
@@ -1305,6 +1296,18 @@ class Conductor:
                 self._remove_request(
                     body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
+
+    def _refuse_undispatched(self, request_id: str, exc: Exception) -> None:
+        """Fail a request no worker has heard of for ``exc``: a ``ValueError``
+        is the client's fault, a 400; an ``HTTPException`` carries its own
+        status; anything else is a 500."""
+        if isinstance(exc, ValueError):
+            self._reject_request(request_id, scrub_paths(str(exc)), status=400)
+        elif isinstance(exc, HTTPException):
+            self._reject_request(request_id, exc.detail, status=exc.status_code)
+        else:
+            text, _ = client_error_text(exc, f"Ingest failed for request {request_id}", log=logger)
+            self._reject_request(request_id, f"Ingest failed: {text}", status=500)
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -2452,15 +2455,11 @@ class Conductor:
                         for request_id in _message_request_ids(message):
                             if (message.message_type == ConductorMessageType.NEW_REQUEST
                                     and request_id not in self.requests):
-                                # Never registered (or only queued), so there
-                                # is no drain barrier to fail it through.
-                                self.waiting_queue[:] = [
-                                    body for body in self.waiting_queue if body.request_id != request_id
-                                ]
-                                if self._status_interval_s is not None:
-                                    self._queued_since.pop(request_id, None)
-                                text, _ = client_error_text(exc, f"Conductor error {step}", log=logger)
-                                self._reject_request(request_id, text, status=500)
+                                # never registered, so no drain barrier can fail it
+                                try:
+                                    self._refuse_undispatched(request_id, exc)
+                                except Exception:
+                                    logger.exception("Could not fail request %s", request_id)
                             else:
                                 self._fail_after_error(request_id, step, exc)
 
