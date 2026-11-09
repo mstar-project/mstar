@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 TOP_K = 5
-NEAR_TIE = 0.25  # as run_parity.py
+NEAR_TIE = 0.25  # a copy of run_parity.py's: this runs in its own venv, apart from mstar
 MAX_REALIGN = 32
 STOP_IDS = (100265, 100257)  # <|im_end|>, <|endoftext|>
 
