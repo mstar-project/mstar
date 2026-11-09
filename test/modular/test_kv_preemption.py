@@ -480,6 +480,8 @@ def _make_room(kv, droppable) -> Victims | None:
     calls it."""
     runner = _runner(kv)
     for refusal in runner.refusals():
+        if refusal.key != "kv":
+            continue
         victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), droppable)
         if victims is not None:
             return victims
@@ -958,6 +960,40 @@ def test_a_guaranteed_request_that_wrote_nothing_keeps_its_allotment_when_an_old
         "a guaranteed request gave back its allotment for an older request's shortage"
     )
     assert "g" in kv._allotments
+
+
+def test_an_older_return_moves_a_guaranteed_request_its_victims_admitted_that_waits_elsewhere():
+    """g's 5-page footprint is admitted as z's drop lands, and g then waits behind s for a slot on another resource.
+    o, older and dropped, needs 7 pages to return, and once x finishes only g's allotment covers them. A guaranteed
+    request couldn't be moved, so o waited for good, and so did g if s's slot waits on o."""
+    kv, slots = _pool(), _StubPool(10, needs={"s": 99})
+    _RUNNERS[id(kv)] = (kv, StepRunner(
+        {"kv": kv, "slots": slots}, node_resources={NODE: ["kv", "slots"], "other": ["slots"]},
+    ))
+    _running(kv, "x", 3, arrival=0)
+    _running(kv, "o", 5, arrival=1)
+    _running(kv, "z", 2, arrival=4)
+    assert _preempt(kv, "x", _step(kv, "x", 2 * PAGE_SIZE).reason.pages_short, lambda rid: rid == "o").to_drop == ["o"]
+    _drop(kv, "o")
+    assert _step(kv, "x", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "z", _step(kv, "z", 4 * PAGE_SIZE).reason.pages_short, lambda rid: False).waits
+    _runner(kv).readmit("z", NODE)
+    _request(kv, "g", 1, arrival=3, guaranteed=True)
+    assert not _admitted(kv, "o") and not _admitted(kv, "g")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z"]
+    _request(kv, "s", 1, arrival=2)
+    assert _runner(kv).admit_request("s", "other", WALK) is not None
+    _drop(kv, "z")
+    assert not _admitted(kv, "g") and kv._allotments["g"].pages == 5
+    assert kv.check_drop("g", kv._laid_out_tokens("g")) is not None, "a drop would bring g back short of its footprint"
+    _remove(kv, "x")
+    assert not _admitted(kv, "o")
+
+    assert _make_room(kv, droppable=lambda rid: True) == Victims([], [], ["g"]), "o waited for pages g held unused"
+    _runner(kv).readmit("g", NODE)
+
+    assert _admitted(kv, "o")
+    assert "g" in kv._guaranteed and kv._asks["g"] == 5, "g didn't ask again for its whole footprint"
 
 
 def test_a_page_an_earlier_row_gives_back_is_no_release():
