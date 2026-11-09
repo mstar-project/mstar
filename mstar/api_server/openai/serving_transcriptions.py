@@ -832,6 +832,12 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
     started = False
     share = window_share(api).join()
 
+    def event(body):
+        # the first byte sets the 200; every error after it goes in band
+        nonlocal started
+        started = True
+        return sse(body)
+
     def error(message, status):
         if not started:
             raise HTTPException(status_code=status or 500, detail=message)
@@ -867,11 +873,9 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
                         if gap:
-                            started = True
-                            yield sse({"type": "transcript.text.delta", "delta": " "})
+                            yield event({"type": "transcript.text.delta", "delta": " "})
                             gap = False
-                        started = True
-                        yield sse({"type": "transcript.text.delta", "delta": delta})
+                        yield event({"type": "transcript.text.delta", "delta": delta})
                 raw += decoder.flush()
                 # A language/control prefix may have held all the text back.
                 # At EOF the final parse can distinguish it from spoken words.
@@ -882,10 +886,8 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 delta, emitted = _stream_delta(final_text, emitted)
                 if delta:
                     if gap:
-                        started = True
-                        yield sse({"type": "transcript.text.delta", "delta": " "})
-                    started = True
-                    yield sse({"type": "transcript.text.delta", "delta": delta})
+                        yield event({"type": "transcript.text.delta", "delta": " "})
+                    yield event({"type": "transcript.text.delta", "delta": delta})
                 inflight.discard(window.request_id)
                 window.raw_text = raw
                 # as merge_windows, which joins only the windows with text
@@ -897,15 +899,12 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 windows.append(window)
                 if window.transcript.text:
                     if spoken:
-                        started = True
-                        yield sse({"type": "transcript.text.delta", "delta": " "})
-                    started = True
-                    yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
+                        yield event({"type": "transcript.text.delta", "delta": " "})
+                    yield event({"type": "transcript.text.delta", "delta": window.transcript.text})
                     spoken = True
                 await asyncio.sleep(0)
         transcript = merge_windows(windows, adapter, req)
-        started = True
-        yield sse({
+        yield event({
             "type": "transcript.text.done",
             "text": transcript.text,
             "usage": _usage(planner.duration),

@@ -214,7 +214,6 @@ def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
 # ---------------------------------------------------------------------------
 
 class Qwen3OmniModel(Model):
-
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
     TOKEN_USAGE_LAYOUT = (THINKER_KV, "main")

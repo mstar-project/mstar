@@ -291,7 +291,6 @@ def _load_into(
 # ---------------------------------------------------------------------------
 
 class BagelModel(Model):
-
     """
     BAGEL unified multimodal model (ByteDance).
 
