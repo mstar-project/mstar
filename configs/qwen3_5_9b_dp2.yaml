@@ -1,5 +1,5 @@
 model: "qwen3_5_9b"
-max_seq_len: 32768
+max_seq_len: null  # keep the model's context limit (262,144 tokens)
 # Captured text-prefill ladder (see docs/models.rst): the powers of two to
 # 2048, 1152-1792 for a prompt a little past 1024 tokens (text-prefill steps
 # only; a mixed step doesn't capture them), and 2176 as slack for a step a few

@@ -7,8 +7,11 @@ its worker dies at build on a division by zero. These tests pin each refusal, wi
 message naming the field and the value it got, and the shapes that still load.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.recurrent.config import (
@@ -148,3 +151,13 @@ def test_deployment_context_default_and_resource_override(limit):
         apply_yaml_overrides([first, second], config)
         assert first.config.max_seq_len == (64 if limit is None else min(64, limit))
         assert second.config.max_seq_len == 128
+
+
+@pytest.mark.parametrize("path", sorted(Path(__file__).parents[2].glob("configs/qwen3_5_*.yaml")), ids=lambda p: p.name)
+def test_shipped_qwen3_5_configs_keep_the_models_context(path):
+    from mstar.engine.resources.kv.config import KVSpec
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    spec = KVSpec(resource_key="kv", nodes={"node"}, config=_paged(max_seq_len=262_144))
+    apply_yaml_overrides([spec], {"max_seq_len": yaml.safe_load(path.read_text())["max_seq_len"]})
+    assert spec.config.max_seq_len == 262_144
