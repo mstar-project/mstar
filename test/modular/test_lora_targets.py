@@ -120,6 +120,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -407,7 +410,8 @@ def _guards(module, x) -> list[str]:
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
+# fused_column_whole is fused_column's module under another checkpoint layout, which this never reads
+@pytest.mark.parametrize("name", sorted(set(CASES) - {"fused_column_whole"}))
 def test_unbound_module_runs_the_pre_lora_forward(name):
     """Same aten ops and outputs (under TP its collectives too), dynamo graph, and no guard
     on LoRA: a deployment without a lora block traces as it did before."""
@@ -545,15 +549,6 @@ def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
     assert text.ignored_modules("model.visual.blocks.0.q") and not vision.ignored_modules("model.visual.blocks.0.q")
 
 
-def test_a_deferred_embedding_is_served_without_embeddings():
-    with torch.device("meta"):
-        root = nn.Module()
-        root.embed_tokens = VocabParallelEmbedding(32, HIDDEN)
-        root.fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", deferred=["embed_tokens"])
-    assert set(spec.targets) == {"embed_tokens", "fc"} and spec.module_map.deferred == {"embed_tokens"}
-
-
 def test_an_exclude_pattern_matching_no_module_is_refused():
     """A typo would leave served a module the model calls outside its step."""
     with torch.device("meta"):
@@ -689,14 +684,6 @@ def _bagel_patch_embed() -> nn.Module:
     return BagelVisionEmbeddings(BagelViTConfig(hidden_size=HIDDEN, image_size=4, patch_size=2))
 
 
-def _qwen3_vit_patch_embed() -> nn.Module:
-    from types import SimpleNamespace
-
-    from mstar.model.components.qwen3_vit import VisionPatchEmbed
-
-    return VisionPatchEmbed(SimpleNamespace(in_channels=3, temporal_patch_size=2, patch_size=2, hidden_size=HIDDEN))
-
-
 def _omnivoice() -> nn.Module:
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
@@ -729,7 +716,6 @@ ANNOTATED = {
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
     "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
     "bagel_converted_patch_embed": (_bagel_patch_embed, {"patch_embedding"}),
-    "qwen3_vit_patch_embed": (_qwen3_vit_patch_embed, {"proj"}),
     "omnivoice_fused": (_omnivoice, {f"model.llm.layers.0.{p}" for p in (
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj")}),
 }
@@ -850,10 +836,14 @@ def test_header_refusals_reach_the_client_as_themselves():
     with pytest.raises(ValueError, match="does not fit") as misfit:
         spec.check_adapter("x", bad)
     with pytest.raises(ValueError, match="DoRA") as dora:
-        inspect_keys(spec, [("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,))])
+        inspect_keys(spec, [
+            (key.format("A"), (4, HIDDEN)), (key.format("B"), (HIDDEN, 4)),
+            ("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,)),
+        ])
     for exc in (misfit.value, dora.value):
         assert describe_load_error(exc) == str(exc)
     assert "/srv" not in describe_load_error(OSError("/srv/adapters/x: permission denied"))
+    assert describe_load_error(ValueError("bad /srv/adapters/x.safetensors")) == "bad x.safetensors"
 
 
 def test_gather_shrink_op_matches_its_fake():

@@ -58,6 +58,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -159,8 +160,13 @@ def _adapt_tokenizer_module(module) -> None:
 
     The decoder config asks for the ``default`` RoPE (dropped from
     ``ROPE_INIT_FUNCTIONS``), and the mask builders renamed ``input_embeds``
-    to ``inputs_embeds`` and dropped ``cache_position``.
+    to ``inputs_embeds`` and dropped ``cache_position``. transformers 5.21
+    made ``MimiModel.upsample`` and ``decoder_transformer`` read-only
+    properties, which the encoder sets to ``None``; plain class attributes
+    let it.
     """
+    module.Qwen3TTSTokenizerV2Encoder.upsample = None
+    module.Qwen3TTSTokenizerV2Encoder.decoder_transformer = None
     rope = module.ROPE_INIT_FUNCTIONS
     if "default" not in rope:
         def default_rope(config, device=None, seq_len=None, layer_type=None):
@@ -190,6 +196,14 @@ def _adapt_tokenizer_module(module) -> None:
 #: qwen-tts pins transformers==4.57.3, which most environments with other
 #: extras cannot satisfy; only its source files are used, so its pins are skipped.
 QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+#: Where transformers 5.21+ puts the flat Mimi checkpoint's encoder half (its
+#: ``conversion_mapping`` for ``MimiModel``); the quantizer keeps its names.
+_MIMI_NESTED_ENCODER = {
+    "encoder.layers.": "encoder.encoder_seanet.layers.",
+    "encoder_transformer.": "encoder.encoder_transformer.",
+    "downsample.": "encoder.downsample.",
+}
 
 
 @lru_cache(maxsize=1)
@@ -468,6 +482,23 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
     # Model ABC: resources
     # -----------------------------------------------------------------------
+
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the Talker: every linear of its stack and the
+        codec-group-0 head (one row per request: the last token's), named as the
+        checkpoint does (``talker.*``) or as the Talker alone does. The text projection
+        takes none: it runs in ``prepare_inputs``, outside the step. The CodePredictor's
+        depth loop and the speaker / codec models are not served."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+
+        root = meta_root(lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"Talker"}, root_path="model",
+            rows={"codec_head": PER_SEGMENT},
+            exclude={"text_projection": "runs in prepare_inputs, outside the planned step"},
+        )]
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Talker paged KV + attention/position/sampler resources, and the
@@ -1218,19 +1249,10 @@ class Qwen3TTSModel(Model):
         talker.to_empty(device=device)
 
         # The top-level checkpoint interleaves Talker and CodePredictor under
-        # ``talker.*``. Stream only the non-CodePredictor keys into this model.
-        def talker_weights():
-            for name, tensor in iter_safetensors_shards(
-                self.local_dir, device=device, prefix="talker."
-            ):
-                if not name.startswith("talker.code_predictor."):
-                    yield name.removeprefix("talker."), tensor
-
-        loaded = load_hf_weights(
-            talker,
-            talker_weights(),
-            stacked_params=LLAMA_STACKED_PARAMS,
-        )
+        # ``talker.*``; the Talker's rules drop the CodePredictor's keys.
+        rules = talker.checkpoint_rules()
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=rules.prefix)
+        loaded = rules.load(talker, ((name.removeprefix(rules.prefix), t) for name, t in weights))
         cp_prefix = "talker.code_predictor."
         talker_keys = {
             key for key in _checkpoint_keys(self.local_dir, "talker.")
@@ -1355,15 +1377,22 @@ class Qwen3TTSModel(Model):
         codec_encoder = encoder_cls(MimiConfig(**self.config.codec.encoder_config)).to(device=device)
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
         encoder_prefix = "encoder."
+        # The checkpoint keeps Mimi's flat layout; transformers 5.21+ nests the encoder half.
+        nested = hasattr(codec_encoder.encoder, "encoder_seanet")
+
+        def module_key(name: str) -> str:
+            for flat, moved in _MIMI_NESTED_ENCODER.items():
+                if nested and name.startswith(flat):
+                    return moved + name.removeprefix(flat)
+            return name
 
         def encoder_weights():
             for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=encoder_prefix):
-                yield name.removeprefix(encoder_prefix), tensor
+                yield module_key(name.removeprefix(encoder_prefix)), tensor
 
         loaded = load_hf_weights(codec_encoder, encoder_weights()) | _load_buffers(codec_encoder, encoder_weights())
-        _verify_checkpoint_coverage(
-            codec_encoder, loaded, _checkpoint_keys(codec_dir, encoder_prefix), "Qwen3-TTS codec encoder"
-        )
+        checkpoint_keys = {module_key(key) for key in _checkpoint_keys(codec_dir, encoder_prefix)}
+        _verify_checkpoint_coverage(codec_encoder, loaded, checkpoint_keys, "Qwen3-TTS codec encoder")
         codec_encoder.eval()
         return RefEncoderSubmodule(
             speaker_encoder,

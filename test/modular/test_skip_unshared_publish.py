@@ -86,7 +86,7 @@ class _Engine:
 def _worker(worker_id, wg_nodes, publisher_nodes):
     engine = _Engine(publisher_nodes)
     worker = make_worker(
-        worker_id=worker_id, _all_wg_nodes=wg_nodes,
+        worker_id=worker_id, all_wg_nodes=wg_nodes,
         engine_manager=type("EM", (), {"engine": engine})(),
     )
     return worker, engine

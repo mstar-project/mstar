@@ -197,7 +197,7 @@ def compile_decode(fn, deterministic: bool = False):
     output by up to 2 uint8 levels, at the same speed.
 
     ``deterministic`` adds the engine's deterministic compile option
-    (``accelerator_graph_runner.deterministic_inductor_options``); see
+    (``mstar.platforms.compile.deterministic_inductor_options``); see
     ``DecoderStep``.
     """
     import torch._inductor.config as inductor_config
@@ -206,7 +206,7 @@ def compile_decode(fn, deterministic: bool = False):
     if hasattr(inductor_config, "comprehensive_padding"):
         options["comprehensive_padding"] = False
     if deterministic:
-        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+        from mstar.platforms.compile import deterministic_inductor_options
 
         options.update(deterministic_inductor_options())
     return torch.compile(fn, fullgraph=False, dynamic=False, options=options or None)

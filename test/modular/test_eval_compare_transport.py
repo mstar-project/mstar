@@ -669,11 +669,16 @@ def test_an_idle_compile_worker_pool_exiting_is_not_a_server_process_exiting(tmp
                               text=True)
     try:
         helper = int(leader.stdout.readline())
+        # wait on the pool's own path: the bare name is also in tmp_path, so the leader's command line has it
         deadline = time.monotonic() + 10
-        while b"compile_worker" not in Path(f"/proc/{helper}/cmdline").read_bytes():
-            assert time.monotonic() < deadline
+        while not stress.helper_process(helper):
+            try:
+                cmdline = Path(f"/proc/{helper}/cmdline").read_bytes()   # empty once it exits
+            except OSError:
+                cmdline = None
+            assert time.monotonic() < deadline, f"pool worker {helper} never ran from the pool: cmdline {cmdline!r}"
             time.sleep(0.05)
-        assert stress.helper_process(helper) and not stress.helper_process(leader.pid)
+        assert not stress.helper_process(leader.pid)
         assert stress.group_pids(leader.pid) == {leader.pid}
         assert arm._group_pids(leader.pid) == {leader.pid}
     finally:

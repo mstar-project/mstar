@@ -14,7 +14,6 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 
 from mstar.engine.resources import (
     AttentionStep,
@@ -32,11 +31,10 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager, DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
-    _ZERO_BLOCK,
     DenseRaggedCrossPrefillWrapper,
     DenseRaggedPrefillWrapper,
-    _zero_rows_from,
 )
+from mstar.engine.resources.attn.ragged.wrappers import zero_unplanned_rows
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 _FA3_REASON = _fa3_unavailable_reason()
@@ -179,10 +177,7 @@ def test_tail_zeroing_overwrites_nan_and_keeps_real_rows(first_zero):
     out = torch.randn(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE)
     out[first_zero:] = float("nan")
     real = out[:first_zero].clone()
-    n_valid = torch.tensor(first_zero, dtype=torch.int32, device=DEVICE)
-    _zero_rows_from[(triton.cdiv(out.numel(), _ZERO_BLOCK),)](
-        out, n_valid, out.numel(), out[0].numel(), BLOCK=_ZERO_BLOCK,
-    )
+    zero_unplanned_rows(out, torch.tensor([0, first_zero], dtype=torch.int32, device=DEVICE))
     assert torch.equal(out[:first_zero], real)
     assert (out[first_zero:] == 0).all()
 

@@ -71,6 +71,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.distributed.base import PARALLEL_AXES
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
@@ -287,14 +288,16 @@ class LoraAdapterPool(Resource):
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            if joint.sp_group.world_size > 1:
-                raise ValueError(
-                    f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
-                    f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
-                    "support: its rows are laid out per request, while each SP rank holds "
-                    "a shard of the tokens. Serve this node without SP, or drop the "
-                    "'lora:' block"
-                )
+            # its rows are laid out per request over the whole batch; every axis but TP
+            # (cfg branches, sp token shards) hands each rank only part of it
+            for axis in PARALLEL_AXES:
+                if axis != "tp" and (size := getattr(joint, f"{axis}_group").world_size) > 1:
+                    raise ValueError(
+                        f"LoRA resource {spec.resource_key!r} serves a node at {axis}_size {size}, "
+                        "which LoRA does not support: its rows are laid out per request over the "
+                        f"whole batch, while each {axis.upper()} rank runs only part of it. Serve "
+                        f"this node at {axis}_size 1, or drop the 'lora:' block"
+                    )
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:

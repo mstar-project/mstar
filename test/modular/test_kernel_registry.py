@@ -386,15 +386,31 @@ def test_shipped_tables_are_well_formed(path):
             from mstar.utils.fused_moe import decode
 
             tuning = decode._from_entry(entry)
+            fp8 = entry.dtype == "float8_e4m3fn"
             for tokens in range(1, tuning.pair_max_tokens + 1):
                 gate_up, down = decode._tiles(tokens, tuning)
-                assert set(gate_up) == {"bj", "bk", "bjs", "bks", "warps"} and set(down) == {"bn", "bc", "warps"}
-            assert set(tuning.router) == {"bk", "splits", "warps"}
+                assert set(gate_up) == ({"bj", "bk", "bjs", "bks", "warps"} if fp8 else {"bj", "bk", "warps"})
+                assert set(down) == {"bn", "bc", "warps"}
+            assert set(tuning.router or ()) == ({"bk", "splits", "warps"} if fp8 else set())
         if op.name == "fp8_linear":
             for _, choice in entry.rows:
                 if choice.impl == "w8a16" and choice.config is not None:
                     assert {"DOT", "BN", "BK", "SPLIT", "STAGES", "num_warps"} <= set(choice.config)
 
+
+def test_the_moe_decode_sweep_refuses_bf16_experts_and_a_bf16_miss_names_no_sweep(fake_moe_decode_sweep, on_gpu):
+    """moe_decode's sweep times the fp8 kernels only, so a bf16 entry is measured end to end: a bf16
+    miss names no sweep command to run, and the sweep refuses bf16 rather than write rows for it."""
+    from benchmark.kernels import sweep as sweep_mod
+
+    _, written, decode = fake_moe_decode_sweep
+    shape = {"H": 64, "E": 8, "I": 32, "K": 2}
+    assert decode.MOE_DECODE.sweep_command(torch.bfloat16, shape) is None
+    assert decode.MOE_DECODE.sweep_command(torch.float8_e4m3fn, shape) is not None
+    with pytest.raises(SystemExit, match="end to end"):
+        sweep_mod.sweep("moe_decode", shape, torch.bfloat16, [1], quick=True, note=None,
+                        out_dir=on_gpu / "out", report=[], min_gain=0.02)
+    assert not written.exists()
 
 # --- moe_decode: fused_moe.decode's tiles from the registry, the built-in table otherwise -----
 
@@ -415,7 +431,7 @@ def decode_on(on_gpu, monkeypatch):
         return decode
 
     yield on
-    decode._tuning.cache_clear()
+    decode._TUNINGS.clear()
 
 
 def _decode_row(path, bj=8):
@@ -445,6 +461,59 @@ def test_moe_decode_keeps_the_builtin_table_where_none_has_the_shape(decode_on):
     assert decode._tuning(GPU, DECODE_SHAPE) is decode._H100
 
 
+THINKER = (2048, 128, 768, 8)  # Qwen3-Omni's Thinker experts at TP1: H, E, I, K
+
+
+def test_the_routed_path_takes_its_gpus_shipped_entry_and_keeps_the_builtin_table_elsewhere(monkeypatch):
+    """bf16 experts (``routed_experts``) take their crossover (and tiles, where it has per-pair
+    rows) from the package's moe_decode table for the GPU, the H200's grouped-only Thinker entry
+    there. Without an entry (an H100, the Talker's shape) the built-in table runs, as before the
+    registry had one."""
+    pytest.importorskip("triton")
+    from mstar.utils.fused_moe import decode
+
+    def on(name):
+        monkeypatch.setattr(registry, "device_key", lambda device: DeviceKey(name, "sm_90"))
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: name)
+        registry.reset_lookups()
+        return lambda shape: decode._tuning(GPU, shape, torch.bfloat16)
+
+    try:
+        assert on("NVIDIA H200")(THINKER) is not decode._UNSCALED
+        assert on("NVIDIA H200")((1024, 128, 384, 8)) is decode._UNSCALED  # the Talker's
+        assert on("NVIDIA H100 80GB HBM3")(THINKER) is decode._UNSCALED
+    finally:
+        decode._TUNINGS.clear()
+
+
+def test_the_routed_paths_lookup_is_a_constant_to_dynamo(decode_on, on_gpu):
+    """The routed path decides and launches inside compiled forwards (dynamic=False for a
+    captured bucket, dynamic=None for an eager one): the table lookup, the fit check and the
+    tiles unpacked into a launch must not break the graph there."""
+    _write(on_gpu, "moe_decode", "NVIDIA_H200", _table("moe_decode", _entry(
+        {"H": 64, "E": 8, "I": 32, "K": 2}, dtype="bfloat16", rows={
+            "2": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 4, "bk": 64, "warps": 4},
+                                               "down": {"bn": 32, "bc": 32, "warps": 4}}},
+            "*": {"impl": "triton", "config": {"path": "grouped"}}})))
+    decode = decode_on("NVIDIA H200")
+
+    def launch(x, *, bj, bk, warps):
+        return x + bj + bk + warps
+
+    def crossover(x, w):
+        tuning = decode._tuning(GPU, (x.shape[1], w.shape[0], w.shape[1], 2), x.dtype)
+        assert decode.routed_fits(x.shape[1], w.shape[1], tuning)
+        return launch(x * tuning.pair_max_tokens, **decode._tiles(x.shape[0], tuning)[0])
+
+    for dynamic in (False, None):
+        torch._dynamo.reset()
+        decode._TUNINGS.clear()
+        run = torch.compile(crossover, dynamic=dynamic, fullgraph=True)
+        for tokens in (1, 3, 5):
+            x = torch.ones(tokens, 64, dtype=torch.bfloat16)
+            assert torch.equal(run(x, torch.zeros(8, 32)), x * 2 + 4 + 64 + 4)
+
+
 def test_the_moe_decode_sweep_writes_the_tiles_the_builtin_table_launches():
     """A bucket that keeps the built-in table is written as the tiles that table launches there,
     and such a row launches them again."""
@@ -469,9 +538,9 @@ def test_the_moe_decode_sweep_writes_the_tiles_the_builtin_table_launches():
     ({"*": "pair"}, "ends with the '\\*' row"),
     ({"4": "grouped", "*": "grouped"}, "per-pair ones"),
     ({"1": "pair", "4": "grouped", "8": "pair", "*": "grouped"}, "per-pair ones"),
-    ({"*": "grouped"}, "per-pair ones, at least one"),
     ({"1": "pair", "*": {"impl": "triton", "config": {"path": "grouped", "router": {"bk": 1}}}},
      "one router config"),
+    ({"*": {"impl": "triton", "config": {"path": "grouped"}}}, "one router config"),
 ])
 def test_moe_decode_entries_are_per_pair_rows_then_the_grouped_star_row(rows, match):
     pytest.importorskip("triton")

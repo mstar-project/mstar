@@ -11,7 +11,7 @@
 //! Endpoints (mirroring `api_server/openai/router.py` + `entrypoint.py`):
 //!   GET  /v1/models
 //!   POST /v1/chat/completions      (SSE stream or JSON; text/audio/image out)
-//!   POST /v1/audio/speech          (streaming WAV or full container)
+//!   POST /v1/audio/speech          (streaming WAV/PCM, SSE deltas, or full container)
 //!   POST /v1/images/generations
 //!   POST /v1/images/edits          (multipart)
 //!   POST /generate                 (native multipart -> NDJSON)
@@ -34,6 +34,7 @@ mod refusals;
 mod serving;
 mod speech_chunking;
 mod tokenizer;
+mod unicode_marks;
 mod utf8;
 
 use std::collections::BTreeMap;
@@ -707,6 +708,125 @@ fn build_chat_response(
 
 // ---- POST /v1/audio/speech -----------------------------------------------
 
+/// OpenAI's `stream_format`, the switch its SDK (and so LiveKit's TTS plugin)
+/// sends instead of `stream`: `"audio"` streams the bytes, `"sse"` wraps them
+/// in `speech.audio.delta` events closed by `speech.audio.done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFormat {
+    Audio,
+    Sse,
+}
+
+/// `create_speech`'s check on `stream_format`: absent and an explicit `null`
+/// both mean "not sent" (`model_extra.pop(..., None)`), `"audio"` and `"sse"`
+/// are the two it takes, and anything else is a 400 that quotes a string and
+/// names any other type, exactly as the Python frontend's `describe_rejected`.
+fn speech_stream_format(v: Option<&Value>) -> Result<Option<StreamFormat>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "audio" => Ok(Some(StreamFormat::Audio)),
+        Some(Value::String(s)) if s == "sse" => Ok(Some(StreamFormat::Sse)),
+        // A string is quoted, as the Python frontend's `repr` quotes it; any
+        // other type is named rather than read back. See `json_type_name`.
+        Some(Value::String(s)) => Err(format!(
+            "stream_format must be 'audio' or 'sse', got {}",
+            media::py_repr(s)
+        )),
+        Some(other) => Err(format!(
+            "stream_format must be 'audio' or 'sse', got {}",
+            media::json_type_name(other)
+        )),
+    }
+}
+
+/// `create_speech`'s streaming rule: `bool(req.stream) or (stream_format is not
+/// None and (req.response_format or "wav").lower() in media_io.audio_formats
+/// (stream=True))`. A compressed container (the SDK's default mp3) cannot be
+/// streamed here, so `stream_format` then falls back to one whole body, which
+/// those clients read too.
+fn speech_streams(stream: Option<bool>, stream_format: Option<StreamFormat>, response_format: &str) -> bool {
+    stream.unwrap_or(false)
+        || (stream_format.is_some() && media::is_streamable_audio_format(response_format))
+}
+
+/// One step of a streaming speech body: a piece of audio as `response_format`
+/// carries it, or the failure that ends the stream. Lets the raw body and the
+/// `stream_format="sse"` wrapper share one generator, as `_as_sse` wraps
+/// `_stream_pcm` on the Python side.
+enum SpeechOut {
+    Audio(Vec<u8>),
+    Failure { status: u16, message: String },
+}
+
+/// `serving_speech._as_sse`: one `speech.audio.delta` per piece of audio
+/// (base64, in `response_format`), then `speech.audio.done`. A failure after
+/// the stream opened ends it with an `error` event instead of
+/// `speech.audio.done`: the 200 is already sent.
+fn speech_sse_events(
+    body: impl futures::Stream<Item = SpeechOut> + Send + 'static,
+) -> impl futures::Stream<Item = String> + Send + 'static {
+    let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events = {
+        let errored = errored.clone();
+        body.map(move |item| match item {
+            SpeechOut::Audio(data) => {
+                let audio = media::b64(&data);
+                sse_frame(&SpeechDeltaEvent { type_: "speech.audio.delta", audio: &audio })
+            }
+            SpeechOut::Failure { status, message } => {
+                errored.store(true, std::sync::atomic::Ordering::SeqCst);
+                sse_frame(&SpeechErrorEvent {
+                    type_: "error",
+                    error: SpeechErrorBody { message: &message, type_: error_type(status), code: status },
+                })
+            }
+        })
+    };
+    let tail = futures::stream::once(async move {
+        let done = (!errored.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| sse_frame(&SpeechDoneEvent { type_: "speech.audio.done" }));
+        futures::stream::iter(done)
+    })
+    .flatten();
+    events.chain(tail)
+}
+
+/// `openai._util.sse`: `data: <compact json>\n\n`. The events below are structs,
+/// not `json!` maps, so their keys serialize in the order the Python dicts write
+/// them — serde_json carries no `preserve_order`, and a map would come out
+/// alphabetical.
+fn sse_frame<T: serde::Serialize>(event: &T) -> String {
+    format!("data: {}\n\n", serde_json::to_string(event).unwrap())
+}
+
+#[derive(serde::Serialize)]
+struct SpeechDeltaEvent<'a> {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    audio: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct SpeechDoneEvent {
+    #[serde(rename = "type")]
+    type_: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct SpeechErrorEvent<'a> {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    error: SpeechErrorBody<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct SpeechErrorBody<'a> {
+    message: &'a str,
+    #[serde(rename = "type")]
+    type_: &'static str,
+    code: u16,
+}
+
 async fn audio_speech(
     State(st): State<AppState>,
     payload: Result<Json<SpeechRequest>, JsonRejection>,
@@ -719,7 +839,16 @@ async fn audio_speech(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let stream = req.stream.unwrap_or(false);
+    // OpenAI's own streaming switch, checked first and never forwarded, as
+    // `create_speech` pops it out of `model_extra` before anything else.
+    let stream_format = match speech_stream_format(req.stream_format.as_ref()) {
+        Ok(sf) => sf,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    let stream = speech_streams(req.stream, stream_format, &req.response_format);
+    // `create_speech`'s `if not stream: stream_format = None` — a whole body
+    // gets no SSE wrapper, whichever switch asked for one.
+    let as_sse = stream && stream_format == Some(StreamFormat::Sse);
     // Before the request is translated, as in `create_speech`: a format this
     // frontend cannot produce is the client's error.
     let fmt = match media::check_audio_format(&req.response_format, stream) {
@@ -754,9 +883,7 @@ async fn audio_speech(
             submitted += 1;
         }
         // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM,
-        // the pieces' audio in order. A later error aborts the body: the status
-        // is already sent, and a cleanly ended stream would pass for a complete
-        // answer.
+        // the pieces' audio in order, and whatever ended it.
         let playing = futures::stream::unfold(
             Some((first, pending, submitted)),
             move |state| {
@@ -766,11 +893,11 @@ async fn audio_speech(
                     loop {
                         match cur.next().await {
                             Some(Out::Chunk(c)) if c.modality == "audio" && !c.data.is_empty() => {
-                                return Some((Ok(Bytes::from(c.data)), Some((cur, pending, submitted))));
+                                return Some((SpeechOut::Audio(c.data), Some((cur, pending, submitted))));
                             }
                             Some(Out::Chunk(_)) => {}
-                            Some(Out::Error { message, .. }) => {
-                                return Some((Err(std::io::Error::other(message)), None));
+                            Some(Out::Error { status, message }) => {
+                                return Some((SpeechOut::Failure { status, message }, None));
                             }
                             None => {
                                 cur = pending.pop_front()?;
@@ -784,12 +911,30 @@ async fn audio_speech(
                 }
             },
         );
-        let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
+        // `_stream_pcm` yields the streaming WAV header as a piece of its own,
+        // so the SSE wrapper around it carries the header as the first delta.
+        let header = (fmt == "wav").then(|| SpeechOut::Audio(media::wav_stream_header(st.sample_rate, 1)));
         let body = futures::stream::iter(header).chain(playing);
+        if as_sse {
+            let events = speech_sse_events(body).map(|e| Ok::<Bytes, std::io::Error>(Bytes::from(e)));
+            return Response::builder()
+                // Starlette appends the charset to a `text/*` media type, so
+                // `_ClosingStreamingResponse`'s header reads exactly this.
+                .header("content-type", "text/event-stream; charset=utf-8")
+                .header("cache-control", "no-cache")
+                .body(Body::from_stream(events))
+                .unwrap();
+        }
+        // A later error aborts the raw body: the status is already sent, and a
+        // cleanly ended stream would pass for a complete answer.
+        let raw = body.map(|item| match item {
+            SpeechOut::Audio(data) => Ok(Bytes::from(data)),
+            SpeechOut::Failure { message, .. } => Err(std::io::Error::other(message)),
+        });
         return Response::builder()
             .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
-            .body(Body::from_stream(body))
+            .body(Body::from_stream(raw))
             .unwrap();
     }
 
@@ -1883,5 +2028,159 @@ mod tests {
         let n = events.len();
         assert_eq!(events[n - 2]["choices"][0]["delta"]["content"], "\u{FFFD}");
         assert_eq!(events[n - 1]["choices"][0]["finish_reason"], "stop");
+    }
+
+    // ---- stream_format (OpenAI's switch on /v1/audio/speech) --------------
+
+    /// `create_speech`: `stream_format not in (None, "audio", "sse")`. Absent
+    /// and an explicit `null` are both "not sent".
+    #[test]
+    fn stream_format_takes_audio_sse_and_nothing_sent() {
+        let sf = |body: &str| {
+            speech_stream_format(
+                serde_json::from_str::<SpeechRequest>(body).unwrap().stream_format.as_ref(),
+            )
+        };
+        assert_eq!(sf(r#"{"input":"hi"}"#), Ok(None));
+        assert_eq!(sf(r#"{"input":"hi","stream_format":null}"#), Ok(None));
+        assert_eq!(sf(r#"{"input":"hi","stream_format":"audio"}"#), Ok(Some(StreamFormat::Audio)));
+        assert_eq!(sf(r#"{"input":"hi","stream_format":"sse"}"#), Ok(Some(StreamFormat::Sse)));
+    }
+
+    /// The refusal quotes a string as Python's `repr` does and names any other
+    /// JSON type, which is what the Python frontend's `describe_rejected` says.
+    #[test]
+    fn stream_format_refuses_anything_else_quoting_a_string_and_naming_a_type() {
+        let msg = |body: &str| {
+            speech_stream_format(
+                serde_json::from_str::<SpeechRequest>(body).unwrap().stream_format.as_ref(),
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":"SSE"}"#),
+            "stream_format must be 'audio' or 'sse', got 'SSE'"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":""}"#),
+            "stream_format must be 'audio' or 'sse', got ''"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":true}"#),
+            "stream_format must be 'audio' or 'sse', got a boolean"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":false}"#),
+            "stream_format must be 'audio' or 'sse', got a boolean"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":1}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        // -0 and an integer past u64 both arrive as f64; the old code had to
+        // reproduce Python's repr of each, and now neither is read back.
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":-0.0}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":18446744073709551616}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":1.5}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":["sse"]}"#),
+            "stream_format must be 'audio' or 'sse', got an array"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":{"a":1}}"#),
+            "stream_format must be 'audio' or 'sse', got an object"
+        );
+    }
+
+    /// `bool(req.stream) or (stream_format is not None and the format is one of
+    /// `media_io.audio_formats(stream=True)`)`: the switch forces a stream only
+    /// for a format that can actually be streamed.
+    #[test]
+    fn stream_format_streams_only_a_streamable_format() {
+        use StreamFormat::{Audio, Sse};
+        // stream_format alone, for the formats a stream carries (wav when unset).
+        for sf in [Audio, Sse] {
+            for fmt in ["wav", "WAV", "pcm", ""] {
+                assert!(speech_streams(None, Some(sf), fmt), "{sf:?} {fmt:?}");
+            }
+            // a compressed container falls back to one whole body
+            for fmt in ["mp3", "flac", "opus", "aac"] {
+                assert!(!speech_streams(None, Some(sf), fmt), "{sf:?} {fmt:?}");
+                assert!(!speech_streams(Some(false), Some(sf), fmt));
+                // `stream` still wins on its own, as it does on the Python side
+                assert!(speech_streams(Some(true), Some(sf), fmt));
+            }
+        }
+        // no switch at all: `stream` decides, absent and null meaning false
+        assert!(!speech_streams(None, None, "wav"));
+        assert!(!speech_streams(Some(false), None, "pcm"));
+        assert!(speech_streams(Some(true), None, "wav"));
+        assert!(speech_streams(Some(true), None, "mp3"));
+    }
+
+    fn sse_events(items: Vec<SpeechOut>) -> Vec<String> {
+        futures::executor::block_on(
+            speech_sse_events(futures::stream::iter(items)).collect::<Vec<String>>(),
+        )
+    }
+
+    /// `_as_sse`: a delta per piece of audio, then `speech.audio.done`, framed
+    /// and keyed exactly as `openai._util.sse` writes them.
+    #[test]
+    fn sse_wraps_each_piece_of_audio_and_closes_with_done() {
+        let events = sse_events(vec![SpeechOut::Audio(b"\x01\x02".to_vec()), SpeechOut::Audio(b"ab".to_vec())]);
+        assert_eq!(
+            events,
+            vec![
+                "data: {\"type\":\"speech.audio.delta\",\"audio\":\"AQI=\"}\n\n".to_string(),
+                "data: {\"type\":\"speech.audio.delta\",\"audio\":\"YWI=\"}\n\n".to_string(),
+                "data: {\"type\":\"speech.audio.done\"}\n\n".to_string(),
+            ]
+        );
+    }
+
+    /// A failure after the 200: the in-band `error` event, and no
+    /// `speech.audio.done` after it — a failed stream must not read as complete.
+    #[test]
+    fn sse_ends_a_failed_stream_with_an_error_event_and_no_done() {
+        let events = sse_events(vec![
+            SpeechOut::Audio(b"ab".to_vec()),
+            SpeechOut::Failure { status: 400, message: "input refused by the model".into() },
+        ]);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[1],
+            concat!(
+                r#"data: {"type":"error","error":{"message":"input refused by the model","#,
+                r#""type":"invalid_request_error","code":400}}"#,
+                "\n\n",
+            )
+        );
+        // a 5xx is ours, as `_util.error_type` has it
+        let events = sse_events(vec![SpeechOut::Failure { status: 500, message: "boom".into() }]);
+        assert_eq!(
+            events,
+            vec![concat!(
+                r#"data: {"type":"error","error":{"message":"boom","type":"server_error","code":500}}"#,
+                "\n\n",
+            )
+            .to_string()]
+        );
+    }
+
+    /// An empty stream still closes: the Python generator falls through to
+    /// `speech.audio.done`.
+    #[test]
+    fn sse_closes_an_empty_stream_with_done() {
+        assert_eq!(sse_events(vec![]), vec!["data: {\"type\":\"speech.audio.done\"}\n\n".to_string()]);
     }
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -15,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     """The response dict, or for ``stream_video`` the NDJSON response itself."""
-    args = adapter.video_to_request(req, api.upload_dir)
+    # off the loop: a conditioning image or video may be decoded, written or fetched
+    args = await asyncio.to_thread(adapter.video_to_request, req, api.upload_dir)
     request_id = rid("vid")
 
     stream = bool(args.model_kwargs.get("stream_video"))

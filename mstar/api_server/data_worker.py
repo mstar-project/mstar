@@ -287,11 +287,6 @@ class PreprocessWorker:
         """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
         server's startup check read them."""
         check_media_limits()
-        # Here, before the thread starts: the thread reads it as it starts, and
-        # a value it cannot take would end the thread with every request waiting.
-        workers = (model_config or {}).get("preprocess_workers")
-        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
-            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -304,6 +299,8 @@ class PreprocessWorker:
         self.results_wakeup = EventWakeup()
         self.output_queue = ResultQueue(self.results_wakeup)
         self.profile_queue = ResultQueue(self.results_wakeup)
+        # ConductorMessages from other threads (runtime LoRA loads), sent by this one
+        self.conductor_outbox = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -340,7 +337,7 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        # the serving config's adapters' prefix-cache roots
+        # registered adapters' prefix-cache roots; a runtime load or unload updates it
         self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
 
         self.thread = Thread(
@@ -365,6 +362,7 @@ class PreprocessWorker:
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
                 adapter_roots=self.adapter_prefix_roots,
+                conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
             )
         )
@@ -383,6 +381,12 @@ class PreprocessWorker:
         submission, so it reaches the conductor before any request submitted
         after this call."""
         self.worker_metrics_requested.set()
+        self._signal()
+
+    def send_to_conductor(self, message) -> None:
+        """Send ``message`` to the conductor from the thread that owns the socket, on
+        the socket every submission goes out on."""
+        self.conductor_outbox.put(message)
         self._signal()
 
     def queue_depth(self) -> int:
@@ -672,13 +676,19 @@ class PreprocessWorkerThread:
     _next_transfer_publish = 0.0
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
+    # class-level so a thread built without __init__ has nothing to send
+    conductor_outbox: queue.Queue | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
     # class-level so a thread built without __init__ stamps no read times
     enable_prof = False
     # None (no model that declares it, one CPU's worth of workers, or a thread
-    # built without __init__) prepares every request inline
+    # built without __init__) prepares every request inline.
     _prepare_pool: ThreadPool | None = None
+    # Requests prepared at once: None from __init__ until the first request
+    # sizes the pool (_size_prepare_pool); 1, inline, for a thread built
+    # without __init__, which has no model to size it from.
+    _prepare_workers: int | None = 1
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -706,9 +716,11 @@ class PreprocessWorkerThread:
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
         adapter_roots: AdapterPrefixRoots | None = None,
+        conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
         self._adapter_roots = adapter_roots
+        self.conductor_outbox = conductor_outbox
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -788,27 +800,28 @@ class PreprocessWorkerThread:
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
         self._encoded: deque[EncodedOutput] = deque()
-        self._prepare_workers = self._num_prepare_workers()
-        if self._prepare_workers > 1:
-            self._prepare_pool = ThreadPool(
-                max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
-            )
+        self._prepare_workers = None
         # Requests on the prepare pool, oldest first. They reach the conductor
         # in this order, whichever finishes first.
         self._preparing: deque[PreparingInput] = deque()
 
-    def _num_prepare_workers(self) -> int:
-        """Requests prepared at once. A model has to declare that its loaders
-        and ``process_prompt`` may overlap, and client streams need their
-        appends handled behind the request, so anything else runs inline."""
-        if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
-            return 1
-        workers = (self._model_config or {}).get("preprocess_workers")
-        if workers is not None:
-            return int(workers)
-        # each request runs on this process's intra-op pool, which the config
-        # or the model may size above the plan's default
-        return cpus.plan().prepare_workers(torch.get_num_threads())
+    def _size_prepare_pool(self) -> None:
+        """Size the prepare pool: requests prepared at once. A model has to
+        declare that its loaders and ``process_prompt`` may overlap, and client
+        streams need their appends handled behind the request, so anything else
+        runs inline. Run with the first request, after the conductor's
+        validate_deployment has accepted ``preprocess_workers`` (this thread
+        starts before it runs), so a bad value is reported with the rest."""
+        workers = 1
+        if getattr(self.model, "PREPROCESS_PARALLEL", False) and not self._client_edges:
+            workers = (self._model_config or {}).get("preprocess_workers")
+            if workers is None:
+                # each request runs on this process's intra-op pool, which the
+                # config or the model may size above the plan's default
+                workers = cpus.plan().prepare_workers(torch.get_num_threads())
+        self._prepare_workers = workers
+        if workers > 1:
+            self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -1847,6 +1860,14 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _send_conductor_outbox(self) -> bool:
+        outbox = self.conductor_outbox
+        if outbox is None or outbox.empty():
+            return False
+        while not outbox.empty():
+            self.communicator.send("conductor", outbox.get())
+        return True
+
     def _send_enable_metrics_if_requested(self) -> None:
         requested = self.worker_metrics_requested
         if requested is not None and requested.is_set():
@@ -1986,6 +2007,8 @@ class PreprocessWorkerThread:
         try:
             if self.timing_requested.is_set():
                 profile = self._start_profile(pre_input)
+            if self._prepare_workers is None:
+                self._size_prepare_pool()
             if self._prepare_pool is not None:
                 self._submit_prepare(pre_input, profile)
             else:
@@ -2080,6 +2103,7 @@ class PreprocessWorkerThread:
                 sends_pending = self.communicator.flush()
                 did_work = self._process_messages()
                 self._send_enable_metrics_if_requested()
+                did_work = self._send_conductor_outbox() or did_work
                 # Output delivery is latency-sensitive: the API server holds a
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a
