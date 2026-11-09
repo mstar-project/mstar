@@ -209,6 +209,13 @@ def test_registry_yaml_and_adapter_agree(model):
         model.validate_config_yaml(
             {**deployment, "prefill_token_buckets": {"flow": {"solve_new_frames": [64]}}}, str(CONFIG_PATH),
         )
+    # a malformed key is EngineManager's to report, and the pool checks still run past it
+    for malformed in ([64], {"flow": "solve_new_frames_x"}):
+        model.validate_config_yaml({**deployment, "prefill_token_buckets": malformed}, str(CONFIG_PATH))
+    with pytest.raises(ValueError, match="pages"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": 64}, "max_concurrent_requests": 64}, str(CONFIG_PATH),
+        )
     assert isinstance(adapters.get_adapter("cosyvoice3"), adapters.CosyVoice3Adapter)
 
 
