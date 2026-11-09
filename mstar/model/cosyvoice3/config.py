@@ -237,6 +237,10 @@ class CosyVoice3Config:
     # Flow estimator precision ("bfloat16", "float32", "float16"); the Euler
     # state stays float32. "float32" is the reference's precision.
     flow_estimator_dtype: str = "bfloat16"
+    # Captured LM prefills, packed: by total tokens and batch size. A prefill they
+    # don't hold runs eagerly, about 30 ms of launches stalling its worker's decode.
+    lm_prefill_token_buckets: tuple[int, ...] = (64, 128, 192, 256, 384, 512, 768, 1024)
+    lm_prefill_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
     flow_max_batch_size: int = 8
     hift_max_batch_size: int = 8
     # Flow solves replayed as CUDA graphs, captured at startup for the default

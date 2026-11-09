@@ -1317,7 +1317,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
             commit(prepared)
         assert ended == {0: False, 1: True, 2: True, 3: False, 4: False}
 
-        (graph,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+        graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
         template = graph.single_request_inputs
         per_value = {
             HISTORY: torch.full((sub.window,), -1, dtype=torch.long),
@@ -1398,8 +1398,12 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     step = sub.declare_step("decode", [0, 1], [SimpleNamespace(input_seq_len=1)] * 2)
     assert set(step.steps) == {LM_KV, LM_ATTN, LM_POS}
     assert [(s.request_id, s.span) for s in step.segments] == [(0, 1), (1, 1)]
-    (graph,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    prefill = sub.get_accelerator_graph_configs(torch.device("cpu"))[1]
+    assert prefill.replay_graph_walks == ["prefill", "prefill_voice"]
+    assert prefill.capture_token_lengths == list(cfg.lm_prefill_token_buckets)
+    assert sub.resident_walks() == {"decode"}
 
 
 # -- flow -----------------------------------------------------------------------------
