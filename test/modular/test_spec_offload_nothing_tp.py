@@ -1,5 +1,10 @@
-"""Rank 0 settles a victim's verify results before offloading it. If the offload then moves nothing, the
-follower must still reach the same lengths, or the two ranks admit the retry from different lengths."""
+"""Rank 0 settles a victim's verify results before offloading it, and ships the settle when the offload moves
+nothing. These tests check that journal: what rank 0 ships, a follower's replay and its wait on a held row, the
+merge into Lockstep's pending delta, the wire format, and ``stored_len`` right after replay.
+
+They run the toy's synchronous mode, where a row's lengths re-converge at its next admit anyway, so they don't
+guard the divergence at an asynchronous retry's admit: the toy has no resident capture on the CPU.
+"""
 from __future__ import annotations
 
 import sys
