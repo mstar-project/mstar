@@ -707,7 +707,7 @@ whole experts. Attention and dense MLPs stay TP-sharded:
 .. code-block:: yaml
 
    model: "qwen3_omni"
-   max_seq_len: 32768
+   max_seq_len: null
    node_groups:
      - node_names: [Thinker]
        ranks: [0, 1]

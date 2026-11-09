@@ -4493,8 +4493,8 @@ class KVManager(AttentionResource):
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
-        # the pool's own context or override (not the serving config's top-level
-        # `max_seq_len`), and a stream's pages are distinct pages of the pool
+        # the pool's own context, as the serving config set or capped it,
+        # and a stream's pages are distinct pages of the pool
         width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
         self._resident = KVResidentTables(planner, key, page_size, width)
 

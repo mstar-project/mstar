@@ -719,8 +719,8 @@ Worker scheduling
        tables are sized at startup, not by a setting: twice the walk's largest
        capture batch in rows, plus one, since a request that finds no row takes
        the least recently run one's. A row has a cell per page of the KV pool's
-       ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
-       not the config's top-level key), at most the pool's pages, plus a few, 8
+       ``max_seq_len`` (the model's context, capped by the config's top-level key,
+       or ``resources: <kv>: max_seq_len``), at most the pool's pages, plus a few, 8
        bytes each. Read by ``knobs.resident_planning``.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``

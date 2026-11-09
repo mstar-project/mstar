@@ -108,8 +108,8 @@ class Glm52ModelConfig:
     rope_interleave: bool = True
     max_position_embeddings: int = 1_048_576
     # The serving window with dsa_long_context on, raised by the
-    # ``max_seq_len`` model kwarg (the top-level YAML max_seq_len key is
-    # only presence-checked by the conductor). With it off the window is
+    # ``max_seq_len`` model kwarg (the top-level YAML max_seq_len key can
+    # only cap the pool). With it off the window is
     # index_topk: dense MLA is exactly GLM-5.2's DSA computation only within
     # the top-2048 window. The KV pool is sized to the window
     # (``Glm52Model.context_limit``), which the conductor holds requests to.
