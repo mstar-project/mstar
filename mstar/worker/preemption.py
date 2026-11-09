@@ -181,9 +181,9 @@ class Preemption:
             counts.victims += 1
             counts.preempted_again += record.times == 2
             kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
-            sampled = -1 if kept is None else len(kept.sampled)
-            counts.returns_preempted += sampled >= 0 and record.sampled_at == sampled
-            record.sampled_at = sampled
+            if kept is not None:
+                counts.returns_preempted += record.sampled_at == len(kept.sampled)
+                record.sampled_at = len(kept.sampled)
             self._scheduler.return_backlogged(rid)
         for rid in victims.to_host:
             for node_name in kv.nodes:
