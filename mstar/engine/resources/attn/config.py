@@ -123,7 +123,7 @@ class AttentionSpec(NodeResourceSpec):
     def async_verify_refusal(self, draft) -> str | None:
         """Asynchronous verify steps need lengths read on the device: FA3's paged
         kernel. A config fact only; whether FA3 runs on the workers' GPUs is
-        theirs to say at load (`FlashInferManager.bind_verify`)."""
+        theirs to say at load (`FlashInferManager.verify_hardware_refusal`)."""
         if self.config.verify_backend is VerifyBackend.FLASHINFER:
             return "verify_backend flashinfer plans lengths on the host"
         return None

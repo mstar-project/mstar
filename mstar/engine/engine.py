@@ -3452,7 +3452,7 @@ class Engine:
             # as a resident-set delta. TP followers can deadlock if they are not
             # given a single source of truth for eviction.
             return 0
-        self._settle_verify(node_name, request_id)
+        settled = self._settle_verify(node_name, request_id)
         if kv_manager._DEBUG_ASSERTS:
             self._poll_print_checks()
         prints = self._fingerprints(node_name, request_id) if kv_manager._DEBUG_ASSERTS else None
@@ -3471,6 +3471,10 @@ class Engine:
                 self._resident_delta[node_name].add_offloaded(
                     self._graph_runtime.get_rid_string(request_id)
                 )
+        elif settled and node_name in self._resident_delta:
+            # no offload for a follower to replay, and the row may stay in the retry:
+            # the followers apply these results too, or the ranks admit it from different lengths
+            self._resident_delta[node_name].add_settled(self._graph_runtime.get_rid_string(request_id))
         return freed
 
     def _rid_name(self, request_id: int) -> str:
@@ -3643,7 +3647,12 @@ class Engine:
                 )
                 delta.pop_left()
                 continue
-            if is_offload:
+            if delta.settled_only[0]:
+                if any(resource.holds_step(rid) for resource in resources):
+                    # as a refused offload: settled once that step has committed
+                    return False
+                self._settle_verify(node_name, rid)
+            elif is_offload:
                 if self.residency(node_name, rid) is Residency.ON_HOST:
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
@@ -3784,20 +3793,22 @@ class Engine:
         (`_settle_verify`)."""
         return any(draft.ledger.unrecorded(rid) for draft in self._drafts.values())
 
-    def _settle_verify(self, node_name: str, rid: int) -> None:
+    def _settle_verify(self, node_name: str, rid: int) -> bool:
         """Apply ``rid``'s recorded verify results before it is offloaded, through
         the admit-time pass's own fan-out, so the offload snapshots the verified
         length and the resident slot it gives up holds nothing the host lacks.
-        On a follower replaying rank 0's offload, an unrecorded one raises."""
+        On a follower replaying rank 0's offload, an unrecorded one raises. Whether
+        it applied any."""
         draft = self._drafts.get(node_name)
         if draft is None or not draft.ledger.pending(rid):
-            return
+            return False
         if any(resource.holds_step(rid) for resource in self._submodules[node_name].resources.values()):
             # admitted to a step not yet committed: the offload refuses it, so settle nothing yet
-            return
+            return False
         self._runner.apply_take_backs(draft.ledger.settle(rid))
         if kv_manager._DEBUG_ASSERTS:
             draft.check_offsets(self._submodules[node_name].resources, [rid])
+        return True
 
     def void_verify(self, batch: ExecutingBatch) -> None:
         """A step that committed and failed before its postprocess recorded it:

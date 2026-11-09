@@ -192,9 +192,11 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded; or, if
+    # settled_only[i], only had its verify results applied by an offload that moved nothing
     rids: list[str] = field(default_factory=list)
     is_offload: list[bool] = field(default_factory=list)
+    settled_only: list[bool] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
@@ -203,10 +205,17 @@ class OffloadDelta:
     def add_offloaded(self, rid: str):
         self.rids.append(rid)
         self.is_offload.append(True)
+        self.settled_only.append(False)
 
     def add_reloaded(self, rid: str):
         self.rids.append(rid)
         self.is_offload.append(False)
+        self.settled_only.append(False)
+
+    def add_settled(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(False)
+        self.settled_only.append(True)
 
     def __len__(self):
         return len(self.rids)
@@ -219,6 +228,7 @@ class OffloadDelta:
     def pop_left(self) -> tuple[str, bool] | None:
         if not len(self):
             return None
+        self.settled_only.pop(0)
         return (self.rids.pop(0), self.is_offload.pop(0))
 
     def copy(self) -> "OffloadDelta":
@@ -226,7 +236,7 @@ class OffloadDelta:
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.is_offload))
+        return OffloadDelta(list(self.rids), list(self.is_offload), list(self.settled_only))
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
@@ -237,11 +247,13 @@ class OffloadDelta:
         taken = self.copy()
         self.rids.clear()
         self.is_offload.clear()
+        self.settled_only.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
         self.is_offload.extend(other.is_offload)
+        self.settled_only.extend(other.settled_only)
 
 
 @dataclass
