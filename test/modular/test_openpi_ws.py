@@ -192,6 +192,12 @@ def test_codec_refuses_what_is_not_a_numeric_array(frame):
         openpi.unpack(frame)
 
 
+@pytest.mark.parametrize("frame", [b"\xc1", b"\x91" * 2000])  # msgpack raises both with no message
+def test_a_codec_error_says_what_is_wrong(frame):
+    with pytest.raises(ValueError, match=r"not openpi's msgpack: \S"):
+        openpi.unpack(frame)
+
+
 # ----------------------------------------------------------------------
 # observation -> request
 # ----------------------------------------------------------------------
@@ -229,12 +235,25 @@ def test_seed_pins_the_noise():
         _policy().request(_droid_obs() | {"seed": 1.5})
 
 
+def _float_image(pixel: float) -> np.ndarray:
+    image = np.full((224, 224, 3), 0.5, np.float32)
+    image[100, 100, 1] = pixel
+    return image
+
+
 @pytest.mark.parametrize("change,match", [
     ({"observation/wrist_image_left": None}, "wrist_image_left"),
     ({"observation/wrist_image_left": np.zeros((224, 224), np.uint8)}, "3 dimensions"),
     ({"observation/wrist_image_left": np.zeros((224, 224, 4), np.uint8)}, "RGB"),
     ({"observation/wrist_image_left": np.zeros((224, 224, 3), np.int32)}, "uint8 or float"),
+    # scaled by 255 and cast, as openpi does, these would be ordinary pixels (2.0 becomes 254)
+    ({"observation/wrist_image_left": _float_image(np.nan)}, r"in \[0, 1\]"),
+    ({"observation/wrist_image_left": _float_image(2.0)}, r"in \[0, 1\]"),
+    ({"observation/wrist_image_left": _float_image(-0.5)}, r"in \[0, 1\]"),
+    ({"observation/wrist_image_left": _float_image(np.inf).astype(np.float16)}, r"in \[0, 1\]"),
     ({"observation/joint_position": "seven"}, "numeric"),
+    ({"observation/joint_position": np.zeros(0), "observation/gripper_position": np.zeros(0)},
+     "has 0 values"),
     ({"prompt": 3}, "prompt"),
 ])
 def test_bad_observations_are_refused(change, match):
@@ -264,8 +283,28 @@ def test_the_policy_shape_comes_from_the_model():
     """The API server names no model: it serves whatever declares Model.robot_io."""
     policy = _policy()
     io = _droid_model().robot_io()
-    assert tuple(io) == ("robot_state", HORIZON, WIDTH)
-    assert (policy.state_kwarg, policy.action_horizon, policy.action_dim) == tuple(io)
+    # no norm stats, so the model doesn't know the robot's state width
+    assert tuple(io) == ("robot_state", HORIZON, WIDTH, None)
+    assert (policy.state_kwarg, policy.action_horizon, policy.action_dim, policy.state_dim) == tuple(io)
+
+
+def test_the_droid_deployment_takes_only_a_droid_state():
+    """configs/pi05_droid.yaml's norm stats cover the 7 joints and the gripper, so
+    its socket refuses a state of another length rather than binning it."""
+    from pathlib import Path
+
+    import yaml
+
+    config = yaml.safe_load((Path(__file__).parents[2] / "configs" / "pi05_droid.yaml").read_text())
+    model = Pi05Model(skip_weight_loading=True, **config["model_kwargs"])
+    policy = openpi.OpenpiPolicy.from_config(config["openpi"], model)
+    assert policy.state_dim == 8
+    assert len(policy.request(_droid_obs()).model_kwargs["robot_state"]) == 8
+    for joints, gripper in ((7, 0), (6, 1), (0, 0), (7, 2)):
+        obs = _droid_obs() | {"observation/joint_position": np.zeros(joints),
+                              "observation/gripper_position": np.zeros(gripper)}
+        with pytest.raises(ValueError, match=f"has {joints + gripper} values; .* sends 8 values"):
+            policy.request(obs)
 
 
 def test_only_a_robot_policy_that_takes_decoded_images_is_served():

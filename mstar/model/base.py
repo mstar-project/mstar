@@ -158,6 +158,9 @@ class RobotIO(NamedTuple):
     # the shape of the float32 actions ``postprocess`` returns for "action"
     action_horizon: int
     action_dim: int
+    # how many values the robot state holds, when the model knows (from its
+    # deployment's norm stats, say); the openpi socket refuses another length
+    state_dim: int | None = None
 
 
 class ProcessPromptOutput(NamedTuple):

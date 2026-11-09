@@ -99,11 +99,16 @@ def pack(value) -> bytes:
     return msgpack.packb(value, default=_pack_array, use_bin_type=True)
 
 
+# the two msgpack errors raised with no message
+_BLANK_ERRORS = {msgpack.FormatError: "an unknown type byte", msgpack.StackError: "nested too deeply"}
+
+
 def unpack(data: bytes):
     try:
         return msgpack.unpackb(data, object_hook=_unpack_array, raw=False)
     except (msgpack.UnpackException, ValueError, TypeError, OverflowError) as exc:
-        raise ValueError(f"the observation is not openpi's msgpack: {exc}") from None
+        detail = str(exc) or _BLANK_ERRORS.get(type(exc), type(exc).__name__)
+        raise ValueError(f"the observation is not openpi's msgpack: {detail}") from None
 
 
 # ----------------------------------------------------------------------
@@ -119,16 +124,22 @@ class PolicyRequest(NamedTuple):
 def _image(value, key: str) -> torch.Tensor:
     """An observation image as RGB uint8 ``[3, H, W]``. Read as openpi's
     ``_parse_image`` reads one: floats are scaled by 255, and a leading axis of
-    3 is the channel axis (else it is ``[H, W, 3]``)."""
+    3 is the channel axis (else it is ``[H, W, 3]``). Unlike openpi, a float
+    image must be in [0, 1]: scaled and cast, NaN or 2.0 would become an
+    ordinary pixel (2.0 wraps to 254)."""
     if not isinstance(value, np.ndarray) or value.ndim != 3:
         raise ValueError(f"{key} must be an image array of 3 dimensions")
-    if np.issubdtype(value.dtype, np.floating):
-        value = (255 * value).astype(np.uint8)
-    elif value.dtype != np.uint8:
+    floating = np.issubdtype(value.dtype, np.floating)
+    if not floating and value.dtype != np.uint8:
         raise ValueError(f"{key} must be uint8 or float, not {value.dtype}")
     chw = value if value.shape[0] == 3 else value.transpose(2, 0, 1)
     if chw.shape[0] != 3 or 0 in chw.shape:
         raise ValueError(f"{key} must be an RGB image, [H, W, 3] or [3, H, W]; got {list(value.shape)}")
+    if floating:
+        # NaN fails both comparisons
+        if not (chw.min() >= 0 and chw.max() <= 1):
+            raise ValueError(f"{key} is a float image, so its values must be in [0, 1] (no NaN or inf)")
+        chw = (255 * chw).astype(np.uint8)
     # a copy: the decoded frame is read-only, and the model gets its own contiguous tensor
     return torch.from_numpy(np.array(chw, order="C"))
 
@@ -147,6 +158,8 @@ class OpenpiPolicy:
     image_keys: tuple[str, ...]
     state_keys: tuple[str, ...]
     state_kwarg: str
+    # how many values the state keys hold together, when the model says (RobotIO.state_dim)
+    state_dim: int | None
     action_horizon: int
     # the model's output width, and the leading dims of it a reply keeps
     action_dim: int
@@ -185,7 +198,7 @@ class OpenpiPolicy:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"openpi: metadata cannot be sent as msgpack: {exc}") from None
         return cls(
-            image_keys=tuple(images), state_keys=tuple(state), state_kwarg=io.state_kwarg,
+            image_keys=tuple(images), state_keys=tuple(state), state_kwarg=io.state_kwarg, state_dim=io.state_dim,
             action_horizon=io.action_horizon, action_dim=io.action_dim, action_dims=action_dims,
             metadata=metadata,
         )
@@ -206,6 +219,10 @@ class OpenpiPolicy:
             raise ValueError("the observation needs a prompt string")
         images = [_image(obs[k], k) for k in self.image_keys]
         state = np.concatenate([_numbers(obs[k], k) for k in self.state_keys])
+        if not state.size or self.state_dim not in (None, state.size):
+            want = f"{self.state_dim} values" if self.state_dim is not None else "at least one value"
+            raise ValueError(f"the state ({' + '.join(self.state_keys)}) has {state.size} values; "
+                             f"this deployment's robot sends {want}")
         model_kwargs = {self.state_kwarg: state.astype(np.float64).tolist()}
         seed = obs.get("seed")
         if seed is not None:

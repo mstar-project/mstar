@@ -248,6 +248,11 @@ as M*'s is. The protocol:
   written for pi0-FAST.
 * A call that fails is answered with a text frame holding the error, which the client
   raises, and the socket closes with ``1011``.
+* Some observations openpi's server takes quietly are refused: a float image with a value
+  outside [0, 1] (scaled by 255 and cast, NaN becomes a pixel and 2.0 wraps to 254), an
+  empty state or one of another length than the deployment's norm stats (8 for
+  ``pi05_droid``: 7 joints and the gripper), and a prompt over 200 tokens with the state
+  (openpi truncates it, which drops the state).
 * An observation may carry ``seed`` (an int), which openpi does not have. It pins the
   call's noise, as ``seed`` in ``/generate``'s ``model_kwargs`` does. Without it each call
   gets a fresh seed.

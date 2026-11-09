@@ -585,7 +585,12 @@ class Pi05Model(Model):
         return TensorAndMetadata(image.to(device))
 
     def robot_io(self) -> RobotIO:
-        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim)
+        # The deployment's state stats are the robot's width (a norm_stats.json's
+        # padding is dropped when it loads). /generate still takes a shorter state,
+        # as openpi does, but a robot on the openpi socket must send all of it.
+        stats = self.norm_stats.state if self.norm_stats is not None else None
+        state_dim = None if stats is None else stats.q01.numel()
+        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim, state_dim)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}

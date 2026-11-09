@@ -97,7 +97,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
        A request sends one image per camera, up to the config's ``num_cameras`` (3 in
        ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
-       images than that are a 400.
+       images than that are a 400. So is a prompt over 200 tokens, task and state together,
+       which openpi would truncate, dropping the state.
        ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
        openpi's DROID normalization: raw joint state in, joint velocities out. It also
        serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
