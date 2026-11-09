@@ -68,11 +68,8 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
     )
 
-    def __init__(
-        self, model_path_hf: str, cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None, **kwargs: Any,
-    ):
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
+        super().__init__(model_path_hf, cache_dir)
         self.config = MuseGlimmerConfig.from_hf(self.local_dir)
         self.vision_config = MuseGlimmerVisionConfig.from_hf(self.local_dir)
         self.tokenizer = load_tokenizer(self.local_dir)
@@ -199,6 +196,9 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             ids = ids[1:]
         return torch.tensor(ids, dtype=torch.long)
 
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {"reasoning_strength", "reasoning_effort", "current_date"}
+
     def render_prompt(self, parts: list[PromptPart], **kwargs) -> str:
         template_kwargs = {}
         strength = kwargs.get("reasoning_strength") or kwargs.get("reasoning_effort")
@@ -272,4 +272,4 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         weight_loader.load_text_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Muse Glimmer LLM onto %s", device)
-        return LLMSubmodule(model, self.config, self.encoders, self.prefill_token_buckets)
+        return LLMSubmodule(model, self.config, self.encoders)

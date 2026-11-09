@@ -166,7 +166,7 @@ def test_each_text_chunk_carries_its_token_count():
     worker.tensor_uuid_to_metadata_per_request["t"] = {1: {}, 2: {}}
     for sequence, (uuid, tensor) in enumerate([(1, torch.tensor([5, 6, 7])), (2, torch.rand(2))]):
         state.next_sequence += 1
-        worker._postprocess_inline("t", sequence, "text", uuid, tensor)
+        worker._postprocess_inline("t", sequence, "text", uuid, tensor, None)
     chunks = [worker.out_queue.get_nowait() for _ in range(5)]
     assert [(c.request_id, c.modality, c.num_tokens) for c in chunks] == [
         ("r", "text", 1), ("s", "text", 1), ("r", "audio", 0), ("t", "text", 3), ("t", "text", 0),

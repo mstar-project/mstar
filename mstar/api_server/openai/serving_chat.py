@@ -2,7 +2,7 @@
 
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
-``message.content``, audio into ``message.audio`` (base64 WAV), images into
+``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
 ``image_url`` data-URL content parts, and the closing ``usage`` chunk into
 ``usage`` and ``finish_reason``.
 """
@@ -24,10 +24,11 @@ from mstar.utils.utf8_stream import Utf8Stream
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
+    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    audio_format = _audio_format(req, sample_rate)
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
     args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
     request_id = rid("chatcmpl")
-    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
         # resolved once, before it is submitted: the response names the adapter that
@@ -60,7 +61,19 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
+
+
+def _audio_format(req, sample_rate: int) -> str:
+    """The container ``message.audio`` is sent in, from OpenAI's ``audio.format``: a speech
+    container, with ``pcm16`` naming raw PCM. Stream deltas are raw PCM16, so a stream takes only that."""
+    fmt = str((req.audio or {}).get("format") or ("pcm16" if req.stream else "wav")).lower()
+    allowed = ("pcm16",) if req.stream else tuple(
+        "pcm16" if f == "pcm" else f for f in media_io.audio_formats(sample_rate=sample_rate))
+    if fmt not in allowed:
+        how = "streamed" if req.stream else "produced"
+        raise ValueError(f"audio.format {fmt!r} cannot be {how} by this server; use one of: {', '.join(allowed)}")
+    return "pcm" if fmt == "pcm16" else fmt
 
 
 def _usage(reported: dict | None) -> dict:
@@ -74,7 +87,7 @@ def _finish_reason(reported: dict | None) -> str:
     return (reported or {}).get("finish_reason", "stop")
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -94,10 +107,10 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
     message: dict = {"role": "assistant", "content": text}
 
     if audio_pcm:
-        wav = media_io.pcm16_to_wav_bytes(b"".join(audio_pcm), sample_rate)
+        audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
         message["audio"] = {
             "id": rid("audio"),
-            "data": base64.b64encode(wav).decode("ascii"),
+            "data": base64.b64encode(audio).decode("ascii"),
             "expires_at": now() + 86400,
             "transcript": text,
         }

@@ -212,6 +212,10 @@ class StopPolicy:
     # AR, EOS: the resource label whose request config carries ``ignore_eos``;
     # None means EOS is never ignored
     sampler: str | None = None
+    # AR, EOS: for a node with no such resource, whether the request ignores EOS,
+    # in place of ``sampler``. Evaluated with ``max_iters``, on the info of the node's
+    # partition.
+    ignores_eos: Callable[[CurrentForwardPassInfo], bool] | None = None
     # the request's iteration limit for this loop; evaluated once per request
     # and walk, not per step. None is ``info.max_tokens``.
     max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
@@ -231,7 +235,9 @@ class StopPolicy:
         if self.kind is not StopKind.EOS:
             max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
         ignore_eos = False
-        if self.reads_token and self.sampler is not None:
+        if self.reads_token and self.ignores_eos is not None:
+            ignore_eos = bool(self.ignores_eos(info))
+        elif self.reads_token and self.sampler is not None:
             config = info.resource_configs.get(self.sampler)
             ignore_eos = bool(getattr(config, "ignore_eos", False))
         return StopLimits(max_iters, ignore_eos)
@@ -532,6 +538,15 @@ class ChunkingPolicy:
     whole prefill needs, so a part-done row cannot wedge on a full arena.
     Counted in tokens, so a walk whose KV grows by something else sets False
     and reserves per chunk.
+
+    ``max_batch_tokens``: a combined walk's step may pass it beside a
+    speculation chain's rows, since a prompt they leave less than
+    ``min_chunk_tokens`` still runs that many. The engine bounds such a step
+    assuming each chain row is a one-token decode row
+    (``ChunkingManagement.max_step_tokens``) and trims a serving config's
+    ``prefill_token_buckets`` to that bound. A walk whose decode rows run more
+    (an MTP verify row's k+1) passes it, and its steps past a trimmed ladder's
+    top run eagerly.
     """
     walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
@@ -826,11 +841,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
-    def dynamo_recompile_limit(self) -> int | None:
-        """Entries dynamo may keep per code object of this submodule's compiled forwards, when
-        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies
-        it around this submodule's compiled calls only. None keeps the engine's."""
-        return None
+    # Entries dynamo keeps per code object of the compiled forward for each bucket (batch
+    # size and token count) a compiled capture takes, e.g. one per kind of layer a frame is
+    # traced for. The runner
+    # raises the recompile limit around this node's compiled calls to hold every capture
+    # (`AcceleratorGraphRunner.recompile_limit`).
+    compiled_entries_per_shape: int = 1
 
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
     # numerically sensitive fp32 vocoder. The engine then neither casts its
@@ -989,8 +1005,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         **kwargs
-    ) -> NodeInputs:
-        pass
+    ) -> NodeInputs | None:
+        """One request's inputs for this step, built on the host.
+
+        None declines the row. On the step that takes its streams' final chunk
+        (``is_final_stream_chunk``) the row still completes its node: its loop
+        ends and its partition reports done. On any other step it is dropped.
+        Every rank sees the same chunk, so all of them decline alike.
+        """
 
     def split_inputs(
         self,
@@ -1524,29 +1546,6 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set by a submodule whose decode walk reads its last sampled token back on
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
-
-    # The packed token counts a prefill capture is built at, which
-    # ``__init__``'s ``prefill_token_buckets`` replaces per instance. A
-    # submodule that takes that kwarg must read its capture ladder off
-    # ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.
-    PREFILL_TOKEN_BUCKETS: list[int]
-
-    def __init__(self, prefill_token_buckets: Sequence[int] | None = None):
-        """``prefill_token_buckets``: a deployment's own captured prefill ladder
-        (``model_kwargs.prefill_token_buckets``), in place of the class's
-        ``PREFILL_TOKEN_BUCKETS``."""
-        super().__init__()
-        if prefill_token_buckets is not None:
-            buckets = prefill_token_buckets
-            if (
-                not isinstance(buckets, (list, tuple)) or not buckets
-                or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in buckets)
-                or len(set(buckets)) < len(buckets)
-            ):
-                raise ValueError(
-                    f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
-                )
-            self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""

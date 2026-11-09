@@ -53,6 +53,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -163,6 +164,27 @@ class VocoderWindow:
     phase_carry: torch.Tensor | None = None  # [B, H+1] cycle sum of the frames before ``start``
 
 
+class VocodeInputs(NamedTuple):
+    """A batch of streams' new frames, right-padded to a common count: the fixed-shape
+    input of ``vocode_stream``. Per-row counts are device tensors, so one captured graph
+    serves every mix of rows that fits its shape."""
+
+    new_mel: torch.Tensor  # [B, 80, F] zero past each row's new frames
+    new_frames: torch.Tensor  # [B] long
+    skip: torch.Tensor  # [B] long, tail frames before the window's first
+    history: torch.Tensor  # [B] long, the window's leading frames fed to the F0 predictor only
+    frames: torch.Tensor  # [B] long, the window's frames after the history
+    start: torch.Tensor  # [B] long, global frame of the window's first frame
+    carry_at: torch.Tensor  # [B] long, window frame whose cycle sum is the next carry
+    advance: torch.Tensor  # [B] long, nonzero where the carry moves there
+
+
+class VocodeOutput(NamedTuple):
+    wav: torch.Tensor  # [B, 480 F] from each window's first frame on
+    tail: torch.Tensor  # [B, 80, K] each row's last K frames, newest last
+    phase_carry: torch.Tensor  # [B, H+1]
+
+
 class CausalHiFTGenerator(nn.Module):
     def __init__(self, config: CausalHiFTConfig):
         super().__init__()
@@ -239,20 +261,28 @@ class CausalHiFTGenerator(nn.Module):
         cfg = self.config
         up = self.upsample_factor
         b, frames = f0.shape
-        rad = torch.remainder(f0.unsqueeze(-1) * self.harmonics / cfg.sampling_rate, 1.0)  # [B, F, H+1]
         carry = window.phase_carry
         if carry is None:
-            carry = torch.zeros(b, rad.shape[-1], dtype=rad.dtype, device=rad.device)
+            carry = torch.zeros(b, self.harmonics.shape[0], dtype=f0.dtype, device=f0.device)
+        offset = window.start * up
+        length = frames * up
+        if offset + length > self.source_noise.shape[1]:
+            raise ValueError(f"the vocoder noise covers {cfg.noise_seconds} s; this call reaches past it")
+        return self._excitation(f0, carry, self.source_noise[:, offset : offset + length])
+
+    def _excitation(
+        self, f0: torch.Tensor, carry: torch.Tensor, noise: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``f0`` ``[B, F]``, ``carry`` ``[B, H+1]``, ``noise`` ``[1 or B, 480F, H+1]``."""
+        cfg = self.config
+        up = self.upsample_factor
+        rad = torch.remainder(f0.unsqueeze(-1) * self.harmonics / cfg.sampling_rate, 1.0)  # [B, F, H+1]
         cycles = torch.cumsum(torch.cat([carry.to(rad.dtype).unsqueeze(1), rad], dim=1), dim=1)[:, 1:]
         phase = (cycles * 2 * math.pi * up).repeat_interleave(up, dim=1)  # [B, 480F, H+1]
         sines = torch.sin(phase) * cfg.nsf_alpha
         f0_samples = f0.repeat_interleave(up, dim=1).unsqueeze(-1)
         uv = (f0_samples > cfg.nsf_voiced_threshold).to(sines.dtype)
-        offset = window.start * up
-        length = frames * up
-        if offset + length > self.source_noise.shape[1]:
-            raise ValueError(f"the vocoder noise covers {cfg.noise_seconds} s; this call reaches past it")
-        noise = self.source_noise[:, offset : offset + length].to(sines.device, sines.dtype)
+        noise = noise.to(sines.device, sines.dtype)
         noise_amp = uv * cfg.nsf_sigma + (1 - uv) * cfg.nsf_alpha / 3
         excitation = sines * uv + noise_amp * noise
         merged = torch.tanh(self.m_source.l_linear(excitation)).transpose(1, 2)
@@ -285,25 +315,20 @@ class CausalHiFTGenerator(nn.Module):
     def _window_envelope(self, num_frames: int, window: torch.Tensor) -> torch.Tensor:
         return self._overlap_add((window**2).expand(1, num_frames, -1).contiguous())[0]
 
-    def _istft(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-        """``torch.istft`` (centred, one-sided, unnormalized) without its host-side envelope check."""
+    def _istft_frames(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         cfg = self.config
         magnitude = torch.clip(magnitude, max=1e2)
         spec = torch.complex(magnitude * torch.cos(phase), magnitude * torch.sin(phase))
-        frames = torch.fft.irfft(spec.transpose(1, 2), n=cfg.istft_n_fft, dim=-1) * self.stft_window
+        return torch.fft.irfft(spec.transpose(1, 2), n=cfg.istft_n_fft, dim=-1) * self.stft_window
+
+    def _istft(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        """``torch.istft`` (centred, one-sided, unnormalized) without its host-side envelope check."""
+        frames = self._istft_frames(magnitude, phase)
         return self._overlap_add(frames) / self._window_envelope(frames.shape[1], self.stft_window)
 
-    def decode(self, mel: torch.Tensor, source: torch.Tensor, finalize: bool) -> torch.Tensor:
+    def _generate(self, x: torch.Tensor, s_stft: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``conv_pre``'s output and the source spectrum -> (magnitude, phase)."""
         cfg = self.config
-        s_real, s_imag = self._stft(source.squeeze(1))
-        if finalize:
-            x = self.conv_pre(mel)
-        else:
-            r = cfg.conv_pre_look_right
-            x = self.conv_pre(mel[:, :, :-r], context=mel[:, :, -r:])
-            cut = math.prod(cfg.upsample_rates) * r
-            s_real, s_imag = s_real[:, :, :-cut], s_imag[:, :, :-cut]
-        s_stft = torch.cat([s_real, s_imag], dim=1)
         for i in range(self.num_upsamples):
             x = self.ups[i](F.leaky_relu(x, cfg.lrelu_slope))
             if i == self.num_upsamples - 1:
@@ -316,7 +341,19 @@ class CausalHiFTGenerator(nn.Module):
             x = xs / self.num_kernels
         x = self.conv_post(F.leaky_relu(x))
         half = cfg.istft_n_fft // 2 + 1
-        wav = self._istft(torch.exp(x[:, :half, :]), torch.sin(x[:, half:, :]))
+        return torch.exp(x[:, :half, :]), torch.sin(x[:, half:, :])
+
+    def decode(self, mel: torch.Tensor, source: torch.Tensor, finalize: bool) -> torch.Tensor:
+        cfg = self.config
+        s_real, s_imag = self._stft(source.squeeze(1))
+        if finalize:
+            x = self.conv_pre(mel)
+        else:
+            r = cfg.conv_pre_look_right
+            x = self.conv_pre(mel[:, :, :-r], context=mel[:, :, -r:])
+            cut = math.prod(cfg.upsample_rates) * r
+            s_real, s_imag = s_real[:, :, :-cut], s_imag[:, :, :-cut]
+        wav = self._istft(*self._generate(x, torch.cat([s_real, s_imag], dim=1)))
         if not finalize:
             wav = wav[:, : -self.upsample_factor]
         return torch.clamp(wav, -cfg.audio_limit, cfg.audio_limit)
@@ -341,6 +378,58 @@ class CausalHiFTGenerator(nn.Module):
         if not finalize:
             mel = mel[:, :, : -self.f0_predictor.look_right]
         return self.decode(mel, source, finalize), cycles
+
+    @torch.no_grad()
+    def vocode_stream(self, inputs: VocodeInputs, tail: torch.Tensor, phase_carry: torch.Tensor) -> VocodeOutput:
+        """``vocode`` for a batch of streams, as one fixed-shape tensor program, from each
+        row's kept mel ``tail`` ``[B, 80, K]`` (newest last) and ``phase_carry`` ``[B, H+1]``.
+
+        Each sample a stream emits equals its row's own ``vocode`` to float rounding.
+        Everything but the STFTs is causal with bounded look-ahead, so frames past a row's
+        end cannot reach samples it emits, and zero frames past the end are what a final
+        call's convolutions pad with. The two STFTs see a row's true end through masks: the
+        source reflects there, and the inverse sums only the row's frames over the row's own
+        envelope. So final and non-final rows share one program; a non-final row's samples
+        near its end are simply never emitted.
+        """
+        up = self.upsample_factor
+        history, frames = inputs.history, inputs.frames
+        total = inputs.new_mel.shape[-1]
+        kept = tail.shape[-1]
+        n_mel = inputs.new_mel.shape[1]
+        joined = torch.cat([tail, inputs.new_mel.to(tail.dtype)], dim=-1)
+        pos = torch.arange(total, device=tail.device)[None, :]
+        window = joined.gather(2, (pos + inputs.skip[:, None]).unsqueeze(1).expand(-1, n_mel, -1))
+        kept_pos = torch.arange(kept, device=tail.device)[None, :]
+        next_tail = joined.gather(2, (kept_pos + inputs.new_frames[:, None]).unsqueeze(1).expand(-1, n_mel, -1))
+
+        mel = window
+        f0 = self.f0_predictor(mel.to(self.f0_predictor.classifier.weight.dtype), finalize=True).to(mel.dtype)
+        # shift each row left past its history
+        from_history = (pos + history[:, None]).clamp_max(total - 1)
+        f0 = f0.gather(1, from_history)
+        keep = (pos < frames[:, None]).unsqueeze(1).to(mel.dtype)
+        window_mel = mel.gather(2, from_history.unsqueeze(1).expand(-1, n_mel, -1)) * keep
+
+        samples = torch.arange(total * up, device=mel.device)[None, :]
+        at = (inputs.start[:, None] * up + samples).clamp_max(self.source_noise.shape[1] - 1)
+        source, cycles = self._excitation(f0, phase_carry, self.source_noise[0][at])
+        row_samples = frames[:, None] * up
+        mirrored = (2 * (row_samples - 1) - samples).clamp_min(0)
+        reflected = source.squeeze(1).gather(1, torch.where(samples < row_samples, samples, mirrored))
+        s_real, s_imag = self._stft(reflected)
+        magnitude, phase = self._generate(self.conv_pre(window_mel), torch.cat([s_real, s_imag], dim=1))
+
+        istft_frames = self._istft_frames(magnitude, phase)
+        hop_frames = torch.arange(istft_frames.shape[1], device=mel.device)[None, :]
+        in_row = (hop_frames <= row_samples // self.config.istft_hop_len).unsqueeze(-1).to(istft_frames.dtype)
+        envelope = self._overlap_add(self.stft_window**2 * in_row)
+        # past a row's end its envelope and its sum are both zero
+        wav = self._overlap_add(istft_frames * in_row) / torch.where(envelope > 0, envelope, 1.0)
+        wav = torch.clamp(wav, -self.config.audio_limit, self.config.audio_limit)
+        moved = cycles.gather(1, inputs.carry_at[:, None, None].expand(-1, 1, cycles.shape[-1])).squeeze(1)
+        carry = torch.where(inputs.advance[:, None] != 0, moved.to(phase_carry.dtype), phase_carry)
+        return VocodeOutput(wav=wav, tail=next_tail, phase_carry=carry)
 
     def keep_f0_predictor_in_float64(self) -> None:
         self.f0_predictor.double()
@@ -417,4 +506,83 @@ def stream_vocode(
     if keep_from > state.mel_start:
         state.mel = state.mel[:, keep_from - state.mel_start :]
         state.mel_start = keep_from
+    return out
+
+
+@dataclass(slots=True)
+class CapturedStream:
+    """A captured stream's host counters. Its mel tail and phase carry live in the
+    node's recurrent state pool, written by the replays (``vocode_stream``)."""
+
+    received: int = 0  # mel frames that have run
+    emitted: int = 0  # samples
+    carry_frame: int = 0
+    done: bool = False
+    # frames not run yet, since nothing was final to emit
+    pending: torch.Tensor | None = None
+
+
+class StreamRow(NamedTuple):
+    """One row of a captured vocoder step, planned from its stream's counters."""
+
+    stream: CapturedStream
+    new_mel: torch.Tensor  # [80, N]
+    skip: int  # tail frames before the window's first
+    history: int
+    frames: int
+    start: int
+    carry_at: int
+    advance: bool  # the next window starts later, so the carry moves
+    emit_to: int
+    final: bool
+    next_start: int
+
+
+def plan_stream_row(
+    config: CausalHiFTConfig, stream: CapturedStream, new_mel: torch.Tensor, final: bool,
+    context_frames: int, tail_frames: int,
+) -> StreamRow | None:
+    """The row that emits what is final now, or None when nothing is. As ``stream_vocode``
+    plans a call, over counters: a stream keeps only its last ``tail_frames`` of mel."""
+    up = config.upsample_factor
+    if stream.done:
+        return None
+    if stream.pending is not None:
+        new_mel = torch.cat([stream.pending, new_mel], dim=-1)
+    end = stream.received + new_mel.shape[-1]
+    if end == 0:
+        stream.done = final
+        return None
+    emit_to = end * up if final else max(end - config.stream_holdback_frames, 0) * up
+    if emit_to <= stream.emitted and not final:
+        stream.pending = new_mel
+        return None
+    stream.pending = None
+    start = max(stream.emitted // up - context_frames, 0)
+    if start != stream.carry_frame:
+        raise RuntimeError(f"vocoder phase carried to frame {stream.carry_frame}, window starts at {start}")
+    history = min(config.f0_left_history, start)
+    kept = stream.received - (start - history)
+    if not 0 <= kept <= tail_frames:
+        raise RuntimeError(f"a window reads {kept} frames of history from a tail of {tail_frames}")
+    frames = end - start - (0 if final else config.f0_look_right)
+    if (start + frames) * up > int(config.noise_seconds * config.sampling_rate):
+        raise ValueError(f"the vocoder noise covers {config.noise_seconds} s; this call reaches past it")
+    next_start = max(emit_to // up - context_frames, 0)
+    return StreamRow(
+        stream, new_mel, tail_frames - kept, history, frames, start,
+        max(next_start - start - 1, 0), next_start > start, emit_to, final, next_start,
+    )
+
+
+def finish_stream_row(config: CausalHiFTConfig, row: StreamRow, wav: torch.Tensor) -> torch.Tensor:
+    """Advance the counters past a row that ran; the samples it emits, of its ``wav``."""
+    stream = row.stream
+    up = config.upsample_factor
+    out = wav[stream.emitted - row.start * up : row.emit_to - row.start * up]
+    stream.received += row.new_mel.shape[-1]
+    stream.emitted = row.emit_to
+    stream.done = row.final
+    if row.advance:
+        stream.carry_frame = row.next_start
     return out

@@ -10,6 +10,7 @@ from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
 if TYPE_CHECKING:
+    import numpy as np
     import torch
 
 
@@ -193,6 +194,9 @@ class ClientAppend:
     file_streams: dict[str, list[str | None]] | None = None
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
+    # per ClientAudio stream, decoded mono float32 samples at its declared
+    # rate: a route that decodes the client's codec itself appends without a file
+    samples: "dict[str, np.ndarray] | None" = None
     # Answers the append as late, with an error naming why; called from the
     # preprocess thread when the model routes items to a stream that has
     # ended (by the client, or with its consuming partition). None: nobody
