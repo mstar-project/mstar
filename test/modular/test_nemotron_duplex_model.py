@@ -297,6 +297,12 @@ def test_duplex_refuses_a_checkpoint_dir_with_no_config(tmp_path):
         _make_model()._json_config(str(tmp_path))
 
 
+def test_duplex_names_a_config_json_of_another_layout(tmp_path):
+    (tmp_path / "config.json").write_text('{"foo": 1}')
+    with pytest.raises(ValueError, match="config.json is not a NeMo VoiceChat config"):
+        _make_model()._json_config(str(tmp_path))
+
+
 def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):
     """The encoder KV's declaration from the defaults equals the one from a
     checkpoint of the same shape (its retention is a SinkWindow, equal by value), and
