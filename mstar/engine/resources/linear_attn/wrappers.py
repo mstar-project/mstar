@@ -115,8 +115,8 @@ def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
 
 # The chunked path's elementwise work around its kernels, compiled into one
 # kernel each: run eagerly, it was a dozen launches per layer and about a
-# third of a long prefill's GPU time on Qwen3.5-0.8B. Pointwise only, so
-# dynamic=True costs nothing here (unlike a reduction over a symbolic head dim).
+# third of a long prefill's GPU time on Qwen3.5-0.8B. The callers mark only the
+# token dim dynamic (``compiled``'s ``dynamic_args``), so the head dim stays static.
 
 
 def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -413,7 +413,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # same mask, so the tail never reaches a kernel.
         if self._stage_inputs:
             return out
-        return compiled(_masked_rows, dynamic=True)(out, self._plan_state.token_mask)
+        return compiled(_masked_rows, dynamic_args=(0, 1))(out, self._plan_state.token_mask)
 
     def _save_conv_snapshots(self, x: torch.Tensor, conv_layer: torch.Tensor):
         """A snapshot's conv state is the inputs before its boundary, the
@@ -478,7 +478,9 @@ class GDNPrefillWrapper(GDNWrapper):
                 q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
             # The padded tail is zeroed so inf there can't poison the result: q, k
             # and v by `run_conv`, whose output they are, the gates here.
-            alpha, beta = compiled(_chunked_gates, dynamic=True)(a, b, a_log, dt_bias, self._plan_state.token_mask)
+            alpha, beta = compiled(_chunked_gates, dynamic_args=(0, 1, 4))(
+                a, b, a_log, dt_bias, self._plan_state.token_mask,
+            )
 
         snapshot_args = {}
         if self._every:

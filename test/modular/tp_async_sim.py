@@ -1,7 +1,7 @@
 """CPU lockstep simulator for the TP async-scheduling protocol.
 
 Models the leader/follower worker protocol for speculative scheduling on
-lockstep-parallel (TP) nodes — the case ``_can_speculate`` currently refuses
+lockstep-parallel (TP) nodes — the case ``Speculator.can_speculate`` currently refuses
 — as an explicit-state model checker: every interleaving of
 {follower message processing, per-rank GPU progress, leader spec build, leader
 post-step} is explored by DFS over a small scripted workload, and the design's
@@ -575,11 +575,13 @@ def explore_verify(rule="ledger", synchronous=False, nranks=2, steps=4, stage_or
 # V is in every step until it is offloaded.
 
 
-def explore_offload(synchronous=False, nranks=2, steps=5, serial_gate=True) -> VerifyResult:
+def explore_offload(synchronous=False, nranks=2, steps=5, serial_gate=True, victim_stays=False) -> VerifyResult:
     """DFS over every interleaving, and over which steps V runs in (a row may
     skip a step: not ready, held back); a violation is a follower settling V
     with one of V's steps unrecorded. ``serial_gate`` False lets a follower take
-    a serial head as early as a speculative one (the negative control)."""
+    a serial head as early as a speculative one (the negative control).
+    ``victim_stays`` is an offload that moved nothing: its settle still ships, and
+    V may run in that step and later ones."""
     res = VerifyResult()
     # per rank: (armed, committed, recorded); then, per step rank 0 built, whether it was
     # speculative and whether V ran in it; and the step whose broadcast carries V's offload
@@ -604,11 +606,13 @@ def explore_offload(synchronous=False, nranks=2, steps=5, serial_gate=True) -> V
                         options = []
                         if offload_at:
                             options.append((offload_at, False))
+                            if victim_stays:
+                                options.append((offload_at, True))
                         else:
                             options += [(0, True), (0, False)]
                             if v_steps <= recorded:
-                                # V is a victim rank 0 may pick now, gone from this step on
-                                options.append((m, False))
+                                # V is a victim rank 0 may pick now, gone from this step on unless it stays
+                                options.append((m, victim_stays))
                         for at, runs in options:
                             if at == m and speculative:
                                 res.speculative_offloads += 1

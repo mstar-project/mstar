@@ -191,3 +191,27 @@ def test_reads_are_split_below_2_gib(tmp_path, monkeypatch):
     save_file({"t": t}, str(path))
     (_, got), = list(iter_safetensors_file(path))
     assert torch.equal(got, t) and max(sizes) <= 16
+
+
+@pytest.mark.parametrize("load", ["file", "hf_shards"])
+def test_the_module_loaders_open_weights_on_the_nodes_own_gpu(tmp_path, monkeypatch, load):
+    """A node on cuda:1 had its weights opened on "cuda" (GPU 0, the process's current device) and
+    then moved: every load staged on GPU 0."""
+    import safetensors.torch
+
+    from mstar.model import utils
+
+    save_file({"weight": torch.ones(2, 2)}, str(tmp_path / "model.safetensors"))
+    opened, real = [], safetensors.torch.safe_open
+
+    def spy(path, framework, device="cpu"):
+        opened.append(str(device))
+        return real(path, framework=framework, device="cpu")  # no GPU here
+
+    monkeypatch.setattr(safetensors.torch, "safe_open", spy)
+    module = utils.ModuleAndPrefix(torch.nn.Linear(2, 2, bias=False))
+    if load == "file":
+        utils.load_weights_from_file(str(tmp_path / "model.safetensors"), [module], device="cuda:1")
+    else:
+        utils.load_weights_from_hf_shards(tmp_path, [module], device="cuda:1")
+    assert opened[-1] == "cuda:1"
