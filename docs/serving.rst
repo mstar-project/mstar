@@ -371,7 +371,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        prompt and copies are kept. One the pool can't hold then is never dropped on that node, though it can
        still move to the host with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
        keeps no ids and sets no memory aside. A non-negative int, and 0 sets no pool aside, so no request is
-       dropped there. The pool is rounded up to a power of two, as the pinned allocator would round it anyway.
+       dropped there and the node preempts as one with no rebuild policy does. The pool is rounded up to a
+       power of two, as the pinned allocator would round it anyway.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,

@@ -288,7 +288,7 @@ def test_rebuild_host_mb_alone_sizes_the_pool_of_a_node_that_copies_media(monkey
 
 def test_rebuild_host_mb_0_rebuilds_no_request_there():
     """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
-    preemption still treated the node as one that drops requests."""
+    preemption still ran its pass for the node, as for one with a rebuild policy."""
     rebuilds = _make_media_rebuilds({"rebuild_host_mb": 0})
 
     assert rebuilds.pool is None and not rebuilds.nodes, "a node with no pool would still count as one that drops"
