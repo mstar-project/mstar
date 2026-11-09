@@ -1,7 +1,8 @@
 """Kimi K3's projections that read one input, packed into one GEMM after load: the latent MoE's router,
 latent down projection and shared experts' gate_up, and the MLA's q_a | kv_a with the output gate. On the
 tiny model through the real loader: the parameters view the packed weight, and the packed forward computes
-what the separate GEMMs do (fp32 on the CPU: bit for bit). With the shared experts beside the routed path
+what the separate GEMMs do (fp32 on the CPU, up to rounding: MKL's AVX2 GEMM, as on CI's runners, blocks the
+packed width differently). With the shared experts beside the routed path
 (``shared_experts_overlap``, the default) the packed GEMMs leave them out; the others pin the packing
 without it."""
 import pytest
@@ -36,16 +37,17 @@ def test_packed_projections_view_one_weight_and_match_the_separate_gemms(monkeyp
             moe._in_weight = None  # the three GEMMs apart
             separate = moe(x)
             moe._in_weight = w
-        assert torch.equal(packed, separate)
+        torch.testing.assert_close(packed, separate, rtol=1e-5, atol=1e-5)
     for mla in mlas:
         w = mla._qkv_a_g_weight
         assert _same_storage(mla.fused_qkv_a_proj_weight, w) and _same_storage(mla.g_proj.weight, w)
         h = torch.randn(4, w.shape[1])
         with torch.no_grad():
             qkv_a = mla._fused_qkv_a(h)
-            assert torch.equal(qkv_a, F.linear(h, mla.fused_qkv_a_proj_weight))
+            torch.testing.assert_close(qkv_a, F.linear(h, mla.fused_qkv_a_proj_weight), rtol=1e-5, atol=1e-5)
             stashed, gate = mla._gate_pre
-            assert stashed is h and torch.equal(gate, mla.g_proj(h))
+            assert stashed is h
+            torch.testing.assert_close(gate, mla.g_proj(h), rtol=1e-5, atol=1e-5)
             # a path that ran no packed GEMM for these rows projects its own gate
             attn = torch.randn(4, mla.g_proj.weight.shape[0])
             out = mla._project_out(attn, torch.randn_like(h))
