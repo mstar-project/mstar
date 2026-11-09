@@ -416,7 +416,7 @@ class ShortGrant(NamedTuple):
 class Earmark:
     """The pages the moves of ``victims`` add to ``rid``'s allotment, past the room its grant counted, which went in
     when it ran short. ``granted`` counts the pages added so far. For a request that waits, ``pages`` is all it asks
-    for, which it takes whole."""
+    for, which it takes whole, and ``granted`` counts the pages kept for it until then."""
     rid: str
     pages: int
     victims: set[str]
@@ -4854,7 +4854,7 @@ class KVManager(AttentionResource):
         grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
         victim that asks again at once is then measured against the room without it. A waiting request the moves
         were for takes the room as soon as it covers all it asks for, before a victim can take it back, and the moves
-        that land after that add nothing. Until then, `_kept` keeps the room for it.
+        that land after that add nothing. Until then, `_kept` keeps the room for it, up to what it asks for.
 
         When ``rid``'s ``allotment`` passed the first request in the queue, `_kept` also keeps what the earmark
         doesn't take while a request waits."""
@@ -4868,15 +4868,18 @@ class KVManager(AttentionResource):
                 # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
                 # window's commit frees pages at another point of the step. The engine journals the move ahead of the
                 # admit.
-                self._kept += freed
+                kept = min(earmark.pages - earmark.granted, freed)
+                earmark.granted += kept
+                self._kept += kept
+                freed -= kept
                 if self._decides and earmark.pages <= self._room():
                     self._admit(earmark.rid, earmark.pages, self.journal)
-                return
-            granted = min(earmark.pages - earmark.granted, freed)
-            if granted:
-                earmark.granted += granted
-                self._allot(earmark.rid, granted)
-            freed -= granted
+            else:
+                granted = min(earmark.pages - earmark.granted, freed)
+                if granted:
+                    earmark.granted += granted
+                    self._allot(earmark.rid, granted)
+                freed -= granted
         if allotment is not None and allotment.passed and self._asks:
             self._kept += freed
 
