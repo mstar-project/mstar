@@ -216,7 +216,7 @@ def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = F
             run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
             if speculative:
                 run["tau"] = _tau(start, _counters(url))
-            # the worker logs each request it offloads for pages (`_try_offload_cold_request`) and reloads
+            # the worker logs each request it offloads for pages (`Admission.relieve`) and reloads
             log = Path(server.log_path).read_text()
             run["offloads"] = log.count("offloaded victim=")
             run["events"] = fp32_screen.events(log)
