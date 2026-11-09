@@ -57,10 +57,11 @@ def _rank(rank: int, case: str, store: str, out_dir: str) -> None:
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     group.device_group = group.cpu_group = dist.new_group([0, 1])
     group.initialized = True
-    group._all_reduce = AllReduce(group.device_group)
+    group._all_reduce = AllReduce()
     try:
         groups = WorkerParallelGroups(num_workers=2, global_rank=rank, any_parallelism=True)
-        groups.add("LLM", group)
+        groups.add("LLM", group, "tp")
+        groups.node_to_instance_comm["LLM"] = group
         model = KimiK3Model("x", config_variant="reduced", kda_conv_dtype=torch.float32,
                             kda_max_requests=4, tokenizer_mode="byte")
         model.config = _config(case)

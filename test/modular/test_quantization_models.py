@@ -4,7 +4,6 @@ block-fp8 conversion, the boot check the conductor runs, and the LLM node loaded
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,12 +101,9 @@ def test_qwen3_5_loads_its_fp8_checkpoint_as_stored(checkpoints):
 
 def test_qwen3_omni_routes_expert_scales_beside_their_weights():
     from mstar.model.loader.base import apply_stacked
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+    from mstar.model.qwen3_omni.components.thinker import thinker_remap, thinker_stacked_params
 
-    omni = Qwen3OmniModel.__new__(Qwen3OmniModel)
-    omni.config = SimpleNamespace(thinker_text=SimpleNamespace(num_experts=4))
-    omni._THINKER_STACKED_PARAMS = []
-    rules = omni._get_thinker_stacked_params()
+    rules = list(thinker_stacked_params(4))
     for suffix, param in (("weight", "gate_up_proj"), ("weight_scale_inv", "gate_up_proj_scale_inv")):
-        name = Qwen3OmniModel._thinker_remap(f"model.layers.0.mlp.experts.3.up_proj.{suffix}")
+        name = thinker_remap(f"model.layers.0.mlp.experts.3.up_proj.{suffix}")
         assert apply_stacked(name, rules) == (f"model.layers.0.mlp.experts.{param}", "up:3")

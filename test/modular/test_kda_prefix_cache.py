@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -41,8 +42,8 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
+from mstar.testing_utils.worker import make_scheduler
 from mstar.utils.ipc_format import ScheduleTPNode
-from mstar.worker.micro_scheduler import MicroScheduler
 
 NODE, WALK, ROOT = "LLM", "prefill", b"a root"
 # a page is the KDA prefill's 64-token chunk, so snapshots sit on chunk ends
@@ -82,7 +83,8 @@ class _Node:
 
     def __init__(self, rank: int = 0, world_size: int = 1, prefix_slots: int = 3,
                  speculative_tokens: int = 0, page: int = PAGE):
-        group = SimpleNamespace(rank=rank, world_size=world_size) if world_size > 1 else None
+        tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
+        group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
         kv_spec = KVSpec("kv", {NODE}, PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1024, num_qo_heads=2,
             max_num_pages=40, page_size=page, prefix_cache_salt="a salt",
@@ -337,11 +339,9 @@ def _send(leader: _Node, rid: str) -> ScheduleTPNode:
 
 def _follow(follower: _Node, head: ScheduleTPNode, caught_up: bool = True) -> bool:
     engine = _engine(follower)
-    scheduler = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
-    )
-    scheduler.register_tp_follow(head)
-    return scheduler.settle_tp_follow_delta(caught_up)
+    lockstep = make_scheduler(SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set()).lockstep
+    lockstep.enqueue_follow(head)
+    return lockstep.settle_delta(caught_up)
 
 
 @pytest.fixture

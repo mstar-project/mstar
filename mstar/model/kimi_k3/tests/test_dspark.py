@@ -253,7 +253,7 @@ def _tp_rank(rank: int, store: str, out_dir: str) -> None:
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     group.device_group = group.cpu_group = dist.new_group([0, 1])
     group.initialized = True
-    group._all_reduce = AllReduce(group.device_group)
+    group._all_reduce = AllReduce()
     try:
         full, cfg = _tiny()
         draft = DSparkDraft(cfg, full.embed_tokens, full.lm_head, comm_group=group)

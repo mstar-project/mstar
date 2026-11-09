@@ -547,7 +547,8 @@ def _tp2_rank(rank: int, args, port: int) -> None:
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     groups = WorkerParallelGroups(num_workers=2, global_rank=rank, any_parallelism=True,
                                   world_parallel_groups=[(0, 1)], dist_timeout_s=1800)
-    groups.add("LLM", group)
+    groups.add("LLM", group, "tp")
+    groups.node_to_instance_comm["LLM"] = group
     if args.engine_device.startswith("cuda"):
         device = f"cuda:{rank}"
         groups.init_dist(init_method=f"tcp://127.0.0.1:{port}", device=torch.device("cuda", rank))
@@ -558,7 +559,7 @@ def _tp2_rank(rank: int, args, port: int) -> None:
                                              world_size=2, timeout=datetime.timedelta(seconds=1800))
         group.device_group = group.cpu_group = torch.distributed.new_group([0, 1])
         group.initialized = True
-        group._all_reduce = AllReduce(group.device_group)
+        group._all_reduce = AllReduce()
     if device == "cpu":
         try:
             cases = run_cases(args, device, group=group, groups=groups)

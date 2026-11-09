@@ -113,10 +113,11 @@ def _rank(rank: int, path: str, store: str, out_dir: str) -> None:
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     group.device_group = group.cpu_group = dist.new_group([0, 1])
     group.initialized = True
-    group._all_reduce = AllReduce(group.device_group)
+    group._all_reduce = AllReduce()
     try:
         groups = WorkerParallelGroups(num_workers=2, global_rank=rank, any_parallelism=True)
-        groups.add("LLM", group)
+        groups.add("LLM", group, "tp")
+        groups.node_to_instance_comm["LLM"] = group
         engine, sub, _ = _engine(path, rank, group, groups)
         block = sub.language_model.model.layers[1].block_sparse_moe
         assert block.experts.down_proj_packed.shape[-1] * 2 == 32  # this rank's half of 64
