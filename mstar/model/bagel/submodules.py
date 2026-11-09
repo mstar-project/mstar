@@ -62,9 +62,8 @@ from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
-# Private key the LLM's inner forwards hand their logits back under; `forward`
-# and `forward_batched` sample it and never emit it. Only they know whether a
-# sampled token is one flat entry or one per request.
+# Private key the LLM's inner forwards hand their logits back under;
+# `forward_batched` samples it and never emits it.
 _LOGITS = "_logits"
 
 
@@ -913,10 +912,6 @@ class LLMSubmodule(ARNodeSubmodule):
         # held past the next step aliases that step's token.
         return sample(self.sampler, logits).clone()
 
-    def _sample_one(self, logits: torch.Tensor) -> NameToTensorList:
-        """The single-request forward's output shape: one flat name -> tensors."""
-        return {"new_token": [self._sample_tokens(logits)]}
-
     def _sample_per_request(self, logits: torch.Tensor) -> BatchedModelOutput:
         """The batched forward's output: row i of ``new_token`` is request i."""
         return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(logits)})
@@ -1345,28 +1340,14 @@ class LLMSubmodule(ARNodeSubmodule):
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
-        # The walks that never sample return straight out.
+        # `can_batch` sends the text, ViT and decode walks to `forward_batched`
         if graph_walk == "prefill_vae":
             return self._forward_prefill_vae(**kwargs)
         elif graph_walk in SINGLE_NODE_DENOISE_WALKS:
             return self._forward_image_gen(branches=DENOISE_WALKS[graph_walk].branches, **kwargs)
         elif graph_walk in CFG_WALKS:
             return self._forward_image_gen_single_branch(**kwargs)
-
-        if graph_walk == "prefill_text":
-            out = self._forward_prefill_text(**kwargs)
-        elif graph_walk == "prefill_vit":
-            out = self._forward_prefill_vit(**kwargs)
-        elif graph_walk == "decode":
-            out = self._forward_decode(**kwargs)
-        else:
-            raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
-
-        # A prefill hands back logits only when it is meant to sample this step
-        # (`sample_prefill_token`); decode always does.
-        if _LOGITS in out:
-            return self._sample_one(out.pop(_LOGITS)[0])
-        return out
+        raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
 
     def _forward_prefill_text(
         self, input_ids: torch.Tensor,
@@ -1391,9 +1372,6 @@ class LLMSubmodule(ARNodeSubmodule):
         )
         if sample_token:
             logits = self.lm_head(at_last_token(self.kv, hidden, label="main"))
-            # `_LOGITS` is the private handoff to whichever dispatcher called:
-            # the shape of a sampled token is `forward` vs `forward_batched`'s
-            # to decide, and this one runs under both.
             return {_LOGITS: [logits]}
         return {}
 
@@ -1447,35 +1425,6 @@ class LLMSubmodule(ARNodeSubmodule):
         # NOTE: we will never sample a token from prefill_vae because it is alwaus
         # followed by prefill_vit
         return {}
-
-    def _forward_decode(
-        self, input_ids: torch.Tensor,
-        **kwargs
-    ) -> NameToTensorList:
-        """embed_tokens -> LLM forward -> lm_head -> logits.
-
-        Returns logits; token sampling is done by the engine post-forward
-        (outside CUDA graph capture).
-
-        When requires_cfg is True, cfg_img's row runs in the same forward,
-        after main's, to keep its KV cache in sync (cfg_img tracks all text,
-        no images).
-        """
-        requires_cfg = kwargs.pop("requires_cfg", False)
-        kwargs.pop("cache_labels", None)
-        kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
-        kwargs.pop("temperature", None)
-        kwargs.pop("top_k", None)
-        kwargs.pop("top_p", None)
-        emb = self.embed_tokens(input_ids)
-
-        hidden = self.language_model(
-            torch.cat([emb, emb]) if requires_cfg else emb, mode="und", **kwargs
-        )
-
-        logits = self.lm_head(hidden[:1])
-        return {_LOGITS: [logits]}
 
     def _forward_image_gen(
         self,
