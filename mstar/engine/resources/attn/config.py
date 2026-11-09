@@ -265,3 +265,31 @@ def refuse_context_only(step: AttentionStep, manager: str) -> None:
             f"{manager} does not read AttentionStep.context_only; only the "
             f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
         )
+
+
+@dataclass
+class BlockCausalAttentionSpec(AttentionSpec):
+    """Self-attention over a paged KV cache in which a row's new tokens attend its
+    cache block-causally: a token in block ``b`` (``block_size`` tokens a block, from
+    the row's first cached token) attends every key of blocks ``0..b``, so what the
+    cache holds never changes and a step runs only new tokens. A step's new tokens
+    start on a block. Declared with ``AttentionStep(causal=False)``.
+
+    Its own kind, not a flag on ``AttentionSpec``: one step plans several blocks per
+    row, on FlashInfer's prefill kernel only. ``RaggedBlockCausalAttentionSpec`` is the
+    same mask over one forward's tokens, with no cache.
+    """
+
+    block_size: int = 0
+
+    def __post_init__(self):
+        if self.block_size < 1:
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
+        if self.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
+            raise ValueError(f"block-causal attention runs on flashinfer, not {self.config.backend!r}")
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.block_causal import BlockCausalAttentionManager
+
+        return BlockCausalAttentionManager
