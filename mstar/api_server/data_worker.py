@@ -710,6 +710,8 @@ class PreprocessWorkerThread:
     # None (a thread built without __init__) leaves a refused request's uploads to the
     # HTTP layer's deferred cleanup
     upload_dir: str | os.PathLike | None = None
+    # the model's client streams by edge name; none for a thread built without __init__
+    _client_edges: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -958,10 +960,14 @@ class PreprocessWorkerThread:
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV. Likewise
-        # only process_prompt sets the model's INTERNAL_KWARGS.
+        # only process_prompt sets the model's INTERNAL_KWARGS, and only this
+        # worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
+        for name in (
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", "open_streams", *internal,
+        ):
             model_kwargs.pop(name, None)
+        open_streams = self._client_edges - input.ends
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -970,6 +976,7 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
+                open_streams=open_streams,
                 **model_kwargs,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
@@ -1088,7 +1095,7 @@ class PreprocessWorkerThread:
             if call is None or self._torn_down(request_id):
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
-            if chunk.file_paths or chunk.text:
+            if chunk.file_paths or chunk.text or chunk.model_kwargs:
                 loaded = self._client_chunk(chunk)
                 items = (self._client_audio_items(loaded) if self._audio_only
                          else self.model.process_stream_chunk(loaded))
@@ -1098,8 +1105,9 @@ class PreprocessWorkerThread:
                         f"process_stream_chunk returned {sorted(unknown)}, which are "
                         f"not client streams ({sorted(self._client_edges)})"
                     )
-                if chunk.text and not any(items.values()):
-                    raise ValueError("this model takes no text in an append")
+                # model_kwargs alone must make an item; beside files, audio or end_input the model may ignore them
+                if (chunk.text or not (chunk.file_paths or chunk.samples or chunk.ends)) and not any(items.values()):
+                    raise ValueError("this model takes no text or model_kwargs in an append")
             for name, audio in (chunk.samples or {}).items():
                 items.setdefault(name, []).append(torch.from_numpy(audio))
             items = self._without_ended_streams(call, chunk, items)

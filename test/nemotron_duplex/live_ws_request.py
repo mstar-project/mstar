@@ -90,7 +90,7 @@ def run_session(url: str, clip: np.ndarray, args, session: Session, start_at: fl
 
     chunk = int(SR * args.chunk_ms / 1000)
     open_msg = {"request_id": session.request_id, "output_modalities": ["text", "audio"],
-                "model_kwargs": {"temperature": args.temperature}}
+                "end_input": False, "model_kwargs": {"temperature": args.temperature}}
     if args.prompt:
         open_msg["text"] = args.prompt
     with websockets.sync.client.connect(url, max_size=None) as ws:

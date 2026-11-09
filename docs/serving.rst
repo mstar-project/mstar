@@ -220,10 +220,10 @@ Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
 
-The Dynamo worker (``python -m mstar.integrations.dynamo``) does not serve a model that
-takes live client input (``nemotron_duplex``): no Dynamo surface carries a live call's
-appends, so it exits at startup saying so, before any GPU process starts. Serve such a
-model with ``mstar serve`` and call it over ``/v1/realtime`` or ``/generate/ws``.
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
@@ -423,8 +423,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker

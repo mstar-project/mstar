@@ -149,32 +149,35 @@ is a complete openpi-style client that builds the observation image and prompt t
 NVIDIA's RoboLab server does for the DROID policies, runs this loop at a fixed observation
 rate and reports chunks/s, actions/s and latency percentiles.
 
-**Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
-request's input open after the opening message, so the opening message may carry no media
-at all. An append feeds the running request more input, in order, while its output keeps
-streaming back:
+**Live input.** A model that listens while it runs (a full-duplex speech model, or a TTS
+model fed text as it is written) can keep a request's input open after the opening
+message: an opening with ``"end_input": false`` opens a live call, and may then carry no
+media at all. An append feeds the running request more input, in order, while its output
+keeps streaming back:
 
 .. code-block:: text
 
    {"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
                                   "model_kwargs": {...}}}
 
-Every field of the record is optional, but an append needs text, files or ``end_input``.
+Every field of the record is optional, but an append needs text, files, ``model_kwargs`` or
+``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
 name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
 reach only the model's ``process_stream_chunk`` (a model whose streams all declare their
 audio has none and ignores them), so they mean what that model reads from them, and the opening message's still hold for the request (its sampling settings, say).
 ``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
-in an append is its own. An append of text alone that the model turns into no stream item
-is rejected; text sent with files reaches the model, and if it ignores the text, the text
-is dropped without an error. ``{"request_id", "end_input": true}``
-ends the input, alone or on an append (or on the opening message, for a one-shot
-request). The request then finishes as usual. Such a model treats every request over the
-socket as live, so a one-shot request to it carries ``end_input: true`` on its opening
-message: without it, the request waits for appends until it times out (or, with no
-``request_id``, is refused). A model may take several client streams
+in an append is its own. An append of text alone, or of ``model_kwargs`` alone (a game
+controller's actions, say) that ends no stream, that the model turns into no stream item is
+rejected; text sent with files reaches the model, and if it ignores the text, the text is
+dropped without an error. An append's ``model_kwargs`` count toward the call's
+``max_call_input_mb``, as JSON. ``{"request_id", "end_input": true}``
+ends the input, alone or on an append. The request then finishes as usual. An opening
+without ``end_input`` is one-shot, as a request over ``/generate`` is: its input ends with
+the opening message. A model may take several client streams
 (audio and video, say); ``end_input`` may then name the ones it ends, as a list
-(``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
+(``"end_input": ["video_in"]``, on the opening too, which keeps the others open), and
+the call's input has ended once every stream has.
 An append that names a stream already ended, as a file's ``stream`` or in
 ``end_input``, is answered as late, as one after ``end_input: true`` is (below). So is
 one whose files name no stream and that the model routes to a stream already ended:
@@ -211,7 +214,8 @@ appends about 100 ms later (H200), while 80 ms appends, whole frames, cost nothi
 
 .. code-block:: python
 
-   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"]}))
+   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"],
+                          "end_input": False}))
    for chunk in microphone_chunks():  # e.g. 80 ms WAV files
        ws.send(msgpack.packb({"request_id": "call",
                               "append": [{"name": "chunk.wav", "data": chunk}]}))
@@ -253,7 +257,7 @@ server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
 handshake and has no ``/healthz``. Only the Python frontend serves this route;
-``--rust-frontend`` logs a warning and serves without it.
+``--rust-frontend`` and the Dynamo worker log a warning and serve without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
@@ -382,7 +386,14 @@ Endpoints and model coverage:
        naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
      - ``bagel``, ``qwen3_omni``
-     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
+     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
+       ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
+       the ``audio`` extra; streamed audio is ``pcm16``. ``n`` or
+       ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
+       ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
+       other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
+       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
+       sends no usage chunk.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise
@@ -421,7 +432,11 @@ Endpoints and model coverage:
      - Text-to-image.
    * - ``POST /v1/images/edits``
      - ``bagel``
-     - Image editing (image + prompt → image).
+     - Image editing (image + prompt → image). One ``image`` (or ``image[]``), edited
+       whole: a ``mask``, a second image and ``n`` > 1 are refused.
+
+Image and video results come back inline as ``b64_json``; ``response_format: "url"`` is
+refused (there is no media store to serve one from).
 
 Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
 return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,
@@ -464,31 +479,34 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
-- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
-  ``prompt`` conditions the decoder on prior text (it reaches the model as
-  ``initial_prompt``), and ``response_format``
-  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
-  model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server;
-  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
-  one segment per window, timed to the windows. A
-  streaming client receives only the spoken words. Uploads longer than the
-  model's clip (30 s for Whisper) are cut into fixed windows, each at the quietest
-  moment before its boundary, and submitted at once. ``long_form="sequential"`` in
-  ``extra_body`` runs them in order instead, openai-whisper style: each window gets
-  the transcript so far as ``initial_prompt`` and the first window's detected
-  language, is decoded with timestamps so the next window can start where its last
-  closed segment ended (no word is split by a boundary), and is decoded again when
-  its text is a repetition loop (gzip compression ratio above 2.4): first without
-  the conditioning text, then at rising temperatures, after which the transcript so
-  far stops conditioning later windows. Leave ``temperature`` at 0 to get that
-  fallback; a pinned temperature is used as is. It is several times slower, and only
-  it has that repetition guard. Segment timestamps
-  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
-  (5 to 30) sets the window length for one request, and an upload longer than it
-  is windowed. An upload, like any audio a request attaches, is refused once it
-  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
-  worker). The decode up to that point still runs, so this bounds memory, not
+- **Whisper / Higgs-Audio** — for Whisper, ``language`` (ISO-639-1) skips language
+  detection and ``prompt`` conditions the decoder on prior text (it reaches the model
+  as ``initial_prompt``); for Higgs-Audio, ``prompt`` is the transcription instruction
+  (the model has a default) and ``language`` does not reach the decoder: nothing
+  detects the language, and ``verbose_json``'s ``language`` is the request's
+  ``language`` as given, or null. ``response_format`` ``verbose_json`` / ``srt`` /
+  ``vtt`` (or ``timestamp_granularities[]``) asks the model for timestamps. Whisper's
+  language and timestamp tokens travel in the text stream and are lifted into
+  ``language`` / ``segments`` by the server; Higgs-Audio emits no timestamps, so its
+  ``verbose_json`` / ``srt`` / ``vtt`` get one segment per window, timed to the
+  windows. A streaming client receives only the spoken words. Uploads longer than 30 s
+  are cut into fixed windows, each at the quietest moment before its boundary, and
+  submitted at once. ``long_form="sequential"`` in ``extra_body`` runs them in order
+  instead; Whisper's then run openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded with
+  timestamps so the next window can start where its last closed segment ended (no word
+  is split by a boundary), and is decoded again when its text is a repetition loop
+  (gzip compression ratio above 2.4): first without the conditioning text, then at
+  rising temperatures, after which the transcript so far stops conditioning later
+  windows. Higgs-Audio's windows run at fixed cuts with no conditioning text, but get
+  the same retry at rising temperatures. Leave ``temperature`` at 0 to get that
+  fallback; a pinned temperature is used as is. Sequential mode is several times
+  slower, and only it has that repetition guard.
+  Segment timestamps are offset to the whole file. ``window_seconds`` in
+  ``extra_body`` (5 to 30) sets the window length for one request, and an upload
+  longer than it is windowed. An upload, like any audio a request attaches, is refused
+  once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
+  data worker). The decode up to that point still runs, so this bounds memory, not
   time: refusing a 31 min file takes about as long as decoding it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
