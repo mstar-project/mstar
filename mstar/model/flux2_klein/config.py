@@ -131,7 +131,7 @@ class Flux2KleinConfig:
     # serving it silently unguided. Flip this back to a real knob when CFG lands.
     is_distilled: bool = True
     default_guidance_scale: float = 1.0
-    # Ceiling on the denoise Loop; a request's step count is clamped to it.
+    # The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.
     max_denoise_steps: int = 50
     # Reference (edit) images: the pipeline's T-coordinate spacing and the
     # area cap it resizes to before encoding.

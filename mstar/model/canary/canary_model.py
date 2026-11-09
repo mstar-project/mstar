@@ -19,6 +19,7 @@ Graph walks:
 
 import json
 import logging
+from collections.abc import Mapping
 
 import torch
 
@@ -36,7 +37,6 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -60,6 +60,14 @@ from mstar.model.canary.config import (
     CanaryModelConfig,
 )
 from mstar.model.components.audio_features import HOP_LENGTH, clip_samples
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import SentencePieceDetokenizer, TextOutput, check_kv_pools_fit, check_loaded, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -75,6 +83,9 @@ class CanaryModel(Model):
     autoregressive Transformer decoder."""
 
     DECODE_LOOP = "decode_loop"
+    # greedy, as NeMo and HF decode Canary, under the checkpoint's
+    # generation_config.json; set by __init__
+    sampling_defaults: Mapping[str, object] = GREEDY_SAMPLING
 
     # the route's 40 s window, plus slack for containers that decode longer than
     # their header said; still the largest encoder graph and 4 context pages
@@ -89,6 +100,7 @@ class CanaryModel(Model):
         self.model_path_hf = model_path_hf
         self.local_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=CHECKPOINT_FILES)
         self.config = CanaryModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         tokenizer = json.loads((self.local_dir / "tokenizer.json").read_text())
         self._detokenizer = SentencePieceDetokenizer(tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -145,7 +157,7 @@ class CanaryModel(Model):
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"decoder"},
                 vocab_size=cfg.vocab_size,
-                enable_repetion_penalty=False,
+                **sampler_capabilities(self.sampling_defaults),
             ),
         ]
 
@@ -156,25 +168,20 @@ class CanaryModel(Model):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
-        model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # greedy by default, as NeMo and HF decode Canary
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
-        }
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"language", "target_language", "punctuation", "max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # graph walks
     # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # the decoder's position table bounds prompt + transcript
+        # The decoder's position table bounds prompt + transcript. A larger
+        # request is refused by the conductor against the decode loop, not clamped.
         limit = self.config.max_position_embeddings - PROMPT_LENGTH
-        requested = model_kwargs.get("max_output_tokens")
-        return limit if requested is None else min(requested, limit)
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", limit)
 
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens()
@@ -204,7 +211,8 @@ class CanaryModel(Model):
                     GraphEdge(next_node="decoder", name="text_inputs"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # the default request's iterations: past them a request overruns the position table
+            max_iters=self.get_loop_caps()["decode_loop"],
             outputs=[],
         )
         return dict(prefill=prefill, decode=decode)
@@ -240,11 +248,15 @@ class CanaryModel(Model):
         default English), ``target_language`` (translation; default the
         speech's language) and ``punctuation`` (default on)."""
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "Canary")
-        source = kwargs.get("language") or "en"
-        target = kwargs.get("target_language") or source
-        punctuation = kwargs.get("punctuation", True)
+        kw = checked_request_kwargs(kwargs)
+        target = kw.get("target_language")
+        if target is not None and not isinstance(target, str):
+            raise ValueError(f"target_language must be a string; got {target!r}")
+        punctuation = kw.get("punctuation", True)
         if not isinstance(punctuation, bool):
             raise ValueError(f"punctuation must be true or false; got {punctuation!r}")
+        source = kw.get("language") or "en"
+        target = target or source
         prompt_ids = self.config.prompt_ids(source, target, punctuation)
         # the encoder's frames for this clip, as the encoder node counts them
         context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
