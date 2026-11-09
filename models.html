@@ -1838,6 +1838,10 @@ the <code class="docutils literal notranslate"><span class="pre">hift_state</spa
 <span class="pre">{max_slots:</span> <span class="pre">N}</span></code>, one more than the requests). A chunk past the largest bucket
 runs as several steps. <code class="docutils literal notranslate"><span class="pre">hift_capture_frame_buckets:</span> <span class="pre">[]</span></code> runs the vocoder
 eagerly.</p></li>
+<li><p>The LM’s prefill is captured with its decode, per prompt token bucket and
+batch size (<code class="docutils literal notranslate"><span class="pre">lm_prefill_token_buckets</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_prefill_batch_sizes</span></code>; the LM’s
+graphs take about 130 MB together). A prompt past the largest bucket runs
+eagerly, and <code class="docutils literal notranslate"><span class="pre">lm_prefill_token_buckets:</span> <span class="pre">[]</span></code> captures no prefill.</p></li>
 </ul>
 </section>
 <section id="qwen3-tts-notes">
