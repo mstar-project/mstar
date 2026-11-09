@@ -125,7 +125,12 @@ impl OpenAIAdapter for LTX25 {
             return Err("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.".to_string());
         }
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-        let with_audio = mk.remove("audio").is_none_or(|v| truthy(&v));
+        // a bool, not truthiness: "false" would be sound
+        let with_audio = match mk.remove("audio") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => b,
+            Some(other) => return Err(format!("audio must be true or false, got {}", py_value_repr(&other))),
+        };
         super::images::size_kwargs(&mut mk, nonempty(&req.size), "960x544")?;
         video_fields(&mut mk, req);
         let output = if with_audio { vec!["video", "audio"] } else { vec!["video"] };

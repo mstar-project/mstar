@@ -1,8 +1,10 @@
 """LoRA on both frontends: ``/v1/models`` lists the served adapters, and a
 request's ``model`` field (or its ``lora_adapter`` kwarg) selects the adapter it
 runs under, or is refused with the same text. mstar-server resolves it itself
-(``served_models.rs``); the Python routes resolve it in ``submit_request``
-(``ServedModels.select``), which these tests apply to what the route submitted."""
+(``served_models.rs``) and submits the adapter as a ``lora_adapter`` kwarg; the
+Python routes resolve ``model`` in ``submit_request`` (``ServedModels.select``),
+which also checks that kwarg and adds the adapter's digest. These tests apply it
+to what each frontend submitted and compare what the engine would run."""
 import json
 import urllib.error
 import urllib.request
@@ -24,7 +26,9 @@ from mstar.api_server.served_models import ServedModels
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
 MODEL = "qwen3_5_0.8b"
-SERVED = ServedModels(base=[MODEL, "Qwen/Qwen3.5-0.8B"], adapters=["sql", "chat"], lora=True)
+# each adapter's weights digest, which submit_request adds to the kwargs
+DIGESTS = {"sql": b"\x01" * 32, "chat": b"\x02" * 32}
+SERVED = ServedModels(base=[MODEL, "Qwen/Qwen3.5-0.8B"], digests=DIGESTS, lora=True)
 
 
 class _Rust(_StubAPIServer):
@@ -78,9 +82,17 @@ def _python(model, served, tmp_path, monkeypatch):
     return api, TestClient(entrypoint.app)
 
 
-def _resolved(submit: dict, served: ServedModels) -> dict:
-    """The kwargs a Python submit runs under once ``submit_request`` resolves its ``model``."""
-    return served.select(submit.get("model"), submit.get("model_kwargs")) or {}
+def _resolved(submit: dict, served: ServedModels) -> tuple[dict, bytes]:
+    """The kwargs and prefix root a Python submit runs under once ``submit_request``
+    resolves its ``model``."""
+    kwargs, root = served.select(submit.get("model"), submit.get("model_kwargs"))
+    return kwargs or {}, root
+
+
+def _rust_resolved(rust_kwargs: dict | None, served: ServedModels) -> tuple[dict, bytes]:
+    """The same for mstar-server's submit, which the bridge makes without a ``model``."""
+    kwargs, root = served.select(None, rust_kwargs)
+    return kwargs or {}, root
 
 
 def test_v1_models_lists_the_adapters_beside_the_base_model(tmp_path, monkeypatch):
@@ -127,7 +139,7 @@ def test_a_chat_runs_under_the_adapter_its_model_names(case, stream, tmp_path, m
         assert stub.submitted == api.submitted == []
         return
     (sub,) = stub.submitted
-    assert (sub["mk"] or {}) == _resolved(api.submitted[0], SERVED)
+    assert _rust_resolved(sub["mk"], SERVED) == _resolved(api.submitted[0], SERVED)
     if stream:
         models = {json.loads(line[6:])["model"] for line in data.decode().splitlines()
                   if line.startswith("data: {")}
@@ -145,7 +157,7 @@ def test_a_chat_runs_under_the_adapter_its_model_names(case, stream, tmp_path, m
 @pytest.mark.parametrize("case", ["adapter", "unknown", "kwarg", "kwarg-disagrees", "no-model"])
 def test_speech_images_and_videos_run_under_the_adapter_too(route, body, cls, case, tmp_path, monkeypatch):
     model = _model_of(cls)
-    served = ServedModels(base=[model], adapters=["sql", "chat"], lora=True)
+    served = ServedModels(base=[model], digests=DIGESTS, lora=True)
     body = {**body, **CHATS[case]}
     api, client = _python(model, served, tmp_path, monkeypatch)
     try:
@@ -168,7 +180,7 @@ def test_speech_images_and_videos_run_under_the_adapter_too(route, body, cls, ca
         assert stub.submitted == []
         return
     assert status == py_status == 200, data
-    assert (stub.submitted[0]["mk"] or {}) == _resolved(api.submitted[0], served)
+    assert _rust_resolved(stub.submitted[0]["mk"], served) == _resolved(api.submitted[0], served)
 
 
 # A 1x1 PNG, the edit's input image.
@@ -193,7 +205,7 @@ def _edit_form(fields: dict) -> tuple[bytes, str]:
 def test_an_image_edit_runs_under_the_adapter_its_form_names(case, tmp_path, monkeypatch):
     """``/v1/images/edits`` reads ``model`` from a form field, not JSON."""
     model = _model_of("DiffusionImageAdapter")
-    served = ServedModels(base=[model], adapters=["sql", "chat"], lora=True)
+    served = ServedModels(base=[model], digests=DIGESTS, lora=True)
     body, ctype = _edit_form({"prompt": "make it blue", **CHATS[case]})
     api, client = _python(model, served, tmp_path, monkeypatch)
     py = client.post("/v1/images/edits", content=body, headers={"Content-Type": ctype})
@@ -219,4 +231,4 @@ def test_an_image_edit_runs_under_the_adapter_its_form_names(case, tmp_path, mon
         assert stub.submitted == []
         return
     assert status == py.status_code == 200, data
-    assert (stub.submitted[0]["mk"] or {}) == _resolved(api.submitted[0], served)
+    assert _rust_resolved(stub.submitted[0]["mk"], served) == _resolved(api.submitted[0], served)

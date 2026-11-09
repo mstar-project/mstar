@@ -21,6 +21,7 @@ from test_rust_openai_adapters import _model_of
 
 from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import APIServer
+from mstar.api_server.openai._util import check_inline_result
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.served_models import ServedModels
 
@@ -129,6 +130,7 @@ VIDEO_CASES = {
     "fps-24": {"prompt": "a cat", "fps": 24},
     "fps-30": {"prompt": "a cat", "fps": 30},
     "two": {"prompt": "a cat", "n": 2},
+    "url-format": {"prompt": "a cat", "response_format": "url"},
 }
 
 
@@ -140,7 +142,9 @@ def test_a_video_request_is_submitted_or_refused_as_the_python_adapter_does(cls,
     model = _model_of(cls)
     body = {"model": model, **VIDEO_CASES[case]}
     try:
-        want = ADAPTER_REGISTRY[model].video_to_request(VideoGenerationRequest(**body), tmp_path)
+        req = VideoGenerationRequest(**body)
+        check_inline_result(req.response_format, req.n)  # create_videos', before the adapter
+        want = ADAPTER_REGISTRY[model].video_to_request(req, tmp_path)
         refusal = None
     except ValueError as e:
         want, refusal = None, str(e)
