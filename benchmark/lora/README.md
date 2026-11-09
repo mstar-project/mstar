@@ -308,8 +308,9 @@ Matched settings: bf16, max rank the loaded adapters' largest `r` (16 for the de
 `--max-loras S`, SGLang `--max-loras-per-batch S+1`, since SGLang counts base-model rows as
 one of a batch's adapters), every adapter in host memory (vLLM `--max-cpu-loras`), prefix
 caching off (mstar `prefix_cache: false`; vLLM `--no-enable-prefix-caching`, SGLang
-`--disable-radix-cache`), context length and running requests from mstar's config
-(32768, 128), fp32 GDN state, CUDA graphs on (mstar with
+`--disable-radix-cache`), running requests from mstar's config (128; context length is
+not matched but no request nears it: vLLM and SGLang serve `--context-length`, 32768 by
+default, and mstar keeps the model's 262144), fp32 GDN state, CUDA graphs on (mstar with
 `MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`, and a server whose log has a `Failed to capture`
 line does not count),
 thinking off, greedy. SGLang's `--lora-target-modules` is the adapters' own union, which

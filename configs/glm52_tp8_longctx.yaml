@@ -23,7 +23,8 @@ max_concurrent_requests: 24
 model_kwargs:
   dsa_long_context: true
   # Becomes config.max_seq_len: the guard bound and the KV sizing input.
-  # Must stay <= max_num_pages * page_size per rank.
+  # Must stay <= max_num_pages * page_size per rank. The top-level
+  # max_seq_len caps the pool too, so raise both together.
   max_seq_len: 8192
 resources:
   kv:

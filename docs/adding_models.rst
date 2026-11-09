@@ -2425,6 +2425,7 @@ cache and its encoder context, can therefore tune each one separately:
      kv_cache:
        cpu_offload_pages: 128
      cross_kv_cache:
+       max_seq_len: 1500  # the encoder's fixed context, past the top-level limit
        cpu_offload_pages: 128
 
 Each spec declares which keys it accepts. An unknown key raises an error at load time, so

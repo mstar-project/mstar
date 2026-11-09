@@ -140,7 +140,7 @@ def main():
     ap.add_argument("--config", required=True, help="serving config, e.g. configs/muse_glimmer.yaml")
     ap.add_argument("--out", help="JSON results, rewritten after each cell (required unless --one)")
     ap.add_argument("--lengths", default="8192,32768,131072",
-                    help=f"request lengths; those past the config's max_seq_len, or not past {DECODE} "
+                    help=f"request lengths; those past the pool's max_seq_len, or not past {DECODE} "
                          "decode tokens, are skipped")
     ap.add_argument("--model-path", help="read the checkpoint's configs from this repo or directory")
     ap.add_argument("--one", help="length,arm: run one cell in this process and print its JSON")

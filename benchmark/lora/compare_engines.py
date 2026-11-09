@@ -50,9 +50,11 @@ base model as one of its adapters per batch, but ``S`` on the churn server, whos
 scenario has no base rows and so would leave SGLang's base buffer to an adapter), the max
 rank of the loaded adapters (their ``r``), every adapter held in host memory, prefix
 caching off (mstar ``prefix_cache: false`` on its KV cache, vLLM
-``--no-enable-prefix-caching``, SGLang ``--disable-radix-cache``), context length and max
-running requests from the mstar config, fp32 GDN state, thinking off in the chat template,
-greedy, CUDA graphs on (an mstar server that drops a capture bucket does not count).
+``--no-enable-prefix-caching``, SGLang ``--disable-radix-cache``), max running requests from
+the mstar config, fp32 GDN state, thinking off in the chat template, greedy, CUDA graphs on
+(an mstar server that drops a capture bucket does not count). Context length is not matched
+but no request nears it: vLLM and SGLang serve ``--context-length`` (32768 by default) and
+mstar keeps the model's own, 262144.
 
 An engine that fails to start, or rejects LoRA or an adapter, is recorded as not
 supported with an excerpt of its error, and the run goes on without it.

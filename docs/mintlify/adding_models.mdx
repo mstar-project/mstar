@@ -1060,6 +1060,7 @@ resources:
   kv_cache:
     cpu_offload_pages: 128
   cross_kv_cache:
+    max_seq_len: 1500  # the encoder's fixed context, past the top-level limit
     cpu_offload_pages: 128
 ```
 
