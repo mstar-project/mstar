@@ -577,6 +577,70 @@ def test_the_captured_kernels_match_the_torch_ops():
     assert run(torch.device("cuda")) == run(CPU)
 
 
+
+def test_the_host_lengths_of_a_graph_indexed_step_match_the_host_plan():
+    """What the KV plan hands an attention that reads its pages off the tables:
+    the same indptr, lengths and last page lengths as the full host plan of the
+    step, padding rows included."""
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    rids = [1, 2, 3]
+    for t in range(12):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, run=False)
+        _promote(live, planner, a)
+        got = live["kv"]._resident.decode_indptrs(a.ctx.resident_plan, 4)
+        b = _captured_step(ref, None, rids, slot=t % 2, bs=4, run=False)
+        want = b.ctx.plan_results["kv"]["main"].cpu_indptrs
+        for field in ("qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "kv_lens"):
+            assert getattr(got, field).tolist() == getattr(want, field).tolist(), (t, field)
+        _replay(live, planner, a, promote=False)
+        _replay(ref, None, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("appends", [True, False])
+def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(appends):
+    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
+    from mstar.engine.resources.kv.resident import KVResidentTables
+
+    cuda = torch.device("cuda")
+    stride, block_col, page = 40, 2, 4
+    store = torch.zeros(6 * stride, dtype=torch.long, device=cuda)
+    lens = {1: 9, 3: 0, 4: 4, 5: 130}
+    for slot, n in lens.items():
+        store[slot * stride + 1] = n
+        cols = n // page + 1
+        store[slot * stride + block_col: slot * stride + block_col + cols] = torch.arange(
+            100 * slot, 100 * slot + cols,
+        )
+    order = [5, 1, 3, 4]
+    bs = 6  # two padding rows, at the trash row
+    slots = torch.tensor(order + [TRASH_SLOT] * (bs - len(order)), device=cuda)
+    kv_len = store[slots * stride + 1].clone()
+    capacity = 64
+    attn = SimpleNamespace(
+        _paged_kv_indptr_buf=torch.full((bs + 1,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_indices_buf=torch.full((capacity,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_last_page_len_buf=torch.full((bs,), -1, dtype=torch.int32, device=cuda),
+    )
+    FlashInferDecodeWrapper.gather_resident(
+        SimpleNamespace(attn_wrapper=attn, page_size=page), store, slots, kv_len, stride, block_col, appends=appends,
+    )
+
+    host_len = torch.zeros(6, dtype=torch.long).numpy()
+    for slot, n in lens.items():
+        host_len[slot] = n
+    tables = SimpleNamespace(host_len=host_len, page_size=page, key="kv", _qo_indptr={})
+    streams = {"kv": SimpleNamespace(reads=not appends)}
+    plan = SimpleNamespace(slots=torch.tensor(order).numpy(), writes=SimpleNamespace(streams=streams))
+    want = KVResidentTables.decode_indptrs(tables, plan, bs)
+    assert attn._paged_kv_indptr_buf.tolist() == want.paged_kv_indptr.tolist()
+    assert attn._paged_kv_last_page_len_buf.tolist() == want.paged_kv_last_page_len.tolist()
+    read = {s: max(lens[s] + appends, 1) for s in order}
+    pages = [list(range(100 * s, 100 * s + (read[s] - 1) // page + 1)) for s in order]
+    pages += [[SINK_PAGE]] * (bs - len(order))
+    end = int(want.paged_kv_indptr[-1])
+    assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
+
 # ---- slots ----
 
 def test_a_freed_slot_waits_for_the_last_step_that_read_it():
@@ -1517,6 +1581,9 @@ def test_capture_refuses_two_labels_on_one_resource():
 class _Fmha:
     """A captured fmha decode wrapper's gather, recorded."""
 
+    plans_in_graph = True
+    supports_gather_resident = False
+
     def __init__(self):
         self.calls = []
 
@@ -1628,9 +1695,14 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
     assert manager.resident_refusal() is None
     manager._query_kv_cache_name = "ctx"
     assert "second stream" in manager.resident_refusal()
-    step = SimpleNamespace(reads_tables=False, host_planned=False)
+    manager._query_kv_cache_name = "kv"
+    manager._cg_plan_states = {}
+    streams = {"kv": SimpleNamespace(label="main")}
+    step = SimpleNamespace(
+        reads_tables=False, host_planned=False, bucket="b", slot=0, streams=streams, lengths_only=set(),
+    )
     FlashInferCrossManager.resident_gather(manager, step)
-    assert step.host_planned and not step.reads_tables
+    assert step.host_planned and not step.reads_tables and not step.lengths_only
 
 
 # ---- refusals ----
@@ -1922,3 +1994,66 @@ def test_the_knob_defaults_to_auto(monkeypatch):
 def test_the_slot_count_is_no_knob():
     with pytest.raises(ValueError):
         knobs.check({"resident_slots": 8})
+
+
+def test_cross_attention_packs_a_resident_steps_queries_off_its_rows():
+    """A resident step's query pool may hand back lengths only, with no views."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name = "ctx", "kv"
+    cross._resident_qo_indptr = {}
+    plan = SimpleNamespace(writes=SimpleNamespace(streams={"kv": SimpleNamespace(label="main")}))
+    ctx = SimpleNamespace(resident=object(), resident_plan=plan, padded_request_ids=[3, 5, 9])
+    packings = cross._query_packings(SimpleNamespace(), ctx)
+    assert list(packings) == ["main"]
+    assert packings["main"].request_ids == [3, 5, 9]
+    assert packings["main"].qo_indptr.tolist() == [0, 1, 2, 3]
+
+
+def test_cross_attention_schedules_a_context_once_per_lengths():
+    """A context's schedule reads only its lengths, so a steady step plans nothing; a full
+    plan on the wrapper in between starts over."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name, cross._context_label = "ctx", "kv", "context"
+    cross._resident_qo_indptr, cross._scheduled_lens, cross._last_plans = {}, {}, {}
+    cross._current_plan_states, cross._preplan_states, cross._preplanned = {}, {}, False
+    cross.reset_default_cursors = lambda: None
+    planned = []
+    wrapper = SimpleNamespace(plan_schedule=lambda indptr, lens: planned.append(lens.tolist()))
+    cross._wrapper_for = lambda *args, **kwargs: ("key", wrapper)
+    lease = SimpleNamespace(bucket="bucket", slot=0)
+    resident = SimpleNamespace(lengths_only={("bucket", "ctx")})
+    streams = {"kv": SimpleNamespace(label="main")}
+
+    def plan(lens):
+        out = SimpleNamespace(cpu_indptrs=SimpleNamespace(
+            paged_kv_indptr=torch.arange(len(lens) + 1, dtype=torch.int32),
+            kv_lens=torch.tensor(lens, dtype=torch.int32),
+        ))
+        cross.plan(SimpleNamespace(segments=None, context_only=False), SimpleNamespace(
+            slot_lease=lease, is_preplan=False, plan_phase="res.plan", resident=resident,
+            resident_plan=SimpleNamespace(writes=SimpleNamespace(streams=streams)),
+            padded_request_ids=list(range(len(lens))), plan_results={"ctx": {"context": out}}, slot=0,
+            force_prefill=False,
+        ))
+
+    plan([1500, 1500, 1])
+    plan([1500, 1500, 1])
+    assert planned == [[1500, 1500, 1]]
+    plan([1500, 1, 1])
+    assert planned == [[1500, 1500, 1], [1500, 1, 1]]
+
+
+def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
+    """A cross attention whose query side keeps no KV cache has no stream on the
+    resident step to read: it stays host planned rather than looking one up."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    manager._query_kv_cache_name, manager._kv_cache_name, manager._cg_plan_states = None, "ctx", {}
+    step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
+    manager.resident_gather(step)
+    assert step.host_planned and not step.lengths_only
