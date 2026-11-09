@@ -480,6 +480,13 @@ class RustFrontendBridge:
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
 
+    def _refuse(self, rid: str, sub: int | None, text: str, status: int) -> None:
+        """``submit_request`` refused the submission: an in-band error chunk, the
+        only reply that carries a status, marked ``refused`` since the request
+        never had its id (``/generate/ws`` answers an unnamed one with null)."""
+        self._send({"t": "chunk", "rid": rid, "sub": sub, "modality": "error", "data": text.encode("utf-8"),
+                    "metadata": {"status": status, "refused": True}})
+
     def relay(self, tags: list[int], chunks: list) -> None:
         """``ChunkSink.relay``: one ``chunks`` message for a message pass."""
         self._send({
@@ -496,8 +503,8 @@ class RustFrontendBridge:
         if msg.get("tokens") is not None:
             # The Python preprocess worker owns tokenization; run the
             # frontend without MSTAR_TOKENIZER so it sends text.
-            self._err(rid, sub, "pre-tokenized ingest is not supported by this "
-                                "backend (unset MSTAR_TOKENIZER)")
+            self._refuse(rid, sub, "pre-tokenized ingest is not supported by this "
+                                   "backend (unset MSTAR_TOKENIZER)", 500)
             return
         try:
             parts = msg.get("prompt_parts")
@@ -521,29 +528,21 @@ class RustFrontendBridge:
                 text = scrub_paths(str(e))
             else:
                 text, _ = client_error_text(e, f"submit {rid} failed", log=logger, type_name=False)
-            self._send({
-                "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                "data": text.encode("utf-8"), "metadata": {"status": 400},
-            })
+            self._refuse(rid, sub, text, 400)
             return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             status = getattr(e, "status_code", None)
             if isinstance(status, int):
                 # An HTTPException (not imported: this bridge runs without
-                # fastapi), e.g. the 409 for a rid still in flight. An in-band
-                # error chunk is the only reply that carries a status; `t="err"`
-                # always surfaces as a 500.
+                # fastapi), e.g. the 409 for a rid still in flight.
                 detail = getattr(e, "detail", e)
                 logger.warning("submit %s refused (%d): %s", rid, status, detail)
-                self._send({
-                    "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                    "data": str(detail).encode(), "metadata": {"status": status},
-                })
+                self._refuse(rid, sub, str(detail), status)
                 return
             text, _ = client_error_text(
                 e, f"submit {rid} failed", log=logger, type_name=False,
             )
-            self._err(rid, sub, text)
+            self._refuse(rid, sub, text, 500)
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.

@@ -78,8 +78,9 @@ pub enum StreamItem {
     Chunk(ResultChunk),
     /// The backend failed this request (worker exception, bad input);
     /// terminal — the route is removed. `status` is the HTTP status the
-    /// frontend should return (from the error chunk's `metadata.status`).
-    Error { status: u16, message: String },
+    /// frontend should return (from the error chunk's `metadata.status`);
+    /// `refused`: `submit_request` refused it, so it never had a request id.
+    Error { status: u16, message: String, refused: bool },
     Done,
 }
 
@@ -363,6 +364,7 @@ impl Bridge {
             let _ = tx.send(StreamItem::Error {
                 status: 500,
                 message: "backend unreachable (bridge send failed)".to_string(),
+                refused: false,
             });
             self.routes.lock().expect("routes lock").remove(sub);
         }
@@ -416,7 +418,7 @@ impl Bridge {
     pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
         match self.round_trip("voices", Extras::default(), timeout).await {
             Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
-            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
         }
     }
@@ -503,7 +505,7 @@ impl Bridge {
         let start = std::time::Instant::now();
         match self.round_trip("check_ref_audio", Extras { check: Some(check), ..Extras::default() }, timeout).await {
             Some(StreamItem::Done) => Ok(()),
-            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             // the request's budget ran out, as the Python frontend's request would
             None if start.elapsed() >= timeout => Err((500, "Request timed out".to_string())),
             _ => Err((500, "the server could not check ref_audio".to_string())),
@@ -546,8 +548,9 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 .get("status")
                 .and_then(Value::as_u64)
                 .unwrap_or(500) as u16;
+            let refused = msg.metadata.get("refused").and_then(Value::as_bool).unwrap_or(false);
             let message = String::from_utf8_lossy(&msg.data.into_vec()).into_owned();
-            (Some(StreamItem::Error { status, message }), true)
+            (Some(StreamItem::Error { status, message, refused }), true)
         }
         "chunk" => (
             Some(StreamItem::Chunk(ResultChunk {
@@ -560,14 +563,14 @@ fn deliver(routes: &Routes, msg: Inbound) {
         // Legacy out-of-band error (the bridge relay caught an exception
         // and sent `t="err"`); no status carried, default to 500.
         "err" => (
-            Some(StreamItem::Error { status: 500, message: msg.msg }),
+            Some(StreamItem::Error { status: 500, message: msg.msg, refused: false }),
             true,
         ),
         "done" => (Some(StreamItem::Done), true),
         // Liveness reply: completes the ping's route like a request.
         "pong" => (Some(StreamItem::Done), true),
         "checked" => match msg.error {
-            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
+            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
         "metrics" | "voices" | "windows" | "live" | "end_of_turn" => (

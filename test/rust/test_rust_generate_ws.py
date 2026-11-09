@@ -25,6 +25,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 msgpack = pytest.importorskip("msgpack")
 
+import websockets.exceptions
 import websockets.sync.client
 from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
@@ -143,10 +144,10 @@ class _Server:
 
 
 @contextlib.contextmanager
-def _rust(server: _Server):
+def _rust(server: _Server, **extra_env):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_genws_")
-    env = dict(os.environ, MSTAR_CLIENT_STREAMS=json.dumps(sorted(server.client_streams)))
+    env = dict(os.environ, MSTAR_CLIENT_STREAMS=json.dumps(sorted(server.client_streams)), **extra_env)
     proc = subprocess.Popen([BINARY, "qwen3_5_0.8b", str(port), bridge_dir, str(server.upload_dir)], env=env)
     bridge = RustFrontendBridge(server, bridge_dir)
     threading.Thread(target=bridge.run, daemon=True).start()
@@ -271,6 +272,8 @@ def test_a_refused_message_reads_as_pythons(stacks, monkeypatch, binary):
         {"request_id": "x" * 200, "text": "x"},
         [1, 2],
         {"request_id": "e9", "text": "refuse me"},
+        # refused before it had an id: its error names none
+        {"text": "refuse me"},
         {"request_id": "e10", "text": "fail later"},
         {"request_id": "e11", "text": "x", "end_input": "yes"},
         {"request_id": "", "text": "empty id is no id"},
@@ -357,3 +360,18 @@ def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch,
     except urllib.error.HTTPError as e:
         rust = (e.code, json.loads(e.read()))
     assert rust == (py.status_code, py.json())
+
+
+
+# what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
+TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
+
+
+def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
+    with _rust(_Server(Path(tempfile.mkdtemp(prefix="mstar_genws_up_")), ()), MSTAR_WS_MAX_BYTES="1000") as port:
+        url = f"ws://127.0.0.1:{port}/generate/ws"
+        with websockets.sync.client.connect(url, compression=None, max_size=None) as ws:
+            ws.send("x" * 2000)
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                ws.recv(timeout=10)
+    assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG

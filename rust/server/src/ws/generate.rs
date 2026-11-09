@@ -267,6 +267,51 @@ fn ws_model_kwargs(value: Option<&Val>) -> Result<Option<Map<String, Value>>, St
 /// Saved upload paths, by modality.
 type PathsByModality = BTreeMap<String, Vec<String>>;
 
+/// A message's saved uploads until a submission or an append hands them on.
+/// Dropped before then (a refusal, or the socket closing while the message
+/// waits or decodes), they are removed, as Python's `finally` clauses and
+/// `_decode_ws_files_off_loop` remove them. While an append's round trip may
+/// have handed them over (`in_flight`), they go after the delay
+/// `schedule_upload_cleanup` gives the preprocess worker to read them.
+struct Uploads {
+    dir: PathBuf,
+    paths: PathsByModality,
+    in_flight: bool,
+}
+
+impl Uploads {
+    /// The API server has them: its preprocess worker deletes them once loaded.
+    fn hand_over(&mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        if self.paths.is_empty() {
+            return;
+        }
+        if let (true, Ok(runtime)) = (self.in_flight, tokio::runtime::Handle::try_current()) {
+            let (dir, paths) = (self.dir.clone(), std::mem::take(&mut self.paths));
+            runtime.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                crate::remove_uploads(&dir, &paths);
+            });
+            return;
+        }
+        crate::remove_uploads(&self.dir, &self.paths);
+    }
+}
+
+/// `decode_files` off the async workers. Its uploads come back owned, so a
+/// decode whose message is dropped meanwhile removes what it saved.
+async fn decode_owned(files: Option<Val>, dir: PathBuf) -> Result<(Uploads, Vec<Part>), String> {
+    crate::blocking(move || {
+        decode_files(files.as_ref(), &dir).map(|(paths, parts)| (Uploads { dir, paths, in_flight: false }, parts))
+    })
+    .await
+}
+
 /// `_decode_ws_files`: a message's files saved under the upload directory,
 /// grouped by the modality of each name, and their parts. A message refused
 /// halfway leaves no files behind.
@@ -418,7 +463,7 @@ async fn serve_one(
     };
     let upload_dir = sock.st.upload_dir.clone();
     let mut turn = Some(turn);
-    let prepared: Result<SubmitArgs, (u16, String)> = async {
+    let prepared: Result<(SubmitArgs, Uploads), (u16, String)> = async {
         let out_mods = ws_modalities(message.get("output_modalities"), "output_modalities").map_err(refusal)?.unwrap_or_else(|| vec!["text".into()]);
         let text = match message.get("text") {
             None => None,
@@ -433,17 +478,14 @@ async fn serve_one(
             let hint = if takes_stream_input() { " (open a live call with end_input: false)" } else { "" };
             return Err(refusal(format!("message carries neither text nor files{hint}")));
         }
-        let files = message.get("files").cloned();
-        let dir = upload_dir.clone();
-        let (file_paths, parts) = crate::blocking(move || decode_files(files.as_ref(), &dir)).await.map_err(refusal)?;
-        let mut args = SubmitArgs { file_paths, ..SubmitArgs::default() };
+        let (uploads, parts) = decode_owned(message.get("files").cloned(), upload_dir.clone()).await.map_err(refusal)?;
+        let mut args = SubmitArgs { file_paths: uploads.paths.clone(), ..SubmitArgs::default() };
         let streams = file_streams(message.get("files"), &parts);
         let modalities = ws_modalities(message.get("input_modalities"), "input_modalities");
         let kwargs = ws_model_kwargs(message.get("model_kwargs"));
         let failed = streams.as_ref().err().or(modalities.as_ref().err()).or(kwargs.as_ref().err()).cloned();
         if let Some(e) = failed {
-            crate::remove_uploads(&upload_dir, &args.file_paths);
-            return Err(refusal(e));
+            return Err(refusal(e)); // dropping the uploads removes them
         }
         let (in_mods, parts) = input_layout(text.as_deref(), modalities.unwrap(), parts);
         args.text = text;
@@ -453,11 +495,11 @@ async fn serve_one(
         args.parts = parts;
         args.end_input = Some(end_input);
         args.file_streams = streams.unwrap();
-        Ok(args)
+        Ok((args, uploads))
     }
     .await;
-    let args = match prepared {
-        Ok(args) => args,
+    let (args, mut uploads) = match prepared {
+        Ok(prepared) => prepared,
         Err((status, error)) => {
             if let Some(call) = &call {
                 let _ = call.send(Some(None));
@@ -482,6 +524,7 @@ async fn serve_one(
         crate::serving::try_result_stream(&sock.st, &args, &rid, true).map(|s| (s, None))
     };
     crate::schedule_upload_cleanup(&upload_dir, &args);
+    uploads.hand_over();
     let mut stream: OutStream = match submitted {
         Ok((stream, sub)) => {
             if let Some(call) = &call {
@@ -494,7 +537,8 @@ async fn serve_one(
                 let _ = call.send(Some(None));
             }
             let _ = turn.take().unwrap().send(());
-            sock.send(error_reply(Some(&rid), &error, Some(status), binary));
+            // refused before it had an id: an unnamed message's error names none, as on Python's route
+            sock.send(error_reply(request_id.as_deref(), &error, Some(status), binary));
             finish_call(&sock, request_id.as_deref(), call.is_some());
             return;
         }
@@ -503,9 +547,10 @@ async fn serve_one(
     let mut failed = false;
     while let Some(item) = stream.next().await {
         match item {
-            Out::Error { status, message } => {
+            Out::Error { status, message, refused } => {
                 failed = true;
-                sock.send(error_reply(Some(&rid), &message, Some(status), binary));
+                let id = if refused { request_id.as_deref() } else { Some(rid.as_str()) };
+                sock.send(error_reply(id, &message, Some(status), binary));
             }
             Out::Chunk(c) => sock.send(encode(
                 vec![
@@ -581,7 +626,7 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
         return;
     }
     let upload_dir = sock.st.upload_dir.clone();
-    let mut file_paths = PathsByModality::new();
+    let mut uploads: Option<Uploads> = None;
     let prepared: Result<Map<String, Value>, String> = async {
         if message.get("append").is_some() {
             let mut misplaced: Vec<&str> = ["files", "model_kwargs", "text"].into_iter().filter(|k| message.get(k).is_some()).collect();
@@ -598,17 +643,15 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
             Some(_) => return Err("text must be a string".into()),
         };
         let kwargs = ws_model_kwargs(record.get("model_kwargs"))?;
-        let files = record.get("files").cloned();
-        let dir = upload_dir.clone();
-        let (paths, parts) = crate::blocking(move || decode_files(files.as_ref(), &dir)).await?;
-        file_paths = paths;
+        let (saved, parts) = decode_owned(record.get("files").cloned(), upload_dir.clone()).await?;
+        let file_paths = &uploads.insert(saved).paths;
         let streams = file_streams(record.get("files"), &parts)?;
         let ends = end_input != Value::Bool(false) && end_input != Value::Array(Vec::new());
         if file_paths.is_empty() && text.as_deref().is_none_or(str::is_empty) && kwargs.as_ref().is_none_or(Map::is_empty) && !ends {
             return Err("an append needs text, files, model_kwargs or end_input".into());
         }
         let mut op = Map::new();
-        op.insert("file_paths".into(), serde_json::to_value(&file_paths).unwrap());
+        op.insert("file_paths".into(), serde_json::to_value(file_paths).unwrap());
         op.insert("end_input".into(), end_input);
         op.insert("text".into(), text.filter(|t| !t.is_empty()).map_or(Value::Null, Value::String));
         op.insert("file_streams".into(), streams.unwrap_or(Value::Null));
@@ -620,22 +663,32 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
     .await;
     let rejection = match prepared {
         Err(text) => Some((crate::scrub_paths(&text), 400)),
-        Ok(op) => match bridge.live(sub, "append", op, timeout).await {
-            Some(meta) if meta.get("accepted").and_then(Value::as_bool) == Some(true) => {
-                // the preprocess worker deletes the files once loaded
-                file_paths.clear();
-                None
+        Ok(op) => {
+            if let Some(u) = &mut uploads {
+                u.in_flight = true; // the socket may close before the reply says who has them
             }
-            Some(meta) if meta.get("error").is_some() => Some((
-                meta["error"].as_str().unwrap_or("").to_string(),
-                meta.get("status").and_then(Value::as_u64).unwrap_or(400) as u16,
-            )),
-            _ => {
-                // the call ended meanwhile: leave it be
-                sock.send(late_reply(&rid, &late, binary));
-                None
+            let reply = bridge.live(sub, "append", op, timeout).await;
+            if let (Some(u), Some(_)) = (&mut uploads, &reply) {
+                u.in_flight = false; // answered: taken, or not
             }
-        },
+            match reply {
+                Some(meta) if meta.get("accepted").and_then(Value::as_bool) == Some(true) => {
+                    if let Some(u) = &mut uploads {
+                        u.hand_over();
+                    }
+                    None
+                }
+                Some(meta) if meta.get("error").is_some() => Some((
+                    meta["error"].as_str().unwrap_or("").to_string(),
+                    meta.get("status").and_then(Value::as_u64).unwrap_or(400) as u16,
+                )),
+                _ => {
+                    // the call ended meanwhile: leave it be
+                    sock.send(late_reply(&rid, &late, binary));
+                    None
+                }
+            }
+        }
     };
     if let Some((text, status)) = rejection {
         let mut op = Map::new();
@@ -647,7 +700,7 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
             sock.send(late_reply(&rid, &late, binary));
         }
     }
-    crate::remove_uploads(&upload_dir, &file_paths);
+    drop(uploads); // what the API server didn't take
 }
 
 /// `GET /generate/ws`.
@@ -708,7 +761,19 @@ async fn serve(socket: WebSocket, st: AppState) {
         });
     }
     let mut previous_turn: Option<Turn> = None;
-    while let Some(Ok(frame)) = source.next().await {
+    loop {
+        let frame = match source.next().await {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => {
+                if let Some(close) = super::read_failure_close(&e) {
+                    let _ = out.send(close);
+                }
+                break;
+            }
+            None => break,
+        };
+        // a finished message's task goes now, not with the socket, as Python's tasks.discard
+        while tasks.try_join_next().is_some() {}
         if matches!(frame, Message::Close(_)) {
             break;
         }
@@ -812,6 +877,56 @@ mod tests {
         assert!(is_append(&msg(serde_json::json!({"request_id": "a", "end_input": true}))));
         assert!(!is_append(&msg(serde_json::json!({"request_id": "a", "end_input": true, "text": "x"}))));
         assert!(!is_append(&msg(serde_json::json!({"request_id": "a", "end_input": []}))));
+    }
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mstar_genws_test_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn saved(dir: &Path, name: &str) -> PathsByModality {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        BTreeMap::from([("image".to_string(), vec![path.to_string_lossy().into_owned()])])
+    }
+
+    #[test]
+    fn uploads_not_handed_over_are_removed_when_dropped() {
+        let dir = scratch();
+        drop(Uploads { dir: dir.clone(), paths: saved(&dir, "a.png"), in_flight: false });
+        let mut handed = Uploads { dir: dir.clone(), paths: saved(&dir, "b.png"), in_flight: false };
+        handed.hand_over();
+        drop(handed);
+        assert!(!dir.join("a.png").exists());
+        assert!(dir.join("b.png").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decode_whose_message_is_dropped_removes_what_it_saved() {
+        let dir = scratch();
+        let files = Val::List(vec![Val::Map(vec![
+            ("name".into(), Val::Str("big.png".into())),
+            ("data".into(), Val::Bytes(vec![7; 256 << 20])),
+        ])]);
+        let decode = tokio::spawn(decode_owned(Some(files), dir.clone()));
+        let count = || std::fs::read_dir(&dir).unwrap().count();
+        // dropped once the decode has saved something
+        while count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        decode.abort();
+        let _ = decode.await;
+        // the blocking decode runs on; its output is dropped once it returns
+        for _ in 0..400 {
+            if count() == 0 {
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the dropped decode's upload is still there");
     }
 
     #[test]

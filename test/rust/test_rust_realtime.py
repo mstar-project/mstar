@@ -25,6 +25,7 @@ pytest.importorskip("websockets")
 np = pytest.importorskip("numpy")
 sf = pytest.importorskip("soundfile")
 
+import websockets.exceptions
 import websockets.sync.client
 from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
@@ -84,8 +85,9 @@ class _Model:
 
 class _ASR:
     """The engine for both frontends: a step's text grows with the audio it heard
-    and continues from its assistant prefix; language "xx" is a 400 and a
-    prompt "boom" a 500."""
+    and continues from its assistant prefix; language "xx" is a 400, as is a
+    prompt "paths" (its error naming the upload and other paths), and a prompt
+    "boom" a 500."""
 
     def __init__(self, upload_dir: Path):
         self.model_name = "qwen3_asr"
@@ -109,6 +111,10 @@ class _ASR:
         self.steps.append({"mk": mk, "seconds": len(data) / rate, "audio": hashlib.sha1(data.tobytes()).hexdigest()})
         if mk.get("language") == "xx":
             chunks = [_Chunk("error", b"unsupported language 'xx' (see /srv/models/qwen/config.json)", {"status": 400})]
+        elif mk.get("initial_prompt") == "paths":
+            error = (f"cannot read {self.upload_dir}/rt-abc-1.wav "
+                     "(not under /models/, nor /tmp, nor '/srv/my models/a b.json')")
+            chunks = [_Chunk("error", error.encode(), {"status": 400})]
         elif mk.get("initial_prompt") == "boom":
             chunks = [_Chunk("error", b"CUDA error: device-side assert", {"status": 500})]
         else:
@@ -141,7 +147,7 @@ class _ASR:
 
 
 @contextlib.contextmanager
-def _rust(server: _ASR):
+def _rust(server: _ASR, **extra_env):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rt_")
     adapter = ADAPTER_REGISTRY["qwen3_asr"]
@@ -149,7 +155,7 @@ def _rust(server: _ASR):
         OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_asr"),
         TRANSCRIPTION_ENV: json.dumps(transcription_facts(server, adapter)),
         REALTIME_ENV: json.dumps(realtime_facts(server, adapter, bridge_dir)),
-    })
+    }, **extra_env)
     proc = subprocess.Popen([BINARY, "qwen3_asr", str(port), bridge_dir, str(server.upload_dir)], env=env)
     bridge = RustFrontendBridge(server, bridge_dir)
     threading.Thread(target=bridge.run, daemon=True).start()
@@ -344,6 +350,9 @@ def test_protocol_errors_read_as_pythons(stack, monkeypatch):
         *_appends(audio[:16000], 16000, 1.0), {"type": "input_audio_buffer.commit"},
         _session(input_audio_transcription={"language": None, "prompt": "boom"}),
         *_appends(audio[:16000], 16000, 1.0), {"type": "input_audio_buffer.commit"},
+        # scrubbed as serving_realtime._scrub_paths scrubs it
+        _session(input_audio_transcription={"prompt": "paths"}),
+        *_appends(audio[:16000], 16000, 1.0), {"type": "input_audio_buffer.commit"},
         _session(mstar={"chunk_seconds": 0.1}),
     ]
     py, rust = _both(stack, monkeypatch, events)
@@ -397,3 +406,19 @@ def test_a_model_without_realtime_is_closed_with_pythons_reason(stack, monkeypat
             ws.recv(timeout=10)
     reason = "unsupported intent 'conversation'; use intent=transcription"
     assert (closed.value.rcvd.code, closed.value.rcvd.reason) == (1008, reason)
+
+
+
+# what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
+TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
+
+
+def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
+    with _rust(_ASR(Path(tempfile.mkdtemp(prefix="mstar_rt_up_"))), MSTAR_WS_MAX_BYTES="1000") as port:
+        url = f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription"
+        with websockets.sync.client.connect(url, compression=None, max_size=None) as ws:
+            ws.recv(timeout=10)   # the greeting frame
+            ws.send("x" * 2000)
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                ws.recv(timeout=10)
+    assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG

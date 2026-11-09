@@ -332,7 +332,14 @@ impl Conversation {
                             self.send(invalid("an event must be a JSON text message, not binary")).await;
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Err(e)) => {
+                            if let Some(close) = crate::ws::read_failure_close(&e) {
+                                let _ = self.socket.send(close).await;
+                                self.closed = true;
+                            }
+                            break;
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
                         Some(Ok(_)) => continue,
                     };
                     match serde_json::from_str::<Value>(&text) {
@@ -360,8 +367,8 @@ impl Conversation {
                                 Ending { status: "failed", code: 1011 }
                             }
                         },
-                        Some(Out::Error { status, message }) => {
-                            let message = clip(&crate::scrub_paths(&message));
+                        Some(Out::Error { status, message, .. }) => {
+                            let message = clip(&super::scrub_paths(&message, &self.st.upload_dir));
                             self.send(error_event(&message, error_type(status), None)).await;
                             Ending { status: "failed", code: if status >= 500 { 1011 } else { 1000 } }
                         }
@@ -701,7 +708,7 @@ impl Conversation {
                     return true;
                 }
                 match tokio::time::timeout(crate::BRIDGE_PROBE_TIMEOUT, stream.next()).await {
-                    Ok(Some(Out::Error { status, message })) => (status, message),
+                    Ok(Some(Out::Error { status, message, .. })) => (status, message),
                     _ => (500, "the server could not open the call".to_string()),
                 }
             }
@@ -709,7 +716,7 @@ impl Conversation {
             Err(refused) => refused,
         };
         let (status, message) = refused;
-        let message = if status == 400 { clip(&crate::scrub_paths(&message)) } else { message };
+        let message = if status == 400 { clip(&super::scrub_paths(&message, &self.st.upload_dir)) } else { message };
         self.send(error_event(&message, error_type(status), None)).await;
         false
     }

@@ -565,7 +565,13 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
         let start = Instant::now();
         let message = match socket.recv().await {
             Some(Ok(m)) => m,
-            _ => return,
+            Some(Err(e)) => {
+                if let Some(close) = super::read_failure_close(&e) {
+                    let _ = socket.send(close).await;
+                }
+                return;
+            }
+            None => return,
         };
         let observation = match message {
             Message::Binary(b) => Ok(b),
