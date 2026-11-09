@@ -190,7 +190,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
     w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
     w._rebuilds._pool, w._rebuilds._allowance = (pool := HostPool(1 << 10, torch.device("cpu"))), StepAllowance()
-    w._rebuilds._droppable = {node: {1: LogRoom(pool.take(64), 0, 0)}}
+    w._rebuilds._keeps_ids = {node: {1: LogRoom(pool.take(64), 0, 0)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()

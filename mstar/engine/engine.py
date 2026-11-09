@@ -3208,10 +3208,10 @@ class Engine:
         """The waiting requests that didn't fit, oldest first; see `Admission.refusals`."""
         return self._runner.refusals()
 
-    def readmit_request(self, node_name: str, request_id: int, queued: bool) -> None:
-        """Ask the node's resources again for the request, which then waits until they fit it, in its queues
-        when ``queued``; see `Admission.readmit`."""
-        self._runner.readmit(request_id, node_name, queued)
+    def readmit_request(self, node_name: str, request_id: int) -> None:
+        """Ask the node's resources again for the request, which then waits until they fit it, as
+        `Admission.readmit` says."""
+        self._runner.readmit(request_id, node_name)
 
     def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
         """Discard the request's state on this node that can be recomputed from
@@ -3222,7 +3222,7 @@ class Engine:
         if refusal is not None:
             raise RuntimeError(refusal)
         freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
-        self._runner.readmit(request_id, node_name, queued=True)
+        self._runner.readmit(request_id, node_name)
         return freed
 
     def drop_refusal(self, node_name: str, request_id: int, tokens: int) -> str | None:
@@ -3261,7 +3261,7 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        self._runner.readmit(request_id, node_name, queued=False)
+        self._runner.readmit(request_id, node_name)
         if freed > 0:
             self._release_resident_slot(node_name, request_id)
             if node_name in self._resident_delta:

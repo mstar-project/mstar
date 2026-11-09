@@ -185,8 +185,8 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free, each with its `LogRoom`. Only these keep ids.
-        self._droppable: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
+        # node -> the handles that keep their ids, those whose pages a drop there can free, each with its `LogRoom`
+        self._keeps_ids: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         assert allowance is not None or not any(names for walks in self._copied.values() for names in walks.values()), (
@@ -287,7 +287,7 @@ class Rebuilds:
         }
         for node, room in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = room
+                self._keeps_ids[node][rid] = room
             else:
                 self._pool.give(room.piece)
         return rebuildable
@@ -306,8 +306,8 @@ class Rebuilds:
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk not in policy.walks and policy.walks.isdisjoint(walks.values()):
             return
-        kept, droppable = self._kept[node], self._droppable[node]
-        cached = [rid for rid in node_batch.cached_rids if rid in droppable and walks.get(rid, walk) in policy.walks]
+        kept, keeps_ids = self._kept[node], self._keeps_ids[node]
+        cached = [rid for rid in node_batch.cached_rids if rid in keeps_ids and walks.get(rid, walk) in policy.walks]
         for rid in cached:
             self._forget(node, rid)
         # The rows that ran: the engine takes a row it skipped or failed out of the step's rows and their infos,
@@ -315,10 +315,10 @@ class Rebuilds:
         for rid in node_batch.request_ids:
             row, row_walk = node_batch.per_request_input_tensors.get(rid), walks.get(rid, walk)
             # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
+            if not row or rid in kept or rid not in keeps_ids or row_walk not in policy.walks:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
-            room, length, copies = droppable[rid], sum(map(len, tensors)), bool(self._copied[node][row_walk])
+            room, length, copies = keeps_ids[rid], sum(map(len, tensors)), bool(self._copied[node][row_walk])
             # The host copies fill the slots past the ids spans, or none when the walk read an id at every slot.
             # Any other count of ids would rebuild other slots than the KV holds, so the request keeps none.
             if copies and length not in (room.ids, room.slots):
@@ -363,7 +363,7 @@ class Rebuilds:
             ):
                 rows.append((rid, kept))
         for rid, kept in rows:
-            piece, inputs = self._droppable[node][rid].piece, node_batch.per_request_input_tensors[rid]
+            piece, inputs = self._keeps_ids[node][rid].piece, node_batch.per_request_input_tensors[rid]
             tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
             used = aligned(kept.prompt.view.nbytes)
             assert used + sum(aligned(tensor.nbytes) for _, tensor in tensors) <= piece.nbytes, (
@@ -419,17 +419,17 @@ class Rebuilds:
 
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
-        room = self._droppable[node][rid]
+        room = self._keeps_ids[node][rid]
         if used < room.piece.nbytes:
             self._pool.give(HostSlice(room.piece.offset + used, room.piece.nbytes - used))
-            self._droppable[node][rid] = room._replace(piece=HostSlice(room.piece.offset, used))
+            self._keeps_ids[node][rid] = room._replace(piece=HostSlice(room.piece.offset, used))
 
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
         if kept is not None and kept.copies is not None and kept.copies.queued:
             # its slice goes back to the pool, so no copy may start into it
             self._queued = deque(queued for queued in self._queued if queued.copies is not kept.copies)
-        room = self._droppable[node].pop(rid, None)
+        room = self._keeps_ids[node].pop(rid, None)
         if room is not None:
             self._pool.give(room.piece)
 

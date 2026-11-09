@@ -231,7 +231,7 @@ def test_only_the_rows_that_ran_keep_their_prompts():
     rebuilds.keep_prompts(step)
 
     assert set(rebuilds._kept[NODE]) == {R}, "a row that never ran would keep a prompt"
-    assert B not in rebuilds._droppable[NODE], "a request the cache served would hold its slice and never use it"
+    assert B not in rebuilds._keeps_ids[NODE], "a request the cache served would hold its slice and never use it"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
@@ -271,7 +271,7 @@ def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
     """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     assert _ingest(rebuilds, R, (PrefixSpan(5, 5, PREFILL),))
-    assert rebuilds._droppable[NODE][R].piece.nbytes == 40, "keeping the prompt would overflow its slice"
+    assert rebuilds._keeps_ids[NODE][R].piece.nbytes == 40, "keeping the prompt would overflow its slice"
 
     rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(5)]}}))
 
@@ -305,7 +305,7 @@ def _copying(*rids: int) -> Rebuilds:
     pool = HostPool(1 << 10, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance())
     for rid in rids:
-        rebuilds._kept[NODE][rid], rebuilds._droppable[NODE][rid] = _media(), LogRoom(pool.take(64), 0, 0)
+        rebuilds._kept[NODE][rid], rebuilds._keeps_ids[NODE][rid] = _media(), LogRoom(pool.take(64), 0, 0)
     return rebuilds
 
 
@@ -353,7 +353,7 @@ def test_a_prompt_whose_ids_cover_neither_its_ids_spans_nor_every_slot_keeps_non
     assert "keeps no ids" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
         "a drop would free the pages of a request whose rebuild writes other slots than its KV holds"
     )
-    assert R not in rebuilds._droppable[NODE], "the request would hold its slice for its life"
+    assert R not in rebuilds._keeps_ids[NODE], "the request would hold its slice for its life"
 
 
 def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
@@ -401,7 +401,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance(), DTYPES)
 
     # an id at 8 B for each of the eleven slots, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 88 + 48), 11, 5)
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._keeps_ids[NODE][R] == (HostSlice(0, 88 + 48), 11, 5)
     assert not _ingest(rebuilds, A, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
     # the image's four rows, without its two sentinels
@@ -412,7 +412,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.keep_copies(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].piece.nbytes == 40 + 32, (
+    assert rebuilds._keeps_ids[NODE][R].piece.nbytes == 40 + 32, (
         "the image's room for ids and its sentinels' room would stay taken for the request's life"
     )
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
@@ -472,7 +472,7 @@ def test_passes_that_run_no_step_start_one_allowance_at_a_time():
     messages makes, queued several allowances of copies at once behind the next step's output copy."""
     pool = _LandingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance(8))
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media(), LogRoom(pool.take(64), 0, 0)
+    rebuilds._kept[NODE][R], rebuilds._keeps_ids[NODE][R] = _media(), LogRoom(pool.take(64), 0, 0)
     step = _vision_step((R,), {}, completion_event=None)
     step.per_request_input_tensors[R]["embeds"] = [torch.arange(8, dtype=torch.float32)]
     rebuilds.keep_copies(step)
@@ -512,7 +512,7 @@ def test_an_empty_input_queues_no_copy_and_holds_back_none_behind_it():
 def test_a_media_copy_split_across_two_steps_lands_whole():
     pool = HostPool(1 << 22, torch.device("cuda"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance=(allowance := StepAllowance(1 << 20)))
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1]), LogRoom(pool.take(1 << 21), 0, 0)
+    rebuilds._kept[NODE][R], rebuilds._keeps_ids[NODE][R] = _media([1]), LogRoom(pool.take(1 << 21), 0, 0)
     embeds = torch.arange(3 << 17, dtype=torch.float32, device="cuda")
     step_done = torch.Event(device="cuda")
     step_done.record()
@@ -611,7 +611,7 @@ def test_a_request_with_images_is_not_rebuildable_on_a_node_whose_dtype_is_unkno
 def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice_alone():
     allowance, pool = StepAllowance(0), HostPool(64, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance)
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media(), LogRoom(pool.take(64), 0, 0)
+    rebuilds._kept[NODE][R], rebuilds._keeps_ids[NODE][R] = _media(), LogRoom(pool.take(64), 0, 0)
     step = _vision_step((R,), {}, completion_event=None)
     step.per_request_input_tensors[R]["embeds"] = [torch.full((4,), 7.0)]
     rebuilds.keep_copies(step)
@@ -656,7 +656,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     rows = 1 << 22
     # room for the prompt's one id and the copy
     room = LogRoom(pool.take(aligned(8) + 4 * rows), 0, 0)
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), room
+    rebuilds._kept[NODE][R], rebuilds._keeps_ids[NODE][R] = _media([1], 5), room
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
     with side:
