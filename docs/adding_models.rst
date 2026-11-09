@@ -1404,9 +1404,9 @@ and the runner tries a passing request again only once ``grew_since`` that mark.
 it only while the first request can't start: a resource that lets requests pass refused it and
 hasn't grown since, and the passing request passes at that resource too. A resource that doesn't
 override it keeps strict order, and a request waiting in its queue can't pass anywhere. A resource
-that sets a waiting request's capacity aside on its own, as the KV cache does when it moves other
-requests for it, overrides ``reserved(rid)`` to say so, and the request may then start wherever it
-stands in that resource's queue, since that takes nothing from the requests ahead of it.
+that overrides it asks nothing more of a waiting request whose capacity it set aside on its own, as
+the KV cache does when it moves other requests for it, and the request may then start wherever it
+stands in that resource's queue.
 
 Step 3 — Declare the computation graph
 --------------------------------------

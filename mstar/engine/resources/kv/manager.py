@@ -4407,9 +4407,6 @@ class KVManager(AttentionResource):
         growth that admission leaves to the room fit in the room less `_kept`. A request that holds an allotment
         waits for its shortage in order."""
         with self._lock:
-            if rid not in self._asks:
-                # the moves `make_room` chose for ``rid`` admitted it, as in `reserve`
-                return None
             room = self._room() - self._kept
             # When even the fewest pages ``rid`` can take don't fit, no page the index files helps, so only the room
             # moves the mark.
@@ -4434,10 +4431,6 @@ class KVManager(AttentionResource):
             if not self._admit(rid, pages, self.journal, passed=True):
                 return PassMark(room, None, None)
             return None
-
-    def reserved(self, rid: str) -> bool:
-        """Whether the moves `make_room` chose for waiting ``rid`` admitted it (`_settle`). Read without the lock."""
-        return rid in self._allotments and rid not in self._asks
 
     def _admit(
         self, rid: str, pages: int, journal: Callable[..., None] | None = None, passed: bool = False,

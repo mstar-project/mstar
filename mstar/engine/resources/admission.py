@@ -37,11 +37,11 @@ class Admission:
 
     A waiting request is admitted once it is first in every queue it is in and each resource it
     asked reserves for it, all or nothing. It may also pass the first request of a queue whose resource
-    overrides `Resource.reserve_past`, while that request can't start (`_pass`), and stand anywhere in the queue of a
-    resource that already holds what it asked for (`Resource.reserved`), since that takes nothing from the requests
-    ahead of it. A request that asks again (`readmit`) waits in no queue, and `admit_waiting` tries it, oldest first,
-    whenever what it didn't fit has grown. It holds up no newer request unless it is the oldest request, when the
-    queues of the resources it waits for admit no one, so newer prompts can't keep passing it.
+    overrides `Resource.reserve_past`, while that request can't start (`_pass`), and stand anywhere in the queue of
+    such a resource once it asks nothing more of the request (`Resource.ask`), since that takes nothing from the
+    requests ahead of it. A request that asks again (`readmit`) waits in no queue, and `admit_waiting` tries it,
+    oldest first, whenever what it didn't fit has grown. It holds up no newer request unless it is the oldest
+    request, when the queues of the resources it waits for admit no one, so newer prompts can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -277,16 +277,16 @@ class Admission:
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: dict[str, str],
     ) -> dict[str, str] | None:
         """Admit waiting ``rid`` where it stands in each queue: first, or behind a first request in ``blocked``
-        whose resource lets requests pass, in a queue no return holds back, or anywhere where the resource holds
-        what ``rid`` asked for. Return the nodes waiting on it, or None, and add ``rid`` to ``blocked`` when a
+        whose resource lets requests pass, in a queue no return holds back, or anywhere where such a resource asks
+        nothing more of ``rid``. Return the nodes waiting on it, or None, and add ``rid`` to ``blocked`` when a
         resource refuses it."""
         if rid in self._refused:
             return None
         held = self._held_back()
         passing, reserved = [], []
-        for key in self._waiting[rid].asked:
+        for key, (node_name, graph_walk) in self._waiting[rid].asked.items():
             first = self._queues[key][0]
-            if self._resources[key].reserved(rid):
+            if key in self._passes and self._resources[key].ask(rid, node_name, graph_walk) is None:
                 reserved.append(key)
             elif key in held:
                 return None

@@ -333,11 +333,6 @@ class Resource(ResidentHooks, ABC):
         resource that doesn't override it admits in order."""
         return 0
 
-    def reserved(self, rid: str) -> bool:
-        """Whether this resource set aside what waiting ``rid`` asked for on its own, so `reserve` takes nothing
-        and ``rid`` may start ahead of the requests in its queue."""
-        return False
-
     def unreserve(self, rid: str) -> None:
         """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
         return
