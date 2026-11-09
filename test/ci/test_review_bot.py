@@ -594,21 +594,16 @@ class TestDispatcher(unittest.TestCase):
                          "the steps after a failed one read what it had found from $GITHUB_OUTPUT")
 
 
-COMMENT = "mcp__github_inline_comment__create_inline_comment"
 
 
 def assistant(*content):
     return {"type": "assistant", "message": {"id": "m", "model": "claude-opus-5-5", "content": list(content)}}
 
 
-def call(tid, **inp):
-    return {"type": "tool_use", "id": tid, "name": COMMENT, "input": inp}
-
-
 class TestHandoff(unittest.TestCase):
     def handoff(self, messages, previous=None):
         """bot.handoff after a run that left `messages`, continuing a run whose handoff.json is `previous`."""
-        with tempfile.TemporaryDirectory() as temp, workspace() as ws:
+        with tempfile.TemporaryDirectory() as temp, workspace():
             if messages is not None:
                 Path(temp, bot.EXECUTION).write_text(json.dumps(messages))
             prev = ""
@@ -619,40 +614,22 @@ class TestHandoff(unittest.TestCase):
             out, _ = step(bot.handoff, {}, pr="7", head_sha="abc", mode="light", runner_temp=temp, home=temp, prev=prev)
             saved = Path(temp, "handoff")
             return (out, json.loads((saved / "handoff.json").read_text()) if saved.exists() else None,
-                    (saved / "handoff.md").read_text() if saved.exists() else "",
-                    (ws / "partial.md").read_text() if (ws / "partial.md").exists() else "")
+                    (saved / "handoff.md").read_text() if saved.exists() else "")
 
     def test_a_handoff_merges_onto_the_one_it_continued_and_keeps_leads_off_the_pr(self):
         earlier = json.dumps({"runs": 1, "comments": [], "reads": ["pr-head/z.py"], "note": "", "recent_text": ""})
         token = "ghp_" + "a" * 36
-        out, h, md, partial = self.handoff([
-            assistant(call("c1", path="a.py", line=3, body="**[P2]** failed one")),
-            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1", "is_error": True,
-                                                       "content": "line 3 is not in the diff"}]}},
-            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token}"},
-                      call("c2", path="b.py", line=7, body="**[P1]** unknown one")),
+        out, h, md = self.handoff([
+            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token}"}),
         ], earlier)
         self.assertEqual((h["pr"], h["runs"], h["reads"]), ("7", 2, ["pr-head/z.py"]))
-        self.assertIn("## Inline comments that failed to post\n\n"
-                      "- `a.py:3` **[P2]** failed one (line 3 is not in the diff)", md)
         self.assertIn("**Progress:** P1 `b.py:7` unverified [REDACTED]", md, "a token would reach a public artifact")
-        self.assertNotIn("unverified", partial, "the public comment would list unverified leads")
         self.assertEqual(self.handoff(None, json.dumps({"runs": 1, "comments": [], "reads": [],
                                                         "note": "Progress: a.py done", "recent_text": ""}))[1]["note"],
                          "Progress: a.py done", "a continued run that said nothing would drop the handoff it had")
         fresh = self.handoff([assistant({"type": "text", "text": "Progress: nothing yet"})], "{not json")[1]
         self.assertEqual(fresh["runs"], 1, "a corrupt earlier handoff would stop this one being saved")
         self.assertEqual(self.handoff(None)[0], {"exit": "No Claude Code messages to hand off."})
-
-    def test_what_a_stopped_review_posts_is_inert(self):
-        partial = self.handoff([
-            assistant(call("c1", path="a.py", line=3, body="**[P2]** @org/team ![x](https://x.example/a.png)")),
-            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
-                                                       "content": '{"comment_id": 1}'}]}},
-        ])[3]
-        self.assertIn("`a.py:3` **[P2]**", partial)
-        for markup in ("@org", "![", "]("):
-            self.assertNotIn(markup, partial, "the model's text would ping a team or load an image from the comment")
 
 
 class TestAfterTheReview(unittest.TestCase):
@@ -724,6 +701,39 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertTrue(all(posted not in arg for argv, _ in fake.calls for arg in argv),
                         "posted text would reach gh's command line")
 
+    def test_inline_comments_post_from_stdin_anchored_to_the_review_and_a_refused_one_joins_the_summary(self):
+        token = "ghp_" + "b" * 36
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
+                      {"path": "a.py", "line": 3, "body": f"**[P1]** first\n\nleaks {token}"},
+                      {"path": "b.py", "line": 9, "start_line": 7, "side": "LEFT", "body": "**[P0]** range"},
+                      {"path": "c.py", "line": 1, "body": "**[P2]** not in the diff"},
+                  ]}
+        posted, answers = [], iter([{"id": 41}, Fail("HTTP 422"), {"id": 43}])
+
+        def create(argv, stdin):
+            posted.append(json.loads(stdin))
+            return next(answers)
+
+        with workspace(), mock.patch.object(bot.time, "sleep"):
+            _, fake = step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": create,
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+        self.assertEqual([p["commit_id"] for p in posted], [HEAD] * 3, "a later push would shift the line numbers")
+        self.assertEqual((posted[1]["start_line"], posted[1]["start_side"], posted[1]["side"]), (7, "LEFT", "LEFT"))
+        self.assertNotIn("start_line", posted[0], "a single-line comment takes no range")
+        self.assertIn("[REDACTED]", posted[0]["body"])
+        self.assertNotIn(token, json.dumps(fake.calls), "a token would reach a comment or a command line")
+        self.assertEqual([k for k, _ in fake.writes()][-1], "pr comment", "the summary is posted last")
+        summary = fake.writes()[-1][1]
+        self.assertEqual(render_summary.saved_state(summary)["outside_diff"],
+                         [{"priority": "P0", "claim": "range", "location": "b.py:9", "detail": "range"}],
+                         "a finding GitHub refused would be lost")
+
     def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
         item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
         question = {"location": "a.py:1", "text": "Should this be a resource?"}
@@ -782,14 +792,13 @@ class TestAfterTheReview(unittest.TestCase):
                            refused="true")
             self.assertEqual([k for k, _ in fake.writes()], ["pr comment"])
             self.assertTrue(fake.writes()[0][1].startswith(bot.REFUSED))
-            Path("partial.md").write_text("**Inline comments it made (1):**\n")
             _, fake = step(bot.incomplete, routes, repo="o/r", pr="7", run_url="u", detail="40 turns",
                            can_continue="true")
         (key, body), = fake.writes()
         self.assertEqual(key, "PATCH repos/o/r/issues/comments/5", "a retry would stack up a second comment")
-        self.assertIn("didn't complete: a step failed (40 turns). [Log](u). Comment `/review continue`",
-                      json.loads(body)["body"])
-        self.assertIn("What it had so far:\n\n**Inline comments it made (1):**", json.loads(body)["body"])
+        text = json.loads(body)["body"]
+        self.assertIn("didn't complete: a step failed (40 turns). [Log](u). Its findings post only when", text)
+        self.assertIn("Comment `/review continue`", text)
 
 
 class TestImprove(unittest.TestCase):
