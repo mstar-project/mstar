@@ -108,3 +108,26 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
         print("ok", len(found))
     """ % ROOT)
     assert out.startswith("ok")
+
+
+def test_kept_resident_kernel_parameters_match_the_triton_functions():
+    run_sim("""
+        import inspect
+        from mstar.engine.resources import resident
+        from mstar.engine.resources.attn import wrappers
+        from mstar.engine.resources.kv import resident as kv_resident
+        from mstar_sim.kernels import KEPT_WRITES
+
+        modules = resident, kv_resident, wrappers
+        mismatches = []
+        for name, kept in KEPT_WRITES.items():
+            originals = [getattr(module, name) for module in modules if hasattr(module, name)]
+            assert len(originals) == 1, f"{name}: expected one resident Triton kernel"
+            expected = list(inspect.signature(originals[0].fn).parameters)
+            # **_ receives Triton launch options (e.g. num_warps), not kernel arguments.
+            actual = [p.name for p in inspect.signature(kept).parameters.values()
+                      if p.kind != inspect.Parameter.VAR_KEYWORD]
+            if actual != expected:
+                mismatches.append(f"{name}: stand-in {actual}; Triton {expected}")
+        assert not mismatches, "\\n".join(mismatches)
+    """)

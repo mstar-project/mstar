@@ -65,7 +65,8 @@ python -m pytest mstar_sim/audits -q
 ```
 
 It reports new CUDA, accelerator, FlashInfer, torch.ops and ctypes entry points, private
-wrappers that no longer apply, and upstream FlashInfer version changes. It is outside
+wrappers that no longer apply, upstream FlashInfer version changes, and parameter drift
+in every kept resident Triton kernel (including constexpr keywords). It is outside
 required CPU Core so an unrelated mstar change need not extend the emulator. Optional
 capability probes must retain their meaning: an absent `flashinfer.rocm` must not be faked
 into existence to make the stand-in appear to be AMD's fork.

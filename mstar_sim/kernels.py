@@ -121,39 +121,40 @@ def causal_conv1d_update(
     return out if out is not None else x
 
 
-def _scatter_cells(cells, values, store, **_):
-    store.index_copy_(0, cells, values)
+def _scatter_cells(cells_ptr, values_ptr, store_ptr, **_):
+    store_ptr.index_copy_(0, cells_ptr, values_ptr)
 
 
-def _gather_column(slots, store, out, plus, STRIDE, COL, PLUS, **_):
-    value = store.index_select(0, slots * STRIDE + COL)
-    out[:slots.numel()].copy_(value + plus if PLUS else value)
+def _gather_column(slots_ptr, store_ptr, out_ptr, plus_ptr, STRIDE, COL, PLUS, **_):
+    value = store_ptr.index_select(0, slots_ptr * STRIDE + COL)
+    out_ptr[:slots_ptr.numel()].copy_(value + plus_ptr if PLUS else value)
 
 
-def _advance_column(slots, store, STRIDE, COL, TRASH, **_):
-    cells = slots * STRIDE + COL
-    store.index_copy_(0, cells, store.index_select(0, cells) + (slots != TRASH))
+def _advance_column(slots_ptr, store_ptr, STRIDE, COL, TRASH, **_):
+    cells = slots_ptr * STRIDE + COL
+    store_ptr.index_copy_(0, cells, store_ptr.index_select(0, cells) + (slots_ptr != TRASH))
 
 
-def _gather_write_slots(slots, kv_len, store, page, offset, STRIDE, BLOCK, PAGE, **_):
-    n = slots.numel()
-    page[:n].copy_(store.index_select(0, slots * STRIDE + BLOCK + kv_len // PAGE))
-    offset[:n].copy_(kv_len % PAGE)
+def _gather_write_slots(slots_ptr, kv_len_ptr, store_ptr, page_ptr, offset_ptr, STRIDE, BLOCK, PAGE, **_):
+    n = slots_ptr.numel()
+    page_ptr[:n].copy_(store_ptr.index_select(0, slots_ptr * STRIDE + BLOCK + kv_len_ptr // PAGE))
+    offset_ptr[:n].copy_(kv_len_ptr % PAGE)
 
 
-def _gather_block_rows(slots, kv_len, store, table, lens, **_):
-    if store._data.device.type == "meta":  # no lengths to read: an unknown length costs the row's longest
+def _gather_block_rows(slots_ptr, kv_len_ptr, store_ptr, table_ptr, lens_ptr, STRIDE, BLOCK, PAGE, WIDTH, **_):
+    if store_ptr._data.device.type == "meta":  # no lengths to read: an unknown length costs the row's longest
         warnings.warn("mstar_sim: the resident table is too big to keep: decode attention is priced at max_seq_len",
                       stacklevel=2)
-        lens.fill_(torch.iinfo(lens.dtype).max)
+        lens_ptr.fill_(torch.iinfo(lens_ptr.dtype).max)
     else:
-        lens.copy_(kv_len + 1)  # the kernel's own count, with this step's token: what attention is priced by
+        lens_ptr.copy_(kv_len_ptr + 1)  # the kernel's own count, with this step's token: what attention is priced by
 
 
 # Triton kernels by name, for what they write on values the emulator keeps (a launch computes
 # nothing else: :mod:`mstar_sim.triton_launch`). Resident planning's integer bookkeeping, as
 # resident planning does it off a GPU; the block-rows gather writes only its lengths, as nothing
-# reads its page table here.
+# reads its page table here. Named parameters match the Triton functions (audits/ checks them);
+# **_ accepts launch options such as num_warps.
 KEPT_WRITES = {
     "_scatter_cells_kernel": _scatter_cells,
     "_gather_column_kernel": _gather_column,
