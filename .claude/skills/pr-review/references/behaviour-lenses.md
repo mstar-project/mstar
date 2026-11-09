@@ -197,6 +197,7 @@ below it falls in, or "none":
 - **Timing:** a `sleep` used as synchronization, an assertion on elapsed time, a timeout sized for
   an idle machine (an 8 s `init_process_group` timeout a loaded runner exceeds; #723), polling with
   no condition to wait for, or a race the test wins only because one side is usually faster.
+  Timing-based tests are never allowed: see the rule after this list.
 - **State shared across tests or xdist workers:** a fixed port, socket path, `/tmp` or `/dev/shm`
   name or SHM prefix; an env var, `torch.backends` flag (`allow_tf32`), `torch.set_default_dtype`,
   seed, cwd, logging level, module global or `lru_cache` set by direct assignment and never
@@ -219,6 +220,18 @@ below it falls in, or "none":
   group after destroy, such as a reference cycle through a bound method or closure, or
   `torch.distributed.nn`'s `group=WORLD` defaults; a client-stream test that closes its socket while
   a call is still in a threadpool hop.
+
+**Timing-based tests are not allowed.** A test whose pass or fail depends on how fast the machine
+runs is a **P1** finding whatever its threshold: an assertion on real elapsed time (a bound on
+`perf_counter`, `time.time`, `monotonic` or `CLOCK_MONOTONIC`), a `sleep` used as synchronization, a
+race the usually-faster side wins, or a timeout that decides pass or fail on a healthy run. The fix
+asserts on something deterministic: an event, barrier or join, order, counts, state, or an injected
+or virtual clock. Widening the threshold, adding a retry or a longer sleep is not a fix; if there is
+no deterministic stand-in, the fix is to delete the test or that assertion. A generous timeout that
+only guards against a hang (never reached on a healthy run) is fine. Scan every added or changed
+test for these reads, not only the ones that look timing-related. (After #1180 merged, wall-clock
+assertions in its emulator tests failed CPU Core 17 times in 8 hours, on `main`, in the merge queue
+and on other PRs.)
 
 A test in any class is a finding at P2 at least: a flaky test on `main` fails everyone's CI. Give
 its fix (the event to wait on, the fixture, the free port, the `monkeypatch`) and, as how to
