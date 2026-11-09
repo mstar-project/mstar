@@ -54,7 +54,8 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
     reviewThreads(first: 100, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
+      nodes { isResolved isOutdated comments(first: 1) {
+        nodes { databaseId author { login } body path line lastEditedAt } } }
     } } } }"""
 # Every merged PR with its live approvals. Each author's __typename separates the bot from a person who took its
 # name, which GraphQL's bare logins (no `[bot]`) can't.
@@ -735,7 +736,9 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
-    out["result"] = redact(json.dumps(review))  # what the approval rule reads, with what it carried over
+    # What the approval rule reads, with what it carried over and the inline findings as they stand now, for
+    # the rule to check they are still there, unchanged.
+    out["result"] = redact(json.dumps({**review, "inline": render_summary.inline_findings(pages)}))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")

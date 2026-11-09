@@ -26,8 +26,8 @@ def threads_page(*nodes):
     return {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(nodes)}}}}}
 
 
-def thread(comment_id, body, outdated=False, resolved=False):
-    first = {"databaseId": comment_id, "author": {"login": "mstar-review"}, "body": body}
+def thread(comment_id, body, outdated=False, resolved=False, edited=None):
+    first = {"databaseId": comment_id, "author": {"login": "mstar-review"}, "body": body, "lastEditedAt": edited}
     return {"isOutdated": outdated, "isResolved": resolved, "comments": {"nodes": [first]}}
 
 
@@ -58,7 +58,8 @@ class TestApproval(unittest.TestCase):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
     def test_only_a_listed_author_and_commenter_can_use_the_slurm_nodes(self):
-        def slurm(authors, commenter, nodes='[{"name": "n", "host": "root@h", "host_key": "k"}]', head=None):
+        def slurm(authors, commenter, nodes='[{"name": "n", "host": "root@h", "host_key": "k"}]', head=None,
+                  attempt="1"):
             fake = FakeGh({f"GET repos/{R}/pulls/7": {"user": {"login": "someone"},
                                                       "head": {"repo": head or OWN_HEAD}}, "ssh-keygen*": ""})
             with tempfile.TemporaryDirectory() as d, \
@@ -66,7 +67,7 @@ class TestApproval(unittest.TestCase):
                     unittest.mock.patch.object(Path, "home", return_value=Path(d)), \
                     unittest.mock.patch.object(bot, "run", fake):
                 gpu_review.configure({}, d, pr=7, ssh_key="k", slurm_nodes=nodes,
-                                     slurm_authors=authors, commenter=commenter)
+                                     slurm_authors=authors, commenter=commenter, github_run_attempt=attempt)
                 return json.loads(Path(d, "config.local.json").read_text())["slurm"]
 
         self.assertEqual(slurm("", "someone"), [], "with the variable unset, nobody may use Slurm")
@@ -74,6 +75,8 @@ class TestApproval(unittest.TestCase):
                          "any write-access author would run code as root on the shared nodes")
         self.assertEqual(slurm("alice someone", "bob"), [],
                          "someone not on the nodes could send a listed author's PR there")
+        self.assertEqual(slurm("alice someone", "alice", attempt="2"), [],
+                         "a re-run would run on the shared nodes on the first attempt's say-so")
         with contextlib.redirect_stdout(io.StringIO()) as log:
             self.assertEqual(len(slurm("alice someone", "alice")), 1)
         self.assertIn("::add-mask::root@h\n", log.getvalue(), "ssh's errors would put the host in a public log")
@@ -90,7 +93,9 @@ class TestApproval(unittest.TestCase):
                      "rust/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", "docs/requirements.txt",
                      "scripts/ci/check.sh", "scripts/release.sh", "docker/Dockerfile", "tools/x.py",
                      "packaging/deb.sh", "MANIFEST.in", "rust/.cargo/config.toml", "sub/.claude/settings.json",
-                     "CLAUDE.local.md", ".gitmodules", "setup.cfg", "uv.toml"):
+                     "CLAUDE.local.md", ".gitmodules", "setup.cfg", "uv.toml", ".mcp.json", ".claude.json",
+                     ".ripgreprc", ".husky/pre-commit", "sub/.husky/pre-commit", "rust-toolchain", "rust/.cargo",
+                     "rust/.claude"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
         self.assertEqual(file_gate(["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py",
                                     "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"],
@@ -105,12 +110,15 @@ class TestApproval(unittest.TestCase):
                            {"permission": "write"}, "POST graphql": threads_page(),
                            f"GET repos/{R}/compare/main...0123456789": {"files": [{"filename": f} for f in files]}})
             r = {"outside_diff": [], "prior_findings": [], "questions": list(questions), "skipped": list(skipped),
+                 "inline": {},
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             with workspace(), unittest.mock.patch.object(bot, "run", fake):
                 return gpu_review.decide(gpu_review.approval_facts(7, "0123456789", verdict, since, r)).why
 
         self.assertEqual(why("pass", "full"), [])
+        self.assertEqual(why("pass", "full", [f"docs/{i}.rst" for i in range(300)]),
+                         ["the file list is too long to check"], "a long file list would crash the approval")
         self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
                          "a review that left files unread could approve them")
         self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
@@ -184,7 +192,7 @@ class TestCarry(unittest.TestCase):
                   f"GET repos/{R}/compare/*": {"status": status},
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws, contextlib.redirect_stdout(io.StringIO()):
-            (ws / "review.json").write_text(json.dumps({"outside_diff": [], **(review or {}),
+            (ws / "review.json").write_text(json.dumps({"outside_diff": [], "inline": {}, **(review or {}),
                                                         "live_test": {"run": run, "checks": checks,
                                                                       "untestable": untestable}}))
             out, _ = step(gpu_review.carry, routes, pr="7", head_sha="1" * 40, runner_temp=temp,
@@ -240,7 +248,13 @@ class TestCarry(unittest.TestCase):
         p1 = {"priority": "P1", "claim": "c", "location": "mstar/engine/engine.py:10", "detail": "d"}
         for review, threads, why in [({"outside_diff": [p1]}, (), "engine.py:10 (P1)"),
                                      ({}, [thread(4, "**[P2]** an inline finding")], "inline 4 (P2)"),
-                                     ({"skipped": ["a.py"]}, (), "the review skipped files")]:
+                                     ({"skipped": ["a.py"]}, (), "the review skipped files"),
+                                     ({"inline": {"4": "P2"}}, (), "deleted or retagged since the bot"),
+                                     ({"inline": {"4": "P2"}}, [thread(4, "**[P3]** retagged")],
+                                      "deleted or retagged since the bot"),
+                                     ({}, [thread(4, "**[P3]** x", edited="2026-11-09T00:00:00Z")], "inline 4 (P0)"),
+                                     ({"prior_findings": [{"ref": "4", "status": "fixed", "why": "w"}]},
+                                      [thread(4, "**[P3]** x", edited="2026-11-09T00:00:00Z")], "inline 4 (P0)")]:
             with self.subTest(why):
                 self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review=review,
                                             threads=threads)[0], {"gated": "true"}, "a box would start")
@@ -407,6 +421,12 @@ class TestComment(unittest.TestCase):
         name = "x](http:/evil.example/y.png"
         _, text = self.comment(f"![a](media/{name})\n", [(name, 10)], media_url="https://o.github.io/m/pr-7/1")
         self.assertIn("media/x%5D%28http%3A/evil.example/y.png)", text, "a file's name would make a link to anywhere")
+        out, text = self.comment("![q](media/a%20b%23.png)\n", [("a b#.png", 10)],
+                                 media_url="https://o.github.io/m/pr-7/1")
+        self.assertIn("![q](https://o.github.io/m/pr-7/1/media/a%20b%23.png)", text,
+                      "a quoted path in the report wouldn't link")
+        self.assertIn('src="media/a%20b%23.png"', (out / "site/index.html").read_text(),
+                      "a name with a space or # would break in the gallery")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
         cap = unittest.mock.patch.object(gpu_review, "MEDIA_CAP", 1000)
@@ -425,7 +445,7 @@ class TestComment(unittest.TestCase):
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD):
+                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -439,7 +459,7 @@ class TestApprove(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
                 "outside_diff": list(outside), "prior_findings": [], "questions": [], "skipped": [],
-                "risk": {"level": risk, "reason": "docs only", "look_at": []},
+                "inline": inline or {}, "risk": {"level": risk, "reason": "docs only", "look_at": []},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
                               "untestable": untestable}}))
             if above is not None:
@@ -473,6 +493,12 @@ class TestApprove(unittest.TestCase):
                                        {"filename": "docs/x.rst", "changes": 1,
                                         "patch": "@@ -1 +1 @@\n+runs on ROCm"}]},
                                     "can't cover this: rocm"),
+                                   ("a finding deleted after the run posted it", {"inline": {"4": "P1"}},
+                                    "deleted or retagged since the bot"),
+                                   ("a finding retagged after the run posted it", {
+                                       "inline": {"4": "P1"},
+                                       "extra": {"POST graphql": threads_page(thread(4, "**[P3]** low"))}},
+                                    "deleted or retagged since the bot"),
                                    ("a diff that can't be read", {"files": [
                                        {"filename": "docs/x.rst", "changes": 9000}]}, "couldn't read the diff")):
             with self.subTest(name):

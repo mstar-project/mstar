@@ -42,9 +42,10 @@ import gpu as gpu_py  # noqa: E402  (gpu.py's functions, for what its command li
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
 NEVER_DIRS = (".github/", "scripts/", "docker/", "tools/", "packaging/")
-NEVER_ANY_DEPTH = {".cargo", ".claude"}  # the tools read these from wherever they sit, at any depth
+NEVER_ANY_DEPTH = {".cargo", ".claude", ".husky"}  # the tools read these from wherever they sit, at any depth
 NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pyproject.toml", "setup.py", "setup.cfg",
-               "Cargo.toml", "rust-toolchain.toml", "uv.toml", "requirements*.txt", ".gitmodules")
+               "Cargo.toml", "rust-toolchain", "rust-toolchain.toml", "uv.toml", "requirements*.txt", ".gitmodules",
+               ".mcp.json", ".claude.json", ".ripgreprc")
 # A submodule's commit in a file's patch, how the compare API shows a gitlink (mode 160000; it gives no mode).
 GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
 # No runtime code: a review's `none` alone approves a change only to these.
@@ -87,13 +88,15 @@ def slurm_allowed(pr, slurm_authors, commenter):
 
 
 def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_authors="", commenter="",
-              max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes=""):
+              max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes="",
+              github_run_attempt="1"):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the runner's ssh key
     (`ssh_key`, REVIEW_SSH_KEY, stored in the environment, one for every Slurm node and Eras; it stays on
     the runner and never reaches the box). The Slurm nodes only with that key and for a run `slurm_allowed`
     lets use them; Eras only with that key and ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of
     nodes, each with its name, host, port and pinned host key, and optionally any other field of gpu.py's
-    node. ERAS_CACHE_VOLUMES: the Eras cache volumes' ids, space-separated."""
+    node. ERAS_CACHE_VOLUMES: the Eras cache volumes' ids, space-separated. A re-run (`github_run_attempt`, which
+    Actions sets, above 1) never gets Slurm: it runs whatever the branch is by then, on the first attempt's request."""
     pr = int(pr)
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
@@ -115,7 +118,7 @@ def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_author
         for host in {n["host"], n["host"].split("@")[-1]}:
             print(f"::add-mask::{host}")
     slurm = []
-    if ssh_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
+    if ssh_key and nodes and int(github_run_attempt) == 1 and slurm_allowed(pr, slurm_authors, commenter):
         defaults = {"port": 22, "partition": "background", "nice": 100, "max_gpus": int(max_gpus),
                     "job_prefix": "review-bot", "workdir": "/workspace/review-bot", "gpu": "H200", "vram_gb": 141,
                     "hf_home": "/workspace/shared/hf"}
@@ -211,7 +214,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     an ancestor, a `targeted` run gets that live test's comment (earlier-live-test.md). A failed read of the PR's
     comments fails the step: it never reads as "no earlier live test"."""
     review = json.loads(Path("review.json").read_text())
-    first = to_fix_first(review, pr, "stacked-above.json")
+    first = [*findings_changed(review, pr), *to_fix_first(review, pr, "stacked-above.json")]
     if first:
         Path(runner_temp, "gate.txt").write_text("; ".join(first))
         print("::notice::No live test: the review left open items to fix first.")
@@ -518,10 +521,19 @@ def file_gate(files, repo_root):
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
     areas = {f: set(labels["areas_of"](f, aliases)) for f in files}
     blocked = [f for f in files if f.startswith(NEVER_DIRS) or f.endswith(".lock")
-               or not NEVER_ANY_DEPTH.isdisjoint(Path(f).parts[:-1])
+               or not NEVER_ANY_DEPTH.isdisjoint(Path(f).parts)
                or any(fnmatch.fnmatchcase(Path(f).name, name) for name in NEVER_FILES)]
     runtime = [f for f in files if not areas[f] <= NO_GPU_AREAS]
     return blocked, runtime
+
+
+def findings_changed(review, pr):
+    """Why not to go on, as reasons (none when nothing changed): an inline finding the bot's post step recorded
+    (`review["inline"]`, comment id to priority tag) that is gone or has another tag now, since the rule reads the
+    live thread and a write-access author can edit or delete it."""
+    now = render_summary.inline_findings(review_threads(pr))
+    changed = [f"inline {ref}" for ref, tag in review["inline"].items() if now.get(ref) != tag]
+    return [f"deleted or retagged since the bot posted them: {', '.join(changed)}"] if changed else []
 
 
 def to_fix_first(review, pr, above):
@@ -564,6 +576,7 @@ class ApprovalFacts:
     since: str  # the last passing live test this run built on, or ""
     untestable: tuple  # what the live test can't cover here (untestable)
     too_many_files: bool  # the changed-file list is over GitHub's limit, so it couldn't be checked
+    findings_changed: tuple  # the bot's inline findings someone has deleted or retagged since it posted them
     blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
     runtime: bool  # the PR touches runtime code
     risk_level: str
@@ -576,7 +589,7 @@ def approval_facts(pr, sha, verdict, since, review):
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     # Against the default branch, not the PR's base, so retargeting the PR can't hide a file.
     changes = changed_files(pull["base"]["repo"]["default_branch"], sha)
-    blocked, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), False)
+    blocked, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), ())
     gitlinks = [f["filename"] for f in changes or [] if GITLINK.search(f.get("patch") or "")]
     return ApprovalFacts(
         head_moved=pull["head"]["sha"] != sha,
@@ -587,6 +600,7 @@ def approval_facts(pr, sha, verdict, since, review):
         since=since,
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
+        findings_changed=tuple(findings_changed(review, pr)),
         blocked=(*blocked, *gitlinks),
         runtime=bool(set(runtime) - set(blocked)),  # a gated file already has its own reason
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
@@ -624,6 +638,7 @@ def decide(f):
         note = "; judge its 👂 rows" if f.verdict == "partial" else ""
         rule.append(f"the live test's verdict is {f.verdict}{note}")
     rule += f.untestable
+    rule += f.findings_changed
     if f.too_many_files:
         rule.append("the file list is too long to check")
     if f.blocked:
@@ -720,8 +735,9 @@ def write_gallery(pr, sha, results, site):
         (site / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(p, site / rel)
         kind = MEDIA[p.suffix.lower()]
-        tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
-               else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
+        src = html.escape(urllib.parse.quote(rel, safe="/@"))  # as the comment's links quote it
+        tag = (f'<img src="{src}" loading="lazy">' if kind == "img"
+               else f'<{kind} controls preload="none" src="{src}"></{kind}>')
         rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
     (site / "index.html").write_text(
         "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
@@ -741,7 +757,8 @@ def render_comment(sha, lt, media_url=""):
     rels = {p.relative_to(results).as_posix() for p in files}
 
     def link(m):  # links to the gallery's media point at its copy; images show inline
-        bang, text, rel = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
+        bang, text, raw = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
+        rel = raw if raw in rels else urllib.parse.unquote(raw)  # the report's path may already be URL-quoted
         if rel not in rels or not media_url:
             return m[0]
         # The box picks the name, so a `](` in it stays dead.

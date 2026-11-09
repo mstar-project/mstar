@@ -223,14 +223,32 @@ def carried(review, earlier, answered):
     return review
 
 
+def bot_threads(pages):
+    """(first comment, priority, text after the tag) of every inline thread the bot started, a page of the PR's review
+    threads (GraphQL) at a time. An untagged one counts as a P2, since its priority is unknown and it should still
+    block approval."""
+    for page in pages:
+        for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+            first = thread["comments"]["nodes"][0]
+            if first["author"] and first["author"]["login"] in POSTING_BOTS:
+                match = TAG.match(first["body"])
+                yield first, match[1] if match else "P2", first["body"][match.end() if match else 0:]
+
+
+def inline_findings(pages):
+    """The bot's inline findings as they stand, comment id to priority tag, what a later step checks them against
+    (gpu_review.findings_changed)."""
+    return {str(first.get("databaseId", "")): priority for first, priority, _ in bot_threads(pages)}
+
+
 def open_findings(review, pages, stacked):
     """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
     run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
     later review judged still open. A thread someone resolved stays open: only a later review that judged
-    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
-    unknown and it should still block approval. A finding a PR stacked above fixes isn't open: it lands
-    with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the PR's review
-    threads (GraphQL)."""
+    it fixed, fixed above or moot clears it. A bot thread someone edited counts as an open P0, whatever a
+    later review judged, since the text the review read isn't the bot's. A finding a PR stacked above fixes
+    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the
+    PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
@@ -240,17 +258,15 @@ def open_findings(review, pages, stacked):
         return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
 
     found, counted = [], {f["location"] for f in review["outside_diff"]}
-    for page in pages:
-        for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            first = thread["comments"]["nodes"][0]
-            ref = str(first.get("databaseId", ""))
-            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
-                continue
-            match = TAG.match(first["body"])
-            where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
-            found.append((where, match[1] if match else "P2",
-                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
-            counted.add(ref)
+    for first, priority, text in bot_threads(pages):
+        ref = str(first.get("databaseId", ""))
+        edited = first.get("lastEditedAt")
+        if ref in cleared and not edited:
+            continue
+        where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
+        found.append((where, "P0", "someone edited this finding after the bot posted it; a person decides") if edited
+                     else (where, priority, what(ref, text.strip().split("\n")[0])))
+        counted.add(ref)
     found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
               for f in review["outside_diff"] if not f.get("fixed_in")]
     # Judged still open, with no thread or outside_diff item here to count it by.

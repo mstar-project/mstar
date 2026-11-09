@@ -1,2 +1,6 @@
-# A person must approve anything under .github/: workflows there can read the review-bot environment.
+# A person must approve these: workflows can read the review-bot environment, and the bot's jobs that hold its keys
+# import .claude/'s scripts and load its settings and MCP config.
 /.github/ @dghosef @NSagan271 @merceod
+/.claude/ @dghosef @NSagan271 @merceod
+/.mcp.json @dghosef @NSagan271 @merceod
+/.claude.json @dghosef @NSagan271 @merceod
