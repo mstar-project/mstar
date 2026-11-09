@@ -416,6 +416,11 @@ def _text(**fields):
 
 TEXT_CHAT_CASES = {
     "accepted": _text(temperature=0.3, top_p=0.9, max_tokens=16, seed=2, top_k=5),
+    # one input modality per part, or a model that rebuilds its turns from them keeps only the first
+    "multi-turn": {"model": "glm52", "messages": [
+        {"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"}, {"role": "user", "content": "again"},
+    ]},
     "text-response-format": _text(response_format={"type": "text"}, best_of=1, n=1, logprobs=False),
     "image": {"model": "glm52", "messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is it"},

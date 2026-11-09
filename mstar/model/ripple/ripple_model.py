@@ -46,6 +46,10 @@ class RippleModel(MultimodalDecoderModel):
         # config.json's auto_map would otherwise stop a server at a prompt to run the repo's code
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True, trust_remote_code=False)
 
+    def request_kwargs(self) -> frozenset[str]:
+        # chat_template.jinja reads no enable_thinking: the reasoning stays on, so a request asking it off is ignored
+        return super().request_kwargs() - {"enable_thinking"}
+
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
         return {}

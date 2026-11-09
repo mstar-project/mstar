@@ -11,8 +11,8 @@ class RippleLLMSubmodule(SampledTokenDecoder):
     ATTN_KEY = ATTN_FULL
     # Tokens a step runs (the chunking budget). As on Qwen3.5, whose measurement stops at 9B.
     MAX_BATCH_TOKENS = 2048
-    # No step passes the budget, but four prompts and their decode rows reach 2176
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176]
+    # At the default min_chunk_tokens no step, prefill or mixed, passes the budget
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         # one KV cache, read through a windowed and an unwindowed resource

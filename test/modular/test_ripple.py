@@ -223,6 +223,8 @@ def test_a_chat_through_the_adapter_keeps_every_turn(model_dir, monkeypatch):
         "<|im_start|> assistant be <|im_end|> <|im_start|> user brief <|im_end|> <|im_start|> assistant"
     )
     assert set(model.text_output().stop_token_ids) == {1, 2}
+    # the template has no thinking switch, so a request's enable_thinking is logged as ignored, not dropped silently
+    assert "enable_thinking" not in model.request_kwargs()
 
 
 @pytest.mark.parametrize("rank", [0, 1])

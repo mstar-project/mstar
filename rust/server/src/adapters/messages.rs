@@ -238,7 +238,8 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
         tokens: None,
         text,
         file_paths: BTreeMap::new(),
-        input_modalities: vec!["text".to_string()],
+        // one per part, all text past the refusal: a model that rebuilds its turns from the modalities keeps them all
+        input_modalities: in_mods,
         output_modalities: vec!["text".to_string()],
         model_kwargs: mk,
         parts,
