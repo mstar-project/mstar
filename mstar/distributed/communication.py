@@ -295,7 +295,7 @@ class CommGroup:
         for partner in partners:
             splits[partner] = blocks[0].numel()
         recv = torch.empty_like(blocks)
-        _all_to_all_single(self.device_group, blocks.view(-1), recv.view(-1), splits, splits)
+        _all_to_all_single(self._device_pg(), blocks.view(-1), recv.view(-1), splits, splits)
         return recv
 
     # Eager as a whole, the boundary where the per-rank sizes become the collective's host split

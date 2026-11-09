@@ -146,6 +146,7 @@ class FlashInferManager(AttentionManager):
         self._new_kwargs = dict(
             num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,
+            sm_scale=self._sm_scale,
         )
 
     def resident_refusal(self) -> str | None:

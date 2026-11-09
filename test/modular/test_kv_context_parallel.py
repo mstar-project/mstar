@@ -859,6 +859,17 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
+def test_a_placed_pools_own_tokens_attend_at_the_contexts_sm_scale(monkeypatch):
+    """The two parts merge by log-sum-exp, so a declared ``sm_scale`` must reach both."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
+    attn, _ = _cp_attention(joint, CPU, torch.float32, sm_scale=0.5)
+    _plan(attn, _Case.build(PREFILL_ROWS, CPU, torch.float32))
+    state = attn._current_plan_states["main"]
+    assert state.new.sm_scale == state.context.sm_scale == 0.5
+
+
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
     """A rank attends every partner's query heads over one KV head, a GQA group FlashInfer's
     CUDA-core decode has no kernel for unless it is one of a few sizes."""
