@@ -374,6 +374,8 @@ def _kv_config(tokens):
 
 
 def _engine(rank, group, kv, prefix_cache, graph_runtime):
+    from functools import partial
+
     from mstar.engine.engine import Engine, SubmoduleManagement
     from mstar.engine.resources import StepRunner
 
@@ -381,6 +383,8 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
     if rank == 0:
         engine._tp_leader_nodes, engine._resident_delta = {NODE}, OffloadDelta.new()
+        # as `Engine.__init__` wires it on rank 0, so the follower replays rank 0's reservations
+        kv.journal = partial(engine._journal, pool=KV)
     else:
         engine._tp_follower_nodes = {NODE}
     engine._resources = {KV: kv}

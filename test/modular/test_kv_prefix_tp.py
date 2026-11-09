@@ -442,10 +442,12 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
 
 
-def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts():
+def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts(monkeypatch):
     """Owner counts can differ between ranks, since above one rank a page is filed under a parent only its
     stream holds. A follower that worked out the lent pages from its own evictable set would then count other room
     than rank 0 and could refuse a grant rank 0 makes. Here a cached page has one more owner on the follower."""
+    # the extra owner belongs to no stream, which the debug checks would stop on first
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
