@@ -7,12 +7,10 @@
 //! characters (`len` of a str), and whitespace is what `str.isspace` (and so
 //! `re`'s `\s` and `str.split()`) calls whitespace.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::adapters::SpeechChunking;
+use crate::unicode_marks::MARK_RANGES;
 
 const LATIN_ENDS: [char; 4] = ['.', '!', '?', ';'];
 const CLOSERS: [char; 6] = ['"', '\'', '”', '’', ')', ']'];
@@ -24,10 +22,20 @@ fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
-/// `unicodedata.category(c).startswith("M")`.
+/// `unicodedata.category(c).startswith("M")`, over the table
+/// `scripts/gen_unicode_marks.py` reads out of CPython's `unicodedata` (Unicode
+/// 15.0.0 on the 3.12 the repository tests on, and on 3.13). `regex`'s `\p{M}`
+/// asks the same question of the crate's own Unicode tables, which are newer
+/// and differ on 51 code points, so the two frontends would cut long text in
+/// different places whenever one of those lands on a cut.
+/// `test/modular/test_speech_chunking.py` compares the table with the running
+/// interpreter's `unicodedata`, over every code point.
 fn is_mark(c: char) -> bool {
-    static MARK: OnceLock<Regex> = OnceLock::new();
-    MARK.get_or_init(|| Regex::new(r"\p{M}").unwrap()).is_match(c.encode_utf8(&mut [0; 4]))
+    let c = c as u32;
+    // the ranges are sorted and disjoint, so the last one starting at or below
+    // `c` is the only one that can hold it
+    let after = MARK_RANGES.partition_point(|&(low, _)| low <= c);
+    after > 0 && c <= MARK_RANGES[after - 1].1
 }
 
 fn strip(s: &[char]) -> &[char] {
@@ -174,7 +182,12 @@ fn join(left: &mut Vec<char>, right: &[char]) {
 /// `max_chars` characters. Sentences are cut only when one alone is longer;
 /// a trailing fragment under `min_chars` is merged into its predecessor.
 /// `[text]` when nothing needs splitting, `[]` for blank input.
+///
+/// Panics on a `max_chars` of zero, which Python refuses with
+/// `ValueError("max_chars must be positive")`. It comes from the adapter, so a
+/// zero is a bad build rather than anything a client can ask for.
 pub fn split_sentences(text: &str, max_chars: usize, min_chars: usize) -> Vec<String> {
+    assert!(max_chars > 0, "max_chars must be positive");
     let chars: Vec<char> = text.chars().collect();
     let text = strip(&chars);
     if text.is_empty() {
@@ -225,6 +238,11 @@ pub fn split_sentences(text: &str, max_chars: usize, min_chars: usize) -> Vec<St
 /// unchunked). `requested` is the request's `sentence_chunking`: `false`
 /// never splits, any other value always does, and absent or `null` splits
 /// inputs of at least the adapter's `min_chars`.
+///
+/// A `max_chars` of zero is refused here with the text Python's `ValueError`
+/// carries, and only where Python would raise it: an input this never splits is
+/// returned whole on both sides. The route answers the refusal as the Python
+/// one answers that `ValueError`, a 400 with the message.
 pub fn plan_chunks(
     requested: Option<&Value>,
     chunking: &SpeechChunking,
@@ -234,6 +252,9 @@ pub fn plan_chunks(
     let short = chunking.min_chars.is_none_or(|min| input.chars().count() < min);
     if requested == Some(&Value::Bool(false)) || (requested.is_none() && short) {
         return Ok(vec![input.to_string()]);
+    }
+    if chunking.max_chars == 0 {
+        return Err("max_chars must be positive".to_string());
     }
     let chunks = split_sentences(input, chunking.max_chars, 24);
     if chunks.len() > chunking.max_pieces {
@@ -311,6 +332,50 @@ mod tests {
         assert_eq!(chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), [300, 300, 302]);
         assert!(chunks.iter().all(|c| !is_mark(c.chars().next().unwrap())), "{chunks:?}");
         assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn the_mark_table_is_canonical_and_answers_for_the_interpreter() {
+        for (i, &(low, high)) in MARK_RANGES.iter().enumerate() {
+            assert!(low <= high && high <= char::MAX as u32, "{i}: {low:#x}..={high:#x}");
+            if i > 0 {
+                let before = MARK_RANGES[i - 1].1;
+                assert!(before + 1 < low, "{i}: {before:#x} runs into {low:#x}");
+            }
+        }
+        // the ends of a range, a code point between two, and non-marks around them
+        assert!(is_mark('\u{300}') && is_mark('\u{36f}') && is_mark('\u{310}'));
+        assert!(!is_mark('\u{2ff}') && !is_mark('\u{370}') && !is_mark('a'));
+        // unassigned in the interpreter's Unicode 15.0.0, a mark in the one
+        // `regex` carries: the table answers for the interpreter. A table
+        // regenerated from an interpreter whose Unicode has U+0897 assigned
+        // moves this case and the even-cut one below.
+        assert!(!is_mark('\u{897}') && is_mark('\u{898}'));
+    }
+
+    #[test]
+    fn an_even_cut_on_a_code_point_only_regex_calls_a_mark_does_not_move() {
+        // `unicodedata` has U+0897 unassigned, so Python cuts at 267 and so must we
+        let text = format!("{}\u{897}{}", "a".repeat(267), "b".repeat(533));
+        let chunks = split_sentences(&text, 400, 24);
+        assert_eq!(chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), [267, 267, 267]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_chars must be positive")]
+    fn a_max_chars_of_zero_is_refused_as_python_refuses_it() {
+        split_sentences("a. b.", 0, 24);
+    }
+
+    #[test]
+    fn a_max_chars_of_zero_is_a_refusal_where_python_raises_and_nowhere_else() {
+        let zero = SpeechChunking { max_chars: 0, ..CHUNKED };
+        let err = plan_chunks(None, &zero, &(0..12).map(sentence).collect::<Vec<_>>().join(" "));
+        assert_eq!(err.unwrap_err(), "max_chars must be positive");
+        // what Python never splits it never measures either
+        assert_eq!(plan_chunks(Some(&json!(false)), &zero, "Hi.").unwrap(), ["Hi."]);
+        assert_eq!(plan_chunks(None, &zero, "Hi.").unwrap(), ["Hi."]);
     }
 
     #[test]

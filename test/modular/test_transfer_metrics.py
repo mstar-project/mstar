@@ -326,7 +326,7 @@ def _bare_worker(tmp_path, scheduler):
         scheduler=scheduler,
     )
     metrics = make_worker(**fields)._start_metrics(3600.0)
-    return make_worker(**fields, _metrics=metrics)
+    return make_worker(**fields, metrics=metrics)
 
 
 def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path):

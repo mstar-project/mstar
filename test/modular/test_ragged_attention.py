@@ -3,9 +3,9 @@ plans it, and both under CUDA-graph capture.
 
 The load-bearing property throughout: a graph captured once per bucket can be
 re-planned before each replay against a different varlen layout, with the
-segment count padded out by zero-length segments. Everything runs at
+segment count padded out by zero-length segments. Almost everything runs at
 head_dim=72, which FlashInfer has no kernel for, so the pad-to-128 path is
-always exercised.
+exercised.
 
 CPU-only head-dimension validation lives in ``test_ragged_attention_cpu.py``.
 """
@@ -81,10 +81,10 @@ def cu(seg_lens: list[int]) -> torch.Tensor:
     return torch.tensor(out, dtype=torch.int32)
 
 
-def qkv(total: int, seed: int = 0):
+def qkv(total: int, seed: int = 0, head_dim: int = HEAD_DIM):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     return tuple(
-        torch.randn(total, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE, generator=gen)
+        torch.randn(total, HEADS, head_dim, dtype=DTYPE, device=DEVICE, generator=gen)
         for _ in range(3)
     )
 
@@ -97,7 +97,7 @@ def ref(q, k, v, cu_seqlens, causal=False):
         if end <= start:
             continue
         qs, ks, vs = (t[start:end].transpose(0, 1).unsqueeze(0).float() for t in (q, k, v))
-        o = F.scaled_dot_product_attention(qs, ks, vs, scale=HEAD_DIM ** -0.5, is_causal=causal)
+        o = F.scaled_dot_product_attention(qs, ks, vs, scale=q.shape[-1] ** -0.5, is_causal=causal)
         out[start:end] = o.squeeze(0).transpose(0, 1).to(out.dtype)
     return out
 
@@ -120,9 +120,9 @@ def wrapper(**overrides) -> FlashInferRaggedPrefillWrapper:
     return FlashInferRaggedPrefillWrapper(**kwargs)
 
 
-def graph_wrapper() -> FlashInferRaggedPrefillWrapper:
+def graph_wrapper(**overrides) -> FlashInferRaggedPrefillWrapper:
     return wrapper(
-        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True
+        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True, **overrides,
     )
 
 
@@ -165,7 +165,7 @@ def test_eager_accepts_device_cu_seqlens():
 
 def capture_wrapper(w):
     static = tuple(
-        torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3)
+        torch.zeros(MAX_TOKENS, HEADS, w.head_dim, dtype=DTYPE, device=DEVICE) for _ in range(3)
     )
     w.plan(cu([MAX_TOKENS // MAX_SEGMENTS] * MAX_SEGMENTS))
     stream = torch.cuda.Stream()
@@ -183,7 +183,7 @@ def capture_wrapper(w):
 
 def replay(w, graph, static, out, seg_lens, seed=0):
     total = sum(seg_lens)
-    q, k, v = qkv(total, seed=seed)
+    q, k, v = qkv(total, seed=seed, head_dim=w.head_dim)
     layout = cu(seg_lens)
     w.plan(layout)
     for buf, real in zip(static, (q, k, v), strict=True):
@@ -219,9 +219,11 @@ def test_graph_replay_survives_a_poisoned_output_tail():
     overread additively. Finite values die correctly but NaN/Inf survive
     (NaN + -inf = NaN), so a poisoned output tail, from which the next layer's
     KV is built, would corrupt the last segment's real rows. The captured graph
-    zeros its output on every replay, so no such value can be there.
+    zeros its output's unplanned rows on every replay, so no such value can be
+    there. At a head dim FlashInfer has, so ``out`` is the buffer the kernel
+    writes rather than a copy of it.
     """
-    w = graph_wrapper()
+    w = graph_wrapper(head_dim=128)
     graph, static, out = capture_wrapper(w)
     seg_lens = [100, 60, 30, 0]
     total = sum(seg_lens)
