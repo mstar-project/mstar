@@ -665,3 +665,29 @@ Both wheels install the same files, so installing an extra again puts the CUDA 1
 Repeat the swap afterwards.
 
 Next: :doc:`quickstart`.
+
+.. _voxcpm2-h200-solve:
+
+VoxCPM2 H200 solve
+-----------------
+
+The optional BF16 batch-one solve uses cuBLASLt and a CUTLASS/CuTe gate kernel.
+It is built locally before graph capture; install Ninja, a C++ compiler and a
+CUDA toolkit with Hopper support (validated with CUDA 12.9 and PyTorch 2.10
+cu128). Point ``CUTLASS_ROOT`` at this clean, pinned CUTLASS checkout:
+
+.. code-block:: bash
+
+   git clone https://github.com/NVIDIA/cutlass.git
+   git -C cutlass checkout b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd
+   export CUTLASS_ROOT="$(pwd)/cutlass"
+   export CUDA_HOME=/usr/local/cuda
+   export PATH="$CUDA_HOME/bin:$PATH"
+   mstar serve voxcpm2 --gpus 0
+
+``mstar.utils.voxcpm2_solve.prepare`` enables the specialization on H200 for
+the supported checkpoint dimensions, BF16 inference and a ten-step schedule.
+Other batches and schedules use the existing implementation. Without
+``CUTLASS_ROOT``, serving uses the existing implementation throughout; a
+configured but incompatible checkout or failed build raises at startup.
+The extension sources and CUTLASS license notice ship with the package.

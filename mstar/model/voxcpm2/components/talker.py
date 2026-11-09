@@ -47,6 +47,7 @@ class VoxCPM2Generator(nn.Module):
     def __init__(self, config: VoxCPM2Config, comm_group: CommGroup | None = None):
         super().__init__()
         self.config = config
+        self.patch_solver = None
         lm = config.lm
         hidden, dit_hidden = lm.hidden_size, config.dit.hidden_size
         self.base_lm = MiniCPMLM(
@@ -81,6 +82,9 @@ class VoxCPM2Generator(nn.Module):
         self.residual_lm.materialize_buffers()
         self.feat_encoder.encoder.materialize_buffers()
         self.feat_decoder.estimator.decoder.materialize_buffers()
+        from mstar.utils.voxcpm2_solve import prepare
+
+        self.patch_solver = prepare(self)
 
     def load_weights(self, weights) -> set[str]:
         from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
@@ -108,6 +112,11 @@ class VoxCPM2Generator(nn.Module):
     ) -> torch.Tensor:
         """One CFM solve per row: ``[rows, patch, feat]`` from the two LM states,
         the previous patch (``cond_patch``) and ``noise`` (``[rows, feat, patch]``)."""
+        if (
+            self.patch_solver is not None and not torch.is_grad_enabled()
+            and self.patch_solver.supports(lm_hidden, res_hidden, cond_patch, noise, cfg_value, t_span)
+        ):
+            return self.patch_solver(lm_hidden, res_hidden, cond_patch, noise, cfg_value, t_span)
         mu = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(res_hidden)], dim=-1)
         patch = solve_cfm(
             self.feat_decoder.estimator,
