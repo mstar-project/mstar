@@ -436,20 +436,20 @@ class Rebuilds:
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None, skip_rids: Collection[int] = (),
-    ) -> None:
-        """Append each kept row's sample, from the stop check's host copy, to its kept ids, or forget them when the
-        sample is one of the policy's ``pad_ids``. ``skip_rids`` are rows whose sample is not real, as for
-        `Engine.step_finished`."""
+    ) -> list[int]:
+        """Append each kept row's sample, from the stop check's host copy, to its kept ids, or forget the ids of a
+        row with host copies when the sample is one of the policy's ``pad_ids``. Returns the requests whose ids it
+        forgot. ``skip_rids`` are rows whose sample is not real, as for `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
-            return
+            return []
         name = self._policies[node].sample_output
         ctx = node_batch.step_context
         if host_rows is not None:
             tokens = host_rows.buffers.get(name)
             if not torch.is_tensor(tokens) or tokens.dim() == 0:
-                return
+                return []
             if tokens.dim() > 1 and tokens[0].numel() != 1:
                 raise ValueError(self._not_one_id(node, name, tokens[0].numel()))
             # the sampler's [B] output skips the reshape, which costs more than the rest of this method
@@ -465,15 +465,17 @@ class Rebuilds:
                 if sample.numel() != 1:
                     raise ValueError(self._not_one_id(node, name, sample.numel()))
                 pairs.append((rid, int(sample)))
-        pads = self._policies[node].pad_ids
+        pads, forgot = self._policies[node].pad_ids, []
         for rid, token in pairs:
             kept = kept_ids.get(rid)
             # the host rows are the forward's, which can hold a row the worker has since taken out of the step
             if kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids:
-                if token in pads:
+                if token in pads and kept.copies is not None:
                     self._forget(node, rid)
+                    forgot.append(rid)
                 else:
                     kept.sampled.append(token)
+        return forgot
 
     @staticmethod
     def _not_one_id(node: str, name: str, count: int) -> str:

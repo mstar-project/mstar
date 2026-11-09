@@ -5,7 +5,7 @@ outlives a call."""
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -119,6 +119,12 @@ class Preemption:
         kept = self._rebuilds.kept(rid, node_name)
         if rid in self._preempted and kept is not None:
             self._preempted[rid].returned_at = len(kept.sampled)
+
+    def refuse_drops(self, rids: Collection[int], node_name: str) -> None:
+        """Tell each paged KV cache of ``node_name`` that no drop can free ``rids``, whose ids the node forgot."""
+        for rid in rids:
+            for key in self._keys[node_name]:
+                self._caches[key].cache.refuse_drops(rid)
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)

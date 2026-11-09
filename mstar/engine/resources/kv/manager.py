@@ -4376,25 +4376,37 @@ class KVManager(AttentionResource):
         if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
             self._cpu_pool.unreserve(rid)
 
+    def refuse_drops(self, rid: str) -> None:
+        """Mark ``rid``, admitted as a request a drop here can free, as one no drop can free from now on. As for a
+        request marked so at its arrival, the host sets aside room for the pages it holds, or it turns guaranteed
+        when the host has none (`_cover_move`)."""
+        with self._lock:
+            self._overrides[rid] = replace(self._overrides[rid], rebuildable=False)
+            if rid in self._allotments:
+                self._cover_move(rid, 0)
+
     def _guarantee(self, rid: str) -> None:
-        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
+        """Make ``rid`` guaranteed, since no host has room to set aside for its move."""
         self._guaranteed.add(rid)
-        self._cpu_pool.unreserve(rid)
-        self._cpu_pool.count_guaranteed(rid)
+        if self._cpu_pool is not None:
+            self._cpu_pool.unreserve(rid)
+            self._cpu_pool.count_guaranteed(rid)
 
     def _cover_move(self, rid: str, n: int) -> int:
-        """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
-        when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
-        nothing."""
-        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
-        if reserved is None:
+        """Grow the room the host sets aside for ``rid``, a request no drop here can free, by the ``n`` pages it is
+        about to take, or guarantee ``rid`` when the host has no room for them. Returns the pages its guarantee is
+        short of, before which ``rid`` takes nothing."""
+        if not self._decides or self._overrides[rid].rebuildable or rid in self._guaranteed:
             return 0
         # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
         held = sum(
             len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
             for stream in self._streams[rid].values()
         )
-        if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
+        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
+        if (reserved is not None and held + n <= reserved) or (
+            self._cpu_pool is not None and self._cpu_pool.reserve(rid, held + n)
+        ):
             return 0
         allotment = self._allotments[rid]
         # a lease's lent pages stay in a guaranteed allotment until `_adopt` takes them off
