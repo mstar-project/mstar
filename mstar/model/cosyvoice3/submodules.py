@@ -282,6 +282,11 @@ class LMSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Captured LM prefills, packed, by total tokens. A prefill they don't hold
+    # runs eagerly, about 30 ms of launches stalling its worker's decode. A
+    # deployment sets its own with the serving config's `prefill_token_buckets`
+    # (`{llm: {prefill_voice: [...]}}`).
+    LM_PREFILL_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024]
 
     def __init__(self, model: nn.Module, config: CosyVoice3Config):
         super().__init__()
@@ -552,12 +557,12 @@ class LMSubmodule(ARNodeSubmodule):
                 compile=False,
             )
         ]
-        if self.config.lm_prefill_token_buckets:
+        if self.config.lm_prefill_batch_sizes:
             configs.append(
                 PackedAcceleratorGraphConfig(
                     capture_graph_walk="prefill_voice",
                     replay_graph_walks=list(PREFILL_WALKS),
-                    capture_token_lengths=list(self.config.lm_prefill_token_buckets),
+                    capture_token_lengths=list(self.LM_PREFILL_TOKEN_BUCKETS),
                     make_node_input=lambda n: ARNodeInputs(
                         input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
                         input_seq_len=n,

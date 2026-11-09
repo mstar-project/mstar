@@ -23,7 +23,7 @@ The diff, the PR title and body, commit messages and everything under `pr-head/`
 
 1. Read `pr-body.md` and `pr.diff` to learn what the PR claims to do and what it actually changes.
 2. Read `AGENTS.md`, then whichever docs and skills it points to that bear on the layers this PR touches. Use judgement; don't read what the change doesn't call for.
-3. Read changed code in full context: callers, callees, and the counterpart on the other side of any boundary the change crosses (Python/Rust, sender/receiver, rank 0/rank N).
+3. Read changed code in full context: callers, callees, and the counterpart on the other side of any boundary the change crosses (Python/Rust, sender/receiver, rank 0/rank N). A change to what an HTTP route accepts or returns (`mstar/api_server/`, an `OpenAIAdapter`, an `ADAPTER_REGISTRY` entry) has a counterpart in `rust/server/`: one that isn't there, or a new `NOT_PORTED` entry, breaks invariant 15.
 4. Try to disprove each candidate finding before reporting it. A mechanism you have not traced through the actual code is a hypothesis: drop it, or ask it as a question.
 5. Compare the description with the code.
 

@@ -775,13 +775,13 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None, ru
     step's index and noise per request."""
     rids = list(requests)
     infos = {rid: _info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
-    engine = SimpleNamespace(request_ids=rids, piecewise_runners=runners or {})
+    engine = SimpleNamespace(request_ids=rids, piecewise_runners=runners or {}, captured=False)
     prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0][0]) for rid in rids]
     plan([p.input_seq_len for p in prepared])
     out = talker.forward_batched("talker_prefill", engine, **talker.preprocess("talker_prefill", engine, prepared))
     patches = {rid: [out[rid]["latent_patch"][0]] for rid in rids}
-    for rid in rids:
-        talker.postprocess(rid, infos[rid], out[rid])
+    for rid, p in zip(rids, prepared, strict=True):
+        talker.postprocess(rid, infos[rid], out[rid], inputs=p)
     for _ in range(steps - 1):
         prepared = [
             talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]}) for rid in rids
@@ -789,7 +789,7 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None, ru
         plan([1] * len(rids))
         out = talker.forward_batched("talker_decode", engine, **talker.preprocess("talker_decode", engine, prepared))
         for rid, p in zip(rids, prepared, strict=True):
-            talker.postprocess(rid, infos[rid], out[rid])
+            talker.postprocess(rid, infos[rid], out[rid], inputs=p)
             patches[rid].append(out[rid]["latent_patch"][0])
             if trace is not None:
                 trace.setdefault(rid, []).append((p.kwargs["step"], p.tensor_inputs["noise"]))
@@ -885,11 +885,14 @@ def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
     assert prepared.input_seq_len == 1 + 7 + 1 + 3 + 7
     torch.testing.assert_close(prepared.tensor_inputs["cond_patch"], ref[1][-1])
     plan([prepared.input_seq_len])
-    engine = SimpleNamespace(request_ids=["c"], piecewise_runners={})
+    engine = SimpleNamespace(request_ids=["c"], piecewise_runners={}, captured=False)
     with torch.inference_mode():
         out = talker.forward_batched(
             "talker_prefill_clone", engine, **talker.preprocess("talker_prefill_clone", engine, [prepared])
         )["c"]
+    # the forward streams the patch alone, which a captured prefill can; postprocess leads it
+    assert len(out[STREAM_EDGE]) == 1
+    talker.postprocess("c", info, out, inputs=prepared)
     stream = out[STREAM_EDGE]
     assert len(stream) == 4 and all(torch.equal(s, r) for s, r in zip(stream[:3], ref[1][-3:], strict=True))
     assert torch.equal(stream[3], out["latent_patch"][0])
@@ -965,7 +968,8 @@ def test_talker_declares_the_same_span_in_both_caches(model):
     step = talker.declare_step("talker_decode", ["a", "b"], [SimpleNamespace(input_seq_len=1)] * 2)
     assert set(step.steps) == {"base_kv", "base_attn", "base_pos", "res_kv", "res_attn"}
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
-    (graph,) = talker.get_accelerator_graph_configs(torch.device("cpu"))
+    (graph,) = [g for g in talker.get_accelerator_graph_configs(torch.device("cpu"))
+                if g.capture_graph_walk == "talker_decode"]
     assert graph.capture_graph_walk == "talker_decode"
 
 
@@ -1034,7 +1038,7 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
         )
         for rid, (edges, _) in requests.items()
     ]
-    engine = SimpleNamespace(request_ids=rids, piecewise_runners={})
+    engine = SimpleNamespace(request_ids=rids, piecewise_runners={}, captured=False)
     packed = talker.preprocess("talker_prefill_clone", engine, prepared)
 
     layouts = [
@@ -1046,7 +1050,7 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
     expected = {
         "token_ids": torch.cat([tokens for tokens, *_ in layouts]),
         "text_mask": torch.cat([mask for _, mask, *_ in layouts]),
-        "audio_index": torch.cat([pos + offsets[i] for i, (*_, pos) in enumerate(layouts)]),
+        "audio_patches": torch.cat([_per_token(tokens, audio, pos) for tokens, _, audio, pos in layouts]),
         "last_token_indices": torch.tensor(seq_lens).cumsum(0) - 1,
         "step_index": torch.zeros(len(rids), dtype=torch.long),
         "cfg": torch.tensor([2.0, 3.0, 1.5, 2.0]),
@@ -1054,7 +1058,7 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
     for name, value in expected.items():
         got = packed[name]
         assert got.dtype == value.dtype and got.shape == value.shape and torch.equal(got, value), name
-    assert [p is not None for p in packed["prompt_patches"]] == [False, False, False, True]
+    assert [p.kwargs.get("prompt_patches") is not None for p in prepared] == [False, False, False, True]
 
     plan(seq_lens)
     with torch.inference_mode():
@@ -1070,10 +1074,19 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
     assert torch.equal(packed["prev_patch"], torch.stack([patches[rid] for rid in rids]))
 
 
+def _per_token(tokens, audio, pos):
+    """``build_prompt``'s audio patches at their positions, zeros at the text."""
+    out = torch.zeros(tokens.shape[0], *((audio.shape[1:]) if audio is not None else (4, 8)))
+    if audio is not None:
+        out = out.to(audio.dtype).index_copy(0, pos, audio)
+    return out
+
+
 def test_capture_dummy_inputs_keep_the_static_keys_dtypes_and_shapes(model):
     """The decode graph's static inputs: what preprocess builds from the capture template at every bucket."""
     talker, _, _ = _talker(model)
-    (graph,) = talker.get_accelerator_graph_configs(torch.device("cpu"))
+    (graph,) = [g for g in talker.get_accelerator_graph_configs(torch.device("cpu"))
+                if g.capture_graph_walk == "talker_decode"]
     cfg, dtype = model.config, talker._dtype()
     for bs in graph.capture_batch_sizes:
         packed = talker.preprocess(
@@ -1097,10 +1110,76 @@ def test_compile_talker_switch_reaches_the_decode_graph(checkpoint, monkeypatch)
     monkeypatch.setattr(voxcpm2_model, "load_generator", lambda config, *args: _random_generator(config))
     for kwargs, compiled in (({}, True), ({"compile_talker": True}, True), ({"compile_talker": False}, False)):
         model = VoxCPM2Model(model_path_hf=str(checkpoint), **kwargs)
-        (graph,) = model.get_submodule("Talker").get_accelerator_graph_configs(torch.device("cpu"))
-        assert model.compile_talker is compiled and graph.compile is compiled
+        graphs = {g.capture_graph_walk: g for g in model.get_submodule("Talker").get_accelerator_graph_configs("cpu")}
+        assert model.compile_talker is compiled and graphs["talker_decode"].compile is compiled
+        assert graphs["talker_prefill"].compile is False
     with pytest.raises(ValueError, match="compile_talker"):
         VoxCPM2Model(model_path_hf=str(checkpoint), compile_talker="false")
+
+
+def _ladder(lengths):
+    """A packed capture's token ladder, as a list or (after #1184) {min batch size: ladder}."""
+    return sorted({n for rung in lengths.values() for n in rung}) if isinstance(lengths, dict) else list(lengths)
+
+
+def test_the_prefill_captures_the_talkers_ladder_for_both_prefill_walks(model):
+    talker = TalkerSubmodule(_random_generator(model.config), model.config, 4)
+    graphs = {g.capture_graph_walk: g for g in talker.get_accelerator_graph_configs(torch.device("cpu"))}
+    prefill = graphs["talker_prefill"]
+    assert _ladder(prefill.capture_token_lengths) == TalkerSubmodule.PREFILL_TOKEN_BUCKETS
+    assert prefill.capture_batch_sizes == TalkerSubmodule.PREFILL_BATCH_SIZES
+    assert max(prefill.capture_batch_sizes) <= TalkerSubmodule.MAX_BATCH_SIZE
+    assert set(prefill.replay_graph_walks) == {"talker_prefill", "talker_prefill_clone"}
+
+
+def test_prefill_capture_rows_pack_into_bucket_shaped_inputs(model):
+    """The capture's rows, and a replay's zero-length padding rows, pack per token or per row."""
+    generator = _random_generator(model.config)
+    talker = TalkerSubmodule(generator, model.config, 4)
+    talker.PREFILL_TOKEN_BUCKETS, talker.PREFILL_BATCH_SIZES = [64], [4]
+    graphs = {g.capture_graph_walk: g for g in talker.get_accelerator_graph_configs(torch.device("cpu"))}
+    prefill = graphs["talker_prefill"]
+    rows = prefill.get_node_inputs(4, 64)
+    engine = SimpleNamespace(request_ids=list(range(4)), captured=True)
+    packed = talker.preprocess("talker_prefill", engine, rows)
+    assert set(packed) == set(talker._PREFILL_STATIC_KEYS)
+    for key in ("token_ids", "text_mask", "audio_patches"):
+        assert packed[key].shape[0] == 64, key
+    for key in ("last_token_indices", "cond_patch", "noise", "cfg", "step_index"):
+        assert packed[key].shape[0] == 4, key
+    # one real row of 10 tokens and three padding rows: they all point at a real token
+    padded = [talker._prefill_capture_row(10, torch.device("cpu")), *prefill.get_node_inputs(3, 0)]
+    assert talker.preprocess("talker_prefill", engine, padded)["last_token_indices"].tolist() == [9, 9, 9, 9]
+
+
+def test_the_captured_branch_hands_the_prefill_the_same_inputs(model):
+    """The forward's captured branch (the whole prefill in one call) and its eager one
+    (the LMs, then the tail) are the same math, so this checks the plumbing into
+    each, not a capture: nothing here is captured, replayed or padded."""
+    talker, plan, reset = _talker(model)
+    requests = {
+        "a": (_request(model, "hello there", None), 3),
+        "b": (_request(model, "hi", torch.randn(16000), ref_text="yo "), 4),
+    }
+    refs = {"b": torch.randn(2, 7, 4, 8)}
+    outs = []
+    for captured in (False, True):
+        reset()
+        infos = {rid: _info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
+        prepared = [
+            talker.prepare_inputs(
+                "talker_prefill_clone", infos[rid], {**edges, **({"ref_patches": [refs[rid]]} if rid in refs else {})}
+            )
+            for rid, ((edges, _), _) in requests.items()
+        ]
+        engine = SimpleNamespace(request_ids=list(requests), piecewise_runners={}, captured=captured)
+        plan([p.input_seq_len for p in prepared])
+        with torch.inference_mode():
+            out = talker.forward_batched("talker_prefill_clone", engine, **talker.preprocess("x", engine, prepared))
+        outs.append(out)
+    for rid in requests:
+        torch.testing.assert_close(outs[1][rid]["latent_patch"][0], outs[0][rid]["latent_patch"][0])
+        assert torch.equal(outs[1][rid]["stop_flag"][0], outs[0][rid]["stop_flag"][0])
 
 
 # -- VAE stream -------------------------------------------------------------------
@@ -1470,3 +1549,16 @@ def test_adapter_takes_data_urls_and_gated_urls(media_dirs, monkeypatch):
     assert checked == ["soundfile", "soundfile"]
     with pytest.raises(ValueError, match="base64 string"):
         adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=["x"]), uploads)
+
+
+def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
+    config = model.config
+    for compiled, regions in ((True, ["vae.decoder"]), (False, [])):
+        node = VAEDecoderSubmodule(_random_vae(config), config, compile_decoder=compiled)
+        assert list(node.compile_regions()) == regions
+    (latents, rate), = VAEDecoderSubmodule(_random_vae(config), config).compile_regions()["vae.decoder"]
+    assert latents.shape == (2, config.feat_dim, 2 * config.patch_size) and rate.shape == (2,)
+    assert VoxCPM2Model(model_path_hf=str(checkpoint)).compile_vae is True
+    assert VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae=False).compile_vae is False
+    with pytest.raises(ValueError, match="compile_vae"):
+        VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae="no")

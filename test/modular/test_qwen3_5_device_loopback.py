@@ -160,7 +160,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
 
     calls = {}
 
-    def build_cos_sin(pos, dtype):
+    def build_text_cos_sin(pos, dtype):
         calls["built"] = pos
         return pos, pos
 
@@ -168,7 +168,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
         """The decoder contract: embed, the stack, logits."""
 
         embed_dtype = torch.float32
-        model = SimpleNamespace(build_cos_sin=build_cos_sin)
+        model = SimpleNamespace(build_text_cos_sin=build_text_cos_sin)
 
         def embed(self, ids):
             calls["ids"] = ids.tolist()
@@ -200,7 +200,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
         return dict(calls)
 
     c = run(True)
-    assert c["ids"] == [9, 9] and c["built"].tolist() == [[10, 20]] * 3 and c["cos"] is not static_cos
+    assert c["ids"] == [9, 9] and c["built"].tolist() == [10, 20] and c["cos"] is not static_cos
     # no lease (an eager step): the inputs are used
     c = run(False)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c

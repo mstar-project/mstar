@@ -78,10 +78,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+        super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -465,7 +464,4 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(
-            model, self.config, self.vision_config, self.encoders,
-            prefill_token_buckets=self.prefill_token_buckets,
-        )
+        return LLMSubmodule(model, self.config, self.vision_config, self.encoders)

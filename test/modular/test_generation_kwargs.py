@@ -56,6 +56,7 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
     ({"return_token_ids": 1}, "return_token_ids"),
+    ({"enable_thinking": "false"}, "enable_thinking"),  # a chat template thinks on "false"
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
@@ -188,7 +189,7 @@ def test_an_unread_key_warns_on_every_request(caplog):
             server._report_ignored_params({"initial_prompt": "x"})
         server._report_ignored_params(
             {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "lora_digest": "d", "max_output_tokens": 4,
-             "return_token_ids": True},
+             "return_token_ids": True, "return_logprobs": True},
         )
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
