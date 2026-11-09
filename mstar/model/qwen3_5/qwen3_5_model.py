@@ -77,6 +77,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         "vocab.json",
         "tokenizer.json",
         "merges.txt",
+        # the tokenizer prefers it to tokenizer_config.json's template, and
+        # some fine-tunes (LightOnOCR-3, Surya) keep their template nowhere else
+        "chat_template.jinja",
     )
     # speculative decoding off unless `__init__` gets a ``draft`` block
     draft: DraftConfig | None = None

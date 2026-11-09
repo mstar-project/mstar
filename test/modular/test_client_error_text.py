@@ -63,7 +63,7 @@ def test_a_decoder_failure_on_an_upload_reaches_the_client_as_an_error_id(tmp_pa
     with pytest.raises(OSError) as raised:
         Image.open(path)
     assert path in str(raised.value)  # the decoder names the upload
-    wt._fail_request("r1", raised.value, "preprocessing", abort=False)
+    wt._fail_request("r1", raised.value, "preprocessing", abort=False, intake=True)
 
     chunk = wt.out_queue.get_nowait()
     text = chunk.data.decode()
@@ -77,7 +77,7 @@ def test_a_deliberate_decoder_refusal_keeps_its_message_without_the_path(tmp_pat
     path = _upload(tmp_path, "3f2a9c_clip.mp4")
     wt = _data_worker()
     wt._fail_request(
-        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False,
+        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False, intake=True,
     )
 
     chunk = wt.out_queue.get_nowait()

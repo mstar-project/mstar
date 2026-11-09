@@ -24,6 +24,7 @@ from mstar.engine.accelerator_graph_runner import (
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    fail_if_required_regions_dropped,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
@@ -1144,6 +1145,12 @@ class Engine:
                 self._device, free / 2**20, plan.floor / 2**20,
             )
 
+        fail_if_required_regions_dropped([
+            f"{node_name} {label} bs={bs} total_tokens={tokens}"
+            for node_name, runners in piecewise.items()
+            for label, runner in runners.items() if runner.required
+            for bs, tokens in runner.dropped_shapes
+        ])
         self._refuse_uncaptured_verify(ag_runners)
 
         fail_if_graphs_required([
