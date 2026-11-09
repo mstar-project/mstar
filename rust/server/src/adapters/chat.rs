@@ -10,7 +10,7 @@ impl OpenAIAdapter for Qwen3_5 {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        text_chat(req, upload_dir, allow_remote)
+        template_kwargs_chat(req, upload_dir, allow_remote)
     }
 }
 

@@ -1917,9 +1917,10 @@ class APIServer:
             self._msg_thread.join(timeout=2)
 
 
-def _resolve_warmup_path(path: str) -> str:
+def _resolve_warmup_path(path: str, cache_dir: str | None = None) -> str:
     """A warmup file is a local path, or ``hf://<owner>/<repo>/<path>`` for a
-    file shipped with a model (its example inputs), taken from the HF cache."""
+    file shipped with a model (its example inputs), taken from the HF cache
+    (``--cache-dir``, as the weights are)."""
     if not path.startswith("hf://"):
         return path
     parts = path[len("hf://"):].split("/", 2)
@@ -1927,7 +1928,7 @@ def _resolve_warmup_path(path: str) -> str:
         raise ValueError(f"hf:// path needs <owner>/<repo>/<path>, got {path!r}")
     from huggingface_hub import hf_hub_download
 
-    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2])
+    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2], cache_dir=cache_dir)
 
 
 @dataclass
@@ -1994,7 +1995,7 @@ class WarmupRequest:
             model_kwargs=model_kwargs,
         )
 
-    def submit(self, server: APIServer, request_id: str) -> str:
+    def submit(self, server: APIServer, request_id: str, cache_dir: str | None = None) -> str:
         """Submit to ``server`` the way ``/generate`` would, ``hf://`` files
         resolved from the cache."""
         file_paths: dict[str, list[str]] = {}
@@ -2002,7 +2003,7 @@ class WarmupRequest:
         for media in self.files:
             paths = file_paths.setdefault(media.modality, [])
             parts.append(PromptPart(modality=media.modality, index=len(paths)))
-            paths.append(_resolve_warmup_path(media.path))
+            paths.append(_resolve_warmup_path(media.path, cache_dir))
         if self.text:
             parts.append(PromptPart(modality="text", text=self.text))
         return server.submit_request(
@@ -2039,6 +2040,7 @@ def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
 
 def _run_warmup_requests(
     server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
+    cache_dir: str | None = None,
 ) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
@@ -2064,7 +2066,7 @@ def _run_warmup_requests(
         return
 
     async def _one(request: WarmupRequest, request_id: str) -> None:
-        await server.collect_results(request.submit(server, request_id))
+        await server.collect_results(request.submit(server, request_id, cache_dir))
 
     async def _all(request: WarmupRequest, base_id: str, n: int) -> None:
         # every copy runs to its end before a failure is reported, so none is
@@ -2842,7 +2844,7 @@ async def generate(
         except json.JSONDecodeError:
             raise   # a downstream parse failure, not a bad request (a 500 below)
         except ValueError as e:   # submit_request's refusals are the client's fault
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            raise HTTPException(status_code=400, detail=scrub_paths(str(e))) from e
 
         if streaming:
             # Substring match, not RFC 7231 q-value parsing: the value is a
@@ -3214,7 +3216,7 @@ def main(argv: list[str] | None = None):
                 "Running %d warmup request(s) before binding, %s%d copies at a time (one per replica)",
                 len(warmups), "each once alone, then " if replicas.fewest < replicas.most else "", replicas.most,
             )
-            _run_warmup_requests(api_server, warmups, replicas)
+            _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
