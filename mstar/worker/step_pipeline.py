@@ -696,8 +696,9 @@ class StepPipeline:
         built on N and lets a step independent of N run.
 
         An uncaught lockstep error may be asymmetric: another rank can still
-        be inside the step's collective and cannot send its next-step verdict.
-        Stop this worker so conductor liveness shuts down its peers.
+        be inside the step's collective and cannot send its next-step verdict
+        (or reach any vote on it). So any raise here, an ordinary OOM included,
+        stops this worker, and conductor liveness shuts down its peers.
         """
         try:
             return pending.future.result()
@@ -882,6 +883,10 @@ class StepPipeline:
         errors = self.lifecycle.take_failures()
         if not errors:
             return
+        fatal = next((err for err in errors.values() if err.fatal), None)
+        if fatal is not None:
+            # The conductor's dead-worker check fails the rest.
+            raise SystemExit(f"Worker {self.worker_id}: fatal device error ({fatal.message})")
         wire_errors = {self._graph_runtime.get_rid_string(rid): msg for rid, msg in errors.items()}
         for wire_rid, msg in wire_errors.items():
             logger.error("Worker %s failing request %s: %s", self.worker_id, wire_rid, msg)

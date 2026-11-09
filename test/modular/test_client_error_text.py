@@ -452,13 +452,3 @@ def test_an_openai_route_keeps_the_status_an_exception_names(monkeypatch, tmp_pa
     assert response.json()["error"]["message"] == str(media_io.AudioTooLongError(1800))
 
 
-@pytest.mark.parametrize("detail", [
-    "CUDA error: an illegal memory access was encountered",
-    "CUDA error: device-side assert triggered",
-    "CUDA error: unspecified launch failure",
-])
-def test_external_kernel_sticky_errors_stop_the_worker(detail):
-    from mstar.utils.client_errors import RequestError
-
-    with pytest.raises(SystemExit, match="fatal device error"):
-        RequestError.from_exception(RuntimeError(detail), "forward failed")

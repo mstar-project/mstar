@@ -25,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import torch
 from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 
@@ -117,6 +118,15 @@ def _pending_batch(rids, future=None):
         node_batch=None, node_name="node",
         partition="default", graph_walk="walk", future=future,
     )
+
+
+def test_a_fatal_device_failure_stops_the_worker_at_the_report():
+    """A sticky device fault would fail every later request here, one by one."""
+    w = _worker()
+    err = RequestError.from_exception(torch.AcceleratorError("illegal memory access"), "step failed")
+    with pytest.raises(SystemExit, match="fatal device error"):
+        w.pipeline._fail_requests({"r1": err})
+    assert w.sent == []
 
 
 @pytest.mark.parametrize("exc, status", [

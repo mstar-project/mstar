@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -159,11 +160,11 @@ def _worker(
 
 def test_failures_leave_the_worker_as_wire_strings():
     w, t = _worker("req-a", "req-b")
-    w.pipeline._fail_requests({t.handle("req-a"): "boom"})
+    w.pipeline._fail_requests({t.handle("req-a"): RequestError("boom")})
     [(entity, msg)] = w.sent
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
-    assert msg.body.errors == {"req-a": "boom"}
+    assert msg.body.errors == {"req-a": RequestError("boom")}
     # ...while the scheduler gate stays on the handle.
     assert w.lifecycle.failed_rids == {t.handle("req-a")}
 

@@ -60,10 +60,15 @@ def client_error_text(
 
 @dataclass(frozen=True)
 class RequestError:
-    """A request failure carried from its owning worker to the API."""
+    """A request failure carried from its owning worker to the API.
+
+    ``fatal`` marks a sticky device fault: every later CUDA call on this worker
+    fails too, so ``StepPipeline._report_failures`` stops the worker on it.
+    """
 
     message: str
     status: int = 500
+    fatal: bool = False
 
     @classmethod
     def from_exception(
@@ -77,18 +82,6 @@ class RequestError:
         its status either way."""
         from torch import AcceleratorError
 
-        # Device-runtime faults poison subsequent work. Ordinary OOM is a
-        # separate torch.OutOfMemoryError and remains request-local.
-        fatal = isinstance(exc, AcceleratorError) or (
-            isinstance(exc, RuntimeError) and any(text in str(exc).lower() for text in (
-                "cuda error: an illegal memory access",
-                "cuda error: device-side assert triggered",
-                "cuda error: unspecified launch failure",
-            ))
-        )
-        if fatal:
-            log.error("%s: fatal device error", what, exc_info=exc)
-            raise SystemExit(f"{what}: fatal device error ({exc})") from exc
         message, _ = client_error_text(exc, what, log=log, traceback=traceback)
         if isinstance(exc, HTTPException):
             status = exc.status_code
@@ -96,4 +89,4 @@ class RequestError:
             status = 400
         else:
             status = 500
-        return cls(message, status)
+        return cls(message, status, fatal=isinstance(exc, AcceleratorError))
