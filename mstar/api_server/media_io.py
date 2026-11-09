@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import http.client
 import io
 import ipaddress
@@ -555,7 +556,7 @@ def _stream_to_upload(resp, conn: _PinnedConnection, url: str, upload_dir: Path,
         suffix = os.path.splitext(urlparse(url).path)[1].lower()
         rev = {v: k for k, v in _MIME_TO_EXT.items()}
         mime = rev.get(suffix, "application/octet-stream")
-    path = upload_dir / f"{uuid4()}{_ext_for(mime)}"
+    path = os.path.join(upload_dir, f"{uuid4()}{_ext_for(mime)}")
     try:
         upload_dir.mkdir(parents=True, exist_ok=True)
         f = open(path, "wb", buffering=0)
@@ -582,9 +583,10 @@ def _stream_to_upload(resp, conn: _PinnedConnection, url: str, upload_dir: Path,
         if conn.timed_out():  # a body that runs to EOF also "ends" when the watchdog shuts the socket
             raise TimeoutError
     except BaseException:
-        path.unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
         raise
-    return modality_from_mime(mime), str(path)
+    return modality_from_mime(mime), path
 
 
 def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False) -> tuple[str, str]:

@@ -121,7 +121,7 @@ for _mod, _exts in {
 
 
 def _detect_modality(filename: str) -> str:
-    return _EXT_TO_MODALITY.get(Path(filename).suffix.lower(), "unknown")
+    return _EXT_TO_MODALITY.get(os.path.splitext(filename)[1].lower(), "unknown")
 
 
 # ------------------------------------------------------------------

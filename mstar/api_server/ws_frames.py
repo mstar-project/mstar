@@ -122,7 +122,7 @@ def _parse_saving_files(frame: str, binary: bool, upload_dir: str):
     The saved names start with the frame's: until this returns, they are
     ``parse_frame``'s to remove."""
     global _parsing
-    stem = Path(frame).stem
+    stem = os.path.splitext(os.path.basename(frame))[0]
     _parsing = (upload_dir, stem)
     with open(frame, "rb") as f:
         payload = f.read()

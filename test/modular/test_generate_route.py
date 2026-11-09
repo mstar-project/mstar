@@ -1,4 +1,6 @@
 import json
+import sys
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -199,3 +201,12 @@ def test_generate_long_upload_name(monkeypatch, tmp_path, name):
     )
     assert response.status_code == 400
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_client_filename_is_not_interned():
+    """On Python 3.12 a ``pathlib`` path interns each part forever, so one
+    built from every upload's name grows the server without bound."""
+    name = f"{uuid.uuid4().hex}.png"
+    assert entrypoint._detect_modality(name) == "image"
+    same_text = "".join(list(name))  # another object: interned already, sys.intern returns the old one
+    assert sys.intern(same_text) is same_text
