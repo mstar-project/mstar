@@ -825,10 +825,11 @@ class QuantExperts(Fp8Experts):
     the same. The stacked rules that route ``experts.N.gate_proj.weight`` route every suffix after ``weight``
     the same way, so a model's loader needs no change beyond passing those suffixes through its remap.
 
-    Dispatch: H100/H200 and later run ``w4a16`` / ``mxfp4`` through ``fused_experts_w4a16`` (Triton, the weight
-    dequantized in registers); B200/B300 run ``mxfp4`` / ``nvfp4`` through FlashInfer's TRT-LLM FP4 MoE
-    (``experts_after_load`` shuffles the weights into its layout on the device). Off CUDA, the reference: every
-    expert dequantized, NVFP4's activations quantized as its kernel would."""
+    Dispatch: B200/B300 run ``mxfp4`` / ``nvfp4`` through FlashInfer's TRT-LLM FP4 MoE where it has the
+    activation (``experts_after_load`` shuffles the weights into its layout on the device); otherwise ``w4a16`` /
+    ``mxfp4`` run vLLM's Marlin MoE (``utils.marlin_moe``, converted at load and probed against the Triton kernel)
+    where it builds, else ``fused_experts_w4a16`` (Triton, the weight dequantized in registers). Off CUDA, the
+    reference: every expert dequantized, NVFP4's activations quantized as its kernel would."""
 
     # the format (as the checkpoint stores it) once the experts hold 4-bit storage
     experts_packed = None
@@ -933,8 +934,12 @@ class QuantExperts(Fp8Experts):
 
     def experts_after_load(self) -> None:
         """Put the loaded experts in their kernel's layout, on the device they serve from (B200/B300's FlashInfer
-        FP4 MoE; the Triton kernel reads the checkpoint layout as is)."""
-        if self.experts_packed is None or self.experts_packed.name not in ("mxfp4", "nvfp4"):
+        FP4 MoE; else, for w4a16 / mxfp4, Marlin MoE where it builds and agrees with the Triton kernel, which reads
+        the checkpoint layout as is and serves the rest)."""
+        if self.experts_packed is None or self.experts_packed.name not in ("mxfp4", "nvfp4", "w4a16"):
+            return
+        if self.experts_packed.name == "w4a16":
+            self._experts_to_marlin()
             return
         if self.experts_packed.name == "nvfp4":
             # one GEMM per expert takes one tensor scale and one activation scale for gate and up together
@@ -950,9 +955,22 @@ class QuantExperts(Fp8Experts):
                   or fp4_flashinfer.unsupported_activation(self._experts_activation, self.experts_packed.name))
         if reason is None:
             self._experts_kernel = fp4_flashinfer.TrtllmFp4Experts.convert(self, device)
-        elif fp4_flashinfer.unavailable_reason(device) is None:
-            # a Blackwell GPU whose FP4 MoE lacks this activation: the Triton kernel serves it
-            logger.info("%s experts on the Triton kernel: %s", self.experts_packed.name, reason)
+            return
+        if fp4_flashinfer.unavailable_reason(device) is None:
+            # a Blackwell GPU whose FP4 MoE lacks this activation (Kimi's SiTU over MXFP4 x bf16)
+            logger.info("%s experts not on FlashInfer's FP4 MoE: %s", self.experts_packed.name, reason)
+        if self.experts_packed.name == "mxfp4":
+            self._experts_to_marlin()
+
+    def _experts_to_marlin(self) -> None:
+        """Marlin MoE for w4a16 / mxfp4 experts on CUDA (``utils.marlin_moe.MarlinExperts``: converted, probed
+        against the Triton kernel, the checkpoint copy freed); the Triton kernel where it can't."""
+        device = next(iter(self.experts.parameters())).device
+        if device.type != "cuda":
+            return
+        from mstar.utils.marlin_moe import MarlinExperts
+
+        self._experts_kernel = MarlinExperts.convert(self, device)
 
     def _experts_quant(
         self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
