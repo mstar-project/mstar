@@ -375,6 +375,13 @@ Read by the ``mstar-server`` binary and its bridge
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
+   * - ``MSTAR_SERVED_MODELS``
+     - unset
+     - The names a Rust-frontend request's ``model`` may carry, as JSON: the
+       base model's names and the served LoRA adapters
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
+       Unset serves the base model alone. Not for deployments to set:
+       ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both

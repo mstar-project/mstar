@@ -54,3 +54,16 @@ def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: "/sf/libsndfile_x86_64.so")
     rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
     assert launched["env"]["MSTAR_LIBSNDFILE"] == "/sf/libsndfile_x86_64.so"
+
+
+def test_mstar_server_gets_the_api_servers_served_models(launched, monkeypatch):
+    from mstar.api_server.served_models import ServedModels
+
+    monkeypatch.setenv("MSTAR_SERVED_MODELS", '{"base": ["stale"]}')
+    rust_frontend.launch_rust_server("bin", "qwen3_5_0.8b", 8000, "/b", "/u")
+    assert "MSTAR_SERVED_MODELS" not in launched["env"]
+    served = ServedModels(base=["qwen3_5_0.8b", "Qwen/Qwen3.5-0.8B"], adapters=["sql"], lora=True)
+    rust_frontend.launch_rust_server("bin", "qwen3_5_0.8b", 8000, "/b", "/u", served_models=served)
+    import json
+    assert json.loads(launched["env"]["MSTAR_SERVED_MODELS"]) == {
+        "base": ["Qwen/Qwen3.5-0.8B", "qwen3_5_0.8b"], "adapters": ["sql"], "lora": True}

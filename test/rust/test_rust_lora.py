@@ -1,0 +1,171 @@
+"""LoRA on both frontends: ``/v1/models`` lists the served adapters, and a
+request's ``model`` field (or its ``lora_adapter`` kwarg) selects the adapter it
+runs under, or is refused with the same text. mstar-server resolves it itself
+(``served_models.rs``); the Python routes resolve it in ``submit_request``
+(``ServedModels.select``), which these tests apply to what the route submitted."""
+import json
+import urllib.error
+import urllib.request
+
+import pytest
+
+pytest.importorskip("mstar_rust")
+pytest.importorskip("fastapi")
+
+from fastapi.testclient import TestClient
+from test_rust_frontend import BINARY, _Chunk, _model_stack, _StubAPIServer
+from test_rust_openai_adapters import _model_of
+
+from mstar.api_server import entrypoint
+from mstar.api_server.entrypoint import APIServer
+from mstar.api_server.rust_frontend import SERVED_MODELS_ENV, served_models_json
+from mstar.api_server.served_models import ServedModels
+
+pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
+
+MODEL = "qwen3_5_0.8b"
+SERVED = ServedModels(base=[MODEL, "Qwen/Qwen3.5-0.8B"], adapters=["sql", "chat"], lora=True)
+
+
+class _Rust(_StubAPIServer):
+    async def iter_result_chunks(self, request_id):
+        for c in (_Chunk("text", b"ok"), _Chunk("image", b"png"), _Chunk("video", b"mp4"), _Chunk("audio", b"\0\0")):
+            yield c
+
+
+class _Python:
+    """What the Python routes call on APIServer: a submit records its kwargs."""
+
+    open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
+
+    def __init__(self, model_name, upload_dir, served):
+        self.model_name, self.upload_dir, self.model, self.served_models = model_name, upload_dir, None, served
+        self.submitted = []
+
+    def submit_request(self, **kwargs):
+        self.submitted.append(kwargs)
+        return kwargs["request_id"]
+
+    async def iter_result_chunks(self, request_id):
+        for c in (_Chunk("text", b"ok"), _Chunk("image", b"png"), _Chunk("video", b"mp4"), _Chunk("audio", b"\0\0")):
+            yield c
+
+    async def collect_results(self, request_id, raw_request=None):
+        return [c async for c in self.iter_result_chunks(request_id)]
+
+    async def iter_result_chunk_batches(self, request_id):
+        async for c in self.iter_result_chunks(request_id):
+            yield [c]
+
+    def release_request(self, request_id):
+        pass
+
+
+def _post(port, path, body):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _python(model, served, tmp_path, monkeypatch):
+    api = _Python(model, tmp_path, served)
+    monkeypatch.setattr(entrypoint, "api_server", api)
+    return api, TestClient(entrypoint.app)
+
+
+def _resolved(submit: dict, served: ServedModels) -> dict:
+    """The kwargs a Python submit runs under once ``submit_request`` resolves its ``model``."""
+    return served.select(submit.get("model"), submit.get("model_kwargs")) or {}
+
+
+def test_v1_models_lists_the_adapters_beside_the_base_model(tmp_path, monkeypatch):
+    _, client = _python(MODEL, SERVED, tmp_path, monkeypatch)
+    want = client.get("/v1/models").json()
+    with _model_stack(MODEL, _Rust(), env={SERVED_MODELS_ENV: served_models_json(SERVED)}) as (port, _upload):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=30) as r:
+            got = json.loads(r.read())
+    blank = lambda cards: [{k: v for k, v in c.items() if k != "created"} for c in cards["data"]]  # noqa: E731
+    assert blank(got) == blank(want) == [
+        {"id": MODEL, "object": "model", "owned_by": "mstar"},
+        {"id": "sql", "object": "model", "owned_by": "mstar", "parent": MODEL},
+        {"id": "chat", "object": "model", "owned_by": "mstar", "parent": MODEL},
+    ]
+
+
+CHATS = {
+    "adapter": {"model": "sql"},
+    "base-name": {"model": MODEL},
+    "repo-name": {"model": "Qwen/Qwen3.5-0.8B"},
+    "no-model": {},
+    "unknown": {"model": "nope"},
+    "kwarg": {"lora_adapter": "chat"},
+    "kwarg-agrees": {"model": "chat", "lora_adapter": "chat"},
+    "kwarg-disagrees": {"model": "sql", "lora_adapter": "chat"},
+    "kwarg-unknown": {"lora_adapter": "nope"},
+}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["full", "stream"])
+@pytest.mark.parametrize("case", sorted(CHATS))
+def test_a_chat_runs_under_the_adapter_its_model_names(case, stream, tmp_path, monkeypatch):
+    """The same adapter in the submit, the same refusal, and the response naming
+    the adapter that served it, as vLLM's does."""
+    body = {"messages": [{"role": "user", "content": "hi"}], "stream": stream, **CHATS[case]}
+    api, client = _python(MODEL, SERVED, tmp_path, monkeypatch)
+    py = client.post("/v1/chat/completions", json=body)
+    stub = _Rust()
+    with _model_stack(MODEL, stub, env={SERVED_MODELS_ENV: served_models_json(SERVED)}) as (port, _upload):
+        status, data = _post(port, "/v1/chat/completions", body)
+    assert status == py.status_code
+    if status != 200:
+        assert json.loads(data)["error"]["message"] == py.json()["error"]["message"]
+        assert stub.submitted == api.submitted == []
+        return
+    (sub,) = stub.submitted
+    assert (sub["mk"] or {}) == _resolved(api.submitted[0], SERVED)
+    if stream:
+        models = {json.loads(line[6:])["model"] for line in data.decode().splitlines()
+                  if line.startswith("data: {")}
+        want = {json.loads(line[6:])["model"] for line in py.text.splitlines() if line.startswith("data: {")}
+    else:
+        models, want = {json.loads(data)["model"]}, {py.json()["model"]}
+    assert models == want
+
+
+@pytest.mark.parametrize("route,body,cls", [
+    ("/v1/audio/speech", {"input": "Hi."}, "Qwen3TTSAdapter"),
+    ("/v1/images/generations", {"prompt": "a cat"}, "DiffusionImageAdapter"),
+    ("/v1/videos/generations", {"prompt": "a cat"}, "Wan22Adapter"),
+], ids=["speech", "images", "videos"])
+@pytest.mark.parametrize("case", ["adapter", "unknown", "kwarg", "kwarg-disagrees", "no-model"])
+def test_speech_images_and_videos_run_under_the_adapter_too(route, body, cls, case, tmp_path, monkeypatch):
+    model = _model_of(cls)
+    served = ServedModels(base=[model], adapters=["sql", "chat"], lora=True)
+    body = {**body, **CHATS[case]}
+    api, client = _python(model, served, tmp_path, monkeypatch)
+    try:
+        py_status = client.post(route, json=body).status_code
+        py_error = None
+    except ValueError as e:  # a submit_request refusal the route lets through
+        py_status, py_error = 400, str(e)
+    stub = _Rust()
+    with _model_stack(model, stub, env={SERVED_MODELS_ENV: served_models_json(served)}) as (port, _upload):
+        status, data = _post(port, route, body)
+    want_error = None
+    if api.submitted:
+        try:
+            _resolved(api.submitted[0], served)
+        except ValueError as e:
+            want_error = str(e)
+    want_error = want_error or py_error
+    if want_error is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, want_error)
+        assert stub.submitted == []
+        return
+    assert status == py_status == 200, data
+    assert (stub.submitted[0]["mk"] or {}) == _resolved(api.submitted[0], served)

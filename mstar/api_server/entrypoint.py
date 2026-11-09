@@ -3123,14 +3123,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    if args.rust_frontend and lora_enabled(config):
-        # The Rust frontend translates OpenAI requests itself: it does not map the `model`
-        # field onto an adapter, so it would serve every request on the base model, and it
-        # has no /v1/load_lora_adapter or /v1/unload_lora_adapter.
-        raise SystemExit(
-            "LoRA adapters (`resources: lora:` in the serving config) are served by the "
-            "Python frontend only; drop --rust-frontend"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
@@ -3248,7 +3240,8 @@ def main(argv: list[str] | None = None):
                 rust_frontend_bin, model_name,
                 args.port, bridge_dir, args.upload_dir, api_key=api_key,
                 timeout_s=args.timeout,
-                sample_rate=model.get_output_sample_rate("audio") if model is not None else None)
+                sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
+                served_models=api_server.served_models)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

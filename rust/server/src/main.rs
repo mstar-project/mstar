@@ -31,6 +31,7 @@ mod bridge;
 mod media;
 mod protocol;
 mod refusals;
+mod served_models;
 mod serving;
 mod sndfile;
 mod speech_chunking;
@@ -61,7 +62,7 @@ use uuid::Uuid;
 use adapters::{OpenAIAdapter, Part, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
 use protocol::{
-    ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
+    ChatCompletionRequest, ImageGenerationRequest, SpeechRequest,
     VideoGenerationRequest,
 };
 use serving::{
@@ -143,6 +144,7 @@ async fn main() {
     }
 
     sndfile::init();
+    let served = Arc::new(served_models::ServedModels::from_env(&model_name));
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -156,6 +158,7 @@ async fn main() {
         tok,
         bridge,
         refusals: refusals.clone(),
+        served,
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration.
@@ -577,8 +580,16 @@ async fn metrics(State(st): State<AppState>) -> Response {
     }
 }
 
-async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
-    Json(ModelList::new(vec![ModelCard::new(st.model_name, now())]))
+/// `GET /v1/models`: the base model, then each served LoRA adapter naming it as its parent.
+async fn list_models(State(st): State<AppState>) -> Json<Value> {
+    Json(st.served.cards(&st.model_name, now()))
+}
+
+/// `APIServer.lora_kwargs`: the LoRA adapter a request runs under, named by its
+/// `model` field or its `lora_adapter` kwarg, put in its kwargs; `None` for the
+/// base model. An adapter this deployment does not serve is the 400.
+fn select_lora(st: &AppState, model: Option<&str>, args: &mut SubmitArgs) -> Result<Option<String>, Response> {
+    st.served.select(model, &mut args.model_kwargs).map_err(|e| error(400, &e, "invalid_request_error"))
 }
 
 /// `GET /v1/audio/voices`, as router.py's `audio_voices`: the model's list,
@@ -629,6 +640,14 @@ async fn chat_completions(
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    // Resolved before it is submitted: the response names the adapter that served it.
+    let model_name = match select_lora(&st, req.model.as_deref(), &mut args) {
+        Ok(served) => served.unwrap_or_else(|| st.model_name.clone()),
+        Err(r) => {
+            remove_uploads(&st.upload_dir, &args.file_paths);
+            return r;
+        }
+    };
     // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
     // submit token ids and detokenize the reply in Rust, off the GIL.
     if adapter.frontend_tokenizes() {
@@ -644,12 +663,12 @@ async fn chat_completions(
             Ok(base) => base,
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
-        return chat_sse(st, base, request_id).into_response();
+        return chat_sse(base, request_id, model_name).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => {
-            let (name, rate) = (st.model_name.clone(), st.sample_rate);
-            match blocking(move || build_chat_response(&name, &request_id, chunks, rate, audio_format)).await {
+            let rate = st.sample_rate;
+            match blocking(move || build_chat_response(&model_name, &request_id, chunks, rate, audio_format)).await {
                 Ok(body) => Json(body).into_response(),
                 Err(e) => error(500, &e, "server_error"),
             }
@@ -671,11 +690,11 @@ async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
 /// rides on the first delta (the finish one when there is none), as in
 /// `serving_chat.py`: clients time the first token from the first chunk.
 fn chat_sse(
-    st: AppState,
     base: OutStream,
     request_id: String,
+    model_name: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let payloads = chat_sse_payloads(base, request_id, now(), st.model_name.clone());
+    let payloads = chat_sse_payloads(base, request_id, now(), model_name);
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
 }
 
@@ -1012,7 +1031,7 @@ async fn audio_speech(
         (req, speech)
     })
     .await;
-    let adapters::Speech { args, ref_audio } = match translated {
+    let adapters::Speech { mut args, ref_audio } = match translated {
         Ok(s) => s,
         Err((status, e)) => return error(status, &e, error_type(status)),
     };
@@ -1031,6 +1050,9 @@ async fn audio_speech(
             Ok(pieces) => pieces,
             Err(e) => return error(400, &e, "invalid_request_error"),
         };
+    if let Err(r) = select_lora(&st, req.model.as_deref(), &mut args) {
+        return r;
+    }
     let n = pieces.len();
     let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream, uploads);
     // Pieces in flight ahead of the one being read; dropping one unread aborts it.
@@ -1184,6 +1206,10 @@ async fn images_generations(
         Ok(n) => n,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    let mut base = base;
+    if let Err(r) = select_lora(&st, req.model.as_deref(), &mut base) {
+        return r;
+    }
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -1269,12 +1295,16 @@ async fn videos_generations(
         return error(400, &e, "invalid_request_error");
     }
     let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let model = req.model.clone();
     let translated = blocking(move || adapter.video_to_request(&req, &dir, remote)).await;
-    let args = match translated {
+    let mut args = match translated {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
     schedule_upload_cleanup(&st.upload_dir, &args);
+    if let Err(r) = select_lora(&st, model.as_deref(), &mut args) {
+        return r;
+    }
     let request_id = rid("vid");
     // `stream_video`: a windowed request's mp4s as NDJSON lines as they land.
     // A refusal at submission is still its status; a later failure is in-band.
@@ -1349,6 +1379,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
     let mut images = 0;
+    let mut requested_model: Option<String> = None;
     let mut prompt = String::new();
     let mut n: Option<String> = None;
     let mut response_format: Option<String> = None;
@@ -1384,6 +1415,14 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
                     return error(status, &msg, "invalid_request_error");
                 }
             }
+        } else if name == "model" {
+            requested_model = match field.text().await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
+            };
         } else if matches!(name.as_str(), "prompt" | "n" | "response_format") {
             let v = match field.text().await {
                 Ok(v) => v,
@@ -1444,7 +1483,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         return error(500, &e.to_string(), "server_error");
     }
 
-    let args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
+    let mut args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
         Ok(a) => a,
         Err(e) => {
             let _ = std::fs::remove_file(&image_path);
@@ -1452,6 +1491,9 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     };
     schedule_upload_cleanup(&st.upload_dir, &args);
+    if let Err(r) = select_lora(&st, requested_model.as_deref(), &mut args) {
+        return r;
+    }
     let request_id = rid("img");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(images_response(chunks)).into_response(),
@@ -1981,6 +2023,7 @@ mod tests {
             tok: None,
             bridge,
             refusals: Arc::new(refusals::Refusals::default()),
+            served: Arc::new(served_models::ServedModels::from_env("m")),
         }
     }
 
@@ -2176,7 +2219,7 @@ mod tests {
             };
             let st = state(None);
             let base = result_stream(&st, &args, "r", true);
-            let (status, _, data) = body(chat_sse(st, base, "r".into()).into_response()).await;
+            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone()).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text
