@@ -391,6 +391,29 @@ Read by the ``mstar-server`` binary and its bridge
        pydantic version its error text cites. Not for deployments to set:
        ``launch_rust_server`` sets it from ``transcription_facts`` for a model
        with a transcription surface, and drops an inherited value.
+   * - ``MSTAR_OPENPI``
+     - unset
+     - The deployment's openpi policy (its ``openpi:`` block as the API server
+       checked it, the metadata frame packed), as JSON; unset serves no socket
+       at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
+       ``openpi_facts``.
+   * - ``MSTAR_WS_MAX_BYTES``
+     - the body limit
+     - The largest WebSocket message the Rust frontend reads, in bytes: the
+       config's ``ws_max_message_mb``. Not for deployments to set:
+       ``launch_rust_server`` sets it.
+   * - ``MSTAR_CLIENT_STREAMS``
+     - ``[]``
+     - The model's client streams, as JSON: on ``/generate/ws`` a request to a
+       model with any is a live call. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``APIServer.client_streams``.
+   * - ``MSTAR_REALTIME``
+     - unset
+     - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: the ONNX
+       Runtime library ``onnxruntime`` loads, Silero's weights, why Smart Turn
+       did not load (if it didn't), and the model's tokenizer. Not for
+       deployments to set: ``launch_rust_server`` sets it from
+       ``realtime_facts``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
