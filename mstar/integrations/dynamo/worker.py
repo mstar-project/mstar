@@ -62,7 +62,6 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         APIServer,
         _conductor_process_target,
         deployment_cpu_plan,
-        resolve_lora_spec,
     )
     from mstar.communication.communicator import CommProtocol
 
@@ -80,7 +79,6 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    resolve_lora_spec(model, config)
 
     # before the workers exist: under ``auto`` this takes the GPUs' locks
     try:
