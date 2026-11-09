@@ -360,6 +360,25 @@ def test_a_passer_moved_for_an_older_request_keeps_for_the_head_what_the_earmark
     assert _ready(kv, "head"), "the head waits though the room, the pages kept for it included, covers it"
 
 
+def test_a_request_dropped_before_its_victim_lands_returns_with_what_its_drop_recorded():
+    """b runs short and moves v, then o runs short and moves b before v lands. v's move then admitted b for the
+    shortage b ran short by, not the history b returns with."""
+    kv = _pool()
+    _running(kv, "o", 2, arrival=0)
+    _running(kv, "b", 3, arrival=1)
+    _running(kv, "v", 4, arrival=2)
+    assert _preempt(kv, "b", _step(kv, "b", 3 * PAGE_SIZE).reason.pages_short, lambda rid: True).to_drop == ["v"]
+    short = _step(kv, "o", 3 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "o", short, droppable=lambda rid: rid == "b").to_drop == ["b"]
+
+    _drop(kv, "b")
+    _drop(kv, "v")
+
+    assert "b" not in kv._allotments or kv._allotments["b"].pages >= kv._dropped["b"].returns, (
+        "v's move admitted b with the shortage it ran short by, not what it returns with"
+    )
+
+
 @pytest.mark.parametrize("then", ["waits", "waits, then is dropped"])
 def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
     """A request that ran short with nothing newer to move dropped itself. Nothing older waited for the room, so it

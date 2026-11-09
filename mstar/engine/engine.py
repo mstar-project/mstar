@@ -3232,7 +3232,7 @@ class Engine:
         return self._runner.newer_than(request_id)
 
     def refusals(self) -> "list[Refusal]":
-        """The waiting requests that didn't fit, oldest first; see `Admission.refusals`."""
+        """The waiting requests that didn't fit, oldest first, as `Admission.refusals` gives them."""
         return self._runner.refusals()
 
     def readmit_request(self, node_name: str, request_id: int) -> None:
