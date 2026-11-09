@@ -447,7 +447,8 @@ class TestAfterTheReview(unittest.TestCase):
             self.assertEqual((out, len(fake.writes())), ({"billing": "true"}, 1))
 
     def test_an_escaped_character_before_a_token_shape_cant_break_the_post(self):
-        fields = {"outside_diff": [], "since_last": "\u00eeyJabcdefghijk.lmnopqrstuv.w", "description_problems": [],
+        fields = {"outside_diff": [], "since_last": "\x0eyJabcdefghijk.lmnopqrstuv.w \u00eeyJabcdefghijk.lmnopqrstuv.w",
+                  "description_problems": [],
                   "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
                   "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}}
         with workspace():
