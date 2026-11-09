@@ -147,7 +147,7 @@ impl OpenAIAdapter for MiniMaxH3 {
     fn supports_videos(&self) -> bool {
         true
     }
-    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, _allow_remote: bool) -> Result<SubmitArgs, String> {
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         if nonempty(&req.video).is_some() {
             return Err("MiniMax-H3 takes keyframes ('image', extra_body 'last_image'), not a 'video'.".to_string());
         }
@@ -181,7 +181,7 @@ impl OpenAIAdapter for MiniMaxH3 {
         }
         let mut paths: Vec<String> = Vec::new();
         for (_, r) in &refs {
-            match media::resolve_media_ref(r.as_str().unwrap_or(""), upload_dir, false) {
+            match media::resolve_media_ref(r.as_str().unwrap_or(""), upload_dir, allow_remote) {
                 Ok((_, path)) => paths.push(path),
                 Err(e) => {
                     // a refused request is never submitted, so no deferred cleanup

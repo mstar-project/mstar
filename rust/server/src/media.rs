@@ -114,12 +114,6 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     LENIENT.decode(compact.as_bytes())
 }
 
-/// `media_io.mux_mp4_with_pcm16`: an H.264 mp4 and raw interleaved 16-bit PCM
-/// into one mp4 with an AAC track, the video stream-copied, by the same
-/// `ffprobe` and `ffmpeg` commands. `video_fps` is the content's true rate: when
-/// it differs from the container's, the video timestamps are rescaled so
-/// playback stays in sync with the audio. Blocking; an `Err` leaves the caller
-/// the video alone, as Python falls back to it.
 /// `subprocess.run(cmd, capture_output=True, timeout=timeout)`: the child's
 /// output, or an `Err` once it has run past `timeout` (it is killed, as
 /// `subprocess.run` kills it).
@@ -168,6 +162,12 @@ fn run_with_timeout(cmd: &mut std::process::Command, timeout: std::time::Duratio
 const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const FFMPEG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// `media_io.mux_mp4_with_pcm16`: an H.264 mp4 and raw interleaved 16-bit PCM
+/// into one mp4 with an AAC track, the video stream-copied, by the same
+/// `ffprobe` and `ffmpeg` commands. `video_fps` is the content's true rate: when
+/// it differs from the container's, the video timestamps are rescaled so
+/// playback stays in sync with the audio. Blocking; an `Err` leaves the caller
+/// the video alone, as Python falls back to it.
 pub fn mux_mp4_with_pcm16(
     video_mp4: &[u8],
     pcm: &[u8],

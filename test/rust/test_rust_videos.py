@@ -162,6 +162,31 @@ def test_a_video_request_is_submitted_or_refused_as_the_python_adapter_does(cls,
     assert counts(sub["files"]) == counts(want.file_paths)
 
 
+
+@pytest.mark.parametrize("field", ["image", "last_image"])
+@pytest.mark.parametrize("cls", VIDEO_CLASSES)
+def test_a_remote_keyframe_follows_the_servers_remote_fetch_setting(cls, field, tmp_path, monkeypatch):
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+
+    # remote fetch on, but no host allowed: the refusal says which check ran
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "")
+    model = _model_of(cls)
+    body = {"model": model, "prompt": "a cat", field: "https://example.com/frame.png"}
+    try:
+        want = ADAPTER_REGISTRY[model].video_to_request(VideoGenerationRequest(**body), tmp_path)
+        refusal = None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _RustVideoStub(b"mp4")
+    with _model_stack(model, stub) as (port, _upload):
+        status, _, data = _post(port, body)
+    if refusal is None:
+        assert status == 200, data
+        assert stub.submitted[0]["mk"] == want.model_kwargs
+    else:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+
 def _python_videos(model, body, tmp_path, monkeypatch, video):
     monkeypatch.setattr(entrypoint, "api_server", _PythonVideoServer(model, tmp_path, video))
     return TestClient(entrypoint.app).post("/v1/videos/generations", json=body)
