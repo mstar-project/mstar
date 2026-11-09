@@ -722,6 +722,13 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3.config import H3Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3Config())
+    return model
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
@@ -778,6 +785,19 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
         MuseGlimmerModel, config=config, vision_config=vision_config,
         media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
     )
+
+
+def _ripple(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ripple.config import RippleConfig
+    from mstar.model.ripple.ripple_model import RippleModel
+    config = RippleConfig(
+        vocab_size=100352, hidden_size=5120, intermediate_size=40960, num_hidden_layers=80,
+        num_attention_heads=80, num_key_value_heads=8, head_dim=128,
+        layer_types=(("sliding_attention",) * 4 + ("full_attention",)) * 16,
+        sliding_window=1024, max_position_embeddings=2097152, rope_theta=10000.0, rms_norm_eps=1e-6,
+        embed_scale=71.55, ffn_clamp_threshold=20.0, stop_token_ids=(100265, 100257),
+    )
+    return _bare(RippleModel, config=config)
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
@@ -879,7 +899,9 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
+    "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,
+    "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,

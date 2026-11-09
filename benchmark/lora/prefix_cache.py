@@ -2,7 +2,7 @@
 
 GPU only; nothing here runs in CI. Needs a model that both keys a KV label for prefix
 reuse (``KVLabel.keys`` in its ``kv_labels``) and serves LoRA adapters
-(``get_lora_specs``). Orpheus does both (speech out, through ``/generate`` with the
+(declares a ``LoraSpec``). Orpheus does both (speech out, through ``/generate`` with the
 adapter in ``model_kwargs``); a text model, Qwen3.5 among them (it keys
 ``prefill_text``), goes through the chat endpoint (``--endpoint chat``).
 
@@ -50,21 +50,21 @@ PROMPT = " ".join(
 
 
 def _preflight(model: str) -> None:
-    from mstar.model.base import Model, keyed_labels
+    from mstar.model.base import keyed_labels
     from mstar.model.registry import get_model_class
 
     cls = get_model_class(model)
-    missing = []
-    if cls.get_lora_specs is Model.get_lora_specs:
-        missing.append("get_lora_specs")
-    # the LoRA models declare their labels without their config or checkpoint (other
-    # models' kv_labels may read self.config, which a bare instance lacks)
-    elif not keyed_labels(object.__new__(cls)):
-        missing.append("a keyed KV label (KVLabel.keys in kv_labels)")
-    if missing:
+    try:
+        # the models that key a label declare it without their config or checkpoint
+        keyed = keyed_labels(object.__new__(cls))
+    except AttributeError:
+        # a kv_labels that reads its config (Cosmos3, V-JEPA 2): none of the LoRA models
+        keyed = {}
+    if not keyed:
+        # a model that serves no adapters refuses the `lora:` block when the server starts
         raise SystemExit(
-            f"{model}: {cls.__name__} lacks {' and '.join(missing)}; this check needs "
-            "a model that keys a prefix-cache label and serves LoRA adapters"
+            f"{model}: {cls.__name__} keys no KV label (KVLabel.keys in kv_labels); this "
+            "check needs a model that keys a prefix-cache label and serves LoRA adapters"
         )
 
 

@@ -491,6 +491,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         encoder_states = inp.tensor_inputs.get("encoder_states")
         return 0 if encoder_states is None else encoder_states.shape[0]
 
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; the context is read, not written,
+        # and `preprocess` reads no planned position or KV location
+        return frozenset({DECODE_WALK})
+
     def declare_step(
         self,
         graph_walk: str,

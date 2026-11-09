@@ -10,11 +10,18 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread, ResultQueue
+from mstar.api_server.data_worker import (
+    InlineTokens,
+    PreprocessWorker,
+    PreprocessWorkerThread,
+    RequestOutputState,
+    ResultQueue,
+)
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
+from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.submodule_base import HostRows
 from mstar.testing_utils.model import StubModel
@@ -144,6 +151,60 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
     assert state.next_sequence == 3 and state.next_emit == 3 and not state.pending
 
 
+def test_turn_tokens_mark_their_text_chunks():
+    """A model's declared turn tokens mark the chunks they arrive in, though
+    postprocess may drop the tokens themselves; other chunks are unmarked.
+    Every chunk carries its loop iteration as its step."""
+    worker, stop = _thread()
+    worker.model.turn_tokens = (1, 2)
+    for i, v in enumerate((12, 1, 13, 2, 12)):
+        worker.result_tensor_queue.put(InlineTokens(["req"], [v], "text", loop_indices=[_loop(i)]))
+    chunks = _run_until(worker, stop, 5)
+    assert [c.metadata.get("turn") for c in chunks] == [None, ["start"], None, ["end"], None]
+    assert [c.metadata["step"] for c in chunks] == [0, 1, 2, 3, 4]
+    # a chunk of several tokens keeps every mark, in order
+    assert worker._turn_metadata([2, 12, 1], None) == {"turn": ["end", "start"]}
+
+
+def test_turn_tokens_stamp_read_text_and_audio_with_their_step():
+    """Chunks read as tensors (text without inline tokens, and all audio)
+    carry their loop step as the inline path's do."""
+    class _ReadModel(_Model):
+        turn_tokens = (1, 2)
+
+        def postprocess(self, output, modality, request_kwargs=None):
+            return b"pcm" if modality == "audio" else super().postprocess(output, modality)
+
+        def get_output_sample_rate(self, modality="audio"):
+            return 24000
+
+        def get_output_audio_channels(self, modality="audio"):
+            return 1
+
+    tensors = {"t": torch.tensor([1]), "a": torch.zeros(4, dtype=torch.int16)}
+
+    class _ReadTM(_TM):
+        def get_ready_tensors(self):
+            return {"req": [GraphEdge(next_node="api", name=f"{modality}_output", tensor_info=[SimpleNamespace(uuid=u)])
+                            for modality, u in (("text", "t"), ("audio", "a"))]}
+
+        def get_tensor(self, uuid):
+            return tensors[uuid]
+
+        def dereference(self, uuid):
+            pass
+
+    worker, _ = _thread()
+    worker.model, worker.tensor_manager = _ReadModel(), _ReadTM()
+    worker.request_output_state = {"req": RequestOutputState(order={"t": (0, _loop(3)), "a": (1, _loop(5))},
+                                                             next_sequence=2)}
+    worker.tensor_uuid_to_metadata_per_request = {"req": {"t": {}, "a": {}}}
+    assert worker._process_read_tensors() is True
+    text, audio = worker.out_queue.get_nowait(), worker.out_queue.get_nowait()
+    assert text.metadata == {"step": 3, "turn": ["start"]}
+    assert audio.modality == "audio" and audio.metadata["step"] == 5
+
+
 def test_a_draining_request_drops_its_inline_tokens():
     worker, stop = _thread()
     worker._draining_rids.add("gone")
@@ -160,8 +221,9 @@ def test_a_row_that_fails_postprocessing_fails_only_its_request():
     worker.result_tensor_queue.put(InlineTokens(["bad", "good"], [13, 2], "text"))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
     assert chunks["good"].modality == "text" and chunks["good"].data == b"<2>"
-    assert chunks["bad"].modality == "error" and b"bad token" in chunks["bad"].data
-    assert chunks["bad"].metadata["status"] == 400
+    # past intake a ValueError is a server bug: a 500 that keeps its text in the log
+    assert chunks["bad"].modality == "error" and b"internal error (error id " in chunks["bad"].data
+    assert chunks["bad"].metadata["status"] == 500
 
 
 def test_inline_logprobs_land_in_their_chunks_metadata():
@@ -265,12 +327,22 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
     assert sig == "text_inputs" and vals == [90, 70, 80]
 
 
-def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
+def test_a_row_that_ran_no_forward_takes_the_tensor_path_alone():
+    # 8 ran no forward (the cache served it, or it declined its stream's final
+    # chunk), so it has no host row; on a rows-only step the tensor path has
+    # nothing for 7 and 9, so they must still go inline
+    rows = HostRows((7, 9), {"new_token": torch.tensor([[70], [90]])})
+    sig, vals = _executor()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), _Batch(), rows, [7, 8, 9], ["text_inputs"],
+    )
+    assert sig == "text_inputs" and vals == [70, None, 90]
+
+
+def test_inline_values_fall_back_when_nothing_applies():
     rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
     w = _executor()
     eng = _Engine({"text_inputs": "new_token"})
     none = (None, [])
-    assert w._inline_emit_values(eng, _Batch(), rows, [7, 8, 9], ["text_inputs"]) == none
     assert w._inline_emit_values(eng, _Batch(), rows, [7], ["other"]) == none
     assert w._inline_emit_values(_Engine({}), _Batch(), rows, [7], ["text_inputs"]) == none
     assert w._inline_emit_values(eng, _Batch(), None, [7], ["text_inputs"]) == none
@@ -293,17 +365,13 @@ def test_a_mixed_step_inlines_its_decode_rows():
     assert sig == "text_inputs" and vals == [70, 80, 90]
 
 
-def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
+def test_a_mixed_step_row_with_no_value_takes_the_tensor_path():
     rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
-    batch = _Batch({7: "prefill_text", 9: "decode"}, label="mixed")
-    assert _executor()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == (None, [])
-    # a row of a walk that sends no inline value needs none
-    batch = _Batch({7: "decode", 9: "prefill_text"}, label="mixed")
-    assert _executor()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == ("text_inputs", [70, 0])
+    for walks in ({7: "prefill_text", 9: "decode"}, {7: "decode", 9: "prefill_text"}):
+        assert _executor()._inline_emit_values(
+            _Engine({"text_inputs": "new_token"}), _Batch(walks, label="mixed"), rows, [7, 9],
+            ["text_inputs"],
+        ) == ("text_inputs", [70, None])
 
 
 def test_row_logprobs_follow_the_batch_order():

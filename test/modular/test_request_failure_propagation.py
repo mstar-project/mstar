@@ -24,6 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
@@ -261,7 +262,6 @@ def _preprocess_thread(model):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue = queue.Queue()
     wt.model = model
-    wt._client_edges = frozenset()
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
@@ -277,13 +277,15 @@ def _preprocess_thread(model):
     return wt
 
 
-def test_output_postprocess_failure_becomes_an_error_chunk():
+# A ValueError past intake is a server bug too, not a 400
+@pytest.mark.parametrize("error", [RuntimeError, ValueError])
+def test_output_postprocess_failure_becomes_an_error_chunk(error):
     """A model that blows up postprocessing a result tensor must fail that
     request, not silently drop the chunk and leave the client hanging."""
 
     class _BadModel(StubModel):
         def postprocess(self, tensor, modality, request_kwargs=None):
-            raise RuntimeError("decode failed")
+            raise error("decode failed")
 
     wt = _preprocess_thread(_BadModel())
     dereferenced = []

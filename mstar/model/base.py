@@ -26,7 +26,7 @@ from mstar.distributed.base import (
 )
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -38,7 +38,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import (
@@ -140,9 +140,6 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
-
-if TYPE_CHECKING:
-    from mstar.engine.resources.lora.config import LoraSpec
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -563,22 +560,37 @@ class ForwardPassArgs:
 
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
-    (``mstar.engine.resources.lora.serving``)."""
-    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
+    its ``resources:`` block does not name."""
+    named = (model_config.get("resources") or {}).keys()
+    return [
+        spec for spec in model.get_node_resources() or []
+        if not spec.opt_in or spec.resource_key in named
+    ]
 
-    specs = list(model.get_node_resources() or [])
-    lora = declared_lora_specs(model, model_config)
-    size_lora_specs(lora, model_config)
-    return specs + lora
+
+def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
+    overrides applied. A ``per_node`` spec is whole here, as the API server checks
+    requests and adapters against it; ``serving_resources`` splits it."""
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return specs
 
 
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
-    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
-    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
-    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
-
-    return drop_lora_specs_without_targets(specs)
+    """The specs a deployment builds of its declared ones: each ``per_node`` spec as its
+    instances (``NodeResourceSpec.for_node``)."""
+    built: list[NodeResourceSpec] = []
+    for spec in specs:
+        if not spec.per_node:
+            built.append(spec)
+            continue
+        instances = (spec.for_node(node) for node in sorted(spec.nodes))
+        built.extend(instance for instance in instances if instance is not None)
+    return built
 
 
 def parse_autocast_dtype(value) -> torch.dtype | None:
@@ -593,18 +605,15 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
 
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
-    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
-    ``resources:`` overrides applied, as ``built_resources``.
+    """The resource specs a deployment builds: ``declared_resources``, as
+    ``built_resources``.
 
     Every process that reads specs resolves them here, so the conductor validates
-    requests against what the workers built. ``validate_deployment`` takes the same
-    steps, reporting every problem rather than the first.
+    requests against what the workers built, under the same keys.
+    ``validate_deployment`` takes the same steps, reporting every problem rather than
+    the first.
     """
-    from mstar.engine.resources.spec import apply_yaml_overrides
-
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
-    return built_resources(specs)
+    return built_resources(declared_resources(model, model_config))
 
 
 class Model(ABC):
@@ -631,7 +640,9 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = (
+        "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+    )
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -771,23 +782,11 @@ class Model(ABC):
 
         The whole declaration: a KV cache's shape, the attention backend over
         it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it.
+        hands each node the subset naming it. An opt-in spec (per-request LoRA
+        adapters) is declared here too, and built only for a deployment whose
+        ``resources:`` block names it.
         """
         pass
-
-    def get_lora_specs(self) -> list["LoraSpec"]:
-        """The per-request LoRA adapters this model can serve: a spec per node they
-        reach (none for a model that serves none), the first keyed
-        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
-        and the conductor opens a request with the same adapter on each.
-
-        Built only when the deployment's YAML has a ``resources: lora:`` block (see
-        ``serving_resources``): a deployment without one builds exactly what it did
-        before. Usually by ``module_lora_spec`` from each node's weights root, whose
-        LoRA-capable modules the node then binds itself. The conductor opens each
-        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
-        """
-        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -971,6 +970,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        open_streams: frozenset[str] = frozenset(),
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -993,6 +993,10 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            open_streams: The client streams the opening leaves open for
+                appends; empty for a one-shot request. Raise
+                ``ValueError`` here for a live opening the request's settings
+                can't serve.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:
@@ -1014,19 +1018,22 @@ class Model(ABC):
         """Turn one append the client sends to a running request into items of
         the model's client streams (``Connection(from_partition=CLIENT, ...)``).
 
-        Called by the API server data worker for each append that carries text
-        or files, after it has loaded the files the way it loads a request's
+        Called by the API server data worker for each append that carries text,
+        files or ``model_kwargs``, after it has loaded the files the way it loads a request's
         (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
         ``video_inputs``). ``chunk.streams`` names the stream the client meant
         each file for, where it named one; ``chunk.model_kwargs`` are the
         append's own, beside the opening's ``chunk.request_kwargs``. Returns
         items by client edge name; each list entry is one item of that stream.
         Raise ``ValueError`` for an append the model can't take (the client
-        gets a 400); an append with text that yields no item is refused.
+        gets a 400); an append of text or ``model_kwargs`` that yields no item
+        is refused.
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 
@@ -1054,20 +1061,22 @@ class Model(ABC):
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, 16000, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)
@@ -1194,9 +1203,10 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads, including the ones an
-        OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key logged as ignored. None (the default) declares nothing, so
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
         return None
@@ -1216,6 +1226,16 @@ class Model(ABC):
         speech codecs used by the audio models here.
         """
         return 24000
+
+    # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
+    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    turn_tokens: tuple[int, int] | None = None
+    # A model whose replies may never get their end mark: a reply ends after this many
+    # steps with no text, no mark and no audio above ``turn_silence_rms`` (the RMS of
+    # samples in [-1, 1]), and text outside a reply opens one; None: only the marks end
+    # and open them.
+    turn_idle_steps: int | None = None
+    turn_silence_rms: float = 0.005
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

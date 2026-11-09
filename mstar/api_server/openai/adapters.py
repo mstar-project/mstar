@@ -141,21 +141,12 @@ def flatten_messages(
                 if ptype == "text":
                     if part.get("text"):
                         add_text(part["text"], role)
-                elif ptype == "image_url":
-                    url = (part.get("image_url") or {}).get("url", "")
+                elif ptype in ("image_url", "video_url", "audio_url"):  # video and audio are extensions
+                    url = (part.get(ptype) or {}).get("url", "")
                     if url:
                         mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "image", path)
-                elif ptype == "video_url":  # extension for video-capable models
-                    url = (part.get("video_url") or {}).get("url", "")
-                    if url:
-                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "video", path)
-                elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
-                    url = (part.get("audio_url") or {}).get("url", "")
-                    if url:
-                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "audio", path)
+                        # a MIME that names no modality (application/octet-stream) takes the part's
+                        add_file(mod if mod != "unknown" else ptype.removesuffix("_url"), path)
                 elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
                     ia = part.get("input_audio") or {}
                     data, fmt = ia.get("data"), ia.get("format", "wav")
@@ -188,27 +179,67 @@ def _forward_sent_speed(req, mk: dict) -> None:
         mk.setdefault("speed", req.speed)
 
 
-def _refuse_tool_calls(req) -> None:
-    """Refuse a chat that asks the model to call a tool.
+# OpenAI request bookkeeping that changes no reply: dropped from a chat's
+# model_kwargs, so a client that sends it on every call (LiveKit's
+# ``stream_options``) is not logged as ignoring it. Dynamo's bridge strips the same.
+CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
 
-    No adapter here parses a tool call out of a reply, so a client sent plain
+
+def _refuse_unserved_chat(req, mk: dict) -> None:
+    """Refuse a chat that asks for more than one plain reply: more choices, stop
+    sequences, log probs, sampling penalties, a response format, or a tool call.
+    ``mk`` is the request's :func:`_passthrough`; an off value of one of these
+    fields (``logprobs: false``, ``tools: []``) is dropped from it, before any
+    ``chat_template_kwargs`` key is merged in.
+
+    Every chat adapter here returns one choice, ended at a stop token or
+    max_tokens, as plain sampled text, so any of these dropped answers a
+    different request with a 200.
+    No adapter parses a tool call out of a reply, so a client sent plain
     text takes it for the model declining every tool. An empty ``tools`` and a
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
     by default. A ``tool_choice`` of ``none`` asks for no call even when
     ``tools`` lists some. Their older names, ``functions`` and
     ``function_call``, follow the same rules.
     """
-    extra = req.model_extra or {}
-    choice = extra.get("tool_choice")
-    function_call = extra.get("function_call")
+    if req.n not in (None, 1):
+        raise ValueError(f"n={req.n}: this model returns one choice")
+    if req.stop:
+        raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
+    for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
+                 "stop_token_ids"):
+        if mk.pop(name, None):
+            raise ValueError(f"{name} is not supported")
+    if mk.pop("best_of", None) not in (None, 1):
+        raise ValueError("best_of is not supported; this model returns one choice")
+    if mk.pop("response_format", None) not in (None, {"type": "text"}):
+        raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+    choice = mk.get("tool_choice")
+    function_call = mk.get("function_call")
     if (
-        (extra.get("tools") not in (None, []) and choice != "none")
-        or (extra.get("functions") not in (None, []) and function_call != "none")
+        (mk.get("tools") not in (None, []) and choice != "none")
+        or (mk.get("functions") not in (None, []) and function_call != "none")
         or choice == "required"
         or isinstance(choice, dict)
         or function_call not in (None, "none", "auto")
     ):
         raise ValueError("tool calling is not supported for this model")
+    for name in ("tools", "tool_choice", "functions", "function_call", *CHAT_ENVELOPE_KEYS):
+        mk.pop(name, None)
+
+
+def _flatten_template_kwargs(mk: dict) -> None:
+    """Each ``chat_template_kwargs`` key onto a flat one, which wins. vLLM-style
+    clients send template variables this way (``enable_thinking``, Muse
+    Glimmer's ``reasoning_strength``); the model reads them flat, and logs a
+    key it does not read as ignored. A flat key the chat refusal dropped as off
+    (``logprobs: false``) counts as not sent, so a template key of that name
+    still reaches the model, and is logged as ignored."""
+    template_kwargs = mk.pop("chat_template_kwargs", None) or {}
+    if not isinstance(template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    for key, value in template_kwargs.items():
+        mk.setdefault(key, value)
 
 
 def _apply_sampling(
@@ -389,9 +420,9 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         _apply_sampling(req, mk)
         return SubmitArgs(
             text=text,
@@ -451,9 +482,9 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         # Speech output also emits text, so request both modalities when audio is asked for.
         want_audio = bool(req.modalities and "audio" in req.modalities)
         out_mods = ["text", "audio"] if want_audio else ["text"]
@@ -501,18 +532,22 @@ class Qwen3_5Adapter(OpenAIAdapter):
       checkpoint's generation_config sets one.
     * ``repetition_penalty`` — counts the prompt's tokens as well as the
       generated ones unless ``penalize_prompt`` is false.
-    * ``enable_thinking`` (default true) — Qwen's template opens a
-      ``<think>`` block; for Muse Glimmer false means reasoning strength low.
+    * ``enable_thinking`` (default true) — Qwen's template opens a ``<think>``
+      block; for Muse Glimmer false means reasoning strength low.
     * ``reasoning_effort`` — Muse Glimmer's reasoning strength.
+
+    ``chat_template_kwargs`` keys are read as flat ones, and a flat key wins.
     """
 
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         _apply_sampling(req, mk)
+        # before the attachments are saved, since a malformed value refuses the request
+        _flatten_template_kwargs(mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -530,6 +565,10 @@ class OrpheusAdapter(OpenAIAdapter):
     Orpheus control and is reported as ignored."""
 
     supports_speech = True
+    # 2,048 output tokens are about 25 s of speech (some 350 characters), and a
+    # longer input is cut off there, so long inputs go as sentence chunks well under it
+    speech_chunk_min_chars = 250
+    speech_chunk_max_chars = 200
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
@@ -550,9 +589,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     Mode follows from what the caller sends, as it does in the reference:
     ``ref_audio`` + ``ref_text`` clones a voice, ``instruct`` designs one from a
-    description, and neither lets the model pick. ``voice`` is accepted as an
-    alias for ``instruct`` so an OpenAI client that only knows the standard
-    field can still reach voice design.
+    description (OpenAI's ``instructions``), and neither lets the model pick.
+    ``voice`` is accepted as an alias for ``instruct`` too.
 
     ``speed`` is a real OmniVoice knob (it scales the estimated duration), so
     unlike the other speech adapters it is forwarded rather than dropped. The
@@ -571,6 +609,10 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
+        # OpenAI's field is ``instructions``; the model reads ``instruct``.
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
         # is-not-None, so an empty voice reaches the model and is refused there
         if getattr(req, "voice", None) is not None and mk.get("instruct") is None:
             mk["instruct"] = req.voice
@@ -714,23 +756,22 @@ def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
     try:
-        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        bare = not (ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"))
+        if not bare:
             try:
                 path = media_io.resolve_media_ref(ref, upload_dir)[1]
             except _REF_AUDIO_FETCH_ERRORS as exc:
                 raise ValueError(f"could not fetch ref_audio ({_ref_audio_fetch_failure(exc)})") from exc
-            media_io.check_ref_audio(path, decoder)
-            return path
-        path = media_io.save_base64_audio(ref, upload_dir, decoder)
+        else:
+            try:
+                _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
+            except ValueError:
+                raise ValueError(media_io.BARE_REF_AUDIO_REFUSAL) from None
+        media_io.check_saved_ref_audio(path, decoder, bare)
     except OSError as exc:
         logger.error("could not store a ref_audio upload under %s: %r", upload_dir, exc)
         raise RuntimeError("the server could not store ref_audio") from None
-    if path:
-        return path
-    raise ValueError(
-        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
-        "or base64 audio the model can decode"
-    )
+    return path
 
 
 class ChatterboxAdapter(OpenAIAdapter):
@@ -1058,17 +1099,11 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         _apply_sampling(req, mk)
-        # Clients written for the Edge model's serving recipe toggle thinking
-        # through ``chat_template_kwargs``; accept it alongside a flat
-        # ``enable_thinking``. Read before the attachments are saved, since a
-        # malformed value refuses the request.
-        template_kwargs = mk.pop("chat_template_kwargs", None) or {}
-        if "enable_thinking" in template_kwargs:
-            # raw, not bool(): the model refuses a non-boolean rather than reading "false" as true
-            mk.setdefault("enable_thinking", template_kwargs["enable_thinking"])
+        # Read before the attachments are saved, since a malformed value refuses the request.
+        _flatten_template_kwargs(mk)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
@@ -1149,7 +1184,11 @@ class LTX25Adapter(OpenAIAdapter):
         if getattr(req, "image", None) or getattr(req, "video", None):
             raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
         mk = _passthrough(req)
-        with_audio = mk.pop("audio", True)
+        with_audio = mk.pop("audio", None)
+        if with_audio is None:  # unset: sound, the model's default
+            with_audio = True
+        if not isinstance(with_audio, bool):  # "false" is truthy
+            raise ValueError(f"audio must be true or false, got {with_audio!r}")
         if getattr(req, "size", None):
             try:
                 width, height = (int(v) for v in req.size.lower().split("x"))
@@ -1163,6 +1202,65 @@ class LTX25Adapter(OpenAIAdapter):
         return SubmitArgs(
             text=req.prompt,
             input_modalities=["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
+            model_kwargs=mk,
+        )
+
+
+class MiniMaxH3Adapter(OpenAIAdapter):
+    """MiniMax-H3: one mp4 with the 32 kHz stereo audio as AAC (``extra_body.audio: false``
+    for video alone). ``size`` is "WxH"; ``image`` is the first frame and
+    ``extra_body.last_image`` the last; the other knobs pass through ``extra_body``. Only
+    24 fps.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:
+        if getattr(req, "video", None):
+            raise ValueError("MiniMax-H3 takes keyframes ('image', extra_body 'last_image'), not a 'video'.")
+        if getattr(req, "fps", None) not in (None, 24, 24.0):
+            raise ValueError(f"MiniMax-H3 generates at 24 fps; got fps={req.fps!r}")
+        if getattr(req, "n", None) not in (None, 1):
+            raise ValueError(f"MiniMax-H3 generates one video per request; got n={req.n!r}")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", None)
+        if with_audio is None:  # unset or null: the default, sound
+            with_audio = True
+        if not isinstance(with_audio, bool):
+            raise ValueError(f"extra_body 'audio' must be true or false; got {with_audio!r}")
+        last_image = mk.pop("last_image", None)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '1344x768'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        refs = [(anchor, ref) for anchor, ref in (("first", getattr(req, "image", None)), ("last", last_image))
+                if ref is not None]
+        for anchor, ref in refs:
+            if not isinstance(ref, str):
+                name = "image" if anchor == "first" else "extra_body 'last_image'"
+                raise ValueError(f"{name} must be a data URL; got {type(ref).__name__}")
+        paths: list[str] = []
+        try:
+            for _, ref in refs:
+                paths.append(media_io.resolve_media_ref(ref, upload_dir)[1])
+        except BaseException:
+            # a refused request is never submitted, so no deferred cleanup covers the
+            # keyframe saved before the refusal
+            media_io.remove_uploads({"image": paths}, upload_dir)
+            raise
+        if paths:
+            mk["keyframe_anchors"] = [anchor for anchor, _ in refs]
+        return SubmitArgs(
+            text=req.prompt,
+            file_paths={"image": paths} if paths else None,
+            input_modalities=["image", "text"] if paths else ["text"],
             output_modalities=["video", "audio"] if with_audio else ["video"],
             model_kwargs=mk,
         )
@@ -1545,6 +1643,10 @@ class HiggsAudioAdapter(OpenAIAdapter):
     ``prompt`` is the transcription instruction (the model has a default)."""
 
     supports_transcriptions = True
+    # The model drops or repeats text on long audio, so uploads go as windows of
+    # at most 30 s. It takes no previous text, so they run at once.
+    max_audio_seconds = 30.0
+    long_form = "parallel"
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         mk = _transcription_kwargs(req)
@@ -1565,7 +1667,8 @@ class TextChatAdapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1578,28 +1681,13 @@ class TextChatAdapter(OpenAIAdapter):
             value = getattr(req, name, None)
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1, got {value}")
-        # what the model cannot serve is refused, not dropped: off, a field passes
-        if req.n not in (None, 1):
-            raise ValueError(f"n={req.n}: this model returns one choice")
-        if req.stop:
-            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
-        mk = _passthrough(req)
-        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
-                     "stop_token_ids"):
-            if mk.get(name):
-                raise ValueError(f"{name} is not supported; got {mk[name]!r}")
-            mk.pop(name, None)
-        if mk.pop("best_of", None) not in (None, 1):
-            raise ValueError("best_of is not supported; this model returns one choice")
-        if mk.pop("response_format", None) not in (None, {"type": "text"}):
-            raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
         _apply_sampling(req, mk)
         # extra_body can override max_tokens with anything; a string reached the
         # conductor's min() and took its whole message batch down
         mk = normalize_generation_kwargs(mk)
         return SubmitArgs(
             text=text,
-            input_modalities=["text"],
+            input_modalities=modalities,
             output_modalities=["text"],
             model_kwargs=mk,
             prompt_parts=parts,
@@ -1673,6 +1761,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
+    "minimax_h3": MiniMaxH3Adapter(),
     "whisper_large": WhisperAdapter(),
     "whisper_large_v3_turbo": WhisperAdapter(),
     "qwen3_asr": Qwen3ASRAdapter(),
@@ -1693,6 +1782,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "glm5_next": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
+    "ripple_65b": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.

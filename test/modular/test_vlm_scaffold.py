@@ -314,7 +314,7 @@ def test_qwen_media_capture_stages_every_media_buffer():
         c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
         if c.capture_graph_walk == "prefill_vision"
     ]
-    for n in config.capture_token_lengths:
+    for n in config.get_total_tokens(1):
         rows = [config.make_node_input(n)]
         engine_inputs = SimpleNamespace(resources={}, request_ids=[0], captured=True)
         out = type(llm).preprocess(llm, "prefill_vision", engine_inputs, rows)
@@ -346,6 +346,17 @@ def test_glimmer_encoder_declares_windows_and_frames():
     assert [(seg.label, seg.span) for seg in step.segments] == [
         (VISION_WINDOW, 4), (VISION_WINDOW, 4), (VISION_FULL, 8),
     ]
+
+
+def test_a_two_label_tower_refuses_a_resource_whose_step_is_its_segments():
+    """A LoRA pool reads the segments as the rows the tower's linears see; Glimmer's
+    windows and frames each cover every patch, so binding one would count them twice."""
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+    encoder = object.__new__(VisionEncoderSubmodule)
+    torch.nn.Module.__init__(encoder)
+    with pytest.raises(ValueError, match="one row per segment"):
+        encoder.bind_node_resources({"lora": SimpleNamespace(steps_from_segments=True)})
 
 
 def _glimmer_encoder(max_segments: int):

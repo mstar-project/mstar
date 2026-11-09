@@ -9,6 +9,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import sys
 import tempfile
 import threading
@@ -24,7 +25,7 @@ pytest.importorskip("pydantic")
 pytest.importorskip("httpx")
 np = pytest.importorskip("numpy")
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
@@ -60,6 +61,10 @@ class _StubAPI:
         # raised out of the stream after its chunks, like the delivery timeout
         self.raise_after: Exception | None = None
         self.aborted: list = []
+        self.released: list = []
+
+    def release_request(self, request_id):
+        self.released.append(request_id)
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -172,6 +177,28 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     assert r.status_code == 400
     # a refused input is the client's error, on every route
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.parametrize("exc,level", [
+    # a refusal is one INFO line: a client that sent stop on every call logged a traceback each
+    (ValueError("stop sequences are not supported"), logging.INFO),
+    # still a 400, but maybe a bug in the route, so it keeps its stack
+    (TypeError("'NoneType' object is not subscriptable"), logging.ERROR),
+], ids=["refusal", "type-error"])
+def test_a_chat_s_400_logs_a_traceback_only_for_a_type_error(client_and_stub, monkeypatch, caplog, exc, level):
+    from mstar.api_server.openai import adapters
+
+    def raising(self, req, upload_dir):
+        raise exc
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    monkeypatch.setattr(adapters.BagelAdapter, "chat_to_request", raising)
+    caplog.set_level(logging.INFO, logger="mstar.api_server.openai.router")
+    r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    [record] = [rec for rec in caplog.records if rec.name == "mstar.api_server.openai.router"]
+    assert (record.levelno, record.exc_info is not None) == (level, level == logging.ERROR)
 
 
 def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
@@ -368,6 +395,23 @@ def test_chat_audio_output(client_and_stub):
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
 
 
+def test_chat_audio_output_is_in_the_requested_format(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_omni"
+    pcm = _pcm([0, 16000, -16000])
+    stub.next_chunks = [_Chunk("audio", pcm)]
+    body = {"messages": [{"role": "user", "content": "x"}], "modalities": ["text", "audio"],
+            "audio": {"voice": "Ethan", "format": "pcm16"}}
+    reply = client.post("/v1/chat/completions", json=body).json()
+    assert base64.b64decode(reply["choices"][0]["message"]["audio"]["data"]) == pcm
+    # stream deltas are raw PCM16, so any other container is refused rather than mislabeled
+    r = client.post("/v1/chat/completions", json={**body, "stream": True, "audio": {"format": "wav"}})
+    assert r.status_code == 400 and "pcm16" in r.json()["error"]["message"]
+    # the refusal names the chat field and its formats, not the speech route's
+    r = client.post("/v1/chat/completions", json={**body, "audio": {"format": "pcm"}})
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith("audio.format 'pcm' cannot be produced")
+
+
 def test_audio_speech(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"
@@ -489,6 +533,9 @@ def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, mon
 
     def fake_mux(video, audio, sample_rate, num_channels, video_fps=None):
         muxed.update(video=video, audio=audio, sample_rate=sample_rate, num_channels=num_channels)
+        # ffmpeg can run for minutes: off the event loop, which keeps serving meanwhile
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
         return b"muxed"
 
     monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
@@ -777,6 +824,34 @@ def test_images_n_below_one_is_400(client_and_stub):
     message = resp.json()["error"]["message"]
     assert resp.status_code == 400 and message.startswith("n must be between 1 and") and "got 0" in message
 
+_PNG = ("in.png", b"\x89PNGinput", "image/png")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("mask", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("image", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "n": "2"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "response_format": "url"}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "n": 2}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+], ids=["mask", "two-images", "edit-n", "edit-url", "image-url", "video-n", "video-url"])
+def test_image_and_video_routes_refuse_what_they_would_drop(client_and_stub, model, path, body):
+    """A mask, a second image, n > 1 on a one-result route, or a url response was dropped with a 200."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    resp = client.post(path, **body)
+    assert resp.status_code == 400, resp.text
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def test_images_edits_takes_the_openai_image_list_name(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    resp = client.post("/v1/images/edits", files=[("image[]", _PNG)], data={"prompt": "x"})
+    assert resp.status_code == 200 and "image" in stub.last_submit["file_paths"]
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the
@@ -1000,7 +1075,7 @@ _ATTACHMENTS = _CHAT["messages"][0]["content"][:2]
     ("qwen3_omni", {"messages": [{"role": "user", "content": _ATTACHMENTS}, {"role": "tool", "content": "42"}]},
      "a message's role must be system, developer, user or assistant, not 'tool'"),
     ("cosmos3_edge", {"messages": [{"role": "user", "content": _ATTACHMENTS}], "chat_template_kwargs": True},
-     "argument of type 'bool' is not iterable"),
+     "chat_template_kwargs must be an object"),
 ], ids=["bad-attachment", "bad-role", "bad-template-kwargs"])
 def test_a_chat_refused_after_its_attachments_leaves_no_upload_behind(client_and_stub, model, body, message):
     """A chat refused once some attachments are saved is never submitted, so
@@ -1043,3 +1118,224 @@ def test_a_chunked_speech_stream_keeps_its_clip_until_the_last_chunk_is_submitte
     assert r.status_code == 200 and r.content == _pcm([1, 2, 3]) * len(on_disk_at_submit)
     assert len(on_disk_at_submit) > 2 and all(on_disk_at_submit)
     assert _left_after_cleanup(stub.upload_dir) == []
+
+
+def test_speech_stream_format_audio_streams_without_stream_flag(client_and_stub):
+    # the OpenAI SDK sends stream_format, never stream
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2])), _Chunk("audio", _pcm([3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm", "stream_format": "audio"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("audio/pcm")
+    assert r.content == _pcm([1, 2, 3])
+    assert stub.last_submit["streaming"] is True
+    assert "stream_format" not in stub.last_submit["model_kwargs"]
+
+
+def test_speech_stream_format_sse_sends_openai_audio_events(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2])), _Chunk("audio", _pcm([3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm", "stream_format": "sse"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    assert [e["type"] for e in events] == ["speech.audio.delta", "speech.audio.delta", "speech.audio.done"]
+    assert b"".join(base64.b64decode(e["audio"]) for e in events[:-1]) == _pcm([1, 2, 3])
+    assert "stream_format" not in stub.last_submit["model_kwargs"]
+
+
+@pytest.mark.parametrize("stream_format", ["sse", "audio"])
+def test_speech_stream_releases_every_piece_when_the_client_leaves_before_the_first_audio(tmp_path, stream_format):
+    """No response has started while the first result is awaited, so the handler
+    itself has to notice the disconnect and release the pieces it submitted."""
+    from api_server_helpers import make_test_api_server
+    from starlette.requests import Request
+
+    from mstar.api_server.entrypoint import PendingRequest
+    from mstar.api_server.openai.adapters import Qwen3TTSAdapter
+    from mstar.api_server.openai.protocol import SpeechRequest
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    aborted = []
+    api = make_test_api_server(
+        upload_dir=tmp_path, timeout_seconds=600,
+        preprocess_worker=types.SimpleNamespace(abort_request=aborted.append),
+    )
+
+    def submit(**kw):
+        rid, key = kw["request_id"], f"{kw['request_id']}#1"
+        api._live[rid], api._client_ids[key] = key, rid
+        api.pending_requests[key] = PendingRequest(kw["streaming"], ["text"], ["audio"], None)
+        return rid
+
+    api.submit_request = submit
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def run():
+        req = SpeechRequest(input="A long sentence. " * 100, response_format="pcm", stream_format=stream_format)
+        return await asyncio.wait_for(
+            create_speech(api, "qwen3_tts", Qwen3TTSAdapter(), req, Request({"type": "http"}, receive)), 5,
+        )
+
+    response = asyncio.run(run())
+    assert response.status_code == 499
+    assert api.pending_requests == {} and len(aborted) >= 2
+
+
+def test_speech_sse_closes_the_audio_stream_when_the_client_leaves():
+    from mstar.api_server.openai.serving_speech import _as_sse
+
+    closed = []
+
+    async def audio():
+        try:
+            yield b"\x01\x00"
+            yield b"\x02\x00"
+        finally:
+            closed.append(True)
+
+    async def leave_after_first_event():
+        events = _as_sse(audio())
+        await anext(events)
+        await events.aclose()
+
+    asyncio.run(leave_after_first_event())
+    assert closed == [True]
+
+
+def test_speech_sse_reports_a_failure_after_the_stream_opened(client_and_stub):
+    # the 200 is sent with the first delta, so a later failure must travel in-band, not as a done
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2]))]
+    stub.raise_after = HTTPException(status_code=504, detail="result delivery timed out")
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm", "stream_format": "sse"})
+    assert r.status_code == 200
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    assert [e["type"] for e in events] == ["speech.audio.delta", "error"]
+    assert events[1]["error"] == {"message": "result delivery timed out", "type": "server_error", "code": 504}
+    assert stub.released == [stub.last_submit["request_id"]]
+
+
+@pytest.mark.parametrize("spec_version", ["2.4", "2.3"])
+def test_speech_stream_releases_its_pieces_when_the_client_leaves_mid_write(spec_version):
+    # Starlette stops at the failed send (2.4) or cancels it on http.disconnect (older
+    # servers) and leaves the body suspended at its yield; the response must close it.
+    from mstar.api_server.openai.serving_speech import _as_sse, _ClosingStreamingResponse
+
+    released = []
+
+    async def audio():
+        try:
+            for i in range(10):
+                yield _pcm([i])
+        finally:
+            released.append(True)
+
+    async def run():
+        gone = asyncio.Event()
+        sent = []
+
+        async def receive():
+            await gone.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and len(sent) > 2:
+                gone.set()
+                if spec_version == "2.4":
+                    raise OSError("client went away")
+                await asyncio.sleep(3600)  # a blocked write, cancelled by the disconnect
+
+        scope = {"type": "http", "asgi": {"spec_version": spec_version}}
+        response = _ClosingStreamingResponse(_as_sse(audio()), release=lambda: None, media_type="text/event-stream")
+        try:
+            await asyncio.wait_for(response(scope, receive, send), timeout=10)
+        except Exception:  # ClientDisconnect on 2.4
+            pass
+        # checked inside the loop: asyncio.run would finalize the generator on its way out
+        assert released == [True]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream_format", ["audio", "sse"])
+def test_speech_stream_releases_its_request_when_the_response_start_fails(client_and_stub, stream_format):
+    # the body never runs, so its own release cannot; the response must do it
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    _, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2]))]
+
+    async def run():
+        from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+        from mstar.api_server.openai.protocol import SpeechRequest
+
+        req = SpeechRequest(model="kokoro", input="hi", response_format="pcm", stream_format=stream_format)
+        response = await create_speech(stub, "kokoro", ADAPTER_REGISTRY["kokoro"], req)
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            raise OSError("client went away")
+
+        from starlette.requests import ClientDisconnect
+
+        with pytest.raises(ClientDisconnect):
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        # checked inside the loop: asyncio.run would finalize the iterator on its way out
+        assert stub.released == [stub.last_submit["request_id"]]
+
+    asyncio.run(run())
+
+
+def test_speech_refuses_an_unknown_stream_format(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream_format": "chunks"})
+    assert r.status_code == 400 and stub.last_submit is None
+    assert r.json()["error"]["message"] == "stream_format must be 'audio' or 'sse', got 'chunks'"
+
+
+@pytest.mark.parametrize(
+    ("sent", "described"),
+    [
+        ("SSE", "'SSE'"),
+        ("", "''"),
+        (True, "a boolean"),
+        (False, "a boolean"),  # == 0, and the guard compares with ==
+        (0, "a number"),
+        (-0.0, "a number"),  # Python keeps it an int; serde_json reports a float
+        (1, "a number"),
+        (1.5, "a number"),
+        (["sse"], "an array"),
+        ({"a": 1}, "an object"),
+    ],
+)
+def test_speech_refusal_quotes_a_string_and_names_any_other_type(client_and_stub, sent, described):
+    # The Rust frontend answers the same text; its
+    # `stream_format_refuses_anything_else_quoting_a_string_and_naming_a_type`
+    # asserts these same pairs. Reading a non-string value back would mean
+    # matching Python's `repr` in Rust, which serde_json's number model cannot.
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream_format": sent})
+    assert r.status_code == 400 and stub.last_submit is None
+    assert r.json()["error"]["message"] == f"stream_format must be 'audio' or 'sse', got {described}"
+
+
+def test_speech_stream_format_with_a_compressed_format_returns_one_body(client_and_stub):
+    # the OpenAI SDK's defaults (mp3 + sse): mp3 cannot stream, so it comes whole, not as a 400
+    pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm(list(range(0, 24000, 7))))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "flac", "stream_format": "sse"})
+    assert r.status_code == 200 and r.content[:4] == b"fLaC"
+    assert stub.last_submit["streaming"] is False
+    assert "stream_format" not in stub.last_submit["model_kwargs"]

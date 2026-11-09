@@ -77,6 +77,7 @@ from mstar.model.chatterbox.config import (
     ChatterboxConfig,
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
+from mstar.model.media_limits import decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -312,7 +313,7 @@ class ChatterboxModel(Model):
         streams = 1 if self.config.is_turbo else 2
         return streams * -(-tokens // page_size)
 
-    def get_lora_specs(self) -> list[LoraSpec]:
+    def _lora_spec(self) -> LoraSpec | None:
         """Per-request adapters on T3: every linear of its Llama backbone and the speech
         head (one row per segment: each stream's last token). Under classifier-free
         guidance a request's cond and uncond rows both run its adapter, as one model
@@ -321,17 +322,15 @@ class ChatterboxModel(Model):
         Turbo serves none: its GPT-2 checkpoint fuses q, k and v into one ``c_attn``
         tensor in Conv1D layout, which an adapter cannot be placed on per slice."""
         if self.config.t3.backbone.is_gpt2:
-            return []
-        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+            return None
         from mstar.model.chatterbox.components.t3 import T3Model
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
-
-        root = meta_root(lambda group: T3Model(self.config.t3, comm_group=group))
-        return [module_lora_spec(
-            root, resource_key=LORA_RESOURCE_KEY, nodes={T3_NODE}, root_path="model",
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+        return module_lora_spec(
+            lambda group: T3Model(self.config.t3, comm_group=group),
+            nodes={T3_NODE}, root_path="model",
             rows={"speech_head": PER_SEGMENT},
             exclude={"cond_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step"},
-        )]
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3
@@ -355,6 +354,7 @@ class ChatterboxModel(Model):
                 high_freq_factor=bb.rope_scaling["high_freq_factor"],
                 old_context_len=bb.rope_scaling["original_max_position_embeddings"],
             )
+        lora = self._lora_spec()
         return [
             KVSpec(resource_key=T3_KV, nodes={T3_NODE}, config=kv),
             AttentionSpec(
@@ -369,6 +369,7 @@ class ChatterboxModel(Model):
                 # the reference samples with min_p 0.05 (Turbo does not)
                 enable_min_p=not self.config.is_turbo,
             ),
+            *([lora] if lora is not None else []),
         ]
 
     def get_request_resource_configs(
@@ -605,16 +606,8 @@ class ChatterboxModel(Model):
             raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            # an undecodable upload is the client's error (400); a missing
-            # decoder library above still surfaces as a server error
-            try:
+            with decoding_upload(filepath, "the reference audio", ffmpeg=True):
                 return decode_torchcodec_capped(filepath, S3GEN_SR).float()
-            except RuntimeError as decode_exc:
-                # the decoder's message names the server's upload path; the client gets none of it
-                logger.info("torchcodec could not decode %s: %s", filepath, decode_exc)
-                raise ValueError(
-                    "Could not decode the reference audio: not a format soundfile or torchcodec can read"
-                ) from None
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")

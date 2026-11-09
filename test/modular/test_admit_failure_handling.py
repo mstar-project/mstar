@@ -85,7 +85,9 @@ class _FakeEngine(Engine):
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), rows_only=False)
+    return SimpleNamespace(
+        request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), no_forward_rids=set(), rows_only=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -182,7 +184,7 @@ def _batches(reason, prepared=("r0", "r1"), cached=()):
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
+        node_name="node", admit_error=reason, request_ids=list(prepared), no_forward_rids=set(cached),
         failed_resource=None,
     )
     return batch, node_batch
@@ -192,7 +194,7 @@ def _refused(batch, reason, failed_resource="kv"):
     """What a step of all of ``batch``'s rows comes back as when admit refuses it."""
     return SimpleNamespace(
         node_name=batch.node_name, admit_error=reason, failed_resource=failed_resource,
-        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(), no_forward_rids=set(),
     )
 
 

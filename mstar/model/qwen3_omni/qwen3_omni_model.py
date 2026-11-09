@@ -223,13 +223,10 @@ class Qwen3OmniModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
-        # the Thinker's captured prefill ladder (`ThinkerSubmodule.PREFILL_TOKEN_BUCKETS`)
-        self.prefill_token_buckets = prefill_token_buckets
 
         self.CONVERTER = [
             WeightConverter(
@@ -287,22 +284,20 @@ class Qwen3OmniModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
-    def get_lora_specs(self) -> list[LoraSpec]:
+    def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the Thinker: its attention, any dense MLP layers and
         the LM head (one row per request: the last token's). The routed experts and the
         router take none (packed expert tensors, run by the fused-MoE kernel), so an
         adapter touching them is refused with that reason; so is one touching the
         Talker or the encoders, which are other nodes. Modules are named as the full
         model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
-        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-
-        root = meta_root(lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group))
-        return [module_lora_spec(
-            root, resource_key=LORA_RESOURCE_KEY, nodes={"Thinker"}, root_path="model",
+        return module_lora_spec(
+            lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group),
+            nodes={"Thinker"}, root_path="model",
             rows={"lm_head": PER_SEGMENT},
-        )]
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         thinker_kv = PagedKVConfig(
@@ -378,6 +373,7 @@ class Qwen3OmniModel(Model):
                 enable_repetion_penalty=False,
             ),
             *self._encoder_resources(),
+            self._lora_spec(),
         ]
 
     def _encoder_resources(self) -> list[NodeResourceSpec]:
@@ -1521,7 +1517,7 @@ class Qwen3OmniModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         # Talker LLM (attention + MoE-with-shared-expert) is TP-capable
-        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock*``
+        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock``
         # parts as the Thinker. The internal CodePredictor is intentionally
         # left at TP=1 (replicated weights, deterministic sampler) — see
         # ``_create_talker_submodule``. ``shard_dim`` stays empty because
@@ -1626,11 +1622,7 @@ class Qwen3OmniModel(Model):
 
 
         from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-        return ThinkerSubmodule(
-            thinker_model=thinker_model,
-            config=self.config,
-            prefill_token_buckets=self.prefill_token_buckets,
-        )
+        return ThinkerSubmodule(thinker_model=thinker_model, config=self.config)
 
     def _create_talker_submodule(
         self, device: str, tp_group=None,
