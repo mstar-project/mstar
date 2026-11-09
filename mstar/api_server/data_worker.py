@@ -45,7 +45,7 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.distributed.base import node_group_axis_sizes
-from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.lora.identity import AdapterPrefixRoots
@@ -221,6 +221,23 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
         spec.resource_key: spec.config.tokens_per_page for spec in specs
         if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
+
+
+# More input characters than this per token of context can't fit: a vocabulary's
+# longest token spans a few dozen characters at most.
+_MAX_PROMPT_CHARS_PER_TOKEN = 64
+
+
+def _max_prompt_chars(model: Model | None, model_config: dict | None) -> int | None:
+    """The longest prompt worth tokenizing, in characters, for any tokenizer, or
+    None when the deployment has no paged KV to fit it in."""
+    if model is None or not model_config:
+        return None
+    contexts = [
+        spec.config.max_seq_len for spec in serving_resources(model, model_config)
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+    ]
+    return max(contexts) * _MAX_PROMPT_CHARS_PER_TOKEN if contexts else None
 
 
 def adapter_prefix_roots(
@@ -725,6 +742,7 @@ class PreprocessWorkerThread:
         # tensors under these names are client stream items, not prompt signals
         self._client_edges = frozenset(self._client_partitions)
         self._model_config = model_config
+        self._max_prompt_chars = _max_prompt_chars(model, model_config)
         # per request of a model with client streams, those streams' state
         self._client_calls: dict[str, ClientCall] = {}
         self.in_queue = in_queue
@@ -937,6 +955,10 @@ class PreprocessWorkerThread:
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
             model_kwargs.pop(name, None)
+        if self._max_prompt_chars is not None:
+            chars = max(len(input.text or ""), sum(len(p.text or "") for p in input.prompt_parts or ()))
+            if chars > self._max_prompt_chars:
+                raise ValueError(f"prompt of {chars} characters exceeds the model context")
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,

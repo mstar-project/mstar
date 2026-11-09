@@ -14,6 +14,7 @@ import torch
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.event import EventWakeup
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.model.base import ProcessPromptOutput
 from mstar.testing_utils.model import StubModel
 from mstar.utils import cpus
@@ -364,3 +365,15 @@ def test_the_prepare_pool_is_sized_with_the_first_request(monkeypatch):
     wt.model.gate("a").set()
     wt._prepare_pool.shutdown(wait=True)
     wt._encode_pool.shutdown()
+
+
+def test_a_prompt_far_past_the_context_is_refused_before_it_is_tokenized():
+    class Model(_Model):
+        def get_node_resources(self):
+            config = PagedKVConfig(num_layers=1, num_kv_heads=4, head_dim=8, max_seq_len=8)
+            return [KVSpec(resource_key="kv", nodes={"node"}, config=config)]
+
+    wt = _thread(Model(), config={"model": "m"}, sized=False)
+    with pytest.raises(ValueError, match="exceeds the model context"):
+        wt._prepare_input(_input("r", "a" * (8 * 64 + 1)))
+    assert wt.model.threads == {}
