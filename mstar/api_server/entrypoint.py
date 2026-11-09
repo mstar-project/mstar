@@ -3292,7 +3292,8 @@ def main(argv: list[str] | None = None):
                 served_models=api_server.served_models,
                 transcription=transcription_facts(api_server, get_adapter(model_name)),
                 openpi=openpi_facts(api_server.openpi_policy),
-                ws_max_bytes=_ws_max_size(config))
+                ws_max_bytes=_ws_max_size(config),
+                client_streams=api_server.client_streams)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

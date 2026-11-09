@@ -22,6 +22,7 @@
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!                        | {t:"voices", rid, sub}
 //!                        | {t:"windows", rid, sub, op, plan, ...}
+//!                        | {t:"live", rid, sub, op, call, ...}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
@@ -30,6 +31,7 @@
 //!                        | {t:"checked", rid, sub, error?, status?}
 //!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
+//!                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -372,14 +374,14 @@ impl Bridge {
         t: &str,
         refusals: Option<&Snapshot>,
         check: Option<&RefAudioCheck>,
-        windows: Option<&serde_json::Map<String, Value>>,
+        extra: Option<&serde_json::Map<String, Value>>,
         timeout: Duration,
     ) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check, windows };
+        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check, windows: extra };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -424,6 +426,32 @@ impl Bridge {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
+    }
+
+    /// One operation on a `/generate/ws` live call, the submission `call`:
+    /// `taking` (`taking_input`), `append` (`stream_input`) or `reject`
+    /// (`reject_input`), with its arguments. The reply's `metadata`, or `None`
+    /// on timeout.
+    pub async fn live(&self, call: u64, op: &str, mut args: serde_json::Map<String, Value>, timeout: Duration) -> Option<Value> {
+        args.insert("op".into(), Value::from(op));
+        args.insert("call".into(), Value::from(call));
+        match self.round_trip("live", None, None, Some(&args), timeout).await? {
+            StreamItem::Chunk(chunk) => Some(chunk.metadata),
+            _ => None,
+        }
+    }
+
+    /// A route for a socket's notices (an append the model found late), open
+    /// until [`Bridge::close_notices`].
+    pub fn notices(&self) -> (u64, UnboundedReceiver<StreamItem>) {
+        let (tx, rx) = unbounded_channel();
+        let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
+        (sub, rx)
+    }
+
+    pub fn close_notices(&self, sub: u64) {
+        self.routes.lock().expect("routes lock").remove(sub);
     }
 
     /// Have the planner of `plan` delete the upload and its windows; the upload
@@ -510,7 +538,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" => (
+        "metrics" | "voices" | "windows" | "live" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),

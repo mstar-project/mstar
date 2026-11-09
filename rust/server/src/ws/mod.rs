@@ -1,6 +1,7 @@
 //! The WebSocket routes: openpi's policy socket at the server's root,
 //! `/generate/ws`, and `/v1/realtime`.
 
+pub mod generate;
 pub mod openpi;
 
 /// The largest WebSocket message the server reads, in bytes: the config's
