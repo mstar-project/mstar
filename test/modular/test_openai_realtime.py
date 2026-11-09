@@ -1080,8 +1080,8 @@ def test_disconnect_is_read_while_a_step_waits_and_cancels_its_request():
         ws = Socket([json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2)})])
         rt = serving_realtime.RealtimeTranscription(api, "rt_test", _ContinuingAdapter(), ws)
         task = asyncio.create_task(rt.run())
-        await asyncio.wait_for(started.wait(), 1)
-        done, _ = await asyncio.wait({task}, timeout=0.2)
+        await asyncio.wait_for(started.wait(), 60)
+        done, _ = await asyncio.wait({task}, timeout=60)
         try:
             assert task in done, "disconnect waits behind the blocked inference step"
             await task

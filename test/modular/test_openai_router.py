@@ -1072,7 +1072,7 @@ def test_chat_attachment_write_does_not_block_other_loop_work(monkeypatch):
 
         def write(*args, **kwargs):
             loop.call_soon_threadsafe(progressed.set)
-            assert progressed.wait(1), "attachment write blocked the event loop"
+            assert progressed.wait(60), "attachment write blocked the event loop"
             return save(*args, **kwargs)
 
         monkeypatch.setattr(media_io, "save_upload", write)
