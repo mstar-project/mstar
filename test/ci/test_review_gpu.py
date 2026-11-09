@@ -595,6 +595,27 @@ class TestEras(unittest.TestCase):
                                          {"identity_file": "~/.ssh/live_pr"})
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
+    def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
+        run = {"status": "failed", "failure": {"code": "launch_refused", "message": "The cluster refused the Pod."}}
+        instance = {"status": "active", "standalone": {"current_run": run}}
+        e = {"provider": "eras", "instance_id": "i-1", "run": True}
+        for files, expected in (((), "launch_refused"), (("result.json",), None), (("refresh.log",), None)):
+            with self.subTest(files=files):
+                temp = Path(tempfile.mkdtemp())
+                (temp / "lt/results").mkdir(parents=True)
+                (temp / "lt/instance").write_text("eras:i-1\n")
+                for f in files:
+                    (temp / "lt/results" / f).write_text("x")
+                patches = {"entry": lambda key: dict(e), "load_config": dict, "eras": lambda *a: instance}
+                with unittest.mock.patch.multiple(gpu_review.gpu_py, **patches), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    out, _ = step(gpu_review.wait, {"gpu.py *": ""}, runner_temp=str(temp))
+                self.assertEqual(out.get("unavailable"), "true" if expected else None)
+                self.assertEqual(out.get("exit"), 3 if expected else None)
+                if expected:
+                    self.assertIn(expected, (temp / "lt/unavailable.md").read_text(),
+                                  "the PR would say 'Live test: none' with no reason")
+
 
 if __name__ == "__main__":
     unittest.main()

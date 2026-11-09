@@ -173,6 +173,14 @@ class TestReviewSummary(unittest.TestCase):
         state = read_state(render(r, [], "0123456789", "full", []))
         self.assertEqual(state["outside_diff"], r["outside_diff"], "a re-review would start from a corrupted state")
 
+    def test_a_blank_or_quotes_only_since_last_is_left_out(self):
+        for blank in ("", '""', " ''\n"):
+            with self.subTest(blank):
+                r = review()
+                r["since_last"] = blank
+                self.assertEqual(render(r, [], "0123456789", "nogpu", []).count('""'), 0,
+                                 "the summary would print a literal pair of quotes")
+
     def test_model_text_cant_ping_load_an_image_or_change_the_state(self):
         r = review()
         r["since_last"] = "see @org/team ![x](https://evil.example/x.png)"
