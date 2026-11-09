@@ -111,15 +111,7 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(24000);
     let allow_remote = std::env::var("MSTAR_ALLOW_REMOTE").as_deref() == Ok("1");
-    // Total per-request budget (mstar's APIServer timeout_seconds default). 0
-    // times every request out, as a --timeout of 0 or below does in Python.
-    let request_timeout = std::time::Duration::from_secs_f64(
-        std::env::var("MSTAR_REQUEST_TIMEOUT_S")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|s| s.is_finite() && *s >= 0.0)
-            .unwrap_or(600.0),
-    );
+    let request_timeout = request_timeout(std::env::var("MSTAR_REQUEST_TIMEOUT_S").ok().as_deref());
     // Same variable and default as serving_images.max_images_per_request.
     let max_images_per_request =
         parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
@@ -1216,6 +1208,15 @@ async fn images_generations(
 
 /// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
 /// matching serving_images.image_count.
+/// `MSTAR_REQUEST_TIMEOUT_S`, the total per-request budget: a finite number of
+/// seconds at least 0, where 0 times every request out, as a `--timeout` at or
+/// below 0 does in Python; anything else is mstar's default 600 s.
+fn request_timeout(raw: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(
+        raw.and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(600.0),
+    )
+}
+
 /// `MSTAR_MAX_IMAGES_PER_REQUEST` as Python's `max_images_per_request` reads
 /// it: an ASCII integer, surrounding whitespace allowed, at least 1; anything
 /// else is the default 10.
@@ -2373,6 +2374,15 @@ mod tests {
         let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
         let resp = build_chat_response("m", "r", chunks, 24000, "pcm").unwrap();
         assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
+    }
+
+    #[test]
+    fn a_timeout_of_0_times_every_request_out_and_an_unreadable_one_is_the_default() {
+        let secs = |raw| request_timeout(raw).as_secs_f64();
+        assert_eq!((secs(Some("0")), secs(Some(" 1800.5 ")), secs(Some("1e9"))), (0.0, 1800.5, 1e9));
+        for raw in [None, Some("-1"), Some("inf"), Some("nan"), Some("abc")] {
+            assert_eq!(secs(raw), 600.0, "{raw:?}");
+        }
     }
 
     #[test]

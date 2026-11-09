@@ -220,27 +220,8 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
             return refuse(format!("{name} must be at least 1, got {v}"));
         }
     }
-    if let Some(n) = req.n.filter(|n| *n != 1) {
-        return refuse(format!("n={n}: this model returns one choice"));
-    }
-    if req.stop.as_ref().is_some_and(truthy) {
-        return refuse(
-            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
-        );
-    }
+    // n, stop and the unserved fields were refused, or dropped, by refuse_unserved_chat
     let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-    for name in ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"] {
-        if let Some(v) = mk.get(name).filter(|v| truthy(v)) {
-            return refuse(format!("{name} is not supported; got {}", py_value_repr(v)));
-        }
-        mk.remove(name);
-    }
-    if mk.remove("best_of").is_some_and(|v| !(v.is_null() || v == 1)) {
-        return refuse("best_of is not supported; this model returns one choice".to_string());
-    }
-    if mk.remove("response_format").is_some_and(|v| !(v.is_null() || v == serde_json::json!({"type": "text"}))) {
-        return refuse("response_format needs constrained decoding; only {'type': 'text'} is served".to_string());
-    }
     apply_sampling(
         &mut mk,
         Sampling {

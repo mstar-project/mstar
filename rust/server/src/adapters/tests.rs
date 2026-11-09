@@ -244,19 +244,6 @@ fn a_thinking_chat_reads_the_template_kwargs_flat() {
     }
 }
 
-#[test]
-fn floats_are_quoted_as_python_reprs_them() {
-    for (x, want) in [
-        (0.5, "0.5"), (1.0, "1.0"), (-2.0, "-2.0"), (1e-05, "1e-05"), (0.0001, "0.0001"),
-        (123.456, "123.456"), (1e16, "1e+16"), (1.5e16, "1.5e+16"), (9999999999999998.0, "9999999999999998.0"),
-        (-3.25e-07, "-3.25e-07"), (0.0, "0.0"),
-    ] {
-        assert_eq!(super::py_float_repr(x), want, "{x}");
-    }
-    let v: Value = serde_json::from_str(r#"{"b": [true, null, "it's"], "a": 1}"#).unwrap();
-    assert_eq!(super::py_value_repr(&v), r#"{'a': 1, 'b': [True, None, "it's"]}"#);
-}
-
 fn chat_with(fields: &str) -> ChatCompletionRequest {
     let body = format!(r#"{{"messages":[{{"role":"user","content":"Hi."}}],{fields}}}"#);
     serde_json::from_str(&body).unwrap()
