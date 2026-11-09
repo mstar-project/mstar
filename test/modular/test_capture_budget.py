@@ -735,6 +735,19 @@ def test_an_idle_bucket_is_planned_only_beside_its_plain_twin():
     assert plan_captures(pools, free=300 * _MIB).buckets == {"LLM": set(pools["LLM"])}
 
 
+def test_every_plain_bucket_is_planned_before_any_idle_one():
+    """A cheap LLM idle bucket, its plain twin already in, took the room a plain
+    vision_encoder bucket needed, so the encoder's steps ran eager."""
+    llm = _bucket("decode", 1, 1)
+    vision = _bucket("encode", 1, 1)
+    pools = {
+        "LLM": {llm: _cost(100), BucketKey("decode", 1, 1, idle=True): _cost(60, kept=60)},
+        "vision_encoder": {vision: _cost(150)},
+    }
+
+    assert plan_captures(pools, free=260 * _MIB).buckets == {"LLM": {llm}, "vision_encoder": {vision}}
+
+
 def test_a_bucket_goes_in_with_all_its_slots_or_not_at_all():
     """Two slots of a 200 MiB graph that keeps 100 MiB of outputs take 300 MiB:
     the second slot reuses the first's scratch but not its outputs."""
