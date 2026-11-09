@@ -344,10 +344,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        graph capture is taken at, in place of the model's. A name is a walk the
        node runs, for its packed captures on that walk (the model's
        ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
-       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of one of its piecewise packed
-       regions, for that region's ``total_tokens`` (BAGEL's ``vit_block_loop``,
-       OmniVoice's ``backbone_layers``). A step pads to the smallest rung that
-       holds it, and a longer one runs eagerly. A walk's ladder is a list, or a
+       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of
+       one of its piecewise packed regions, for that region's ``total_tokens``
+       (BAGEL's ``vit_block_loop``, OmniVoice's ``backbone_layers``). A step
+       pads to the smallest rung that holds it, and a longer one runs eagerly.
+       A walk's ladder is a list, or a
        mapping of min batch size -> list for a ladder per range of batch sizes:
        ``{1: [...], 2: [...]}`` captures one request on the first and every larger
        batch on the second (a larger batch size's ladder must reach at least as

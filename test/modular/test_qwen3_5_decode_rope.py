@@ -97,6 +97,7 @@ def _captured_engine(monkeypatch, root):
         "vision_start_token_id": 90, "vision_end_token_id": 91, "text_config": _TEXT,
     }))
     monkeypatch.setattr(LLMSubmodule, "PREFILL_TOKEN_BUCKETS", [64, 256])
+    monkeypatch.setattr(LLMSubmodule, "MIXED_TOKEN_BUCKETS", [64, 256])
     model = qwen3_5_model.Qwen3_5DenseModel(model_path_hf=str(root))
 
     lm = model._build(lambda: Qwen3_5ForCausalLM(model.config, None), torch.float32, "cpu")
