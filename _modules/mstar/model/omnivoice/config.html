@@ -1087,8 +1087,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">class_temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
     <span class="n">denoise</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
-    <span class="c1"># Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step</span>
-    <span class="c1"># is the loop's cap; this only bounds the graph.</span>
+    <span class="c1"># Ceiling for the unmask Loop's ``max_iters`` and the largest num_step a</span>
+    <span class="c1"># request may ask for (above it is a 400). A request's own num_step is the</span>
+    <span class="c1"># loop's cap.</span>
     <span class="n">max_num_step</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span></div>
 
 

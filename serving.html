@@ -1654,9 +1654,12 @@ DROID robot’s normalization stats:</p>
 <p>With <code class="docutils literal notranslate"><span class="pre">norm_stats</span></code> set, Pi0.5 takes the raw robot state in <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> and returns
 actions in robot units, as openpi’s policy server does. <code class="docutils literal notranslate"><span class="pre">norm_stats</span></code> can also be the path
 of an openpi <code class="docutils literal notranslate"><span class="pre">norm_stats.json</span></code>. Without it, <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> must already be normalized to
-[-1, 1].</p>
+[-1, 1]. Either way it is a list of 1 to <code class="docutils literal notranslate"><span class="pre">state_dim</span></code> finite numbers (the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">max_state_dim</span></code>, 32 when it sets none); anything else is a 400.</p>
 <p>Per-request knobs (<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, …) are sent by the
-client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. Give each request its own <code class="docutils literal notranslate"><span class="pre">seed</span></code> for independent
+client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>, and <a class="reference internal" href="clients.html#generation-parameters"><span class="std std-ref">Generation parameters</span></a> for what each
+sampling knob means.
+Give each request its own <code class="docutils literal notranslate"><span class="pre">seed</span></code> for independent
 samples. A seed fixes a request’s tokens whatever it is batched with only where M* draws
 with one kernel that reads each row’s own seed: on CUDA, a sampler whose vocabulary is at
 most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),

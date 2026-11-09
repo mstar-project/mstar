@@ -1600,6 +1600,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.load_generation_defaults">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">load_generation_defaults</span><span class="p">(</span>
     <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span> <span class="n">stage</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
+    <span class="n">switch_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The sampling defaults ``checkpoint_dir/generation_config.json`` declares.</span>
 
@@ -1607,6 +1608,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads</span>
 <span class="sd">    ``talker_temperature``) and ``stage`` prefixes the returned names</span>
 <span class="sd">    (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.</span>
+<span class="sd">    ``switch_only`` reads ``do_sample`` alone, for a file that is the backbone's</span>
+<span class="sd">    chat preset rather than the model's own recipe.</span>
 <span class="sd">    Returns ``{}`` when there is no file, so the caller's own defaults apply.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="n">checkpoint_dir</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1620,7 +1623,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Unreadable </span><span class="si">%s</span><span class="s2">; using the model's own defaults"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">{}</span>
     <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
-    <span class="k">for</span> <span class="n">hf_key</span><span class="p">,</span> <span class="n">knob</span> <span class="ow">in</span> <span class="n">_KNOBS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">hf_key</span><span class="p">,</span> <span class="n">knob</span> <span class="ow">in</span> <span class="p">({}</span> <span class="k">if</span> <span class="n">switch_only</span> <span class="k">else</span> <span class="n">_KNOBS</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="n">value</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">prefix</span> <span class="o">+</span> <span class="n">hf_key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">out</span><span class="p">[</span><span class="n">stage</span> <span class="o">+</span> <span class="n">knob</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>

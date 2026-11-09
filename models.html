@@ -729,9 +729,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ripple-65b-ripple-65b">Ripple-65B (<code class="docutils literal notranslate"><span class="pre">ripple_65b</span></code>)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-asr-qwen3-asr-qwen3-asr-realtime-notes">Qwen3-ASR (<code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code>) notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bagel-notes">BAGEL notes</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#glm-5-2-glm-5-3-flash-glm52-glm5-next">GLM-5.2 / GLM-5.3-Flash (<code class="docutils literal notranslate"><span class="pre">glm52</span></code>, <code class="docutils literal notranslate"><span class="pre">glm5_next</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#muse-glimmer-muse-glimmer">Muse Glimmer (<code class="docutils literal notranslate"><span class="pre">muse_glimmer</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#command-a-command-a-plus">Command A+ (<code class="docutils literal notranslate"><span class="pre">command_a_plus</span></code>)</a></li>
@@ -1075,6 +1077,17 @@ performance-optimized; treat their throughput/latency as provisional.</p></li>
 the expert shape, and default tiles otherwise. The server logs the sweep command
 for each shape it serves untuned; see “Tuned kernel configs” in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
 <li><p>To add a new family, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
+<li><p>Unset sampling knobs take the checkpoint’s <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>, then the
+model’s config. BAGEL and Orpheus are the exception: their files are the
+backbone’s chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
+<code class="docutils literal notranslate"><span class="pre">do_sample:</span> <span class="pre">false</span></code> is read and the recipes stay (BAGEL temperature 0.6,
+top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8).</p></li>
+<li><p>Qwen3-Omni’s Talker cap comes from <code class="docutils literal notranslate"><span class="pre">talker_max_new_tokens</span></code>, 4096 on the
+released checkpoint (it was 2048). Plain sampling keys target the Thinker, except
+on <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>, where <code class="docutils literal notranslate"><span class="pre">temperature</span></code> and <code class="docutils literal notranslate"><span class="pre">top_p</span></code> set the Talker;
+<code class="docutils literal notranslate"><span class="pre">talker_*</span></code> and <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code> set those stages on every route.</p></li>
+<li><p>Qwen3-TTS: <code class="docutils literal notranslate"><span class="pre">talker_&lt;knob&gt;</span></code> wins over a plain <code class="docutils literal notranslate"><span class="pre">&lt;knob&gt;</span></code> when a request
+sends both.</p></li>
 </ul>
 <section id="per-request-lora-adapters">
 <h3>Per-request LoRA adapters<a class="headerlink" href="#per-request-lora-adapters" title="Link to this heading">#</a></h3>
@@ -1161,9 +1174,10 @@ VoxCPM2, Wan2.2, Waypoint and Z-Image.</p>
 <section id="omnivoice-notes">
 <h3>OmniVoice notes<a class="headerlink" href="#omnivoice-notes" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p>Zero-shot only: there are no built-in speakers. Pass <code class="docutils literal notranslate"><span class="pre">reference_audio</span></code> with its
-transcript in <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> to clone a voice, or describe one in <code class="docutils literal notranslate"><span class="pre">voice</span></code>.
-<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> is required alongside <code class="docutils literal notranslate"><span class="pre">reference_audio</span></code>.</p></li>
+<li><p>Zero-shot only: there are no built-in speakers. Pass <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (an uploaded
+<code class="docutils literal notranslate"><span class="pre">audio</span></code> input on <code class="docutils literal notranslate"><span class="pre">/generate</span></code>) with its transcript in <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> to clone a voice,
+or describe one in <code class="docutils literal notranslate"><span class="pre">instruct</span></code> (<code class="docutils literal notranslate"><span class="pre">voice</span></code> on <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>).
+<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> is required alongside the reference clip.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">language</span></code> takes either the name (<code class="docutils literal notranslate"><span class="pre">Vietnamese</span></code>) or the id (<code class="docutils literal notranslate"><span class="pre">vi</span></code>): a
 name is resolved to the id the model was trained on before the prompt is
 built, and an unrecognised value warns and falls back to language-agnostic
@@ -1321,7 +1335,7 @@ sk, sl, es, sv, ru, uk) and is then ignored; any other is refused.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">canary</span></code>: <code class="docutils literal notranslate"><span class="pre">language</span></code> (the speech’s, default <code class="docutils literal notranslate"><span class="pre">en</span></code>; one of Parakeet’s 25),
 <code class="docutils literal notranslate"><span class="pre">target_language</span></code> (a translation to or from English; the OpenAI route also takes
 <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>) and <code class="docutils literal notranslate"><span class="pre">punctuation</span></code> (default on).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>: English only (checked on the OpenAI route). <code class="docutils literal notranslate"><span class="pre">instruction</span></code>
+<li><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>: English only. <code class="docutils literal notranslate"><span class="pre">instruction</span></code>
 replaces the trained one, “Transcribe the following:”; <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s text is unused.</p></li>
 </ul>
 </li>
@@ -1339,6 +1353,29 @@ and startup refuses a cap the caches can’t hold.</p></li>
 <li><p>Canary-Qwen’s default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
 smaller GPU, lower <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code>
 together.</p></li>
+<li><p>Request knobs must have their documented types (a string <code class="docutils literal notranslate"><span class="pre">language</span></code>, a boolean
+<code class="docutils literal notranslate"><span class="pre">punctuation</span></code>, a string <code class="docutils literal notranslate"><span class="pre">instruction</span></code>), or the request is a 400. Canary-Qwen refuses a
+<code class="docutils literal notranslate"><span class="pre">language</span></code> other than English on every route. Canary and Canary-Qwen decode greedily
+unless the request sets <code class="docutils literal notranslate"><span class="pre">temperature</span></code> above 0 (<code class="docutils literal notranslate"><span class="pre">top_p</span></code> and <code class="docutils literal notranslate"><span class="pre">top_k</span></code> then apply);
+neither checkpoint declares sampling defaults, so a <code class="docutils literal notranslate"><span class="pre">min_p</span></code> or <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>
+is refused.
+<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> may be at most 1014 on Canary (the position table less its 10-token
+prompt) and 1024 on Canary-Qwen; a larger value is refused rather than cut. Parakeet and
+Nemotron decode greedily and read only <code class="docutils literal notranslate"><span class="pre">language</span></code>: a sent <code class="docutils literal notranslate"><span class="pre">temperature</span></code> is logged
+as ignored.</p></li>
+</ul>
+</section>
+<section id="qwen3-asr-qwen3-asr-qwen3-asr-realtime-notes">
+<h3>Qwen3-ASR (<code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code>) notes<a class="headerlink" href="#qwen3-asr-qwen3-asr-qwen3-asr-realtime-notes" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Greedy, as the checkpoint’s <code class="docutils literal notranslate"><span class="pre">do_sample:</span> <span class="pre">false</span></code> declares. A request reads <code class="docutils literal notranslate"><span class="pre">language</span></code>
+(an ISO code or name; it forces the language and drops the model’s <code class="docutils literal notranslate"><span class="pre">language</span> <span class="pre">X</span></code> line),
+<code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> (or the request text) as system-turn context, and <code class="docutils literal notranslate"><span class="pre">assistant_prefix</span></code>,
+a string the model continues from (the realtime route’s running hypothesis).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> defaults to 4096; a larger value is served up to the text model’s
+<code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code> while the KV pool has room, and past it is a 400. The model
+writes no timestamps: <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> gives a timed format’s segments one
+per window. <code class="docutils literal notranslate"><span class="pre">min_p</span></code> and <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> are refused.</p></li>
 </ul>
 </section>
 <section id="bagel-notes">
@@ -1366,6 +1403,22 @@ GPU. A config that places <code class="docutils literal notranslate"><span class
 <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> only <code class="docutils literal notranslate"><span class="pre">image_gen_cfg3</span></code>.</p></li>
 </ul>
 </section>
+</section>
+<section id="glm-5-2-glm-5-3-flash-glm52-glm5-next">
+<h2>GLM-5.2 / GLM-5.3-Flash (<code class="docutils literal notranslate"><span class="pre">glm52</span></code>, <code class="docutils literal notranslate"><span class="pre">glm5_next</span></code>)<a class="headerlink" href="#glm-5-2-glm-5-3-flash-glm52-glm5-next" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Sampling defaults come from the checkpoint’s <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code> (temperature
+1.0 and top_p 0.95 for both), read from a local checkpoint or the cached Hub snapshot;
+the conductor never fetches it, and without it the same values apply. A request may set
+<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code>, <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>,
+<code class="docutils literal notranslate"><span class="pre">penalize_prompt</span></code> and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. <code class="docutils literal notranslate"><span class="pre">min_p</span></code> above 0 is refused, since neither
+checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.</p></li>
+<li><p>GLM-5.2’s <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> may run to its serving window (<code class="docutils literal notranslate"><span class="pre">index_topk</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> with <code class="docutils literal notranslate"><span class="pre">dsa_long_context</span></code>). GLM-5.3-Flash holds contexts to
+<code class="docutils literal notranslate"><span class="pre">index_topk</span></code> (2048), where dense MLA computes exactly what its sparse attention does,
+so <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> above 2048 is a 400 rather than being shortened; under MTP, a
+<code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> past the room the prompt leaves is refused too.</p></li>
+</ul>
 </section>
 <section id="muse-glimmer-muse-glimmer">
 <h2>Muse Glimmer (<code class="docutils literal notranslate"><span class="pre">muse_glimmer</span></code>)<a class="headerlink" href="#muse-glimmer-muse-glimmer" title="Link to this heading">#</a></h2>
@@ -1503,7 +1556,8 @@ request sets. Qwen3.5-27B’s sets temperature 0.6, top_k 20 and top_p 0.95,
 and Qwen3.8-27B’s temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
 and 9B ship none, so the engine sampler’s defaults apply. A request’s
 <code class="docutils literal notranslate"><span class="pre">min_p</span></code> above 0 is refused (a 400) unless the checkpoint sets a <code class="docutils literal notranslate"><span class="pre">min_p</span></code>,
-which turns the sampler’s min-p filter on; none of these does.</p>
+which turns the sampler’s min-p filter on; none of these does.
+<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> may not exceed <code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code>.</p>
 <p>With <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{sampler:</span> <span class="pre">{enable_logprobs:</span> <span class="pre">true}}</span></code> in the deployment’s
 YAML, <code class="docutils literal notranslate"><span class="pre">&quot;return_logprobs&quot;:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> on <code class="docutils literal notranslate"><span class="pre">/generate</span></code> puts each
 token’s raw log-prob in its chunk’s <code class="docutils literal notranslate"><span class="pre">metadata</span></code> (<code class="docutils literal notranslate"><span class="pre">{&quot;logprobs&quot;:</span> <span class="pre">[...]}</span></code>, one per
@@ -1713,7 +1767,11 @@ as <code class="docutils literal notranslate"><span class="pre">af_heart</span><
 <code class="docutils literal notranslate"><span class="pre">speed</span></code> (0.25-4.0), <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> (defaults to the voice prefix: <code class="docutils literal notranslate"><span class="pre">a</span></code> American
 English, <code class="docutils literal notranslate"><span class="pre">b</span></code> British, <code class="docutils literal notranslate"><span class="pre">e</span></code> Spanish, <code class="docutils literal notranslate"><span class="pre">f</span></code> French, <code class="docutils literal notranslate"><span class="pre">h</span></code> Hindi, <code class="docutils literal notranslate"><span class="pre">i</span></code> Italian,
 <code class="docutils literal notranslate"><span class="pre">p</span></code> Portuguese, <code class="docutils literal notranslate"><span class="pre">j</span></code> Japanese, <code class="docutils literal notranslate"><span class="pre">z</span></code> Mandarin) and <code class="docutils literal notranslate"><span class="pre">phonemes</span></code> (skip G2P and
-synthesize a phoneme string directly).</p></li>
+synthesize a phoneme string directly). An empty <code class="docutils literal notranslate"><span class="pre">voice</span></code> / <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> or a
+<code class="docutils literal notranslate"><span class="pre">speed</span></code> outside 0.25-4.0 is a 400. <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes the vocoder’s noise (absent, the
+server derives one from the request id), so a seeded request run at the same batch
+layout repeats exactly; batched differently, its noise is the same but padding rounding
+moves the waveform’s phase, as it does in the reference.</p></li>
 <li><p>Deployment-wide options go in the YAML’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> (see <code class="docutils literal notranslate"><span class="pre">configs/kokoro.yaml</span></code>):
 <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> fixes the G2P language, <code class="docutils literal notranslate"><span class="pre">espeak_fallback:</span> <span class="pre">false</span></code> disables the espeak-ng
 fallback even when it is installed, <code class="docutils literal notranslate"><span class="pre">chunk_target_phonemes</span></code> and
@@ -1866,6 +1924,13 @@ worker on the same GPU, with MPS and batches of 16, for throughput.</p></li>
 <li><p>Keep the reference clip short, a few seconds like CosyVoice’s own 3.5 s
 prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
 from 1.4% to 13.4%, with words dropped mid-sentence.</p></li>
+<li><p>Request knobs are strictly typed: <code class="docutils literal notranslate"><span class="pre">ras_window</span></code> and <code class="docutils literal notranslate"><span class="pre">n_cfm_timesteps</span></code> take a whole
+float but not a string or a boolean; <code class="docutils literal notranslate"><span class="pre">top_k</span></code> (1-128) and <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> follow
+the server’s integer rule (<a class="reference internal" href="clients.html#generation-parameters"><span class="std std-ref">Generation parameters</span></a>); an out-of-range value is a
+400. <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">instruct</span></code> and <code class="docutils literal notranslate"><span class="pre">ref_text</span></code>
+must be strings. <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> above the deployment’s speech-token limit is
+refused, not cut. <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes the LM’s sampling; the flow and vocoder noise is
+fixed, as in the reference. <code class="docutils literal notranslate"><span class="pre">speed</span></code> has no effect and is logged as ignored.</p></li>
 <li><p>On <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>, text longer than one piece is synthesized as ordered
 sentence pieces, as the reference frontend does: about 80 tokens (320
 characters) of English, or 80 characters of text with Chinese, each piece
@@ -1968,7 +2033,7 @@ a packed capture sized to the decode batch. A decode-only step uses the
 whole-walk CUDA Graph (up to 128 rows a step), with the 15-step CodePredictor
 loop captured inside it; request-local EOS suppression is
 carried as a graph tensor input so replay does not consult capture-slot dummy
-request state. Residual <code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> sampling is per-request through the
+request state. Residual <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code> sampling (<code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> is a deprecated alias) is per-request through the
 <code class="docutils literal notranslate"><span class="pre">code_predictor</span></code> aux sampler, so custom values neither block batching nor
 fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
 Talker-width inputs through <code class="docutils literal notranslate"><span class="pre">small_to_mtp_projection</span></code> before its depth loop.
@@ -2105,7 +2170,7 @@ the first clone request pays the one-time cost.</p></li>
 control is part of the text. Clone a voice with <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL,
 base64, or an http(s) URL when the server allows remote fetch) and its transcript in
 <code class="docutils literal notranslate"><span class="pre">ref_text</span></code>; with the SDK, <code class="docutils literal notranslate"><span class="pre">client.tts(text,</span> <span class="pre">reference_audio=&quot;ref.wav&quot;,</span>
-<span class="pre">ref_text=&quot;...&quot;)</span></code>. <code class="docutils literal notranslate"><span class="pre">voice</span></code> and <code class="docutils literal notranslate"><span class="pre">speed</span></code> are ignored.</p></li>
+<span class="pre">ref_text=&quot;...&quot;)</span></code>. <code class="docutils literal notranslate"><span class="pre">voice</span></code> and <code class="docutils literal notranslate"><span class="pre">speed</span></code> are logged as ignored.</p></li>
 <li><p>Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
 <code class="docutils literal notranslate"><span class="pre">do_sample:</span> <span class="pre">false</span></code> is greedy. The order differs: M*’s sampler applies the
 temperature first and takes top-k and top-p over the tempered probabilities,
@@ -2164,6 +2229,13 @@ to about 2.9 patches per token, so longer text may not fit in the
 mid-text, as it does in the official <code class="docutils literal notranslate"><span class="pre">voxcpm</span></code> package (a 983-character
 Russian text stopped about three quarters of the way in on 5 of 10 seeds
 there). Split long text into several requests.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">min_len</span></code>, <code class="docutils literal notranslate"><span class="pre">max_len</span></code> and <code class="docutils literal notranslate"><span class="pre">inference_timesteps</span></code> must be integers (a whole float
+such as <code class="docutils literal notranslate"><span class="pre">16.0</span></code> is accepted; <code class="docutils literal notranslate"><span class="pre">2.7</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;20&quot;</span></code> are 400s), <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> /
+<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> (160 ms patches) follow the server’s integer rule, and
+<code class="docutils literal notranslate"><span class="pre">cfg_value</span></code> is a number in [0, 10].
+<code class="docutils literal notranslate"><span class="pre">inference_timesteps</span></code> is a deployment setting a request may only repeat. A budget past
+the model’s <code class="docutils literal notranslate"><span class="pre">max_len</span></code> is refused. <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes the diffusion noise. <code class="docutils literal notranslate"><span class="pre">voice</span></code> is
+dropped (VoxCPM2 has no named voices) and a sent <code class="docutils literal notranslate"><span class="pre">speed</span></code> is logged as ignored.</p></li>
 </ul>
 </section>
 <section id="nemotron-voicechat-nemotron-duplex-notes">
@@ -2382,19 +2454,21 @@ paths on the server, clips over 60 s and clips below 8 kHz are refused),
 <code class="docutils literal notranslate"><span class="pre">cfg_weight</span></code> (0-1, default 0.5; 0 disables guidance and halves the T3 work),
 <code class="docutils literal notranslate"><span class="pre">temperature</span></code> (up to 5; under 1e-5 is greedy)/<code class="docutils literal notranslate"><span class="pre">top_p</span></code>/<code class="docutils literal notranslate"><span class="pre">top_k</span></code> (the
 whole vocab or more is no filter)/<code class="docutils literal notranslate"><span class="pre">min_p</span></code>/<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> (up to 2;
-the upper bounds are the reference demo’s), <code class="docutils literal notranslate"><span class="pre">seed</span></code>, <code class="docutils literal notranslate"><span class="pre">n_cfm_timesteps</span></code>
-(S3Gen Euler steps, 10; Turbo 2), <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (up to the deployment’s
+the upper bounds are the reference demo’s), <code class="docutils literal notranslate"><span class="pre">penalize_prompt</span></code> (whether the
+penalty counts the prompt’s tokens, default true), <code class="docutils literal notranslate"><span class="pre">seed</span></code>, <code class="docutils literal notranslate"><span class="pre">n_cfm_timesteps</span></code>
+(S3Gen Euler steps, 10; Turbo 2), <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> (up to the deployment’s
 <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">max_new_tokens_limit</span></code>, 1000 in the shipped configs; with
 <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> set, the server refuses to start unless that
 many requests of that length fit the KV cache, so raise it together with
 <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> or a lower cap),
-<code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code> (T3 decodes all <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code>
+<code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code> (T3 decodes all <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>
 past the stop token, for fixed-length benchmarks; the speech tokens among
 them are vocoded, but T3 keeps emitting stop and control tokens after the
 end of speech and those are dropped, so the audio is shorter than
-<code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> / 25 s: 4096 tokens gave 117 s on base and 141 s on
-Turbo, not 164 s) and <code class="docutils literal notranslate"><span class="pre">watermark</span></code> (default on). Turbo ignores
-<code class="docutils literal notranslate"><span class="pre">cfg_weight</span></code>, <code class="docutils literal notranslate"><span class="pre">exaggeration</span></code> and <code class="docutils literal notranslate"><span class="pre">min_p</span></code> like the reference package.
+<code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> / 25 s: 4096 tokens gave 117 s on base and 141 s on
+Turbo, not 164 s) and <code class="docutils literal notranslate"><span class="pre">watermark</span></code> (default on). Turbo has no
+<code class="docutils literal notranslate"><span class="pre">cfg_weight</span></code>, <code class="docutils literal notranslate"><span class="pre">exaggeration</span></code> or <code class="docutils literal notranslate"><span class="pre">min_p</span></code>: a non-zero value is a 400.
+<code class="docutils literal notranslate"><span class="pre">language_id</span></code> on a non-multilingual checkpoint is reported as ignored.
 The native <code class="docutils literal notranslate"><span class="pre">/generate</span></code> route and <code class="docutils literal notranslate"><span class="pre">client.tts(...)</span></code> take the same knobs;
 a clip uploaded as <code class="docutils literal notranslate"><span class="pre">audio</span></code> input is the reference voice.</p></li>
 <li><p>Graph: <code class="docutils literal notranslate"><span class="pre">voice_encoder</span></code> (speaker LSTM + S3 tokenizer over the reference,
@@ -2554,7 +2628,9 @@ same transformer instance and KV pool as the generator. <code class="docutils li
 takes image and video content parts (URLs or data URIs) and streams tokens; the
 chat template opens a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block by default. <code class="docutils literal notranslate"><span class="pre">extra_body</span></code> knobs:
 <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> (or <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs.enable_thinking</span></code>), <code class="docutils literal notranslate"><span class="pre">top_k</span></code>,
-<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, and for video attachments <code class="docutils literal notranslate"><span class="pre">video_fps</span></code> / <code class="docutils literal notranslate"><span class="pre">video_num_frames</span></code>
+<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">penalize_prompt</span></code> (<code class="docutils literal notranslate"><span class="pre">min_p</span></code> is refused unless the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code> sets one; <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>
+defaults to 2048), and for video attachments <code class="docutils literal notranslate"><span class="pre">video_fps</span></code> / <code class="docutils literal notranslate"><span class="pre">video_num_frames</span></code>
 (frames are sampled at 2 fps by default, each frame a timestamped span).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sN<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s1">'Content-Type: application/json'</span><span class="w"> </span>-d<span class="w"> </span><span class="s1">'{</span>
 <span class="s1">  "model": "cosmos3_edge", "stream": true, "max_tokens": 256,</span>
@@ -2715,8 +2791,8 @@ new frames are delivered — a new prompt steers the same world.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">session_timeout_s</span></code></p></td>
 <td><p>600</p></td>
-<td><p>Seconds an idle session is kept after its request finishes, capped at the
-deployment’s <code class="docutils literal notranslate"><span class="pre">session_timeout_max_s</span></code> (3600). An expired session resumes
+<td><p>Seconds an idle session is kept after its request finishes, at most the
+deployment’s <code class="docutils literal notranslate"><span class="pre">session_timeout_max_s</span></code> (3600); more is a 400. An expired session resumes
 like an unknown one: the request is rejected.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">end_session</span></code></p></td>
@@ -2820,7 +2896,8 @@ frames = <code class="docutils literal notranslate"><span class="pre">(num_frame
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code></p></td>
 <td><p>50</p></td>
-<td><p>Clamped to <code class="docutils literal notranslate"><span class="pre">max_denoise_steps</span></code> (100), the denoise loop’s ceiling.</p></td>
+<td><p>An integer in 1-100; the upper bound is the denoise loop’s <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>
+(<code class="docutils literal notranslate"><span class="pre">max_denoise_steps</span></code>). A 400 outside it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code></p></td>
 <td><p>5.0</p></td>
@@ -3308,9 +3385,11 @@ since its magnitudes would be dropped from the merge.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ripple-65b-ripple-65b">Ripple-65B (<code class="docutils literal notranslate"><span class="pre">ripple_65b</span></code>)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-asr-qwen3-asr-qwen3-asr-realtime-notes">Qwen3-ASR (<code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code>) notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bagel-notes">BAGEL notes</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#glm-5-2-glm-5-3-flash-glm52-glm5-next">GLM-5.2 / GLM-5.3-Flash (<code class="docutils literal notranslate"><span class="pre">glm52</span></code>, <code class="docutils literal notranslate"><span class="pre">glm5_next</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#muse-glimmer-muse-glimmer">Muse Glimmer (<code class="docutils literal notranslate"><span class="pre">muse_glimmer</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#command-a-command-a-plus">Command A+ (<code class="docutils literal notranslate"><span class="pre">command_a_plus</span></code>)</a></li>

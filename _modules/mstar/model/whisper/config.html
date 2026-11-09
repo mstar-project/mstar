@@ -1271,6 +1271,17 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">ids</span></div>
 
 
+<div class="viewcode-block" id="WhisperModelConfig.decoder_prompt_len">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_len">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">decoder_prompt_len</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Length of the plain forced prompt: ``&lt;|sot|&gt; &lt;|lang|&gt; &lt;|task|&gt; &lt;|notimestamps|&gt;``.</span>
+
+<span class="sd">        A count rather than ``len(decoder_prompt_ids())``: a config built without</span>
+<span class="sd">        the tokenizer's language and task tables (startup graph validation, the</span>
+<span class="sd">        CPU tests) has no ids to measure. test_whisper_model pins it to the ids."""</span>
+        <span class="k">return</span> <span class="mi">4</span></div>
+
+
 <div class="viewcode-block" id="WhisperModelConfig.prompt_tail_ids">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.prompt_tail_ids">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prompt_tail_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"transcribe"</span><span class="p">,</span> <span class="n">timestamps</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>

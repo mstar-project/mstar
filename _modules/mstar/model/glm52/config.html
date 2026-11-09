@@ -1140,10 +1140,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># None: a request that names no max_tokens may run to the end of the window,</span>
     <span class="c1"># as in vLLM; the submodule caps each request at what its prompt leaves.</span>
     <span class="n">max_output_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
-    <span class="n">top_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.95</span>
-    <span class="n">repetition_penalty</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
-    <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># --- quantization / serving knobs ---</span>
     <span class="c1"># The official checkpoint is FP8 e4m3 with [128, 128] block scales</span>

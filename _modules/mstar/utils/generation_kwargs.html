@@ -1012,7 +1012,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.utils.generation_kwargs</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""The client-facing generation knobs, checked once where every endpoint submits.</span>
+<span></span><span class="sd">"""The client-facing generation knobs, sampling and output geometry, checked once where every endpoint submits.</span>
 
 <span class="sd">One meaning per knob on every model: ``null`` is the</span>
 <span class="sd">same as leaving the key out, a value is coerced to the knob's type only when it</span>
@@ -1060,10 +1060,21 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="c1"># knob -&gt; (rule text, predicate); the sampling ones are the sampler's own</span>
-<span class="n">_REAL_RULES</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">REAL_KNOB_RULES</span><span class="p">}</span>
+<span class="n">_REAL_RULES</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="o">**</span><span class="n">REAL_KNOB_RULES</span><span class="p">,</span>
+    <span class="s2">"fps"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt; 0"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">),</span>
+    <span class="s2">"guidance_scale"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"of any sign"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="kc">True</span><span class="p">),</span>
+    <span class="s2">"speed"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt; 0"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">),</span>
+<span class="p">}</span>
 <span class="n">_INT_RULES</span> <span class="o">=</span> <span class="p">{</span>
     <span class="o">**</span><span class="n">INT_KNOB_RULES</span><span class="p">,</span>
     <span class="s2">"max_output_tokens"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="s2">"num_inference_steps"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="s2">"num_step"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="s2">"rollout_horizon"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 0"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">),</span>
+    <span class="s2">"num_frames"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="s2">"height"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="s2">"width"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
 <span class="p">}</span>
 <span class="c1"># enable_thinking: what a chat template reads; "false" is truthy there</span>
 <span class="n">_BOOL_KNOBS</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">BOOL_KNOBS</span><span class="p">,</span> <span class="s2">"do_sample"</span><span class="p">,</span> <span class="s2">"return_token_ids"</span><span class="p">,</span> <span class="s2">"enable_thinking"</span><span class="p">)</span>

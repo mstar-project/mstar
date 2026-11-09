@@ -1466,7 +1466,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># never evicted, and a second request on it is refused.</span>
     <span class="n">session_store_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
     <span class="c1"># Idle sessions expire after this many seconds unless the request set</span>
-    <span class="c1"># ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.</span>
+    <span class="c1"># ``session_timeout_s`` (at most the max); ``end_session`` drops one early.</span>
     <span class="n">session_timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">600.0</span>
     <span class="n">session_timeout_max_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">3600.0</span>
     <span class="c1"># A generation step whose requests total more vision tokens than this runs</span>
@@ -1482,7 +1482,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Number of denoise model evaluations. The per-mode cookbook defaults are</span>
     <span class="c1"># t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4. ``num_inference_steps``</span>
     <span class="c1"># is the image default; ``num_inference_steps_video`` is the video default.</span>
-    <span class="c1"># A request may override either; the value is clamped to ``max_inference_steps``.</span>
+    <span class="c1"># A request may override either; a value above ``max_inference_steps`` is a 400.</span>
     <span class="n">num_inference_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span>
     <span class="n">num_inference_steps_video</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">35</span>
     <span class="c1"># Upper bound on the denoise loop's iteration count. The loop is built with</span>

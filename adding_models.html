@@ -1072,8 +1072,9 @@ engine passes each config to its resource when the request is ingested.
 There are two <code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code> subclasses:</p>
 <ul>
 <li><p><code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>,
-<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code> and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. The conductor fills in the
-per-request seed. <code class="docutils literal notranslate"><span class="pre">min_p</span></code> follows the HF processor order (after the penalty and
+<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code>, <code class="docutils literal notranslate"><span class="pre">penalize_prompt</span></code> and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. The
+conductor fills in the per-request seed, derived per resource key so each sampler of a
+request draws its own stream. <code class="docutils literal notranslate"><span class="pre">min_p</span></code> follows the HF processor order (after the penalty and
 temperature, before top-k/top-p) and needs <code class="docutils literal notranslate"><span class="pre">enable_min_p=True</span></code> on the node’s
 <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>, which adds the filter to that node’s captured sampler only.
 Further knobs, each needing a <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> capability (CUDA only):</p>
@@ -1120,7 +1121,8 @@ streams.</p></li>
 <p>Orpheus shows the simple case. It has one sampler, and reads the parameters from
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_request_resource_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_modalities</span><span class="p">,</span> <span class="n">output_modalities</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">):</span>
-    <span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="s2">"top_p"</span><span class="p">,</span> <span class="s2">"repetition_penalty"</span><span class="p">,</span> <span class="s2">"ignore_eos"</span><span class="p">]</span>
+    <span class="n">keys</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="s2">"top_p"</span><span class="p">,</span> <span class="s2">"top_k"</span><span class="p">,</span> <span class="s2">"min_p"</span><span class="p">,</span>
+            <span class="s2">"repetition_penalty"</span><span class="p">,</span> <span class="s2">"penalize_prompt"</span><span class="p">,</span> <span class="s2">"ignore_eos"</span><span class="p">)</span>
     <span class="k">return</span> <span class="p">{</span>
         <span class="n">SAMPLER</span><span class="p">:</span> <span class="n">SamplingReqConfig</span><span class="p">(</span>
             <span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">k</span><span class="p">))</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">}</span>
@@ -1131,6 +1133,25 @@ streams.</p></li>
 <p>BAGEL (<code class="docutils literal notranslate"><span class="pre">bagel_model.py</span></code>) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.</p>
+<p>Sampling knobs mean the same thing on every model (<a class="reference internal" href="clients.html#generation-parameters"><span class="std std-ref">Generation parameters</span></a>), and
+the server range-checks them before your model sees them. A model’s part of that
+contract:</p>
+<ul class="simple">
+<li><p>Default each knob the request leaves unset from the checkpoint’s own
+<code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar.model.utils.load_generation_defaults</span></code>),
+falling back to your config only when the checkpoint ships none.</p></li>
+<li><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (a 400) for an input you cannot serve; never clamp, coerce, or
+fall back silently. A <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> without <code class="docutils literal notranslate"><span class="pre">enable_repetition_penalty</span></code> or
+<code class="docutils literal notranslate"><span class="pre">enable_min_p</span></code> refuses those knobs at admission, so do not default a penalty onto it.</p></li>
+<li><p>Declare every <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> key you read in <code class="docutils literal notranslate"><span class="pre">request_kwargs()</span></code>; any other key a
+client sends is logged as ignored by the server. <code class="docutils literal notranslate"><span class="pre">test_model_contracts.py</span></code> fails for a
+registered model that does not override it.</p></li>
+<li><p>Bound a request’s length, or a denoise loop’s step count, through <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>: the
+conductor refuses a cap past the loop’s <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> instead of cutting the request short,
+so do not clamp it, or check it against a typed-in limit, yourself.</p></li>
+<li><p>Draw any model-local randomness from the request’s seed (<code class="docutils literal notranslate"><span class="pre">random_seed</span></code> on the
+forward-pass info), never the global RNG.</p></li>
+</ul>
 <p>A spec can also build its own request’s config from <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
 (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config</span></code>), which the conductor adds beside the model’s. That
 is how a resource the deployment declares, such as a LoRA pool, takes per-request
@@ -1602,9 +1623,9 @@ kernel must turn. A model with learned position
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetition_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
-seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
+seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetition_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
 Whether the penalty runs on a given step is decided from the
 <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> values of the resident requests.
@@ -1701,7 +1722,7 @@ appears in no spec, so it receives no resources:</p>
         <span class="n">SamplerSpec</span><span class="p">(</span>
             <span class="n">resource_key</span><span class="o">=</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
             <span class="n">vocab_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">enable_repetion_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">enable_repetition_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="p">),</span>
         <span class="n">PositionSpec</span><span class="p">(</span>
             <span class="n">resource_key</span><span class="o">=</span><span class="n">ROPE</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
@@ -1770,10 +1791,10 @@ node does this. The Talker LLM samples codec group 0. The CodePredictor samples 
 to N-1, using its own vocabulary size and no repetition penalty:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">SamplerSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="n">TALKER_SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"Talker"</span><span class="p">},</span>
             <span class="n">vocab_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">talker_text</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">enable_repetion_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
+            <span class="n">enable_repetition_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
 <span class="n">SamplerSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="n">CODE_PRED_SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"Talker"</span><span class="p">},</span>
             <span class="n">vocab_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">code_predictor</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">enable_repetion_penalty</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+            <span class="n">enable_repetition_penalty</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
 </pre></div>
 </div>
 <p>The forward looks up each sampler by key and calls <code class="docutils literal notranslate"><span class="pre">.sample()</span></code> on it:</p>
@@ -3851,7 +3872,7 @@ own KV cache and attention, a second KV cache for the encoder context, a
 <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code> over that second cache, a <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code>, and a <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>.
 The <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code> exists only for the position counter. Whisper uses learned position
 embeddings, so the planned ids index an <code class="docutils literal notranslate"><span class="pre">embed_positions</span></code> table instead of driving RoPE.
-The <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> sets <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty=False</span></code>, because ASR transcription
+The <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> sets <code class="docutils literal notranslate"><span class="pre">enable_repetition_penalty=False</span></code>, because ASR transcription
 decodes greedily.</p>
 <p>The page counts show how to size a cache for a specific model instead of using the
 default. Both caches use 128-token pages and hold <code class="docutils literal notranslate"><span class="pre">WhisperModel.MAX_CONCURRENT_REQUESTS</span></code>

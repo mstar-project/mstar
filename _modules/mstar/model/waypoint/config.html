@@ -1162,7 +1162,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">base_fps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">15</span>  <span class="c1"># fps the RoPE time axis was trained against</span>
     <span class="n">inference_fps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">60</span>  <span class="c1"># raw video fps</span>
     <span class="n">temporal_compression</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span>  <span class="c1"># raw frames per latent frame (TAEHV)</span>
-    <span class="n">max_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span>  <span class="c1"># training-time rollout ceiling; not enforced here</span>
+    <span class="n">max_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span>  <span class="c1"># training-time rollout ceiling; the largest num_steps a request may ask</span>
 
     <span class="c1"># VAE</span>
     <span class="n">taehv_ae</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>

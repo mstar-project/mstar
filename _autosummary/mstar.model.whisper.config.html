@@ -731,6 +731,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_ffn_dim"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_ffn_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_layers"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_ids"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_prompt_ids()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_len"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_prompt_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_start_token_id"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_start_token_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.encoder_attention_heads"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.encoder_attention_heads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.encoder_ffn_dim"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.encoder_ffn_dim</span></code></a></li>
@@ -892,6 +893,20 @@ long-form carry-over, kept to the last <a class="reference internal" href="#msta
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_len">
+<span class="sig-name descname"><span class="pre">decoder_prompt_len</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/config.html#WhisperModelConfig.decoder_prompt_len"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_len" title="Link to this definition">#</a></dt>
+<dd><p>Length of the plain forced prompt: <code class="docutils literal notranslate"><span class="pre">&lt;|sot|&gt;</span> <span class="pre">&lt;|lang|&gt;</span> <span class="pre">&lt;|task|&gt;</span> <span class="pre">&lt;|notimestamps|&gt;</span></code>.</p>
+<p>A count rather than <code class="docutils literal notranslate"><span class="pre">len(decoder_prompt_ids())</span></code>: a config built without
+the tokenizer’s language and task tables (startup graph validation, the
+CPU tests) has no ids to measure. test_whisper_model pins it to the ids.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1193,6 +1208,7 @@ them to <code class="docutils literal notranslate"><span class="pre">max_source_
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_ffn_dim"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_ffn_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_layers"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_ids"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_prompt_ids()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_len"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_prompt_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.decoder_start_token_id"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.decoder_start_token_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.encoder_attention_heads"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.encoder_attention_heads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.config.WhisperModelConfig.encoder_ffn_dim"><code class="docutils literal notranslate"><span class="pre">WhisperModelConfig.encoder_ffn_dim</span></code></a></li>

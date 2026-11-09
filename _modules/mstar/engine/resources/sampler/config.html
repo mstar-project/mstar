@@ -1102,13 +1102,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.SamplerSpec">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">SamplerSpec</span><span class="p">(</span><span class="n">NodeResourceSpec</span><span class="p">):</span>
-    <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="c1"># must be set for enabled_repetion_penalty</span>
+    <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="c1"># must be set for enable_repetition_penalty</span>
     <span class="c1"># Capability, not intent: whether this node's sampling kernel is *able* to</span>
     <span class="c1"># apply a repetition penalty, which decides both the seen-token buffers and</span>
     <span class="c1"># the kernel variant baked into the captured graph. Whether the penalty</span>
     <span class="c1"># actually runs on a given step is settled per step from the resident</span>
     <span class="c1"># requests' `repetition_penalty` — see `SamplerResource.admit`.</span>
-    <span class="n">enable_repetion_penalty</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">enable_repetition_penalty</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># Same kind of capability for min-p: whether the node's sampler (eager and</span>
     <span class="c1"># graph-captured) carries the filter. It costs two passes over ``[B, V]``</span>
     <span class="c1"># per step, so nodes that never ask for it pay nothing; a request that</span>
@@ -1243,7 +1243,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"this deployment does not report processed logprobs; use logprobs_mode 'raw'"</span><span class="p">)</span>
         <span class="c1"># a windowed penalty counts the generation history, not the seen-token mask</span>
         <span class="n">windowed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_window</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">max_repetition_window</span> <span class="o">&gt;</span> <span class="mi">0</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">enable_repetion_penalty</span> <span class="ow">or</span> <span class="n">windowed</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">enable_repetition_penalty</span> <span class="ow">or</span> <span class="n">windowed</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">"this model does not support repetition_penalty; send 1 or leave it unset"</span>
             <span class="p">)</span></div>

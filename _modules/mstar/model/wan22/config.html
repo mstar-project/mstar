@@ -1080,7 +1080,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">default_negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">video_fps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">24</span>
 
-    <span class="c1"># Ceiling on the denoise loop; the per-request step count is clamped to it.</span>
+    <span class="c1"># The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.</span>
     <span class="n">max_denoise_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">100</span>
 
     <span class="c1"># Ceiling on a request's height x width x num_frames (about 3.6x the default</span>
