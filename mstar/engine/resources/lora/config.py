@@ -19,6 +19,7 @@ import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
+from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -31,9 +32,10 @@ LORA_ADAPTER_KWARG = "lora_adapter"
 
 
 def lora_enabled(model_config: Mapping[str, Any]) -> bool:
-    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block). A
-    ``resources:`` value that is not a mapping turns nothing on: the conductor's
-    ``validate_deployment`` reports it with the deployment's other problems."""
+    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block), with or
+    without adapters named in it: adapters may also be loaded at runtime. A ``resources:``
+    value that is not a mapping turns nothing on: the conductor's ``validate_deployment``
+    reports it with the deployment's other problems."""
     resources = model_config.get("resources")
     return isinstance(resources, Mapping) and LORA_RESOURCE_KEY in resources
 
@@ -46,11 +48,13 @@ def served_lora_adapters(model_config: Mapping[str, Any]) -> tuple[str, ...]:
 
 def describe_load_error(exc: BaseException) -> str:
     """What a failed adapter read tells a client: a refusal (a ``ValueError``: rank,
-    targets, shapes, weights changed on disk, a name already loaded) as itself, anything
+    targets, shapes, weights changed on disk, a name already loaded) as itself, with
+    server paths cut to base names as every route's errors are (``scrub_paths``), anything
     else (an I/O error naming the server's files, say) only that it could not be read.
-    The caller logs ``exc`` in full."""
+    Deterministic, so every rank of an instance says the same. The caller logs ``exc``
+    in full."""
     if isinstance(exc, ValueError):
-        return str(exc)
+        return scrub_paths(str(exc))
     return "the adapter could not be read (the server log has the details)"
 
 
@@ -92,7 +96,8 @@ class LoraTarget:
     ``slice_packs`` names checkpoint modules that pack several slices into one tensor: a
     gated delta-net's ``in_proj_qkv`` is ``[q | k | v]``, three outputs the base shards
     across ranks on their own. Such a module has one A, which each of its slices takes,
-    and a B whose rows are those slices' in order.
+    and a B whose rows are those slices' in order. A pack named None is the module itself
+    as a checkpoint stores it fused, with no stacked-shard id.
 
     ``slice_align`` rounds each slice's rank-local width up to a multiple, for a base
     linear that pads its fused output per rank so the next slice starts aligned. The
@@ -116,7 +121,7 @@ class LoraTarget:
     parallel: Literal["column", "row", "none"] = "column"
     slice_names: tuple[str | int, ...] = ()
     slice_units: tuple[int, ...] | None = None
-    slice_packs: tuple[tuple[str | int, tuple[str | int, ...]], ...] | None = None
+    slice_packs: tuple[tuple[str | int | None, tuple[str | int, ...]], ...] | None = None
     slice_align: tuple[int, ...] | None = None
     layers: tuple[int, ...] | None = None
     kind: Literal["linear", "embedding"] = "linear"
@@ -305,6 +310,12 @@ class LoraSpec(NodeResourceSpec):
     max_rank: int = 16
     cpu_capacity: int = 16
     adapters: dict[str, str] = field(default_factory=dict)
+    # serve /v1/load_lora_adapter and /v1/unload_lora_adapter, which make the server read
+    # client-named paths; off, they answer 404 as vLLM's do without its opt-in
+    runtime_updates: bool = False
+    # how long the conductor waits for every worker to answer a runtime load or unload
+    # before it gives up on it (a load is then undone everywhere)
+    runtime_update_timeout_s: float = 120.0
     # adapter name -> the digest (``identity.adapter_digest``) its weights were checked
     # and prefix-keyed under; every read must match it. The conductor fills these in for
     # the serving config's adapters, and a runtime load carries its own.
@@ -351,6 +362,8 @@ class LoraSpec(NodeResourceSpec):
         cpu_capacity: int | None = None,
         adapters: dict[str, str] | None = None,
         adapter_digests: dict[str, str] | None = None,
+        runtime_updates: bool | None = None,
+        runtime_update_timeout_s: float | None = None,
         targets: list[str] | None = None,
     ):
         """How many adapters stay resident, the largest rank served, and which adapters
@@ -368,6 +381,16 @@ class LoraSpec(NodeResourceSpec):
             if value is not None
         }
         check_sizes(sizes)
+        if runtime_updates is not None and not isinstance(runtime_updates, bool):
+            raise ValueError(f"runtime_updates must be true or false; got {runtime_updates!r}")
+        if runtime_update_timeout_s is not None and (
+            isinstance(runtime_update_timeout_s, bool)
+            or not isinstance(runtime_update_timeout_s, int | float)
+            or runtime_update_timeout_s <= 0
+        ):
+            raise ValueError(
+                f"runtime_update_timeout_s must be a positive number; got {runtime_update_timeout_s!r}"
+            )
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
@@ -389,6 +412,10 @@ class LoraSpec(NodeResourceSpec):
 
         for name, value in sizes.items():
             setattr(self, name, value)
+        if runtime_updates is not None:
+            self.runtime_updates = runtime_updates
+        if runtime_update_timeout_s is not None:
+            self.runtime_update_timeout_s = float(runtime_update_timeout_s)
         if adapters is not None:
             self.adapters = adapters
             self.adapter_digests = {}

@@ -25,7 +25,6 @@ from mstar.utils.profiler import PhaseLaps
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.speculation import Speculation, SpeculationContext, SpeculationPreparer
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 EDGE, NODE, SPEC_ID = "new_token", "snac_decoder", 7
 
@@ -149,7 +148,7 @@ def _streams(rids, refuse=frozenset(), window=3, stride=2, items=5):
 @pytest.mark.parametrize("refuse", [set(), {0}, {1}, {0, 1}])
 def test_the_poll_holds_or_hands_back_every_chunk(refuse):
     streams, runtime = _streams([1, 2], refuse)
-    w = make_worker(streams=streams, _graph_runtime=runtime)
+    w = make_worker(streams=streams, graph_runtime=runtime)
     w.ingest.poll_stream_buffers()
     assert len(streams.popped) == 2
     assert not streams.unsettled()
@@ -178,10 +177,10 @@ def test_a_speculation_hands_back_only_what_its_settle_undid(success, dropped, r
     )
     w = make_worker(
         streams=streams,
-        _graph_runtime=runtime,
+        graph_runtime=runtime,
         engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda b: None)),
     )
-    Worker._settle_speculation(w, spec, success, dropped)
+    w.speculator.settle(spec, success, dropped)
     assert not streams.unsettled()
     kept = {id(se) for r, edges in runtime.spec_held.items() for se in edges if success and r not in dropped}
     assert streams.held == kept
@@ -189,7 +188,7 @@ def test_a_speculation_hands_back_only_what_its_settle_undid(success, dropped, r
 
 def test_the_ledger_catches_a_chunk_handed_back_while_held():
     streams, runtime = _streams([1])
-    w = make_worker(streams=streams, _graph_runtime=runtime)
+    w = make_worker(streams=streams, graph_runtime=runtime)
     w.ingest.poll_stream_buffers()
     (se,) = streams.popped.values()
     with pytest.raises(AssertionError, match="graph holds"):
