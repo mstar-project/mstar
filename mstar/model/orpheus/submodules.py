@@ -30,9 +30,10 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
 
     PREFILL_WALK = "prefill"
     ATTN_KEY = ATTN
-    # The decode step also streams its token to SNAC, so its outputs never all
-    # stay on the device, which the loop-back needs: the sampler keeps no slot
-    # masters for it.
+    # The decode step loops its token back under the same name it streams to
+    # SNAC (``new_token``). A token can stay on the device only when the loop-back
+    # has a signal of its own (MiniCPM-o's TTS uses ``tts_next``), so the sampler
+    # keeps no slot masters for it.
     device_loopback = None
     # A prompt is a voice and its text, so the ladder stops at 1024: a longer
     # step runs eagerly rather than every capture being sized for 8192.
