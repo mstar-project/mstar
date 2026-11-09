@@ -61,7 +61,10 @@ class _Engine(_RoomEngine):
     def supports_chunked_prefill(self, node_name, graph_walk):
         return self.chunkable
 
-    def min_chunk_tokens(self, budget):
+    def min_chunk_tokens(self, budget, align=1):
+        return 1
+
+    def chunk_alignment(self, node_name):
         return 1
 
     def chunk_align(self, node_name, graph_walk):

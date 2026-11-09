@@ -4,8 +4,8 @@ Prefill and decode share the forward; per step it declares the latent KV cache, 
 attention over it, the KDA recurrent pool and the KDA resource, the sampler, and under
 ``dsa_long_context`` the DSA resource. Decode is captured per batch size, DSA included (the routed experts on
 CUDA take the fused kernels: bf16, fp8, or MXFP4 on Triton / FlashInfer's FP4 MoE). Prefill is
-captured at packed token buckets where the deployment names them (``prefill_token_buckets``) and
-the context stays within index_topk; else eager.
+captured at packed token buckets where the serving config names them (``prefill_token_buckets``,
+which the engine applies) and the context stays within index_topk; else eager.
 """
 from __future__ import annotations
 
@@ -87,14 +87,14 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     # bf16 weights; the KDA state, the router, AttnRes and SiTU run fp32 on purpose, which the
     # engine's bf16 autocast would undo
     disable_autocast: bool = True
-    # no captured prefill unless the deployment names its buckets (``prefill_token_buckets``)
+    # no captured prefill unless the serving config names its buckets (``prefill_token_buckets``)
     PREFILL_TOKEN_BUCKETS: list[int] = []
 
     def __init__(self, language_model: nn.Module, config: KimiK3ModelConfig,
                  decode_capture_batch_sizes: tuple[int, ...] | None = None, compile_glue: bool = True,
-                 compile_reads: bool = False, prefill_token_buckets: list[int] | None = None,
+                 compile_reads: bool = False,
                  prefill_capture_batch_sizes: tuple[int, ...] | None = None) -> None:
-        super().__init__(prefill_token_buckets=prefill_token_buckets)
+        super().__init__()
         self.language_model = language_model  # KimiK3ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
@@ -138,7 +138,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         written) and "dsa" (every row selects over the serving window and attends sparse). Not on
         MLA's torch fallback (its plan holds the capture's pages).
 
-        Prefill, where the deployment names ``prefill_token_buckets`` and dsa_long_context is off:
+        Prefill, where the serving config names ``prefill_token_buckets`` (none by default: declared
+        empty, for the engine to fill) and dsa_long_context is off:
         one graph per (rows, token bucket), rows up to ``prefill_capture_batch_sizes`` and the KDA
         slots. An eager prefill step issues ~2.2 ms of host work a layer whatever its length (H200
         job 1707: 205 ms over the 93 layers from 64 to 1920 tokens; the B300's 960-token step ran
@@ -160,8 +161,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             capture_batch_sizes=sizes,
             compile=False,
         ) for key in keys]
-        buckets = list(self.PREFILL_TOKEN_BUCKETS)
-        if buckets and not self.config.dsa_long_context:
+        if not self.config.dsa_long_context:
             rows = [b for b in self.prefill_capture_batch_sizes if slots is None or b <= slots]
 
             def ids(n: int) -> ARNodeInputs:
@@ -169,7 +169,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
 
             configs.append(_PrefillCaptures(
                 capture_graph_walk="prefill",
-                capture_token_lengths=buckets,
+                capture_token_lengths=list(self.PREFILL_TOKEN_BUCKETS),
                 make_node_input=ids,
                 capture_batch_sizes=rows,
                 compile=False,

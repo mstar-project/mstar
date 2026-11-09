@@ -45,6 +45,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
@@ -71,6 +72,7 @@ from mstar.model.cosyvoice3.components.flow import (
     NewFramesInputs,
     ReferenceVoice,
     SolveInputs,
+    native_convolutions,
 )
 from mstar.model.cosyvoice3.components.hift import (
     CapturedStream,
@@ -169,7 +171,10 @@ class ReferenceEncoder:
     @torch.no_grad()
     def tokens(self, wav24: torch.Tensor) -> torch.Tensor:
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
-        tokens, lens = self.tokenizer([wav16])
+        # Clips vary in length, and cuDNN plans anew per shape: native convolutions
+        # hold CAMPPlus to about 14 ms a clip, against 37 to 119 ms.
+        with native_convolutions():
+            tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
         frames = self._mel_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
@@ -188,7 +193,8 @@ class ReferenceEncoder:
         feat = feat[: 2 * tokens.numel()]
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
         fbank = kaldi_fbank_80(wav16)
-        embedding = self.campplus(fbank[None])[0]
+        with native_convolutions():
+            embedding = self.campplus(fbank[None])[0]
         return ReferenceVoice(prompt_tokens=tokens, prompt_feat=feat, embedding=embedding)
 
 
@@ -276,6 +282,11 @@ class LMSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Captured LM prefills, packed, by total tokens. A prefill they don't hold
+    # runs eagerly, about 30 ms of launches stalling its worker's decode. A
+    # deployment sets its own with the serving config's `prefill_token_buckets`
+    # (`{llm: {prefill_voice: [...]}}`).
+    LM_PREFILL_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024]
 
     def __init__(self, model: nn.Module, config: CosyVoice3Config):
         super().__init__()
@@ -532,19 +543,42 @@ class LMSubmodule(ARNodeSubmodule):
         dtype = self.model.speech_embedding.weight.dtype
         width = max(self.window, 1)
         tensor_inputs = {HISTORY: torch.full((width,), -1, dtype=torch.long, device=device)}
-        return [
+        kwargs = {KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None}
+        configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
                     input_seq_len=1,
                     tensor_inputs=tensor_inputs,
-                    kwargs={KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None},
+                    kwargs=kwargs,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )
         ]
+        if self.config.lm_prefill_batch_sizes:
+            configs.append(
+                PackedAcceleratorGraphConfig(
+                    capture_graph_walk="prefill_voice",
+                    replay_graph_walks=list(PREFILL_WALKS),
+                    capture_token_lengths=list(self.LM_PREFILL_TOKEN_BUCKETS),
+                    make_node_input=lambda n: ARNodeInputs(
+                        input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
+                        input_seq_len=n,
+                        tensor_inputs=tensor_inputs,
+                        kwargs=kwargs,
+                    ),
+                    capture_batch_sizes=list(self.config.lm_prefill_batch_sizes),
+                    compile=False,
+                    # a longer or wider prefill runs eagerly
+                    caps_eager_batch_size=False,
+                )
+            )
+        return configs
+
+    def resident_walks(self) -> frozenset[str]:
+        return frozenset({"decode"})
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return self.can_batch(batch, model_inputs) and super().can_use_accelerator_graphs(batch, model_inputs)
@@ -1005,6 +1039,10 @@ class FlowSubmodule(NodeSubmodule):
         del autocast_dtype, tp_world_size, kwargs
         regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
         if self.config.flow_cache_frames > 0:
+            if device.type == "cuda":
+                self.flow.decoder.estimator.prepare_fused(
+                    self.flow.decoder.time_grid(self.config.flow.cfm.n_timesteps, device, torch.float32, meanflow=False)
+                )
             regions[FLOW_NEW_FRAMES_REGION] = PiecewisePackedConfig(
                 capture_fn=self._new_frames_capture,
                 make_static_inputs=functools.partial(self._new_frames_static_inputs, device=device),

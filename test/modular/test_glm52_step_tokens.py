@@ -28,7 +28,8 @@ def test_longctx_config_window_fits_its_pages():
     assert model.config.dsa_long_context
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks
-    assert max(cfg["model_kwargs"]["prefill_batched_token_buckets"]) <= model.config.prefill_chunk_tokens
+    ladders = cfg["prefill_token_buckets"]["LLM"]["prefill"]
+    assert max(max(ladder) for ladder in ladders.values()) <= model.config.prefill_chunk_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -53,34 +54,36 @@ def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match
         _submodule(cfg).bind_node_resources(resources)
 
 
-def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag):
+def _captured_prefill(sub, ladder=None) -> list[int]:
+    """The prefill token counts the submodule captures at any batch size, once the engine has
+    applied ``ladder`` (a serving config's ``prefill_token_buckets``)."""
     import torch
 
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+
+    sub._moe_capture_blocked = lambda tp_world_size: False
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    if ladder is not None:
+        apply_token_ladders("LLM", configs, {"prefill": ladder}, lambda walk, rows: None,
+                            lambda config: config.capture_batch_sizes)
+    return [n for c in configs if c.capture_graph_walk == "prefill"
+            for bs in c.capture_batch_sizes for n in c.get_total_tokens(bs)]
+
+
+def test_long_context_captures_no_prefill_bucket_past_the_chunk():
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
-    sub = _submodule(cfg)
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
+    prefill = _captured_prefill(_submodule(cfg))
     assert prefill and max(prefill) <= chunk
 
 
-def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan(torch_flag):
+def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan():
     """A captured prefill attends in one sparse plan, which FlashInfer takes up to
-    sparse_mla.MAX_ROWS rows; a longer bucket runs eager, whose plan takes chunks."""
-    import torch
-
+    sparse_mla.MAX_ROWS rows; a longer bucket runs eager, whose plan takes chunks, whatever
+    ladder the deployment names."""
     from mstar.engine.resources.dsa import sparse_mla
 
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144,
-                           prefill_chunk_tokens=4 * sparse_mla.MAX_ROWS,
-                           prefill_batched_token_buckets=[1024, 2 * sparse_mla.MAX_ROWS])
-    sub = _submodule(cfg)
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
+                           prefill_chunk_tokens=4 * sparse_mla.MAX_ROWS)
+    prefill = _captured_prefill(_submodule(cfg), {1: [1024], 2: [1024, 2 * sparse_mla.MAX_ROWS]})
     assert 1024 in prefill and max(prefill) <= sparse_mla.MAX_ROWS

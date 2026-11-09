@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,7 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
+    FLOW_NEW_FRAMES_REGION,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
@@ -191,6 +193,9 @@ class CosyVoice3Model(Model):
         flow_capture_batch_frames: int | None = None,
         hift_capture_frame_buckets: list[int] | None = None,
         hift_capture_batch_sizes: list[int] | None = None,
+        lm_prefill_batch_sizes: list[int] | None = None,
+        flow_max_batch_size: int | None = None,
+        hift_max_batch_size: int | None = None,
         flow_cache_frames: int | None = None,
         flow_new_frame_buckets: list[int] | None = None,
         flow_new_batch_sizes: list[int] | None = None,
@@ -229,6 +234,10 @@ class CosyVoice3Model(Model):
             cfg.hift_capture_frame_buckets = _sizes("hift_capture_frame_buckets", hift_capture_frame_buckets)
         if hift_capture_batch_sizes is not None:
             cfg.hift_capture_batch_sizes = _sizes("hift_capture_batch_sizes", hift_capture_batch_sizes)
+        if flow_max_batch_size is not None:
+            cfg.flow_max_batch_size = _integer("flow_max_batch_size", flow_max_batch_size, low=1)
+        if hift_max_batch_size is not None:
+            cfg.hift_max_batch_size = _integer("hift_max_batch_size", hift_max_batch_size, low=1)
         if (
             cfg.hift_captured
             and cfg.hift_capture_batch_sizes
@@ -244,6 +253,8 @@ class CosyVoice3Model(Model):
                 f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
                 "tail and pending mel"
             )
+        if lm_prefill_batch_sizes is not None:
+            cfg.lm_prefill_batch_sizes = _sizes("lm_prefill_batch_sizes", lm_prefill_batch_sizes)
         if flow_cache_frames is not None:
             cfg.flow_cache_frames = _integer("flow_cache_frames", flow_cache_frames, low=0)
         if flow_new_frame_buckets is not None:
@@ -324,7 +335,17 @@ class CosyVoice3Model(Model):
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the LM KV pool or a stream-state pool cannot hold:
-        nothing preempts a stream once a pool is full."""
+        nothing preempts a stream once a pool is full, and a serving-config ladder
+        for the flow's new-frame region, whose frame buckets also cap how rows
+        pack and size the flow's cache (``flow_new_frame_buckets``)."""
+        # a malformed key is EngineManager's to report
+        ladders = config.get("prefill_token_buckets")
+        flow = ladders.get(FLOW_NODE) if isinstance(ladders, Mapping) else None
+        if isinstance(flow, Mapping) and FLOW_NEW_FRAMES_REGION in flow:
+            raise ValueError(
+                f"{config_path}: prefill_token_buckets can't set {FLOW_NODE}/{FLOW_NEW_FRAMES_REGION}; its "
+                "buckets also pack the flow's rows and size its cache, so set model_kwargs.flow_new_frame_buckets"
+            )
         check_kv_pools_fit(self, config, config_path, logger)
         cap = config.get("max_concurrent_requests")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
@@ -367,7 +388,11 @@ class CosyVoice3Model(Model):
         )
         specs: list[NodeResourceSpec] = [
             KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
-            AttentionSpec(resource_key=LM_ATTN, nodes={LM_NODE}, config=AttentionConfig(kv_cache=LM_KV)),
+            AttentionSpec(
+                resource_key=LM_ATTN,
+                nodes={LM_NODE},
+                config=AttentionConfig(kv_cache=LM_KV, decode_fmha=True),
+            ),
             PositionSpec(
                 resource_key=LM_POS,
                 nodes={LM_NODE},

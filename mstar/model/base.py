@@ -632,7 +632,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -979,6 +979,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        open_streams: frozenset[str] = frozenset(),
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -1001,6 +1002,10 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            open_streams: The client streams the opening leaves open for
+                appends; empty for a one-shot request. Raise
+                ``ValueError`` here for a live opening the request's settings
+                can't serve.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:
@@ -1022,19 +1027,22 @@ class Model(ABC):
         """Turn one append the client sends to a running request into items of
         the model's client streams (``Connection(from_partition=CLIENT, ...)``).
 
-        Called by the API server data worker for each append that carries text
-        or files, after it has loaded the files the way it loads a request's
+        Called by the API server data worker for each append that carries text,
+        files or ``model_kwargs``, after it has loaded the files the way it loads a request's
         (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
         ``video_inputs``). ``chunk.streams`` names the stream the client meant
         each file for, where it named one; ``chunk.model_kwargs`` are the
         append's own, beside the opening's ``chunk.request_kwargs``. Returns
         items by client edge name; each list entry is one item of that stream.
         Raise ``ValueError`` for an append the model can't take (the client
-        gets a 400); an append with text that yields no item is refused.
+        gets a 400); an append of text or ``model_kwargs`` that yields no item
+        is refused.
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 
@@ -1204,9 +1212,10 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads, including the ones an
-        OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key logged as ignored. None (the default) declares nothing, so
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
         return None
@@ -1226,6 +1235,16 @@ class Model(ABC):
         speech codecs used by the audio models here.
         """
         return 24000
+
+    # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
+    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    turn_tokens: tuple[int, int] | None = None
+    # A model whose replies may never get their end mark: a reply ends after this many
+    # steps with no text, no mark and no audio above ``turn_silence_rms`` (the RMS of
+    # samples in [-1, 1]), and text outside a reply opens one; None: only the marks end
+    # and open them.
+    turn_idle_steps: int | None = None
+    turn_silence_rms: float = 0.005
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

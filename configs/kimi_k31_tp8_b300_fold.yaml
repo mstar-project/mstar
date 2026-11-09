@@ -38,8 +38,10 @@ model_kwargs:
   routed_experts_backend: auto
   # the routed finalize folded into the routed all-reduce + RMSNorm (see the top); kernel in kimi_k31_tp8_b300.yaml
   routed_experts_finalize: fused
-  # prefill captured at these packed token counts, 1-8 rows, as kimi_k31_tp8.yaml (see there)
-  prefill_token_buckets: [512, 1024, 2048, 3072, 4096, 6144, 8192]
+# prefill captured at these packed token counts, 1-8 rows, as kimi_k31_tp8.yaml (see there)
+prefill_token_buckets:
+  LLM:
+    prefill: [512, 1024, 2048, 3072, 4096, 6144, 8192]
 resources:
   kv_cache:
     # 24 MLA layers x 576-wide latent, bf16, replicated: ~27.6 KB/token/rank. 64 requests of

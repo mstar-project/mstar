@@ -1,6 +1,7 @@
 
 import json
 import logging
+import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
@@ -48,6 +49,9 @@ def load_weights_from_file(
 ):
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
+    refuse_unserved_quantization(safetensors_file)
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -254,7 +258,10 @@ def load_weights_from_hf_shards(
     """
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
     repo_dir = Path(repo_dir)
+    refuse_unserved_quantization(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
@@ -622,6 +629,14 @@ def capture_ladder(key: str, value) -> list[int]:
             or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
         raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
     return list(value)
+
+
+def warn_retired_ladder_env(name: str, setting: str) -> None:
+    """Warn that the environment variable ``name``, a capture ladder the serving config's
+    ``prefill_token_buckets`` replaced, is set but no longer read; ``setting`` is the
+    serving config entry that sets it."""
+    if name in os.environ:
+        logger.warning("%s is no longer read; set the ladder in the serving config: %s", name, setting)
 
 
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:

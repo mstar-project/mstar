@@ -27,8 +27,10 @@ model_kwargs:
   # tactics are tuned at load (routed_experts_autotune, default true; routed_experts_tune_tokens, default
   # every FlashInfer bucket: 1..256, 512..8192) and kept per GPU under ~/.cache/mstar/flashinfer_moe_tune: the first boot pays for it
   routed_experts_backend: auto
-  # prefill captured at these packed token counts, 1-8 rows, as kimi_k31_tp8.yaml (see there)
-  prefill_token_buckets: [512, 1024, 2048, 3072, 4096, 6144, 8192]
+# prefill captured at these packed token counts, 1-8 rows, as kimi_k31_tp8.yaml (see there)
+prefill_token_buckets:
+  LLM:
+    prefill: [512, 1024, 2048, 3072, 4096, 6144, 8192]
 resources:
   kv_cache:
     # 24 MLA layers x 576-wide latent, bf16, replicated: ~27.6 KB/token/rank. 64 requests of

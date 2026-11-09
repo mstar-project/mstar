@@ -115,14 +115,16 @@ def build(ckpt: str, device: str, overrides: dict | None = None, group=None, gro
 
     kv_mod.KVTransferManager = H._StubTransfer  # one engine, nothing to transfer
     model = KimiK31Model(ckpt, strict_config=False, kda_max_requests=4, tokenizer_mode="byte",
-                         kda_conv_dtype=dtype, **(model_kwargs or {}), **({"prefill_token_buckets": prefill_buckets,
-                                                  "prefill_capture_batch_sizes": (1, 2, 4)}
-                                                 if prefill_buckets else {}))
+                         kda_conv_dtype=dtype, **(model_kwargs or {}),
+                         **({"prefill_capture_batch_sizes": (1, 2, 4)} if prefill_buckets else {}))
     if overrides:
         model.config = dataclasses.replace(model.config, **overrides)
         model._check_checkpoint_config = lambda source: None  # the overrides are deliberate
     # as the engine loads a node: under its quantization scope (MXFP4 experts load as stored)
     sub = load_submodule(model, "LLM", {}, device, tp_group=group, autocast_dtype=dtype)
+    if prefill_buckets:
+        # what the engine applies from a serving config's prefill_token_buckets
+        sub.PREFILL_TOKEN_BUCKETS = list(prefill_buckets)
     # the step's logits come back as a row output: a captured decode replays the graph, not the
     # sampler's Python, so a list the sampler appends to would hold the last eager step's (job 1461)
     sub.__class__ = _logits_submodule_class()
@@ -655,8 +657,7 @@ class Stepper:
         buckets = getattr(args, "prefill_buckets", None)
         model = KimiK31Model(args.ckpt, strict_config=False, kda_max_requests=8, tokenizer_mode="byte",
                              **json.loads(getattr(args, "model_kwargs", None) or "{}"),
-                             **({"prefill_token_buckets": buckets, "prefill_capture_batch_sizes": (1, 2, 4)}
-                                if buckets else {}))
+                             **({"prefill_capture_batch_sizes": (1, 2, 4)} if buckets else {}))
         if buckets and model.config.context_limit < 512:  # a tiny dry-run cut's top-k: room for the cases
             model.config = dataclasses.replace(model.config, index_topk=1024, max_seq_len=1024)
             model._check_checkpoint_config = lambda source: None
@@ -665,6 +666,8 @@ class Stepper:
             model.config = dataclasses.replace(model.config, **_dsa_overrides(args, longest))
             model._check_checkpoint_config = lambda source: None
         sub = load_submodule(model, "LLM", {}, self.dev, autocast_dtype=args.dtype)
+        if buckets:
+            sub.PREFILL_TOKEN_BUCKETS = list(buckets)  # what the engine applies from prefill_token_buckets
         sub.__class__ = _logits_submodule_class()
         if getattr(args, "force_small_m", False):
             force_small_m_backends(sub)

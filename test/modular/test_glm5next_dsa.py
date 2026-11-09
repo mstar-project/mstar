@@ -375,8 +375,6 @@ def test_one_token_prompts_prefill_eager_in_long_mode():
 @pytest.mark.parametrize("change, page_size, match", [
     ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
     ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
-    ({"prefill_graphs": True, "prefill_token_buckets": [128, 2 * sparse_mla.MAX_ROWS]}, None,
-     "prefill buckets"),
 ])
 def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
     sub = object.__new__(Glm5NextLLMSubmodule)
@@ -384,6 +382,24 @@ def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
     kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=page_size))
     with pytest.raises(ValueError, match=match):
         sub.bind_node_resources({} if page_size is None else {KV_CACHE: kv})
+
+
+def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan():
+    """A captured prefill plans its whole bucket in one sparse plan, which FlashInfer takes up to
+    sparse_mla.MAX_ROWS rows; a longer bucket the deployment names runs eager, whose plan takes chunks."""
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+
+    sub = object.__new__(Glm5NextLLMSubmodule)
+    sub.config = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), prefill_graphs=True)
+    sub.mtp_k, sub.node_resources = 0, {}
+    sub._moe_capture_blocked = lambda tp_world_size: False
+    sub._kda_max_slots = lambda: None
+    sub._kda_prefill_capturable = lambda: True
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    apply_token_ladders("LLM", configs, {"prefill": [128, 2 * sparse_mla.MAX_ROWS]}, lambda walk, rows: None,
+                        lambda config: config.capture_batch_sizes)
+    (prefill,) = [c for c in configs if c.capture_graph_walk == "prefill"]
+    assert prefill.get_total_tokens(1) == [128]
 
 
 def test_long_context_refuses_pools_per_page_off_a_power_of_two():

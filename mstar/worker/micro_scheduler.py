@@ -1,6 +1,7 @@
 import functools
 import itertools
 import logging
+import math
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -649,10 +650,11 @@ class MicroScheduler:
                     chunkable |= chunks
             if continuing is not None:
                 row_tokens.update(self._measure_unstarted(continuing, taken.difference(starts)))
-        min_chunk, align = 1, 1
+        min_chunk = align = 1
         if max_tokens is not None and row_tokens:
-            min_chunk = engine.min_chunk_tokens(max_tokens)
-            align = engine.chunk_align(*node_walk)
+            # what the node's resources need of where a chunk starts, and what the walk's policy asks
+            align = math.lcm(engine.chunk_alignment(node_walk[0]), engine.chunk_align(*node_walk))
+            min_chunk = engine.min_chunk_tokens(max_tokens, align)
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
             max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         budgeted = max_tokens is not None and bool(row_tokens)
@@ -664,8 +666,8 @@ class MicroScheduler:
             row_tokens=row_tokens,
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
+            chunk_alignment=align,
             start_order=started,
-            chunk_align=align,
         ), starts, resumed)
 
     def _mid_prefill_rows(

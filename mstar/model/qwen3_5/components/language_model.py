@@ -33,6 +33,7 @@ from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
     compute_inv_freq,
+    compute_text_cos_sin,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -256,6 +257,12 @@ class Qwen3_5LanguageModel(nn.Module):
             position_ids_3d, self.inv_freq, self.config.mrope_section,
             target_dtype=dtype,
         )
+
+    def build_text_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin for text rows' ``[tokens]`` 1D positions (`compute_text_cos_sin`)."""
+        return compute_text_cos_sin(positions, self.inv_freq, target_dtype=dtype)
 
     def forward(
         self, query_sequence: torch.Tensor, *, label: str,

@@ -21,11 +21,13 @@ model_kwargs:
   # tactics are tuned at load (routed_experts_autotune, default true; routed_experts_tune_tokens, default
   # every FlashInfer bucket: 1..256, 512..8192) and kept per GPU under ~/.cache/mstar/flashinfer_moe_tune: the first boot pays for it
   routed_experts_backend: auto
-  # prefill captured at these packed token counts, 1-8 rows (prefill_capture_batch_sizes): an eager prefill
-  # step costs ~2.2 ms of host work a layer whatever its length (216-221 ms for a 960-token prompt on B300,
-  # nearly all of c=1's TTFT, and every decode row waits it out under load); a replay costs its kernels.
-  # A step past 8192 tokens or 8 rows, or a chunk cut off a 64-key boundary, runs eager.
-  prefill_token_buckets: [512, 1024, 2048, 3072, 4096, 6144, 8192]
+# prefill captured at these packed token counts, 1-8 rows (prefill_capture_batch_sizes): an eager prefill
+# step costs ~2.2 ms of host work a layer whatever its length (216-221 ms for a 960-token prompt on B300,
+# nearly all of c=1's TTFT, and every decode row waits it out under load); a replay costs its kernels.
+# A step past 8192 tokens or 8 rows, or a chunk cut off a 64-key boundary, runs eager.
+prefill_token_buckets:
+  LLM:
+    prefill: [512, 1024, 2048, 3072, 4096, 6144, 8192]
 resources:
   kv_cache:
     # 24 MLA layers x 576-wide latent, bf16, replicated: ~27.6 KB/token/rank. 64 requests of

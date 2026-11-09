@@ -26,13 +26,15 @@ model_kwargs:
   prefill_chunk_tokens: 8192
   # TP ranks split a long prompt's selection (the indexer's cost grows as the prompt squared)
   dsa_shard_prefill: true
-  # glm52_tp8.yaml's prefill graphs, to 4096 tokens; a longer prompt prefills eager
-  prefill_token_buckets: [
-    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
-    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
-    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
-  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
   prefill_capture_batch_sizes: [1, 4, 16]
+# glm52_tp8.yaml's prefill graphs, to 4096 tokens; a longer prompt prefills eager
+prefill_token_buckets:
+  LLM:
+    prefill:
+      1: [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+          832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+          1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+      2: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
 resources:
   kv:
     # 2304 x 128-token pages = 295k tokens/rank: one full window and change

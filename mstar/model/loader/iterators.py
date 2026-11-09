@@ -24,7 +24,7 @@ import math
 import os
 import struct
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
@@ -33,6 +33,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.model.loader.quantization import refuse_unserved_quantization
 from mstar.utils.threads import ThreadPool
 
 
@@ -242,8 +243,14 @@ def iter_safetensors_file(
     prefix: str | None = None,
     keys: set[str] | None=None,
     slice_spec: SliceSpec | None = None,
+    quant_methods: Collection[str] = (),
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield ``(key, tensor)`` from a single safetensors file."""
+    """Yield ``(key, tensor)`` from a single safetensors file.
+
+    A quantized checkpoint (its directory's config says so) is refused unless its
+    ``quant_method`` is in ``quant_methods``, the formats the caller loads itself.
+    """
+    refuse_unserved_quantization(path, quant_methods)
     yield from _iter_files([Path(path)], device, prefix, keys, slice_spec)
 
 
@@ -252,13 +259,16 @@ def iter_safetensors_shards(
     prefix: str | None = None,
     keys: set[str] | None=None,
     slice_spec: SliceSpec | None = None,
+    quant_methods: Collection[str] = (),
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(key, tensor)`` from a sharded HF safetensors checkpoint.
 
     Looks for ``model.safetensors.index.json`` in ``repo_dir``; if absent,
-    falls back to a single ``model.safetensors`` file.
+    falls back to a single ``model.safetensors`` file. A quantized checkpoint
+    is refused unless its ``quant_method`` is in ``quant_methods``.
     """
     repo_dir = Path(repo_dir)
+    refuse_unserved_quantization(repo_dir, quant_methods)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
@@ -285,7 +295,7 @@ def iter_safetensors_shards(
     if single.exists():
         yield from iter_safetensors_file(
             single, device=device,
-            prefix=prefix, keys=keys, slice_spec=slice_spec,
+            prefix=prefix, keys=keys, slice_spec=slice_spec, quant_methods=quant_methods,
         )
         return
     raise FileNotFoundError(

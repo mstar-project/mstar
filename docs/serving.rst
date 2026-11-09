@@ -214,13 +214,16 @@ environment, and so does a variable that expands to nothing (``--api-key "$UNSET
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
 ``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`. The standalone Nemotron realtime server
-(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
-variable.
+:doc:`clients`.
 
 Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
+
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
@@ -271,14 +274,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
        kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
-       ``chatterbox*_split``, ``omnivoice_split``, ``qwen3tts_split``). NVIDIA only, and it
+       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
-       message's included.
+       message's included, and of decoded audio samples a route appends
+       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
+       included).
        A live call's opening message past it is refused, and an append that would pass
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
@@ -334,6 +339,55 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, one token budget for every walk the model budgets, or a
        mapping of walk -> budget; null turns a walk's chunking off. Overrides the
        model's defaults. See *Chunked prefill budgets* below.
+   * - ``prefill_token_buckets``
+     - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
+       graph capture is taken at, in place of the model's. A name is a walk the
+       node runs, for its packed captures on that walk (the model's
+       ``capture_token_lengths``; Orpheus's ``mixed`` steps replay its ``prefill``
+       capture, so name ``prefill``), or the label of one of its piecewise packed
+       regions, for that region's ``total_tokens`` (BAGEL's ``vit_block_loop``,
+       OmniVoice's ``backbone_layers``). A step pads to the smallest rung that
+       holds it, and a longer one runs eagerly. A walk's ladder is a list, or a
+       mapping of min batch size -> list for a ladder per range of batch sizes:
+       ``{1: [...], 2: [...]}`` captures one request on the first and every larger
+       batch on the second (a larger batch size's ladder must reach at least as
+       far). A walk's ladder runs to the first rung that holds the most tokens a
+       step its capture replays runs: its token budget (``max_batch_tokens``; a walk
+       inside a combined walk runs under the combined walk's), or, for a combined
+       walk's steps, past it where the capture's widest batch of one-token decode
+       rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
+       that many. The rungs past it, which no step would reach, are dropped and
+       logged. A ladder is kept whole
+       where its steps run under no budget or may hold a prompt of a walk whose
+       chunking ``max_batch_tokens`` turned off, which runs whole, as is a
+       region's. A vision tower's ``vision_block_loop`` and an AuT encoder's
+       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
+       every other region keeps its own batch cap. A tower's attention resource is
+       sized from the model's own top rung, and a batch with more attention segments
+       than it holds is split into its requests, a request still over it running
+       eagerly, so a ladder past that rung replays its longer steps only with the
+       resource raised under ``resources``: ``vision_attn: {max_segments_per_step: N}``
+       for a vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N
+       frames or windows a step), and ``audio_attn: {max_segments_per_request: N}`` for
+       Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung adds captures,
+       graph memory and startup time. Loading fails, before any weights load, if the
+       setting is not a mapping of node -> name -> ladder, names a node in no node
+       group or a walk of the model that does not run the node (a node runs the walks
+       it is in and its combined walks), a ladder is not a non-empty list of distinct
+       positive ints, or a name that is no walk has a mapping. Warmup fails on a walk
+       whose steps replay another walk's capture, naming that walk, on a walk the node
+       captures by batch size alone (a ``decode`` capture), on a walk of a node whose
+       model captures no walk at all (a vision tower, an AuT encoder), naming its
+       regions, on a name that is neither a walk nor a region of the node or is both
+       (on a node whose model declares no region, every name that is no walk), and on a
+       region captured by batch size alone; a walk or region the node captures nothing
+       for at this deployment (a model that turns its captures off, such as GLM-5.2's prefill
+       under ``dsa_long_context`` with MTP) is logged and skipped. Loading also fails where a model
+       refuses a region whose buckets it uses elsewhere: CosyVoice3's
+       ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
+       key replaces ``model_kwargs.prefill_token_buckets``,
+       ``prefill_batched_token_buckets`` (GLM-5.2), ``backbone_token_buckets``
+       (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.
@@ -354,7 +408,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``min_chunk_tokens``
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
-       chunked walk. See *Chunked prefill budgets* below.
+       chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
+       up to a page. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
@@ -368,8 +423,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
@@ -518,9 +574,19 @@ A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
-for the next step rather than running the step over its budget. A model can also declare
-that a cut runs a multiple of so many tokens (``ChunkingPolicy.chunk_align``; Kimi K3.1's
-is 64): the cut rounds down to it, and a prompt it rounds to nothing waits too.
+for the next step rather than running the step over its budget. Under ``fifo`` the first
+prompt in line, started or not, keeps that much of each step from the other prompts, so a
+stream of short ones cannot hold it off.
+
+A node whose resources keep state only on a grid of tokens counted from where a chunk starts
+(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each
+chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
+default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
+up to a page, a budget under a page fails loading, and one under three pages logs a warning:
+a step can then leave up to a page, less one token, of its budget unused. A model can also
+declare that a walk's cuts run a multiple of so many tokens (``ChunkingPolicy.chunk_align``;
+Kimi K3.1's is 64, where its MLA rows replay a packed prefill capture): the scheduler cuts to
+the least common multiple of the two.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
@@ -624,7 +690,7 @@ before it spawns the workers, run every worker as its client so their kernels ov
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
 
 **A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
 group runs that node's steps on a lane of their own instead of the worker's main chain:

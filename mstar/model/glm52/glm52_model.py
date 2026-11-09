@@ -55,6 +55,9 @@ _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
     "prefill_last_layer_rows")
+# The quantized checkpoint formats GLM-5.2's loader reads itself: fp8 block-scale
+# (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
+QUANT_METHODS = ("fp8",)
 
 
 class Glm52Model(Model):
@@ -67,7 +70,6 @@ class Glm52Model(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -127,13 +129,9 @@ class Glm52Model(Model):
             if not isinstance(kwargs["graph_compile"], bool):
                 raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
             self.config.graph_compile = kwargs["graph_compile"]
-        if prefill_token_buckets is not None:
-            # as given: the submodule checks it as Qwen3.5's, and int() would read 64.5 as 64
-            # and "64" as [6, 4]
-            self.config.prefill_token_buckets = prefill_token_buckets
-        for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         if "mtp_num_draft_tokens" in kwargs:
             k = kwargs["mtp_num_draft_tokens"]
             if isinstance(k, bool) or not isinstance(k, int) or k < 0:
@@ -620,7 +618,7 @@ class Glm52Model(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            load_weights(language_model, source, device=device)
+            load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS)
             return
 
         with open(index_file) as f:
@@ -636,7 +634,7 @@ class Glm52Model(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         language_model.load_weights(weights)
 

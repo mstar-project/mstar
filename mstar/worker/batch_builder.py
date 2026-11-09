@@ -99,11 +99,12 @@ class BatchBuildRequest:
     # The fewest tokens a cut row runs (the node's floor for its configured
     # budget; ``max_batch_tokens`` above is what is left of that budget).
     min_chunk_tokens: int = 1
+    # A cut row takes a multiple of this, the alignment the node's resources
+    # declare (`Engine.chunk_alignment`), so its next chunk starts on it;
+    # ``min_chunk_tokens`` is one too.
+    chunk_alignment: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
-    # A row cut mid-way runs a multiple of this many tokens, so its next chunk starts on one (the
-    # walk's ``ChunkingPolicy.chunk_align``).
-    chunk_align: int = 1
 
 
 class BatchBuildResult(NamedTuple):
@@ -315,13 +316,13 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         take, dropped = self.share_token_budget(
             list(scheduled.request_to_worker_graph), request.row_tokens,
             request.chunkable, request.max_batch_tokens, request.min_chunk_tokens,
-            request.start_order, request.chunk_align,
+            request.start_order, request.chunk_alignment,
         )
         if request.walk_max_tokens:
             _cap_walks(
                 scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
                 self.share_token_budget, request.min_chunk_tokens, request.start_order,
-                request.chunk_align,
+                request.chunk_alignment,
             )
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
@@ -382,7 +383,7 @@ def _take_whole(
 
 def _run_head(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-    min_chunk: int, take: dict[int, int], dropped: set[int],
+    min_chunk: int, take: dict[int, int], dropped: set[int], align: int = 1,
 ) -> None:
     """Never an empty step while a row exists: the first of ``rids`` runs
     over budget if it must. Updates ``take`` and ``dropped`` in place."""
@@ -390,7 +391,11 @@ def _run_head(
         return
     head = rids[0]
     need = tokens.get(head, 0)
-    take[head] = min(need, max(budget, min_chunk, 1)) if head in chunkable else need
+    if head in chunkable:
+        cap = max(budget, min_chunk, 1)
+        take[head] = min(need, max(cap - cap % align, align))
+    else:
+        take[head] = need
     dropped.discard(head)
 
 
@@ -405,33 +410,36 @@ def fill_token_budget_in_start_order(
     (``start_order``), then the others as listed -- each taking all it needs
     of what is left, so a prompt finishes before the next one starts and its
     first token does not wait on every other prompt's prefill. The first that
-    does not fit is cut to what is left if that is at least ``min_chunk``
-    tokens, and otherwise waits for the next step; one that cannot be cut sits
-    out without holding up the rows behind it. Never empty while a row
-    exists: the first row runs over budget if it must.
+    does not fit is cut to what is left, rounded down to a multiple of
+    ``align``, if that is at least ``min_chunk`` tokens, and otherwise waits
+    for the next step; one that cannot be cut sits out without holding up the
+    rows behind it. Never empty while a row exists: the first row runs over
+    budget if it must.
 
-    The oldest prompt mid-prefill keeps ``min_chunk`` of the budget out of
-    the finishing pass, so a steady stream of short prompts cannot starve it.
-    A cut row runs a multiple of ``align`` tokens (`_align_cuts`).
-    Returns (rid -> tokens taken, rids left out)."""
+    The first prompt in line (the oldest mid-prefill, else the first not
+    started) keeps ``min_chunk`` of the budget from the other prompts in the
+    finishing pass, so a steady stream of short prompts cannot starve it,
+    before its first chunk or after. Returns (rid -> tokens taken, rids left
+    out)."""
     take, left, pending = _take_whole(rids, tokens, budget)
     start_order = start_order or {}
-    oldest = min(
-        (rid for rid in pending if rid in start_order and rid in chunkable),
-        key=start_order.__getitem__, default=None,
-    )
+    started = sorted((rid for rid in pending if rid in start_order), key=start_order.__getitem__)
+    line = started + [rid for rid in pending if rid not in start_order]
+    oldest = next((rid for rid in line if rid in chunkable), None)
     reserved = min(min_chunk, tokens.get(oldest, 0)) if oldest is not None and left >= min_chunk else 0
-    left -= reserved
     for rid in sorted(pending, key=lambda rid: tokens.get(rid, 0)):
         need = tokens.get(rid, 0)
-        if need > left or rid == oldest:
+        if need > left - (reserved if rid != oldest and rid in chunkable else 0):
             continue
         take[rid] = need
         left -= need
-    left += reserved
-    pending = [rid for rid in pending if rid not in take]
-    started = sorted((rid for rid in pending if rid in start_order), key=start_order.__getitem__)
-    order = started + [rid for rid in pending if rid not in start_order]
+        if rid == oldest:
+            reserved = 0
+    order = [rid for rid in line if rid not in take]
+    if reserved:
+        # what was kept for the oldest is its own, whoever is ahead of it in line
+        order.remove(oldest)
+        order.insert(0, oldest)
     dropped: set[int] = set()
     cut = False
     for rid in order:
@@ -439,44 +447,16 @@ def fill_token_budget_in_start_order(
         if need <= left:
             take[rid] = need
             left -= need
-        elif rid in chunkable and not cut and left >= min_chunk:
+        elif rid in chunkable and not cut and left - left % align >= max(min_chunk, 1):
             # the one row cut. Not to the floor past the budget: a step over
             # its budget pays for the next capture bucket up
             cut = True
-            take[rid] = left
-            left = 0
+            take[rid] = left - left % align
+            left %= align
         else:
             dropped.add(rid)
-    _run_head(order, tokens, chunkable, budget, min_chunk, take, dropped)
-    _align_cuts(order, tokens, chunkable, budget, min_chunk, take, dropped, align)
+    _run_head(order, tokens, chunkable, budget, min_chunk, take, dropped, align)
     return take, dropped
-
-
-def _align_cuts(
-    rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-    min_chunk: int, take: dict[int, int], dropped: set[int], align: int,
-) -> None:
-    """Each cut row's tokens rounded down to a multiple of ``align``, so its next chunk starts
-    on one: a row starts at 0 or past a cached prefix, a whole number of pages, which a model
-    declaring ``ChunkingPolicy.chunk_align`` keeps a multiple of it. A row finishing this step
-    is not cut. A cut that rounds to nothing sits out for the next step, unless that leaves the
-    step empty: then its head runs as `_run_head` has it, a cut rounded up to ``align`` (over
-    budget, as a head may run). Updates ``take`` and ``dropped`` in place."""
-    if align <= 1:
-        return
-    for rid in [rid for rid, n in take.items() if n < tokens.get(rid, 0)]:
-        n = take[rid] - take[rid] % align
-        if n:
-            take[rid] = n
-        else:
-            del take[rid]
-            dropped.add(rid)
-    if take or not rids:
-        return
-    _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped)
-    head = rids[0]
-    if take.get(head, 0) < tokens.get(head, 0):
-        take[head] = min(tokens.get(head, 0), -(-take[head] // align) * align)
 
 
 def fill_token_budget(
@@ -489,7 +469,6 @@ def fill_token_budget(
     is fewer: when the share is smaller, only as many rows as what is left
     holds are cut, and if it holds none, they wait for the next step.
     Never empty while a row exists: the first row runs over budget if it must.
-    A cut row runs a multiple of ``align`` tokens (`_align_cuts`).
     Returns (rid -> tokens taken, rids left out)."""
     take, left, pending = _take_whole(rids, tokens, budget)
     dropped = {rid for rid in pending if rid not in chunkable}
@@ -501,12 +480,13 @@ def fill_token_budget(
         dropped.update(cut[n:])
         cut = cut[:n]
     for rid in cut:
-        if share >= 1:
-            take[rid] = min(tokens.get(rid, 0), share)
+        need = tokens.get(rid, 0)
+        n = need if need <= share else share - share % align
+        if n >= 1:
+            take[rid] = n
         else:
             dropped.add(rid)
-    _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped)
-    _align_cuts(rids, tokens, chunkable, budget, min_chunk, take, dropped, align)
+    _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped, align)
     return take, dropped
 
 
@@ -524,9 +504,10 @@ def _cap_walks(
         rids = [rid for rid in batch.request_to_worker_graph if rid in take and batch.walk_of(rid) == walk]
         if sum(take[rid] for rid in rids) <= cap:
             continue
+        # the floor stays a multiple of ``align`` under a cap that isn't one
         walk_take, walk_dropped = share(
-            rids, {rid: take[rid] for rid in rids}, chunkable, cap, min(min_chunk, cap),
-            start_order or {}, align,
+            rids, {rid: take[rid] for rid in rids}, chunkable, cap,
+            min(min_chunk, max(cap - cap % align, align)), start_order or {}, align,
         )
         for rid in rids:
             del take[rid]

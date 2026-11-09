@@ -38,6 +38,8 @@ PROMPTS = {"a": list(range(3, 12)), "b": list(range(40, 45))}
 # prefill bucket and eager and replay run the same shapes
 BUCKET_PROMPTS = {"a": list(range(3, 19)), "b": list(range(40, 56))}
 MAX_TOKENS = 12
+# the one prefill capture, which BUCKET_PROMPTS fill
+PREFILL_BUCKET = 16
 # the scale block fused_experts_fp8 compiles for
 FP8_BLOCK = (128, 128)
 
@@ -55,7 +57,7 @@ def _latent_cfg(fp8: bool, **overrides) -> Glm52ModelConfig:
         base = Glm52ModelConfig.reduced()
     cfg = dataclasses.replace(
         base, mla_absorb=True, kv_lora_rank=512, qk_rope_head_dim=64,
-        prefill_token_buckets=[16], prefill_capture_batch_sizes=[1], **overrides,
+        prefill_capture_batch_sizes=[1], **overrides,
     )
     assert flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     return cfg
@@ -139,6 +141,8 @@ class _Node:
                 submodule_name=NODE, submodule=submodule, resources=self.resources,
                 step_runner=self.runner, device=DEVICE, autocast_dtype=DTYPE,
                 joint_comm_group=self.groups, num_slots=1,
+                # the serving config's prefill_token_buckets, as the engine hands it over
+                token_ladders={"prefill": [PREFILL_BUCKET]},
             )
             with torch.no_grad():
                 self.cg.warmup_and_capture(None)

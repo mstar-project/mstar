@@ -128,7 +128,6 @@ class KimiK3Model(Model):
         return KimiK3ModelConfig.k3(**overrides)
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
-                 prefill_token_buckets: list[int] | None = None,
                  prefill_capture_batch_sizes: list[int] | None = None, **kwargs):
         self.cache_dir = cache_dir
         self.model_path_hf = kwargs.get("checkpoint_path") or model_path_hf
@@ -171,10 +170,9 @@ class KimiK3Model(Model):
         # largest that fits the KDA slots, so a config past 64 requests names a longer ladder.
         ladder = kwargs.get("decode_capture_batch_sizes")
         self.decode_capture_batch_sizes = None if ladder is None else tuple(int(b) for b in ladder)
-        # Captured prefill (within index_topk): the packed token counts and row counts it is captured at.
-        # None leaves prefill eager, ~2.2 ms of host work a layer a step whatever its length.
-        self.prefill_token_buckets = (None if prefill_token_buckets is None
-                                      else [int(n) for n in prefill_token_buckets])
+        # Captured prefill (within index_topk): the row counts it is captured at. Its packed token
+        # counts are the serving config's prefill_token_buckets; without them prefill runs eager,
+        # ~2.2 ms of host work a layer a step whatever its length.
         self.prefill_capture_batch_sizes = (None if prefill_capture_batch_sizes is None
                                             else tuple(int(b) for b in prefill_capture_batch_sizes))
         # torch.compile of the tensor glue between the resources (AttnRes reads, norms, the MoE block:
@@ -549,7 +547,6 @@ class KimiK3Model(Model):
         return KimiK3LLMSubmodule(language_model=language_model, config=self.config,
                                   decode_capture_batch_sizes=self.decode_capture_batch_sizes,
                                   compile_glue=self.compile_glue, compile_reads=self.compile_reads,
-                                  prefill_token_buckets=self.prefill_token_buckets,
                                   prefill_capture_batch_sizes=self.prefill_capture_batch_sizes)
 
     def checkpoint_path(self) -> str | None:

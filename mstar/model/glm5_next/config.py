@@ -187,9 +187,8 @@ class Glm5NextModelConfig:
     moe_quant_kernel: str = "reference"
 
     # Capture the prefill per (rows, token bucket); off keeps it eager. The
-    # two lists override the submodule's default buckets.
+    # list overrides the submodule's default batch sizes.
     prefill_graphs: bool = False
-    prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # the latent width, kv_lora_rank + qk_rope_head_dim (0 here)
@@ -582,7 +581,6 @@ class Glm5NextModelConfig:
             max_seq_len=512,
             eos_token_ids=(250, 251, 252),
             pad_token_id=250,
-            prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
 

@@ -1,9 +1,7 @@
-"""The Qwen3.5 graph-bucket ladders: the decode one from the environment, the
-prefill one from the deployment's model_kwargs; and every prefill ladder a
-shipped config sets, for whichever model it serves."""
+"""The Qwen3.5 graph-bucket ladders: the decode one from the environment, and
+every prefill ladder a shipped config sets."""
 import ast
 import importlib
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +9,7 @@ import pytest
 import torch
 
 from mstar.engine import recompile_limit
+from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig
 from mstar.utils import knobs
 
 
@@ -23,35 +22,6 @@ def _reload(monkeypatch, name, value):
     return importlib.reload(m)
 
 
-def test_prefill_ladder_from_model_kwargs():
-    from mstar.model.keys import MIXED
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-    default = list(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
-    # a batch that fills a power of two doesn't pad past it
-    assert {256, 512, 1024, 2048, 4096, 8192} <= set(default)
-    sub = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=[8192, 3072, 2048])
-    assert sub.PREFILL_TOKEN_BUCKETS == [2048, 3072, 8192]
-    # an instance override, not the class's
-    assert LLMSubmodule.PREFILL_TOKEN_BUCKETS == default
-    assert LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,))).PREFILL_TOKEN_BUCKETS == default
-    # the ladders the text-prefill and mixed captures are taken on; a mixed
-    # step keeps only the ladder's powers of two and 2176
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    ladders = {c.capture_graph_walk: c.capture_token_lengths for c in configs if c.capture_graph_walk != "decode"}
-    assert ladders["prefill_text"] == [2048, 3072, 8192]
-    assert ladders[MIXED] == [2048, 8192]
-
-
-@pytest.mark.parametrize("buckets", [[], [512, 512], [0, 64], 2048, [1152, 1536]])
-def test_a_bad_prefill_ladder_is_refused(buckets):
-    """Refused when the submodule is built, not taken as the default (an empty
-    list), captured twice (a repeat), failing later with a TypeError (a scalar),
-    or leaving a mixed step no bucket to replay (no power of two)."""
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-    with pytest.raises(ValueError, match="prefill_token_buckets"):
-        LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
-
-
 def test_decode_ladder_knob(monkeypatch):
     m = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", "1,2,4,8,16,32")
     assert m.LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32]
@@ -59,85 +29,49 @@ def test_decode_ladder_knob(monkeypatch):
     assert m.LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES[-1] == 128
 
 
-def test_a_ladder_with_no_mixed_bucket_captures_no_mixed_step():
-    # Qwen3.5 refuses such a ladder (above); the scaffold's rule is that an empty
-    # one captures nothing rather than falling back to the prefill ladder
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-    s = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=[2048, 3000])
-    s.MIXED_TOKEN_BUCKETS = []
-    configs = s.get_accelerator_graph_configs(torch.device("cpu"))
-    (mixed,) = [c for c in configs if c.capture_graph_walk == "mixed"]
-    assert mixed.capture_token_lengths == []
-
-
-def _configs_with_prefill_ladders():
-    """``{config: (model class, ladder)}`` for every shipped config that sets
-    ``model_kwargs.prefill_token_buckets``."""
-    import yaml
-
-    from mstar.model.registry import get_model_class
-    ladders = {}
-    for path in sorted((Path(__file__).resolve().parents[2] / "configs").rglob("*.yaml")):
-        config = yaml.safe_load(path.read_text())
-        buckets = (config.get("model_kwargs") or {}).get("prefill_token_buckets")
-        if buckets is not None:
-            ladders[path.name] = (get_model_class(config["model"]), buckets)
-    return ladders
+def test_default_prefill_ladder_holds_every_power_of_two(monkeypatch):
+    submodule = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None).LLMSubmodule
+    # a batch that fills a power of two doesn't pad past it
+    assert {256, 512, 1024, 2048, 4096, 8192} <= set(submodule.PREFILL_TOKEN_BUCKETS)
 
 
 def _shipped_prefill_ladders():
-    """None (the default) and every ``prefill_token_buckets`` a Qwen3.5 config sets."""
+    """None (the default) and the ``prefill_token_buckets`` of every shipped
+    config that sets them on a Qwen3.5 LLM."""
+    import yaml
+
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.registry import get_model_class
     ladders = {str(None): None}
-    for name, (cls, buckets) in _configs_with_prefill_ladders().items():
-        if cls is Qwen3_5DenseModel:
-            ladders[name] = buckets
+    for path in sorted((Path(__file__).resolve().parents[2] / "configs").rglob("*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        llm = (config.get("prefill_token_buckets") or {}).get("LLM")
+        if llm is not None and issubclass(get_model_class(config["model"]), Qwen3_5DenseModel):
+            ladders[path.name] = llm
     return ladders
 
 
-@pytest.mark.parametrize("config", _configs_with_prefill_ladders())
-def test_every_shipped_prefill_ladder_is_a_model_argument(config):
-    """A config's ladder is a named argument of its model, not lost in ``**kwargs``;
-    Qwen3-Omni's Thinker captures its prefill on it."""
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.kimi_k3.kimi_k3_model import KimiK3Model
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-    cls, buckets = _configs_with_prefill_ladders()[config]
-    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel, Glm52Model) or issubclass(cls, KimiK3Model), (
-        f"a {cls.__name__} config sets prefill_token_buckets, which no test checks")
-    assert "prefill_token_buckets" in inspect.signature(cls.__init__).parameters, (
-        f"prefill_token_buckets isn't a named argument of {cls.__name__}.__init__")
-    if cls is Qwen3OmniModel:
-        from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-        node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
-        configs = {c.capture_graph_walk: c for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
-        assert configs["prefill_text"].capture_token_lengths == sorted(buckets)
-    if issubclass(cls, KimiK3Model):
-        # the submodule's packed prefill captures take it (kimi_k3/tests/test_model.py checks the configs)
-        assert cls("x", tokenizer_mode="byte", prefill_token_buckets=buckets).prefill_token_buckets == buckets
-    if cls is Glm52Model:
-        # the submodule's prefill captures take it (test_glm52_prefill checks the configs)
-        assert Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
-                          prefill_token_buckets=buckets).config.prefill_token_buckets == buckets
+def _captured_ladders(submodule, ladders) -> dict[str, PackedAcceleratorGraphConfig]:
+    """Each packed capture walk's config once the engine has applied the
+    serving config's ``ladders`` under the LLM's budget."""
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+    configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
+    if ladders:
+        # at the default min_chunk_tokens no step passes the budget
+        apply_token_ladders(
+            "LLM", configs, ladders, lambda walk, max_rows: submodule.MAX_BATCH_TOKENS,
+            lambda config: config.capture_batch_sizes,
+        )
+    return {c.capture_graph_walk: c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)}
 
 
-@pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
-def test_shipped_ladders_hold_a_mixed_step_without_the_next_power_of_two(buckets):
-    """A mixed step a few tokens over the step budget replays at 2176, not
-    padded to 4096, on every ladder a config ships."""
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-    s = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
-    tokens = s.MAX_BATCH_TOKENS + 4
-    assert min(b for b in s.MIXED_TOKEN_BUCKETS if b >= tokens) == 2176
-
-
-@pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
-def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, buckets):
+@pytest.mark.parametrize("ladders", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
+def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, ladders):
     monkeypatch.delenv("MSTAR_QWEN35_DECODE_BUCKETS", raising=False)
     monkeypatch.delenv("MSTAR_DECODE_BUCKETS", raising=False)
     m = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None)
-    s = m.LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
+    s = m.LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
+    captured = _captured_ladders(s, ladders)
 
     def pairs(rows, tokens):
         return sum(t >= r for r in rows for t in tokens)
@@ -147,8 +81,8 @@ def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, bucket
     # graphs. The count is an estimate: a compile it doesn't model (another eager shape, a
     # guard failure) would leave the last bucket uncompiled, so one is kept spare.
     compiles = (
-        len(s.DECODE_CAPTURE_BATCH_SIZES) + len(s.PREFILL_TOKEN_BUCKETS)
-        + pairs(s.MIXED_CAPTURE_BATCH_SIZES, s.MIXED_TOKEN_BUCKETS)
+        len(s.DECODE_CAPTURE_BATCH_SIZES) + len(captured["prefill_text"].get_total_tokens(1))
+        + sum(len(captured["mixed"].get_total_tokens(r)) for r in s.MIXED_CAPTURE_BATCH_SIZES)
         + pairs(s.PREFILL_MEDIA_CAPTURE_BATCH_SIZES, s.PREFILL_MEDIA_TOKEN_BUCKETS)
     )
     assert compiles < recompile_limit()

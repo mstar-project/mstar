@@ -672,7 +672,7 @@ def test_checkpoint_load_refuses_a_missing_trunk_weight(tmp_path):
             model._load_checkpoint(_build_model(seed=24, process=False)[0], str(partial), "cpu", None)
 
 
-def _safe_open_shards(repo_dir, device="cpu", prefix=None, keys=None, slice_spec=None):
+def _safe_open_shards(repo_dir, device="cpu", prefix=None, keys=None, slice_spec=None, quant_methods=()):
     """The obvious reader, as the oracle: safe_open + get_slice."""
     import json
 

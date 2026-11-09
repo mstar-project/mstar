@@ -215,7 +215,8 @@ class CosyVoice3Config:
     max_text_tokens: int = 512  # prompt text + text
     max_reference_seconds: float = 30.0  # the tokenizer's single-pass limit
     max_speech_tokens: int = 2048  # ~82 s of audio per request
-    voice_cache_size: int = 64
+    # about 100 KB a voice on the GPU; a miss stalls the flow node about 30 ms
+    voice_cache_size: int = 1024
     max_new_tokens_limit: int | None = None
 
     # Streaming. The flow decoder re-runs over the prompt and every settled
@@ -237,6 +238,9 @@ class CosyVoice3Config:
     # Flow estimator precision ("bfloat16", "float32", "float16"); the Euler
     # state stays float32. "float32" is the reference's precision.
     flow_estimator_dtype: str = "bfloat16"
+    # Batch sizes of the captured LM prefills (`LM_PREFILL_TOKEN_BUCKETS` in
+    # submodules.py has their token ladder); () captures no prefill.
+    lm_prefill_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
     flow_max_batch_size: int = 8
     hift_max_batch_size: int = 8
     # Flow solves replayed as CUDA graphs, captured at startup for the default

@@ -107,9 +107,10 @@ def test_quantization_patterns_name_real_modules():
 
 
 def test_decode_capture_is_declared_where_it_can_replay():
-    """One decode graph per batch size up to the KDA slots; with dsa_long_context two, dense and
-    selecting (the DSA resource selects on the device); none on MLA's torch fallback (its plan holds
-    the capture's pages)."""
+    """One decode graph per batch size up to the KDA slots, beside the packed prefill capture (empty
+    until the serving config names its buckets); with dsa_long_context two decode graphs, dense and
+    selecting (the DSA resource selects on the device), and no prefill; none on MLA's torch fallback
+    (its plan holds the capture's pages)."""
     from types import SimpleNamespace
 
     from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
@@ -123,7 +124,8 @@ def test_decode_capture_is_declared_where_it_can_replay():
                               KDA_STATE: SimpleNamespace(config=SimpleNamespace(usable_slots=slots))}
         return sub.get_accelerator_graph_configs(torch.device("meta"))  # a device, not CPU
 
-    (decode,) = configs(KimiK3ModelConfig.reduced())
+    decode, prefill = configs(KimiK3ModelConfig.reduced())
+    assert prefill.capture_graph_walk == "prefill" and not prefill.get_total_tokens(1)
     assert isinstance(decode, BatchedAcceleratorGraphConfig) and decode.capture_graph_walk == "decode"
     assert decode.capture_batch_sizes == [1, 2, 4] and not decode.compile
     assert decode.additional_key_info is None
@@ -199,32 +201,35 @@ def test_decode_ladder_refuses_a_disordered_list():
 
 
 def test_prefill_is_captured_at_the_named_buckets_within_index_topk_only():
-    """``prefill_token_buckets`` adds a packed prefill capture at those token counts and at the row
-    counts the KDA slots hold; under dsa_long_context (DSA's selecting prefill) and without the
-    buckets, prefill stays eager."""
+    """The serving config's ``prefill_token_buckets`` (which the engine applies) give the packed
+    prefill capture its token counts, at the row counts the KDA slots hold; without them it captures
+    nothing, and under dsa_long_context (DSA's selecting prefill) there is none to name."""
     from types import SimpleNamespace
 
-    from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig, apply_token_ladders
     from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
     from mstar.model.kimi_k3.config import ATTN, KDA_STATE
     from mstar.model.kimi_k3.submodules import KimiK3LLMSubmodule
 
-    def graphs(cfg, **kwargs):
+    def graphs(cfg, ladder=None, **kwargs):
         sub = KimiK3LLMSubmodule(KimiK3ForCausalLM(cfg), cfg, **kwargs)
         pool = SimpleNamespace(config=SimpleNamespace(usable_slots=4))
         sub.node_resources = {ATTN: SimpleNamespace(uses_kernel=True), KDA_STATE: pool}
-        return [g for g in sub.get_accelerator_graph_configs(torch.device("meta"))
-                if isinstance(g, PackedAcceleratorGraphConfig)]
+        configs = sub.get_accelerator_graph_configs(torch.device("meta"))
+        if ladder is not None:
+            apply_token_ladders("LLM", configs, {"prefill": ladder}, lambda walk, rows: None,
+                                lambda config: config.capture_batch_sizes)
+        return [g for g in configs if isinstance(g, PackedAcceleratorGraphConfig)]
 
     plain = KimiK3ModelConfig.reduced()
-    (prefill,) = graphs(plain, prefill_token_buckets=[512, 64, 256])
-    assert prefill.capture_graph_walk == "prefill" and prefill.capture_token_lengths == [64, 256, 512]
+    (prefill,) = graphs(plain, [512, 64, 256])
+    assert prefill.capture_graph_walk == "prefill" and prefill.capture_token_lengths == {1: [64, 256, 512]}
     assert prefill.capture_batch_sizes == [1, 2, 4], "rows past the KDA slots"
     assert not prefill.caps_eager_batch_size, "a step with more rows than a capture must still run"
     # no row runs past the context the deployment serves (the reduced model's 64 tokens)
     assert prefill.get_total_tokens(1) == [64] and prefill.get_total_tokens(4) == [64, 256]
-    assert not graphs(plain)
-    assert not graphs(KimiK3ModelConfig.reduced(dsa_long_context=True), prefill_token_buckets=[64])
+    assert all(not g.get_total_tokens(bs) for g in graphs(plain) for bs in (1, 2, 4))
+    assert not graphs(KimiK3ModelConfig.reduced(dsa_long_context=True), [64])
     with pytest.raises(ValueError, match="ascend"):
         KimiK3LLMSubmodule(KimiK3ForCausalLM(plain), plain, prefill_capture_batch_sizes=(4, 2))
 
