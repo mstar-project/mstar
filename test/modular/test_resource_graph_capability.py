@@ -96,7 +96,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
 def test_empty_capture_batch_sizes_capture_nothing(piecewise):
     """``capture_batch_sizes=[]`` means no capture in both runners (``None`` is the
     runner's defaults)."""
-    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False)
+    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, lean_capture=False)
     declare = Mock(return_value=SimpleNamespace(steps={"attention": object()}))
     if piecewise:
         runner = PiecewiseAcceleratorGraphRunner(
@@ -114,7 +114,9 @@ def test_empty_capture_batch_sizes_capture_nothing(piecewise):
         )
         runner = AcceleratorGraphRunner(
             submodule_name="llm",
-            submodule=SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config], declare_step=declare),
+            submodule=SimpleNamespace(
+                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare, compiled_entries_per_shape=1,
+            ),
             resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
             autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
         )

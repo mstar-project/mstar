@@ -63,7 +63,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
             ),
         ),
         request_state=SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None),
-        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        streams=SimpleNamespace(add_request=lambda rid, info: None, consumer_node={}),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         tensor_manager=SimpleNamespace(
             get_tensor=None,

@@ -668,7 +668,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     )
     engine_manager = SimpleNamespace(
         get_engine=lambda node: engine, warmup_all=lambda: None,
-        remove_request=engine.remove_request,
+        remove_request=engine.remove_request, partial_loopback_keys=frozenset(),
     )
     w = make_worker(
         worker_id=WORKERS[rank], communicator=comm, tensor_manager=tm, graph_runtime=graph,

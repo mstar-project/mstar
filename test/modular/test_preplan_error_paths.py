@@ -40,6 +40,7 @@ def _fake_worker(engine=None) -> Worker:
         streams=StreamBufferManager(request_state, None, []),
         engine_manager=SimpleNamespace(
             get_engine=lambda node: engine or SimpleNamespace(release_cached_prefix=lambda batch: None),
+            partial_loopback_keys=frozenset(),
         ),
     )
     w.failed, w.resets, w.pushed_back, w.despeculated, w.settled = failed, resets, pushed_back, despeculated, settled
