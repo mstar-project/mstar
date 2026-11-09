@@ -702,8 +702,8 @@ def check_kv_pools_fit(
                 f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
                 f"need {kv.pages_of(need, round_up=True)} pages of resources.{spec.resource_key} "
                 f"({kv.pages_of(per_request, round_up=True)} per request and the sink page), "
-                f"which has {kv.max_num_pages}; raise max_num_pages or lower "
-                "max_concurrent_requests"
+                f"which has {kv.max_num_pages}; raise max_num_pages, or lower max_concurrent_requests or the "
+                "tokens a request may hold"
             )
 
 
