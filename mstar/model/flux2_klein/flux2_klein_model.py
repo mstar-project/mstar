@@ -44,7 +44,7 @@ from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
-from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
@@ -305,8 +305,8 @@ class Flux2KleinModel(Model):
         default_h, default_w = self.config.default_height, self.config.default_width
         if ref_dims:
             default_h, default_w = ref_dims[0]
-        height = int(model_kwargs.get("height", default_h))
-        width = int(model_kwargs.get("width", default_w))
+        height = model_kwargs.get("height", default_h)
+        width = model_kwargs.get("width", default_w)
         align = self.config.spatial_alignment
         for name, value in (("height", height), ("width", width)):
             if value <= 0 or value % align:
@@ -322,16 +322,15 @@ class Flux2KleinModel(Model):
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
-        steps = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
-        if steps < 1:
-            raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
-        if steps > self.config.max_denoise_steps:
-            logger.debug("clamping num_inference_steps %d to the loop ceiling %d", steps, self.config.max_denoise_steps)
-            steps = self.config.max_denoise_steps
-        return steps
+        return model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
+
+    def request_kwargs(self) -> frozenset[str]:
+        # guidance_scale is read only to warn that the distilled checkpoint ignores it
+        return frozenset({"height", "width", "num_inference_steps", "guidance_scale", *OUTPUT_FORMAT_KWARGS})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the loop ends on the request's own step count, and is never speculated past it
+        # the loop ends on the request's own step count, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
         return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def process_prompt(
@@ -356,7 +355,7 @@ class Flux2KleinModel(Model):
         # needed telling, and it was the one case that stayed silent. Only distilled
         # checkpoints load at all now (Flux2KleinConfig.from_snapshot), so this fires
         # whenever a caller's guidance_scale is about to be dropped.
-        if float(kwargs.get("guidance_scale", 1.0)) != 1.0:
+        if kwargs.get("guidance_scale", 1.0) != 1.0:
             logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 

@@ -124,10 +124,6 @@ class Glm52ModelConfig:
     # None: a request that names no max_tokens may run to the end of the window,
     # as in vLLM; the submodule caps each request at what its prompt leaves.
     max_output_tokens: int | None = None
-    temperature: float = 1.0
-    top_p: float = 0.95
-    repetition_penalty: float = 1.0
-    ignore_eos: bool = False
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales

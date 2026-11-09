@@ -30,7 +30,7 @@ def _resource(monkeypatch, slots: int, max_bs: int, comm_group=None, ingraph: bo
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
     monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", str(slots))
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU, comm_group=comm_group)
+    res = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=CPU, comm_group=comm_group)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=s) for s in (0, 1)], max_bs, 1)
     return res

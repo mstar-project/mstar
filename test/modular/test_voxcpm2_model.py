@@ -1509,6 +1509,88 @@ def test_adapter_takes_data_urls_and_gated_urls(media_dirs, monkeypatch):
         adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=["x"]), uploads)
 
 
+# -- request contract -----------------------------------------------------------
+
+
+def _loop_conductor(model):
+    """A conductor with only what ``_loop_caps`` reads: the model and its loops' ``max_iters``."""
+    from mstar.conductor.conductor import Conductor
+
+    c = Conductor.__new__(Conductor)
+    c.model = model
+    c._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    return c
+
+
+def test_request_kwargs_are_the_keys_the_model_and_its_adapter_read(model, tmp_path):
+    assert model.request_kwargs() == {
+        "instruct", "instructions", "ref_text", "cfg_value", "min_len", "inference_timesteps",
+        "max_new_tokens", "max_output_tokens", "max_len",
+    }
+    req = SpeechRequest(model="voxcpm2", input="hi", voice="alloy", speed=1.2, seed=7, instructions="calm",
+                        cfg_value=2.5, min_len=2, max_new_tokens=9)
+    sa = adapters.VoxCPM2Adapter().speech_to_request(req, tmp_path)
+    # seed is the conductor's; the adapter drops voice, speech_request forwards a sent speed to be
+    # logged as ignored, and the model reads neither
+    assert set(sa.model_kwargs) - {"seed"} <= model.request_kwargs()
+    assert not {"voice", "speed"} & model.request_kwargs()
+
+
+@pytest.mark.parametrize("key", ["max_new_tokens", "max_output_tokens", "max_len", "min_len", "inference_timesteps"])
+@pytest.mark.parametrize("bad", [2.7, "20", True])
+def test_integer_knobs_are_strict(model, key, bad):
+    """``int()`` used to truncate 2.7 to 2 and read "20" as 20."""
+    with pytest.raises(ValueError, match=f"{key} must be an integer"):
+        model.process_prompt("hello", ["text"], ["audio"], **{key: bad})
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"max_new_tokens": -1}, "max_new_tokens"),
+        ({"min_len": -1}, "min_len"),
+        ({"cfg_value": "2"}, "cfg_value must be a number"),
+        ({"cfg_value": True}, "cfg_value must be a number"),
+        ({"cfg_value": 10**400}, "finite"),
+        ({"max_len": 10**400}, "max_new_tokens <="),
+        ({"instruct": 5}, "instruct must be a string"),
+        ({"instructions": ["calm"]}, "instructions must be a string"),
+        ({"ref_text": 5}, "ref_text must be a string"),
+    ],
+)
+def test_wrong_types_and_ranges_are_value_errors(model, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        model.process_prompt("hello", ["text"], ["audio"], **kwargs)
+
+
+def test_whole_floats_pass_for_integer_knobs(model):
+    _, metadata = model.process_prompt(
+        "hello world", ["text"], ["audio"], max_new_tokens=9.0, min_len=2.0,
+        inference_timesteps=float(model.inference_timesteps), cfg_value=2,
+    )
+    assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, 9) and metadata[MIN_LEN_KEY] == 2
+    assert type(metadata[MIN_LEN_KEY]) is int
+    assert model.get_loop_caps(max_new_tokens=9.0) == {TALKER_LOOP: 8}
+
+
+def test_a_patch_budget_past_the_decode_loop_is_refused_not_clamped(model):
+    """The loop is built from the default request's cap (one under ``max_len``,
+    since the prefill emits the first patch), so one patch past ``max_len`` is
+    refused by the conductor as well as by ``process_prompt``."""
+    limit = model.config.max_len
+    c = _loop_conductor(model)
+    assert c._loop_max_iters == {TALKER_LOOP: limit - 1}
+    assert c._loop_caps({"max_new_tokens": limit}) == {TALKER_LOOP: limit - 1}
+    with pytest.raises(ValueError, match="iterations"):
+        c._loop_caps({"max_new_tokens": limit + 1})
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=limit + 1)
+
+
 def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
     config = model.config
     for compiled, regions in ((True, ["vae.decoder"]), (False, [])):

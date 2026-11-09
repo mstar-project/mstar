@@ -1,7 +1,9 @@
 """Text and image-in, text-out generation with pinned metadata and explicitly supplied weights."""
 
 import json
+from collections.abc import Mapping
 from itertools import chain
+from types import MappingProxyType
 
 import torch
 
@@ -15,7 +17,6 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -28,6 +29,12 @@ from mstar.model.command_a_plus.config import (
     ROPE,
     SAMPLER,
     CommandAPlusConfig,
+)
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
 )
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -42,16 +49,21 @@ from mstar.model.multimodal import (
 
 TEXT_WEIGHTS = ("model.language_model.",)
 VISION_WEIGHTS = ("model.vision_tower.", "model.multi_modal_projector.")
+# Cohere's published recipe; the checkpoint's generation_config.json sets no sampling knob
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 0.9, "top_p": 0.95, "repetition_penalty": 1.04})
 
 
 class CommandAPlusModel(Model):
     DECODE_LOOP = "decode_loop"
+    # the checkpoint's sampling defaults over the recipe, set by __init__
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
         max_seq_len: int | None = None, checkpoint_dir: str | None = None, **kwargs,
     ):
         self.local_dir = resolve_metadata(checkpoint_dir or model_path_hf, cache_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir, DEFAULT_SAMPLING)
         config = CommandAPlusConfig.from_json(self.local_dir / "config.json")
         self.config = config.text_config
         self.vision_config = config.vision_config
@@ -132,14 +144,14 @@ class CommandAPlusModel(Model):
                 rope_theta=config.rope_theta,
             )),
             SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                        enable_repetion_penalty=True),
+                        **sampler_capabilities(self.sampling_defaults)),
         ]
 
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-        defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
-                        repetition_penalty=1.04, ignore_eos=False)
-        supplied = model_kwargs or {}
-        return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self):
+        return frozenset({"messages", "max_output_tokens", *SAMPLING_KEYS})
 
     def kv_labels(self):
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}

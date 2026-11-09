@@ -624,7 +624,7 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
 
     req = TranscriptionRequest(language="en", prompt="names: Ada")
     sa = ad.transcription_to_request(req, "/tmp/a.wav")
-    assert sa.model_kwargs == {"language": "en", "initial_prompt": "names: Ada", "temperature": 0.0}
+    assert sa.model_kwargs == {"language": "en", "initial_prompt": "names: Ada"}
     step = ad.realtime_step_request(req, "/tmp/a.wav", "language English<asr_text> so far")
     assert step.model_kwargs["assistant_prefix"] == "language English<asr_text> so far"
 
@@ -665,14 +665,17 @@ def test_config_yaml_needs_a_concurrency_cap_the_pages_can_hold():
 
 
 def test_request_kwargs_are_checked_before_the_conductor_reads_them():
+    """The API normalized numeric strings already; the model coerces nothing."""
     model = _make_model()
-    assert model.get_max_output_tokens(max_output_tokens="32") == 32
-    with pytest.raises(ValueError, match="max_output_tokens"):
-        model.get_max_output_tokens(max_output_tokens="abc")
-    cfgs = model.get_request_resource_configs([], [], {"temperature": "0.5", "ignore_eos": "true"})
+    assert model.get_max_output_tokens(max_output_tokens=32) == 32
+    for bad in ("32", "abc"):
+        with pytest.raises(ValueError, match="max_output_tokens"):
+            model.get_max_output_tokens(max_output_tokens=bad)
+    cfgs = model.get_request_resource_configs([], [], {"temperature": 0.5, "ignore_eos": True})
     assert cfgs["sampler"].temperature == 0.5 and cfgs["sampler"].ignore_eos is True
-    with pytest.raises(ValueError, match="top_p"):
-        model.get_request_resource_configs([], [], {"top_p": "abc"})
+    for key, bad in (("top_p", "abc"), ("temperature", "0.5"), ("ignore_eos", "true")):
+        with pytest.raises(ValueError, match=key):
+            model.get_request_resource_configs([], [], {key: bad})
 
 
 def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device(monkeypatch):
@@ -724,4 +727,4 @@ def test_the_transcription_route_sees_the_keys_qwen3_asr_reads():
 
     api = SimpleNamespace(model=_make_model())
     assert all(_reads(api, key) for key in ("initial_prompt", "language", "assistant_prefix"))
-    assert not _reads(api, "top_k")
+    assert not _reads(api, "timestamps")

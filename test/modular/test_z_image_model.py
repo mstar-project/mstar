@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, ZImageConfig  # noqa: E402
@@ -85,8 +86,23 @@ def test_process_prompt_and_validation():
         model.process_prompt("x", ["image", "text"], ["image"])
     with pytest.raises(ValueError, match="multiple of 16"):
         model.process_prompt("x", ["text"], ["image"], height=1000)
-    with pytest.raises(ValueError, match="num_inference_steps"):
-        model.process_prompt("x", ["text"], ["image"], num_inference_steps=0)
+
+
+def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
+    model = _make_model()
+    ceiling = model.config.max_denoise_steps
+    assert model.get_loop_caps(num_inference_steps=8) == {DENOISE_LOOP: 8}
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model
+    # read off the graph, so the test also checks the loop's max_iters is the ceiling
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": ceiling}) == {DENOISE_LOOP: ceiling}
+    with pytest.raises(ValueError, match=f"at most {ceiling}"):
+        conductor._loop_caps({"num_inference_steps": ceiling + 1})
 
 
 def test_schedule_and_caption_bucket_from_token_count():
@@ -101,15 +117,16 @@ def test_schedule_and_caption_bucket_from_token_count():
     assert shape == ZShape(grid=(64, 48), cap_len=64) and shape.image_tokens_padded == 3072
 
 
-@pytest.mark.parametrize("requested", [3, 10**6])
+@pytest.mark.parametrize("requested", [3, 50])
 def test_the_loop_cap_is_the_schedules_step_count(requested):
     """The DiT indexes its schedule by the loop counter, so the loop must end on
-    the step count the schedule is built from, clamped to the loop's ceiling."""
+    the step count the schedule is built from (past the loop's ceiling the
+    conductor refuses the request)."""
     model = _make_model()
     plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
                            {"num_inference_steps": requested})
     steps = plan[-1].step_metadata["num_inference_steps"]
-    assert steps == min(requested, model.config.max_denoise_steps)
+    assert steps == requested
     assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP: steps}
 
 

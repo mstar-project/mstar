@@ -99,7 +99,7 @@ def test_a_reused_slot_starts_again_at_the_default():
 def _resource(monkeypatch):
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
+        vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"),
         loopback_state={"rules": STATE},
     )
     res.enable_device_loopback_reader()
