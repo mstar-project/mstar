@@ -1011,9 +1011,12 @@ ragged prefill wrapper. For a self-attention whose config names neither a backen
 geometry on the GPU. An eager plan runs the row its layout's longest query segment falls in, so
 one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
 the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
-klein 4B / 9B and Z-Image's geometries: under a CUDA graph FlashInfer's ``auto`` stays on FA2
-there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs cuDNN 9.24),
-which is about 4.5x slower at those sizes. The cuDNN wrapper runs a layout of equal-length
+klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B's 24 heads read
+klein 4B's entry) up to 4608 tokens, the largest size a served model ran on it: under a CUDA graph
+FlashInfer's ``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its
+cuDNN path needs cuDNN 9.24), which is about 4.5x slower at those sizes. Past 4608 tokens a ``"*"``
+row names ``flashinfer``, the resource's own default. A GPU of the architecture reads the file
+whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
 declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT

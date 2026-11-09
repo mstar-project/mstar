@@ -170,8 +170,9 @@ def test_an_eager_slot_runs_cudnn_then_flashinfer_then_cudnn():
 @pytest.mark.skipif(not torch.cuda.is_available() or current_platform.arch() != "sm_103",
                     reason="the shipped table covers sm_103")
 @pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
-@pytest.mark.parametrize(("heads", "seq"), [(24, 4608), (30, 96)])
+@pytest.mark.parametrize(("heads", "seq"), [(24, 4608), (30, 96), (32, 8192)])
 def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
+    """cuDNN at the sizes the table's cudnn rows cover; FlashInfer past them."""
     spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
         num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
     manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
@@ -181,7 +182,8 @@ def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
     manager.plan(step, StepContext(request_ids=["r0", "r1"], graph_walk="image_gen", slot=0, capture=False,
                                    is_preplan=False, slot_lease=lease))
     wrapper = manager._current_plan_states["main"]
-    assert type(wrapper) is CudnnRaggedPrefillWrapper and wrapper.accelerator_graph is captured
+    kind = CudnnRaggedPrefillWrapper if seq <= 4608 else FlashInferRaggedPrefillWrapper
+    assert type(wrapper) is kind and wrapper.accelerator_graph is captured
     q, k, v = qkv(2 * seq, heads)
     out = replay(lambda: manager.run(q, k, v, label="main")) if captured else manager.run(q, k, v, label="main")
     assert rel_l2(out, reference(q, k, v, cu(2, seq))) < REL_L2

@@ -90,6 +90,10 @@ gets faster on a GPU without a change to model code.
   `python -m benchmark.kernels.ragged_attention --heads 24 --seq 4608` prints a wider table at
   one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
   table was written with `--arch`, which names the file for the architecture, not the GPU model.
+  Its `cudnn` rows stop at 4608 tokens, the largest size a served model ran on them, and a `"*"`
+  row naming `flashinfer` gives larger sizes the resource's default; their `measured` times
+  go further, kernel-level only. A sweep writes its last bucket's winner as `"*"`, so bound a
+  re-swept entry the same way until a served model has run the larger sizes.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
   `w8a16`, `flashinfer` or `cublas`; `--shape N=...,K=...,glu=0|1`, N per half with glu). Tables
   only for now: its sweep is not ported.

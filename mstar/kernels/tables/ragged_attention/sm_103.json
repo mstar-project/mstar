@@ -5,43 +5,54 @@
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 24, "num_qo_heads": 24},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "d38ea3bde", "note": "FLUX.2 klein 4B / Z-Image Turbo / klein 9B dit joint attention, 1024x1024"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 4B dit joint attention at 1024x1024 (4608 tokens) and Wan2.2-TI2V-5B self-attention at 832x480x33 (3510 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that; measured above 4608 tokens (LTX-2.5's video self-attention sizes) is kernel-level only"},
       "rows": {
-        "*": {"impl": "cudnn"}
+        "4608": {"impl": "cudnn"},
+        "*": {"impl": "flashinfer"}
       },
       "measured": {
-        "128": {"us": 11.66, "default_us": 20.92, "cudnn_us": 11.66, "flashinfer_fa2_us": 20.9, "flashinfer_cudnn_us": 24.16},
-        "1024": {"us": 37.21, "default_us": 162.4, "cudnn_us": 37.21, "flashinfer_fa2_us": 164.75, "flashinfer_cudnn_us": 68.85},
-        "4096": {"us": 354.5, "default_us": 1682.41, "cudnn_us": 354.5, "flashinfer_fa2_us": 1707.26, "flashinfer_cudnn_us": 411.52},
-        "4608": {"us": 423.26, "default_us": 1992.08, "cudnn_us": 423.26, "flashinfer_fa2_us": 2111.31, "flashinfer_cudnn_us": 486.21}
+        "128": {"us": 11.41, "default_us": 22.41, "cudnn_us": 11.41, "flashinfer_fa2_us": 21.0, "flashinfer_cudnn_us": 26.02},
+        "1024": {"us": 37.5, "default_us": 160.93, "cudnn_us": 37.5, "flashinfer_fa2_us": 161.55, "flashinfer_cudnn_us": 67.14},
+        "4096": {"us": 354.02, "default_us": 1670.64, "cudnn_us": 354.02, "flashinfer_fa2_us": 1669.6, "flashinfer_cudnn_us": 405.61},
+        "4608": {"us": 424.96, "default_us": 1977.58, "cudnn_us": 424.96, "flashinfer_fa2_us": 1990.07, "flashinfer_cudnn_us": 477.2},
+        "8192": {"us": 1392.16, "default_us": 6620.75, "cudnn_us": 1392.16, "flashinfer_fa2_us": 7199.4, "flashinfer_cudnn_us": 1434.75},
+        "16384": {"us": 5578.08, "default_us": 23234.86, "cudnn_us": 5578.08, "flashinfer_fa2_us": 23241.36, "flashinfer_cudnn_us": 5852.07},
+        "32768": {"us": 23728.36, "default_us": 89961.91, "cudnn_us": 23728.36, "flashinfer_fa2_us": 89973.27, "flashinfer_cudnn_us": 24968.28},
+        "65536": {"us": 99965.51, "default_us": 356619.66, "cudnn_us": 99965.51, "flashinfer_fa2_us": 356628.05, "flashinfer_cudnn_us": 103942.04}
       }
     },
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 30, "num_qo_heads": 30},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=30,num_kv_heads=30,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "d38ea3bde", "note": "FLUX.2 klein 4B / Z-Image Turbo / klein 9B dit joint attention, 1024x1024"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=30,num_kv_heads=30,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "Z-Image Turbo dit attention at 1024x1024 (main 4128-4224, image 4096, caption 32-128 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that"},
       "rows": {
-        "*": {"impl": "cudnn"}
+        "4608": {"impl": "cudnn"},
+        "*": {"impl": "flashinfer"}
       },
       "measured": {
-        "128": {"us": 11.69, "default_us": 22.46, "cudnn_us": 11.69, "flashinfer_fa2_us": 22.45, "flashinfer_cudnn_us": 23.09},
-        "1024": {"us": 40.0, "default_us": 179.17, "cudnn_us": 40.0, "flashinfer_fa2_us": 179.44, "flashinfer_cudnn_us": 76.75},
-        "4096": {"us": 450.41, "default_us": 2018.32, "cudnn_us": 450.41, "flashinfer_fa2_us": 2060.45, "flashinfer_cudnn_us": 519.15},
-        "4608": {"us": 541.4, "default_us": 2588.52, "cudnn_us": 541.4, "flashinfer_fa2_us": 2544.12, "flashinfer_cudnn_us": 614.36}
+        "128": {"us": 11.67, "default_us": 22.77, "cudnn_us": 11.67, "flashinfer_fa2_us": 21.76, "flashinfer_cudnn_us": 26.05},
+        "1024": {"us": 40.09, "default_us": 177.0, "cudnn_us": 40.09, "flashinfer_fa2_us": 177.01, "flashinfer_cudnn_us": 71.59},
+        "4096": {"us": 450.8, "default_us": 1997.92, "cudnn_us": 450.8, "flashinfer_fa2_us": 1997.53, "flashinfer_cudnn_us": 504.71},
+        "4608": {"us": 542.13, "default_us": 2758.6, "cudnn_us": 542.13, "flashinfer_fa2_us": 2524.56, "flashinfer_cudnn_us": 596.82}
       }
     },
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 32, "num_qo_heads": 32},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=32,num_kv_heads=32,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "d38ea3bde", "note": "FLUX.2 klein 4B / Z-Image Turbo / klein 9B dit joint attention, 1024x1024"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=32,num_kv_heads=32,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 9B dit joint attention at 1024x1024 (4608 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that; measured above 4608 tokens (LTX-2.5's video self-attention sizes) is kernel-level only"},
       "rows": {
-        "*": {"impl": "cudnn"}
+        "4608": {"impl": "cudnn"},
+        "*": {"impl": "flashinfer"}
       },
       "measured": {
-        "128": {"us": 11.59, "default_us": 22.5, "cudnn_us": 11.59, "flashinfer_fa2_us": 22.47, "flashinfer_cudnn_us": 23.03},
-        "1024": {"us": 40.43, "default_us": 188.07, "cudnn_us": 40.43, "flashinfer_fa2_us": 186.77, "flashinfer_cudnn_us": 77.72},
-        "4096": {"us": 468.03, "default_us": 2106.08, "cudnn_us": 468.03, "flashinfer_fa2_us": 2216.47, "flashinfer_cudnn_us": 537.2},
-        "4608": {"us": 563.11, "default_us": 2804.03, "cudnn_us": 563.11, "flashinfer_fa2_us": 2666.42, "flashinfer_cudnn_us": 637.41}
+        "128": {"us": 11.56, "default_us": 23.42, "cudnn_us": 11.56, "flashinfer_fa2_us": 21.69, "flashinfer_cudnn_us": 25.1},
+        "1024": {"us": 40.53, "default_us": 183.62, "cudnn_us": 40.53, "flashinfer_fa2_us": 183.86, "flashinfer_cudnn_us": 73.5},
+        "4096": {"us": 468.17, "default_us": 2207.04, "cudnn_us": 468.17, "flashinfer_fa2_us": 2070.57, "flashinfer_cudnn_us": 521.35},
+        "4608": {"us": 564.14, "default_us": 2732.47, "cudnn_us": 564.14, "flashinfer_fa2_us": 2933.78, "flashinfer_cudnn_us": 614.6},
+        "8192": {"us": 1769.13, "default_us": 8529.86, "cudnn_us": 1769.13, "flashinfer_fa2_us": 8360.45, "flashinfer_cudnn_us": 1869.62},
+        "16384": {"us": 7507.27, "default_us": 30421.91, "cudnn_us": 7507.27, "flashinfer_fa2_us": 30242.75, "flashinfer_cudnn_us": 7811.37},
+        "32768": {"us": 32777.54, "default_us": 118882.18, "cudnn_us": 32777.54, "flashinfer_fa2_us": 118877.59, "flashinfer_cudnn_us": 34001.85},
+        "65536": {"us": 133867.56, "default_us": 469622.69, "cudnn_us": 133867.56, "flashinfer_fa2_us": 469633.99, "flashinfer_cudnn_us": 139011.64}
       }
     }
   ]

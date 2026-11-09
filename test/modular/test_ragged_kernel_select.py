@@ -91,18 +91,22 @@ def test_sm_103_table_names_cudnn_for_the_dit_geometries(heads, head_dim):
     for key in (B300, GB300):
         entry = next(find_entries("ragged_attention", key, "bfloat16", shape))
         assert entry.source.endswith("ragged_attention/sm_103.json")
-        assert [c.impl for _, c in entry.rows] == ["cudnn"]
-        # what it was chosen over, by the harness that wrote it
+        # cudnn up to the largest size served on it, FlashInfer's default past that
+        assert entry.rows == ((4608, Choice("cudnn")), (None, Choice("flashinfer")))
+        # what it was chosen over, by the harness that wrote it, including the sizes past the bound
         assert all(m["cudnn_us"] < m["flashinfer_fa2_us"] for m in entry.measured.values())
 
 
 @pytest.mark.parametrize(("heads", "head_dim"), DIT_GEOMETRIES)
-@pytest.mark.parametrize("seq_len", [96, 4096, 4192, 4608])
-def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len):
+@pytest.mark.parametrize(("seq_len", "impl"), [(96, "cudnn"), (4096, "cudnn"), (4192, "cudnn"), (4608, "cudnn"),
+                                               (4609, "flashinfer"), (8160, "flashinfer")])
+def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len, impl):
+    """cuDNN up to the largest size a served model ran on the table; past it (LTX-2.5's 8160-token video
+    self-attention, say) the resource's default."""
     gpu(B300)
     manager = build(spec(heads, head_dim))
     assert type(manager) is FlashInferRaggedManager
-    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice("cudnn")
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice(impl)
 
 
 @pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])
@@ -126,7 +130,7 @@ def test_the_table_is_read_for_the_ranks_heads(gpu):
     two_ranks = SimpleNamespace(tp_group=SimpleNamespace(world_size=2), sp_group=SimpleNamespace(world_size=1))
     manager = build_resource(s, EngineResourceInfo(device=GPU, kv_dtype=torch.bfloat16, joint_comm_group=two_ranks))
     assert manager._config.num_qo_heads == 24
-    assert [c.impl for _, c in manager._kernel_rows] == ["cudnn"]
+    assert [c.impl for _, c in manager._kernel_rows] == ["cudnn", "flashinfer"]
 
 
 def test_rows_that_cant_run_here_keep_flashinfer(gpu, monkeypatch, caplog):
