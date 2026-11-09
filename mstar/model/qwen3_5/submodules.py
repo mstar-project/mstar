@@ -29,7 +29,7 @@ from mstar.model.components.qwen3_vit import (
     vision_seq_lengths,
 )
 from mstar.model.components.qwen3_vit import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    # the tower's 2D patch grid, not the 3D MRoPE ids `mrope` places
     vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
