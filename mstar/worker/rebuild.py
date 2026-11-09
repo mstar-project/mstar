@@ -213,10 +213,11 @@ class Rebuilds:
         self._keeps_ids: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # The lockstep nodes this rank follows, whose first rank's pool decides which requests keep a log. A log on
         # one of them takes room past the pool when the pool has none, so this rank holds every log rank 0 holds.
-        # `_verdicts` keeps, until its teardown, a request such a node writes: each paged KV cache's writers here,
-        # and whether a drop can free the request's pages there, for `refuse` to redo once rank 0 refuses a log.
+        # `_writes` keeps, until a request's teardown, the paged KV caches each such node writes for it, which
+        # `refuse` returns. Validation refuses two lockstep nodes on one worker that share a cache, so the node is
+        # its caches' only writer here.
         self._followed = frozenset(followed)
-        self._verdicts: dict[int, tuple[dict[str, list[str]], dict[str, bool]]] = {}
+        self._writes: dict[int, dict[str, list[str]]] = defaultdict(dict)
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         assert allowance is not None or not any(names for walks in self._copied.values() for names in walks.values()), (
@@ -330,21 +331,15 @@ class Rebuilds:
                 self._prefilling[node].add(rid)
             else:
                 self._pool.give(self._keeps_ids[node].pop(rid))
-        if not self._followed.isdisjoint(written):
-            self._verdicts[rid] = (dict(writers), dict(rebuildable))
+        for node in self._followed & written.keys():
+            self._writes[rid][node] = [key for key, nodes in writers.items() if node in nodes]
         return Ingested(rebuildable, frozenset(unheld))
 
     def refuse(self, rid: int, node: str) -> list[str]:
-        """Take back the room ``rid`` took for its log on ``node``, which rank 0's pool couldn't hold, as rank 0's
-        `ingest_request` did, and return the paged KV caches a drop can no longer free ``rid``'s pages in. Every node
-        that writes one of them gives back its log too."""
-        writers, rebuildable = self._verdicts[rid]
-        refused = [key for key, nodes in writers.items() if node in nodes and rebuildable[key]]
-        for key in refused:
-            rebuildable[key] = False
-        for writer in {writer for key in refused for writer in writers[key]} & self._policies.keys():
-            self.forget(rid, writer)
-        return refused
+        """Give back ``rid``'s log on ``node``, which rank 0's pool couldn't hold, and return the paged KV caches
+        ``node`` writes for ``rid``, where a drop then can't free ``rid``'s pages, as at rank 0's `ingest_request`."""
+        self.forget(rid, node)
+        return self._writes[rid][node]
 
     def record(
         self, node_batch: ExecutingBatch, cached_infos: Mapping[int, CurrentForwardPassInfo] = MappingProxyType({}),
@@ -653,7 +648,7 @@ class Rebuilds:
         return run
 
     def remove_request(self, rid: int) -> None:
-        self._verdicts.pop(rid, None)
+        self._writes.pop(rid, None)
         for node in self._kept:
             self.forget(rid, node)
             self._cursors.pop((node, rid), None)

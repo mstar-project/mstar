@@ -181,7 +181,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     pieces = {rid: w._rebuilds._pool.take(8) for rid in (a, b)}
     w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": dict(pieces)}
     w._rebuilds._prefilling = {"n": {a, b}}
-    w._rebuilds._verdicts = {a: ({}, {}), b: ({}, {})}
+    w._rebuilds._writes = {a: {"n": ["kv"]}, b: {"n": ["kv"]}}
     w._rebuilds._cursors[("n", a)] = None
     w._preemption._preempted[a] = Preempted()
     w.streams._rids.add(a)
@@ -200,7 +200,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
     assert w._rebuilds._keeps_ids == {"n": {b: pieces[b]}}, "the next request would keep ids it can't be dropped with"
     assert w._rebuilds._prefilling == {"n": {b}}, "the next request's steps would be recorded as this one's"
-    assert w._rebuilds._verdicts.keys() == {b}, "rank 0's refusal of the next request's log would find this one's"
+    assert w._rebuilds._writes.keys() == {b}, "rank 0's refusal of the next request's log would find this one's"
     assert not (w._rebuilds._cursors or w._preemption._preempted), (
         "the next request would run this one's rebuild, or be counted as preempted"
     )
