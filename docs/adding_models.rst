@@ -1999,6 +1999,19 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+A quantized checkpoint is refused at load unless the model reads its format itself. Without this, a
+model that knows only unquantized weights would load fp8 values unscaled and drop the scales and
+packed weights, and then serve garbage. There are two checks:
+
+- The safetensors iterators refuse a checkpoint that declares a quantization: ``quantization_config``
+  in ``config.json`` (HF fp8, AWQ, GPTQ, bitsandbytes, mxfp4, compressed-tensors, ModelOpt), ModelOpt's
+  ``hf_quant_config.json``, or AutoGPTQ's or AutoAWQ's config file.
+- ``load_weights_into`` refuses a quantized weight's part, such as ``weight_scale_inv``,
+  ``weight_scale``, ``weight_packed`` or ``qweight``, when no parameter takes it.
+
+A model that loads a format itself names its ``quant_method``. GLM-5.2 and GLM-5.3-Flash, for
+example, pass ``quant_methods=("fp8",)`` to ``load_weights`` and to the iterators.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
