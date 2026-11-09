@@ -42,6 +42,9 @@ class HostPool:
         self._memory = torch.empty(nbytes, dtype=torch.uint8, pin_memory=DeviceCapability.of(device).pin_memory)
         # sorted by offset, with no two adjacent
         self._free = [HostSlice(0, nbytes)]
+        # offset -> the memory of a slice taken past the pool's end, and the offset the next one takes
+        self._spilled: dict[int, torch.Tensor] = {}
+        self._spill_end = nbytes
         self._stream: torch.Stream | None = None
         self._in_stream: torch.Stream | None = None
 
@@ -52,7 +55,9 @@ class HostPool:
     def nbytes_used(self) -> int:
         return self.nbytes - sum(free.nbytes for free in self._free)
 
-    def take(self, nbytes: int) -> HostSlice | None:
+    def take(self, nbytes: int, spill: bool = False) -> HostSlice | None:
+        """A free slice of ``nbytes``, or None when no free slice holds it, unless ``spill``, which then allocates
+        memory for the slice alone and places it past the pool's end."""
         size = aligned(nbytes)
         for i, free in enumerate(self._free):
             if free.nbytes >= size:
@@ -61,9 +66,20 @@ class HostPool:
                 else:
                     self._free[i] = HostSlice(free.offset + size, free.nbytes - size)
                 return HostSlice(free.offset, size)
-        return None
+        if not spill:
+            return None
+        piece = HostSlice(self._spill_end, size)
+        self._spilled[piece.offset] = torch.empty(
+            size, dtype=torch.uint8, pin_memory=DeviceCapability.of(self.device).pin_memory,
+        )
+        self._spill_end += size
+        return piece
 
     def give(self, piece: HostSlice) -> None:
+        if piece.offset >= self.nbytes:
+            # A spilled slice is freed whole, so the tail its owner gives back first stays with it.
+            self._spilled.pop(piece.offset, None)
+            return
         i = bisect.bisect(self._free, piece)
         start, end = piece.offset, piece.offset + piece.nbytes
         if i < len(self._free) and self._free[i].offset == end:
@@ -77,7 +93,11 @@ class HostPool:
         """The start of ``into`` as a tensor of ``dtype`` and ``shape``."""
         nbytes = shape.numel() * dtype.itemsize
         assert nbytes <= into.nbytes, f"a copy of {nbytes} bytes doesn't fit the {into.nbytes} bytes it was given"
-        return self._memory[into.offset:into.offset + nbytes].view(dtype).view(shape)
+        memory, offset = self._memory, into.offset
+        if offset >= self.nbytes:
+            start = max(start for start in self._spilled if start <= offset)
+            memory, offset = self._spilled[start], offset - start
+        return memory[offset:offset + nbytes].view(dtype).view(shape)
 
     def copy_in(self, view: torch.Tensor) -> tuple[torch.Tensor, torch.Event | None]:
         """Copy ``view``, a tensor in the pool whose copy from the device has landed, to the device, and return the copy

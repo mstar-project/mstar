@@ -123,7 +123,7 @@ class RankRebuilds(Protocol):
 
     def rebuilding(self, rid: int, node: str) -> bool: ...
 
-    def forget(self, rid: int, node: str) -> None: ...
+    def refuse(self, rid: int, node: str) -> Collection[str]: ...
 
 
 @contextmanager
@@ -3280,7 +3280,8 @@ class Engine:
             self._journal(MoveKind.LAND, request_id, node=node_name)
 
     def keeps_no_ids(self, node_name: str, request_id: int) -> None:
-        """Rank 0 journals that the request keeps no ids on the node, so each follower gives back the ones it kept."""
+        """Rank 0 journals that its pool couldn't hold the request's log on the node, ahead of any move of the request,
+        so each follower gives back the room it took and admits the request as rank 0 does."""
         if node_name in self._tp_leader_nodes:
             self._journal(MoveKind.FORGET, request_id, node=node_name)
 
@@ -3463,7 +3464,10 @@ class Engine:
                 self._land_rebuild(node_name, rid)
                 logger.debug("Replayed rank 0's LAND of request %s on %s", wire_rid, node_name)
             elif kind == MoveKind.FORGET:
-                rebuilds.forget(rid, node_name)
+                refused = rebuilds.refuse(rid, node_name)
+                for kv in self.paged_kv_caches():
+                    if kv.key in refused:
+                        kv.cache.refuse_rebuild(rid)
             elif kind == MoveKind.OFFLOAD:
                 hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.residency(node_name, rid) is Residency.ON_HOST:

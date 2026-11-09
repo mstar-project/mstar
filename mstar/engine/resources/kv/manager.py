@@ -4341,6 +4341,14 @@ class KVManager(AttentionResource):
 
     # Admission
 
+    def refuse_rebuild(self, rid: str) -> None:
+        """Mark ``rid`` as a request no drop here can free, as rank 0 found when it took ``rid`` in."""
+        with self._lock:
+            assert rid not in self._asks and rid not in self._allotments, (
+                f"KV {self.name}: rank 0 refused {rid} a rebuild after this rank counted its pages as rebuildable"
+            )
+            self._overrides[rid] = replace(self._overrides[rid], rebuildable=False)
+
     def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
         """`ASKS` until ``rid`` has an allotment, or while it waits on a shortage `preempt` asked for, or why
         it can never be admitted.

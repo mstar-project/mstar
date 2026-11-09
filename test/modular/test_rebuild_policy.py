@@ -202,9 +202,9 @@ def test_a_higgs_transcription_can_be_dropped_where_its_llm_runs():
     )
     writes = {KV_CACHE: {"LLM": NodeWrites(frozenset({"prefill_audio", "decode"}), frozenset({"decode_loop"}))}}
 
-    rebuildable = rebuilds.ingest_request(R, writes, {KV_CACHE: config.kv_layout.values()}, unpausable=False)
+    ingested = rebuilds.ingest_request(R, writes, {KV_CACHE: config.kv_layout.values()}, unpausable=False)
 
-    assert rebuildable[KV_CACHE], "every Higgs transcription would stay guaranteed"
+    assert ingested.rebuildable[KV_CACHE], "every Higgs transcription would stay guaranteed"
 
 
 def _rows(*rids: int) -> dict:
@@ -216,7 +216,7 @@ def _ingest(rebuilds: Rebuilds, rid: int, spans: tuple[PrefixSpan, ...]) -> bool
     can free it."""
     writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, VISION, DECODE}), frozenset({"decode_loop"}))}}
     layouts = {"kv": [StreamLayout(spans=spans, growth=(("decode_loop", 1),))]}
-    return rebuilds.ingest_request(rid, writes, layouts, unpausable=False)["kv"]
+    return rebuilds.ingest_request(rid, writes, layouts, unpausable=False).rebuildable["kv"]
 
 
 def _rebuilds(pool_bytes: int = 1 << 10) -> Rebuilds:

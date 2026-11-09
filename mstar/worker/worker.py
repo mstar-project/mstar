@@ -198,7 +198,7 @@ def _make_rebuilds(
     nbytes = host_mb << (21 if followed & policies.keys() else 20)
     return Rebuilds(
         policies, graphs, HostPool(nbytes, device) if policies else None, engine.host_allowance,
-        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
+        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None}, followed,
     )
 
 
@@ -842,9 +842,12 @@ class Worker:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
         layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
-        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
+        ingested = self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable)
+        for key, rebuildable in ingested.rebuildable.items():
             if key in configs:
                 configs[key].rebuildable = rebuildable
+        for node in ingested.unheld:
+            self.engine_manager.get_engine(node).keeps_no_ids(node, request_id)
 
     def _apply_drains(self, in_flight: Collection[int]) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling a rid, then ACK

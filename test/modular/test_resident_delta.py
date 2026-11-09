@@ -2154,13 +2154,14 @@ def test_an_unreserve_cancels_no_reservation_that_grew_an_allotment(monkeypatch)
 
 
 class _Forgets(_KeepsIds):
-    """Records the requests whose ids it gives back."""
+    """Records the requests whose ids it gives back, each refused a rebuild in ``refused``."""
 
-    def __init__(self):
-        self.forgot = []
+    def __init__(self, refused=()):
+        self.forgot, self._refused = [], list(refused)
 
-    def forget(self, rid, node):
+    def refuse(self, rid, node):
         self.forgot.append((rid, node))
+        return self._refused
 
 
 def test_a_follower_gives_back_the_ids_of_a_request_rank_0_journals_as_keeping_none(monkeypatch):

@@ -942,7 +942,8 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         StepAllowance(), {NODE: torch.float32},
     )
     writes = {"kv": {NODE: NodeWrites(frozenset({step.walk, "decode"}), frozenset({"decode_loop"}))}}
-    assert w._rebuilds.ingest_request(R, writes, {"kv": config.kv_layout.values()}, unpausable=False)["kv"], (
+    ingested = w._rebuilds.ingest_request(R, writes, {"kv": config.kv_layout.values()}, unpausable=False)
+    assert ingested.rebuildable["kv"], (
         "a chat with images or video would be guaranteed"
     )
     prefilled = SimpleNamespace(
