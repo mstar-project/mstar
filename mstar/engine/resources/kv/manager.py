@@ -4085,12 +4085,7 @@ class KVManager(AttentionResource):
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             self._settle(rid, self._room() - room)
-            earmark = self._earmarks.pop(rid, None)
-            if earmark is not None:
-                # its victims run on without being dropped
-                for victim in earmark.victims:
-                    del self._victims[victim]
-                    self._hosted.discard(victim)
+            self._forget_earmark(rid)
             self._ran_short.pop(rid, None)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -4433,13 +4428,9 @@ class KVManager(AttentionResource):
             self._cpu_pool.count_guaranteed(rid)
 
     def _flip(self, rid: str, pages: int) -> None:
-        """Guarantee ``rid``, which waits for room, so that it and the earmark it waits on ask for its footprint of
-        ``pages``."""
+        """Guarantee ``rid``, which waits for room, so that it asks for its footprint of ``pages``."""
         self._guarantee(rid)
         self._asks[rid] = pages
-        earmark = self._earmarks.get(rid)
-        if earmark is not None:
-            earmark.pages = pages
 
     def _cover_move(self, rid: str, n: int, undoable: bool) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
@@ -4698,6 +4689,16 @@ class KVManager(AttentionResource):
     def moves_to_host(self, rid: str) -> bool:
         return rid in self._hosted
 
+    def _forget_earmark(self, rid: str) -> None:
+        """Take down ``rid``'s earmark once ``rid`` is removed or gives back its allotment. A request that asks again
+        then asks for what its move recorded, not the shortage the earmark holds. Caller holds the lock."""
+        earmark = self._earmarks.pop(rid, None)
+        if earmark is not None:
+            # its victims run on without being dropped
+            for victim in earmark.victims:
+                del self._victims[victim]
+                self._hosted.discard(victim)
+
     def _holds(self, rid: str) -> bool:
         allotment = self._allotments.get(rid)
         return (allotment is not None and allotment.remaining > 0) or any(
@@ -4785,6 +4786,7 @@ class KVManager(AttentionResource):
         self._unreserve(rid)
         self._ran_short.pop(rid, None)
         self._settle(rid, self._room() - room)
+        self._forget_earmark(rid)
 
     def _allot(self, rid: str, pages: int) -> None:
         # A request past its allotment holds more than ``allotment.pages``, so ``pages`` add to what it holds.
