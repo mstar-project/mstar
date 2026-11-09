@@ -755,6 +755,29 @@ def test_a_passer_back_from_a_drop_takes_none_of_the_pages_kept_for_the_head():
     assert kept == 4 and kv._kept == kept, "p returned into the pages kept for h"
 
 
+@pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
+def test_a_passer_returns_once_the_head_it_left_pages_kept_for_leaves(moves):
+    """p passed h and, moved for x, left the pages it freed kept for h. Nothing tied them to h, so they stayed kept
+    once h was aborted. p can't take them, and as the oldest asker it held back q, with the whole pool free."""
+    kv = _pool()
+    if moves == "moves to the host":
+        kv._cpu_pool = host._HostPool(64)
+    _running(kv, "x", 4, arrival=0)
+    _request(kv, "h", 8, arrival=1)
+    assert not _admitted(kv, "h")
+    _request(kv, "p", 5, arrival=2, decodes=1)
+    assert _ready(kv, "p") and _step(kv, "p", 5 * PAGE_SIZE).ok
+    victims = _preempt(kv, "x", _short(kv, "x"), droppable=lambda rid: True)
+    assert victims.to_drop + victims.to_host == ["p"]
+    (_drop if moves == "is dropped" else _offload)(kv, "p")
+    assert kv._kept
+    _remove(kv, "h")
+    _remove(kv, "x")
+    _request(kv, "q", 1, arrival=3)
+
+    assert _ready(kv, "p") and _ready(kv, "q"), "p and q wait with every page free"
+
+
 def test_a_waiting_request_that_leaves_before_its_moves_land_leaves_nothing_kept():
     """h's first move freed 4 pages into `_kept`, and h left before the second move landed. The 4 pages stayed kept
     from passers with no request to take them."""
