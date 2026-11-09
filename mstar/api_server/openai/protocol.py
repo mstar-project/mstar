@@ -148,3 +148,12 @@ class ModelCard(BaseModel):
 class ModelList(BaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
+
+
+class LoadLoraAdapterRequest(BaseModel):
+    lora_name: str
+    lora_path: str
+
+
+class UnloadLoraAdapterRequest(BaseModel):
+    lora_name: str
