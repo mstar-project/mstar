@@ -58,7 +58,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use adapters::{Adapter, Part, SubmitArgs};
+use adapters::{OpenAIAdapter, Part, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
 use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
@@ -142,7 +142,7 @@ async fn main() {
     });
 
     let python_adapter = std::env::var("MSTAR_OPENAI_ADAPTER").unwrap_or_default();
-    if !python_adapter.is_empty() && Adapter::from_python(&python_adapter).is_none() {
+    if !python_adapter.is_empty() && adapters::from_python(&python_adapter).is_none() {
         eprintln!(
             "WARNING: {model_name}'s OpenAI adapter {python_adapter} has no port in this \
              frontend: /v1/* answers 404 here, /generate is served"
@@ -473,7 +473,7 @@ fn check_request_id(id: &str) -> Result<(), String> {
 
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
-fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
+fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, Response> {
     let message = if st.python_adapter.is_empty() {
         format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
     } else {
@@ -483,7 +483,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
             st.model_name, st.python_adapter
         )
     };
-    let adapter = Adapter::from_python(&st.python_adapter)
+    let adapter = adapters::from_python(&st.python_adapter)
         .ok_or_else(|| error(404, &message, "model_not_found"))?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),

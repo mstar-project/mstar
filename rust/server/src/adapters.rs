@@ -20,7 +20,7 @@
 //!
 //! The model's adapter is the one `ADAPTER_REGISTRY` names for it: the
 //! launcher passes the Python adapter class in `MSTAR_OPENAI_ADAPTER`, and
-//! [`Adapter::from_python`] maps each class with a port here to its variant.
+//! [`from_python`] finds its port in [`ADAPTERS`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -310,209 +310,88 @@ const SPEECH_CHUNKING: SpeechChunking = SpeechChunking {
     splitter: crate::speech_chunking::Splitter::Sentences,
 };
 
-/// Which OpenAI surfaces a model serves + the request translation. One
-/// variant per ported `OpenAIAdapter` subclass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Adapter {
-    Bagel,
-    Qwen3Omni,
-    Qwen3_5,
-    Orpheus,
-    Cosmos3,
-    Cosmos3Edge,
-    Qwen3TTS,
-    DiffusionImage,
-    TextChat,
-    Kokoro,
-    Chatterbox,
-    FishS2Pro,
-    CosyVoice3,
-    OmniVoice,
-    VoxCPM2,
-}
-
-impl Adapter {
-    /// The variant for a Python adapter class name (`MSTAR_OPENAI_ADAPTER`);
-    /// `None` for a class with no port here.
-    pub fn from_python(class: &str) -> Option<Adapter> {
-        match class {
-            "BagelAdapter" => Some(Adapter::Bagel),
-            "Qwen3OmniAdapter" => Some(Adapter::Qwen3Omni),
-            "Qwen3_5Adapter" => Some(Adapter::Qwen3_5),
-            "OrpheusAdapter" => Some(Adapter::Orpheus),
-            "Cosmos3Adapter" => Some(Adapter::Cosmos3),
-            "Cosmos3EdgeAdapter" => Some(Adapter::Cosmos3Edge),
-            "Qwen3TTSAdapter" => Some(Adapter::Qwen3TTS),
-            "DiffusionImageAdapter" => Some(Adapter::DiffusionImage),
-            "TextChatAdapter" => Some(Adapter::TextChat),
-            "KokoroAdapter" => Some(Adapter::Kokoro),
-            "ChatterboxAdapter" => Some(Adapter::Chatterbox),
-            "FishS2ProAdapter" => Some(Adapter::FishS2Pro),
-            "CosyVoice3Adapter" => Some(Adapter::CosyVoice3),
-            "OmniVoiceAdapter" => Some(Adapter::OmniVoice),
-            "VoxCPM2Adapter" => Some(Adapter::VoxCPM2),
-            _ => None,
-        }
+/// One Python `OpenAIAdapter` subclass, ported: which OpenAI surfaces its
+/// models serve and how a request on each becomes a submission. A surface a
+/// class doesn't serve keeps the default, which refuses it, so a new model's
+/// adapter is a type implementing what it serves and a row in [`ADAPTERS`].
+pub trait OpenAIAdapter: Send + Sync {
+    fn supports_chat(&self) -> bool {
+        false
     }
 
-    pub fn supports_chat(&self) -> bool {
-        matches!(
-            self,
-            Adapter::Bagel | Adapter::Qwen3Omni | Adapter::Qwen3_5 | Adapter::Cosmos3Edge | Adapter::TextChat
-        )
+    fn supports_speech(&self) -> bool {
+        false
     }
 
-    pub fn supports_speech(&self) -> bool {
-        matches!(
-            self,
-            Adapter::Qwen3Omni
-                | Adapter::Orpheus
-                | Adapter::Qwen3TTS
-                | Adapter::Kokoro
-                | Adapter::Chatterbox
-                | Adapter::FishS2Pro
-                | Adapter::CosyVoice3
-                | Adapter::OmniVoice
-                | Adapter::VoxCPM2
-        )
+    fn supports_images(&self) -> bool {
+        false
     }
 
-    pub fn speech_chunking(&self) -> SpeechChunking {
-        match self {
-            // Each Talker request stays near the lengths the model was trained on.
-            Adapter::Qwen3TTS | Adapter::FishS2Pro => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
-            // 80 tokens at ~4 characters each; nothing under 80 characters of Chinese is split
-            Adapter::CosyVoice3 => SpeechChunking {
-                min_chars: Some(81),
-                max_chars: 320,
-                splitter: crate::speech_chunking::Splitter::CosyVoice3,
-                ..SPEECH_CHUNKING
-            },
-            _ => SPEECH_CHUNKING,
-        }
+    fn supports_videos(&self) -> bool {
+        false
     }
 
-    pub fn supports_images(&self) -> bool {
-        matches!(self, Adapter::Bagel | Adapter::Cosmos3 | Adapter::Cosmos3Edge | Adapter::DiffusionImage)
-    }
-
-    pub fn supports_videos(&self) -> bool {
-        matches!(self, Adapter::Cosmos3 | Adapter::Cosmos3Edge)
+    /// The adapter's `speech_chunk_*` attributes.
+    fn speech_chunking(&self) -> SpeechChunking {
+        SPEECH_CHUNKING
     }
 
     /// Whether this model's prompt processing is expressible in the frontend
     /// (plain `tokenizer.json`, no custom processor), so the server should
-    /// tokenize + detokenize in Rust and submit token ids — the
-    /// Rust-default-with-model-override capability flag. Requires the server
-    /// to be started with a tokenizer (`MSTAR_TOKENIZER`). Currently false for
-    /// every registered model: qwen3_omni needs its multimodal processor +
-    /// chat template, bagel/orpheus their own prompt formatting — they keep
-    /// the ship-text path. A model opts in here when its processing is a pure
-    /// tokenizer encode (the mechanism is exercised by /generate's
-    /// `tokenize` field and the echo verification).
-    pub fn frontend_tokenizes(&self) -> bool {
+    /// tokenize and detokenize in Rust and submit token ids. It needs the server
+    /// started with a tokenizer (`MSTAR_TOKENIZER`), and is false for every
+    /// registered model: each needs its own processor or prompt formatting. The
+    /// mechanism is exercised by /generate's `tokenize` field.
+    fn frontend_tokenizes(&self) -> bool {
         false
     }
 
-    pub fn chat_to_request(
-        &self,
-        req: &ChatCompletionRequest,
-        upload_dir: &Path,
-        allow_remote: bool,
-    ) -> Result<SubmitArgs, String> {
+    /// `chat_to_request`, after the tool-call refusal every chat adapter makes.
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        let _ = (req, upload_dir, allow_remote);
+        Err("chat is not supported by this model".to_string())
+    }
+
+    /// `speech_to_request` short of the `ref_audio` clip, which
+    /// [`OpenAIAdapter::speech_to_request`] saves as [`OpenAIAdapter::ref_audio`] says.
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let _ = req;
+        Err("audio/speech is not supported by this model".to_string())
+    }
+
+    /// How a voice-cloning model takes `ref_audio`; `None` for one that takes none
+    /// (the field then passes through, as the Python adapter leaves it).
+    fn ref_audio(&self) -> Option<RefAudio> {
+        None
+    }
+
+    fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+        let _ = req;
+        Err("image generation is not supported by this model".to_string())
+    }
+
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        let _ = (req, upload_dir, allow_remote);
+        Err("video generation is not supported by this model".to_string())
+    }
+
+    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        let _ = (prompt, image_path, extra_kwargs);
+        Err("image editing is not supported by this model".to_string())
+    }
+
+    /// A chat's submission. Not for adapters to override: they implement [`OpenAIAdapter::chat_args`].
+    fn chat_to_request(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         refuse_tool_calls(req)?;
-        match self {
-            // BAGEL reads temperature / top_p from its model config; only
-            // max_output_tokens and seed are honored.
-            Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
-            Adapter::TextChat => text_only_chat(req, upload_dir),
-            Adapter::Cosmos3Edge => {
-                // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
-                // Read before the attachments are saved, since a malformed value
-                // refuses the request.
-                let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
-                let mut args = text_chat(req, upload_dir, allow_remote)?;
-                args.model_kwargs.remove("chat_template_kwargs");
-                if let Some(on) = thinking {
-                    set_default(&mut args.model_kwargs, "enable_thinking", on);
-                }
-                Ok(args)
-            }
-            Adapter::Qwen3Omni => {
-                let (text, file_paths, in_mods, parts) =
-                    flatten_messages(&req.messages, upload_dir, allow_remote)?;
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                // Speech output also emits text, so request both when audio asked.
-                let want_audio = req
-                    .modalities
-                    .as_ref()
-                    .map(|m| m.iter().any(|x| x == "audio"))
-                    .unwrap_or(false);
-                let out_mods = if want_audio {
-                    vec!["text".to_string(), "audio".to_string()]
-                } else {
-                    vec!["text".to_string()]
-                };
-                apply_sampling(
-                    &mut mk,
-                    Sampling {
-                        temperature: req.temperature.clone(),
-                        top_p: req.top_p.clone(),
-                        seed: req.seed,
-                        max_tokens: chat_max_tokens(req),
-                        temperature_key: "thinker_temperature",
-                        top_p_key: "thinker_top_p",
-                        max_tokens_key: Some("max_output_tokens"),
-                    },
-                );
-                if let Some(voice) = chat_voice(req) {
-                    mk.insert("voice".to_string(), Value::from(voice));
-                }
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text,
-                    file_paths,
-                    input_modalities: in_mods,
-                    output_modalities: out_mods,
-                    model_kwargs: mk,
-                    parts,
-                })
-            }
-            Adapter::Orpheus
-            | Adapter::Cosmos3
-            | Adapter::Qwen3TTS
-            | Adapter::DiffusionImage
-            | Adapter::Kokoro
-            | Adapter::Chatterbox
-            | Adapter::FishS2Pro
-            | Adapter::CosyVoice3
-            | Adapter::OmniVoice
-            | Adapter::VoxCPM2 => {
-                Err("chat is not supported by this model".to_string())
-            }
-        }
+        self.chat_args(req, upload_dir, allow_remote)
     }
 
-    /// The library a voice-cloning model's loader opens `ref_audio` with
-    /// (`_resolve_ref_audio`'s `decoder`); `None` for a model that takes none.
-    fn ref_audio_decoder(&self) -> Option<&'static str> {
-        match self {
-            Adapter::Qwen3TTS | Adapter::FishS2Pro | Adapter::CosyVoice3 | Adapter::VoxCPM2 => Some("soundfile"),
-            Adapter::Chatterbox | Adapter::OmniVoice => Some("soundfile+torchcodec"),
-            _ => None,
-        }
-    }
-
-    /// `speech_to_request`, saving a `ref_audio` the model clones a voice from:
-    /// it becomes the request's audio input, as the Python adapter's does.
-    pub fn speech_to_request(
-        &self,
-        req: &SpeechRequest,
-        upload_dir: &Path,
-        allow_remote: bool,
-    ) -> Result<Speech, (u16, String)> {
+    /// A speech's submission, with a `ref_audio` clip saved as the model's audio
+    /// input, as the Python adapter's is. Not for adapters to override: they
+    /// implement [`OpenAIAdapter::speech_args`] and [`OpenAIAdapter::ref_audio`].
+    fn speech_to_request(&self, req: &SpeechRequest, upload_dir: &Path, allow_remote: bool) -> Result<Speech, (u16, String)> {
         let mut args = self.speech_args(req).map_err(|e| (400, e))?;
-        let Some(decoder) = self.ref_audio_decoder() else {
+        let Some(RefAudio { decoder, clip_first }) = self.ref_audio() else {
             return Ok(Speech { args, ref_audio: None });
         };
         let Some(reference) = args.model_kwargs.remove("ref_audio").filter(truthy) else {
@@ -520,331 +399,528 @@ impl Adapter {
         };
         let check = crate::media::save_ref_audio(&reference, upload_dir, allow_remote, decoder)?;
         args.file_paths.insert("audio".to_string(), vec![check.path.clone()]);
-        // Qwen3-TTS lays the clip out before the text; the others after it
-        args.input_modalities = if *self == Adapter::Qwen3TTS { vec!["audio", "text"] } else { vec!["text", "audio"] }
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let layout = if clip_first { ["audio", "text"] } else { ["text", "audio"] };
+        args.input_modalities = layout.map(str::to_string).to_vec();
         Ok(Speech { args, ref_audio: Some(check) })
     }
+}
 
-    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
-        match self {
-            Adapter::Qwen3Omni => {
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                if let Some(v) = &req.voice {
-                    mk.insert("voice".to_string(), Value::from(v.clone()));
-                }
-                apply_sampling(
-                    &mut mk,
-                    Sampling {
-                        temperature: req.temperature.clone(),
-                        top_p: req.top_p.clone(),
-                        seed: req.seed,
-                        max_tokens: None,
-                        temperature_key: "talker_temperature",
-                        top_p_key: "talker_top_p",
-                        max_tokens_key: None,
-                    },
-                );
-                forward_sent_speed(&mut mk, req);
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text: Some(req.input.clone()),
-                    file_paths: BTreeMap::new(),
-                    input_modalities: vec!["text".to_string()],
-                    output_modalities: vec!["text".to_string(), "audio".to_string()],
-                    model_kwargs: mk,
-                    parts: Vec::new(),
-                })
-            }
-            Adapter::Orpheus | Adapter::Qwen3TTS => {
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                if let Some(v) = &req.voice {
-                    mk.insert("voice".to_string(), Value::from(v.clone()));
-                }
-                if *self == Adapter::Qwen3TTS {
-                    // OpenAI's field is `instructions`; the model reads `instruct`.
-                    if let Some(instructions) = mk.remove("instructions").filter(truthy) {
-                        set_default(&mut mk, "instruct", instructions);
-                    }
-                }
-                apply_sampling(
-                    &mut mk,
-                    Sampling {
-                        temperature: req.temperature.clone(),
-                        top_p: req.top_p.clone(),
-                        seed: req.seed,
-                        max_tokens: None,
-                        temperature_key: "temperature",
-                        top_p_key: "top_p",
-                        max_tokens_key: None,
-                    },
-                );
-                forward_sent_speed(&mut mk, req);
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text: Some(req.input.clone()),
-                    file_paths: BTreeMap::new(),
-                    input_modalities: vec!["text".to_string()],
-                    output_modalities: vec!["audio".to_string()],
-                    model_kwargs: mk,
-                    parts: Vec::new(),
-                })
-            }
-            Adapter::Kokoro
-            | Adapter::Chatterbox
-            | Adapter::FishS2Pro
-            | Adapter::CosyVoice3
-            | Adapter::OmniVoice
-            | Adapter::VoxCPM2 => Ok(self.voice_model_args(req)),
-            Adapter::Bagel | Adapter::Qwen3_5 | Adapter::Cosmos3 | Adapter::Cosmos3Edge
-            | Adapter::DiffusionImage | Adapter::TextChat => {
-                Err("audio/speech is not supported by this model".to_string())
-            }
-        }
+/// How a voice-cloning adapter takes its reference clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefAudio {
+    /// The library its model's loader opens the clip with (`_resolve_ref_audio`'s `decoder`).
+    pub decoder: &'static str,
+    /// The clip's place in the layout: before the text (Qwen3-TTS) or after it.
+    pub clip_first: bool,
+}
+
+/// The ported adapters, by the Python class name the launcher passes in
+/// `MSTAR_OPENAI_ADAPTER`.
+pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
+    ("BagelAdapter", &Bagel),
+    ("Qwen3OmniAdapter", &Qwen3Omni),
+    ("Qwen3_5Adapter", &Qwen3_5),
+    ("OrpheusAdapter", &Orpheus),
+    ("Cosmos3Adapter", &Cosmos3),
+    ("Cosmos3EdgeAdapter", &Cosmos3Edge),
+    ("Qwen3TTSAdapter", &Qwen3TTS),
+    ("DiffusionImageAdapter", &DiffusionImage),
+    ("TextChatAdapter", &TextChat),
+    ("KokoroAdapter", &Kokoro),
+    ("ChatterboxAdapter", &Chatterbox),
+    ("FishS2ProAdapter", &FishS2Pro),
+    ("CosyVoice3Adapter", &CosyVoice3),
+    ("OmniVoiceAdapter", &OmniVoice),
+    ("VoxCPM2Adapter", &VoxCPM2),
+];
+
+/// The adapter for a Python class name; `None` for a class with no port here.
+pub fn from_python(class: &str) -> Option<&'static dyn OpenAIAdapter> {
+    ADAPTERS.iter().find(|(name, _)| *name == class).map(|(_, adapter)| *adapter)
+}
+
+/// A speech's model kwargs: the passthrough fields, `voice` when sent, and the
+/// standard sampling fields under the model's names.
+fn speech_kwargs(req: &SpeechRequest, temperature_key: &str, top_p_key: &str) -> Map<String, Value> {
+    let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+    if let Some(v) = &req.voice {
+        mk.insert("voice".to_string(), Value::from(v.clone()));
     }
+    sampling(&mut mk, req, temperature_key, top_p_key);
+    mk
+}
 
-    /// `speech_to_request` of the Kokoro, Chatterbox, Fish S2-Pro, CosyVoice3,
-    /// OmniVoice and VoxCPM2 adapters, short of the `ref_audio` each takes
-    /// (`speech_to_request` saves it). Which standard fields each forwards
-    /// differs per model, as the Python adapters' docstrings say why.
-    fn voice_model_args(&self, req: &SpeechRequest) -> SubmitArgs {
+/// `_apply_sampling` for a speech: `temperature`, `top_p` and `seed`, no token cap.
+fn sampling(mk: &mut Map<String, Value>, req: &SpeechRequest, temperature_key: &str, top_p_key: &str) {
+    apply_sampling(
+        mk,
+        Sampling {
+            temperature: req.temperature.clone(),
+            top_p: req.top_p.clone(),
+            seed: req.seed,
+            max_tokens: None,
+            temperature_key,
+            top_p_key,
+            max_tokens_key: None,
+        },
+    );
+}
+
+/// An audio-out submission of the speech's input.
+fn speech_submission(req: &SpeechRequest, model_kwargs: Map<String, Value>) -> SubmitArgs {
+    SubmitArgs {
+        text: Some(req.input.clone()),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["audio".to_string()],
+        model_kwargs,
+        ..SubmitArgs::default()
+    }
+}
+
+/// `SpeechRequest.speed` as Python reads it: unsent is its default 1.0, `null` None.
+fn speech_speed(req: &SpeechRequest) -> Option<f64> {
+    match req.speed {
+        None => Some(1.0),
+        Some(sent) => sent,
+    }
+}
+
+fn set_seed(mk: &mut Map<String, Value>, seed: Option<i64>) {
+    if let Some(seed) = seed {
+        set_default(mk, "seed", Value::from(seed));
+    }
+}
+
+/// OpenAI's `instructions` as the model's `instruct`, when non-empty.
+fn instructions_as_instruct(mk: &mut Map<String, Value>) {
+    if let Some(instructions) = mk.remove("instructions").filter(truthy) {
+        set_default(mk, "instruct", instructions);
+    }
+}
+
+/// `BagelAdapter.image_to_request` (`DiffusionImageAdapter`'s is the same, line for line).
+fn sized_image(req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+    let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+    size_kwargs(&mut mk, req.size.as_deref())?;
+    set_seed(&mut mk, req.seed);
+    Ok(SubmitArgs {
+        text: Some(req.prompt.clone()),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["image".to_string()],
+        model_kwargs: mk,
+        ..SubmitArgs::default()
+    })
+}
+
+/// `BagelAdapter.image_edit_to_request` (and `DiffusionImageAdapter`'s).
+fn sized_image_edit(prompt: &str, image_path: &str, mut extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+    // a form field that parsed as JSON (e.g. "512") is still the size text
+    let size = extra_kwargs
+        .remove("size")
+        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+    size_kwargs(&mut extra_kwargs, size.as_deref())?;
+    let mut file_paths = BTreeMap::new();
+    file_paths.insert("image".to_string(), vec![image_path.to_string()]);
+    Ok(SubmitArgs {
+        text: Some(prompt.to_string()),
+        file_paths,
+        input_modalities: vec!["image".to_string(), "text".to_string()],
+        output_modalities: vec!["image".to_string()],
+        model_kwargs: extra_kwargs,
+        ..SubmitArgs::default()
+    })
+}
+
+/// BAGEL: chat (it reads temperature / top_p from its model config; only
+/// max_output_tokens and seed are honored), images and edits.
+pub struct Bagel;
+
+impl OpenAIAdapter for Bagel {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn supports_images(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        text_chat(req, upload_dir, allow_remote)
+    }
+    fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+        sized_image(req)
+    }
+    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        sized_image_edit(prompt, image_path, extra_kwargs)
+    }
+}
+
+/// Qwen3.5: multimodal chat.
+pub struct Qwen3_5;
+
+impl OpenAIAdapter for Qwen3_5 {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        text_chat(req, upload_dir, allow_remote)
+    }
+}
+
+/// Qwen3-Omni: chat (text, or text and audio) and speech, sampling the Thinker
+/// for a chat and the Talker for a speech.
+pub struct Qwen3Omni;
+
+impl OpenAIAdapter for Qwen3Omni {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote)?;
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-        // `SpeechRequest.speed` defaults to 1.0: unsent reads as 1.0, `null` as None
-        let speed = match req.speed {
-            None => Some(1.0),
-            Some(sent) => sent,
-        };
-        let seed = |mk: &mut Map<String, Value>| {
-            if let Some(seed) = req.seed {
-                set_default(mk, "seed", Value::from(seed));
-            }
-        };
-        let instructions = |mk: &mut Map<String, Value>| {
-            if let Some(instructions) = mk.remove("instructions").filter(truthy) {
-                set_default(mk, "instruct", instructions);
-            }
-        };
-        let sampling = |mk: &mut Map<String, Value>| {
-            apply_sampling(
-                mk,
-                Sampling {
-                    temperature: req.temperature.clone(),
-                    top_p: req.top_p.clone(),
-                    seed: req.seed,
-                    max_tokens: None,
-                    temperature_key: "temperature",
-                    top_p_key: "top_p",
-                    max_tokens_key: None,
-                },
-            )
-        };
-        match self {
-            Adapter::Kokoro => {
-                if let Some(voice) = &req.voice {
-                    set_default(&mut mk, "voice", Value::from(voice.clone()));
-                }
-                if let Some(speed) = speed {
-                    set_default(&mut mk, "speed", json_num(speed));
-                }
-                seed(&mut mk);
-            }
-            Adapter::Chatterbox => {
-                if let Some(voice) = &req.voice {
-                    set_default(&mut mk, "voice", Value::from(voice.clone()));
-                }
-                sampling(&mut mk);
-                forward_sent_speed(&mut mk, req);
-            }
-            Adapter::FishS2Pro => {
-                sampling(&mut mk);
-                // a transcript without its clip
-                if !mk.get("ref_audio").is_some_and(truthy) {
-                    mk.remove("ref_text");
-                }
-            }
-            Adapter::CosyVoice3 => {
-                if let Some(voice) = req.voice.as_ref().filter(|v| !v.is_empty()) {
-                    set_default(&mut mk, "voice", Value::from(voice.clone()));
-                }
-                instructions(&mut mk);
-                sampling(&mut mk);
-            }
-            Adapter::OmniVoice => {
-                // is-not-None, so an empty voice reaches the model and is refused there
-                if let Some(voice) = &req.voice {
-                    if mk.get("instruct").is_none_or(Value::is_null) {
-                        mk.insert("instruct".to_string(), Value::from(voice.clone()));
-                    }
-                }
-                mk.remove("voice");
-                if let Some(speed) = speed {
-                    set_default(&mut mk, "speed", json_num(speed));
-                }
-                seed(&mut mk);
-            }
-            Adapter::VoxCPM2 => {
-                instructions(&mut mk);
-                seed(&mut mk);
-            }
-            _ => unreachable!("voice_model_args for {self:?}"),
+        // Speech output also emits text, so request both when audio asked.
+        let want_audio = req.modalities.as_ref().is_some_and(|m| m.iter().any(|x| x == "audio"));
+        let out_mods = if want_audio { vec!["text", "audio"] } else { vec!["text"] };
+        apply_sampling(
+            &mut mk,
+            Sampling {
+                temperature: req.temperature.clone(),
+                top_p: req.top_p.clone(),
+                seed: req.seed,
+                max_tokens: chat_max_tokens(req),
+                temperature_key: "thinker_temperature",
+                top_p_key: "thinker_top_p",
+                max_tokens_key: Some("max_output_tokens"),
+            },
+        );
+        if let Some(voice) = chat_voice(req) {
+            mk.insert("voice".to_string(), Value::from(voice));
         }
-        SubmitArgs {
+        Ok(SubmitArgs {
             tokens: None,
-            text: Some(req.input.clone()),
-            file_paths: BTreeMap::new(),
-            input_modalities: vec!["text".to_string()],
-            output_modalities: vec!["audio".to_string()],
+            text,
+            file_paths,
+            input_modalities: in_mods,
+            output_modalities: out_mods.into_iter().map(str::to_string).collect(),
             model_kwargs: mk,
-            parts: Vec::new(),
+            parts,
+        })
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk = speech_kwargs(req, "talker_temperature", "talker_top_p");
+        forward_sent_speed(&mut mk, req);
+        Ok(SubmitArgs { output_modalities: vec!["text".to_string(), "audio".to_string()], ..speech_submission(req, mk) })
+    }
+}
+
+/// Orpheus: speech.
+pub struct Orpheus;
+
+impl OpenAIAdapter for Orpheus {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk = speech_kwargs(req, "temperature", "top_p");
+        forward_sent_speed(&mut mk, req);
+        Ok(speech_submission(req, mk))
+    }
+}
+
+/// Qwen3-TTS (CustomVoice, VoiceDesign, Base): speech, with `instructions` as
+/// `instruct`, long input chunked, and a Base model's reference clip first.
+pub struct Qwen3TTS;
+
+impl OpenAIAdapter for Qwen3TTS {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_chunking(&self) -> SpeechChunking {
+        // each Talker request stays near the lengths the model was trained on
+        SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING }
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(v) = &req.voice {
+            mk.insert("voice".to_string(), Value::from(v.clone()));
+        }
+        // OpenAI's field is `instructions`; the model reads `instruct`.
+        instructions_as_instruct(&mut mk);
+        sampling(&mut mk, req, "temperature", "top_p");
+        forward_sent_speed(&mut mk, req);
+        Ok(speech_submission(req, mk))
+    }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile", clip_first: true })
+    }
+}
+
+/// Cosmos3: images and videos, `size` passed on as the model's own kwarg.
+pub struct Cosmos3;
+
+impl OpenAIAdapter for Cosmos3 {
+    fn supports_images(&self) -> bool {
+        true
+    }
+    fn supports_videos(&self) -> bool {
+        true
+    }
+    fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(size) = &req.size {
+            set_default(&mut mk, "size", Value::from(size.clone()));
+        }
+        set_seed(&mut mk, req.seed);
+        Ok(SubmitArgs {
+            text: Some(req.prompt.clone()),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["image".to_string()],
+            model_kwargs: mk,
+            ..SubmitArgs::default()
+        })
+    }
+    /// Text-to-video, or image/video-to-video when a conditioning reference is
+    /// supplied, as `Cosmos3Adapter.video_to_request`.
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(size) = &req.size {
+            set_default(&mut mk, "size", Value::from(size.clone()));
+        }
+        set_seed(&mut mk, req.seed);
+        // num_frames / fps are first-class video fields (not extra_body).
+        if let Some(nf) = req.num_frames {
+            set_default(&mut mk, "num_frames", Value::from(nf));
+        }
+        if let Some(fps) = req.fps {
+            set_default(&mut mk, "fps", json_num(fps));
+        }
+        let mut args = SubmitArgs {
+            text: Some(req.prompt.clone()),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["video".to_string()],
+            model_kwargs: mk,
+            ..SubmitArgs::default()
+        };
+        // The conditioning frame (image-to-video) or clip (video-to-video) is
+        // persisted and VAE-encoded by the worker into the clean frame-0 anchor /
+        // pinned latent prefix. At most one may be given.
+        let reference = match (req.image.as_deref(), req.video.as_deref()) {
+            (Some(_), Some(_)) => return Err("Provide either 'image' or 'video' conditioning, not both.".to_string()),
+            (Some(image), None) => Some(("image", image)),
+            (None, Some(video)) => Some(("video", video)),
+            (None, None) => None,
+        };
+        if let Some((modality, reference)) = reference {
+            let (_, path) = media::resolve_media_ref(reference, upload_dir, allow_remote)?;
+            args.file_paths.insert(modality.to_string(), vec![path]);
+            args.input_modalities = vec![modality.to_string(), "text".to_string()];
+        }
+        Ok(args)
+    }
+}
+
+/// Cosmos3-Edge: Cosmos3's images and videos, and chat.
+pub struct Cosmos3Edge;
+
+impl OpenAIAdapter for Cosmos3Edge {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn supports_images(&self) -> bool {
+        true
+    }
+    fn supports_videos(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
+        // Read before the attachments are saved, since a malformed value
+        // refuses the request.
+        let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
+        let mut args = text_chat(req, upload_dir, allow_remote)?;
+        args.model_kwargs.remove("chat_template_kwargs");
+        if let Some(on) = thinking {
+            set_default(&mut args.model_kwargs, "enable_thinking", on);
+        }
+        Ok(args)
+    }
+    fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+        Cosmos3.image_to_request(req)
+    }
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        Cosmos3.video_to_request(req, upload_dir, allow_remote)
+    }
+}
+
+/// The DiT-scaffold image models (FLUX.2 klein, Z-Image): BAGEL's image translations.
+pub struct DiffusionImage;
+
+impl OpenAIAdapter for DiffusionImage {
+    fn supports_images(&self) -> bool {
+        true
+    }
+    fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
+        sized_image(req)
+    }
+    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        sized_image_edit(prompt, image_path, extra_kwargs)
+    }
+}
+
+/// Text-only LLMs (GLM-5.x): chat, refusing what a text-only model cannot serve.
+pub struct TextChat;
+
+impl OpenAIAdapter for TextChat {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, _allow_remote: bool) -> Result<SubmitArgs, String> {
+        text_only_chat(req, upload_dir)
+    }
+}
+
+/// Kokoro: speech, forwarding `voice` and `speed`, which are real model knobs.
+pub struct Kokoro;
+
+impl OpenAIAdapter for Kokoro {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(voice) = &req.voice {
+            set_default(&mut mk, "voice", Value::from(voice.clone()));
+        }
+        if let Some(speed) = speech_speed(req) {
+            set_default(&mut mk, "speed", json_num(speed));
+        }
+        set_seed(&mut mk, req.seed);
+        Ok(speech_submission(req, mk))
+    }
+}
+
+/// Chatterbox: speech with the standard sampling fields, cloning a voice from
+/// a clip its loader opens with soundfile, else FFmpeg.
+pub struct Chatterbox;
+
+impl OpenAIAdapter for Chatterbox {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(voice) = &req.voice {
+            set_default(&mut mk, "voice", Value::from(voice.clone()));
+        }
+        sampling(&mut mk, req, "temperature", "top_p");
+        forward_sent_speed(&mut mk, req);
+        Ok(speech_submission(req, mk))
+    }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile+torchcodec", clip_first: false })
+    }
+}
+
+/// Fish Audio S2-Pro: speech with the standard sampling fields, long input
+/// chunked; `voice` and `speed` are no controls of it.
+pub struct FishS2Pro;
+
+impl OpenAIAdapter for FishS2Pro {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_chunking(&self) -> SpeechChunking {
+        SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING }
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        sampling(&mut mk, req, "temperature", "top_p");
+        // a transcript without its clip
+        if !mk.get("ref_audio").is_some_and(truthy) {
+            mk.remove("ref_text");
+        }
+        Ok(speech_submission(req, mk))
+    }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile", clip_first: false })
+    }
+}
+
+/// Fun-CosyVoice3: speech that always clones a voice, cut by its own splitter.
+pub struct CosyVoice3;
+
+impl OpenAIAdapter for CosyVoice3 {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_chunking(&self) -> SpeechChunking {
+        // 80 tokens at ~4 characters each; nothing under 80 characters of Chinese is split
+        SpeechChunking {
+            min_chars: Some(81),
+            max_chars: 320,
+            splitter: crate::speech_chunking::Splitter::CosyVoice3,
+            ..SPEECH_CHUNKING
         }
     }
-
-    pub fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
-        match self {
-            // `DiffusionImageAdapter`'s translations are `BagelAdapter`'s, line for line.
-            Adapter::Bagel | Adapter::DiffusionImage => {
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                size_kwargs(&mut mk, req.size.as_deref())?;
-                if let Some(seed) = req.seed {
-                    set_default(&mut mk, "seed", Value::from(seed));
-                }
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text: Some(req.prompt.clone()),
-                    file_paths: BTreeMap::new(),
-                    input_modalities: vec!["text".to_string()],
-                    output_modalities: vec!["image".to_string()],
-                    model_kwargs: mk,
-                    parts: Vec::new(),
-                })
-            }
-            Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                if let Some(size) = &req.size {
-                    set_default(&mut mk, "size", Value::from(size.clone()));
-                }
-                if let Some(seed) = req.seed {
-                    set_default(&mut mk, "seed", Value::from(seed));
-                }
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text: Some(req.prompt.clone()),
-                    file_paths: BTreeMap::new(),
-                    input_modalities: vec!["text".to_string()],
-                    output_modalities: vec!["image".to_string()],
-                    model_kwargs: mk,
-                    parts: Vec::new(),
-                })
-            }
-            _ => Err("image generation is not supported by this model".to_string()),
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        if let Some(voice) = req.voice.as_ref().filter(|v| !v.is_empty()) {
+            set_default(&mut mk, "voice", Value::from(voice.clone()));
         }
+        instructions_as_instruct(&mut mk);
+        sampling(&mut mk, req, "temperature", "top_p");
+        Ok(speech_submission(req, mk))
     }
-
-    /// `/v1/videos/generations` (Cosmos3). Text-to-video, or image/video-to-video
-    /// when a conditioning reference is supplied. Mirrors the Python
-    /// `Cosmos3Adapter.video_to_request`.
-    pub fn video_to_request(
-        &self,
-        req: &VideoGenerationRequest,
-        upload_dir: &Path,
-        allow_remote: bool,
-    ) -> Result<SubmitArgs, String> {
-        match self {
-            Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                if let Some(size) = &req.size {
-                    set_default(&mut mk, "size", Value::from(size.clone()));
-                }
-                if let Some(seed) = req.seed {
-                    set_default(&mut mk, "seed", Value::from(seed));
-                }
-                // num_frames / fps are first-class video fields (not extra_body).
-                if let Some(nf) = req.num_frames {
-                    set_default(&mut mk, "num_frames", Value::from(nf));
-                }
-                if let Some(fps) = req.fps {
-                    set_default(&mut mk, "fps", json_num(fps));
-                }
-                // The conditioning frame (image-to-video) or clip (video-to-video)
-                // is persisted and VAE-encoded by the worker into the clean
-                // frame-0 anchor / pinned latent prefix. At most one may be given.
-                match (req.image.as_deref(), req.video.as_deref()) {
-                    (Some(_), Some(_)) => Err(
-                        "Provide either 'image' or 'video' conditioning, not both.".to_string(),
-                    ),
-                    (Some(image), None) => {
-                        let (_, path) = media::resolve_media_ref(image, upload_dir, allow_remote)?;
-                        let mut file_paths = BTreeMap::new();
-                        file_paths.insert("image".to_string(), vec![path]);
-                        Ok(SubmitArgs {
-                            tokens: None,
-                            text: Some(req.prompt.clone()),
-                            file_paths,
-                            input_modalities: vec!["image".to_string(), "text".to_string()],
-                            output_modalities: vec!["video".to_string()],
-                            model_kwargs: mk,
-                            parts: Vec::new(),
-                        })
-                    }
-                    (None, Some(video)) => {
-                        let (_, path) = media::resolve_media_ref(video, upload_dir, allow_remote)?;
-                        let mut file_paths = BTreeMap::new();
-                        file_paths.insert("video".to_string(), vec![path]);
-                        Ok(SubmitArgs {
-                            tokens: None,
-                            text: Some(req.prompt.clone()),
-                            file_paths,
-                            input_modalities: vec!["video".to_string(), "text".to_string()],
-                            output_modalities: vec!["video".to_string()],
-                            model_kwargs: mk,
-                            parts: Vec::new(),
-                        })
-                    }
-                    (None, None) => Ok(SubmitArgs {
-                        tokens: None,
-                        text: Some(req.prompt.clone()),
-                        file_paths: BTreeMap::new(),
-                        input_modalities: vec!["text".to_string()],
-                        output_modalities: vec!["video".to_string()],
-                        model_kwargs: mk,
-                        parts: Vec::new(),
-                    }),
-                }
-            }
-            _ => Err("video generation is not supported by this model".to_string()),
-        }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile", clip_first: false })
     }
+}
 
-    pub fn image_edit_to_request(
-        &self,
-        prompt: &str,
-        image_path: &str,
-        extra_kwargs: Map<String, Value>,
-    ) -> Result<SubmitArgs, String> {
-        match self {
-            Adapter::Bagel | Adapter::DiffusionImage => {
-                let mut extra_kwargs = extra_kwargs;
-                // a form field that parsed as JSON (e.g. "512") is still the size text
-                let size = extra_kwargs
-                    .remove("size")
-                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
-                size_kwargs(&mut extra_kwargs, size.as_deref())?;
-                let mut file_paths = BTreeMap::new();
-                file_paths.insert("image".to_string(), vec![image_path.to_string()]);
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text: Some(prompt.to_string()),
-                    file_paths,
-                    input_modalities: vec!["image".to_string(), "text".to_string()],
-                    output_modalities: vec!["image".to_string()],
-                    model_kwargs: extra_kwargs,
-                    parts: Vec::new(),
-                })
+/// OmniVoice: speech whose mode follows from what is sent; `voice` stands in
+/// for `instruct` and `speed` is a real knob.
+pub struct OmniVoice;
+
+impl OpenAIAdapter for OmniVoice {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        // is-not-None, so an empty voice reaches the model and is refused there
+        if let Some(voice) = &req.voice {
+            if mk.get("instruct").is_none_or(Value::is_null) {
+                mk.insert("instruct".to_string(), Value::from(voice.clone()));
             }
-            _ => Err("image editing is not supported by this model".to_string()),
         }
+        mk.remove("voice");
+        if let Some(speed) = speech_speed(req) {
+            set_default(&mut mk, "speed", json_num(speed));
+        }
+        set_seed(&mut mk, req.seed);
+        Ok(speech_submission(req, mk))
+    }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile+torchcodec", clip_first: false })
+    }
+}
+
+/// VoxCPM2: speech designing a voice from `instructions` or cloning one; it has
+/// no named voices and no speed control.
+pub struct VoxCPM2;
+
+impl OpenAIAdapter for VoxCPM2 {
+    fn supports_speech(&self) -> bool {
+        true
+    }
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        instructions_as_instruct(&mut mk);
+        set_seed(&mut mk, req.seed);
+        Ok(speech_submission(req, mk))
+    }
+    fn ref_audio(&self) -> Option<RefAudio> {
+        Some(RefAudio { decoder: "soundfile", clip_first: false })
     }
 }
 
@@ -1162,32 +1238,31 @@ mod tests {
         assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
     }
 
-    const CHAT_ADAPTERS: [Adapter; 4] =
-        [Adapter::Bagel, Adapter::Qwen3Omni, Adapter::Qwen3_5, Adapter::Cosmos3Edge];
+    /// The surfaces a class serves: chat, speech, images, videos.
+    fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 4] {
+        [adapter.supports_chat(), adapter.supports_speech(), adapter.supports_images(), adapter.supports_videos()]
+    }
 
     #[test]
-    fn each_ported_python_adapter_class_has_its_variant() {
-        for (class, adapter) in [
-            ("BagelAdapter", Adapter::Bagel),
-            ("Qwen3OmniAdapter", Adapter::Qwen3Omni),
-            ("Qwen3_5Adapter", Adapter::Qwen3_5),
-            ("OrpheusAdapter", Adapter::Orpheus),
-            ("Cosmos3Adapter", Adapter::Cosmos3),
-            ("Cosmos3EdgeAdapter", Adapter::Cosmos3Edge),
-            ("Qwen3TTSAdapter", Adapter::Qwen3TTS),
-        ] {
-            assert_eq!(Adapter::from_python(class), Some(adapter));
+    fn each_ported_python_adapter_class_is_found_by_its_name_once() {
+        let mut names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ADAPTERS.len(), "a class listed twice");
+        for (class, adapter) in ADAPTERS {
+            assert_eq!(surfaces(from_python(class).unwrap()), surfaces(*adapter), "{class}");
         }
         for class in ["", "WhisperAdapter", "qwen3_5_0.8b", "bagel"] {
-            assert_eq!(Adapter::from_python(class), None, "{class:?}");
+            assert!(from_python(class).is_none(), "{class:?}");
         }
-        assert!(CHAT_ADAPTERS.iter().all(Adapter::supports_chat));
-        assert!(!Adapter::Orpheus.supports_chat() && !Adapter::Cosmos3.supports_chat());
-        assert!(Adapter::Cosmos3Edge.supports_images() && Adapter::Cosmos3Edge.supports_videos());
-        let q = Adapter::Qwen3_5;
-        assert!(!q.supports_speech() && !q.supports_images() && !q.supports_videos());
-        let t = Adapter::Qwen3TTS;
-        assert!(t.supports_speech() && !t.supports_chat() && !t.supports_images() && !t.supports_videos());
+        // the surfaces of a few classes, as their Python attributes declare them
+        assert_eq!(surfaces(&Bagel), [true, false, true, false]);
+        assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false]);
+        assert_eq!(surfaces(&Qwen3_5), [true, false, false, false]);
+        assert_eq!(surfaces(&Cosmos3), [false, false, true, true]);
+        assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true]);
+        assert_eq!(surfaces(&Qwen3TTS), [false, true, false, false]);
+        assert_eq!(surfaces(&Orpheus), [false, true, false, false]);
     }
 
     fn speech(body: &str) -> SpeechRequest {
@@ -1196,7 +1271,7 @@ mod tests {
 
     #[test]
     fn a_qwen3_tts_speech_maps_instructions_sampling_and_a_sent_speed() {
-        let args = Adapter::Qwen3TTS
+        let args = Qwen3TTS
             .speech_args(&speech(
                 r#"{"input":"Hello.","voice":"ryan","language":"English","instructions":"calm",
                     "temperature":0.7,"top_p":0.8,"seed":4,"speed":1.25,"top_k":20,"stream":true}"#,
@@ -1213,29 +1288,29 @@ mod tests {
 
     #[test]
     fn a_qwen3_tts_speech_keeps_an_explicit_instruct_and_drops_empty_instructions() {
-        let mk = |body: &str| Value::Object(Adapter::Qwen3TTS.speech_args(&speech(body)).unwrap().model_kwargs);
+        let mk = |body: &str| Value::Object(Qwen3TTS.speech_args(&speech(body)).unwrap().model_kwargs);
         assert_eq!(mk(r#"{"input":"x","instructions":"calm","instruct":"bright"}"#), serde_json::json!({"instruct": "bright"}));
         assert_eq!(mk(r#"{"input":"x","instructions":""}"#), serde_json::json!({}));
         assert_eq!(mk(r#"{"input":"x","speed":null}"#), serde_json::json!({"speed": null}));
         // an empty clip is dropped, as the Python adapter pops it
-        let speech = Adapter::Qwen3TTS.speech_to_request(&speech(r#"{"input":"x","ref_audio":""}"#), Path::new("/unused"), false);
+        let speech = Qwen3TTS.speech_to_request(&speech(r#"{"input":"x","ref_audio":""}"#), Path::new("/unused"), false);
         assert_eq!(Value::Object(speech.unwrap().args.model_kwargs), serde_json::json!({}));
     }
 
     #[test]
     fn every_speech_adapter_forwards_only_a_sent_speed() {
-        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+        for (name, adapter) in [("Qwen3TTS", &Qwen3TTS as &dyn OpenAIAdapter), ("Orpheus", &Orpheus), ("Qwen3Omni", &Qwen3Omni)] {
             let args = adapter.speech_args(&speech(r#"{"input":"x"}"#)).unwrap();
-            assert!(!args.model_kwargs.contains_key("speed"), "{adapter:?}");
+            assert!(!args.model_kwargs.contains_key("speed"), "{name}");
             let args = adapter.speech_args(&speech(r#"{"input":"x","speed":"2"}"#)).unwrap();
-            assert_eq!(args.model_kwargs["speed"], serde_json::json!(2.0), "{adapter:?}");
+            assert_eq!(args.model_kwargs["speed"], serde_json::json!(2.0), "{name}");
         }
     }
 
     #[test]
     fn a_qwen3_tts_voice_clone_saves_its_clip_for_the_loader_to_check() {
         let dir = std::env::temp_dir().join(format!("mstar_ref_{}", uuid::Uuid::new_v4().simple()));
-        let clone = |body: &str| Adapter::Qwen3TTS.speech_to_request(&speech(body), &dir, false);
+        let clone = |body: &str| Qwen3TTS.speech_to_request(&speech(body), &dir, false);
         for (body, bare) in [
             (r#"{"input":"x","ref_audio":"data:audio/wav;base64,UklGRg=="}"#, false),
             (r#"{"input":"x","ref_audio":"UklGRg"}"#, true), // bare and unpadded, as Python reads it
@@ -1262,11 +1337,11 @@ mod tests {
 
     #[test]
     fn only_qwen3_tts_chunks_long_speech_by_default() {
-        assert_eq!(Adapter::Qwen3TTS.speech_chunking().min_chars, Some(600));
-        assert_eq!(Adapter::Orpheus.speech_chunking().min_chars, None);
-        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+        assert_eq!(Qwen3TTS.speech_chunking().min_chars, Some(600));
+        assert_eq!(Orpheus.speech_chunking().min_chars, None);
+        for (name, adapter) in [("Qwen3TTS", &Qwen3TTS as &dyn OpenAIAdapter), ("Orpheus", &Orpheus), ("Qwen3Omni", &Qwen3Omni)] {
             let c = adapter.speech_chunking();
-            assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{adapter:?}");
+            assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{name}");
         }
     }
 
@@ -1278,7 +1353,7 @@ mod tests {
                 "enable_thinking":false,"repetition_penalty":1.1,"max_output_tokens":8}"#,
         )
         .unwrap();
-        let args = Adapter::Qwen3_5.chat_to_request(&req, Path::new("/unused"), false).unwrap();
+        let args = Qwen3_5.chat_to_request(&req, Path::new("/unused"), false).unwrap();
         assert_eq!(args.text.as_deref(), Some("Be brief.\n海について"));
         assert_eq!(args.input_modalities, ["text", "text"]);
         assert_eq!(args.output_modalities, ["text"]);
@@ -1291,7 +1366,7 @@ mod tests {
 
     #[test]
     fn a_cosmos3_edge_chat_reads_enable_thinking_from_the_template_kwargs() {
-        let chat = |fields: &str| Adapter::Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+        let chat = |fields: &str| Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
         let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
         for (fields, want) in [
             (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
@@ -1348,9 +1423,9 @@ mod tests {
             r#""functions":[{"name":"get_weather"}]"#,
             r#""function_call":{"name":"get_weather"}"#,
         ] {
-            for adapter in CHAT_ADAPTERS {
+            for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
                 let err = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
-                assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {adapter:?}");
+                assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {name}");
             }
         }
     }
@@ -1371,9 +1446,9 @@ mod tests {
             r#""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"none""#,
             r#""functions":[{"name":"get_weather"}],"function_call":"none""#,
         ] {
-            for adapter in CHAT_ADAPTERS {
+            for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
-                assert!(args.is_ok(), "{fields} refused a plain chat on {adapter:?}");
+                assert!(args.is_ok(), "{fields} refused a plain chat on {name}: {args:?}");
             }
         }
     }
