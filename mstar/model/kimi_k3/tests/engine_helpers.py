@@ -8,6 +8,7 @@ import types
 
 import torch
 
+from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
@@ -15,10 +16,12 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as kv_mod
+from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
+from mstar.model.base import LabelLayout, Span, keyed_labels
 from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
-from mstar.model.kimi_k3.config import SAMPLER
+from mstar.model.kimi_k3.config import KDA_STATE, KV_CACHE, LABEL, SAMPLER
 from mstar.model.kimi_k3.kimi_k3_model import KimiK3Model
 from mstar.model.kimi_k3.submodules import KimiK3LLMSubmodule
 from mstar.model.kimi_k3.tests.reference import random_checkpoint
@@ -82,9 +85,12 @@ def load_tiny(model: KimiK3Model, sd: dict[str, torch.Tensor]) -> KimiK3ForCausa
     return lm.eval()
 
 
-def build_engine(variant: str = "reduced", seed: int = 0, config=None, **model_kwargs):
+def build_engine(variant: str = "reduced", seed: int = 0, config=None, prefix_slots: int = 0,
+                 page_size: int = 64, **model_kwargs):
     """``(engine, submodule, model, state_dict)`` over a random checkpoint; ``config`` replaces
-    the variant's."""
+    the variant's. ``prefix_slots``: the prefix cache open, over ``page_size``-token pages (a
+    multiple of KDA's 64-token chunk), with that many KDA snapshots, as a serving config sets
+    it (a salt stands in for the checkpoint)."""
     torch.manual_seed(seed)
     model = KimiK3Model("x", config_variant=variant, kda_conv_dtype=torch.float32,
                         kda_max_requests=4, tokenizer_mode="byte", **model_kwargs)
@@ -93,9 +99,19 @@ def build_engine(variant: str = "reduced", seed: int = 0, config=None, **model_k
     sd = random_checkpoint(model.config, seed=seed, a_log_pad=3)
     lm = load_tiny(model, sd)
     sub = KimiK3LLMSubmodule(lm, model.config)
+    specs = model.get_node_resources()
+    if prefix_slots:
+        for spec in specs:
+            if spec.resource_key == KV_CACHE:
+                spec.apply_yaml_overrides(page_size=page_size, prefix_cache_salt="a salt")
+            elif spec.resource_key == KDA_STATE:
+                spec.apply_yaml_overrides(prefix_slots=prefix_slots)
+    if prefix_slots:
+        # the random checkpoint is on no disk: the salt roots the cache
+        model.checkpoint_path = lambda: None
     engine = Engine(None)
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs, model=model if prefix_slots else None,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -118,6 +134,24 @@ def _info(rid: str, walk: str, max_tokens: int = 64) -> CurrentForwardPassInfo:
 
 def add_request(engine: Engine, rid: str) -> None:
     engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+
+
+def add_keyed_request(engine: Engine, model: KimiK3Model, rid: str, prompt: torch.Tensor, page_size: int = 64) -> None:
+    """``add_request`` with the KV keys the data worker sends for ``prompt``, as Kimi lays it out
+    (`KimiK3Model.process_prompt`), so the engine probes the prefix cache for it."""
+    n = prompt.numel()
+    layouts = {KV_CACHE: {LABEL: LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),),
+                                             growth=(("decode_loop", 1),))}}
+    worker = types.SimpleNamespace(
+        _keyed_labels=keyed_labels(model), _prefix_page_sizes={KV_CACHE: page_size}, model=None,
+        _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
+    )
+    rows = {KV_CACHE: {LABEL: layouts[KV_CACHE][LABEL].row()}}
+    sent = PreprocessWorkerThread._prefix_keys(worker, {"text_inputs": [prompt]}, layouts, rows, None, {})
+    kv = KVReqConfig()
+    kv.apply_conductor_config(kv_layout=rows[KV_CACHE], loop_caps={"decode_loop": 64},
+                              **{name: by[KV_CACHE] for name, by in sent.items()})
+    engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0), KV_CACHE: kv})
 
 
 def _batch(walk: str, inputs: dict[str, torch.Tensor]) -> ExecutingBatch:

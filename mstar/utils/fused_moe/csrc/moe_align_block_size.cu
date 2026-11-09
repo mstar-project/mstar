@@ -9,8 +9,16 @@
 // needed.  Registered under the ``_mstar_moe_C`` op namespace so it never
 // collides with a real vLLM ``_moe_C`` in the same process.
 //
-// Local change: the small-batch kernel skips ids >= num_experts, as the
+// Local changes: the small-batch kernel skips ids >= num_experts, as the
 // large-batch kernels already do, so every path treats them as skipped slots.
+// Up to STABLE_MAX_SLOTS slots the large-batch path is mstar's
+// ``moe_align_block_size_stable_kernel``: each expert's slots in increasing slot
+// order, as the torch fallback places them. vLLM's placement ranks each slot by
+// atomicAdd, so the order within an expert changes from call to call, and Marlin
+// MoE's output follows the order of its rows (H200 job 1656: one MoE block, the
+// same input, 47 of 200 calls differed at 256 tokens; with the order fixed, 0).
+// Past STABLE_MAX_SLOTS (prefill chunks) vLLM's placement stays: the single-block
+// stable kernel ran 309 us at 8192 tokens x top-16 against its 55 (job 1659).
 //
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -26,6 +34,8 @@
 
 #define WARP_SIZE 32
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+// up to 256 tokens x top-16: decode, and a verify step of 64 requests x 4 tokens
+#define STABLE_MAX_SLOTS 4096
 
 namespace mstar {
 namespace moe {
@@ -210,78 +220,147 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 }
 
-// Decode-sized batches with more than 64 experts: count, scan, expert ids and the
-// scatter in one block, where the two-kernel path below launches twice. One thread per
-// expert in the scan (num_experts < 1024 is checked by the caller), the slots strided
-// over the block.
-template <typename scalar_t>
-__global__ void moe_align_block_size_single_block_kernel(
+// One block of WARPS warps. Warp w owns the slots [w * seg, (w + 1) * seg): it counts
+// them per expert (one warp's lanes agree through __match_any_sync, so no atomics),
+// the counts become each warp's offset within each expert, and the warp places its
+// slots in order, 32 at a time. Every expert's slots land in increasing slot order.
+template <typename scalar_t, int WARPS>
+__global__ void moe_align_block_size_stable_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
     int32_t block_size, size_t numel, int32_t max_num_tokens_padded) {
   extern __shared__ int32_t smem[];
-  int32_t* counts = smem;                   // num_experts
-  int32_t* offsets = smem + num_experts;    // num_experts + 1
+  int32_t* hist = smem;                              // [WARPS][num_experts]
+  int32_t* cumsum = smem + WARPS * num_experts;      // [num_experts + 1]
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int warp = threadIdx.x / WARP_SIZE;
+  const unsigned lower = (1u << lane) - 1u;
 
-  for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x) {
+  for (size_t it = threadIdx.x; it < (size_t)max_num_tokens_padded; it += blockDim.x) {
     sorted_token_ids[it] = numel;
   }
+  for (int i = threadIdx.x; i < WARPS * num_experts; i += blockDim.x) {
+    hist[i] = 0;
+  }
+  __syncthreads();
+
+  const size_t seg = CEILDIV(numel, (size_t)WARPS);
+  const size_t lo = (size_t)warp * seg < numel ? (size_t)warp * seg : numel;
+  const size_t hi = lo + seg < numel ? lo + seg : numel;
+  int32_t* mine = hist + warp * num_experts;
+  // UNROLL rows of 32 slots a step, their loads issued together; the rows in slot order
+  constexpr int UNROLL = 4;
+  for (size_t base = lo; base < hi; base += UNROLL * WARP_SIZE) {
+    int ex[UNROLL];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+      const size_t i = base + k * WARP_SIZE + lane;
+      ex[k] = i < hi ? (int)topk_ids[i] : -1;
+    }
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+      const int e = ex[k];
+      const bool valid = e >= 0 && e < num_experts;
+      // a lane with no expert matches no other lane
+      const unsigned peers = __match_any_sync(0xffffffffu, valid ? e : -1 - lane);
+      if (valid && lane == __ffs(peers) - 1) mine[e] += __popc(peers);
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+
+  // per expert: each warp's offset among the expert's slots, and the padded total
   for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-    counts[e] = 0;
-  }
-  __syncthreads();
-
-  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
-    int expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
-      continue;
+    int32_t run = 0;
+    for (int w = 0; w < WARPS; ++w) {
+      const int32_t c = hist[w * num_experts + e];
+      hist[w * num_experts + e] = run;
+      run += c;
     }
-    atomicAdd(&counts[expert_id], 1);
+    cumsum[e] = CEILDIV(run, block_size) * block_size;
   }
   __syncthreads();
 
-  using BlockScan = cub::BlockScan<int32_t, 1024>;
-  __shared__ typename BlockScan::TempStorage temp_storage;
-  int32_t padded = 0;
-  if (threadIdx.x < num_experts) {
-    padded = CEILDIV(counts[threadIdx.x], block_size) * block_size;
+  // exclusive scan of the padded totals: each thread four consecutive experts (E <= 4 * threads)
+  constexpr int ITEMS = 4;
+  using BlockScan = cub::BlockScan<int32_t, WARPS * WARP_SIZE>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  int32_t vals[ITEMS], outs[ITEMS];
+#pragma unroll
+  for (int k = 0; k < ITEMS; ++k) {
+    const int e = threadIdx.x * ITEMS + k;
+    vals[k] = e < num_experts ? cumsum[e] : 0;
   }
-  int32_t start;
-  BlockScan(temp_storage).ExclusiveSum(padded, start);
-  if (threadIdx.x <= num_experts) {
-    offsets[threadIdx.x] = start;
+  int32_t total;
+  BlockScan(scan_storage).ExclusiveSum(vals, outs, total);
+  __syncthreads();
+#pragma unroll
+  for (int k = 0; k < ITEMS; ++k) {
+    const int e = threadIdx.x * ITEMS + k;
+    if (e < num_experts) cumsum[e] = outs[k];
   }
-  if (threadIdx.x == num_experts) {
-    *total_tokens_post_pad = start;
+  if (threadIdx.x == 0) {
+    cumsum[num_experts] = total;
+    *total_tokens_post_pad = total;
   }
   __syncthreads();
 
-  if (threadIdx.x < num_experts) {
-    for (int i = offsets[threadIdx.x]; i < offsets[threadIdx.x + 1]; i += block_size) {
-      expert_ids[i / block_size] = threadIdx.x;
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+    for (int i = cumsum[e]; i < cumsum[e + 1]; i += block_size) {
+      expert_ids[i / block_size] = e;
     }
   }
-  const size_t fill_start_idx = offsets[num_experts] / block_size + threadIdx.x;
   const size_t expert_ids_size = CEILDIV(max_num_tokens_padded, block_size);
-  for (size_t i = fill_start_idx; i < expert_ids_size; i += blockDim.x) {
+  for (size_t i = cumsum[num_experts] / block_size + threadIdx.x; i < expert_ids_size; i += blockDim.x) {
     expert_ids[i] = 0;
   }
-  // every read of the offsets above lands before the scatter below moves them
-  __syncthreads();
 
-  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
-    int expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
-      continue;
+  for (size_t base = lo; base < hi; base += UNROLL * WARP_SIZE) {
+    int ex[UNROLL];
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+      const size_t i = base + k * WARP_SIZE + lane;
+      ex[k] = i < hi ? (int)topk_ids[i] : -1;
     }
-    int32_t rank_post_pad = atomicAdd(&offsets[expert_id], 1);
-    sorted_token_ids[rank_post_pad] = i;
+#pragma unroll
+    for (int k = 0; k < UNROLL; ++k) {
+      const int e = ex[k];
+      const bool valid = e >= 0 && e < num_experts;
+      const unsigned peers = __match_any_sync(0xffffffffu, valid ? e : -1 - lane);
+      if (valid) {
+        sorted_token_ids[cumsum[e] + mine[e] + __popc(peers & lower)] =
+            (int32_t)(base + k * WARP_SIZE + lane);
+      }
+      __syncwarp();
+      if (valid && lane == __ffs(peers) - 1) mine[e] += __popc(peers);
+      __syncwarp();
+    }
   }
 }
 
 }  // namespace moe
 }  // namespace mstar
+
+template <typename scalar_t, int WARPS>
+static void stable_align(torch::Tensor& topk_ids, int64_t num_experts, int64_t block_size,
+                         torch::Tensor& sorted_token_ids, torch::Tensor& experts_ids,
+                         torch::Tensor& num_tokens_post_pad, cudaStream_t stream) {
+  TORCH_CHECK(num_experts <= 4 * WARPS * WARP_SIZE, "moe_align_block_size: ", num_experts,
+              " experts > ", 4 * WARPS * WARP_SIZE);
+  auto kernel = mstar::moe::moe_align_block_size_stable_kernel<scalar_t, WARPS>;
+  const int smem = (WARPS * num_experts + num_experts + 1) * sizeof(int32_t);
+  static int smem_set = 0;  // the largest dynamic shared memory opted in so far
+  if (smem > 48 * 1024 && smem > smem_set) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    smem_set = smem;
+  }
+  kernel<<<1, WARPS * WARP_SIZE, smem, stream>>>(
+      topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+      experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
+      num_experts, block_size, topk_ids.numel(), sorted_token_ids.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
@@ -308,14 +387,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
   // a router's int64 ids are read as they are: no cast kernel ahead of this one
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "moe_align_block_size", [&] {
     using scalar_t = index_t;
-    // calc needed amount of shared mem for `cumsum` tensors
-    auto options_int =
-        torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-    torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, options_int);
     bool small_batch_expert_mode =
         (topk_ids.numel() < 1024) && (num_experts <= 64);
-    // a decode step's slots fit one block: one launch instead of align + sort
-    bool single_block_mode = !small_batch_expert_mode && topk_ids.numel() < 4096;
 
     if (small_batch_expert_mode) {
       const int32_t threads = max((int32_t)num_experts, WARP_SIZE);
@@ -329,16 +402,17 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
           experts_ids.data_ptr<int32_t>(),
           num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
           topk_ids.numel(), sorted_token_ids.size(0));
-    } else if (single_block_mode) {
-      const size_t shared_mem_size = (2 * num_experts + 1) * sizeof(int32_t);
-      auto single_block_kernel =
-          mstar::moe::moe_align_block_size_single_block_kernel<scalar_t>;
-      single_block_kernel<<<1, 1024, shared_mem_size, stream>>>(
-          topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-          experts_ids.data_ptr<int32_t>(),
-          num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
-          topk_ids.numel(), sorted_token_ids.size(0));
+    } else if (topk_ids.numel() <= 2048) {
+      // decode sizes (up to 128 tokens x top-16): eight warps
+      stable_align<scalar_t, 8>(topk_ids, num_experts, block_size, sorted_token_ids,
+                                experts_ids, num_tokens_post_pad, stream);
+    } else if (topk_ids.numel() <= STABLE_MAX_SLOTS) {
+      stable_align<scalar_t, 32>(topk_ids, num_experts, block_size, sorted_token_ids,
+                                 experts_ids, num_tokens_post_pad, stream);
     } else {
+      auto options_int =
+          torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+      torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, options_int);
       auto align_kernel = mstar::moe::moe_align_block_size_kernel<scalar_t>;
 
       size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);

@@ -42,7 +42,10 @@ def _cpu(monkeypatch):
 
 def test_every_kimi_config_is_covered():
     assert {p.name for p in CONFIGS} >= {"kimi_k31_tp8.yaml", "kimi_k31_tp8_c128.yaml", "kimi_k31_ep8.yaml",
-                                         "kimi_k31_tp8_longctx.yaml", "kimi_k3_tp8.yaml"}
+                                         "kimi_k31_tp8_longctx.yaml", "kimi_k31_tp8_32k.yaml", "kimi_k31_tp8_40k.yaml",
+                                         "kimi_k3_tp8.yaml", "kimi_k31_tp8_b300.yaml", "kimi_k31_tp8_32k_b300.yaml",
+                                         "kimi_k31_tp8_40k_b300.yaml", "kimi_k31_tp8_b300_fold.yaml",
+                                         "kimi_k31_tp8_b300_split.yaml"}
 
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: p.stem)
@@ -120,3 +123,27 @@ def test_the_openai_chat_endpoint_serves_kimi_with_the_benches_fields(name, tmp_
         assert model.get_request_resource_configs({}, mk)[SAMPLER].ignore_eos is True
         model.process_prompt(args.text, ["text"], ["text"], prompt_parts=args.prompt_parts, **mk)
         assert template.calls[-1]["thinking"] is thinks, extra
+
+
+def test_the_fold_config_is_the_b300_config_with_the_fold():
+    """kimi_k31_tp8_b300_fold.yaml A/Bs the routed finalize fold with one config switch: it is kimi_k31_tp8_b300.yaml
+    with routed_experts_finalize fused, which the model's default (kernel) leaves off."""
+    from mstar.model.kimi_k3.config import KimiK3ModelConfig
+
+    base, fold = (yaml.safe_load((ROOT / "configs" / name).read_text())
+                  for name in ("kimi_k31_tp8_b300.yaml", "kimi_k31_tp8_b300_fold.yaml"))
+    assert fold["model_kwargs"].pop("routed_experts_finalize") == "fused"
+    assert "routed_experts_finalize" not in base["model_kwargs"] and fold == base
+    assert KimiK3ModelConfig.routed_experts_finalize == "kernel"
+
+
+def test_the_split_config_is_the_b300_config_with_the_router_on_the_side_stream():
+    """kimi_k31_tp8_b300_split.yaml A/Bs the router's GEMM beside the latent's with one config switch: it is
+    kimi_k31_tp8_b300.yaml with latent_moe_front split, which the model's default (gemm) leaves off."""
+    from mstar.model.kimi_k3.config import KimiK3ModelConfig
+
+    base, front = (yaml.safe_load((ROOT / "configs" / name).read_text())
+                   for name in ("kimi_k31_tp8_b300.yaml", "kimi_k31_tp8_b300_split.yaml"))
+    assert front["model_kwargs"].pop("latent_moe_front") == "split"
+    assert "latent_moe_front" not in base["model_kwargs"] and front == base
+    assert KimiK3ModelConfig.latent_moe_front == "gemm"

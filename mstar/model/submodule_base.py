@@ -538,6 +538,12 @@ class ChunkingPolicy:
     whole prefill needs, so a part-done row cannot wedge on a full arena.
     Counted in tokens, so a walk whose KV grows by something else sets False
     and reserves per chunk.
+
+    ``chunk_align``: a row the scheduler cuts mid-way runs a multiple of this
+    many tokens, so its next chunk starts on one. A row starts at 0 or past a
+    cached prefix, a whole number of KV pages, so an alignment that divides
+    the page keeps every chunk's start on it (what a kernel's tiles or a
+    recurrent state's chunks need of where a chunk starts).
     """
     walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
@@ -549,8 +555,11 @@ class ChunkingPolicy:
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
     reserve_whole_prefill: bool = True
+    chunk_align: int = 1
 
     def __post_init__(self):
+        if isinstance(self.chunk_align, bool) or not isinstance(self.chunk_align, int) or self.chunk_align < 1:
+            raise ValueError(f"chunk_align must be a positive int, got {self.chunk_align!r}")
         both = self.accumulated_outputs & self.per_chunk_outputs
         if both:
             raise ValueError(
@@ -942,6 +951,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
+
+    def can_replay(self, graph_walk: str, inputs: Sequence[NodeInputs]) -> bool:
+        """Whether a step of these prepared inputs may replay a captured graph that fits it;
+        False runs it eager. For a limit the bucket's shape does not express, such as where in
+        its sequence a packed row starts. True by default."""
+        del graph_walk, inputs
+        return True
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

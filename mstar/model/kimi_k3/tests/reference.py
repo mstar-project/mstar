@@ -133,7 +133,9 @@ def mla(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig, use_dsa: bool
     return F.linear(out, sd[f"{p}o_proj.weight"])
 
 
-def latent_moe(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig) -> torch.Tensor:
+def route(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(T, top_k)`` expert ids and weights: noaux_tc, sigmoid scores, the top-k by score + bias, their unbiased
+    scores renormalized (``moe_renormalize``) and times ``routed_scaling_factor``."""
     logits = F.linear(x.float(), sd[f"{p}gate.weight"].float())
     scores = logits.sigmoid()
     choice = scores + sd[f"{p}gate.e_score_correction_bias"].float()
@@ -141,7 +143,11 @@ def latent_moe(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig) -> tor
     w = scores.gather(1, idx)
     if cfg.moe_renormalize:
         w = w / (w.sum(-1, keepdim=True) + 1e-20)
-    w = w * cfg.routed_scaling_factor
+    return idx, w * cfg.routed_scaling_factor
+
+
+def latent_moe(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig) -> torch.Tensor:
+    idx, w = route(sd, p, x, cfg)
     z = F.linear(x, sd[f"{p}routed_expert_down_proj.weight"])
     y = torch.zeros(x.shape[0], z.shape[1], device=x.device)
     for e in idx.unique().tolist():  # each expert over the tokens that picked it

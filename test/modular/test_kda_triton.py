@@ -1,4 +1,5 @@
-"""The fused KDA kernels against the torch reference on CUDA: prefill, decode and verify.
+"""The fused KDA kernels against the torch reference on CUDA: prefill, decode and verify, with
+GLM-5.3's low-rank output gate (one TP8 rank: 8 heads of 128) and Kimi K3.1's full-rank one (12).
 
 The prefill oracle is the layer's ``prefill`` per span in fp32; the fused path must be no less
 accurate than that reference under the engine's bf16 autocast.
@@ -24,6 +25,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 HEADS, HEAD_DIM, HIDDEN, SLOTS = 8, 128, 4096, 12
+# one TP8 rank of Kimi K3.1: 96 heads of 128 and a full-rank output gate
+K31_HEADS, K31_HIDDEN = 12, 7168
+GATES = pytest.mark.parametrize("heads, full_rank", [(HEADS, False), (K31_HEADS, True)],
+                                ids=["low_rank_gate", "full_rank_gate"])
 
 
 @pytest.fixture
@@ -78,13 +83,13 @@ def _plan(spans) -> KDAPlan:
     )
 
 
-def _kda(seed=0, head_dim=HEAD_DIM):
+def _kda(seed=0, head_dim=HEAD_DIM, heads=HEADS, full_rank=False):
     """One TP8 rank's KDA layer with gates spread like a trained model's: per-channel decay
     from ~0 (long memory) to the lower bound (forgets within a token)."""
     torch.manual_seed(seed)
     kda = ParallelKimiDeltaAttention(KDAConfig(
-        hidden_size=HIDDEN, num_heads=HEADS, head_dim=head_dim),
-        dtype=torch.bfloat16).cuda()
+        hidden_size=HIDDEN, num_heads=heads, head_dim=head_dim,
+        full_rank_output_gate=full_rank), dtype=torch.bfloat16).cuda()
     with torch.no_grad():
         for name, p in kda.named_parameters():
             if "conv1d" in name:
@@ -110,10 +115,10 @@ def _spans(lengths, seed=0):
     return spans, start
 
 
-def _pools(fresh, seed=1):
+def _pools(fresh, seed=1, heads=HEADS):
     torch.manual_seed(seed)
-    rec = torch.randn(SLOTS, HEADS, HEAD_DIM, HEAD_DIM, device="cuda") * 0.1
-    conv = torch.randn(SLOTS, 3 * HEADS * HEAD_DIM, 3, device="cuda").to(torch.bfloat16)
+    rec = torch.randn(SLOTS, heads, HEAD_DIM, HEAD_DIM, device="cuda") * 0.1
+    conv = torch.randn(SLOTS, 3 * heads * HEAD_DIM, 3, device="cuda").to(torch.bfloat16)
     if fresh:
         rec.zero_(), conv.zero_()
     return rec, conv
@@ -184,7 +189,7 @@ def test_kda_prefill_stress(case, fp32_matmul):
 
 def _compare(kda, x, spans, fresh):
     """The fused prefill against the fp32 oracle and the served path, on every pool slot."""
-    rec, conv = _pools(fresh)
+    rec, conv = _pools(fresh, heads=kda.num_heads)
     rec_o, conv_o = rec.clone(), conv.clone()
     oracle = _reference(kda, x, spans, rec_o, conv_o)
     rec_s, conv_s = rec.clone(), conv.clone()
@@ -200,6 +205,15 @@ def _compare(kda, x, spans, fresh):
     untouched = [i for i in range(SLOTS) if i not in touched]
     assert torch.equal(rec[untouched], rec_o[untouched])
     assert torch.equal(conv[untouched], conv_o[untouched])
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+@pytest.mark.parametrize("lengths", [(3,), (5, 64, 1, 130, 2, 700)])
+def test_kda_prefill_full_rank_gate(lengths, fresh, fp32_matmul):
+    """Kimi K3.1's full-rank output gate, read from the projection row by the output norm."""
+    spans, tokens = _spans(lengths)
+    x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    _compare(_kda(heads=K31_HEADS, full_rank=True), x, spans, fresh)
 
 
 def test_kda_prefill_continue_then_decode(fp32_matmul):
@@ -280,12 +294,14 @@ def _bind(kda, rec, conv, plan, kernels):
     kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
 
 
+@GATES
 @pytest.mark.parametrize("batch", [1, 32])
-def test_kda_decode_matches_reference(batch):
-    heads, head_dim, hidden, slots = 8, 128, 4096, 40
+def test_kda_decode_matches_reference(batch, heads, full_rank):
+    head_dim, slots = 128, 40
+    hidden = K31_HIDDEN if full_rank else HIDDEN
     kda = ParallelKimiDeltaAttention(KDAConfig(
-        hidden_size=hidden, num_heads=heads, head_dim=head_dim),
-        dtype=torch.bfloat16).cuda()
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim,
+        full_rank_output_gate=full_rank), dtype=torch.bfloat16).cuda()
     _randomize(kda, 0)
     kda.process_weights_after_loading("cuda")
     # the pool is V-first, [H, V, K]; the reference step is K-first
@@ -361,10 +377,11 @@ def _verify_plan(slots, block):
 def _verify(bundle, layer, x, pool, plan):
     proj = F.linear(x, layer._in_proj_weight)
     p, h, d = layer.qkv_dim, layer.num_heads, layer.head_dim
+    gate = p if layer.full_rank_output_gate else d
     return bundle.run_verify(
         proj[:, :3 * p], proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p:3 * p + h], plan,
         pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), layer.params(),
-        gate=proj[:, 3 * p + h + d:3 * p + h + 2 * d],
+        gate=proj[:, 3 * p + h + d:3 * p + h + d + gate],
     )
 
 
@@ -376,11 +393,13 @@ def _after_verdict(pool, slots, accepted):
 
 
 @torch.no_grad()
+@GATES
 @pytest.mark.parametrize("block", [1, 2, 4])
 @pytest.mark.parametrize("batch", [1, 64])
-def test_kda_verify_matches_reference(block, batch):
-    """One TP8 rank's KDA layer (8 heads of 128) over four verify steps with random verdicts."""
-    cfg = KDAConfig(hidden_size=4096, num_heads=8, head_dim=128)
+def test_kda_verify_matches_reference(block, batch, heads, full_rank):
+    """One TP8 rank's KDA layer over four verify steps with random verdicts."""
+    cfg = KDAConfig(hidden_size=4096, num_heads=heads, head_dim=128,
+                    full_rank_output_gate=full_rank)
     layer = _layer(cfg, "cuda", torch.bfloat16)
     ker = _pool(layer, 70, 3, "cuda", torch.bfloat16)
     ref = _clone(ker)
@@ -401,3 +420,48 @@ def test_kda_verify_matches_reference(block, batch):
         accepted = torch.randint(0, block, (batch,), device="cuda", generator=gen)
         _after_verdict(ker, slots, accepted)
         _after_verdict(ref, slots, accepted)
+
+
+# -- decode under a CUDA graph ----------------------------------------------------
+
+
+@torch.no_grad()
+@GATES
+def test_kda_decode_replays_under_a_cuda_graph(heads, full_rank):
+    """A decode step captured at 8 rows, as the engine captures a bucket, replays with new
+    tokens and slots: 5 live rows and 3 padding rows on the sink slot 0, against the torch
+    reference run eager on the live rows."""
+    rows, live, slots, head_dim = 8, 5, 24, 128
+    hidden = K31_HIDDEN if full_rank else HIDDEN
+    kda = ParallelKimiDeltaAttention(KDAConfig(
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim,
+        full_rank_output_gate=full_rank), dtype=torch.bfloat16).cuda()
+    _randomize(kda, 1)
+    kda.process_weights_after_loading("cuda")
+    rec = torch.randn(slots, heads, head_dim, head_dim, device="cuda") * 0.1
+    conv = torch.randn(slots, 3 * heads * head_dim, 3, device="cuda").to(torch.bfloat16)
+    slot_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    x = torch.zeros(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    _bind(kda, rec, conv, _decode_plan(slot_ids), kda_triton.TritonKDAKernels())
+    kda(x, 0)  # compiles the kernels, as the engine's warm-up does
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = kda(x, 0)
+
+    reference = ParallelKimiDeltaAttention(KDAConfig(
+        hidden_size=hidden, num_heads=heads, head_dim=head_dim,
+        full_rank_output_gate=full_rank), dtype=torch.bfloat16).cuda()
+    reference.load_state_dict(kda.state_dict())
+    reference.process_weights_after_loading("cuda")
+    rec_ref, conv_ref = rec.clone(), conv.clone()
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    for step in range(3):
+        live_slots = torch.randperm(slots - 1, device="cuda", generator=gen)[:live] + 1
+        slot_ids.zero_()[:live] = live_slots.to(torch.int32)
+        x.copy_(torch.randn(rows, hidden, device="cuda", generator=gen))
+        graph.replay()
+        _bind(reference, rec_ref, conv_ref, _decode_plan(live_slots), TorchKDAKernels())
+        want = reference(x[:live], 0)
+        torch.testing.assert_close(out[:live], want, rtol=2e-2, atol=2e-2, msg=f"step {step}")
+    torch.testing.assert_close(rec[1:], rec_ref[1:], rtol=4e-3, atol=4e-3)
+    torch.testing.assert_close(conv[1:], conv_ref[1:], rtol=0, atol=0)

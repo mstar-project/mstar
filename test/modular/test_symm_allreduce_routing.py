@@ -626,9 +626,21 @@ def test_flashinfer_routing(nccl_calls, flashinfer, message, kernel):
     assert nccl_calls == ([] if kernel else [(message, g.device_group)])
 
 
-def test_compiled_flashinfer_goes_nccl(monkeypatch, nccl_calls, flashinfer):
+def test_compiled_flashinfer_takes_the_op_that_sizes_the_message_itself(monkeypatch, nccl_calls, flashinfer):
+    """Under torch.compile a 2-D bf16 message goes to ``allreduce_flashinfer``, an op Dynamo does not
+    trace into, which picks FlashInfer's kernel or NCCL per call (the workspace's size check is no
+    traceable code); before, every compiled all-reduce went to NCCL, so a compiled region's ran
+    NCCL where the eager forward's ran FlashInfer's kernel."""
+    from mstar.distributed import ar_fusion
+
     g, _, routed = flashinfer
     g._all_reduce = AllReduce.new(g, "flashinfer")
+    ops = []
+    monkeypatch.setattr(ar_fusion, "allreduce_flashinfer", lambda t, ws_id, world: ops.append((t, world)) or t)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    g.all_reduce(_Matrix((8, 4096)))
-    assert routed == []
+    big = _Matrix((65, 4096))
+    assert g.all_reduce(big) is big
+    assert ops == [(big, g.world_size)] and routed == [] and nccl_calls == []
+    other = _Matrix((8, 4096), dtype=torch.float32)
+    g.all_reduce(other)
+    assert nccl_calls == [(other, g.device_group)]

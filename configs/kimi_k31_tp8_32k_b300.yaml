@@ -1,0 +1,40 @@
+model: "kimi_k31"
+# kimi_k31_tp8_32k.yaml on 8x B300 with the small-M GEMM backends measured there: the decode projections (KDA's in/out,
+# the packed MoE input and MLA q_a | kv_a | gate) take the backend the table names per shape and M
+# (benchmark/kernels/k31_dense_gemm.py --table-out on the node), cuBLAS where it names none; without the
+# file at boot, a warning and cuBLAS throughout. Everything else as kimi_k31_tp8_32k.yaml.
+#
+# kimi_k31_tp8.yaml past index_topk, at 32K: K3.1's DSA over the MLA cache's pages (each MLA layer's
+# index keys beside its latents, scored and picked on the device), so decode is captured per batch
+# size as within index_topk. Prompts prefill eager in chunks of prefill_chunk_tokens. A token costs
+# 24 MLA layers x (576 latent + 128 index key) x 2 B = 33 KiB a rank.
+max_seq_len: 32768
+# One request per KDA slot below, as kimi_k31_tp8.yaml.
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  small_m_gemm_table: /workspace/results/k31-gemm/table_b300.json
+  dsa_long_context: true
+  max_seq_len: 32768
+  kda_max_requests: 64
+  prefill_chunk_tokens: 8192
+  # routed experts as kimi_k31_tp8.yaml: FlashInfer's trtllm-gen MXFP4 x MXFP8 MoE with SiTU fused on B200/B300
+  # where its load probe agrees, else Marlin; tactics tuned at load and kept per GPU
+  routed_experts_backend: auto
+resources:
+  kv_cache:
+    # 9216 pages of 128 tokens plus the sink, ~39 GB/rank: 1.18M tokens, 64 requests averaging
+    # 18K or 36 at the full 32K; past that the pool backpressures. A B300 rank has ~68 GB left
+    # after the weights and kimi_k31_tp8.yaml's caches: size this to the headroom measured at load.
+    max_num_pages: 9217
+    page_size: 128
+  kda_state:
+    # 64 requests plus the sink, ~3.7 GB/rank whatever the context
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

@@ -4,6 +4,23 @@ Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 ``message.content``, audio into ``message.audio`` (base64 WAV), images into
 ``image_url`` data-URL content parts.
+
+Usage: ``completion_tokens`` is the reply's sampled token count, from the
+``token_ids`` its text chunks carry (``return_token_ids``, which the handler
+sets for a reply it reports usage on), stop tokens under ``ignore_eos``
+included. The text can't give it back: a special token, or a split the
+tokenizer would not make, re-encodes to fewer tokens (vllm bench serve counted
+Kimi K3.1's 960-token replies as ~845 that way). A streamed reply reports it
+when the request asks (``stream_options.include_usage``) in one last chunk with
+no choices, as vLLM does; ``prompt_tokens`` (and ``total_tokens``) only once a
+model reports its prompt length, so a client keeps its own count rather than
+taking a zero.
+
+finish_reason: ``length`` when the reply's sampled tokens reached the request's
+own limit (``max_completion_tokens``, else ``max_tokens``), ``stop`` otherwise,
+streamed or not, as vLLM reports it. A reply cut by a limit the request didn't
+set (a model's output cap, its context) reads ``stop``: the engine reports no
+reason.
 """
 
 from __future__ import annotations
@@ -35,6 +52,10 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
         if served is not None:
             model_name = served
+        include_usage = _include_usage(req)
+        # every reply counts its tokens: its usage, and its finish_reason against the request's limit
+        model_kwargs = {**(model_kwargs or {}), "return_token_ids": True}
+        limit = _token_limit(req)
         api.submit_request(
             text=args.text,
             file_paths=args.file_paths,
@@ -49,21 +70,57 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
             return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate),
+                _stream_events(batches, model_name, request_id, sample_rate, include_usage=include_usage,
+                               limit=limit),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(model_name, request_id, chunks, sample_rate, limit=limit)
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _token_limit(req) -> int | None:
+    """The reply's token limit the request set: ``max_completion_tokens``, else ``max_tokens``."""
+    limit = getattr(req, "max_completion_tokens", None)
+    return getattr(req, "max_tokens", None) if limit is None else limit
+
+
+def _include_usage(req) -> bool:
+    """A streamed request that asked for its usage (``stream_options.include_usage``)."""
+    return bool(req.stream) and bool((getattr(req, "stream_options", None) or {}).get("include_usage"))
+
+
+class _TokenCount:
+    """A reply's sampled tokens, summed over its text chunks' ``token_ids``; None once a text chunk came without
+    them (a model whose text is not one chunk per sampled token, or a request that didn't ask)."""
+
+    def __init__(self) -> None:
+        self.tokens: int | None = 0
+
+    def add(self, chunk) -> None:
+        if chunk.modality != "text" or self.tokens is None:
+            return
+        ids = (getattr(chunk, "metadata", None) or {}).get("token_ids")
+        self.tokens = None if ids is None else self.tokens + len(ids)
+
+    def finish_reason(self, limit: int | None) -> str:
+        """``length`` once the counted tokens reach the request's limit, else ``stop``."""
+        return "length" if self.tokens is not None and limit is not None and self.tokens >= limit else "stop"
+
+    def usage(self) -> dict | None:
+        """The usage a reply reports, None when its tokens weren't counted."""
+        return None if self.tokens is None else {"completion_tokens": self.tokens}
+
+
+def _build_response(model_name, request_id, chunks, sample_rate, limit=None) -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
+    count = _TokenCount()
     for c in chunks:
+        count.add(c)
         if c.modality == "text":
             text_parts.append(c.data)
         elif c.modality == "audio":
@@ -96,13 +153,15 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": count.finish_reason(limit)}],
+        # the prompt's length is not known here: 0, as before, rather than a guess
+        "usage": {"prompt_tokens": 0, "completion_tokens": count.tokens or 0, "total_tokens": count.tokens or 0},
     }
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate):
+async def _stream_events(batches, model_name, request_id, sample_rate, include_usage=False, limit=None):
     created = now()
+    count = _TokenCount()
 
     def chunk(delta, finish=None) -> str:
         return sse({
@@ -130,6 +189,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         async for batch in batches:
             text_events: list[str] = []
             for c in batch:
+                count.add(c)
                 if c.modality == "text":
                     content = text.feed(c.data)
                     if content:
@@ -167,5 +227,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         yield error(str(exc.detail), exc.status_code)
     if not failed:
         tail = text.flush()
-        yield chunk({**role, "content": tail} if tail else role, finish="stop")
+        yield chunk({**role, "content": tail} if tail else role, finish=count.finish_reason(limit))
+        usage = count.usage() if include_usage else None
+        if usage is not None:
+            yield sse({"id": request_id, "object": "chat.completion.chunk", "created": created,
+                       "model": model_name, "choices": [], "usage": usage})
     yield SSE_DONE

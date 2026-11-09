@@ -36,6 +36,8 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     stop: str | list[str] | None = None
     stream: bool | None = False
+    # OpenAI's {"include_usage": true}: a streamed reply ends with a chunk carrying its usage (serving_chat)
+    stream_options: dict[str, Any] | None = None
 
     # Multimodal output (OpenAI chat-completions ``modalities`` and ``audio``)
     modalities: list[str] | None = None

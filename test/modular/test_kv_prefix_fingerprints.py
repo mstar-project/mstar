@@ -20,7 +20,7 @@ import torch
 from mstar.engine.engine import checkpoint_identity
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.config import AuxPlanes, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
@@ -93,6 +93,8 @@ def test_a_kv_fingerprint_is_the_same_twice():
 @pytest.mark.parametrize("overrides", [
     {"page_size": 32},
     {"prefix_cache_salt": "another tenant"},
+    # DSA's index keys beside the latents
+    {"aux_planes": {"index": AuxPlanes(num_layers=1, width=8)}},
 ])
 def test_a_kv_fingerprint_changes_with_what_a_page_holds(overrides):
     assert _kv().fingerprint() != _kv(**overrides).fingerprint(), (

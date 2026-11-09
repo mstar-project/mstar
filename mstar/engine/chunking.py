@@ -167,6 +167,13 @@ class ChunkingManagement:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._overrides[(node, walk)] = budget
 
+    def chunk_align(self, node_name: str, graph_walk: str) -> int:
+        """The multiple of tokens a row cut mid-way runs in a step of this walk: its policy's
+        ``chunk_align``, or for a combined walk the largest of its walks'."""
+        walks = [walk for (node, walk), combined in self._combined_walk_of.items()
+                 if node == node_name and combined == graph_walk] or [graph_walk]
+        return max(self.policy(node_name, walk).chunk_align for walk in walks)
+
     def min_chunk_tokens(self, budget: int) -> int:
         """The fewest tokens the scheduler cuts a row to under ``budget``, or
         the whole budget when that is smaller. Without a floor, decode rows

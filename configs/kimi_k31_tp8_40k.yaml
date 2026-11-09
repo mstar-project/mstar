@@ -1,0 +1,44 @@
+model: "kimi_k31"
+# kimi_k31_tp8_32k.yaml at 40K, with the prefix cache: a prompt sharing a cached prefix (the SWE
+# workload's 24K of a 32K prompt) restores the KDA state kept at a page boundary under it and reads
+# the latents and index keys on the shared pages, and prefills only the rest. A token costs 24 MLA
+# layers x (576 latent + 128 index key) x 2 B = 33 KiB a rank; a KDA slot, request or snapshot,
+# 69 layers x (12 heads x 128 x 128 fp32 + the conv tail) = 54 MiB a rank.
+max_seq_len: 40960
+# One request per KDA slot below, as kimi_k31_tp8.yaml.
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  dsa_long_context: true
+  max_seq_len: 40960
+  kda_max_requests: 64
+  prefill_chunk_tokens: 8192
+  # routed experts as kimi_k31_tp8.yaml: FlashInfer's trtllm-gen MXFP4 x MXFP8 MoE with SiTU fused on B200/B300
+  # where its load probe agrees, else Marlin; tactics tuned at load and kept per GPU
+  routed_experts_backend: auto
+resources:
+  kv_cache:
+    # 11264 pages of 128 tokens plus the sink, 45.4 GiB/rank: 1.44M tokens, 35 requests at the full
+    # 40K and the cached prefixes beside them; past that the pool evicts cached pages, then
+    # backpressures. Sized on B300: the 32K config (9216 pages) measured 236.2 GiB/rank after load
+    # and 243.1 at the start-up peak, of 268.6 (241824 / 248920 / 275040 MiB); these 2048 more
+    # pages and the snapshots below add 11.6 GiB, leaving ~14 GiB over the peak. Size this to the
+    # headroom measured at load.
+    max_num_pages: 11265
+    page_size: 128
+    # rank 0 decides each hit and the other ranks adopt it, the KDA snapshot with the pages
+    prefix_cache_tp: true
+  kda_state:
+    # 64 requests plus the sink, 3.4 GiB/rank whatever the context
+    max_slots: 65
+    # KDA states at page boundaries for the prefix cache, kept across requests and evicted oldest
+    # first, replies before prompts. A prompt keeps one at each 8K chunk's last page boundary and
+    # one at its cached prefix's end: 64 hold a dozen long prompts. 3.3 GiB/rank.
+    prefix_slots: 64
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

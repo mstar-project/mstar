@@ -225,7 +225,7 @@ def test_target_taps_are_the_layers_output_streams():
     plain = lm.forward
     got: dict[int, torch.Tensor] = {}
     taps = (1, 3)
-    lm.forward = lambda ids, rows=None: plain(ids, rows=rows, aux_layers=taps,
+    lm.forward = lambda ids, rows=None, **kwargs: plain(ids, rows=rows, aux_layers=taps, **kwargs,
                                               aux_sink=lambda j, s: got.__setitem__(taps[j], s.detach().clone()))
     prompt = torch.randint(0, cfg.vocab_size, (13,), generator=torch.Generator().manual_seed(1))
     H.add_request(engine, "a")

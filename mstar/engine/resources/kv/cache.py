@@ -107,13 +107,50 @@ def _kv_scatter_nhd_kernel(
     tl.store(dst + stride_kv, v.to(layer_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _kv_scatter_mla_kernel(
+    layer_ptr, latent_ptr, page_idx_ptr, cache_idx_ptr,
+    stride_page, stride_slot, stride_lt, num_pages, page_size,
+    WIDTH: tl.constexpr, BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    page = tl.load(page_idx_ptr + token).to(tl.int64)
+    slot = tl.load(cache_idx_ptr + token).to(tl.int64)
+    # A bad index would overwrite another page's latents. Compiled in only with TRITON_DEBUG=1.
+    tl.device_assert((page >= 0) & (page < num_pages), "KV page index out of range")
+    tl.device_assert((slot >= 0) & (slot < page_size), "KV slot index out of range")
+    offs = tl.arange(0, BLOCK)
+    mask = offs < WIDTH
+    row = tl.load(latent_ptr + token * stride_lt + offs, mask=mask)
+    tl.store(layer_ptr + page * stride_page + slot * stride_slot + offs, row.to(layer_ptr.dtype.element_ty),
+             mask=mask)
+
+
 @torch.compiler.disable
 def _kv_scatter_mla_eager(
     cache: torch.Tensor, layer_idx: int,
     latent: torch.Tensor,
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
-    cache[layer_idx][page_idx, cache_idx] = latent.to(cache.dtype)
+    layer = cache[layer_idx]
+    tokens = latent.shape[0]
+    if (
+        layer.is_cuda and tokens > 0 and latent.dim() == 2 and latent.stride(1) == 1
+        and layer.stride(2) == 1 and latent.shape[1] == layer.shape[2]
+        and page_idx.is_contiguous() and cache_idx.is_contiguous()
+        and page_idx.numel() == tokens and cache_idx.numel() == tokens
+        and all(t.device == layer.device for t in (latent, page_idx, cache_idx))
+    ):
+        # one launch: index_put's generic indexing kernel took 8.8 us a write at decode (B300, K3.1's
+        # 576-wide latents, 24 a step)
+        width = latent.shape[1]
+        _kv_scatter_mla_kernel[(tokens,)](
+            layer, latent, page_idx, cache_idx,
+            layer.stride(0), layer.stride(1), latent.stride(0), layer.shape[0], layer.shape[1],
+            WIDTH=width, BLOCK=triton.next_power_of_2(width), num_warps=4,
+        )
+        return
+    layer[page_idx, cache_idx] = latent.to(cache.dtype)
 
 
 @torch.compiler.disable
@@ -182,6 +219,16 @@ class KVCache:
             raise NotImplementedError(
                 f"KV layout {cfg.layout} is not recognized."
             )
+        # per-token planes on the same pages: [layer, page, token, width] each
+        if cfg.aux_planes:
+            self._check_ungrouped("aux_planes")
+        self.aux = {
+            name: torch.zeros(
+                planes.num_layers, cfg.max_num_pages, cfg.tokens_per_page, planes.width,
+                dtype=dtype, device=device,
+            )
+            for name, planes in cfg.aux_planes.items()
+        }
 
     def _allocate_groups(self, cfg: PagedKVConfig, device: torch.device, dtype) -> None:
         """One buffer of ``num_units`` equal pages, each holding one page of a group's layers
@@ -294,6 +341,18 @@ class KVCache:
             )
         return self.tensor[layer_idx]
 
+    def aux_view(self, name: str, layer_idx: int) -> torch.Tensor:
+        """One layer of the aux planes ``name``: [max_num_pages, page_size, width]."""
+        return self.aux[name][layer_idx]
+
+    def write_aux(
+        self, name: str, layer_idx: int, rows: torch.Tensor,
+        page_idx: torch.Tensor, cache_idx: torch.Tensor,
+    ) -> None:
+        """Scatter per-token rows ([num_tokens, width]) into the aux planes ``name`` at the
+        (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
+        _kv_scatter_mla_eager(self.aux[name], layer_idx, rows, page_idx, cache_idx)
+
     def read_tokens(
         self, layer_idx: int,
         page_idx: torch.Tensor, cache_idx: torch.Tensor,
@@ -379,14 +438,21 @@ class KVCache:
         dst = torch.as_tensor(dst_pages, dtype=torch.long, device=self.device)
         # The gather is materialized before the scatter, so pages may appear
         # in both src and dst.
-        self.tensor[:, dst] = self.tensor[:, src]
+        for t in (self.tensor, *self.aux.values()):
+            t[:, dst] = t[:, src]
 
     def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
-        """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
+        """Copy tokens [0, end) of one page onto another, every layer (both K and V under
+        NHD) and the aux planes."""
         self._check_ungrouped("copy_slots")
         # Index with slices rather than tensors. Slices need no copy from the host,
         # so the copy doesn't wait on the stream.
-        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        if self.layout == KVLayout.MLA:  # [layer, page, token, latent]
+            self.tensor[:, dst_page, :end] = self.tensor[:, src_page, :end]
+        else:  # [layer, page, K/V, token, ...]
+            self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        for t in self.aux.values():
+            t[:, dst_page, :end] = t[:, src_page, :end]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,

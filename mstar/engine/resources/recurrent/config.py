@@ -353,8 +353,11 @@ class RecurrentStateSpec(NodeResourceSpec):
         return {self.config.kv_cache} if self.config.kv_cache else set()
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
-        # snapshots are keyed by `kv_cache`'s pages, and kept at one rank only
-        return bool(self.config.prefix_slots) and self.config.kv_cache is not None and world_size == 1
+        # snapshots are keyed by `kv_cache`'s pages, so they keep only where that cache opens:
+        # above one rank, only where rank 0 decides its hits (`prefix_cache_tp`) and leases the
+        # snapshot with them
+        del world_size, checkpoint_named
+        return bool(self.config.prefix_slots) and self.config.kv_cache is not None
 
     @property
     def restores_prefix(self) -> bool:

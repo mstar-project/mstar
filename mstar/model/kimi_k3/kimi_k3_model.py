@@ -20,6 +20,7 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    AuxPlanes,
     KVLayout,
     KVSpec,
     NodeResourceSpec,
@@ -28,7 +29,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.dsa.config import DSAConfig, DSASpec
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnConfig,
@@ -42,7 +43,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.kimi_k3.config import (
     ATTN,
     DSA,
@@ -59,6 +60,11 @@ from mstar.model.utils import check_loaded, process_weights_after_loading
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
+
+# Steps of up to this many rows reduce the latent MoE's routed experts in their norm's fused
+# all-reduce + RMSNorm kernel (decode, and verify steps of up to 64 requests x 4 tokens);
+# larger ones (prefill chunks) all-reduce and norm apart.
+AR_FUSION_MAX_TOKENS = 256
 
 # what the conductor and the tokenizer read; the weights stay on the workers
 METADATA_FILES = (
@@ -121,17 +127,28 @@ class KimiK3Model(Model):
     def default_config(**overrides) -> KimiK3ModelConfig:
         return KimiK3ModelConfig.k3(**overrides)
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs):
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None,
+                 prefill_token_buckets: list[int] | None = None,
+                 prefill_capture_batch_sizes: list[int] | None = None, **kwargs):
         self.cache_dir = cache_dir
         self.model_path_hf = kwargs.get("checkpoint_path") or model_path_hf
         overrides = {}
         for key, cast in (("max_seq_len", int), ("dsa_long_context", bool),
-                          ("moe_expert_parallel", bool)):
+                          ("moe_expert_parallel", bool), ("routed_experts_backend", str),
+                          ("routed_experts_autotune", bool), ("routed_experts_tune_tokens", tuple),
+                          ("shared_experts_overlap_max_tokens", int), ("moe_mask_padding", bool),
+                          ("routed_experts_routing", str), ("routed_experts_finalize", str),
+                          ("attn_res_backend", str), ("latent_moe_front", str)):
             if key in kwargs:
                 value = kwargs[key]
                 if cast is bool and not isinstance(value, bool):
                     raise ValueError(f"{key} must be true or false, got {value!r}")  # bool("false")
                 overrides[key] = cast(value)
+        if "shared_experts_overlap" in kwargs:  # routed / shared / off, or a bool (shared / off)
+            value = kwargs["shared_experts_overlap"]
+            if not isinstance(value, (bool, str)):
+                raise ValueError(f"shared_experts_overlap must be routed, shared, off or a bool, got {value!r}")
+            overrides["shared_experts_overlap"] = value
         # a checkpoint whose config.json is not K3 / K3.1 Pro's geometry (a truncated test one)
         strict = kwargs.get("strict_config", True)
         if not isinstance(strict, bool):
@@ -154,6 +171,24 @@ class KimiK3Model(Model):
         # largest that fits the KDA slots, so a config past 64 requests names a longer ladder.
         ladder = kwargs.get("decode_capture_batch_sizes")
         self.decode_capture_batch_sizes = None if ladder is None else tuple(int(b) for b in ladder)
+        # Captured prefill (within index_topk): the packed token counts and row counts it is captured at.
+        # None leaves prefill eager, ~2.2 ms of host work a layer a step whatever its length.
+        self.prefill_token_buckets = (None if prefill_token_buckets is None
+                                      else [int(n) for n in prefill_token_buckets])
+        self.prefill_capture_batch_sizes = (None if prefill_capture_batch_sizes is None
+                                            else tuple(int(b) for b in prefill_capture_batch_sizes))
+        # torch.compile of the tensor glue between the resources (AttnRes reads, norms, the MoE block:
+        # router, SiTU, latent projections), as regions the engine compiles before capture
+        self.compile_glue = bool(kwargs.get("compile_glue", True))
+        # the small-M GEMM backends measured on this GPU (benchmark/kernels/k31_dense_gemm.py --table-out); without
+        # one every projection runs cuBLAS. Loaded where the submodule is built (`_load_small_m_gemm_table`): the
+        # workers get this instance pickled, without running __init__, and the table is their process's
+        table = kwargs.get("small_m_gemm_table")
+        self.small_m_gemm_table = str(table) if table else None
+        # with compile_glue: the AttnRes reads' regions too (their Triton op inside), or only the MLP blocks.
+        # Off: the reads are Triton kernels with the residual add fused, and a region around them added
+        # launches (H200 job 1639, full model: 3,170 a decode step with them, 2,844 without; no faster)
+        self.compile_reads = bool(kwargs.get("compile_reads", False))
         # the KDA conv tail's dtype, which must match the projections' (CPU tests pass fp32)
         self.kda_conv_dtype = kwargs.get("kda_conv_dtype", torch.bfloat16)
         # A prompt runs in chunks of at most this many tokens (one step each), so a 200K-token
@@ -227,6 +262,10 @@ class KimiK3Model(Model):
                     layout=KVLayout.MLA,
                     kv_lora_rank=cfg.kv_lora_rank,
                     qk_rope_head_dim=cfg.mla_cache_kpe,
+                    # dsa_long_context: each MLA layer's index keys on the latents' pages
+                    aux_planes={INDEX_PLANES: AuxPlanes(
+                        num_layers=len(cfg.full_attn_layers), width=cfg.index_head_dim,
+                    )} if cfg.dsa_long_context else {},
                 ),
             ),
             AttentionSpec(
@@ -242,7 +281,11 @@ class KimiK3Model(Model):
                 nodes={"LLM"},
                 config=RecurrentStateConfig(
                     num_layers=len(cfg.kda_layers), blocks=kda_blocks,
-                    max_slots=self.kda_max_requests + 1),  # + the sink
+                    max_slots=self.kda_max_requests + 1,  # + the sink
+                    # prefix reuse: the KDA state at the latent cache's page boundaries, in the
+                    # serving config's `resources: kda_state: prefix_slots`; above one rank where
+                    # the latent cache sets prefix_cache_tp
+                    kv_cache=KV_CACHE),
             ),
             LinearAttnSpec(
                 resource_key=KDA,
@@ -252,8 +295,11 @@ class KimiK3Model(Model):
             ),
         ]
         if cfg.dsa_long_context:
-            specs.append(DSASpec(resource_key=DSA, nodes={"LLM"},
-                                 config=DSAConfig(kv_cache=KV_CACHE, topk=cfg.index_topk)))
+            # past index_topk each query attends its indexer's top index_topk latents; within
+            # it dense MLA is the same computation, which an eager step keeps
+            specs.append(DSASpec(resource_key=DSA, nodes={"LLM"}, config=DSAConfig(
+                kv_cache=KV_CACHE, topk=cfg.index_topk, sm_scale=cfg.softmax_scale,
+                dense_below_topk=True, index_head_dim=cfg.index_head_dim)))
         return specs
 
     def get_chunking_policies(self):
@@ -264,11 +310,19 @@ class KimiK3Model(Model):
 
         if not self.prefill_chunk_tokens:
             return {}
+        # a chunk cut mid-way ends on a 64-token boundary, so the next starts on one: its MLA rows
+        # need no peeling (it replays a packed prefill capture) and its KDA chunks end on the
+        # boundaries a snapshot is stored at
+        from mstar.engine.resources.attn.flashinfer_mla import ROW_ALIGN
+
         return {"LLM": (ChunkingPolicy(walks=("prefill",), chunkable=True,
-                                       max_batch_tokens=self.prefill_chunk_tokens),)}
+                                       max_batch_tokens=self.prefill_chunk_tokens,
+                                       chunk_align=ROW_ALIGN),)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {LABEL: KVLabel(growth=(("decode", "decode_loop"),))}}
+        # keyed by the prompt's ids and the tokens decode samples, for cross-request prefix reuse
+        return {KV_CACHE: {LABEL: KVLabel(growth=(("decode", "decode_loop"),),
+                                          keys=PrefixKeys("text_inputs", ("prefill",), growth=True))}}
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
@@ -440,9 +494,28 @@ class KimiK3Model(Model):
                 node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype)
         return self._submodule_cache[node_name]
 
+    def _load_small_m_gemm_table(self) -> None:
+        """The small-M GEMM table into this process's dispatcher (``small_m_gemm.load_table``), in the process
+        that runs the forward. A table the config names but the host lacks (the B300 configs' path on another
+        machine, or before the node's bench wrote it) is a warning and cuBLAS, not a failed boot."""
+        table = self.small_m_gemm_table
+        if not table:
+            return
+        if not Path(table).is_file():
+            logger.warning("small_m_gemm_table %s is not on this host: every projection runs cuBLAS", table)
+            return
+        from mstar.utils import small_m_gemm
+
+        small_m_gemm.load_table(table)
+        logger.info("small_m_gemm_table %s: %d shapes for capability %s", table,
+                    sum(len(v) for v in small_m_gemm._TABLES.values()), sorted(small_m_gemm._TABLES))
+
     def _create_submodule(self, node_name, device, tp_group=None, autocast_dtype=None):
         if node_name != "LLM":
             return None
+        # B300 job 20261108T003606Z: loaded in __init__, the table reached only the conductor; every worker
+        # projection ran cuBLAS (nvjet) while the config named it
+        self._load_small_m_gemm_table()
         source = self._resolve_checkpoint()
         if source is None:
             logger.info("KimiK3Model: no checkpoint for %r, dummy mode (None).", node_name)
@@ -462,10 +535,27 @@ class KimiK3Model(Model):
         self._load_checkpoint(language_model, source, device)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if (tp_group is not None and tp_group.world_size > 1 and self.config.latent_moe_use_norm
+                and torch.device(device).type == "cuda"):
+            # the latent MoE's routed experts reduce in their norm's kernel (all-reduce + RMSNorm,
+            # FlashInfer's allreduce_fusion); collective over the TP group, and every rank builds
+            # the LLM here.
+            dtype = language_model.model.layers[-1].ffn.routed_expert_norm.weight.dtype
+            tp_group.init_allreduce_fusion(
+                self.config.routed_expert_hidden_size, dtype,
+                max_tokens=AR_FUSION_MAX_TOKENS)
         self.kda_conv_dtype = language_model.kda_conv_dtype()
         logger.info("Loaded Kimi K3 (%s) for %s", "DSA" if self.config.dsa else "dense MLA", node_name)
         return KimiK3LLMSubmodule(language_model=language_model, config=self.config,
-                                  decode_capture_batch_sizes=self.decode_capture_batch_sizes)
+                                  decode_capture_batch_sizes=self.decode_capture_batch_sizes,
+                                  compile_glue=self.compile_glue, compile_reads=self.compile_reads,
+                                  prefill_token_buckets=self.prefill_token_buckets,
+                                  prefill_capture_batch_sizes=self.prefill_capture_batch_sizes)
+
+    def checkpoint_path(self) -> str | None:
+        """The checkpoint directory: the prefix cache roots its keys in its index and config, so
+        the cache opens without a ``prefix_cache_salt``."""
+        return self._resolve_checkpoint()
 
     def _resolve_checkpoint(self) -> str | None:
         from mstar.model.utils import resolve_checkpoint
@@ -483,7 +573,17 @@ class KimiK3Model(Model):
         loaded = KimiK3ModelConfig.from_hf_config(
             json.loads(path.read_text()), strict=False, max_seq_len=self.config.max_seq_len,
             dsa_long_context=self.config.dsa_long_context,
-            moe_expert_parallel=self.config.moe_expert_parallel)
+            moe_expert_parallel=self.config.moe_expert_parallel,
+            routed_experts_backend=self.config.routed_experts_backend,
+            routed_experts_autotune=self.config.routed_experts_autotune,
+            routed_experts_tune_tokens=self.config.routed_experts_tune_tokens,
+            shared_experts_overlap=self.config.shared_experts_overlap,
+            shared_experts_overlap_max_tokens=self.config.shared_experts_overlap_max_tokens,
+            moe_mask_padding=self.config.moe_mask_padding,
+            routed_experts_routing=self.config.routed_experts_routing,
+            routed_experts_finalize=self.config.routed_experts_finalize,
+            attn_res_backend=self.config.attn_res_backend,
+            latent_moe_front=self.config.latent_moe_front)
         if loaded != self.config:
             raise ValueError(f"{source}/config.json is not the model the resources were declared for")
 

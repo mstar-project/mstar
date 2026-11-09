@@ -23,7 +23,7 @@ the two ranks' tokens and picks compared, and its prefill rows against the tp1 r
 weights than the engine's (the bf16 cut of an MXFP4 cut: what the packing stands for); ``--compare``
 prints the prefill rows against another run's. ``--mode capture``: decode replayed from its captured
 graphs against the same decode eager, teacher-forced on the eager tokens (4 rows, an exact bucket,
-and 3, padded). Exits nonzero on any failed check.
+and 3, padded); with ``--dsa`` past ``--dsa-topk``, the captured DSA decode. Exits nonzero on any failed check.
 
     python test/kimi_k3/gpu_truncated_parity.py --ckpt <dir> --mode tp1 --out tp1.pt
     python test/kimi_k3/gpu_truncated_parity.py --ckpt <dir> --mode tp2 --out tp2.pt --tp1 tp1.pt
@@ -65,22 +65,59 @@ def _empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def force_small_m_backends(sub) -> dict:
+    """Route every small-M GEMM of ``sub`` (its shapes as this process holds them: a TP rank's own) to
+    FlashInfer: bf16 products on ``tinygemm`` up to 8 rows and ``cublaslt`` up to 64, fp32 ones on
+    ``cublaslt`` (H200 has neither ``tgv`` nor ``cute-dsl``), by loading a table of exactly those shapes.
+    A table keyed by TP8 shapes never hits a TP1 or TP2 cut. Returns the shapes."""
+    import json
+    import tempfile
+
+    from mstar.utils import small_m_gemm
+
+    shapes = {}
+    for mod in sub.modules():
+        for attr, out in (("_in_proj_weight", "bf16"), ("_qkv_a_g_weight", "bf16"), ("_in_weight", "fp32"),
+                          ("_out_weight", "bf16")):
+            w = getattr(mod, attr, None)
+            if isinstance(w, torch.Tensor) and w.dim() == 2:
+                shapes[(int(w.shape[0]), int(w.shape[1]), out)] = attr
+        o_proj = getattr(mod, "o_proj", None)
+        if hasattr(mod, "_project_out") and o_proj is not None and getattr(mod, "tp_size", 1) > 1:
+            shapes[(int(o_proj.weight.shape[0]), int(o_proj.weight.shape[1]), "bf16")] = "kda o_proj"
+    entries = []
+    for (n, k, out) in shapes:
+        rows = [(8, "fi_tinygemm"), (64, "fi_cublaslt")] if out == "bf16" else [(64, "fi_cublaslt")]
+        entries += [{"n": n, "k": k, "out": out, "m": m, "backend": b} for m, b in rows]
+    cap = list(torch.cuda.get_device_capability())
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"capability": cap, "entries": entries}, f)
+    small_m_gemm.load_table(f.name)
+    print(f"small_m_gemm forced on {len(shapes)} shapes: {sorted(shapes)}", flush=True)
+    return shapes
+
+
 def build(ckpt: str, device: str, overrides: dict | None = None, group=None, groups=None,
-          dtype: torch.dtype = torch.bfloat16):
-    """``(engine, model)`` with the checkpoint loaded through ``KimiK31Model.get_submodule``."""
+          dtype: torch.dtype = torch.bfloat16, page_size: int | None = None, prefix_slots: int = 0,
+          prefill_buckets: list[int] | None = None, force_small_m: bool = False, model_kwargs: dict | None = None):
+    """``(engine, model)`` with the checkpoint loaded through ``KimiK31Model.get_submodule``. ``page_size``:
+    the latent cache's, as a serving config sets it; ``prefix_slots``: the prefix cache open, rooted in
+    the checkpoint, with that many KDA snapshots; ``model_kwargs``: serving model kwargs (--model-kwargs)."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import WorkerParallelGroups
     from mstar.engine.engine import Engine
     from mstar.engine.resources.kv import manager as kv_mod
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
-    from mstar.model.kimi_k3.config import SAMPLER
+    from mstar.model.kimi_k3.config import KDA_STATE, KV_CACHE, SAMPLER
     from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
     from mstar.model.kimi_k3.tests import engine_helpers as H
     from mstar.quantization.scope import load_submodule
 
     kv_mod.KVTransferManager = H._StubTransfer  # one engine, nothing to transfer
     model = KimiK31Model(ckpt, strict_config=False, kda_max_requests=4, tokenizer_mode="byte",
-                         kda_conv_dtype=dtype)
+                         kda_conv_dtype=dtype, **(model_kwargs or {}), **({"prefill_token_buckets": prefill_buckets,
+                                                  "prefill_capture_batch_sizes": (1, 2, 4)}
+                                                 if prefill_buckets else {}))
     if overrides:
         model.config = dataclasses.replace(model.config, **overrides)
         model._check_checkpoint_config = lambda source: None  # the overrides are deliberate
@@ -89,13 +126,28 @@ def build(ckpt: str, device: str, overrides: dict | None = None, group=None, gro
     # the step's logits come back as a row output: a captured decode replays the graph, not the
     # sampler's Python, so a list the sampler appends to would hold the last eager step's (job 1461)
     sub.__class__ = _logits_submodule_class()
+    if force_small_m:
+        force_small_m_backends(sub)
+    if model.config.dsa_long_context:
+        # the DSA picks are recorded from Python (generate), which a captured decode skips: this case
+        # decodes eager; --mode capture --dsa checks the captured DSA decode against it
+        sub.get_accelerator_graph_configs = lambda *args, **kwargs: []
     block = next(m for m in sub.modules() if hasattr(m, "experts_packed"))
     print(f"experts: {block.experts_packed.name if block.experts_packed else 'bf16'}", flush=True)
     engine = Engine(None, autocast_dtype=dtype)
     if groups is None:
         groups = WorkerParallelGroups(num_workers=1, global_rank=0)
+    specs = model.get_node_resources()
+    for spec in specs:
+        if spec.resource_key == KV_CACHE and page_size:
+            # above one rank the prefix cache opens only with rank 0 deciding the hits (prefix_cache_tp)
+            tp = bool(prefix_slots) and group is not None and group.world_size > 1
+            spec.apply_yaml_overrides(page_size=page_size, **({"prefix_cache_tp": True} if tp else {}))
+        elif spec.resource_key == KDA_STATE and prefix_slots:
+            spec.apply_yaml_overrides(prefix_slots=prefix_slots)
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(), parallel_groups=groups, device=torch.device(device),
+        {"LLM": sub}, specs, parallel_groups=groups, device=torch.device(device),
+        model=model if prefix_slots else None,
         transfer_engine_info=TransferEngineInfo(
             my_entity_id=f"e{device}", my_session_id="s", transfer_engine=LocalTransferEngine("localhost")),
         kv_cache_type=dtype)
@@ -130,6 +182,24 @@ def _step(engine, walk: str, inputs: dict[str, torch.Tensor]) -> tuple[dict, dic
     return tokens, logits
 
 
+def _slots_to_positions(selection: torch.Tensor, ctx) -> torch.Tensor:
+    """The paged DSA resource's picks (``[rows, topk]`` MLA-cache slots, entries past each row's
+    ``attn_lens`` unused) as request-local key positions, -1 padded: a slot's page is the request's
+    ``i``-th, so its position is ``i * page_size + offset``. An eager step's context only."""
+    sel = selection.detach().cpu()
+    pages = ctx.pages.cpu().tolist()
+    starts = [*ctx.host_page_start, len(pages)]
+    lens = ctx.attn_lens()
+    out = torch.full_like(sel, -1)
+    for r0, n, req in ctx.spans:
+        index = {page: i for i, page in enumerate(pages[starts[req]:starts[req + 1]])}
+        for r in range(r0, r0 + n):
+            live = sel[r, :lens[r]].tolist()
+            out[r, :len(live)] = torch.tensor(
+                [index[s // ctx.page_size] * ctx.page_size + s % ctx.page_size for s in live], dtype=out.dtype)
+    return out
+
+
 def generate(engine, prompts: dict[str, torch.Tensor], steps: int, chunk: int | None = None) -> dict[str, dict]:
     """Batched greedy: per request, the tokens, each step's logits and the DSA picks of every row
     that picked (``dsa[query position][layer]``, request-local key positions, -1 padding). With
@@ -144,10 +214,11 @@ def generate(engine, prompts: dict[str, torch.Tensor], steps: int, chunk: int | 
     dsa = engine._resources.get("dsa")
     if dsa is not None:
         select = dsa.select
+        mla_layers = engine._submodules["LLM"].submodule.config.full_attn_layers
 
-        def recording(layer_idx, q, weights, label="main"):
-            selection = select(layer_idx, q, weights, label=label)
-            picks.append((layer_idx, selection.detach().cpu()))
+        def recording(plane, q, weights, group=None, label=None):
+            selection = select(plane, q, weights, group=group, label=label)
+            picks.append((mla_layers[plane], _slots_to_positions(selection, dsa.current(label))))
             return selection
 
         dsa.select = recording
@@ -404,7 +475,9 @@ def run_cases(args, device: str, group=None, groups=None) -> list[tuple]:
     """Dense, then DSA past the top-k: ``(name, config, runs, use_dsa)``."""
     cases = []
     if not args.skip_dense:
-        engine, model = build(args.ckpt, device, dtype=args.dtype, group=group, groups=groups)
+        engine, model = build(args.ckpt, device, dtype=args.dtype, group=group, groups=groups,
+                              prefill_buckets=args.prefill_buckets, force_small_m=args.force_small_m,
+                              model_kwargs=json.loads(args.model_kwargs or "{}"))
         cfg = model.config
         print(f"config: {cfg.num_hidden_layers} layers, kda {cfg.kda_layers}, mla {cfg.full_attn_layers}, "
               f"{cfg.num_experts} experts", flush=True)
@@ -418,6 +491,7 @@ def run_cases(args, device: str, group=None, groups=None) -> list[tuple]:
         raise SystemExit(f"the DSA case never passes top-k {args.dsa_topk}: prompts of {length} tokens and "
                          f"{args.steps} steps (raise --steps or --dsa-prompt-len)")
     engine, model = build(args.ckpt, device, overrides=_dsa_overrides(args, length), dtype=args.dtype,
+                          force_small_m=args.force_small_m, model_kwargs=json.loads(args.model_kwargs or "{}"),
                           group=group, groups=groups)
     print(f"dsa: index_topk {model.config.index_topk}, prompts of {length} tokens"
           f"{f', prefill in chunks of {args.prefill_chunk}' if args.prefill_chunk else ''}", flush=True)
@@ -551,7 +625,7 @@ def _logits_submodule_class():
         """The submodule, its logits emitted beside the tokens so a replay's can be read back."""
 
         def forward_batched(self, graph_walk, engine_inputs, input_ids, **kwargs):
-            logits = self._logits(graph_walk, engine_inputs, input_ids)
+            logits = self._logits(graph_walk, engine_inputs, input_ids, kwargs.get("num_valid_tokens"))
             tokens = engine_inputs.resources["sampler"].sample(engine_inputs.request_ids, logits=logits)
             return BatchedModelOutput(row_outputs={"new_token": tokens, "logits": logits},
                                       check_stop_buffers={"new_token": tokens})
@@ -577,9 +651,22 @@ class Stepper:
 
         kv_mod.KVTransferManager = H._StubTransfer
         self.dev = torch.device(args.engine_device)
-        model = KimiK31Model(args.ckpt, strict_config=False, kda_max_requests=8, tokenizer_mode="byte")
+        buckets = getattr(args, "prefill_buckets", None)
+        model = KimiK31Model(args.ckpt, strict_config=False, kda_max_requests=8, tokenizer_mode="byte",
+                             **json.loads(getattr(args, "model_kwargs", None) or "{}"),
+                             **({"prefill_token_buckets": buckets, "prefill_capture_batch_sizes": (1, 2, 4)}
+                                if buckets else {}))
+        if buckets and model.config.context_limit < 512:  # a tiny dry-run cut's top-k: room for the cases
+            model.config = dataclasses.replace(model.config, index_topk=1024, max_seq_len=1024)
+            model._check_checkpoint_config = lambda source: None
+        if args.dsa:  # past --dsa-topk keys every row selects: the prompts' prefill and the decode
+            longest = max(length for _, length in PROMPT_SEEDS)
+            model.config = dataclasses.replace(model.config, **_dsa_overrides(args, longest))
+            model._check_checkpoint_config = lambda source: None
         sub = load_submodule(model, "LLM", {}, self.dev, autocast_dtype=args.dtype)
         sub.__class__ = _logits_submodule_class()
+        if getattr(args, "force_small_m", False):
+            force_small_m_backends(sub)
         specs = model.get_node_resources()
         by_key = resolve_spec_dependencies(specs)
         self.resources = {}
@@ -588,6 +675,9 @@ class Stepper:
                 spec.config.max_num_pages = 256
             info = EngineResourceInfo(device=self.dev, dependencies={k: by_key[k] for k in spec.depends_on()})
             self.resources[spec.resource_key] = build_resource(spec, info)
+        for spec in specs:  # as Engine.load_model: DSA reads its KV cache's pages
+            self.resources[spec.resource_key].bind_dependencies(
+                {k: self.resources[k] for k in spec.depends_on()})
         if self.dev.type == "cpu":  # a dry run: the sampler's kernels are GPU-only
             self.resources["sampler"] = H.GreedySampler()
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
@@ -622,7 +712,11 @@ class Stepper:
         node_inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
                        for rid, ids in inputs.items()]
         real_inputs = list(node_inputs)
-        lease = self.cg.lease_slot(walk, bs=len(rids), slot=0) if captured else None
+        # the capture the engine would pick: under dsa_long_context, dense or selecting by the rows' contexts
+        key = self.sub.cg_key_info(walk, infos)
+        tokens = sum(inp.input_seq_len for inp in node_inputs) if walk == "prefill" else None
+        lease = (self.cg.lease_slot(walk, bs=len(rids), slot=0, num_tokens=tokens, cg_key_info=key)
+                 if captured else None)
         if captured and lease is None:
             raise RuntimeError(f"no captured {walk} graph fits {len(rids)} rows")
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False, slot_lease=lease)
@@ -635,8 +729,10 @@ class Stepper:
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        # as the engine stages a padded step: the real rows' token count (a model may mask the rest)
         ei = ModelInputsFromEngine(request_ids=padded, per_request_info=infos, resources=self.resources,
-                                   captured=lease is not None, step=step)
+                                   captured=lease is not None, step=step,
+                                   real_seq_len=sum(inp.input_seq_len for inp in real_inputs))
         pre = self.sub.preprocess(walk, ei, node_inputs)
         with torch.no_grad():
             raw = self.cg.run_forward(lease, pre) if lease is not None else self.sub.forward_batched(walk, ei, **pre)
@@ -753,6 +849,91 @@ def mode_capture(args) -> int:
     return _report(failures)
 
 
+def mode_prefill_capture(args) -> int:
+    """Prefill replayed from its packed captures (``prefill_token_buckets``) against the same prefill run
+    eager, then decode teacher-forced on the eager run's tokens from what each left. An exact bucket (one
+    256-token row) runs the eager step's kernels at its shape: the replay must be the eager step. A padded
+    one (fewer tokens than the bucket, or rows) may move the real rows as far as a real neighbour row does
+    eager, never flip a decisive step. A continuation chunk replays past the context an eager chunk wrote,
+    where that ends on a 64-key boundary (``KimiK3LLMSubmodule.can_replay``)."""
+    failures: list[str] = []
+    args.prefill_buckets = [64, 128, 256, 512]
+    st = Stepper(args)
+    vocab = st.model.config.vocab_size
+    high = min(vocab, 160000)
+
+    def ids(n: int, seed: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(seed)
+        return torch.randint(min(1000, high // 4), high, (n,), generator=g).to(st.dev)
+
+    def run(prefix: str, prompts: dict, captured: bool, head: dict | None = None, steps: int = 4, feed=None):
+        """Prefill ``prompts`` (after ``head``, prefilled eager first, if given), then ``steps`` decodes fed
+        ``feed`` (the eager run's tokens) or their own; the prefill's and each decode's logits."""
+        rids = {r: f"{prefix}{r}" for r in prompts}
+        if head is not None:
+            st.step("prefill", {rids[r]: h for r, h in head.items()}, captured=False)
+        tok, logits = st.step("prefill", {rids[r]: p for r, p in prompts.items()}, captured=captured)
+        rows, tokens = [logits], [tok]
+        for k in range(steps):
+            src = tokens[-1] if feed is None else feed[k]
+            tok, logits = st.step("decode", {rids[r]: src[i:i + 1] for i, r in enumerate(prompts)},
+                                  captured=st.dev.type != "cpu")
+            rows.append(logits)
+            tokens.append(tok)
+        st.remove(list(rids.values()))
+        return rows, tokens
+
+    def compare(name: str, got: list, ref: list) -> dict:
+        diffs = [_max_err(g, r).max().item() for g, r in zip(got, ref, strict=True)]
+        sure = [(r.topk(2, dim=-1).values[:, 0] - r.topk(2, dim=-1).values[:, 1]) > 0.5 for r in ref]
+        flips = sum(int((g.argmax(-1) != r.argmax(-1))[m].sum()) for g, r, m in zip(got, ref, sure, strict=True))
+        row = {"case": name, "prefill_max_diff": round(diffs[0], 4), "decode_max_diff": round(max(diffs[1:]), 4),
+               "decisive": sum(int(m.sum()) for m in sure), "flips": flips}
+        print(json.dumps(row), flush=True)
+        return row
+
+    captured = st.dev.type != "cpu"
+    cases = [
+        ("exact_1x256", {"a": ids(256, 1)}, None, True),
+        ("padded_1x200", {"a": ids(200, 2)}, None, False),
+        ("padded_3rows", {"a": ids(100, 3), "b": ids(70, 4), "c": ids(60, 5)}, None, False),
+        # a chunk past the 256 tokens an eager chunk wrote: on a 64-key boundary, so it replays
+        ("continuation_150_after_256", {"a": ids(150, 6)}, {"a": ids(256, 7)}, False),
+    ]
+    from mstar.model.submodule_base import ARNodeInputs
+
+    # past a cut the scheduler made mid-way the MLA plan peels the row, which no capture holds: eager
+    off = ARNodeInputs(input_seq_len=150, chunk_start=200)
+    if captured and st.sub.can_replay("prefill", [off]):
+        failures.append("a prefill row starting 200 keys in would replay a capture its peeled plan overflows")
+    padded, spreads = [], []
+    for name, prompts, head, exact in cases:
+        eager, eager_tokens = run("e", prompts, False, head)
+        replay, _ = run("c", prompts, captured, head, feed=eager_tokens)
+        row = compare(f"prefill_capture/{name}", replay, eager)
+        if exact:
+            if row["prefill_max_diff"] > 0.25 or row["flips"]:
+                failures.append(f"{name}: the replay of an exact bucket is off the eager step ({row})")
+            continue
+        # a real neighbour row in the padding's place, eager: how far a row's neighbours move it
+        filler = {"z": ids(48, 8)}
+        beside, _ = run("f", {**prompts, **filler}, False,
+                        None if head is None else {**head, "z": ids(16, 9)}, feed=[
+                            torch.cat([t, t[:1]]) for t in eager_tokens[:4]])
+        n = len(prompts)
+        neighbour = compare(f"prefill_capture/{name}/eager_neighbour", [b[:n] for b in beside], eager)
+        padded.append((name, row))
+        spreads.append(max(neighbour["prefill_max_diff"], neighbour["decode_max_diff"]))
+    # One neighbour row is one draw of the bf16 noise a row's company moves it by (job 1733: 0.08 to 1.41
+    # across the cases); a padded replay may move a row as far as the run's real neighbours do, never flip
+    # a decisive step.
+    bound = max([0.25, *(1.5 * s for s in spreads)])
+    for name, row in padded:
+        if row["flips"] or max(row["prefill_max_diff"], row["decode_max_diff"]) > bound:
+            failures.append(f"{name}: the padded replay moves the rows past real neighbours' {bound:.3g} ({row})")
+    return _report(failures)
+
+
 def _moe_neighbour_probe(st) -> dict:
     """One MoE layer alone on 4 tokens: tokens 0-2 fixed, token 3 drawn twice. Rows 0-2 come out
     bitwise equal unless the experts' kernels round a token by its neighbours' routing."""
@@ -781,7 +962,7 @@ def _configs(args):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--mode", choices=("tp1", "tp2", "capture"), default="tp1")
+    ap.add_argument("--mode", choices=("tp1", "tp2", "capture", "prefill-capture"), default="tp1")
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tp1", help="the tp1 run's --out, for --mode tp2")
@@ -793,9 +974,16 @@ def main() -> int:
     ap.add_argument("--dsa-prompts", type=int, default=2, help="prompts of --dsa-prompt-len")
     ap.add_argument("--prefill-chunk", type=int, default=0, help="prefill the DSA case in chunks of this many tokens")
     ap.add_argument("--skip-dense", action="store_true", help="the DSA case alone")
+    ap.add_argument("--dsa", action="store_true",
+                    help="--mode capture with DSA past --dsa-topk: captured DSA decode against it eager")
     ap.add_argument("--engine-device", default="cuda:0")
+    ap.add_argument("--prefill-buckets", type=lambda v: [int(n) for n in v.split(",")], default=None,
+                    help="capture prefill at these packed token counts (within index_topk): the engine replays them")
+    ap.add_argument("--force-small-m", action="store_true",
+                    help="route every small-M GEMM to FlashInfer at the shapes each process holds")
     ap.add_argument("--ref-device", default="cuda:1")
     ap.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    ap.add_argument("--model-kwargs", default="", help="JSON serving model kwargs for the engine's model, every mode")
     # CPU: the FlashInfer stub and no CUDA (a tiny checkpoint's dry run, or the fp32 check)
     ap.add_argument("--cpu", "--cpu-dry-run", dest="cpu", action="store_true")
     args = ap.parse_args()
@@ -804,7 +992,8 @@ def main() -> int:
     torch.set_float32_matmul_precision("highest")
     if args.cpu:
         _cpu_stubs()
-    return {"tp1": mode_tp1, "tp2": mode_tp2, "capture": mode_capture}[args.mode](args)
+    return {"tp1": mode_tp1, "tp2": mode_tp2, "capture": mode_capture,
+            "prefill-capture": mode_prefill_capture}[args.mode](args)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ experts' SiTU-GLU reaches the 4-bit path (CPU: its per-expert reference; CUDA: t
 kernel's activation spec, ``test_components``). At TP2 over gloo each rank holds its
 intermediate slice of the packed experts."""
 import datetime
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -154,12 +155,12 @@ class _Allocations(torch.utils._python_dispatch.TorchDispatchMode):
         return out
 
 
-def _load(path):
+def _load(path, **kwargs):
     from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
     from mstar.quantization.scope import load_submodule
 
     model = KimiK31Model(str(path), strict_config=False, kda_max_requests=4, tokenizer_mode="byte",
-                         kda_conv_dtype=torch.float32)
+                         kda_conv_dtype=torch.float32, **kwargs)
     with _Allocations() as allocs:
         sub = load_submodule(model, "LLM", {}, "cpu", autocast_dtype=torch.bfloat16)
     return sub, model, allocs.made
@@ -219,20 +220,90 @@ def test_the_scales_are_marked_unloaded_once_they_exist(tmp_path):
             scope.finish(lm)
 
 
-def test_on_a_blackwell_gpu_the_situ_experts_take_the_triton_kernel(tmp_path, monkeypatch):
-    """B300 04c: FlashInfer's trtllm-gen has no MXFP4 x bf16 SiTU GEMM ("No kernel found" at the first
-    decode), so on a GPU where its FP4 MoE is otherwise available the W4A16 SiTU experts stay on the
-    Triton kernel instead of being converted to its layout."""
-    from mstar.utils.fused_moe import fp4_flashinfer
+class _Selection:
+    """``experts_after_load``'s collaborators on a pretend B200/B300: FlashInfer's FP4 MoE available, its probe's
+    verdict ``probe``; records what converted the experts and the backend lines logged."""
 
+    def __init__(self, monkeypatch, block, probe=(None, "probe rel L2 0.03 vs Triton W4A16"), available=True):
+        from mstar.model.components import moe
+        from mstar.utils.fused_moe import fp4_flashinfer
+
+        self.converted, self.marlin, self.probed, self.lines = [], [], [], []
+        monkeypatch.setattr(fp4_flashinfer, "unavailable_reason",
+                            lambda device: None if available else "FlashInfer's TRT-LLM FP4 MoE runs on sm_100")
+
+        def probed(block_, device, activation, routing=None):
+            self.probed.append(activation if routing is None else f"{activation}+routing")
+            return probe
+
+        self.kernel = SimpleNamespace(routing=None)
+
+        def convert(block_, device, activation="bf16"):
+            self.converted.append(activation)
+            return self.kernel
+
+        monkeypatch.setattr(fp4_flashinfer, "probe", probed)
+        monkeypatch.setattr(fp4_flashinfer, "_PROBED", {})
+        self.tuned = []
+        monkeypatch.setattr(fp4_flashinfer, "autotune", lambda block_, kernel, device, tokens, skip_invalid: (
+            self.tuned.append((tokens, skip_invalid)) or "autotuned (stub)"))
+        monkeypatch.setattr(fp4_flashinfer.TrtllmFp4Experts, "convert", convert)
+        monkeypatch.setattr(block, "_experts_to_marlin", lambda: self.marlin.append(True))
+        monkeypatch.setattr(moe, "_EXPERTS_BACKEND_LOGGED", set())
+        monkeypatch.setattr(moe.logger, "info", lambda msg, *a: self.lines.append(msg % a))
+        monkeypatch.setattr(moe.logger, "warning", lambda msg, *a: self.lines.append(msg % a))
+
+
+def _experts_block(sub):
+    return next(m for m in sub.language_model.modules() if getattr(m, "experts_packed", None) is not None)
+
+
+def test_on_a_blackwell_gpu_the_situ_experts_take_flashinfers_mxfp4_x_mxfp8_moe(tmp_path, monkeypatch):
+    """vLLM's kimi-k31 image serves K3.1's experts on sm_103 with FLASHINFER_TRTLLM_MXFP4_MXFP8: trtllm-gen's MXFP4
+    x MXFP8 MoE, SiTU fused into FC1 (its MXFP4 x bf16 SiTU kernel doesn't exist, B300 04c). Where FlashInfer's
+    FP4 MoE is available and its load probe agrees, the SiTU experts take it with MXFP8 activations, not Marlin;
+    the load logs the backend once, as the B300 kit's kernel grep reads it."""
     make_tiny_release(tmp_path)
     sub, _, _ = _load(tmp_path)
-    block = next(m for m in sub.language_model.modules() if getattr(m, "experts_packed", None) is not None)
-
-    def converted(*args, **kwargs):
-        raise AssertionError("converted for the TRT-LLM FP4 MoE")
-
-    monkeypatch.setattr(fp4_flashinfer, "unavailable_reason", lambda device: None)
-    monkeypatch.setattr(fp4_flashinfer.TrtllmFp4Experts, "convert", converted)
+    block = _experts_block(sub)
+    sel = _Selection(monkeypatch, block)
     block.experts_after_load()
-    assert block._experts_kernel is None
+    # the router in the kernel: its calls carry no sentinel (the padding mask can't reach them), tuned without
+    # the experts probed, then the router inside the kernel (DeepSeekV3 routing from the logits)
+    assert sel.probed == ["mxfp8", "mxfp8+routing"] and sel.converted == ["mxfp8"] and not sel.marlin
+    assert block._experts_kernel is sel.kernel and sel.kernel.routing is not None
+    assert sel.tuned == [(None, False)]  # Kimi tunes by default, over the default buckets, TP (no sentinel)
+    assert any("routing in the kernel (DeepSeekV3, one group)" in line for line in sel.lines), sel.lines
+    assert any("routed-expert backend: FlashInfer trtllm-gen MXFP4 x MXFP8 (" in line for line in sel.lines), sel.lines
+
+
+def test_a_failed_probe_keeps_the_situ_experts_on_marlin(tmp_path, monkeypatch):
+    """No cubin for these dtypes ("No kernel found"), a FlashInfer without the op or a layout mismatch shows only at
+    a launch: the load probe's failure keeps the experts on Marlin under ``auto``, and fails the load under
+    ``trtllm``."""
+    make_tiny_release(tmp_path)
+    sub, _, _ = _load(tmp_path)
+    block = _experts_block(sub)
+    sel = _Selection(monkeypatch, block, probe=("the probe failed: RuntimeError: No kernel found", ""))
+    block.experts_after_load()
+    assert sel.probed == ["mxfp8"] and not sel.converted and sel.marlin
+    assert any("not on FlashInfer's FP4 MoE: the probe failed" in line for line in sel.lines), sel.lines
+    block.routed_experts_backend = "trtllm"
+    with pytest.raises(RuntimeError, match="routed_experts_backend: trtllm.*No kernel found"):
+        block.experts_after_load()
+
+
+def test_routed_experts_backend_forces_either_kernel(tmp_path, monkeypatch):
+    """model_kwargs.routed_experts_backend: ``marlin`` keeps the experts off FlashInfer's FP4 MoE without probing
+    it; ``trtllm`` fails the load where FlashInfer's FP4 MoE isn't available (an H200) instead of falling back."""
+    make_tiny_release(tmp_path)
+    sub, model, _ = _load(tmp_path, routed_experts_backend="marlin")
+    block = _experts_block(sub)
+    assert model.config.routed_experts_backend == "marlin" and block.routed_experts_backend == "marlin"
+    sel = _Selection(monkeypatch, block)
+    block.experts_after_load()
+    assert not sel.probed and not sel.converted and sel.marlin
+    block.routed_experts_backend = "trtllm"
+    _Selection(monkeypatch, block, available=False)
+    with pytest.raises(RuntimeError, match="routed_experts_backend: trtllm.*sm_100"):
+        block.experts_after_load()

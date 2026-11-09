@@ -2,8 +2,9 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import Future, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -496,6 +497,9 @@ class KVManager(AttentionResource):
         nodes: Collection[str] | None = None,
     ):
         self.config = cfg
+        if cfg.aux_planes and cfg.cpu_offload_pages > 0:
+            # offload moves the KV tensor's pages alone (a KV retrieve refuses them too)
+            raise ValueError(f"KV {name}: aux_planes need cpu_offload_pages: 0")
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -1323,6 +1327,12 @@ class KVManager(AttentionResource):
         """The walks whose writes under ``label`` the prefix cache keys."""
         return self._keyed_walks.get(label, frozenset())
 
+    def lease_tokens(self, rid: str, label: str) -> int:
+        """The tokens the stream's prefix lease holds, 0 without one."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            return stream.lease_len if stream is not None and stream.lease is not None else 0
+
     def chain_key(self, rid: str, label: str, pages: int) -> bytes | None:
         """The index key of the stream's first ``pages`` pages, or None until
         its chain keys that many whole pages."""
@@ -1637,6 +1647,9 @@ class KVManager(AttentionResource):
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
+            # what else a page holds, such as DSA's index keys
+            *([sorted((name, aux.num_layers, aux.width) for name, aux in self.config.aux_planes.items())]
+              if self.config.aux_planes else []),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
@@ -3622,6 +3635,11 @@ class KVManager(AttentionResource):
         """What `reclaimable` counts, the most reclaimable first."""
         return float(self.reclaimable(rid))
 
+    def stored_len(self, rid: str, label: str = "main") -> int:
+        """Tokens the stream holds."""
+        with self._lock:
+            return self._streams[rid][label].stored_len
+
     def _own_transfer_info(
         self,
         request_id: str,
@@ -4575,6 +4593,29 @@ class KVManager(AttentionResource):
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
+    def aux_view(self, name: str, layer_idx: int) -> torch.Tensor:
+        """One layer of the aux planes ``name`` (``PagedKVConfig.aux_planes``):
+        [max_num_pages, page_size, width], addressed by the same pages as ``layer_view``."""
+        return self.kv_cache.aux_view(name, layer_idx)
+
+    @torch.compiler.disable
+    def write_aux(
+        self, name: str, rows: torch.Tensor, layer_idx: int, label: str=None,
+    ) -> None:
+        """Write per-token ``rows`` ([num_tokens, width]) into the aux planes ``name`` at
+        this step's planned slots, the ones ``write_kv`` writes."""
+        if label is None:
+            label = self._default_label
+        # a cache with aux planes has one group (KVCache refuses them beside sliding layers)
+        plan_state = self._current_plan_states[label, 0]
+        n = plan_state.total_tokens
+        self.kv_cache.write_aux(
+            name, layer_idx, rows[:n],
+            page_idx=plan_state.token_to_page[:n],
+            cache_idx=plan_state.token_to_cache[:n],
+        )
+
+    @torch.compiler.disable
     def read_kv(self, layer_idx: int=None, plan_label: str=None) -> torch.Tensor:
         """
         The slots this step's plan writes, e.g. for NHD:
@@ -4604,6 +4645,43 @@ class KVManager(AttentionResource):
         plan_state = self._current_plan_states[label, 0]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    @contextmanager
+    def token_window(self, start: int, end: int, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``[start, end)``, for a forward
+        that runs a long step's tokens in windows: each window writes at its own slots."""
+        if label is None:
+            label = self._default_label
+        # the label's addressing in each group of the pool
+        full = {(label, g): self._current_plan_states[label, g] for g in range(len(self._groups))}
+        for key, state in full.items():
+            self._current_plan_states[key] = KVPlanState(
+                token_to_page=state.token_to_page[start:end],
+                token_to_cache=state.token_to_cache[start:end],
+                total_tokens=end - start,
+            )
+        try:
+            yield
+        finally:
+            self._current_plan_states.update(full)
+
+    @contextmanager
+    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
+        order), for a pass over some of a step's rows: each writes at its own slot."""
+        if label is None:
+            label = self._default_label
+        full = {(label, g): self._current_plan_states[label, g] for g in range(len(self._groups))}
+        for key, state in full.items():
+            self._current_plan_states[key] = KVPlanState(
+                token_to_page=state.token_to_page[rows],
+                token_to_cache=state.token_to_cache[rows],
+                total_tokens=rows.numel(),
+            )
+        try:
+            yield
+        finally:
+            self._current_plan_states.update(full)
 
     @torch.compiler.disable
     def write_kv(

@@ -29,6 +29,15 @@ _STOP_IDS = (163586, 163585, 163593)
 _K3_MAX_SEQ_LEN = 32768
 
 
+def index_skips_topk(layer: int, index_topk_freq: int, index_skip_topk_offset: int) -> bool:
+    """Whether DSA layer ``layer`` (0-based, in the trunk) reuses an earlier layer's top-k instead of
+    running its own: DeepSeek-V3.2's IndexCache rule, as vLLM reads ``index_topk_freq`` and
+    ``index_skip_topk_offset`` (``deepseek_v2.py``; offset default 2). At ``index_topk_freq`` 1, K3.1's,
+    no layer skips whatever the offset; vLLM's K3.1 model never reads the offset and refuses any
+    other frequency."""
+    return max(layer - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+
+
 def _kda_layers(num_layers: int, full_attn: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(i for i in range(num_layers) if i not in set(full_attn))
 
@@ -93,6 +102,47 @@ class KimiK3ModelConfig:
     # expert parallelism for the routed experts (every rank owns num_experts / tp whole experts);
     # attention, the dense layers and the shared experts stay tensor parallel
     moe_expert_parallel: bool = False
+    # the routed experts' kernel (QuantExperts.routed_experts_backend): "auto" takes FlashInfer's trtllm-gen MXFP4 x
+    # MXFP8 MoE with SiTU fused on B200/B300 where it builds and its load probe agrees (vLLM's kimi-k31 path), else
+    # Marlin; "trtllm" or "marlin" force one ("trtllm" fails the load where it can't serve)
+    routed_experts_backend: str = "auto"
+    # with FlashInfer's FP4 MoE: tune its tactics at load over these token buckets (empty: fp4_flashinfer.TUNE_TOKENS,
+    # every FlashInfer bucket under 8192 tokens: decode 1..256, prefill 512..8192), as vLLM's boot does; the tactics
+    # are kept per GPU across boots
+    routed_experts_autotune: bool = True
+    routed_experts_tune_tokens: tuple[int, ...] = ()
+    # which branch of the latent MoE block runs on the engine's side stream (mstar.engine.side_stream), the two joined
+    # before the routed experts' all-reduce + norm so every collective stays on the main stream: "shared" (the shared
+    # experts beside the router and the routed experts), "routed" (the router and routed experts beside the shared
+    # experts: vLLM's stream assignment), "off" (one stream). true / false read as "shared" / "off". Either overlap
+    # is the same dependency structure as vLLM's (B300 slot 7 nsys: one layer's shared experts beside its routing
+    # and routed experts, no overlap across layers); B300 slot 8, TP8 c=1 ITL p50 against one stream's 12.92 ms:
+    # shared 12.54, routed 13.38.
+    shared_experts_overlap: str = "shared"
+    shared_experts_overlap_max_tokens: int = 32
+    # the latent MoE's front (router logits, latent, shared experts' SiTU activation): "gemm", the packed GEMM, its
+    # casts and the SiTU kernel (with the overlap above, the shared experts on the side stream); "split", with the
+    # shared overlap the router's GEMM on the side stream ahead of the shared experts, beside the latent's bf16 GEMM
+    # on the main stream (vLLM's layout: B300 slot 9, router 4.5 us beside the latent's 9.3 against the packed
+    # fp32 GEMM's 13.0 + 3.2); "flashinfer", FlashInfer's generated Kimi-K3 program (latent_front.py: SM100 / SM103,
+    # up to 128 rows, one launch for all three, one stream), refused at load where it can't run
+    latent_moe_front: str = "gemm"
+    # a padded step's padding rows skip the routed experts (routed to the sentinel id, weight 0): the MoE tiles
+    # follow every row's routing, so a captured replay's real rows otherwise depend on what the padding row (its
+    # contents not the step's) routes to. H200 job 1818, the MXFP4 cut: a 3-row step replayed on the 4-row graph
+    # came out bit for bit as the 3-row eager step with it, in every overlap mode (1.09-1.28 apart without it,
+    # varying run to run). Every call then skips slots, which FlashInfer's FP4 MoE is tuned for at load. Where the
+    # router runs inside FlashInfer's FP4 MoE (routed_experts_routing: kernel, B300) the kernel picks every row's
+    # experts from the logits and the mask can't reach them: the padding rows route as they would unmasked.
+    moe_mask_padding: bool = True
+    # with FlashInfer's FP4 MoE: "kernel" routes inside it from the router's logits (DeepSeekV3 routing, one group:
+    # K3.1's noaux_tc exactly, as vLLM routes it; probed on the GPU at load), "torch" routes in the block
+    routed_experts_routing: str = "kernel"
+    # with routing in the kernel under TP: "fused" folds the routed experts' top-k sum into the routed all-reduce +
+    # RMSNorm (FlashInfer's kMoEFinalizeARResidualRMSNorm, probed at load, up to 128 tokens), "kernel" finalizes in
+    # the MoE. "kernel" by default: on B300 the fold's probe hit an illegal memory access at load, which poisons the
+    # CUDA context, so the probe never runs unless a config asks for "fused"
+    routed_experts_finalize: str = "kernel"
 
     # --- SiTU-GLU ---
     situ_beta: float = 4.0
@@ -100,6 +150,10 @@ class KimiK3ModelConfig:
 
     # --- block attention residuals ---
     attn_res_block_size: int = 12
+    # the AttnRes read sites (each with its norm and block write): "auto" runs them as FlashInfer's kimi_k3_attn_res
+    # where it serves (SM100 / SM103, bf16, hidden 7168: one launch for the residual add, the block write, the mix
+    # and the norm), else the Triton read; "triton" never takes FlashInfer's
+    attn_res_backend: str = "auto"
 
     # --- lengths ---
     max_position_embeddings: int = 1_048_576
@@ -128,6 +182,9 @@ class KimiK3ModelConfig:
         self.full_attn_layers = tuple(self.full_attn_layers)
         self.kda_layers = tuple(self.kda_layers)
         self.eos_token_ids = tuple(self.eos_token_ids)
+        self.routed_experts_tune_tokens = tuple(int(t) for t in self.routed_experts_tune_tokens)
+        if isinstance(self.shared_experts_overlap, bool):
+            self.shared_experts_overlap = "shared" if self.shared_experts_overlap else "off"
         self._validate()
 
     def _validate(self) -> None:
@@ -150,6 +207,20 @@ class KimiK3ModelConfig:
             )
         if self.num_attention_heads % 1 or self.linear_conv_kernel_size < 2:
             raise ValueError(f"linear_conv_kernel_size={self.linear_conv_kernel_size} must be >= 2")
+        if self.shared_experts_overlap not in ("routed", "shared", "off"):
+            raise ValueError(
+                f"shared_experts_overlap must be routed, shared or off, got {self.shared_experts_overlap!r}")
+        if self.latent_moe_front not in ("gemm", "split", "flashinfer"):
+            raise ValueError(f"latent_moe_front must be gemm, split or flashinfer, got {self.latent_moe_front!r}")
+        if self.routed_experts_finalize not in ("fused", "kernel"):
+            raise ValueError(f"routed_experts_finalize must be fused or kernel, got {self.routed_experts_finalize!r}")
+        if self.routed_experts_routing not in ("kernel", "torch"):
+            raise ValueError(f"routed_experts_routing must be kernel or torch, got {self.routed_experts_routing!r}")
+        if self.routed_experts_backend not in ("auto", "trtllm", "marlin"):
+            raise ValueError(
+                f"routed_experts_backend must be auto, trtllm or marlin, got {self.routed_experts_backend!r}")
+        if self.attn_res_backend not in ("auto", "triton"):
+            raise ValueError(f"attn_res_backend must be auto or triton, got {self.attn_res_backend!r}")
         if self.attn_res_block_size < 1:
             raise ValueError(f"attn_res_block_size={self.attn_res_block_size} must be >= 1")
 
@@ -258,7 +329,9 @@ class KimiK3ModelConfig:
                 raise ValueError("a rotary DSA indexer (index_rope_dim > 0) is not ported")
             if dsa_cfg.get("index_k_norm_type", "layernorm") != "layernorm":
                 raise ValueError(f"index_k_norm_type={dsa_cfg.get('index_k_norm_type')!r} is not ported")
-            if int(dsa_cfg.get("index_topk_freq", 1)) != 1:
+            freq = int(dsa_cfg.get("index_topk_freq", 1))
+            offset = int(dsa_cfg.get("index_skip_topk_offset", 2))
+            if freq != 1 or any(index_skips_topk(i, freq, offset) for i in full):
                 # every DSA layer runs its own indexer; shared (IndexShare) layers are glm52's
                 raise ValueError("index_topk_freq != 1 (shared indexer layers) is not ported")
             dsa_fields.update(

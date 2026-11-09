@@ -583,6 +583,35 @@ def test_blackwell_fp4_experts_match_the_reference(stored, layout, group, tol):
 
 
 @blackwell
+@pytest.mark.parametrize("skip", [False, True])
+def test_blackwell_mxfp4_situ_experts_take_mxfp8_and_match_the_reference(stored, skip):
+    """Kimi's SiTU over MXFP4 experts: trtllm-gen ships it only with MXFP8 activations (vLLM's
+    FLASHINFER_TRTLLM_MXFP4_MXFP8; no MXFP4 x bf16 SiTU kernel, B300 04c), which the load takes once its probe
+    agrees; W4A8 against the bf16-activation reference within MXFP8's rounding. ``skip`` routes a slot to the
+    sentinel id (expert parallelism, padding rows), whose expert count the routing kernel takes in 4s."""
+    from mstar.utils.fused_moe.fp4_flashinfer import TrtllmFp4Experts
+    from mstar.utils.situ import SiTU
+
+    path, _ = stored[("mxfp4", 32)]
+    root, _ = load(path)
+    block = root.layers[0].moe
+    block.activation = SiTU(4.0, 25.0)
+    torch.manual_seed(8)
+    h = torch.randn(33, HIDDEN, dtype=torch.bfloat16)
+    weights, ids, _ = block.gate(h)
+    if skip:
+        ids[2, 0] = EXPERTS
+    ref = block._experts_reference(h, weights, ids, skip)
+    root.to("cuda")
+    block.experts_after_load()
+    kernel = block._experts_kernel
+    assert isinstance(kernel, TrtllmFp4Experts) and kernel.activation == "mxfp8", kernel
+    got = block._experts_quant(h.cuda(), weights.cuda(), ids.cuda(), skip).cpu()
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 8e-2, rel
+
+
+@blackwell
 def test_blackwell_nvfp4_stored_linear_matches_the_reference(stored):
     path, _ = stored[("nvfp4", 16)]
     root, _ = load(path)

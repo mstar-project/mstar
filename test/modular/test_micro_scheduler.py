@@ -2345,6 +2345,10 @@ class _SizedEngine(_Engine):
     def min_chunk_tokens(self, budget):
         return self._chunking.min_chunk_tokens(budget)
 
+    def chunk_align(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return getattr(self, "align", 1)
+
     def walk_token_caps(self, node_name, graph_walk):
         del node_name, graph_walk
 
@@ -2648,6 +2652,38 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     manager.land(first)
     manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (6, 8, 10, 2)}
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_prompt_cut_mid_way_resumes_on_the_walks_alignment():
+    """With ``chunk_align`` 2 and a 5-token budget beside a decode row, the prompt's chunks end
+    on even tokens, so each starts on one: (0, 4), then (4, 8); its last chunk ends where it does."""
+    engine = _ChunkingEngine(max_bs=8, budget=5)
+    engine.align = 2
+    sched = _chunking_scheduler(engine)
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    queue = manager.queues["wg0"]._ready
+    ranges = []
+    for _ in range(4):
+        batch = _next_batch(sched, manager)
+        ranges.append(tuple(batch.chunk_ranges["p0"])[:2])
+        manager.land(batch)
+        if not batch.chunk_ranges["p0"].is_final:
+            queue["p0"] = {NODE}
+        else:
+            break
+    assert ranges == [(0, 4), (4, 8), (8, 10)]
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_prompt_past_a_cached_prefix_is_cut_on_the_alignment_from_there():
+    """A cached prefix starts the row on a page, which the alignment divides: its cuts keep to it."""
+    engine = _ChunkingEngine(max_bs=8, cached={"p0": 4}, budget=3)
+    engine.align = 2
+    sched = _chunking_scheduler(engine)
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    first = _next_batch(sched, manager)
+    assert tuple(first.chunk_ranges["p0"])[:2] == (4, 6)
 
 
 def test_a_row_the_cache_holds_whole_is_not_chunked():

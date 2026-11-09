@@ -37,6 +37,7 @@ def _force_cpu_flashinfer(monkeypatch):
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
     install_cpu_rope,
@@ -594,6 +595,42 @@ def test_stop_counts_what_the_checked_steps_delivered():
                 break
             cur = nxt
         assert delivered == budget, (budget, delivered)
+
+
+def _stored_index_rows(kv, rid: str) -> torch.Tensor:
+    """The first index plane's rows at the request's stored tokens."""
+    pos = torch.arange(kv.stored_len(rid))
+    pages = torch.tensor(kv._streams[rid]["main"].page_indices)[pos // kv.config.page_size]
+    return kv.aux_view(INDEX_PLANES, 0)[pages, pos % kv.config.page_size]
+
+
+# random weights reject nearly every draft, the partial oracle accepts some; row chunks
+# change only the prefill, so one acceptance pattern covers them
+@pytest.mark.parametrize("chunk, wrong_every", [(8192, None), (8192, 3), (3, 3)],
+                         ids=["mtp", "oracle_partial", "row-chunks"])
+def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
+    """MTP on paged DSA past index_topk emits plain decode's stream, and a rejected row's
+    index keys are trimmed with its latents."""
+    cfg = _cfg(2, True)
+    cfg.dsa_long_context, cfg.index_topk = True, 4
+    cfg.prefill_chunk_tokens = chunk
+    model = _model(cfg)
+    prompt = torch.tensor([5, 9, 2, 7, 1, 8, 3])
+    streams = []
+    for k in (0, 2):
+        cfg.mtp_num_draft_tokens = k
+        sub = Glm52LLMSubmodule(model, cfg)
+        if k and wrong_every is not None:
+            _oracle(sub, {"r0": streams[0].tolist()}, wrong_every)
+        driver = _Driver(sub, cfg, ["r0"])
+        streams.append(_drive(driver, prompt, _fwd_info("r0", 18, True)))
+        # the index keys sit at their tokens' latent slots, one length for both: every token
+        # the cache still holds after the trims has its keys
+        rows = _stored_index_rows(driver.resources[KV_RESOURCE], "r0")
+        assert rows.shape[0] > prompt.shape[0] and (rows != 0).any(-1).all()
+    cfg.mtp_num_draft_tokens = 2
+    assert torch.equal(streams[0], streams[1]), f"{streams[0].tolist()} vs {streams[1].tolist()}"
+    assert len(set(streams[0].tolist())) > 3
 
 
 # ── a stop on the prefill walk ──────────────────────────────────────────

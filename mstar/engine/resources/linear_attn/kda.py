@@ -13,18 +13,19 @@ stages the layout into buffers that stay put under capture.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn import kda_torch, kda_triton
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.platforms import current_platform
 from mstar.utils.h2d import PinnedStager
@@ -45,7 +46,8 @@ class KDAParams:
     scale: float
     # the forget gate's up-projection [P, D], when g is its low-rank factor [T, D]
     f_b: torch.Tensor | None = None
-    # the output gate's up-projection [P, D] and the norm, when the kernels apply them
+    # the low-rank output gate's up-projection [P, D]; None for a full-rank gate, whose
+    # pre-activation the layer passes as is
     g_b: torch.Tensor | None = None
     norm_weight: torch.Tensor | None = None
     norm_eps: float = 1e-5
@@ -89,6 +91,12 @@ class KDAPlan:
     settled: bool = False
     # the bucket slot a captured verify step records, so its replays know it settles
     capture_key: CGSlotKey | None = None
+    # (row, offset into the row, slot): the states this prefill keeps for prefix reuse, and
+    # whether `layout` carries their section (a captured step's always does, on a keyed walk)
+    snapshots: tuple[tuple[int, int, int], ...] = ()
+    snapshot_section: bool = False
+    # a window's first tokens, run on their own first (`KDAManager.token_window`)
+    head: KDAPlan | None = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -104,8 +112,7 @@ class KDAPlan:
 
 def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, conv_dtype: torch.dtype):
     """The fused kernels where they run the pool's shape, else the torch reference. Where they
-    would run, a dtype they don't take is a config error, not a slow fallback. A full-rank output
-    gate can still move it to the reference (`KDAManager.bind_layer`)."""
+    would run, a dtype they don't take is a config error, not a slow fallback."""
     # the Triton kernels inline NVIDIA PTX
     if device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON:
         return kda_torch.TorchKDAKernels()
@@ -156,6 +163,8 @@ class KDAManager(LinearAttnManager):
         # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
         self.speculative_tokens = speculative_tokens
 
+        # the pool, whose snapshot slots a prefill fills (`bind_dependencies`)
+        self._pool: RecurrentStatePool | None = None
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
         # the verify captures that settled their count, which their replays then repeat
@@ -164,24 +173,17 @@ class KDAManager(LinearAttnManager):
         # verify step replays
         self._verifying: set = set()
         self._layout_stager = PinnedStager(torch.int32)
+        self._rows_stager = PinnedStager(torch.long)
         self._current: dict[str, KDAPlan] = {}
         # Pre-planning: the plan mutates no live state, so staging is caching
         # it. Follows the pool, which it depends on.
         self._preplanned = False
         self._cached_plan_output: dict[str, KDAPlan] | None = None
 
-    def bind_layer(self, *, lower_bound: float, full_rank_output_gate: bool) -> None:
-        """A layer's gates, as it binds. The fused kernels apply only the low-rank output gate,
-        so a full-rank one moves every layer to the torch reference; a forget-gate bound past
-        what their decay blocks hold is refused."""
+    def bind_layer(self, *, lower_bound: float) -> None:
+        """A layer's forget-gate bound, as it binds: one past what the fused kernels' decay
+        blocks hold is refused."""
         if not isinstance(self.kernels, kda_triton.TritonKDAKernels):
-            return
-        if full_rank_output_gate:
-            if self._current or self._preplanned:
-                raise RuntimeError("kda: a layer bound after the resource planned with its kernels")
-            logger.warning("kda: the fused kernels don't run a full-rank output gate; the torch "
-                           "reference runs")
-            self.kernels = kda_torch.TorchKDAKernels()
             return
         block = min(self.kernels.config.row_block, self.kernels.config.chunk)
         if not kda_triton.bound_fits(lower_bound, block):
@@ -199,6 +201,15 @@ class KDAManager(LinearAttnManager):
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
+
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        self._pool = resources.get(self._pool_key)
+        if self._pool is not None:
+            # the kernels store each snapshot themselves, through no checkpoint buffer, and only
+            # the state and conv tail, at a chunk end
+            self._pool.bind_snapshot_writer(
+                buffered=False, blocks=("state", "conv"), chunk=getattr(self.kernels, "chunk", 1),
+            )
 
     # Step lifecycle
 
@@ -288,10 +299,27 @@ class KDAManager(LinearAttnManager):
                     f"({lease.bucket}); leave the node's prefill buckets out where "
                     "KDAManager.prefill_capturable is False"
                 )
-            host = self.kernels.layout(spans, num_tokens, lease is not None)
+            targets = self._snapshot_targets(label, addressing, ctx)
+            plan.snapshots = targets or ()
+            # an eager step without targets runs the kernels that keep none
+            plan.snapshot_section = targets is not None and (lease is not None or bool(targets))
+            host = self.kernels.layout(
+                spans, num_tokens, lease is not None, plan.snapshots if plan.snapshot_section else None,
+            )
             if host is not None:
                 plan.layout = self._stage_layout(host, label, ctx)
         return plan
+
+    def _snapshot_targets(
+        self, label: str, addressing: RecurrentAddressing, ctx: StepContext,
+    ) -> tuple[tuple[int, int, int], ...] | None:
+        """The pool's snapshot targets for this prefill, or None on a walk the KV cache doesn't
+        key, where the pool keeps none."""
+        walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
+        if not addressing.snapshot_every or self._pool is None or walk not in self._pool.keyed_walks(label):
+            assert not addressing.snapshots, f"kda: a {walk!r} step keeps snapshots its KV cache doesn't key"
+            return None
+        return tuple((t.row, t.offset, t.slot) for t in addressing.snapshots)
 
     def _stage_layout(self, host: list[int], label: str, ctx: StepContext) -> torch.Tensor:
         """A fresh device copy eager; under a lease, the static buffer of that
@@ -332,6 +360,43 @@ class KDAManager(LinearAttnManager):
             )
         return found
 
+    @contextmanager
+    def token_window(self, pieces: list[tuple[int, int]], label: str | None = None) -> Iterator[None]:
+        """Run this step's KDA over a window of its prefill tokens: ``pieces`` are (row, tokens)
+        in packed order, each the next run of that row's tokens. A row's state carries over in
+        its slot, so windows run in order compute what the whole step would.
+
+        A piece that starts inside one of its row's chunks (the row a window boundary cut) runs
+        its tokens up to the chunk's end first, on their own, so the rest of the row chunks as
+        the whole row would and each snapshot lands on a chunk end."""
+        if label is None:
+            label = self._default_label
+        full = self.current_plan(label)
+        assert not (full.is_decode or full.is_verify), "kda: a token window splits a prefill"
+        done = full.cached("window_done", lambda: [0] * full.num_rows)
+        chunk = getattr(self.kernels, "chunk", 1)
+        heads, rest = [], []
+        for row, n in pieces:
+            first = min(-done[row] % chunk, n)
+            if first:
+                heads.append((row, done[row], first))
+            if n > first:
+                rest.append((row, done[row] + first, n - first))
+            done[row] += n
+        if heads and (len(heads) > 1 or heads[0][0] != pieces[0][0]):
+            raise NotImplementedError(
+                f"kda: a window's pieces {pieces} start inside a chunk past its first; "
+                "only the row the window boundary cut can"
+            )
+        plan = self._window_plan(full, rest or heads)
+        if heads and rest:
+            plan.head = self._window_plan(full, heads)
+        self._current[label] = plan
+        try:
+            yield
+        finally:
+            self._current[label] = full
+
     def commit(self, step: LinearAttnStep, ctx: StepContext) -> None:
         if not step.speculative or ctx.capture:
             return
@@ -346,6 +411,30 @@ class KDAManager(LinearAttnManager):
 
     def remove_request(self, rid: str) -> None:
         self._verifying.discard(rid)
+
+    def _window_plan(self, full: KDAPlan, pieces: list[tuple[int, int, int]]) -> KDAPlan:
+        """``full`` cut to ``pieces``, (row, first token, tokens) in packed order, with the
+        snapshots that fall in them."""
+        rows = torch.empty(len(pieces), dtype=torch.long, device=self._device)
+        self._rows_stager.copy_(rows, [row for row, _, _ in pieces])
+        spans = tuple(n for _, _, n in pieces)
+        snapshots = tuple(
+            (i, offset - at, slot)
+            for i, (row, at, n) in enumerate(pieces)
+            for kept, offset, slot in full.snapshots if kept == row and at < offset <= at + n
+        )
+        plan = KDAPlan(
+            slot_ids=full.slot_ids.index_select(0, rows),
+            has_state=full.has_state.index_select(0, rows),
+            spans=spans, num_tokens=sum(spans), is_decode=False,
+            snapshots=snapshots, snapshot_section=bool(snapshots),
+        )
+        if self.kernels is not None:
+            host = self.kernels.layout(spans, plan.num_tokens, False, snapshots or None)
+            if host is not None:
+                plan.layout = torch.empty(len(host), dtype=torch.int32, device=self._device)
+                self._layout_stager.copy_(plan.layout, host)
+        return plan
 
     # Submodule-level functionality
 
@@ -383,8 +472,9 @@ class KDAManager(LinearAttnManager):
         ``[T, D]`` with ``params.f_b``. ``conv_layer`` / ``state_layer`` are the
         layer's pool blocks, updated in place, and ``spec`` its speculative
         blocks for a verify step. Returns ``[T, H, D]``, or the gated-normed
-        ``[T, P]`` when ``gate`` (the output gate's low-rank factor) comes with
-        ``params.g_b``.
+        ``[T, P]`` when ``gate`` comes: the output gate's low-rank factor
+        ``[T, D]`` with ``params.g_b``, or without it the full-rank pre-activation
+        ``[T, P]``.
         """
         plan = self.current_plan(label)
         if plan.is_verify:
@@ -393,6 +483,18 @@ class KDAManager(LinearAttnManager):
             return self.kernels.run_verify(
                 qkv, g, beta, plan, conv_layer, state_layer, spec, params, gate=gate,
             )
+        if plan.head is not None:
+            # a window's head runs first, on its own (`token_window`)
+            n = plan.head.num_tokens
+            first = self.kernels.run_paged(
+                qkv[:n], g[:n], beta[:n], plan.head, conv_layer, state_layer, params,
+                gate=None if gate is None else gate[:n],
+            )
+            rest = self.kernels.run_paged(
+                qkv[n:], g[n:], beta[n:], plan, conv_layer, state_layer, params,
+                gate=None if gate is None else gate[n:],
+            )
+            return torch.cat([first, rest])
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,
         )

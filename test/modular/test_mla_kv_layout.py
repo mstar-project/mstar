@@ -1,5 +1,6 @@
 """CPU tests for the MLA KV layout: storage shape, latent write/read, chunk pointers,
-page copies, and the manager's plan-driven write path."""
+page copies, and the manager's plan-driven write path; the GPU latent scatter against index_put."""
+import pytest
 import torch
 
 from mstar.engine.resources import (
@@ -58,6 +59,27 @@ def test_write_read_and_pointers():
     assert torch.equal(cache.chunk_view(1, 2, 1, 3), latent[1:3])
     cache.copy_pages([2], [5])
     assert torch.equal(cache.layer_view(1)[5], latent[:4])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the Triton scatter runs on the GPU")
+def test_the_gpu_scatter_writes_what_index_put_does():
+    """The one-launch Triton latent scatter against index_put: K3.1's 576-wide latents, bf16 and fp32
+    rows into a bf16 cache, scattered over pages in any order; every other slot untouched."""
+    cfg = PagedKVConfig(
+        num_layers=3, num_kv_heads=96, head_dim=999, max_seq_len=8 * 16, max_num_pages=8, page_size=16,
+        num_qo_heads=96, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64,
+    )
+    for dtype in (torch.bfloat16, torch.float32):
+        gpu = KVCache(cfg, torch.device("cuda"), torch.bfloat16)
+        ref = KVCache(cfg, torch.device("cuda"), torch.bfloat16)
+        for c in (gpu, ref):
+            c.tensor.copy_(torch.full_like(c.tensor, 7.0))
+        latent = torch.randn(9, 576, device="cuda", dtype=dtype)
+        pages = torch.tensor([5, 0, 0, 7, 3, 3, 3, 1, 6], device="cuda")
+        offs = torch.tensor([15, 0, 9, 4, 1, 2, 3, 0, 8], device="cuda")
+        gpu.write_tokens(2, latent, None, pages, offs)
+        ref.tensor[2][pages, offs] = latent.to(torch.bfloat16)
+        assert torch.equal(gpu.tensor, ref.tensor)
 
 
 class _StubTransfer:

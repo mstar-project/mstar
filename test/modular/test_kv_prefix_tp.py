@@ -429,3 +429,52 @@ def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
     first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
 
     assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)
+
+
+def test_rank_0_leases_a_chunked_rows_prefix_when_the_scheduler_measures_it():
+    """The scheduler measures a chunkable row on rank 0 before the row's first step goes out. Rank 0 leases
+    the cached prefix there, so the chunks start past it, and the step sends that same lease, which the
+    follower adopts. Before, the measure found nothing above one rank (a probe answers only a lease), the
+    chunks were cut from 0, and the hit leased as the step went out was declined: at TP8 a 24K shared prefix
+    ran cold."""
+    from mstar.engine.chunking import ChunkRange
+    from mstar.model.submodule_base import ChunkingPolicy, InputSeqLenInfo
+
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(40, seed=1)
+    _cache(ranks, "b0", shared)
+    for kv in ranks:
+        _ingest(kv, "b", prompt)
+
+    class _Prompt(_Submodule):
+        def get_input_sequence_len(self, graph_walk, fwd_info, inputs):
+            return InputSeqLenInfo(len(prompt))
+
+        def prepare_inputs(self, **kwargs):
+            return ARNodeInputs(input_ids=torch.tensor(prompt), input_seq_len=len(prompt))
+
+    engine = _engine(leader)
+    engine._submodules[NODE] = make_mgmt(_Prompt())
+    engine._chunking.set_policies({(NODE, WALK): ChunkingPolicy(walks=(WALK,), chunkable=True,
+                                                                max_batch_tokens=PAGE_SIZE)})
+    engine._tp_leader_nodes = {NODE}
+    for _ in range(2):  # measured again (a refused first chunk), it holds the one lease
+        measured = engine.input_sequence_len(NODE, WALK, None, {}, rid="b")
+        assert (measured.cached_prefix, measured.seq_len) == (5 * PAGE_SIZE, 40)
+    lease = leader._streams["b"]["main"].lease
+    assert lease is not None
+
+    head = _send(leader, "b")
+    assert head.prefix_hits["wire-b"]["kv"] == lease
+    assert _follow(follower, head)
+    start = measured.cached_prefix
+    engine = _engine(follower)
+    engine._submodules[NODE] = make_mgmt(_Prompt())
+    batch = SimpleNamespace(
+        node_name=NODE, per_request_info_wrapped={"b": None}, per_request_input_tensors={},
+        final_stream_rids=set(), per_request_input_metadata={}, first_chunk_rids=set(),
+    )
+    end = start + PAGE_SIZE
+    first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
+    assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)

@@ -706,6 +706,84 @@ def test_chat_stream_flushes_a_truncated_character(client_and_stub):
     assert lines[-1]["choices"][0] == {"index": 0, "delta": {"content": "�"}, "finish_reason": "stop"}
 
 
+def _chat(client, **body):
+    return client.post("/v1/chat/completions",
+                       json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], **body})
+
+
+def _events(text):
+    return [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+
+
+def test_chat_stream_reports_the_sampled_token_count_when_asked(client_and_stub):
+    """``stream_options.include_usage`` (vllm bench serve sends it): one last chunk with no choices and the
+    reply's sampled token count, from the ids its text chunks carry, a token that renders nothing (an end token
+    under ignore_eos) and a chunk of two tokens included. The bench takes ``completion_tokens`` from it; without
+    it, it re-encoded the text, which counted Kimi K3.1's 960-token replies as ~845 (B300 k31-debug)."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"Hel", {"token_ids": [11]}), _Chunk("text", b"", {"token_ids": [2]}),
+                        _Chunk("text", b"lo", {"token_ids": [12, 13]})]
+    events = _events(_chat(client, stream=True, stream_options={"include_usage": True}).text)
+    assert stub.last_submit["model_kwargs"]["return_token_ids"] is True
+    assert "stream_options" not in stub.last_submit["model_kwargs"]
+    assert "".join(e["choices"][0]["delta"].get("content", "") for e in events[:-1]) == "Hello"
+    assert events[-2]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1]["choices"] == [] and events[-1]["usage"] == {"completion_tokens": 4}
+    # the client's read: usage from the chunk without choices, prompt_tokens left to its own count
+    usage = next(e["usage"] for e in events if not e.get("choices") and e.get("usage"))
+    assert usage.get("completion_tokens") == 4 and usage.get("prompt_tokens") is None
+
+
+def test_chat_stream_sends_no_usage_unless_asked_or_countable(client_and_stub):
+    """Without ``include_usage`` the stream sends no usage chunk; with it, a reply whose text chunks carry no ids
+    (a model that doesn't sample its text token by token) sends no usage rather than a wrong count, so the client
+    keeps its own."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"ok", {"token_ids": [7]})]
+    events = _events(_chat(client, stream=True).text)
+    assert all(e["choices"] for e in events) and not any("usage" in e for e in events)
+    stub.next_chunks = [_Chunk("text", b"ok")]
+    events = _events(_chat(client, stream=True, stream_options={"include_usage": True}).text)
+    assert not any("usage" in e for e in events)
+
+
+def test_chat_response_counts_its_sampled_tokens(client_and_stub):
+    """A non-streamed reply's usage counts its tokens the same way (it reported 0 before)."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"Hi", {"token_ids": [5]}), _Chunk("text", b"", {"token_ids": [2]})]
+    body = _chat(client, ignore_eos=True).json()
+    assert stub.last_submit["model_kwargs"]["return_token_ids"] is True
+    assert body["choices"][0]["message"]["content"] == "Hi"
+    assert body["usage"] == {"prompt_tokens": 0, "completion_tokens": 2, "total_tokens": 2}
+
+
+@pytest.mark.parametrize("limit_field", ["max_tokens", "max_completion_tokens"])
+def test_chat_finish_reason_is_length_when_the_reply_hits_its_limit(client_and_stub, limit_field):
+    """As vLLM reports it: ``length`` when the reply's sampled tokens reach the request's limit (an ignore_eos
+    benchmark reply always does), ``stop`` when it ended before (an end token), streamed or not; a reply with no
+    limit set, or whose tokens aren't counted, reads ``stop`` as before."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    three = [_Chunk("text", b"a", {"token_ids": [1]}), _Chunk("text", b"", {"token_ids": [2]}),
+             _Chunk("text", b"c", {"token_ids": [3]})]
+    for limit, want in ((3, "length"), (4, "stop"), (None, "stop")):
+        stub.next_chunks = three
+        body = {limit_field: limit} if limit is not None else {}
+        assert _chat(client, **body).json()["choices"][0]["finish_reason"] == want, (limit, "non-streamed")
+        events = _events(_chat(client, stream=True, **body).text)
+        assert [e["choices"][0]["finish_reason"] for e in events][-1] == want, (limit, "streamed")
+        assert sum(1 for e in events if e["choices"][0]["finish_reason"]) == 1
+    stub.next_chunks = [_Chunk("text", b"abc")]  # no ids: not counted
+    assert _chat(client, **{limit_field: 1}).json()["choices"][0]["finish_reason"] == "stop"
+    # with usage asked, the finish chunk comes before the usage chunk
+    stub.next_chunks = three
+    events = _events(_chat(client, stream=True, stream_options={"include_usage": True}, **{limit_field: 3}).text)
+    assert events[-2]["choices"][0]["finish_reason"] == "length" and events[-1]["usage"] == {"completion_tokens": 3}
+
+
 def test_chat_stream_without_output_still_names_the_role(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"

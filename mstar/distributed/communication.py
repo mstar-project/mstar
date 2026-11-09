@@ -124,6 +124,8 @@ class CommGroup:
         self.initialized = False
         # (dtype, hidden) -> its fused all-reduce workspace; see ``init_allreduce_fusion``
         self._ar_fusion: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
+        # (dtype, hidden) -> the TRT-LLM workspace of allreduce_moe_finalize_rmsnorm
+        self._moe_finalize: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce()
 
@@ -244,6 +246,87 @@ class CommGroup:
         zeros = torch.zeros(max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator())
         self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens, zeros)
         return True
+
+    def enable_moe_finalize_fusion(self, hidden: int, dtype: torch.dtype, max_tokens: int = 128) -> bool:
+        """Set up ``allreduce_moe_finalize_rmsnorm`` for ``[<=max_tokens, hidden]`` of ``dtype``: a TRT-LLM
+        backend workspace of its own (FlashInfer runs the MoE finalize pattern on TRT-LLM's IPC workspace, not
+        MNNVL's). Collective, like ``enable_ar_fusion``; returns whether it is available."""
+        if self.world_size == 1:
+            return False
+        have = self._moe_finalize.get((dtype, hidden))
+        if have is not None and have.max_tokens >= max_tokens:
+            return True
+        from mstar.distributed.ar_fusion import create_workspace
+
+        ws_id = create_workspace(self, max_tokens, hidden, dtype, backends=("trtllm",))
+        if ws_id is None:
+            return False
+        zeros = torch.zeros(max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator())
+        self._moe_finalize[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens, zeros)
+        return True
+
+    def moe_finalize_max_tokens(self, hidden: int, dtype: torch.dtype) -> int:
+        """The most tokens ``allreduce_moe_finalize_rmsnorm`` takes for ``(dtype, hidden)``; 0 without it."""
+        ws = self._moe_finalize.get((dtype, hidden))
+        return 0 if ws is None else ws.max_tokens
+
+    def moe_finalize_unfit(
+        self, permuted: torch.Tensor, expanded_idx: torch.Tensor, scales: torch.Tensor, weight: torch.Tensor,
+    ) -> str | None:
+        """Why ``allreduce_moe_finalize_rmsnorm`` can't take these tensors (None: it can), from their shapes,
+        dtypes and strides alone (no device sync): what FlashInfer's kernel indexes by, checked before it
+        launches. A bad index there is an illegal address, which is sticky (nothing after it, a fallback
+        included, runs), and the kernel takes ``top_k`` off ``expanded_idx``'s last dim and the token count off
+        the residual."""
+        if self.world_size not in (2, 4, 8, 16):
+            return f"{self.world_size} ranks (the kernel takes 2, 4, 8 or 16)"
+        if expanded_idx.dim() != 2 or expanded_idx.dtype != torch.int32:
+            return f"expanded index {tuple(expanded_idx.shape)} {expanded_idx.dtype}, not [tokens, top_k] int32"
+        tokens, top_k = expanded_idx.shape
+        if permuted.dim() != 2 or not permuted.is_contiguous():
+            return f"permuted rows {tuple(permuted.shape)} strides {permuted.stride()}, not [rows, hidden] dense"
+        rows, hidden = permuted.shape
+        ws = self._moe_finalize.get((permuted.dtype, hidden))
+        if ws is None:
+            return f"no workspace for {hidden} x {permuted.dtype}"
+        if tokens > ws.max_tokens:
+            return f"{tokens} tokens past the workspace's {ws.max_tokens}"
+        if rows < tokens * top_k:
+            return f"{rows} permuted rows for {tokens} tokens x top-{top_k}"
+        if tuple(scales.shape) != (tokens, top_k) or scales.dtype != permuted.dtype:
+            # the kernel reads them as the rows' dtype
+            return f"routing weights {tuple(scales.shape)} {scales.dtype}, not [{tokens}, {top_k}] {permuted.dtype}"
+        if weight.numel() != hidden or weight.dtype != permuted.dtype:
+            return f"norm weight {tuple(weight.shape)} {weight.dtype}, not [{hidden}] {permuted.dtype}"
+        if hidden * permuted.element_size() % 16:
+            return f"hidden {hidden} not whole 16-byte vectors"
+        devices = {str(t.device) for t in (permuted, expanded_idx, scales, weight, ws.zeros)}
+        if len(devices) != 1:
+            return f"tensors on {sorted(devices)}"
+        return None
+
+    def allreduce_moe_finalize_rmsnorm(
+        self, permuted: torch.Tensor, expanded_idx: torch.Tensor, scales: torch.Tensor,
+        weight: torch.Tensor, eps: float, weight_bias: float = 0.0,
+    ) -> torch.Tensor | None:
+        """``rms_norm(all_reduce(finalize(permuted)))`` in one kernel: a MoE's unfinalized output (its permuted
+        expert rows, ``expanded_idx [tokens, top_k]`` into them, ``scales`` the routing weights) summed over
+        each token's top-k, reduced over the group, normed (a zero residual). None where it isn't set up for
+        these shapes (the caller finalizes in the MoE and takes ``allreduce_rmsnorm``); ValueError, before any
+        launch, where the tensors break the kernel's contract (``moe_finalize_unfit``)."""
+        tokens = expanded_idx.shape[0] if expanded_idx.dim() == 2 else 0  # any other shape: unfit, below
+        ws = self._moe_finalize.get((permuted.dtype, permuted.shape[-1]))
+        if ws is None or tokens > ws.max_tokens:
+            return None
+        why = self.moe_finalize_unfit(permuted, expanded_idx, scales, weight)
+        if why is not None:
+            raise ValueError(f"allreduce_moe_finalize_rmsnorm: {why}")
+        from mstar.distributed.ar_fusion import allreduce_moe_finalize_rmsnorm
+
+        return allreduce_moe_finalize_rmsnorm(
+            permuted, expanded_idx.contiguous(), scales.contiguous(), ws.zeros[:tokens], weight, eps,
+            weight_bias, ws.ws_id,
+        )
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,

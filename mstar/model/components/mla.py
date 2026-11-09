@@ -115,10 +115,16 @@ class MLAAttention(nn.Module):
         self.mla_absorb = config.mla_absorb
         # the absorbed path's norms, RoPEs and cache write in two kernels (mla_prep.py). Each
         # has its ops' bits alone, but a captured MTP step writes different bits into each
-        # request's last live cache rows with them, so the reference keeps the ops
+        # request's last live cache rows with them, so the reference keeps the ops. Under
+        # mla_use_nope the decoupled dims pass through: the kernels turn them by an identity table
+        # (cos 1, sin 0), which keeps their bits, in place of the clone, the kv norm, the latent's
+        # concatenation and its cache write (B300 K3.1 decode: 6 launches a layer, ~19 us)
         self.mla_fused_prep = (
-            not ref and self.mla_absorb and self.use_rope
+            not ref and self.mla_absorb and self.qk_rope_head_dim > 0
+            and self.mla_cache_kpe == self.qk_rope_head_dim
             and mla_prep.supports(config.q_lora_rank, config.kv_lora_rank, self.qk_rope_head_dim))
+        # under mla_use_nope: the identity table and the zero positions the fused prep reads, per device
+        self._nope_rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         if self.mla_absorb:
             self.register_buffer("w_kc", None, persistent=False)  # (H_local, Dnope, L)
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
@@ -138,7 +144,7 @@ class MLAAttention(nn.Module):
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key] if self.use_rope else None
-        if self.mla_fused_prep and (self._pos.cos_sin_table is None or not self._pos.interleave):
+        if self.mla_fused_prep and self.use_rope and (self._pos.cos_sin_table is None or not self._pos.interleave):
             # the fused prep turns interleaved pairs from the position resource's cos/sin
             # table (PositionConfig.rope_table_dtype); otherwise the op-by-op path serves
             self.mla_fused_prep = False
@@ -413,12 +419,28 @@ class MLAAttention(nn.Module):
         layer = self._kv.layer_view(self.cache_layer_idx)
         label = self._label
         pages, offsets = self._kv.write_slots(**label)
+        if self.use_rope:
+            table = self._pos.cos_sin_table
+        else:
+            table, position_ids = self._identity_rope(fused.device, fused.shape[0])
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
-            self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
+            table, position_ids, q, layer, pages, offsets)
         if selection is None:
             return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
         return self._attend_written(selection, q_nope, q_pe, **sparse)
+
+    def _identity_rope(self, device: torch.device, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(table, positions)`` for the fused prep under mla_use_nope: one fp32 row of R/2 cosines of
+        1 and R/2 sines of 0 (``tl.fma(v, 1, pair * 0)`` is ``v``), and ``tokens`` zero positions,
+        views of a buffer that grows only outside a capture (warmup and eager prefill run first)."""
+        held = self._nope_rope.get(device)
+        if held is None or held[1].shape[0] < tokens:
+            half = self.qk_rope_head_dim // 2
+            table = torch.cat([torch.ones(1, half), torch.zeros(1, half)], dim=1).to(device)
+            positions = torch.zeros(max(tokens, 16384), dtype=torch.int32, device=device)
+            held = self._nope_rope[device] = (table, positions)
+        return held[0], held[1][:tokens]
 
     # A selecting subclass that implements ``_attend_written`` takes the fused prep too.
     _attends_written = False

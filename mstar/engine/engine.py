@@ -2819,6 +2819,9 @@ class Engine:
     def min_chunk_tokens(self, budget: int) -> int:
         return self._chunking.min_chunk_tokens(budget)
 
+    def chunk_align(self, node_name: str, graph_walk: str) -> int:
+        return self._chunking.chunk_align(node_name, graph_walk)
+
     def set_chunking_policies(
         self, policies: Mapping[tuple[str, str], ChunkingPolicy],
     ) -> None:
@@ -2858,6 +2861,11 @@ class Engine:
                 and not policy.reuses_cached_prefix(request_info))
         ):
             return info
+        if node_name in self._tp_leader_nodes:
+            # Above one rank a probe answers only rank 0's lease, which it took as it sent the row's
+            # first step: after the measure, so the chunks were cut from 0 and the hit declined. The
+            # scheduler measures on rank 0, so the lease is taken here, and the step sends the same one.
+            self._runner.lease_cached_prefix(rid, node_name, graph_walk)
         prefix = self._runner.resolve_cached_prefix(
             rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
         )
@@ -2939,6 +2947,10 @@ class Engine:
             None if batch.inputs is None
             else sum(inp.input_seq_len for inp in batch.inputs)
         )
+        if batch.inputs is not None and not submodule_mgmt.submodule.can_replay(
+            batch.step_context.graph_walk, batch.inputs,
+        ):
+            return None
         lease = None
         pools = submodule_mgmt.lora_pools
         if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):

@@ -81,6 +81,8 @@ from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight, quanti
 from mstar.utils.situ import activation_spec
 
 logger = logging.getLogger(__name__)
+# (block class, backend) pairs whose routed-expert backend line was logged
+_EXPERTS_BACKEND_LOGGED: set[tuple[str, str]] = set()
 
 # bf16 x bf16 -> fp32 mm (aten::mm.dtype); older torch lacks the overload
 _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
@@ -278,6 +280,11 @@ class NoAuxTcRouter(nn.Module):
                 if w is None or w.device != self.weight.device:
                     w = self.weight.float()
                 logits = F.linear(flat.float(), w)
+        return self.route(logits)
+
+    def route(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """``forward`` from the fp32 router logits ``(T, E)``, for a caller that computed them
+        itself (e.g. in one GEMM with other projections of the same input)."""
         if self._topk_op is not None and logits.is_cuda:
             topk_weights, topk_ids = self._topk_op(
                 logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
@@ -932,12 +939,29 @@ class QuantExperts(Fp8Experts):
                 out[suffix] = t if not stands_for.is_floating_point else t.view(stands_for)
         return out
 
+    # which kernel serves the 4-bit experts: "auto" (FlashInfer's FP4 MoE on B200/B300 where it has the
+    # activation, else Marlin), "trtllm" (FlashInfer's or a load error), "marlin" (Marlin, else Triton); a model
+    # sets it from its serving config (Kimi K3: model_kwargs.routed_experts_backend)
+    routed_experts_backend = "auto"
+    # FlashInfer's FP4 MoE tuned at load over these token buckets (fp4_flashinfer.autotune, as vLLM's boot does),
+    # its tactics kept per GPU across boots; None the default buckets. Off unless the model asks (Kimi K3 does).
+    routed_experts_autotune = False
+    # "kernel": a noaux_tc router runs inside FlashInfer's FP4 MoE from the logits (fp4_flashinfer.kernel_routing,
+    # checked on the GPU at load); "torch": the block routes and passes ids and weights. Kimi K3 asks for "kernel".
+    routed_experts_routing = "torch"
+    routed_experts_tune_tokens: tuple[int, ...] | None = None
+    # every call passes skip_invalid (a model that masks a padded step's padding rows on every step): tune that call
+    routed_experts_skip_invalid = False
+
     def experts_after_load(self) -> None:
         """Put the loaded experts in their kernel's layout, on the device they serve from (B200/B300's FlashInfer
         FP4 MoE; else, for w4a16 / mxfp4, Marlin MoE where it builds and agrees with the Triton kernel, which reads
         the checkpoint layout as is and serves the rest)."""
         if self.experts_packed is None or self.experts_packed.name not in ("mxfp4", "nvfp4", "w4a16"):
             return
+        backend = self.routed_experts_backend
+        if backend not in ("auto", "trtllm", "marlin"):
+            raise ValueError(f"routed_experts_backend must be auto, trtllm or marlin, got {backend!r}")
         if self.experts_packed.name == "w4a16":
             self._experts_to_marlin()
             return
@@ -950,17 +974,60 @@ class QuantExperts(Fp8Experts):
                                      "differ; serve these experts bf16 instead")
         from mstar.utils.fused_moe import fp4_flashinfer
 
+        fmt = self.experts_packed.name
         device = next(iter(self.experts.parameters())).device
-        reason = (fp4_flashinfer.unavailable_reason(device)
-                  or fp4_flashinfer.unsupported_activation(self._experts_activation, self.experts_packed.name))
-        if reason is None:
-            self._experts_kernel = fp4_flashinfer.TrtllmFp4Experts.convert(self, device)
-            return
-        if fp4_flashinfer.unavailable_reason(device) is None:
-            # a Blackwell GPU whose FP4 MoE lacks this activation (Kimi's SiTU over MXFP4 x bf16)
-            logger.info("%s experts not on FlashInfer's FP4 MoE: %s", self.experts_packed.name, reason)
-        if self.experts_packed.name == "mxfp4":
+        reason = "routed_experts_backend: marlin"
+        if backend != "marlin":
+            dtype, detail = fp4_flashinfer.choose(self, device)
+            if dtype is not None:
+                kernel = fp4_flashinfer.TrtllmFp4Experts.convert(self, device, activation=dtype)
+                self._experts_kernel = kernel
+                if self.routed_experts_routing == "kernel":
+                    routing, why = fp4_flashinfer.kernel_routing(self)
+                    if routing is not None:
+                        why, _ = fp4_flashinfer.probe_routing(self, device, dtype, routing)
+                    if why is None:
+                        kernel.routing = routing
+                        detail = f"{detail}; routing in the kernel (DeepSeekV3, one group)"
+                    else:
+                        detail = f"{detail}; routing in torch: {why}"
+                if self.routed_experts_autotune:
+                    # expert parallel blocks pass the sentinel id on every call: tune the call they make
+                    total = getattr(self, "num_experts", None)
+                    # (a block masking its padding rows too, unless the kernel routes from the logits: no sentinel)
+                    ep = (getattr(self, "num_local_experts", total) != total
+                          or (self.routed_experts_skip_invalid and kernel.routing is None))
+                    tuned = fp4_flashinfer.autotune(self, kernel, device, self.routed_experts_tune_tokens,
+                                                    skip_invalid=ep)
+                    detail = f"{detail}; {tuned}" if detail else tuned
+                self._log_experts_backend(
+                    f"FlashInfer trtllm-gen {fmt.upper()} x {dtype.upper()}", detail)
+                return
+            reason = detail
+            if backend == "trtllm":
+                raise RuntimeError(f"routed_experts_backend: trtllm, but FlashInfer's FP4 MoE can't serve these "
+                                   f"{fmt} experts: {reason}")
+            if fp4_flashinfer.unavailable_reason(device) is None:
+                # a Blackwell GPU whose FP4 MoE can't take these experts
+                logger.warning("%s experts not on FlashInfer's FP4 MoE: %s", fmt, reason)
+        if fmt == "mxfp4":
             self._experts_to_marlin()
+        if device.type == "cuda":
+            kernel = ("Marlin MoE" if self._experts_kernel is not None else
+                      "Triton W4A16" if fmt == "mxfp4" else "reference dispatch")
+            self._log_experts_backend(f"{kernel} {fmt.upper()} x BF16", f"not FlashInfer's FP4 MoE: {reason}")
+
+    def _log_experts_backend(self, backend: str, detail: str) -> None:
+        """One INFO line per block class and backend (a model's ~90 MoE layers would repeat it)."""
+        key = (type(self).__name__, backend)
+        if key in _EXPERTS_BACKEND_LOGGED:
+            return
+        _EXPERTS_BACKEND_LOGGED.add(key)
+        e, two_inter, hidden = self._experts_dims()
+        logger.info("%s routed-expert backend: %s (%s experts x %d x %d, activation %s, setting %s%s)",
+                    type(self).__name__, backend, e, two_inter // 2, hidden,
+                    activation_spec(self._experts_activation), self.routed_experts_backend,
+                    f"; {detail}" if detail else "")
 
     def _experts_to_marlin(self) -> None:
         """Marlin MoE for w4a16 / mxfp4 experts on CUDA (``utils.marlin_moe.MarlinExperts``: converted, probed
@@ -1146,31 +1213,37 @@ class ParallelSparseMoeBlock(QuantExperts, nn.Module):
         *,
         token_valid: torch.Tensor | None = None,
         alignment: "MoeAlignment | None" = None,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         """The routed experts on ``flat (tokens, hidden)`` given each token's top-k, summed over
         the ranks: ``forward`` after its router, for a block whose router reads another input
-        (a latent MoE routes on the hidden state and runs its experts on a projection of it)."""
+        (a latent MoE routes on the hidden state and runs its experts on a projection of it).
+        ``reduce_results=False`` returns this rank's partial sum, for a caller that reduces it in
+        a fused kernel (e.g. the all-reduce + RMSNorm of ``RMSNorm.forward(x, comm_group)``)."""
         skip = token_valid is not None
         if skip:
             selected_experts, routing_weights = _mask_padding(
                 selected_experts, routing_weights, token_valid, self.num_experts,
             )
+        reduce = reduce_results and self.comm_group.world_size > 1
         if self.experts_quantized:
             out = self._experts_quant(flat, routing_weights, selected_experts, skip_invalid=skip)
-            return self.comm_group.all_reduce(out) if self.comm_group.world_size > 1 else out
+            return self.comm_group.all_reduce(out) if reduce else out
         if self.comm_group.world_size == 1:
             return _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
                 self.num_experts, selected_experts, routing_weights, skip_invalid=skip, alignment=alignment,
                 activation=self.activation,
             )
-        return self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
+        return self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip,
+                                 reduce_results=reduce_results)
 
     def _dispatch_tp(
         self, flat: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         skip_invalid: bool = False,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         if not flat.is_cuda:
             # the naive loop over this rank's slice of every expert (CPU tests)
@@ -1178,7 +1251,7 @@ class ParallelSparseMoeBlock(QuantExperts, nn.Module):
                 flat, self.experts.gate_up_proj, self.experts.down_proj, self.num_experts,
                 selected_experts, routing_weights, skip_invalid=skip_invalid, activation=self.activation,
             )
-            return self.comm_group.all_reduce(output)
+            return self.comm_group.all_reduce(output) if reduce_results else output
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
         # (tokens, top_k, hidden) — partial results before reduce
@@ -1189,7 +1262,7 @@ class ParallelSparseMoeBlock(QuantExperts, nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        return self.comm_group.all_reduce(output)
+        return self.comm_group.all_reduce(output) if reduce_results else output
 
 
 class ParallelSparseMoeBlockWithSharedExpert(QuantExperts, nn.Module):
@@ -1534,8 +1607,10 @@ class ExpertParallelSparseMoeBlock(QuantExperts, nn.Module):
         selected_experts: torch.Tensor,
         *,
         token_valid: torch.Tensor | None = None,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
-        """``forward`` after its router (see ``ParallelSparseMoeBlock.experts_forward``)."""
+        """``forward`` after its router (see ``ParallelSparseMoeBlock.experts_forward``,
+        ``reduce_results`` too)."""
         if self.track_expert_load:
             ids = selected_experts.flatten()
             if token_valid is None:
@@ -1560,13 +1635,15 @@ class ExpertParallelSparseMoeBlock(QuantExperts, nn.Module):
         routing_weights, selected_experts = _sync_routing(
             self.comm_group, routing_weights, selected_experts,
         )
-        return self._dispatch_ep(flat, routing_weights, selected_experts, token_valid)
+        return self._dispatch_ep(flat, routing_weights, selected_experts, token_valid,
+                                 reduce_results=reduce_results)
 
     def _dispatch_ep(
         self, flat: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         token_valid: torch.Tensor | None = None,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         # Every shape is static, so this stays torch.compile and CUDA-graph safe.
         local = selected_experts - self.expert_start
@@ -1584,4 +1661,4 @@ class ExpertParallelSparseMoeBlock(QuantExperts, nn.Module):
                 self.num_local_experts, local, routing_weights, skip_invalid=True,
                 activation=self.activation,
             )
-        return self.comm_group.all_reduce(out)
+        return self.comm_group.all_reduce(out) if reduce_results else out

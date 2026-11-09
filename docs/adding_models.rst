@@ -500,10 +500,14 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 - A prefill keeps the state at its last page boundary before its end, since a resend's KV
   hit always leaves the last page to recompute, and at its KV hit's last page
   boundary when that is past what it restored. A shared prefix is then served from the third request
-  that shares it. A step longer than the largest captured bucket checkpoints less often, so that
-  its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
-- A decode step that ends a page keeps the state there, so a later turn that re-sends the
-  reply restores it. It replaces the request's previous decode snapshot once the KV chain
+  that shares it. Under GDN, a step longer than the largest captured bucket checkpoints less often,
+  so that its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval;
+  KDA's kernels store each snapshot themselves and keep every page, at the end of one of
+  their 64-token chunks, so loading refuses a KV ``page_size`` that isn't a multiple of 64.
+  Under KDA a chunked prompt's later chunks keep their own last boundary too, when the chunk
+  starts on one of the kernels' chunks, so a long shared prefix is served from the second request.
+- A decode step that ends a page keeps the state there, where the KV cache keys the decode walk,
+  so a later turn that re-sends the reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
   past the reply's end, leaves the previous one in place.
 - A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
@@ -511,12 +515,14 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   so the slots hold about one prompt each. A decode snapshot that a later prompt restores
   is kept like a prompt's from then on.
 
-Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
-off or can't open at the pool's world size; in those cases the pool allocates no snapshot
-slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+Snapshots stay off without ``prefix_slots``, without a named KV cache, when that cache isn't
+on every node of the pool, or when its ``prefix_cache`` is off or can't open at the pool's
+world size (above one rank, unless it sets ``prefix_cache_tp``); in those cases the pool
+allocates no snapshot slots. Above one rank, rank 0 leases a request's snapshot as it sends
+the step, as it does the KV pages, and the other ranks restore the same slot. Neither does a
+pool whose cache the engine keeps shut for another reason, such as a model that names no
+checkpoint and sets no salt. Every cache on the node of a pool without snapshots stays shut,
+and the engine logs which pool kept it shut.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt
@@ -623,6 +629,13 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       ``aux_planes`` names per-token state of its own width on the same pages
+       (``AuxPlanes(num_layers, width)``, DSA's index keys for one): it shares the page
+       table, is copied and freed with the pages, and is read and written through
+       ``KVManager.aux_view`` and ``write_aux``. CPU offload, a cross-instance KV
+       retrieve and a pool that keeps a window (below) refuse aux planes for now. An eager
+       forward that runs a long step's tokens in windows writes each window at its own
+       slots inside ``KVManager.token_window(start, end)``.
        A pool keeps only a window of the layers a windowed attention over it runs
        (``AttentionConfig.sliding_window``, below); its ``page_size``, ``max_num_pages``
        and ``cpu_offload_pages`` then work as described there.
@@ -715,18 +728,21 @@ The spec types are:
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
-     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
-       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
-       The model's indexer layers store their index keys (``store_keys``) and pick each
-       query's top ``topk`` positions by the indexer's score (``select``); a layer that
-       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
-       absorbed MLA over just the picked latents. The keys sit in per-request buffers
-       outside the paged pool and the selection runs per request on the host, so the
-       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
-       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
-       move onto the MLA cache's pages under its page table, so the allocator, eviction and
-       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
+       keys, each query row attends only the ``topk`` tokens its indexer scores highest.
+       The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
+       model declares on its ``PagedKVConfig``, so they share its page table; a row is
+       ``index_head_dim`` wide, three times that with ``kpool`` above 1 (checked at build).
+       A step declares ``DSAStep()``: ``plan`` builds its rows from the KV plan, into
+       buffers of the capture slot under a lease (the graph reads them, every plan refills
+       them), and the layers write their keys, select and attend through the resource
+       (``write_index``, ``select``, ``attend``), on device and under CUDA graphs. A pass
+       over some of a step's rows narrows the plan (``rows``, ``pick``) and writes at their
+       own slots inside ``KVManager.token_window`` or ``token_rows``; ``dense`` leaves a
+       pass to dense attention.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
+       ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -821,11 +837,11 @@ The spec types are:
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
        settles each one's accepted drafts. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
-       the resource its gates as it binds: with Kimi K3's full-rank output gate
-       (``full_rank_output_gate``) the resource runs the torch reference. Where the fused
-       kernels run, activations other than bf16 or a forget-gate bound below -5 are a
-       ValueError at load. The torch reference's prefill can't be captured
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). The fused kernels
+       take either output gate: GLM-5.3's low-rank one or Kimi K3's full-rank one
+       (``full_rank_output_gate``), whose pre-activation the layer's input projection
+       already computes. Where the fused kernels run, activations other than bf16 or a
+       forget-gate bound below -5 are a ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
@@ -890,7 +906,7 @@ appears in no spec, so it receives no resources:
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
-   * - An LLM with DeepSeek sparse attention (GLM-5.2)
+   * - An LLM with DeepSeek sparse attention (GLM-5.2, GLM-5.3)
      - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
        plus a ``DSASpec`` over the same cache.
    * - A node that carries per-request state between steps of a loop (an RNN-T
@@ -1667,6 +1683,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+  - ``chunk_align`` (default 1): a row cut mid-way runs a multiple of this many tokens, so
+    its next chunk starts on one. A row starts at 0 or past a cached prefix, a whole
+    number of KV pages, so an alignment that divides the page keeps every chunk on it.
+    Kimi K3.1 declares 64: a chunk starting off a 64-key boundary has its MLA rows split
+    into single-query rows, which no captured prefill holds, and keeps no KDA snapshot.
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``

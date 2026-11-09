@@ -518,7 +518,9 @@ A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
-for the next step rather than running the step over its budget.
+for the next step rather than running the step over its budget. A model can also declare
+that a cut runs a multiple of so many tokens (``ChunkingPolicy.chunk_align``; Kimi K3.1's
+is 64): the cut rounds down to it, and a prompt it rounds to nothing waits too.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
@@ -1113,9 +1115,9 @@ or ``increase()``.
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
   tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
-  Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
-  ``prefix_cache_tp`` set. Qwen3.5's hit counts the KV cache's tokens before its
-  recurrent pool cuts the hit to a snapshot.
+  Kimi K3, Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
+  ``prefix_cache_tp`` set. Kimi K3's and Qwen3.5's hits count the KV cache's tokens before
+  their recurrent pool cuts the hit to a snapshot.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.

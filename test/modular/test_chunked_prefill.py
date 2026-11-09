@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.chunking import ChunkRange
@@ -784,3 +785,61 @@ def test_a_chunked_walk_that_reports_no_row_length_is_refused():
 
     with pytest.raises(ValueError, match="get_input_sequence_len"):
         _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups())
+
+
+# ── chunk alignment (ChunkingPolicy.chunk_align) ─────────────────────────
+
+
+def test_a_cut_runs_a_multiple_of_the_alignment_and_a_finishing_row_runs_whole():
+    """A 300-token budget over a 1000-token prompt cuts it at 256 with 64-token alignment, so its
+    next chunk starts on a boundary; a row that finishes this step is never rounded."""
+    take, dropped = fill_token_budget_in_start_order(["p"], {"p": 1000}, {"p"}, 300, 1, align=64)
+    assert take == {"p": 256} and not dropped
+    take, _ = fill_token_budget_in_start_order(["a", "p"], {"a": 70, "p": 1000}, {"a", "p"}, 300, 1, align=64)
+    assert take == {"a": 70, "p": 192}, "a finishes whole at 70; p's cut rounds down from 230"
+    take, _ = fill_token_budget(["a", "b"], {"a": 500, "b": 500}, {"a", "b"}, 300, 1, align=64)
+    assert take == {"a": 128, "b": 128}, "a fair share of 150 each rounds down too"
+
+
+def test_a_cut_that_rounds_to_nothing_waits_for_the_next_step():
+    """Decode rows leave 40 tokens: under 64 the prompt waits rather than run off a boundary."""
+    decodes = _decodes(260)
+    take, dropped = fill_token_budget_in_start_order(
+        [*decodes, "p"], decodes | {"p": 1000}, {"p"}, 300, 1, align=64)
+    assert "p" not in take and "p" in dropped
+    take, dropped = fill_token_budget([*decodes, "p"], decodes | {"p": 1000}, {"p"}, 300, 1, align=64)
+    assert "p" not in take and "p" in dropped
+
+
+def test_an_otherwise_empty_step_runs_its_head_cut_up_to_the_alignment():
+    """Never empty while a row exists: a 40-token budget still runs the prompt, 64 tokens of it."""
+    take, dropped = fill_token_budget_in_start_order(["p"], {"p": 1000}, {"p"}, 40, 1, align=64)
+    assert take == {"p": 64} and not dropped
+    take, _ = fill_token_budget(["p"], {"p": 50}, {"p"}, 40, 1, align=64)
+    assert take == {"p": 50}, "a head that finishes runs its rest, however short"
+
+
+def test_without_an_alignment_cuts_are_unchanged():
+    take, _ = fill_token_budget_in_start_order(["p"], {"p": 1000}, {"p"}, 300, 1)
+    assert take == {"p": 300}
+
+
+def test_a_combined_walk_aligns_its_cuts_to_its_walks_largest():
+    from mstar.engine.chunking import ChunkingManagement
+
+    chunking = ChunkingManagement({"n": object()})
+    chunking.set_policies({
+        ("n", "prefill"): ChunkingPolicy(walks=("prefill",), chunkable=True, max_batch_tokens=64, chunk_align=16),
+        ("n", "decode"): ChunkingPolicy(walks=("decode",)),
+    })
+    chunking.set_budgets({}, {"prefill", "decode"},
+                         combined_walk_of={("n", "prefill"): "mixed", ("n", "decode"): "mixed"})
+    assert chunking.chunk_align("n", "prefill") == 16
+    assert chunking.chunk_align("n", "mixed") == 16
+    assert chunking.chunk_align("n", "decode") == 1
+
+
+def test_a_policy_refuses_an_alignment_that_is_not_a_positive_int():
+    for bad in (0, -64, 1.5, True):
+        with pytest.raises(ValueError, match="chunk_align"):
+            ChunkingPolicy(walks=("prefill",), chunkable=True, chunk_align=bad)

@@ -1,12 +1,11 @@
 model: "kimi_k31"
 # kimi_k31_tp8.yaml past index_topk with K3.1's DSA: the MLA layers' indexers hand their keys
 # and queries to the DSA resource, and every token past the 2048th, prompt or decode, attends its
-# own top-2048 latents. Prompts prefill in chunks of prefill_chunk_tokens. Decode runs eager (the
-# resource selects per request on the host). Its per-request index keys (24 layers x 128,
-# ~6 KB/token/rank) live outside the paged pool.
+# own top-2048 latents. Prompts prefill in chunks of prefill_chunk_tokens; decode is captured. The
+# index keys (24 layers x 128) sit on the MLA cache's pages: 33 KiB a token a rank in all.
 max_seq_len: 131072
 dist_timeout_s: 7200
-# 16 full-window requests fit the pool below.
+# 16 requests; the pool below holds ten at the full window.
 max_concurrent_requests: 16
 tp_allreduce: "flashinfer"
 tp_async_sched: true
@@ -18,8 +17,8 @@ model_kwargs:
   prefill_chunk_tokens: 8192
 resources:
   kv_cache:
-    # 16 x 1024 pages of 128 tokens + the sink, ~27.6 KB/token/rank: ~58 GB/rank.
-    max_num_pages: 16385
+    # 10240 pages of 128 tokens + the sink, 33 KiB/token/rank: ~44 GB/rank, 1.31M tokens.
+    max_num_pages: 10241
     page_size: 128
   kda_state:
     max_slots: 17

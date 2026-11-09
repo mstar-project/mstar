@@ -10,8 +10,9 @@ from mstar.model.kimi_k3.tests import engine_helpers as H
 from mstar.model.kimi_k3.tests.reference import reference_logits
 
 PROMPT = torch.tensor([5, 9, 13, 7, 21, 2, 40, 33], dtype=torch.long)
-# fp32 end to end: the port and the reference differ only in summation order
-ATOL = 5e-5
+# fp32 end to end: the port and the reference differ only in summation order (the latent MoE sums its up
+# projection's and shared experts' partials in one K-packed GEMM: up to 6e-5 off the reference's two)
+ATOL = 1e-4
 
 
 @pytest.fixture(autouse=True)
@@ -192,4 +193,45 @@ def test_a_rows_logits_do_not_depend_on_the_rows_beside_it():
             tok = H.run_step(engine, "decode", {rid: tok[rid].view(1) for rid in batch})
             steps.append(engine._resources["sampler"].logits[-1][:3].clone())
         rows[label] = torch.stack(steps)
-    torch.testing.assert_close(rows["beside"], rows["alone"], atol=1e-5, rtol=0)
+    # fp32 rounding at another batch shape (up to 1.6e-5): a row reaching into another moves it by far more
+    torch.testing.assert_close(rows["beside"], rows["alone"], atol=3e-5, rtol=0)
+
+
+@pytest.mark.parametrize("dsa", [False, True])
+def test_a_prompt_sharing_a_cached_prefix_skips_it_and_matches_the_reference(dsa):
+    """Prefix reuse through the engine: a second prompt sharing the first's two pages restores the
+    KDA state kept at the second page's end and runs only its own tokens over the latent pages
+    (and, K3.1 past an index_topk of 8, the index keys) the first wrote; its prefill logits and
+    the decode after it match the reference over the whole prompt, and its context counts the
+    skipped tokens."""
+    cfg = (KimiK3ModelConfig.reduced(index_topk=8, max_seq_len=256, dsa_long_context=True) if dsa
+           else KimiK3ModelConfig.reduced(dsa=False, max_seq_len=256))
+    engine, sub, model, sd = H.build_engine(config=cfg, seed=5, prefix_slots=4)
+    gen = torch.Generator().manual_seed(11)
+    first = torch.randint(0, 250, (150,), generator=gen)
+    second = torch.cat([first[:128], torch.randint(0, 250, (20,), generator=gen)])
+    cuts = []
+    split = sub.split_inputs
+
+    def spy(graph_walk, fwd_info, inputs, start, end):
+        cuts.append((fwd_info.rid_handle, start, end))
+        return split(graph_walk, fwd_info, inputs, start, end)
+
+    sub.split_inputs = spy
+    H.add_keyed_request(engine, model, "a", first)
+    tok = H.run_step(engine, "prefill", {"a": first})["a"].view(1)
+    H.run_step(engine, "decode", {"a": tok})
+    engine.remove_request("a")
+    assert not cuts, "the first prompt found a prefix in an empty cache"
+
+    H.add_keyed_request(engine, model, "b", second)
+    tok = H.run_step(engine, "prefill", {"b": second})["b"].view(1)
+    assert cuts == [("b", 128, 148)], "b didn't skip the two pages a cached"
+    assert sub.request_state("b").get("context") == 148
+    ref = reference_logits(sd, second, cfg, use_dsa=dsa)
+    torch.testing.assert_close(_logits(engine)[-1], ref[-1], atol=2 * ATOL, rtol=0)
+    assert tok.item() == ref[-1].argmax().item()
+    H.run_step(engine, "decode", {"b": tok})
+    ref = reference_logits(sd, torch.cat([second, tok]), cfg, use_dsa=dsa)
+    torch.testing.assert_close(_logits(engine)[-1], ref[-1], atol=2 * ATOL, rtol=0)
+    assert sub.request_state("b").get("context") == 149

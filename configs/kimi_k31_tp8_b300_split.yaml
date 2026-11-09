@@ -1,0 +1,56 @@
+model: "kimi_k31"
+# kimi_k31_tp8_b300.yaml with the latent MoE's router GEMM on the side stream (latent_moe_front: split): with the
+# shared experts' overlap (up to shared_experts_overlap_max_tokens rows) the router's fp32 GEMM runs on the side
+# stream ahead of the shared experts, beside the latent's bf16 GEMM on the main stream, which the experts kernel
+# then quantizes: vLLM's layout (B300 slot 9: router 4.5 us beside the latent's 9.3) in place of the packed fp32
+# GEMM over router | latent (cuBLAS split-K + its reduce, 13.0 + 3.2 us at c=1) and its cast. Here the table names
+# FlashInfer's router GEMM (3.9 us at one row) and cute-dsl for the latent (9.7). Everything else as
+# kimi_k31_tp8_b300.yaml, to A/B it with one config switch (its notes below).
+#
+# kimi_k31_tp8.yaml on 8x B300 with the small-M GEMM backends measured there: the decode projections (KDA's in/out,
+# the packed MoE input and MLA q_a | kv_a | gate) take the backend the table names per shape and M
+# (benchmark/kernels/k31_dense_gemm.py --table-out on the node), cuBLAS where it names none; without the
+# file at boot, a warning and cuBLAS throughout. Everything else as kimi_k31_tp8.yaml.
+#
+# Kimi K3.1 Pro on 8x B300 (288 GB), tensor parallel: 12 KDA and 12 MLA heads per rank, the
+# routed experts sharded by intermediate dim (3072 / 8 = 384). With the release's MXFP4 experts
+# held as stored (the quantization API's mxfp4 experts format, `quantization: auto`) a rank
+# holds ~195 GB of weights: ~180 GB of experts, ~15 GB bf16. bf16 experts do not fit any
+# 8-GPU node (5.4 TB). Resolve the checkpoint through the HF cache or model_kwargs.checkpoint_path.
+#
+# Within index_topk (2048) tokens dense MLA is exactly K3.1's DSA, so this config serves
+# 2048-token contexts on the dense paged path; kimi_k31_tp8_longctx.yaml goes past it.
+max_seq_len: 2048
+# One request per KDA slot below.
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  # the router's GEMM on the side stream beside the latent's (see above)
+  latent_moe_front: split
+  small_m_gemm_table: /workspace/results/k31-gemm/table_b300.json
+  max_seq_len: 2048
+  kda_max_requests: 64
+  # routed experts: auto = FlashInfer's trtllm-gen MXFP4 x MXFP8 MoE with SiTU fused on B200/B300 (vLLM's
+  # FLASHINFER_TRTLLM_MXFP4_MXFP8) where its load probe agrees, else Marlin; trtllm / marlin force one. Its
+  # tactics are tuned at load (routed_experts_autotune, default true; routed_experts_tune_tokens, default
+  # every FlashInfer bucket: 1..256, 512..8192) and kept per GPU under ~/.cache/mstar/flashinfer_moe_tune: the first boot pays for it
+  routed_experts_backend: auto
+  # prefill captured at these packed token counts, 1-8 rows, as kimi_k31_tp8.yaml (see there)
+  prefill_token_buckets: [512, 1024, 2048, 3072, 4096, 6144, 8192]
+resources:
+  kv_cache:
+    # 24 MLA layers x 576-wide latent, bf16, replicated: ~27.6 KB/token/rank. 64 requests of
+    # 2048 tokens at 128 tokens a page plus the sink: ~3.6 GB/rank.
+    max_num_pages: 1025
+    page_size: 128
+  kda_state:
+    # 64 requests plus the sink, head-sharded like the KDA layers: 69 layers x 12 heads x
+    # 128 x 128 fp32 + the conv tails, ~56 MB/slot/rank, ~3.7 GB/rank.
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

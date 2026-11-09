@@ -17,6 +17,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
+from mstar.utils import small_m_gemm
 
 
 def _slice_rows_loader(
@@ -147,8 +148,7 @@ class ParallelKimiDeltaAttention(KimiDeltaAttention):
             # o_proj writes its partial straight into the all-reduce buffer
             buf = self.comm_group.all_reduce_buffer(
                 hidden_states.shape, self.o_proj.weight.dtype, hidden_states.device)
-            return self.comm_group.all_reduce(
-                torch.mm(out, self.o_proj.weight.t(), out=buf))
+            return self.comm_group.all_reduce(small_m_gemm.linear(out, self.o_proj.weight, out=buf))
         return self.comm_group.all_reduce(self.o_proj(out))
 
     def prefill(self, hidden_states, recurrent_state=None, conv_state=None, attention_mask=None):

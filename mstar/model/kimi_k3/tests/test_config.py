@@ -51,6 +51,27 @@ def test_dsa_holds_the_context_to_index_topk_unless_long_context():
         KimiK3ModelConfig.k3(dsa_long_context=True)
 
 
+def test_index_skip_topk_offset_skips_no_k31_layer():
+    """K3.1's ``index_skip_topk_offset`` (1 in the release) under DeepSeek-V3.2's IndexCache rule, as
+    vLLM reads it: a layer reuses an earlier top-k when ``max(layer - offset + 1, 0) % freq != 0``. At the
+    release's ``index_topk_freq`` 1 every DSA layer runs its own indexer whatever the offset, so each MLA
+    layer keeps an index plane; another frequency is refused (vLLM's K3.1 refuses it too)."""
+    from mstar.model.kimi_k3.config import index_skips_topk
+
+    hf = _hf("k31_config.json")
+    dsa = hf["text_config"]["dsa_config"]
+    assert (dsa["index_topk_freq"], dsa["index_skip_topk_offset"]) == (1, 1)
+    full = KimiK3ModelConfig.from_hf_config(hf).full_attn_layers
+    for offset in (0, 1, 2, 7):
+        assert not any(index_skips_topk(layer, 1, offset) for layer in full)
+        edited = copy.deepcopy(hf)
+        edited["text_config"]["dsa_config"]["index_skip_topk_offset"] = offset
+        assert KimiK3ModelConfig.from_hf_config(edited) == KimiK3ModelConfig.k31()
+    # the rule at a frequency K3.1 doesn't use: offset 1 keeps every 4th layer from 0, offset 2 from 1
+    assert [layer for layer in range(9) if not index_skips_topk(layer, 4, 1)] == [0, 4, 8]
+    assert [layer for layer in range(9) if not index_skips_topk(layer, 4, 2)] == [0, 1, 5]
+
+
 @pytest.mark.parametrize("edit, match", [
     (lambda t: t["dsa_config"].update(index_topk_freq=4), "index_topk_freq"),
     (lambda t: t["dsa_config"].update(index_rope_dim=64), "rotary DSA"),

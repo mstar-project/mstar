@@ -64,6 +64,9 @@ class _Engine(_RoomEngine):
     def min_chunk_tokens(self, budget):
         return 1
 
+    def chunk_align(self, node_name, graph_walk):
+        return 1
+
     def walk_token_caps(self, node_name, graph_walk):
         return None
 
