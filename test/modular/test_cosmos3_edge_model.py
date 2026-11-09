@@ -377,6 +377,55 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=2) == set()
 
 
+
+def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -> None:
+    """The tower takes rotary tables, built by the DiT transformer's own rotary:
+    an eager vision prefill's from the positions its layout places, based at
+    the counter; a captured decode step's from the counter's planned positions
+    on all three axes, inside the graph."""
+    import types
+
+    from torch import nn
+
+    from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.cosmos3.components.reasoner import MediaGrid, vision_layout
+    from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer, Cosmos3RotaryEmbedding
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+    model = _model(tmp_path)
+    r, cfg = model.config.reasoner, model.config
+
+    class Tower(nn.Module):
+        _rotary = Cosmos3OmniTransformer._rotary
+        build_cos_sin = Cosmos3OmniTransformer.build_cos_sin
+
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 4)
+            self.rotary_emb = Cosmos3RotaryEmbedding(cfg.head_dim, cfg.rope_theta, cfg.rope_axes_dim)
+
+    tower = Tower()
+    sub = Cosmos3ReasonerSubmodule(transformer=tower, config=cfg, encoders=(model._vision_encoder(),))
+    sub.get_device = lambda: torch.device("cpu")
+    planned = torch.tensor([40, 41])
+    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 17, pos_ids=lambda label: planned)}
+
+    ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
+    layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
+    walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    row = sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(8, 4)]})
+    eager = types.SimpleNamespace(captured=False)
+    tensors = sub.preprocess(walk, eager, [row])
+    pos, _ = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids), start=17)
+    cos, sin = sub.decoder_kwargs(walk, eager, len(ids), **tensors)["cos_sin"]
+    want = tower.build_cos_sin(pos, torch.float32)
+    assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
+
+    cos, sin = sub.decoder_kwargs(Cosmos3Model.REASONER_DECODE_WALK, types.SimpleNamespace(captured=True), 2)["cos_sin"]
+    want = tower.build_cos_sin(planned.expand(3, -1), torch.float32)
+    assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
+
 def test_edge_chat_adapter(tmp_path) -> None:
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import ChatCompletionRequest
