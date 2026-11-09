@@ -8,14 +8,15 @@ from the ONNX files MiniCPM-o ships (``speech_tokenizer_v2_25hz.onnx``, ``camppl
   the tanh output before rounding (Chatterbox's ``FSQuantizer`` scales it by 0.999 instead),
   and its attention LayerNorm eps of 1e-6 (the ONNX graph and Chatterbox use 1e-5);
 - x-vector: ``CAMPPlus`` on the mean-normalised Kaldi fbank;
-- mel: ``MelSpectrogram24k`` of the clip resampled 16 -> 24 kHz, replicate-padded (or cut) to
-  two frames per prompt token, which is what the flow's prompt condition must be.
+- mel: the Matcha log-mel (``MatchaLogMel``) of the clip resampled 16 -> 24 kHz,
+  replicate-padded (or cut) to two frames per prompt token, which is what the flow's prompt condition must be.
 
 Both ONNX files load through CosyVoice3's readers (``cosyvoice3.components.onnx_weights``),
 which need no ``onnx`` package.
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import NamedTuple
 
 import torch
@@ -23,10 +24,11 @@ import torch.nn.functional as F
 import torchaudio
 from torch import nn
 
-from mstar.model.chatterbox.components.audio import MelSpectrogram24k, kaldi_fbank_80
+from mstar.model.chatterbox.components.audio_frontend import kaldi_fbank_80
 from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
 from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
 from mstar.model.chatterbox.config import S3GenMelConfig, S3GenXVectorConfig, S3TokenizerConfig
+from mstar.model.components.audio_features import MatchaLogMel
 
 PROMPT_SR = 16000
 MEL_SR = 24000
@@ -73,7 +75,7 @@ class VoicePromptEncoder(nn.Module):
         super().__init__()
         self.tokenizer = PromptTokenizer()
         self.speaker = CAMPPlus(S3GenXVectorConfig())
-        self.mel = MelSpectrogram24k(S3GenMelConfig())
+        self.mel = MatchaLogMel(**asdict(S3GenMelConfig()))
         self.resample = torchaudio.transforms.Resample(PROMPT_SR, MEL_SR)
 
     @torch.inference_mode()

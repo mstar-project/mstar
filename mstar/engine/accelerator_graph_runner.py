@@ -80,20 +80,32 @@ def compile_level() -> int:
     return level
 
 
-def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+def compile_kwargs(
+    config_mode: str | None, inductor_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """``torch.compile``'s arguments for a capture config whose ``compile_mode``
-    is ``config_mode``, which the config checked when it was built. None takes
-    the compile level's arguments."""
+    is ``config_mode`` and whose ``inductor_options`` are ``inductor_options``,
+    both checked when the config was built. None takes the compile level's
+    arguments. torch.compile takes a mode or options, not both, so options turn
+    the mode into the option set it stands for, with these over it."""
     kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
     if config_mode is None:
-        return {**kwargs, **COMPILE_LEVELS[compile_level()]}
-    if config_mode == DETERMINISTIC_COMPILE_MODE:
-        options = deterministic_inductor_options()
-        return {**kwargs, "options": options} if options else kwargs
+        kwargs.update(COMPILE_LEVELS[compile_level()])
+    elif config_mode == DETERMINISTIC_COMPILE_MODE:
+        if options := deterministic_inductor_options():
+            kwargs["options"] = options
     # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
-    if config_mode != "default":
+    elif config_mode != "default":
         kwargs["mode"] = config_mode
-    return kwargs
+    if not inductor_options:
+        return kwargs
+    from torch._inductor import list_mode_options
+
+    mode = kwargs.pop("mode", None)
+    options = dict(list_mode_options(mode)) if mode else {}
+    options.update(kwargs.pop("options", None) or {})
+    options.update(inductor_options)
+    return {**kwargs, "options": options}
 
 
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
@@ -1352,7 +1364,7 @@ class AcceleratorGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward, **compile_kwargs(spec.config.compile_mode),
+                forward, **compile_kwargs(spec.config.compile_mode, spec.config.inductor_options),
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,

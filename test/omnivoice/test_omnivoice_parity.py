@@ -54,6 +54,7 @@ from mstar.model.omnivoice.components.text import build_prefix
 from mstar.model.omnivoice.components.unmask import build_reveal_schedule, filter_top_k, unmask_step
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
+    TARGET_LEN,
     UNMASK_LOOP_NAME,
     OmniVoiceBackboneSubmodule,
 )
@@ -202,6 +203,23 @@ def test_reveal_schedule_covers_the_canvas():
             assert len(schedule) == num_step
             assert min(schedule) >= 0
             assert sum(schedule) == target_len * NUM_CODEBOOK
+
+
+@pytest.mark.parametrize("num_step", [1, 8, 1000])
+def test_the_unmask_loop_ends_on_the_requests_reveal_schedule(num_step):
+    """The loop's cap alone ends it, so it must be the length of the reveal
+    schedule the backbone indexes by iteration (a clamped num_step included)."""
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    model = object.__new__(OmniVoiceModel)
+    model.config = OmniVoiceConfig()
+    kwargs = {"num_step": num_step, TARGET_LEN: 7}
+    [step] = model.walk_plan("p", ["text"], ["audio"], {"prefix_ids": [object()]}, kwargs)
+    schedule = build_reveal_schedule(
+        target_len=7, num_codebook=NUM_CODEBOOK,
+        num_step=step.step_metadata["num_step"], t_shift=step.step_metadata["t_shift"],
+    )
+    assert model.get_loop_caps(**kwargs) == {UNMASK_LOOP_NAME: len(schedule)}
 
 
 def _reveal_all(canvas, logits, generator=None, class_temperature=0.0, count=None):

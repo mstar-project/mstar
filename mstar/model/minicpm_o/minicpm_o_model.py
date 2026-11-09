@@ -34,11 +34,7 @@ import torch
 from transformers import Qwen2Tokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -65,14 +61,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import (
-    ForwardPassArgs,
-    KVLabel,
-    LabelLayout,
-    Model,
-    ProcessPromptOutput,
-    Span,
-)
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
@@ -99,7 +88,6 @@ from mstar.model.minicpm_o.config import (
     LLM_KV,
     LLM_POS,
     LLM_SAMPLER,
-    PREFILL_WALKS,
     RESAMPLER_ATTN,
     SPEECH_TEXT_TOKENS,
     T2W_KV,
@@ -163,25 +151,6 @@ VOICE_PROMPT_SUFFIX = (
 # Upstream's `chat` defaults when sampling.
 DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalty=1.02)
 
-# walk -> the request signals each node reads
-_WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "prefill_text": {LLM: ("text_inputs",)},
-    "prefill_image": {
-        VISION: ("pixel_values",),
-        LLM: ("text_inputs", "image_positions"),
-    },
-    "prefill_audio": {
-        AUDIO: ("audio_features",),
-        LLM: ("text_inputs", "audio_positions"),
-    },
-    "prefill_omni": {
-        VISION: ("pixel_values",),
-        AUDIO: ("audio_features",),
-        LLM: ("text_inputs", "image_positions", "audio_positions"),
-    },
-}
-# TokenStop ends a reply on a stop sampled in PREFILL_WALKS, so each prefill walk is there
-assert set(_WALK_INPUTS) == PREFILL_WALKS
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
@@ -427,9 +396,8 @@ class MiniCPMOModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        model_kwargs = model_kwargs or {}
         keys = (
             "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
             "return_logprobs", "logprobs_mode",
@@ -543,11 +511,8 @@ class MiniCPMOModel(Model):
     def get_partitions(self) -> list[PartitionDefinition]:
         main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK}
         return [
-            PartitionDefinition(name=MAIN, graph_walks=main, initial_walk=None, producer_partitions=[]),
-            PartitionDefinition(
-                name=TOKEN2WAV, graph_walks={T2W_CHUNK}, initial_walk=T2W_CHUNK,
-                producer_partitions=[MAIN],
-            ),
+            PartitionDefinition(name=MAIN, graph_walks=main),
+            PartitionDefinition(name=TOKEN2WAV, graph_walks={T2W_CHUNK}),
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
@@ -806,107 +771,37 @@ class MiniCPMOModel(Model):
             return "prefill_audio"
         return "prefill_text"
 
-    @staticmethod
-    def _walk_inputs(walk: str, signals: dict[str, list[TensorPointerInfo]]) -> list[GraphEdge]:
-        edges = []
-        for node, names in _WALK_INPUTS[walk].items():
-            for name in names:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = list(signals[name])
-                edges.append(edge)
-        return edges
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """Main: one prefill walk over the whole prompt, picked by the
+        attachments it carries, then decode fed the prefill's token. A spoken
+        reply decodes on ``decode_spoken`` instead and then runs the TTS:
+        ``tts_prefill`` over the reply's hidden states, then ``tts_decode``,
+        whose codes stream to the vocoder. The prefill carries the encoders'
+        segment sizes that ``process_prompt`` settled.
+
+        Token2Wav runs a chunk per streamed window, and only for a spoken reply."""
         speech = "audio" in output_modalities
         if partition_name == TOKEN2WAV:
-            # self-triggered by its stream; idle unless the reply is spoken
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk=T2W_CHUNK, is_prefill=False,
-                kwargs={"voice": model_kwargs.get("voice") or DEFAULT_VOICE},
-            )
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=not speech,
-                step_metadata={"voice": metadata.kwargs["voice"]},
-            )
-        walk = self._prefill_walk(input_signals)
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=walk,
-            is_prefill=True,
-            kwargs={"audio_output": "audio" in output_modalities},
-        )
-        inputs = self._walk_inputs(walk, input_signals)
-        model_kwargs = model_kwargs or {}
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata={k: model_kwargs[k] for k in (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS) if k in model_kwargs},
-        )
-
-    @staticmethod
-    def _carry(
-        node: str, names: tuple[str, ...], persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        edges = []
-        for name in names:
-            edge = GraphEdge(next_node=node, name=name)
-            edge.tensor_info = list(persist_signals.get(name, []))
-            edges.append(edge)
-        return edges
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """prefill -> decode -> done, or for a spoken reply prefill -> decode_spoken
-        -> tts_prefill -> tts_decode -> done.
-
-        The loops stop in their submodules' ``check_stop``; arriving here after
-        one means it finished."""
-        metadata = partition_metadata
-        if partition_name == TOKEN2WAV:
-            # The stream buffer decides when it is done (after flushing the last
-            # window); nothing here predicts it from counts.
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[],
-                step_metadata={"voice": metadata.kwargs["voice"]},
-            )
-        walk = metadata.graph_walk
-        speech = metadata.kwargs["audio_output"]
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = DECODE_SPOKEN if speech else DECODE
-            inputs = self._carry(LLM, ("new_token",), persist_signals)
-            inputs[0].name = "text_inputs"
-        elif walk == DECODE_SPOKEN:
-            metadata.graph_walk = TTS_PREFILL
-            inputs = self._carry(TTS, ("tts_ids", "tts_hidden"), persist_signals)
-        elif walk == TTS_PREFILL:
-            metadata.graph_walk = TTS_DECODE
-            inputs = self._carry(TTS, ("tts_code",), persist_signals)
-            inputs[0].name = "tts_next"
-        else:
-            # the decode loop has stopped; back here, the reply is done
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-        )
+            if not speech:
+                return []
+            return [WalkStep(T2W_CHUNK, step_metadata={"voice": model_kwargs.get("voice") or DEFAULT_VOICE})]
+        settled = {k: model_kwargs[k] for k in self.INTERNAL_KWARGS if k in model_kwargs}
+        prefill = WalkStep(self._prefill_walk(input_signals), step_metadata={FINAL_PREFILL: True, **settled})
+        if not speech:
+            return [prefill, WalkStep(DECODE, bind={"text_inputs": "new_token"})]
+        return [
+            prefill,
+            WalkStep(DECODE_SPOKEN, bind={"text_inputs": "new_token"}),
+            WalkStep(TTS_PREFILL),
+            WalkStep(TTS_DECODE, bind={"tts_next": "tts_code"}),
+        ]
 
     # ------------------------------------------------------------------
     # Submodules

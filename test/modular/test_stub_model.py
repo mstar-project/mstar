@@ -16,9 +16,7 @@ def test_a_stub_declares_nothing_and_inherits_the_base_defaults():
     assert model.kv_labels() == {}
 
 
-@pytest.mark.parametrize("method", [
-    "get_initial_forward_pass_args", "get_partition_forward_pass_args", "process_prompt",
-])
+@pytest.mark.parametrize("method", ["walk_plan", "process_prompt"])
 def test_a_stub_refuses_to_invent_a_request_path(method):
     with pytest.raises(NotImplementedError, match=method):
         getattr(make_model(), method)()

@@ -143,23 +143,43 @@ def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
     so its steps run rows-only (device loop-back). A spoken reply's decode also hands
     the TTS its condition, which goes through the host. Either way the client's token
     rides inline."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
     from mstar.model.minicpm_o.minicpm_o_model import MAIN
     from mstar.model.minicpm_o.submodules import LLMSubmodule
 
     model = a_model(tmp_path)
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text", "audio"] if speech else ["text"],
-        graph_walk="prefill_text", is_prefill=True, kwargs={"audio_output": speech},
-    )
-    model.get_partition_forward_pass_args(MAIN, metadata, {"new_token": []})
-    walk = metadata.graph_walk
+    outputs = ["text", "audio"] if speech else ["text"]
+    walk = model.walk_plan(MAIN, ["text"], outputs, {}, {})[1].walk
     signals = {edge.name for edge in model.get_graph_walk_graphs()[walk].section.outputs}
     llm = LLMSubmodule(torch.nn.Identity(), a_config())
     llm.node_resources = {LLM_SAMPLER: SimpleNamespace(has_slot_masters=True)}
     # the worker's test for a rows-only step (``Worker._all_on_device``)
     assert (signals <= llm.device_loopback_signals(walk)) == (not speech)
     assert llm.inline_client_signals(walk) == {"text_inputs": "new_token"}
+
+
+def test_a_spoken_reply_plans_the_tts_after_its_text_and_streams_to_the_vocoder(tmp_path):
+    """A spoken reply decodes on ``decode_spoken``, then the TTS prefills over it and
+    decodes looping its code back as ``tts_next``; Token2Wav runs only for it."""
+    from mstar.conductor.request_info import FINAL_PREFILL
+    from mstar.model.minicpm_o.config import DECODE_SPOKEN, TTS_DECODE, TTS_PREFILL
+    from mstar.model.minicpm_o.minicpm_o_model import DEFAULT_VOICE, MAIN, T2W_CHUNK, TOKEN2WAV
+
+    model = a_model(tmp_path)
+    plan = model.walk_plan(MAIN, ["text"], ["text", "audio"], {}, {})
+    assert [(s.walk, dict(s.bind)) for s in plan] == [
+        ("prefill_text", {}),
+        (DECODE_SPOKEN, {"text_inputs": "new_token"}),
+        (TTS_PREFILL, {}),
+        (TTS_DECODE, {"tts_next": "tts_code"}),
+    ]
+    assert plan[0].step_metadata[FINAL_PREFILL]
+    assert model.walk_plan(TOKEN2WAV, ["text"], ["text"], {}, {}) == []
+    [chunk] = model.walk_plan(TOKEN2WAV, ["text"], ["text", "audio"], {}, {})
+    assert (chunk.walk, dict(chunk.step_metadata)) == (T2W_CHUNK, {"voice": DEFAULT_VOICE})
+    graphs = model.get_graph_walk_graphs()
+    for step in plan:
+        inputs = set().union(*(node.input_names for node in graphs[step.walk].get_nodes().values()))
+        assert set(step.bind) <= inputs
 
 
 def test_tts_code_budget_is_its_loop_cap():
@@ -201,7 +221,7 @@ def test_min_p_is_served(tmp_path):
 
     model = a_model(tmp_path)
     [spec] = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec) and s.resource_key == LLM_SAMPLER]
-    model.get_request_resource_configs({}, {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
+    model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
 
 
 def test_an_attachment_tag_in_the_users_text_is_refused():
@@ -435,9 +455,9 @@ def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
     )
     out = prompt.new_input_tensors
     signals = {name: [None] for name in out}
-    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, model_kwargs=prompt.metadata)
-    assert args.full_metadata.graph_walk == "prefill_omni"
-    info = SimpleNamespace(step_metadata=args.step_metadata)
+    prefill, _ = model.walk_plan("default", ["text"], ["text"], signals, prompt.metadata)
+    assert prefill.walk == "prefill_omni"
+    info = SimpleNamespace(step_metadata=prefill.step_metadata)
     vision = VisionEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
         "prefill_omni", info, {"pixel_values": out["pixel_values"]},
     )
@@ -485,16 +505,20 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
         ({"text_inputs", "pixel_values", "image_positions", "audio_features", "audio_positions"}, "prefill_omni"),
     ],
 )
-def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
+def test_the_plan_prefills_by_the_attachments_then_decodes_its_token(model, tensors, walk):
+    """The prefill walk the attachments pick, whose inputs the request's signals
+    all name (the conductor sends each input the signal of its name), then decode
+    fed the prefill's token."""
+    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.graph.base import TensorPointerInfo
 
     signals = {name: [TensorPointerInfo.__new__(TensorPointerInfo)] for name in tensors}
-    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals)
-    assert args.full_metadata.graph_walk == walk
-    fed = {(e.next_node, e.name) for e in args.inputs}
+    prefill, decode = model.walk_plan("default", ["text"], ["text"], signals, {})
+    assert (prefill.walk, prefill.step_metadata[FINAL_PREFILL]) == (walk, True)
+    assert (decode.walk, decode.bind) == ("decode", {"text_inputs": "new_token"})
     produced = {"vision_embeds", "audio_embeds"}
-    for name, node in model.get_graph_walk_graphs()[walk].get_nodes().items():
-        assert {(name, n) for n in node.input_names if n not in produced} <= fed
+    for node in model.get_graph_walk_graphs()[walk].get_nodes().values():
+        assert set(node.input_names) - produced <= tensors
 
 
 @needs_ckpt
