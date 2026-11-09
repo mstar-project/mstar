@@ -43,6 +43,8 @@ def make_test_api_server(**overrides) -> APIServer:
     server.lora_admin = LoraAdmin(None, server.served_models, lambda message: None)
     server.client_streams = frozenset()
     server.takes_stream_input = False
+    server.client_audio = []
+    server.reads_turns = False   # no turn marks: no model
     server.max_concurrent_requests = None
     server.preprocess_worker = None
     server.communicator = None

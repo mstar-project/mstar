@@ -16,11 +16,12 @@ Long uploads
     ask for the whole file.
 
     The adapter's ``long_form`` picks the mode, and a request can override it;
-    Whisper and Qwen3-ASR default to ``parallel``.
+    every transcription adapter in ``adapters.py`` defaults to ``parallel``.
 
     ``sequential`` is openai-whisper's ``transcribe`` loop.
     Windows run in order, each conditioned on the transcript so far
-    (``initial_prompt``) and on the language the first window settled. When
+    (``initial_prompt``, when the model reads it) and on the language the
+    first window settled. When
     the adapter ``seeks_by_timestamps`` every window is decoded with
     timestamps, and a window that stopped inside a segment gives that
     unfinished segment up: the next window starts where the last closed
