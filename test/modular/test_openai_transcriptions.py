@@ -155,6 +155,12 @@ def test_timed_formats_ask_for_timestamps():
     assert ad.transcription_to_request(words, "a").model_kwargs["timestamps"] == "word"
 
 
+def test_qwen3_asr_is_not_sent_the_route_s_timestamps():
+    """Qwen3-ASR writes no timestamps; a timed format's key would only be logged as ignored."""
+    req = TranscriptionRequest(response_format="verbose_json")
+    assert "timestamps" not in adapters.Qwen3ASRAdapter().transcription_to_request(req, "a").model_kwargs
+
+
 def test_extra_fields_pass_through_as_model_kwargs():
     req = TranscriptionRequest(model="whisper_large", beam_size=4, task="translate")
     mk = adapters.WhisperAdapter().transcription_to_request(req, "a").model_kwargs
@@ -281,6 +287,15 @@ def test_transcription_verbose_json_segments(client_and_stub):
     assert body["words"] == []
     assert body["usage"]["type"] == "duration"
     assert stub.last_submit["model_kwargs"]["timestamps"] == "word"
+
+
+def test_verbose_json_reports_the_temperature_the_request_ran_at(client_and_stub):
+    """A single window runs no retry ladder; its segments report the request's temperature."""
+    client, stub = client_and_stub
+    stub.next_chunks = _text("<|en|>", "<|0.00|>", " Hello", "<|0.80|>")
+    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json", "temperature": "0.3"})
+    assert stub.last_submit["model_kwargs"]["temperature"] == 0.3
+    assert [s["temperature"] for s in r.json()["segments"]] == [0.3]
 
 
 def test_transcription_srt(client_and_stub):

@@ -5,18 +5,23 @@ tokenization into a conditional + unconditional pair, generation-parameter
 resolution + step-metadata threading, and the OpenAI image adapter. No GPU and
 no model weights are required. The prompt-tokenization check needs a real
 tokenizer, so point ``COSMOS3_NANO_DIR`` at a Cosmos3-Nano directory to run it
-(it is skipped otherwise).
-"""
+(it is skipped otherwise)."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.conductor.conductor import Conductor
+from mstar.engine.resources import SamplingReqConfig
+from mstar.model.base import MAX_OUTPUT_TOKENS
+from mstar.model.cosmos3.cosmos3_model import SAMPLER, Cosmos3Model
 from mstar.model.cosmos3.tests.stubs import StubSampler
+from mstar.model.utils import load_generation_defaults
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
 
@@ -89,18 +94,18 @@ def test_gen_params_and_step_metadata() -> None:
             model._resolve_gen_params(size, ["text"], ["image"])
 
     # The denoise loop's cap is per request, so a per-request
-    # num_inference_steps is honored, clamped to [1, max_inference_steps];
+    # num_inference_steps is honored in [1, max_inference_steps] (past it the
+    # conductor refuses the request);
     # guidance_scale is likewise per request.
     p = model._resolve_gen_params(
         {"num_inference_steps": 3, "guidance_scale": 2.5}, ["text"], ["image"]
     )
     assert p["num_inference_steps"] == 3
     assert p["guidance_scale"] == 2.5
-    # A request above the loop's upper bound is clamped; the image/video defaults
-    # differ by mode.
-    assert model._resolve_gen_params(
-        {"num_inference_steps": 10_000}, ["text"], ["image"]
-    )["num_inference_steps"] == model.config.max_inference_steps
+    # below 1 is a 400 here; past the loop, the conductor's get_loop_caps check
+    # refuses it. The image/video defaults differ by mode.
+    with pytest.raises(ValueError, match="num_inference_steps must be >= 1"):
+        model._resolve_gen_params({"num_inference_steps": 0}, ["text"], ["image"])
     assert model._resolve_gen_params({}, ["text"], ["image"])[
         "num_inference_steps"
     ] == model.config.num_inference_steps
@@ -348,7 +353,6 @@ def test_vae_decode_bf16_warmup(monkeypatch) -> None:
     """The compiled bf16 decode warms each new latent shape with a discarded
     call (a process's first compiled-bf16 execution returns corrupted frames
     on some stacks); fp32 and uncompiled decodes run exactly once."""
-    from types import SimpleNamespace
 
     import torch
 
@@ -408,10 +412,9 @@ def test_gen_params_max_sequence_length() -> None:
     assert model._resolve_gen_params(
         {"max_sequence_length": 128}, ["text"], ["image"]
     )["max_sequence_length"] == 128
-    # Floor of 1: a bad value can't empty the prompt.
-    assert model._resolve_gen_params(
-        {"max_sequence_length": 0}, ["text"], ["image"]
-    )["max_sequence_length"] == 1
+    # Below 1 would empty the prompt: refused, not floored.
+    with pytest.raises(ValueError, match="max_sequence_length must be >= 1"):
+        model._resolve_gen_params({"max_sequence_length": 0}, ["text"], ["image"])
 
 
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
@@ -736,10 +739,196 @@ if __name__ == "__main__":
     print("PASS")
 
 
+
+# ── generation-input contract ───────────────────────────────────────────────
+
+@pytest.fixture
+def contract_model() -> Cosmos3Model:
+    return Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+
+
+def _contract_sampler(contract_model, mk) -> SamplingReqConfig:
+    return contract_model.get_request_resource_configs(["text"], ["text"], mk)[SAMPLER]
+
+
+# ----- request_kwargs -----
+
+
+def test_request_kwargs_cover_adapter_and_model_keys(contract_model) -> None:
+    keys = contract_model.request_kwargs()
+    # adapter-mapped (images/videos/chat) and sampler keys
+    for key in ("size", "seed", "num_frames", "fps", "temperature", "top_p", "max_output_tokens",
+                "enable_thinking", "top_k", "min_p", "repetition_penalty", "penalize_prompt",
+                "ignore_eos", "video_fps", "video_num_frames"):
+        assert key in keys, key
+    # generator knobs read by _resolve_gen_params / process_prompt
+    for key in ("num_inference_steps", "guidance_scale", "negative_prompt", "max_sequence_length",
+                "window_mode", "session_timeout_s", "action_mode", "domain_name", "use_system_prompt"):
+        assert key in keys, key
+    assert "do_sample" not in keys and "max_new_tokens" not in keys
+
+
+# ----- max_output_tokens limit -----
+
+
+def test_default_output_cap(contract_model) -> None:
+    assert contract_model.get_max_output_tokens() == MAX_OUTPUT_TOKENS
+
+
+# ----- reasoner sampler: no coercion -----
+
+
+@pytest.mark.parametrize("mk", [
+    {"ignore_eos": "false"},
+    {"top_k": 1.7},
+    {"temperature": "0.7"},
+    {"top_p": 0},
+    {"repetition_penalty": True},
+    {"penalize_prompt": 1},
+])
+def test_sampler_rejects_wrong_types(contract_model, mk) -> None:
+    with pytest.raises(ValueError):
+        _contract_sampler(contract_model, mk).validate()
+
+
+def test_sampler_forwards_values(contract_model) -> None:
+    cfg = _contract_sampler(contract_model, {"temperature": 0, "top_k": 5, "top_p": 0.5, "min_p": 0.1,
+                           "repetition_penalty": 1.1, "penalize_prompt": False, "ignore_eos": True})
+    cfg.validate()
+    assert (cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p) == (0, 5, 0.5, 0.1)
+    assert cfg.repetition_penalty == 1.1 and cfg.penalize_prompt is False and cfg.ignore_eos is True
+
+
+def test_min_p_refused_by_reasoner_node(contract_model) -> None:
+    spec = contract_model._reasoner_sampler_spec()
+    with pytest.raises(ValueError, match="min_p"):
+        _contract_sampler(contract_model, {"min_p": 0.1}).validate(spec)
+    _contract_sampler(contract_model, {"repetition_penalty": 1.2}).validate(spec)
+
+
+def test_checkpoint_min_p_turns_the_reasoner_capability_on(contract_model) -> None:
+    contract_model._generation_defaults = {"min_p": 0.05}
+    spec = contract_model._reasoner_sampler_spec()
+    assert spec.enable_min_p
+    # a plain request takes that default and is not refused
+    _contract_sampler(contract_model, {}).validate(spec)
+
+
+def test_sampler_defaults(contract_model, tmp_path) -> None:
+    cfg = _contract_sampler(contract_model, {})
+    assert (cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p, cfg.repetition_penalty) == (
+        contract_model.config.reasoner_temperature, 0, 1.0, 0.0, 1.0)
+    # the published Cosmos3-Edge generation_config.json declares no knob
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {"bos_token_id": 1, "do_sample": True, "eos_token_id": 11, "pad_token_id": 0}))
+    assert load_generation_defaults(tmp_path) == {}
+    # a checkpoint that does declare knobs wins over the config
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {"temperature": 0.3, "top_p": 0.9, "top_k": 20, "repetition_penalty": 1.05}))
+    contract_model._generation_defaults = load_generation_defaults(tmp_path)
+    cfg = _contract_sampler(contract_model, {})
+    assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.repetition_penalty) == (0.3, 0.9, 20, 1.05)
+    assert _contract_sampler(contract_model, {"temperature": 0.8}).temperature == 0.8
+    (tmp_path / "generation_config.json").write_text(json.dumps({"do_sample": False}))
+    contract_model._generation_defaults = load_generation_defaults(tmp_path)
+    assert _contract_sampler(contract_model, {}).temperature == 0.0
+
+
+# ----- generator knobs: out of range or mistyped is a 400 -----
+
+
+@pytest.mark.parametrize("mk, match", [
+    ({"num_inference_steps": 0}, "num_inference_steps must be >= 1"),
+    ({"num_inference_steps": 2.5}, "num_inference_steps must be an integer"),
+    ({"num_inference_steps": "20"}, "num_inference_steps must be an integer"),
+    ({"size": "abc"}, "size must be"),
+    ({"size": "0x256"}, "size must be"),
+    ({"size": "256x256x3"}, "size must be"),
+    ({"size": 256}, "size must be"),
+    ({"width": 0}, "width must be"),
+    ({"max_sequence_length": 0}, "max_sequence_length must be >= 1"),
+    ({"guidance_scale": "7"}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": True}, "guidance_scale must be a finite number"),
+    ({"fps": 0}, "fps must be positive"),
+    ({"num_frames": 1.5}, "num_frames must be an integer"),
+    ({"use_karras_sigmas": "false"}, "use_karras_sigmas must be true or false"),
+    ({"generate_sound": "false"}, "generate_sound must be true or false"),
+    ({"stream_video": "false"}, "stream_video must be true or false"),
+    ({"flow_shift": "3"}, "flow_shift must be a finite number"),
+    ({"guidance_interval": [1, "2"]}, "guidance_interval"),
+])
+def test_generator_rejects(contract_model, mk, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        contract_model._resolve_gen_params(mk, ["text"], ["image"])
+
+
+def test_steps_past_the_denoise_loop_are_refused_by_the_conductor(contract_model) -> None:
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = contract_model
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in contract_model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    top = contract_model.config.max_inference_steps
+
+    def kwargs(steps: int) -> dict:
+        # the denoise cap process_prompt hands the conductor
+        p = contract_model._resolve_gen_params({"num_inference_steps": steps}, ["text"], ["image"])
+        return {contract_model.DENOISE_CAP: contract_model._denoise_cap(["image"], p)}
+
+    caps = conductor._loop_caps(kwargs(top))
+    assert set(caps.values()) >= {top}
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps(kwargs(top + 1))
+
+
+def test_generator_accepts(contract_model) -> None:
+    p = contract_model._resolve_gen_params(
+        {"size": "480X256", "num_inference_steps": contract_model.config.max_inference_steps,
+         "guidance_scale": -1, "use_karras_sigmas": False, "fps": 24},
+        ["text"], ["image"],
+    )
+    assert (p["width"], p["height"]) == (480, 256)
+    assert p["num_inference_steps"] == contract_model.config.max_inference_steps
+    # CFG semantics are out of contract scope; a negative scale still passes
+    assert p["guidance_scale"] == -1.0 and p["use_karras_sigma"] is False
+
+
+def test_generator_takes_a_whole_float_for_an_integer(contract_model) -> None:
+    from mstar.model.cosmos3.components.packing import normalize_condition_frame_indexes
+
+    p = contract_model._resolve_gen_params(
+        {"num_inference_steps": 4.0, "max_sequence_length": 512.0}, ["text"], ["image"],
+    )
+    assert (p["num_inference_steps"], type(p["num_inference_steps"])) == (4, int)
+    assert normalize_condition_frame_indexes([0, 2.0], (0,)) == (0, 2)
+    assert normalize_condition_frame_indexes(1.0, (0,)) == (1,)
+
+
+def test_action_domain_id_strict(contract_model) -> None:
+    base = {"action_mode": "policy", "raw_action_dim": 7}
+    with pytest.raises(ValueError, match="domain_id must be an integer"):
+        contract_model._resolve_gen_params({**base, "domain_id": 1.7}, ["image", "text"], ["action"])
+    with pytest.raises(ValueError, match="raw_action_dim must be an integer"):
+        contract_model._resolve_gen_params(
+            {**base, "raw_action_dim": 7.5, "domain_id": 1}, ["image", "text"], ["action"],
+        )
+    with pytest.raises(ValueError, match="action_mode must be a string"):
+        contract_model._resolve_gen_params({"action_mode": 1}, ["image", "text"], ["action"])
+
+
+def test_condition_frame_indexes_strict() -> None:
+    from mstar.model.cosmos3.components.packing import normalize_condition_frame_indexes
+
+    for bad in ([0, 1.5], [True], 1.5):
+        with pytest.raises(ValueError):
+            normalize_condition_frame_indexes(bad, (0, 1))
+
+
 def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypatch) -> None:
     """With vae_decode_fast the whole-clip node decodes through
     wan_vae.decode_causal from an empty cache, channels-last."""
-    from types import SimpleNamespace
 
     import torch
 
@@ -780,7 +969,6 @@ def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypat
 def test_vae_decode_fast_keeps_images_on_the_stock_decode(monkeypatch) -> None:
     """One latent (an image) is faster through the compiled stock decode than
     through the per-latent step, so the fast path only takes clips."""
-    from types import SimpleNamespace
 
     import torch
 
@@ -829,7 +1017,6 @@ def test_vae_decode_fast_must_be_a_bool() -> None:
 def test_the_denoise_loops_cap_is_the_dits_step_count(kwargs, inputs, outputs) -> None:
     """The loop's cap (``_denoise_cap``) and the DiT's schedule are computed apart; a loop past the
     schedule indexes off its end mid-request, and one short of it returns noisy latents."""
-    from types import SimpleNamespace
 
     from diffusers import UniPCMultistepScheduler
 

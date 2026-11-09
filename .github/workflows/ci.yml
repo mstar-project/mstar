@@ -94,6 +94,9 @@ jobs:
           # Model.load_audio decodes with libsndfile before torchcodec; the
           # tests of that path skip without it.
           python -m pip install soundfile
+          # The eval runner (benchmark/asr_eval.py, imported by the WER and DROID
+          # dataset tests) needs aiohttp, which datasets 5.2 stopped pulling in.
+          python -m pip install aiohttp
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
           python -m pip install diffusers==0.39.0

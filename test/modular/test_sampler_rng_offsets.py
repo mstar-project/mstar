@@ -36,7 +36,7 @@ def ingraph(request, monkeypatch) -> bool:
 
 
 def _resource(device: torch.device, ingraph: bool, **spec) -> SamplerResource:
-    res = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=device, **spec)
+    res = SamplerResource(vocab_size=V, enable_repetition_penalty=True, device=device, **spec)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=1, max_seq_len=1)
     assert res._cg_buffers.ingraph_scatter is ingraph

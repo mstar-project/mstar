@@ -175,6 +175,8 @@ def _deflate_pool() -> ThreadPool:
 
 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
+# the request keys image_output_format and encode_image read, for a model's request_kwargs
+OUTPUT_FORMAT_KWARGS = ("output_format", "output_compression", "png_compress_level")
 
 
 def image_output_format(request_kwargs: dict | None) -> str:
