@@ -750,10 +750,8 @@ class Speculator:
             # holds no row of N. It does not follow N: run it as a step of its
             # own, under its own walk. Sent as N's head, a TP follower finds no
             # row of N to follow it by, and one GPU labels it with N's signals.
-            self._graph_runtime.commit_speculation(prep.spec_id, False)
-            for rid, edges in prep.consumed_streaming_edges.items():
-                for edge in edges:
-                    self.streams.return_edge(rid, edge)
+            # With no continuing row the prep staged nothing to undo, as for
+            # the return above.
             return None if fresh_batch is None else self._yield_away_speculation(fresh_batch, gave_way=True)
 
         if fresh_batch is not None:

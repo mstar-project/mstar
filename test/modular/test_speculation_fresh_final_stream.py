@@ -214,7 +214,6 @@ def test_a_step_the_budget_leaves_with_no_row_of_its_parent_runs_on_its_own():
     runtime.prep_spec_rids = lambda inp: SpeculationPrepOutput(
         consumed_streaming_edge_idxs=[], ready_rids=[], wg_ids=[], input_edges=_edges([]),
     )
-    runtime.commit_speculation = lambda *a: None
     speculator = _speculator(scheduler, runtime)
     speculator.request_state.get_partition_for_node = lambda node: PART
     spec = speculator._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
