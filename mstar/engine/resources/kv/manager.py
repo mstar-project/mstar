@@ -379,10 +379,12 @@ class Victims(NamedTuple):
 
 
 class StalledMoves(NamedTuple):
-    """The requests that wait holding pages which a move can take now, and the host's room, which decides how many
-    of them fit there."""
+    """The requests that wait holding pages which a move can take now, the host's room, which decides how many
+    of them fit there, and the room moving them all would make, which grows when another request lets go of a page
+    they share."""
     rids: frozenset[str]
     host_room: int
+    frees: int
 
 
 class ShortGrant(NamedTuple):
@@ -4446,7 +4448,7 @@ class KVManager(AttentionResource):
                 pages = self._host_pages(rid)
                 if self._unwritten(rid) or (pages is not None and pages <= host) or droppable(rid):
                     rids.add(rid)
-            return StalledMoves(frozenset(rids), host)
+            return StalledMoves(frozenset(rids), host, self._frees(rids))
 
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
