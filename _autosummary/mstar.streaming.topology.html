@@ -366,7 +366,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -717,6 +716,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio"><code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio.frame_samples"><code class="docutils literal notranslate"><span class="pre">ClientAudio.frame_samples</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio.sample_rate"><code class="docutils literal notranslate"><span class="pre">ClientAudio.sample_rate</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream"><code class="docutils literal notranslate"><span class="pre">ClientStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream.graph_walk"><code class="docutils literal notranslate"><span class="pre">ClientStream.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream.node"><code class="docutils literal notranslate"><span class="pre">ClientStream.node</span></code></a></li>
@@ -730,6 +734,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection"><code class="docutils literal notranslate"><span class="pre">Connection</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.audio"><code class="docutils literal notranslate"><span class="pre">Connection.audio</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.chunk_policy_factory"><code class="docutils literal notranslate"><span class="pre">Connection.chunk_policy_factory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.consumer_walk"><code class="docutils literal notranslate"><span class="pre">Connection.consumer_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.edge_name"><code class="docutils literal notranslate"><span class="pre">Connection.edge_name</span></code></a></li>
@@ -793,27 +798,61 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.ClientStream" title="mstar.streaming.topology.ClientStream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ClientStream</span></code></a>(node, graph_walk, partition)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.ClientAudio" title="mstar.streaming.topology.ClientAudio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ClientAudio</span></code></a>(sample_rate, frame_samples)</p></td>
+<td><p>What an audio client stream carries: mono audio at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.ClientStream" title="mstar.streaming.topology.ClientStream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ClientStream</span></code></a>(node, graph_walk, partition)</p></td>
 <td><p>Where a client stream's items go: the node that consumes the edge, a walk it runs in (for routing to its workers) and its partition.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.ClientStreamLimits" title="mstar.streaming.topology.ClientStreamLimits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ClientStreamLimits</span></code></a>([max_items, item_size, unit])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.ClientStreamLimits" title="mstar.streaming.topology.ClientStreamLimits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ClientStreamLimits</span></code></a>([max_items, item_size, unit])</p></td>
 <td><p>Bounds on what the client feeds one client stream; None is unbounded.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.Connection" title="mstar.streaming.topology.Connection"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Connection</span></code></a>(from_partition, to_partition, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.Connection" title="mstar.streaming.topology.Connection"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Connection</span></code></a>(from_partition, to_partition, ...)</p></td>
 <td><p>Defines a streaming connection between two partitions, or from the client (<code class="docutils literal notranslate"><span class="pre">from_partition=CLIENT</span></code>) into one.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.PartitionTopology" title="mstar.streaming.topology.PartitionTopology"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PartitionTopology</span></code></a>(partitions[, connections])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.PartitionTopology" title="mstar.streaming.topology.PartitionTopology"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PartitionTopology</span></code></a>(partitions[, connections])</p></td>
 <td><p>Declares how a model's computation is split into async partitions.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.ProducerWalkCtx" title="mstar.streaming.topology.ProducerWalkCtx"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ProducerWalkCtx</span></code></a>([producer_walk, node, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.ProducerWalkCtx" title="mstar.streaming.topology.ProducerWalkCtx"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ProducerWalkCtx</span></code></a>([producer_walk, node, ...])</p></td>
 <td><p>The producer's state for one pass that emits on a walk-driving edge.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.topology.StreamingGraphEdge" title="mstar.streaming.topology.StreamingGraphEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingGraphEdge</span></code></a>(next_node, name[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.topology.StreamingGraphEdge" title="mstar.streaming.topology.StreamingGraphEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingGraphEdge</span></code></a>(next_node, name[, ...])</p></td>
 <td><p>A graph edge that carries streaming data between partitions.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.streaming.topology.ClientAudio">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">ClientAudio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">frame_samples</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#ClientAudio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.ClientAudio" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>What an audio client stream carries: mono audio at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>.
+<code class="docutils literal notranslate"><span class="pre">frame_samples</span></code> is the frame its consumer computes on: the stream’s
+producer (the data worker) sends whole frames on every route, holding
+the rest for the next append, and turns appends into items itself when
+every client stream declares one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>frame_samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.topology.ClientAudio.frame_samples">
+<span class="sig-name descname"><span class="pre">frame_samples</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.streaming.topology.ClientAudio.frame_samples" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.topology.ClientAudio.sample_rate">
+<span class="sig-name descname"><span class="pre">sample_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.streaming.topology.ClientAudio.sample_rate" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.topology.ClientStream">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">ClientStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">partition</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#ClientStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.ClientStream" title="Link to this definition">#</a></dt>
@@ -888,11 +927,12 @@ deployment may lower it (<code class="docutils literal notranslate"><span class=
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.topology.Connection">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">Connection</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">to_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_policy_factory</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">limits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#Connection"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.Connection" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">Connection</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">to_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_policy_factory</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">limits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#Connection"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.Connection" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Defines a streaming connection between two partitions, or from the
 client (<code class="docutils literal notranslate"><span class="pre">from_partition=CLIENT</span></code>) into one. Only a client stream takes
-<code class="docutils literal notranslate"><span class="pre">limits</span></code>: a partition’s output is bounded by the model itself.</p>
+<code class="docutils literal notranslate"><span class="pre">limits</span></code> (a partition’s output is bounded by the model itself) or
+<code class="docutils literal notranslate"><span class="pre">audio</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -903,9 +943,15 @@ client (<code class="docutils literal notranslate"><span class="pre">from_partit
 <li><p><strong>limits</strong> (<a class="reference internal" href="#mstar.streaming.topology.ClientStreamLimits" title="mstar.streaming.topology.ClientStreamLimits"><em>ClientStreamLimits</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>join_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>consumer_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference internal" href="#mstar.streaming.topology.ProducerWalkCtx" title="mstar.streaming.topology.ProducerWalkCtx"><em>ProducerWalkCtx</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>audio</strong> (<a class="reference internal" href="#mstar.streaming.topology.ClientAudio" title="mstar.streaming.topology.ClientAudio"><em>ClientAudio</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.topology.Connection.audio">
+<span class="sig-name descname"><span class="pre">audio</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.streaming.topology.ClientAudio" title="mstar.streaming.topology.ClientAudio"><span class="pre">ClientAudio</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.streaming.topology.Connection.audio" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.streaming.topology.Connection.chunk_policy_factory">
 <span class="sig-name descname"><span class="pre">chunk_policy_factory</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy" title="mstar.streaming.chunk_policy.ChunkPolicy"><span class="pre">ChunkPolicy</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.streaming.topology.Connection.chunk_policy_factory" title="Link to this definition">#</a></dt>
@@ -1198,6 +1244,11 @@ the data worker, whose copy of the model is unshaped.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio"><code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio.frame_samples"><code class="docutils literal notranslate"><span class="pre">ClientAudio.frame_samples</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientAudio.sample_rate"><code class="docutils literal notranslate"><span class="pre">ClientAudio.sample_rate</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream"><code class="docutils literal notranslate"><span class="pre">ClientStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream.graph_walk"><code class="docutils literal notranslate"><span class="pre">ClientStream.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.ClientStream.node"><code class="docutils literal notranslate"><span class="pre">ClientStream.node</span></code></a></li>
@@ -1211,6 +1262,7 @@ the data worker, whose copy of the model is unshaped.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection"><code class="docutils literal notranslate"><span class="pre">Connection</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.audio"><code class="docutils literal notranslate"><span class="pre">Connection.audio</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.chunk_policy_factory"><code class="docutils literal notranslate"><span class="pre">Connection.chunk_policy_factory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.consumer_walk"><code class="docutils literal notranslate"><span class="pre">Connection.consumer_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.edge_name"><code class="docutils literal notranslate"><span class="pre">Connection.edge_name</span></code></a></li>

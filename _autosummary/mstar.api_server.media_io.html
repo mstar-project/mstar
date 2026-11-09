@@ -366,7 +366,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -739,6 +738,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_saved_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_saved_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_torchcodec_capped"><code class="docutils literal notranslate"><span class="pre">decode_torchcodec_capped()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.g711_decode"><code class="docutils literal notranslate"><span class="pre">g711_decode()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.g711_encode"><code class="docutils literal notranslate"><span class="pre">g711_encode()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_container"><code class="docutils literal notranslate"><span class="pre">pcm16_to_container()</span></code></a></li>
@@ -753,6 +754,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.to_pcm16"><code class="docutils literal notranslate"><span class="pre">to_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.torchcodec_samples_capped"><code class="docutils literal notranslate"><span class="pre">torchcodec_samples_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.window_stop"><code class="docutils literal notranslate"><span class="pre">window_stop()</span></code></a></li>
@@ -818,6 +820,12 @@ the base install stays slim.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_torchcodec_capped" title="mstar.api_server.media_io.decode_torchcodec_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_torchcodec_capped</span></code></a>(path, sample_rate)</p></td>
 <td><p>FFmpeg (torchcodec) decode of <code class="docutils literal notranslate"><span class="pre">path</span></code>: a float32 mono tensor at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>, the same samples <code class="docutils literal notranslate"><span class="pre">get_all_samples()</span></code> returns.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.g711_decode" title="mstar.api_server.media_io.g711_decode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">g711_decode</span></code></a>(data, law)</p></td>
+<td><p>G.711 bytes (<code class="docutils literal notranslate"><span class="pre">law</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;audio/pcmu&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;audio/pcma&quot;</span></code>) -&gt; int16 samples.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.g711_encode" title="mstar.api_server.media_io.g711_encode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">g711_encode</span></code></a>(pcm, law)</p></td>
+<td><p>int16 samples -&gt; G.711 bytes, one per sample.</p></td>
+</tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.modality_from_mime" title="mstar.api_server.media_io.modality_from_mime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modality_from_mime</span></code></a>(mime)</p></td>
 <td><p>Map a MIME type to one of our modality strings (image/audio/video).</p></td>
 </tr>
@@ -860,17 +868,20 @@ the base install stays slim.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.split_windows" title="mstar.api_server.media_io.split_windows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_windows</span></code></a>(audio, window_seconds[, ...])</p></td>
 <td><p>Cut a waveform into consecutive windows of at most <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>; concatenating them gives the input back sample for sample.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.torchcodec_samples_capped" title="mstar.api_server.media_io.torchcodec_samples_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">torchcodec_samples_capped</span></code></a>(path[, max_seconds])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.to_pcm16" title="mstar.api_server.media_io.to_pcm16"><code class="xref py py-obj docutils literal notranslate"><span class="pre">to_pcm16</span></code></a>(audio)</p></td>
+<td><p>Float waveform -&gt; little-endian int16 samples.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.torchcodec_samples_capped" title="mstar.api_server.media_io.torchcodec_samples_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">torchcodec_samples_capped</span></code></a>(path[, max_seconds])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">AudioDecoder(path,</span> <span class="pre">**decoder_args)</span></code>'s samples from the stream's first frame, as <code class="docutils literal notranslate"><span class="pre">get_all_samples()</span></code> returns them, decoding just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code> of play time; refused with <a class="reference internal" href="#mstar.api_server.media_io.AudioTooLongError" title="mstar.api_server.media_io.AudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">AudioTooLongError</span></code></a> when the audio plays longer or holds more samples than that.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.wav_stream_header" title="mstar.api_server.media_io.wav_stream_header"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wav_stream_header</span></code></a>(sample_rate[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.wav_stream_header" title="mstar.api_server.media_io.wav_stream_header"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wav_stream_header</span></code></a>(sample_rate[, ...])</p></td>
 <td><p>A 44-byte WAV header with streaming (unknown-length) size fields.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.window_stop" title="mstar.api_server.media_io.window_stop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">window_stop</span></code></a>(start, total, step, balanced)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.window_stop" title="mstar.api_server.media_io.window_stop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">window_stop</span></code></a>(start, total, step, balanced)</p></td>
 <td><p>Nominal end of the window starting at <code class="docutils literal notranslate"><span class="pre">start</span></code>: <code class="docutils literal notranslate"><span class="pre">step</span></code> samples on, or, <code class="docutils literal notranslate"><span class="pre">balanced</span></code>, an equal share of what is left over the fewest windows of at most <code class="docutils literal notranslate"><span class="pre">step</span></code> (so the last window is never a sliver).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.write_wav" title="mstar.api_server.media_io.write_wav"><code class="xref py py-obj docutils literal notranslate"><span class="pre">write_wav</span></code></a>(audio, path[, sample_rate])</p></td>
-<td><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.write_wav" title="mstar.api_server.media_io.write_wav"><code class="xref py py-obj docutils literal notranslate"><span class="pre">write_wav</span></code></a>(audio, path[, sample_rate])</p></td>
+<td><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code> (see <a class="reference internal" href="#mstar.api_server.media_io.to_pcm16" title="mstar.api_server.media_io.to_pcm16"><code class="xref py py-func docutils literal notranslate"><span class="pre">to_pcm16()</span></code></a>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -1177,6 +1188,40 @@ duration the container declares.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.g711_decode">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">g711_decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">law</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#g711_decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.g711_decode" title="Link to this definition">#</a></dt>
+<dd><p>G.711 bytes (<code class="docutils literal notranslate"><span class="pre">law</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;audio/pcmu&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;audio/pcma&quot;</span></code>) -&gt; int16 samples.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>data</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+<li><p><strong>law</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>ndarray</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.g711_encode">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">g711_encode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pcm</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">law</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#g711_encode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.g711_encode" title="Link to this definition">#</a></dt>
+<dd><p>int16 samples -&gt; G.711 bytes, one per sample.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pcm</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>law</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.modality_from_mime">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">modality_from_mime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mime</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#modality_from_mime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.modality_from_mime" title="Link to this definition">#</a></dt>
 <dd><p>Map a MIME type to one of our modality strings (image/audio/video).</p>
@@ -1457,6 +1502,18 @@ places the nominal boundaries as <a class="reference internal" href="#mstar.api_
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.to_pcm16">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">to_pcm16</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#to_pcm16"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.to_pcm16" title="Link to this definition">#</a></dt>
+<dd><p>Float waveform -&gt; little-endian int16 samples. The inverse of reading
+PCM16 as <code class="docutils literal notranslate"><span class="pre">int16</span> <span class="pre">/</span> <span class="pre">32768</span></code>, so 16-bit audio comes back sample for sample.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>ndarray</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.torchcodec_samples_capped">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">torchcodec_samples_capped</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">MAX_AUDIO_SECONDS</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">decoder_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#torchcodec_samples_capped"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.torchcodec_samples_capped" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">AudioDecoder(path,</span> <span class="pre">**decoder_args)</span></code>’s samples from the stream’s first
@@ -1519,9 +1576,7 @@ of at most <code class="docutils literal notranslate"><span class="pre">step</sp
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.write_wav">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">write_wav</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#write_wav"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.write_wav" title="Link to this definition">#</a></dt>
-<dd><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>. The inverse of
-reading PCM16 as <code class="docutils literal notranslate"><span class="pre">int16</span> <span class="pre">/</span> <span class="pre">32768</span></code>, so 16-bit audio comes back sample for
-sample.</p>
+<dd><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code> (see <a class="reference internal" href="#mstar.api_server.media_io.to_pcm16" title="mstar.api_server.media_io.to_pcm16"><code class="xref py py-func docutils literal notranslate"><span class="pre">to_pcm16()</span></code></a>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1606,6 +1661,8 @@ sample.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_saved_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_saved_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_torchcodec_capped"><code class="docutils literal notranslate"><span class="pre">decode_torchcodec_capped()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.g711_decode"><code class="docutils literal notranslate"><span class="pre">g711_decode()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.g711_encode"><code class="docutils literal notranslate"><span class="pre">g711_encode()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_container"><code class="docutils literal notranslate"><span class="pre">pcm16_to_container()</span></code></a></li>
@@ -1620,6 +1677,7 @@ sample.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.to_pcm16"><code class="docutils literal notranslate"><span class="pre">to_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.torchcodec_samples_capped"><code class="docutils literal notranslate"><span class="pre">torchcodec_samples_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.window_stop"><code class="docutils literal notranslate"><span class="pre">window_stop()</span></code></a></li>

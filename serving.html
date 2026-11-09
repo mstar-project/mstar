@@ -366,7 +366,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1002,12 +1001,14 @@ list. An empty value turns the check off, so <code class="docutils literal notra
 environment, and so does a variable that expands to nothing (<code class="docutils literal notranslate"><span class="pre">--api-key</span> <span class="pre">&quot;$UNSET_VAR&quot;</span></code>).</p>
 <p>Clients send the key as their API key: <code class="docutils literal notranslate"><span class="pre">MStarClient(base_url,</span> <span class="pre">api_key=...)</span></code> (it reads
 <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code> when not given one) or <code class="docutils literal notranslate"><span class="pre">OpenAI(base_url=...,</span> <span class="pre">api_key=...)</span></code>; see
-<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. The standalone Nemotron realtime server
-(<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.model.nemotron_duplex.realtime_api</span></code>) takes the same flag and
-variable.</p>
+<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
 <p>Under NVIDIA Dynamo, Dynamo’s own frontend serves HTTP and does not forward
 <code class="docutils literal notranslate"><span class="pre">Authorization</span></code> to backends, so the M* worker cannot check a key there: authenticate at
 Dynamo’s frontend or a gateway in front of it.</p>
+<p>The Dynamo worker (<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.integrations.dynamo</span></code>) does not serve a model that
+takes live client input (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>): no Dynamo surface carries a live call’s
+appends, so it exits at startup saying so, before any GPU process starts. Serve such a
+model with <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> and call it over <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> or <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>.</p>
 </section>
 <section id="config-files">
 <h2>Config files<a class="headerlink" href="#config-files" title="Link to this heading">#</a></h2>
@@ -1076,7 +1077,9 @@ shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Defa
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
 <td><p><em>(optional, default 512)</em> For a model that takes live client input: how many MiB
 of files (and append text) one call may send over its whole life, its opening
-message’s included.
+message’s included, and of decoded audio samples a route appends
+(<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>: 4 bytes a sample at the stream’s rate, server-padded silence
+included).
 A live call’s opening message past it is refused, and an append that would pass
 it ends the call with a 400; a one-shot request is not counted. It caps a call’s input, not memory:
 decoded input is larger than its files, and how much of it waits in buffers

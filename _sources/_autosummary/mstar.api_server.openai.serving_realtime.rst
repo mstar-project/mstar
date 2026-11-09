@@ -13,7 +13,13 @@ mstar.api\_server.openai.serving\_realtime
 
    .. autosummary::
    
-      pcm16_to_float
+      content_event
+      decode_append
+      decode_base64
+      encode_audio
+      error_event
+      response_object
+      server_event
       stable_prefix
    
    
@@ -24,6 +30,8 @@ mstar.api\_server.openai.serving\_realtime
 
    .. autosummary::
    
+      AudioFormat
+      RealtimeConversation
       RealtimeSession
       RealtimeTranscription
    

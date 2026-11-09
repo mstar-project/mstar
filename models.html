@@ -366,7 +366,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -2203,12 +2202,19 @@ ships only the RNN-T tokenizer); prefetch both repositories on machines
 without egress.</p></li>
 <li><p>Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
 request’s text, primed before the first frame exactly as the reference
-does): one clip uploaded with the request, or a live call over
+does): one clip uploaded with the request; a live call over
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">append</span></code> messages until <code class="docutils literal notranslate"><span class="pre">end_input</span></code> (see
 <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>; a one-shot request over the socket carries <code class="docutils literal notranslate"><span class="pre">end_input:</span>
-<span class="pre">true</span></code> on its opening message, or it waits for appends). Output is clocked by
-the input, one agent frame per 80 ms of user audio, so a live client keeps
-streaming (silence included) for as long as it wants the agent to talk. The
+<span class="pre">true</span></code> on its opening message, or it waits for appends); or an OpenAI
+Realtime conversation over <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>, which takes PCM16 at one of
+the eight rates <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a> lists (8 to 48 kHz) or G.711, resamples it
+to 16 kHz, appends it as it comes, and sends each agent reply as one
+response (BOS / EOS on the agent text channel mark the reply,
+<code class="docutils literal notranslate"><span class="pre">metadata.turn</span></code> on <code class="docutils literal notranslate"><span class="pre">/generate</span></code>). The voice is <code class="docutils literal notranslate"><span class="pre">Aria</span></code>. Output is clocked by
+the input, one agent frame per 80 ms of user audio, so a <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>
+client keeps streaming (silence included) for as long as it wants the agent
+to talk; <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> pads a pause in the client’s audio with silence,
+up to 30 s. The
 model answers in the frames <em>after</em> the user stops, so append a few seconds
 of trailing silence to a clip. The checkpoint’s demo recordings are
 two-channel conversations (user left, agent right); feed the left channel
@@ -2220,11 +2226,12 @@ samples as its <code class="docutils literal notranslate"><span class="pre">max_
 sees them (raise <code class="docutils literal notranslate"><span class="pre">max_session_s</span></code>, not the stream’s limit, for longer calls). A
 call that ends with no more than 16 ms of audio, which the encoder cannot
 featurize, fails with a 500 (the worker reports it without a client status).
-Appends must be 16 kHz audio (they are neither
-resampled nor rescaled one by one, which would put a seam at every append).
-Send appends of 80 ms or more: the encoder takes one append per step, so
-shorter appends need several steps per frame and fall behind once a step
-takes longer than an append.</p></li>
+<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> appends must be 16 kHz audio (they are neither
+resampled nor rescaled one by one, which would put a seam at every append);
+<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> resamples for the client. On both, <code class="docutils literal notranslate"><span class="pre">audio_in</span></code> declares the
+encoder’s 80 ms frame (<code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code>), and the data worker sends a live
+call’s audio in whole frames, a step each, the rest waiting for the next
+append or the call’s end.</p></li>
 <li><p>Encoder numerics, measured on CPU at the checkpoint’s dimensions with random
 weights on the duplex encoder the shared FastConformer replaced, and not
 since: an upload was one encoder pass, bit for bit that encoder’s offline
@@ -2248,16 +2255,13 @@ resources: its attention keys and values in a bounded KV (<code class="docutils 
 which keeps a call’s last 70 frames per layer and runs the attention, each new
 frame over the 70 before it, with the relative-position term as a band of
 distances; its conv inputs (<code class="docutils literal notranslate"><span class="pre">encoder_state</span></code>); and its newest audio and mel
-frames (<code class="docutils literal notranslate"><span class="pre">encoder_front</span></code>), the last two recurrent-state pools. A
-call that appends one frame of audio (1280 samples) on the frame grid, every
-live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-the call’s start: an opening clip or append that is not a multiple of 1280
-samples keeps the call off it for good); other calls take the front end
-eagerly, then the layer stack as a graph when each got at most one frame (a
-live step, the call’s end), or eagerly (a one-shot upload, a large append:
-a chunk over a second is not batched with other calls, so the engine runs
-each call of that step on its own). Appends of other sizes are served the same,
-without the whole-step graph.</p></li>
+frames (<code class="docutils literal notranslate"><span class="pre">encoder_front</span></code>), the last two recurrent-state pools. Every live
+step, one frame (1280 samples) whatever the client’s append size, runs whole
+as a CUDA graph; other steps take the front end eagerly, then the layer stack
+as a graph when each got at most one frame (the call’s end), or eagerly (a
+one-shot upload, an opening clip, the call’s last append: a chunk over a
+second is not batched with other calls, so the engine runs each call of that
+step on its own).</p></li>
 <li><p>Checks: <code class="docutils literal notranslate"><span class="pre">test/nemotron_duplex/duplex_request.py</span></code> prepares a clip from the
 bundled <code class="docutils literal notranslate"><span class="pre">turn_taking.wav</span></code> and sends it; <code class="docutils literal notranslate"><span class="pre">parity_compare.py</span></code> runs the
 standalone reference path on the same clip and checks the served text

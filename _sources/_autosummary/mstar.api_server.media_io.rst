@@ -26,6 +26,8 @@ mstar.api\_server.media\_io
       check_saved_ref_audio
       decode_audio
       decode_torchcodec_capped
+      g711_decode
+      g711_encode
       modality_from_mime
       mux_mp4_with_pcm16
       pcm16_to_container
@@ -40,6 +42,7 @@ mstar.api\_server.media\_io
       save_remote_url
       schedule_upload_cleanup
       split_windows
+      to_pcm16
       torchcodec_samples_capped
       wav_stream_header
       window_stop

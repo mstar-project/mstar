@@ -30,6 +30,5 @@ mstar.model.nemotron\_duplex
    components
    config
    nemotron_duplex_model
-   realtime_api
    submodules
 

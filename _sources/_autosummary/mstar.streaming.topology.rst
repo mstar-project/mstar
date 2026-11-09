@@ -25,6 +25,7 @@ mstar.streaming.topology
 
    .. autosummary::
    
+      ClientAudio
       ClientStream
       ClientStreamLimits
       Connection

@@ -366,7 +366,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -717,6 +716,30 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat"><code class="docutils literal notranslate"><span class="pre">AudioFormat</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.codec"><code class="docutils literal notranslate"><span class="pre">AudioFormat.codec</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.rate"><code class="docutils literal notranslate"><span class="pre">AudioFormat.rate</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.view"><code class="docutils literal notranslate"><span class="pre">AudioFormat.view()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.append"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.append()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.clock_task"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.clock_task</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.close"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.close()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.create_item"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.create_item()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.early"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.early</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.handle"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.handle()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.key"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.open"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.open()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.relay()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay_task"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.relay_task</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.request_id"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.run"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.send"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.turns"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.turns</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.update"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.update()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession"><code class="docutils literal notranslate"><span class="pre">RealtimeSession</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.add"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.add()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.append"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.append()</span></code></a></li>
@@ -732,7 +755,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.failures"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.failures</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.flush"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.heard"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.heard</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_rate"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.input_rate</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_format"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.input_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.item_id"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.item_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.item_samples"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.item_samples()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.max_item_seconds"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.max_item_seconds</span></code></a></li>
@@ -748,7 +771,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.segment"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.segment()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.segmenter"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.segmenter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.session_id"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.session_id</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_rate"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.set_input_rate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_format"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.set_input_format()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.short"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.short</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.stream_samples"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.stream_samples</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.take_chunk"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.take_chunk()</span></code></a></li>
@@ -770,7 +793,13 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.StepError"><code class="docutils literal notranslate"><span class="pre">StepError</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.pcm16_to_float"><code class="docutils literal notranslate"><span class="pre">pcm16_to_float()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.content_event"><code class="docutils literal notranslate"><span class="pre">content_event()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.decode_append"><code class="docutils literal notranslate"><span class="pre">decode_append()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.decode_base64"><code class="docutils literal notranslate"><span class="pre">decode_base64()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.encode_audio"><code class="docutils literal notranslate"><span class="pre">encode_audio()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.error_event"><code class="docutils literal notranslate"><span class="pre">error_event()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.response_object"><code class="docutils literal notranslate"><span class="pre">response_object()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.server_event"><code class="docutils literal notranslate"><span class="pre">server_event()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.stable_prefix"><code class="docutils literal notranslate"><span class="pre">stable_prefix()</span></code></a></li>
 </ul>
             </nav>
@@ -785,9 +814,17 @@
                   
   <section id="module-mstar.api_server.openai.serving_realtime">
 <span id="mstar-api-server-openai-serving-realtime"></span><h1>mstar.api_server.openai.serving_realtime<a class="headerlink" href="#module-mstar.api_server.openai.serving_realtime" title="Link to this heading">#</a></h1>
-<p><code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (transcription intent): streaming speech-to-text over a WebSocket.</p>
-<p>A subset of OpenAI’s Realtime transcription session, enough for a client
-that streams microphone audio and wants partial transcripts:</p>
+<p><code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>: OpenAI’s Realtime API over a WebSocket, two intents.</p>
+<p>The conversation intent (<a class="reference internal" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation" title="mstar.api_server.openai.serving_realtime.RealtimeConversation"><code class="xref py py-class docutils literal notranslate"><span class="pre">RealtimeConversation</span></code></a>, GA events) serves a
+full-duplex model, one that declares a <code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code> client stream and
+decides when to speak; see its docstring. The transcription intent
+(<code class="docutils literal notranslate"><span class="pre">?intent=transcription</span></code>, <a class="reference internal" href="#mstar.api_server.openai.serving_realtime.RealtimeTranscription" title="mstar.api_server.openai.serving_realtime.RealtimeTranscription"><code class="xref py py-class docutils literal notranslate"><span class="pre">RealtimeTranscription</span></code></a>, the beta
+transcription-session events) streams speech-to-text with partial results.
+Both take audio in OpenAI’s formats, converted on the socket to what the
+model hears.</p>
+<p>The transcription intent is a subset of OpenAI’s Realtime transcription
+session, enough for a client that streams microphone audio and wants partial
+transcripts:</p>
 <dl class="simple">
 <dt>Client events</dt><dd><p><code class="docutils literal notranslate"><span class="pre">transcription_session.update</span></code>  <code class="docutils literal notranslate"><span class="pre">{&quot;session&quot;:</span> <span class="pre">{&quot;input_audio_transcription&quot;:</span>
 <span class="pre">{&quot;model&quot;,</span> <span class="pre">&quot;language&quot;,</span> <span class="pre">&quot;prompt&quot;},</span> <span class="pre">&quot;input_audio_format&quot;,</span> <span class="pre">&quot;turn_detection&quot;,</span>
@@ -797,10 +834,13 @@ that streams microphone audio and wants partial transcripts:</p>
 <code class="docutils literal notranslate"><span class="pre">input_audio_buffer.clear</span></code>       drop buffered audio and start over</p>
 </dd>
 </dl>
-<p><code class="docutils literal notranslate"><span class="pre">input_audio_format</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;pcm16&quot;</span></code> (16 kHz, the default) or OpenAI’s
-<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>; 24 kHz audio is resampled to the
-model’s 16 kHz as it arrives, so partial <code class="docutils literal notranslate"><span class="pre">audio_seconds</span></code> stay on the
-client’s timeline. The rate changes only with an empty buffer.</p>
+<p><code class="docutils literal notranslate"><span class="pre">input_audio_format</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;pcm16&quot;</span></code> (PCM16 at 16 kHz, the default; OpenAI
+reads it as 24 kHz), <code class="docutils literal notranslate"><span class="pre">&quot;g711_ulaw&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;g711_alaw&quot;</span></code> (8 kHz), or a GA format
+object (<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">N}</span></code> at a rate in <code class="docutils literal notranslate"><span class="pre">REALTIME_RATES</span></code>,
+<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcmu&quot;}</span></code>, <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcma&quot;}</span></code>).
+Audio at another rate is resampled to 16 kHz as it arrives, so partial
+<code class="docutils literal notranslate"><span class="pre">audio_seconds</span></code> stay on the client’s timeline. The format changes only with
+an empty buffer.</p>
 <p><code class="docutils literal notranslate"><span class="pre">turn_detection</span></code> null (the default) leaves ending an utterance to the
 client’s commit. <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;server_vad&quot;,</span> <span class="pre">&quot;threshold&quot;,</span> <span class="pre">&quot;prefix_padding_ms&quot;,</span>
 <span class="pre">&quot;silence_duration_ms&quot;}</span></code> lets the server end it (<code class="docutils literal notranslate"><span class="pre">realtime_vad</span></code>), adding
@@ -843,8 +883,26 @@ chunks at once is decoded as one step.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.pcm16_to_float" title="mstar.api_server.openai.serving_realtime.pcm16_to_float"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_float</span></code></a>(payload[, carry])</p></td>
-<td><p>Base64 PCM16 (little-endian, mono) -&gt; (float32 in [-1, 1), the odd trailing byte).</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.content_event" title="mstar.api_server.openai.serving_realtime.content_event"><code class="xref py py-obj docutils literal notranslate"><span class="pre">content_event</span></code></a>(kind, response_id, item_id, ...)</p></td>
+<td><p>A GA event about a response's one content part (<code class="docutils literal notranslate"><span class="pre">response.output_audio.delta</span></code> and the like).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.decode_append" title="mstar.api_server.openai.serving_realtime.decode_append"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_append</span></code></a>(payload[, carry, codec])</p></td>
+<td><p>A base64 append in <code class="docutils literal notranslate"><span class="pre">codec</span></code> -&gt; (float32 in [-1, 1), the odd trailing byte).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.decode_base64" title="mstar.api_server.openai.serving_realtime.decode_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_base64</span></code></a>(payload)</p></td>
+<td><p>An append's base64 payload, strictly: whitespace is allowed (base64.encodebytes wraps lines), anything else outside the alphabet raises, as does a payload that is not a string.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.encode_audio" title="mstar.api_server.openai.serving_realtime.encode_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">encode_audio</span></code></a>(audio, codec)</p></td>
+<td><p>float32 audio -&gt; base64 in <code class="docutils literal notranslate"><span class="pre">codec</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.error_event" title="mstar.api_server.openai.serving_realtime.error_event"><code class="xref py py-obj docutils literal notranslate"><span class="pre">error_event</span></code></a>(message[, kind, code])</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.response_object" title="mstar.api_server.openai.serving_realtime.response_object"><code class="xref py py-obj docutils literal notranslate"><span class="pre">response_object</span></code></a>(response_id, status, modalities)</p></td>
+<td><p>A GA <code class="docutils literal notranslate"><span class="pre">realtime.response</span></code>, as <code class="docutils literal notranslate"><span class="pre">response.created</span></code> / <code class="docutils literal notranslate"><span class="pre">.done</span></code> carry it.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.server_event" title="mstar.api_server.openai.serving_realtime.server_event"><code class="xref py py-obj docutils literal notranslate"><span class="pre">server_event</span></code></a>(kind, **fields)</p></td>
+<td><p>A server event: <code class="docutils literal notranslate"><span class="pre">kind</span></code> with a fresh <code class="docutils literal notranslate"><span class="pre">event_id</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.stable_prefix" title="mstar.api_server.openai.serving_realtime.stable_prefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stable_prefix</span></code></a>(raw_text, tokenizer, ...)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">raw_text</span></code> minus its last <code class="docutils literal notranslate"><span class="pre">unfixed_tokens</span></code> tokens, backed off further when the cut lands inside a multi-byte character.</p></td>
@@ -855,6 +913,12 @@ chunks at once is decoded as one step.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.AudioFormat" title="mstar.api_server.openai.serving_realtime.AudioFormat"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AudioFormat</span></code></a>(codec, rate)</p></td>
+<td><p>A socket's audio on the wire: <code class="docutils literal notranslate"><span class="pre">codec</span></code> <code class="docutils literal notranslate"><span class="pre">audio/pcm</span></code> (PCM16, little endian, mono), <code class="docutils literal notranslate"><span class="pre">audio/pcmu</span></code> or <code class="docutils literal notranslate"><span class="pre">audio/pcma</span></code> (G.711), at <code class="docutils literal notranslate"><span class="pre">rate</span></code> Hz.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation" title="mstar.api_server.openai.serving_realtime.RealtimeConversation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RealtimeConversation</span></code></a>(api, model_name, ...)</p></td>
+<td><p>Drives one <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> conversation (OpenAI's GA events) with a full-duplex model: one whose client stream declares <code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code> and that decides when to speak (see docs/clients.rst for the protocol).</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.RealtimeSession" title="mstar.api_server.openai.serving_realtime.RealtimeSession"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RealtimeSession</span></code></a>(session_id, request[, ...])</p></td>
 <td><p>One WebSocket's transcription state (the SDK's <code class="docutils literal notranslate"><span class="pre">ASRStreamingState</span></code>).</p></td>
 </tr>
@@ -874,8 +938,223 @@ chunks at once is decoded as one step.</p>
 </table>
 </div>
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.AudioFormat">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">AudioFormat</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">codec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rate</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#AudioFormat"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.AudioFormat" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A socket’s audio on the wire: <code class="docutils literal notranslate"><span class="pre">codec</span></code> <code class="docutils literal notranslate"><span class="pre">audio/pcm</span></code> (PCM16, little
+endian, mono), <code class="docutils literal notranslate"><span class="pre">audio/pcmu</span></code> or <code class="docutils literal notranslate"><span class="pre">audio/pcma</span></code> (G.711), at <code class="docutils literal notranslate"><span class="pre">rate</span></code> Hz.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>codec</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.AudioFormat.codec">
+<span class="sig-name descname"><span class="pre">codec</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.AudioFormat.codec" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.AudioFormat.rate">
+<span class="sig-name descname"><span class="pre">rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.AudioFormat.rate" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.AudioFormat.view">
+<span class="sig-name descname"><span class="pre">view</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#AudioFormat.view"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.AudioFormat.view" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">RealtimeConversation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">api</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">websocket</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Drives one <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> conversation (OpenAI’s GA events) with a
+full-duplex model: one whose client stream declares <code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code> and
+that decides when to speak (see docs/clients.rst for the protocol).</p>
+<p>The call is one engine request, opened by the first append with the
+session’s instructions as its prompt; formats and instructions are fixed
+from then on. Input is decoded, resampled to the stream’s rate and
+appended as it comes; the data worker cuts it into the stream’s frames.
+Each reply between the model’s <code class="docutils literal notranslate"><span class="pre">turn_tokens</span></code> marks is one response:
+text and audio chunks are paired by the loop step the data worker
+stamps on them (<code class="docutils literal notranslate"><span class="pre">metadata[&quot;step&quot;]</span></code>), audio that arrives before its
+step’s text waits for it, and a response closes once its last step’s
+audio is sent. One response is in progress at a time, as OpenAI’s
+clients expect: a reply that starts while the one before is still
+speaking opens when that one is done. Audio between replies is silence
+and is not sent.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>websocket</strong> (<em>WebSocket</em>)</p></li>
+<li><p><strong>stream</strong> (<a class="reference internal" href="mstar.streaming.topology.html#mstar.streaming.topology.Connection" title="mstar.streaming.topology.Connection"><em>Connection</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.append">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">append</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">payloads</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.append"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.append" title="Link to this definition">#</a></dt>
+<dd><p>Put the audio of an append, or of an item’s parts, on the call,
+all or none; False, with an <code class="docutils literal notranslate"><span class="pre">error</span></code> sent (or the call over), if it
+was not taken.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.clock_task">
+<span class="sig-name descname"><span class="pre">clock_task</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Task</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.clock_task" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.close">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">close</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">code</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.close"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.close" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>code</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.create_item">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">create_item</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">item</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.create_item"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.create_item" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">conversation.item.create</span></code> of a user message of <code class="docutils literal notranslate"><span class="pre">input_audio</span></code>
+parts: their audio goes on the stream as appends do.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.early">
+<span class="sig-name descname"><span class="pre">early</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.html#collections.deque" title="(in Python v3.12)"><span class="pre">deque</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><span class="pre">bytes</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.early" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.handle">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">handle</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.handle"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.handle" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>event</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.key">
+<span class="sig-name descname"><span class="pre">key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.key" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.open">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">open</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.open"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.open" title="Link to this definition">#</a></dt>
+<dd><p>Open the call’s engine request; False, with an <code class="docutils literal notranslate"><span class="pre">error</span></code> sent, if
+the server refused it (at capacity, say).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.relay">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">relay</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.relay"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay" title="Link to this definition">#</a></dt>
+<dd><p>Turn the call’s output into response events until it ends, then
+finish any reply still open and close the socket: a call that ended
+takes no more audio.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.relay_task">
+<span class="sig-name descname"><span class="pre">relay_task</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Task</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay_task" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.request_id">
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.run">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.run" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.send">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">send</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.send"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.send" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>event</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.turns">
+<span class="sig-name descname"><span class="pre">turns</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.html#collections.deque" title="(in Python v3.12)"><span class="pre">deque</span></a><span class="p"><span class="pre">[</span></span><span class="pre">_AgentTurn</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.turns" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeConversation.update">
+<span class="sig-name descname"><span class="pre">update</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">session</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeConversation.update"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.update" title="Link to this definition">#</a></dt>
+<dd><p>Apply a session update. One that is malformed, or would change
+what the call has fixed, is refused whole (<code class="docutils literal notranslate"><span class="pre">ValueError</span></code>). An option
+this model can’t honour keeps its served value and is answered with
+one of the returned messages, so a client’s defaults (another voice,
+input transcription) don’t cost it the rest of the update.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>session</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeSession">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">RealtimeSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">session_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unfixed_chunks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unfixed_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">5</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_item_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">300.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pending</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pending_samples</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">heard</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_hypothesis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">emitted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">item_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">failures</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">(''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">{})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">odd_byte</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">b''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resampler</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">short</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">turn_detection</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">segmenter</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream_samples</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock_base</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock_in</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">RealtimeSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">session_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unfixed_chunks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unfixed_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">5</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_item_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">300.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pending</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pending_samples</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">heard</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_hypothesis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">emitted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">item_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">failures</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">(''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">{})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">odd_byte</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">b''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_format</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resampler</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">short</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">turn_detection</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">segmenter</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream_samples</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock_base</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clock_in</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One WebSocket’s transcription state (the SDK’s <code class="docutils literal notranslate"><span class="pre">ASRStreamingState</span></code>).</p>
 <dl class="field-list simple">
@@ -896,7 +1175,7 @@ chunks at once is decoded as one step.</p>
 <li><p><strong>item_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>failures</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>]</em>)</p></li>
 <li><p><strong>odd_byte</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
-<li><p><strong>input_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>input_format</strong> (<a class="reference internal" href="#mstar.api_server.openai.serving_realtime.AudioFormat" title="mstar.api_server.openai.serving_realtime.AudioFormat"><em>AudioFormat</em></a>)</p></li>
 <li><p><strong>resampler</strong> (<a class="reference internal" href="mstar.api_server.media_io.html#mstar.api_server.media_io.StreamResampler" title="mstar.api_server.media_io.StreamResampler"><em>StreamResampler</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>short</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>turn_detection</strong> (<a class="reference internal" href="mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.ServerVAD" title="mstar.api_server.openai.realtime_vad.ServerVAD"><em>ServerVAD</em></a><em> | </em><a class="reference internal" href="mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.SemanticVAD" title="mstar.api_server.openai.realtime_vad.SemanticVAD"><em>SemanticVAD</em></a><em> | </em><em>None</em>)</p></li>
@@ -1017,8 +1296,8 @@ chunks at once is decoded as one step.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeSession.input_rate">
-<span class="sig-name descname"><span class="pre">input_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">16000</span></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_rate" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeSession.input_format">
+<span class="sig-name descname"><span class="pre">input_format</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.openai.serving_realtime.AudioFormat" title="mstar.api_server.openai.serving_realtime.AudioFormat"><span class="pre">AudioFormat</span></a></span><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_format" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1140,11 +1419,11 @@ the timeline (the dropped audio still counts).</p>
 <dd></dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_rate">
-<span class="sig-name descname"><span class="pre">set_input_rate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rate</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeSession.set_input_rate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_rate" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_format">
+<span class="sig-name descname"><span class="pre">set_input_format</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#RealtimeSession.set_input_format"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_format" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><p><strong>fmt</strong> (<a class="reference internal" href="#mstar.api_server.openai.serving_realtime.AudioFormat" title="mstar.api_server.openai.serving_realtime.AudioFormat"><em>AudioFormat</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
@@ -1350,21 +1629,125 @@ is the request’s fault (a model’s ValueError), anything else the server’s.
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.pcm16_to_float">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">pcm16_to_float</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">payload</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">carry</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">b''</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#pcm16_to_float"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.pcm16_to_float" title="Link to this definition">#</a></dt>
-<dd><p>Base64 PCM16 (little-endian, mono) -&gt; (float32 in [-1, 1), the odd
-trailing byte). <code class="docutils literal notranslate"><span class="pre">carry</span></code> is the previous append’s odd byte, so a sample
-split across two appends is joined instead of shifting every sample after
-it. Strict decoding: a malformed payload is an error, not silence.</p>
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.content_event">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">content_event</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kind</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">response_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">item_id</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">fields</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#content_event"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.content_event" title="Link to this definition">#</a></dt>
+<dd><p>A GA event about a response’s one content part (<code class="docutils literal notranslate"><span class="pre">response.output_audio.delta</span></code> and the like).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kind</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>response_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>item_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.decode_append">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">decode_append</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">payload</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">carry</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">b''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">codec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'audio/pcm'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#decode_append"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.decode_append" title="Link to this definition">#</a></dt>
+<dd><p>A base64 append in <code class="docutils literal notranslate"><span class="pre">codec</span></code> -&gt; (float32 in [-1, 1), the odd trailing
+byte). <code class="docutils literal notranslate"><span class="pre">carry</span></code> is the previous append’s odd byte (PCM16 only; a G.711
+sample is one byte), so a sample split across two appends is joined
+instead of shifting every sample after it. Strict decoding: a malformed
+payload is an error, not silence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>payload</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>carry</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+<li><p><strong>codec</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<em>ndarray</em>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.decode_base64">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">decode_base64</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">payload</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#decode_base64"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.decode_base64" title="Link to this definition">#</a></dt>
+<dd><p>An append’s base64 payload, strictly: whitespace is allowed
+(base64.encodebytes wraps lines), anything else outside the alphabet
+raises, as does a payload that is not a string.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>payload</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.encode_audio">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">encode_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">codec</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#encode_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.encode_audio" title="Link to this definition">#</a></dt>
+<dd><p>float32 audio -&gt; base64 in <code class="docutils literal notranslate"><span class="pre">codec</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>audio</strong> (<em>ndarray</em>)</p></li>
+<li><p><strong>codec</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.error_event">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">error_event</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">message</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kind</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'invalid_request_error'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">code</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#error_event"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.error_event" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>message</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>kind</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>code</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.response_object">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">response_object</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">response_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">status</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modalities</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">status_details</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#response_object"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.response_object" title="Link to this definition">#</a></dt>
+<dd><p>A GA <code class="docutils literal notranslate"><span class="pre">realtime.response</span></code>, as <code class="docutils literal notranslate"><span class="pre">response.created</span></code> / <code class="docutils literal notranslate"><span class="pre">.done</span></code> carry it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>response_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>status</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>modalities</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>output</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>status_details</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_realtime.server_event">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_realtime.</span></span><span class="sig-name descname"><span class="pre">server_event</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kind</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">fields</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_realtime.html#server_event"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_realtime.server_event" title="Link to this definition">#</a></dt>
+<dd><p>A server event: <code class="docutils literal notranslate"><span class="pre">kind</span></code> with a fresh <code class="docutils literal notranslate"><span class="pre">event_id</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>kind</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1436,6 +1819,30 @@ further when the cut lands inside a multi-byte character.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat"><code class="docutils literal notranslate"><span class="pre">AudioFormat</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.codec"><code class="docutils literal notranslate"><span class="pre">AudioFormat.codec</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.rate"><code class="docutils literal notranslate"><span class="pre">AudioFormat.rate</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.AudioFormat.view"><code class="docutils literal notranslate"><span class="pre">AudioFormat.view()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.append"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.append()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.clock_task"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.clock_task</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.close"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.close()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.create_item"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.create_item()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.early"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.early</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.handle"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.handle()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.key"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.open"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.open()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.relay()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.relay_task"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.relay_task</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.request_id"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.run"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.send"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.turns"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.turns</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeConversation.update"><code class="docutils literal notranslate"><span class="pre">RealtimeConversation.update()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession"><code class="docutils literal notranslate"><span class="pre">RealtimeSession</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.add"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.add()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.append"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.append()</span></code></a></li>
@@ -1451,7 +1858,7 @@ further when the cut lands inside a multi-byte character.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.failures"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.failures</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.flush"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.heard"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.heard</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_rate"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.input_rate</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.input_format"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.input_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.item_id"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.item_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.item_samples"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.item_samples()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.max_item_seconds"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.max_item_seconds</span></code></a></li>
@@ -1467,7 +1874,7 @@ further when the cut lands inside a multi-byte character.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.segment"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.segment()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.segmenter"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.segmenter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.session_id"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.session_id</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_rate"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.set_input_rate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.set_input_format"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.set_input_format()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.short"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.short</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.stream_samples"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.stream_samples</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.RealtimeSession.take_chunk"><code class="docutils literal notranslate"><span class="pre">RealtimeSession.take_chunk()</span></code></a></li>
@@ -1489,7 +1896,13 @@ further when the cut lands inside a multi-byte character.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.StepError"><code class="docutils literal notranslate"><span class="pre">StepError</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.pcm16_to_float"><code class="docutils literal notranslate"><span class="pre">pcm16_to_float()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.content_event"><code class="docutils literal notranslate"><span class="pre">content_event()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.decode_append"><code class="docutils literal notranslate"><span class="pre">decode_append()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.decode_base64"><code class="docutils literal notranslate"><span class="pre">decode_base64()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.encode_audio"><code class="docutils literal notranslate"><span class="pre">encode_audio()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.error_event"><code class="docutils literal notranslate"><span class="pre">error_event()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.response_object"><code class="docutils literal notranslate"><span class="pre">response_object()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.server_event"><code class="docutils literal notranslate"><span class="pre">server_event()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_realtime.stable_prefix"><code class="docutils literal notranslate"><span class="pre">stable_prefix()</span></code></a></li>
 </ul>
   </nav></div>
