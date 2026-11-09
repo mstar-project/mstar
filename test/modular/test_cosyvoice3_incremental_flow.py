@@ -237,7 +237,7 @@ def test_the_flow_declares_its_cache_when_on(tmp_path, monkeypatch):
     keys = {spec.resource_key for spec in model.get_node_resources()}
     assert {FLOW_KV, FLOW_ATTN, FLOW_TAILS} <= keys
     assert set(model.kv_labels()[FLOW_KV]) == {FLOW_COND_LABEL, FLOW_UNCOND_LABEL}
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs(["text"], ["audio"], {})
     assert configs[FLOW_KV].needed_labels == [FLOW_COND_LABEL, FLOW_UNCOND_LABEL]
 
 
@@ -253,7 +253,7 @@ def test_the_cache_is_off_where_it_cant_run(tmp_path, monkeypatch, kwargs):
     model = _model(tmp_path, monkeypatch, **kwargs)
     assert model.config.flow_cache_frames == 0
     assert FLOW_KV not in {spec.resource_key for spec in model.get_node_resources()}
-    assert FLOW_KV not in model.get_request_resource_configs({})
+    assert FLOW_KV not in model.get_request_resource_configs(["text"], ["audio"], {})
 
 
 @pytest.mark.parametrize(

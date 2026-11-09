@@ -1388,7 +1388,7 @@ def test_an_empty_step_falls_through_to_the_next_node():
 
 def test_scheduling_a_batch_advances_the_round_robin_cursor():
     """The regression: the bookkeeping moved out of batch assembly, so every
-    (node, walk) stayed at 0 and `_node_rr_order` kept returning it first."""
+    (node, walk) stayed at 0 and round robin kept trying it first."""
     sched = _scheduler(_Engine(max_bs=2))
 
     _next_batch(sched, _Manager([f"r{i}" for i in range(4)]))

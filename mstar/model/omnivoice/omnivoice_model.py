@@ -27,10 +27,6 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -41,7 +37,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.omnivoice.components.backbone import (
     OmniVoiceBackbone,
     assert_flashinfer_api,
@@ -155,6 +151,9 @@ class OmniVoiceModel(Model):
         self.model_path_hf = os.environ.get("MSTAR_OMNIVOICE_MODEL_PATH") or model_path_hf
         self.cache_dir = cache_dir
         self.config = OmniVoiceConfig()
+        # Uploads decode at the Higgs-Audio-v2 codec's rate, not 16 kHz: a 16 kHz
+        # reference would not error, it would clone a voice pitched and paced wrong.
+        self.AUDIO_INPUT_RATE = self.config.sample_rate
         if "backbone_graphs" in kwargs:
             self.config.backbone_graphs = bool(kwargs["backbone_graphs"])
         self.skip_weight_loading = skip_weight_loading
@@ -246,12 +245,9 @@ class OmniVoiceModel(Model):
                     GraphEdge(next_node="backbone", name="audio_tokens"),
                     GraphEdge(next_node="backbone", name="step_index"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop;
-                # OmniVoiceBackboneSubmodule.prepare_inputs vetoes the
-                # overshoot by returning None.
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's own num_step stops the loop early.
+            # Ceiling only; each request's num_step is the loop's cap.
             max_iters=self.config.generation.max_num_step,
             outputs=[
                 # Matched by name against the section's loop-back edges: the
@@ -276,26 +272,6 @@ class OmniVoiceModel(Model):
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------
-
-    def load_audio(self, filepath: str, device: str):
-        """Decode the cloning reference at the **codec's** rate, not the default.
-
-        ``Model.load_audio`` decodes at 16 kHz, which is right for the ASR
-        models in the tree and wrong here: the Higgs-Audio-v2 codec encodes at
-        24 kHz, and feeding it 16 kHz samples would not error — it would encode
-        a reference pitched and paced wrong, and clone that. Like the base
-        loader, libsndfile first: torchcodec needs an FFmpeg built with audio
-        decoders, which some deployment images lack (#639).
-        """
-        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
-        from mstar.model.base import TensorAndMetadata
-        from mstar.model.components.audio_features import load_speech_file
-
-        rate = self.config.sample_rate
-        audio = load_speech_file(filepath, rate, MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(
-            data=audio, metadata=dict(sample_rate=rate, num_channels=1)
-        )
 
     def _ensure_data_worker_assets(self):
         """Load the tokenizer and duration estimator on first use.
@@ -378,9 +354,8 @@ class OmniVoiceModel(Model):
     ) -> ProcessPromptOutput:
         """Validate, then build the canvas prefix on the data worker.
 
-        Every malformed-request check lives here rather than in
-        ``get_initial_forward_pass_args``: a ValueError here becomes a 400,
-        while the same raise at the conductor is swallowed and the client hangs.
+        Every malformed-request check lives here, so a malformed request is a
+        400 before it reaches the conductor; ``walk_plan`` only backstops them.
 
         The prefix is built once and shipped, not rebuilt per iteration —
         tokenizing the text 32 times would be the dominant cost for a short
@@ -457,9 +432,9 @@ class OmniVoiceModel(Model):
             instruct=resolve_instruct(kwargs.get("instruct"), prompt),
             ref_text=ref_text,
             # The reference tokens are not available on the data worker; the
-            # ref_encoder walk supplies them, and get_initial_forward_pass_args
-            # splices them into the prefix before the loop starts. The style
-            # span still has to know a reference is coming, hence the flag.
+            # ref_encoder walk supplies them, and the backbone appends them to
+            # the prefix. The style span still has to know a reference is
+            # coming, hence the flag.
             ref_audio_tokens=None,
             has_reference=bool(ref_audio),
             denoise=bool(kwargs.get("denoise", self.config.generation.denoise)),
@@ -538,18 +513,22 @@ class OmniVoiceModel(Model):
         self._codec_hop = int(cfg.hop_length)
         return self._codec_hop
 
-    def get_initial_forward_pass_args(
+    def _num_step(self, model_kwargs: dict) -> int:
+        defaults = self.config.generation
+        return max(1, min(requested_num_step(model_kwargs, defaults), defaults.max_num_step))
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {UNMASK_LOOP_NAME: self._num_step(model_kwargs)}
+
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
-        input_signals: dict[str, list],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
-        # Backstops. process_prompt already rejected each of these on the data
-        # worker where a ValueError becomes a 400; a raise here runs at the
-        # conductor, whose loop swallows it and leaves the client hanging.
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # Backstops: process_prompt already rejected each of these.
         if not input_signals.get("prefix_ids") or TARGET_LEN not in model_kwargs:
             raise ValueError("OmniVoice requires a processed prompt (prefix_ids, target_len)")
         target_output = output_modalities[0] if output_modalities else "audio"
@@ -558,128 +537,28 @@ class OmniVoiceModel(Model):
                 f"OmniVoice only generates audio; got output modality {target_output!r}."
             )
 
-        is_clone = bool(input_signals.get("ref_audio_inputs"))
-        schedule = []
-        if is_clone:
-            schedule.append(self.ENCODE_REFERENCE_WALK)
-        schedule.append(
-            self.SPEECH_GEN_CLONE_WALK if is_clone else self.SPEECH_GEN_WALK
-        )
+        if input_signals.get("ref_audio_inputs"):
+            walks = [self.ENCODE_REFERENCE_WALK, self.SPEECH_GEN_CLONE_WALK]
+        else:
+            walks = [self.SPEECH_GEN_WALK]
 
         defaults = self.config.generation
         requested_steps = requested_num_step(model_kwargs, defaults)
-        num_step = max(1, min(requested_steps, defaults.max_num_step))
+        num_step = self._num_step(model_kwargs)
         if num_step != requested_steps:
             logger.info(
                 "Clamped num_step from %d to %d (max_num_step=%d)",
                 requested_steps, num_step, defaults.max_num_step,
             )
 
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        # What the submodules read from ``request_info.step_metadata``.
+        request = {
             # from process_prompt, which settles it on the data worker
             TARGET_LEN: int(model_kwargs[TARGET_LEN]),
             "num_step": num_step,
             **unmask_knobs(model_kwargs, defaults),
         }
-
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=schedule[0],
-            is_prefill=True,
-            kwargs=kwargs,
-        )
-
-        # Only the FIRST walk is seeded here. Everything else stays persisted
-        # and is picked up from ``persist_signals`` when the schedule steps --
-        # feeding a later walk's node now would target a node this walk does
-        # not contain.
-        if is_clone:
-            edge = GraphEdge(next_node="ref_encoder", name="ref_audio_inputs")
-            edge.tensor_info = input_signals["ref_audio_inputs"]
-            inputs = [edge]
-        else:
-            inputs = self._speech_gen_inputs(schedule[0], input_signals)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(full_metadata),
-        )
-
-    def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            TARGET_LEN: kw[TARGET_LEN],
-            "num_step": kw["num_step"],
-            "guidance_scale": kw["guidance_scale"],
-            "t_shift": kw["t_shift"],
-            "layer_penalty_factor": kw["layer_penalty_factor"],
-            "position_temperature": kw["position_temperature"],
-            "class_temperature": kw["class_temperature"],
-        }
-
-    def _speech_gen_inputs(
-        self, walk: str, persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """External inputs seeding a speech walk.
-
-        The loop-back edges go in empty; the backbone seeds the canvas and the
-        step counter at iteration 0.
-        """
-        inputs: list[GraphEdge] = []
-        for name in ("prefix_ids", "prefix_audio_mask"):
-            edge = GraphEdge(next_node="backbone", name=name)
-            edge.tensor_info = persist_signals.get(name, [])
-            inputs.append(edge)
-        if walk == self.SPEECH_GEN_CLONE_WALK:
-            ref_edge = GraphEdge(next_node="backbone", name="ref_audio_tokens")
-            ref_edge.tensor_info = persist_signals.get("ref_audio_tokens", [])
-            inputs.append(ref_edge)
-        inputs += [
-            GraphEdge(next_node="backbone", name="audio_tokens"),
-            GraphEdge(next_node="backbone", name="step_index"),
-        ]
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Step through the request's fixed walk schedule; done after the speech walk."""
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        if step < len(schedule):
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk == self.ENCODE_REFERENCE_WALK
-            inputs = self._speech_gen_inputs(walk, persist_signals)
-        else:
-            # The speech walk completed — one utterance per request.
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(metadata),
-            request_done=request_done,
-        )
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     def get_autocast_dtype(self):
         """No engine autocast: the fused kernels need one dtype throughout.

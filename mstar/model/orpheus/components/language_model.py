@@ -109,6 +109,11 @@ class OrpheusForCausalLM(nn.Module):
             output_start=config.custom_token_base_id,
         )
 
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
         self,
         query_sequence: torch.Tensor,
@@ -117,6 +122,9 @@ class OrpheusForCausalLM(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, label=label)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden)
 
     def checkpoint_rules(self):
         """How the HF Llama checkpoint lands here (and where LoRA adapters land):

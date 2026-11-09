@@ -1167,13 +1167,9 @@ class Speculator:
             # chunk must not keep decode rows waiting a second prompt step. A
             # walk with no token budget runs its prompts whole and keeps
             # main's order.
-            other_ready = (
-                self._peek
-                and (
-                    self._consecutive >= 1
-                    or (chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key))
-                )
-                and self.scheduler.has_ready_excluding(chain_key)
+            other_ready = self._peek and self.scheduler.chain_yields(
+                chain_key, self._consecutive,
+                chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key),
             )
             must_yield_away = self._consecutive >= self._max_consecutive or other_ready
             if target is not None and not must_yield_away and not admit_refused:

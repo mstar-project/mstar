@@ -75,6 +75,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``meta-models/Muse-Glimmer-30B``
      - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
        NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
+   * - ``ripple_65b`` *(Experimental)*
+     - ``ricursiveAI/Ripple-65B-Preview``
+     - Ricursive's 65B dense text LLM: sliding-window and NoPE global attention layers
+       4:1, with a value residual from the token embeddings. BF16, TP2 or TP4.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -292,7 +296,7 @@ merge's.
    * - Higgs Audio (``LLM``)
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head`` (the
        checkpoint's ``audio_decoder_proj.text_lm_head``)
-     - No embedding target: text prefill embeds before the step.
+     - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
      - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
      - Attention only on MoE layers: an adapter on the routed experts or the router is
@@ -434,6 +438,32 @@ Omnilingual ASR notes
 - Parity scripts against Meta's pipeline live in ``test/omnilingual_asr/``
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
+
+Ripple-65B (``ripple_65b``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+    mstar serve ripple_65b --gpus 0,1,2,3
+    mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
+
+- ``configs/ripple_65b_tp4.yaml``, the default, needs four 80 GB GPUs and
+  ``configs/ripple_65b_tp2.yaml`` two 141 GB ones. TP can't pass the model's 8 KV heads. Both
+  serve 131072 tokens a request.
+  For more, raise ``resources.kv_cache.max_seq_len`` and ``max_num_pages`` together: a prompt
+  holds all 80 layers' K/V until its prefill commits, so the shipped pool runs out near 260K
+  tokens and two 128K prompts can't prefill at once.
+- A chat with no ``temperature`` samples at 1.0, as Ricursive's server does, and one with no
+  ``max_tokens`` stops at 2048 tokens, which a long reasoning reply can reach inside
+  ``<think>``. Set ``max_tokens`` for hard problems.
+- Text in, text out, on ``/generate`` and ``/v1/chat/completions``. A reply's reasoning stays
+  inline as ``<think>...</think>``, and a chat that asks for tool calls is refused.
+- Not supported yet: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window
+  doesn't prefix cache) and DP replicas (a window pool can't span instances).
+- The GPU parity scripts live in ``test/ripple/``: ``run_parity.py`` drives a server and gates
+  the result, and ``record_oracle.py`` teacher-forces its replies through the checkpoint's own
+  ``modeling_ricursive.py``, in its own venv, with the attention gate and the value residual
+  each turned off as controls.
 
 FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) notes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -691,9 +721,10 @@ Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:
   2B, 4B) each delta stays on its own side, as PEFT applies them;
 * the vision tower, as unsloth's vision fine-tunes adapt it: each block's
   ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1`` and ``mlp.linear_fc2``, the merger's
-  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. The vision
-  encoder node has its own pool (``vision_lora``), sized by the same ``lora:`` block,
-  and runs the request's adapter too.
+  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. One spec covers
+  both nodes, sized by the one ``lora:`` block; the vision encoder node has a pool of
+  its own (``lora@vision_encoder``, beside the LLM's ``lora@LLM``) and runs the
+  request's adapter too.
 
 Module names may be in any layout PEFT writes for the model: the released checkpoint's
 (``model.language_model.layers.*``, ``model.visual.*``), the text-only causal LM's
@@ -752,8 +783,11 @@ Under TP the LLM's targets split as its linears do (the 27B's single K/V head pe
 at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
 on one GPU in every shipped config.
 
-LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
-block).
+Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
+(``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
+Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
+reads the served adapters once at launch and has neither route, so ``mstar serve``
+refuses ``--rust-frontend`` with ``runtime_updates: true``.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off
@@ -767,8 +801,7 @@ unless the ``lora`` block opts in, and answer 404 otherwise (as vLLM's do withou
         -d '{"lora_name": "sql"}'
 
 ``lora_path`` is a PEFT directory (its ``adapter_model.safetensors`` is read) or a
-safetensors file, readable at the same path by the API server, the conductor (which
-reads the adapter's header to check requests on it) and every worker. A load is checked
+safetensors file, readable at the same path by the API server and every worker. A load is checked
 first (LoRA layers present, rank within ``max_rank``, only the targets above, shapes
 that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM's
 or the vision encoder's); the name is selectable, and listed by ``/v1/models``, once all
@@ -1656,8 +1689,9 @@ Cosmos3 environment requirements
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
-  when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
-  ``write_video``, which needs the PyAV (``av``) package.
+  when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
+  ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  covers a torchcodec that cannot load FFmpeg.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -1707,13 +1741,13 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
-compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
-turns it off): the eager step is over a thousand tiny kernels, and the fused
-step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
-(continuous batching over the captured decode graphs, padded to the next batch
-bucket). Requests never see each other's data, but the batch bucket changes the
+The reasoner is a ``SampledTokenDecoder``: its decode steps are captured into
+CUDA graphs per batch bucket, each compiled first: the eager decode step is over
+a thousand tiny kernels, and the fused step runs at the weight-streaming floor
+(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
+and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
+decode steps (continuous batching over the captured decode graphs, padded to the
+next batch bucket). Requests never see each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens'
 logits were equal or one bf16 ulp apart, the first differing token came after
@@ -2294,8 +2328,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``async_scheduling``
    The engine's speculative scheduling of the image nodes: the worker assembles a batch's
    next denoise step while the current one runs and merges requests that became ready
-   meanwhile, so requests at different steps share a forward. On by default; a step a
-   request speculates past its schedule is vetoed before any forward, and ``false``
+   meanwhile, so requests at different steps share a forward. On by default; the loop's cap
+   (the request's step count) keeps speculation from running past its schedule, and ``false``
    restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
    to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
    concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

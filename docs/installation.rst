@@ -591,9 +591,9 @@ sources a build was made from.
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat, speech and images are served for every model the
-Python frontend serves them for. The Wan2.2 and LTX-2.5 video adapters, and the
-transcription and realtime routes, are not ported yet (``NOT_PORTED`` in
+ported class is served. Chat, speech, images and videos are served for every
+model the Python frontend serves them for. The transcription and realtime
+routes are not ported yet (``NOT_PORTED`` in
 ``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
 logs a warning at startup, and ``/generate`` still works.
 

@@ -175,7 +175,7 @@ MODELS = {
     ),
     "fish_s2_pro": lambda: _bare(
         "fish_s2_pro.fish_s2_pro_model", "FishS2ProModel",
-        config=SimpleNamespace(codec=SimpleNamespace(sample_rate=44_100)),
+        config=SimpleNamespace(codec=SimpleNamespace(sample_rate=44_100), reference_max_seconds=30.0),
     ),
     "qwen3_tts": _qwen3_tts,
     "vjepa2": lambda: _bare("vjepa2.vjepa2_model", "VJepa2Model", config=SimpleNamespace(frames_per_clip=64)),

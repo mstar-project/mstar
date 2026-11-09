@@ -8,7 +8,7 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -35,7 +35,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -68,6 +68,7 @@ QUANT_METHODS = ("fp8",)
 class Glm5NextModel(Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
+    DECODE_LOOP = "decode_loop"
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
 
@@ -216,10 +217,9 @@ class Glm5NextModel(Model):
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
@@ -282,74 +282,21 @@ class Glm5NextModel(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        # seed decode from the persisted emitted token
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -368,7 +315,7 @@ class Glm5NextModel(Model):
         # the conductor reads these kwargs; read here first, a bad one is the
         # client's 400 before the request reaches any rank
         kwargs = normalize_generation_kwargs(kwargs)
-        self.get_request_resource_configs({}, kwargs)
+        self.get_request_resource_configs([], [], kwargs)
         self.get_max_output_tokens(**kwargs)
         if kwargs.get("min_p", 0) > 0:
             # the node's sampler is built without min-p, and the request configs do not pass it on
@@ -466,11 +413,6 @@ class Glm5NextModel(Model):
         if budget is None:
             return min(self.config.index_topk, self.max_decode_steps() + 1)
         return min(budget, self.config.index_topk)
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so decode runs one fewer; the
-        # conductor refuses a cap past the loop's max_iters
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
