@@ -112,12 +112,17 @@ def _read_tensor(fd: int, rd: _Read) -> torch.Tensor:
     return buf.view(rd.dtype).view(shape)
 
 
+def safe_open(*args, **kwargs):
+    """``safetensors.safe_open``, imported on first use: safetensors is an optional dependency, and the
+    conductor, worker and API server import this package (through mstar.quantization) whether or not
+    they read a checkpoint."""
+    from safetensors import safe_open as open_file
+
+    return open_file(*args, **kwargs)
+
+
 def _read_with_safetensors(path: Path, key: str, spec: TensorSlice | None) -> torch.Tensor:
     """For dtypes the byte reader has no torch view for (packed fp4, ...)."""
-    # imported here: safetensors is an optional dependency, and the conductor, worker and API server
-    # import this package (through mstar.quantization) whether or not they read a checkpoint
-    from safetensors import safe_open
-
     with safe_open(str(path), framework="pt", device="cpu") as f:
         if spec is None:
             return f.get_tensor(key)
