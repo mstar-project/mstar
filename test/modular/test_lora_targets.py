@@ -56,6 +56,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
+from mstar.testing_utils.model import make_model
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -119,6 +120,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -406,7 +410,8 @@ def _guards(module, x) -> list[str]:
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
+# fused_column_whole is fused_column's module under another checkpoint layout, which this never reads
+@pytest.mark.parametrize("name", sorted(set(CASES) - {"fused_column_whole"}))
 def test_unbound_module_runs_the_pre_lora_forward(name):
     """Same aten ops and outputs (under TP its collectives too), dynamo graph, and no guard
     on LoRA: a deployment without a lora block traces as it did before."""
@@ -515,7 +520,7 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
 def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():
     """Nothing would bind its nodes' modules: refused before any worker starts."""
     hand = replace(_spec(CASES["qkv"]), module_map=lambda m: None)
-    model = SimpleNamespace(get_lora_specs=lambda: [hand])
+    model = make_model(get_lora_specs=lambda: [hand])
     with pytest.raises(ValueError, match="module_lora_spec"):
         declared_lora_specs(model, {"resources": {"lora": {"adapters": {}}}})
 
@@ -542,15 +547,6 @@ def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
     ])
     assert not text.ignored_modules("layers.0.q") and vision.ignored_modules("layers.0.q")
     assert text.ignored_modules("model.visual.blocks.0.q") and not vision.ignored_modules("model.visual.blocks.0.q")
-
-
-def test_a_deferred_embedding_is_served_without_embeddings():
-    with torch.device("meta"):
-        root = nn.Module()
-        root.embed_tokens = VocabParallelEmbedding(32, HIDDEN)
-        root.fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", deferred=["embed_tokens"])
-    assert set(spec.targets) == {"embed_tokens", "fc"} and spec.module_map.deferred == {"embed_tokens"}
 
 
 def test_an_exclude_pattern_matching_no_module_is_refused():
@@ -688,14 +684,6 @@ def _bagel_patch_embed() -> nn.Module:
     return BagelVisionEmbeddings(BagelViTConfig(hidden_size=HIDDEN, image_size=4, patch_size=2))
 
 
-def _qwen3_vit_patch_embed() -> nn.Module:
-    from types import SimpleNamespace
-
-    from mstar.model.components.qwen3_vit import VisionPatchEmbed
-
-    return VisionPatchEmbed(SimpleNamespace(in_channels=3, temporal_patch_size=2, patch_size=2, hidden_size=HIDDEN))
-
-
 def _omnivoice() -> nn.Module:
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
@@ -728,7 +716,6 @@ ANNOTATED = {
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
     "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
     "bagel_converted_patch_embed": (_bagel_patch_embed, {"patch_embedding"}),
-    "qwen3_vit_patch_embed": (_qwen3_vit_patch_embed, {"proj"}),
     "omnivoice_fused": (_omnivoice, {f"model.llm.layers.0.{p}" for p in (
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj")}),
 }

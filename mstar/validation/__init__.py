@@ -37,6 +37,13 @@ class DeploymentError(ValueError):
 _UNREADABLE = (TypeError, AttributeError, KeyError, IndexError)
 
 
+def positive_int(name: str, value: Any) -> int:
+    """``value``, a deployment's ``name``; ValueError unless a positive integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 def _unreadable(step: str, e: Exception) -> str:
     return f"{step} could not read the config: {type(e).__name__}: {e}"
 
@@ -78,6 +85,11 @@ def validate_deployment(
         problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
+    if (workers := config.get("preprocess_workers")) is not None:
+        try:
+            positive_int("preprocess_workers", workers)
+        except ValueError as e:
+            problems.append(str(e))
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
     resources_readable = resources_shape_problem(config) is None
     if resources_readable:

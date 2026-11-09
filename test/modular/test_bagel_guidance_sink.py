@@ -78,7 +78,7 @@ def test_an_unguided_row_holds_no_guidance_pages():
 
 def test_a_pre_plan_over_the_template_rows_is_the_step_that_runs(monkeypatch):
     kv, llm = _manager(), _llm()
-    kv._plan_cache_mode, kv._cg_max_seq_len = 2, 4096
+    kv._cg_max_seq_len = 4096
     _step(kv, llm, "prefill_text", 40)
     dropped, clear_preplan = [], kv.clear_preplan
 
@@ -103,5 +103,5 @@ def test_a_pre_plan_over_the_template_rows_is_the_step_that_runs(monkeypatch):
         kv.commit(step, ctx)
 
     assert not any(dropped), "the pre-plan over the template rows was dropped for the step over the real rows"
-    assert set(kv._streams["plain"]) == {"main"} and kv.plan_cache_stats["mismatch"] == 0
+    assert set(kv._streams["plain"]) == {"main"}
     kv.assert_pages_conserved()

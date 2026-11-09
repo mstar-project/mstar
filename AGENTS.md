@@ -102,7 +102,7 @@ See https://github.com/mstar-project/mstar/pull/368 for some sources of overhead
 
 By default the worker speculates step N+1 through the graph while step N is still running (`enable_async_scheduling`, [mstar/graph/base.py](mstar/graph/base.py#L240), default `True`). It pre-plans it on a separate thread and stream. The full stage order, thread by thread, is in [.claude/skills/async-worker/SKILL.md](.claude/skills/async-worker/SKILL.md) — **read it before changing the worker's main loop, the GPU thread, the plan thread, speculation or postprocess.**
 
-(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
+(Note: for lockstep-parallel (TP/SP/CFG) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
 
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
@@ -151,7 +151,7 @@ Two things about what the number is for. **Don't optimize against one benchmark.
 
 ### 11. Ranks in a lockstep instance must stay in lockstep
 
-A node's TP×SP block is its **lockstep instance** ([mstar/distributed/communication.py](mstar/distributed/communication.py)). Every rank in it must execute the same sequence of collectives, in the same order, with the same shapes — including on failure paths.
+A node's TP×SP×CFG block is its **lockstep instance** ([mstar/distributed/communication.py](mstar/distributed/communication.py)). Every rank in it must execute the same sequence of collectives, in the same order, with the same shapes — including on failure paths.
 
 The failure mode that actually happens: a readiness scan, admission check, capture decision or early `return` that consults **per-rank** state, so one rank takes a branch the others don't and the instance deadlocks on the next collective. Anything that decides control flow for the instance must be derived from state all ranks agree on, or reduced across the group first — `accelerator_graph_runner.py` ANDs capture flags across the joint group for exactly this reason, and barriers once per spec whether it passed or failed.
 
@@ -190,7 +190,7 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 ```bash
 ruff check .                          # CI enforces this
 # the CPU Core CI job's tests, no GPU or weights; see "Running the CPU suite" below
-env -u MSTAR_SHM_ARENA CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases \
     -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=$(mktemp -d /tmp/s_XXXX)
@@ -205,7 +205,7 @@ It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If
 - **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
 - **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.
 - **Keep the per-test limit.** `--timeout=120` (`pytest-timeout`) names a stuck test instead of letting it hold the run; CI's slowest test is about 85 s.
-- **Match CI's environment.** A machine that exports `MSTAR_SHM_ARENA=1` fails `test_shm_shutdown_cleanup.py`, which is why the command unsets it, and a visible GPU sends tests that check for one onto it.
+- **Match CI's environment.** A visible GPU sends tests that check for one onto it.
 
 The CPU suites build a graph runtime and the Rust communicator, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
 
@@ -215,7 +215,7 @@ CI has no GPU. A PR whose change runs on the GPU says which GPU tests it ran, on
 
 The modular tests exist because these are the parts that are easy to get wrong: `test_resource_runner.py` (the admit/plan/commit lifecycle from `declare_step`), `test_accelerator_graph_capture.py` (bucket keys, `cg_key_info`, `additional_key_info`), `test_micro_scheduler.py` (admission, failure, backpressure), `test_admit_failure_handling.py`, `test_kv_offload.py`.
 
-Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker or engine method, build the smallest real object (`Worker.__new__(Worker)` plus the attributes the method reads) and call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
+Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on a worker component can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker or engine method, build the smallest real object (for a worker, `make_worker` in [mstar/testing_utils/worker.py](mstar/testing_utils/worker.py), which builds every component real over the collaborators the test names; `make_scheduler` and `make_services` there build less) and call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
 
 If a bug only reproduces through a running server, write a standalone harness before the third attempt. A server restart can be minutes of compilation, while a harness that builds the resources directly, drives `admit`/`plan`/`commit` by hand, and captures and replays a graph runs in seconds — [test/modular/test_gdn_cuda_graph.py](test/modular/test_gdn_cuda_graph.py) is the shape to copy. Where the bug is inside a captured graph, intermediates are invisible after a replay; returning `torch.isfinite(x).all()` per layer as an extra graph output gives a flag tensor readable afterwards, which names the first bad kernel instead of the first place the damage shows.
 

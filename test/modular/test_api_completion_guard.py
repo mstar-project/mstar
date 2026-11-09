@@ -26,7 +26,7 @@ from PIL import Image
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
+from mstar.testing_utils.model import StubModel
 
 
 def _worker_with(received_chunk_counts):
@@ -104,7 +104,7 @@ def test_preprocess_failure_emits_error_chunk():
     """A request rejected during preprocessing (e.g. an invalid model kwarg)
     must produce an "error" chunk so the waiting client is released."""
 
-    class _RejectingModel:
+    class _RejectingModel(StubModel):
         def process_prompt(self, *args, **kwargs):
             raise ValueError("bad knob")
 
@@ -114,13 +114,8 @@ def test_preprocess_failure_emits_error_chunk():
     assert cleaned == ["r1"]
 
 
-class _BaseLoaders:
+class _BaseLoaders(StubModel):
     """``Model``'s own loaders, for the models that don't override them."""
-
-    max_input_files = Model.max_input_files
-    load_image = Model.load_image
-    load_audio = Model.load_audio
-    load_video = Model.load_video
 
 
 def _bare(module, cls, **attrs):

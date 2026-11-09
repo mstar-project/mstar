@@ -10,7 +10,6 @@ import sys
 
 sys.path.insert(0, ".")
 
-from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +19,7 @@ from mstar.model.base import _wrap_node_in_loop
 from mstar.model.submodule_base import ChunkingPolicy, chunk_tick_name
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.testing_utils.model import make_model
 from mstar.validation.placement import _chunked_streams
 
 NODE, WALK = "Thinker", "prefill"
@@ -70,7 +70,7 @@ def _problems(policy, *, allow_partial=False, join_dim=None, states_streaming=Tr
         chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, allow_partial=allow_partial),
         join_dim=join_dim,
     )])
-    model = SimpleNamespace(
+    model = make_model(
         get_partition_topology=lambda: topology,
         chunking_policy_of=lambda: {(NODE, WALK): policy},
     )
@@ -116,7 +116,7 @@ def test_a_per_chunk_name_that_is_no_output_is_refused():
 def test_an_unchunkable_policy_is_not_checked():
     """No Loop wraps it, so its edges route as declared."""
     policy = ChunkingPolicy(walks=(WALK,), per_chunk_outputs=frozenset({"states"}))
-    model = SimpleNamespace(
+    model = make_model(
         get_partition_topology=lambda: PartitionTopology(partitions=["Thinker"]),
         chunking_policy_of=lambda: {(NODE, WALK): policy},
     )

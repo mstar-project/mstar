@@ -12,6 +12,7 @@ against what the request's earlier files used.
 """
 import errno
 import os
+import struct
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -46,6 +47,8 @@ DEFAULT_MAX_AUDIO_SECONDS = 60 * 60
 IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
 # a loader that decodes with Pillow also reads the other image types the API accepts
 PILLOW_IMAGE_FORMATS = IMAGE_FORMATS + ("BMP", "TIFF")
+# what Pillow's lazy EXIF parse raises on a malformed block; the image is then read as stored
+_MALFORMED_EXIF = (SyntaxError, struct.error, ValueError, TypeError)
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -320,6 +323,23 @@ def charge_decoded_audio(audio: torch.Tensor, sample_rate: int) -> None:
     _charge_request("audio", audio.numel() / sample_rate)
 
 
+def charge_decoded_image(image: torch.Tensor) -> None:
+    """Hold an image that arrived decoded (``[C, H, W]``) to the cap a file's
+    header is held to, and charge the request its pixels."""
+    height, width = image.shape[-2:]
+    limit = max_image_pixels()
+    if width * height > limit:
+        raise ValueError(f"image is {width}x{height} ({width * height} pixels); the limit is {limit} pixels")
+    _charge_request("image", width * height)
+
+
+#: Which modalities a request may send as ``raw_inputs`` (tensors instead of files),
+#: each with its size check: the check refuses an input over the limit (for images,
+#: MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request's total, as reading a
+#: file's header does. The model then loads each with ``Model.load_decoded_<modality>``.
+RAW_INPUT_CHARGES = {"image": charge_decoded_image}
+
+
 def sound_file_seconds(frames: int, rate: int) -> float | None:
     """The length a libsndfile header declares, or None when it declares none
     (a sample count of 0 or libsndfile's "unknown" value)."""
@@ -383,16 +403,17 @@ def check_image_size(filepath: str, formats: tuple[str, ...] = IMAGE_FORMATS) ->
     Reads the header only. The decoders allocate what the header declares, so
     it cannot understate the decode.
     """
-    fmt, animated, _, _ = _check_image_header(filepath, formats)
+    fmt, animated, _, _, _ = _check_image_header(filepath, formats)
     return fmt, animated
 
 
-def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool]:
-    """:func:`check_image_size`, plus Pillow's mode and whether the file
-    carries transparency (an alpha channel or a tRNS or GIF transparent color)."""
+def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool, int]:
+    """:func:`check_image_size`, plus Pillow's mode, whether the file
+    carries transparency (an alpha channel or a tRNS or GIF transparent color)
+    and a static WebP's EXIF orientation (1, upright, for any other file)."""
     import warnings
 
-    from PIL import Image, UnidentifiedImageError
+    from PIL import ExifTags, Image, UnidentifiedImageError
 
     limit = max_image_pixels()
     try:
@@ -404,6 +425,12 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
                 animated = bool(getattr(image, "is_animated", False))
                 mode = image.mode
                 transparent = bool(image.has_transparency_data)
+                orientation = 1
+                if fmt == "WEBP" and not animated:
+                    try:
+                        orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
+                    except _MALFORMED_EXIF:
+                        pass
     except Image.DecompressionBombError:
         raise ValueError(f"image is too large to decode; the limit is {limit} pixels") from None
     except (UnidentifiedImageError, OSError, SyntaxError):
@@ -412,7 +439,22 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
     if width * height > limit:
         raise ValueError(f"image is {width}x{height} ({width * height} pixels); the limit is {limit} pixels")
     _charge_request("image", width * height)
-    return fmt, animated, mode, transparent
+    return fmt, animated, mode, transparent, orientation
+
+
+@contextmanager
+def open_upright_image(filepath: str, formats: tuple[str, ...] | None = None):
+    """The image opened with Pillow and turned upright by its EXIF orientation,
+    as transformers' and diffusers' ``load_image`` do. A malformed EXIF block
+    leaves it as stored."""
+    from PIL import Image, ImageOps
+
+    with Image.open(filepath, formats=formats) as image:
+        try:
+            upright = ImageOps.exif_transpose(image)
+        except _MALFORMED_EXIF:
+            upright = image
+        yield upright
 
 
 def _on_white(image: torch.Tensor) -> torch.Tensor:
@@ -431,18 +473,19 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
     channels are kept, as ``torchvision.io.decode_image`` does. A GIF or an
     animated WebP is read with Pillow, as its first frame in RGB: torchvision's
     GIF decoder is not safe on untrusted files before torchvision 0.28, and its
-    WebP decoder refuses animation.
+    WebP decoder refuses animation and ignores EXIF, so a WebP stored rotated
+    is read with Pillow too. The image is turned upright by its EXIF
+    orientation (see :func:`open_upright_image`).
     """
     import torchvision
 
-    fmt, animated, pil_mode, transparent = _check_image_header(filepath, IMAGE_FORMATS)
+    fmt, animated, pil_mode, transparent, orientation = _check_image_header(filepath, IMAGE_FORMATS)
     # torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it
     trns_color = rgb and transparent and pil_mode in ("L", "RGB")
-    if fmt == "GIF" or (fmt == "WEBP" and animated) or trns_color:
+    if fmt == "GIF" or (fmt == "WEBP" and (animated or orientation != 1)) or trns_color:
         import numpy as np
-        from PIL import Image
 
-        with decoding_upload(filepath, "the image"), Image.open(filepath) as image:
+        with decoding_upload(filepath, "the image"), open_upright_image(filepath) as image:
             array = np.array(image.convert("RGBA"))
         return _on_white(torch.from_numpy(array).permute(2, 0, 1))
     if not rgb:
@@ -452,7 +495,7 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
         # four channels are not RGBA
         mode = torchvision.io.ImageReadMode.RGB_ALPHA if transparent else torchvision.io.ImageReadMode.RGB
     with decoding_upload(filepath, "the image"):
-        image = torchvision.io.decode_image(filepath, mode=mode)
+        image = torchvision.io.decode_image(filepath, mode=mode, apply_exif_orientation=True)
     if image.dtype == torch.uint16:
         # a 16-bit PNG: its high byte, as Pillow reads a 16-bit RGB PNG
         image = (image.to(torch.int32) >> 8).to(torch.uint8)

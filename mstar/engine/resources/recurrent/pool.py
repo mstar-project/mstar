@@ -1225,21 +1225,19 @@ class RecurrentStatePool(Resource):
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
     def post_warmup_validate(self):
-        """Every rank of the group must hold the same free slots after warmup:
+        """Every rank of the instance must hold the same free slots after warmup:
         each rank admits from its own pool. See ``KVManager.post_warmup_validate``."""
         if self._comm_group is None or self._comm_group.world_size == 1:
             return
-        local = torch.tensor(
-            [self.num_free_slots], dtype=torch.int64, device=self._device,
-        )
-        for group in (self._comm_group.tp_group, self._comm_group.sp_group):
-            values = group.all_gather(local, dim=0).cpu().tolist()
-            if any(v != values[0] for v in values):
-                raise RuntimeError(
-                    f"recurrent state pool has asymmetric free slots across "
-                    f"ranks: {values}. Check the YAML for a per-rank max_slots, "
-                    "and any code that admits before warmup completes."
-                )
+        free = self.num_free_slots
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
+            raise RuntimeError(
+                f"recurrent state pool has asymmetric free slots across the "
+                f"ranks of its instance: min {lo}, max {-neg_hi}. Check the YAML "
+                "for a per-rank max_slots, and any code that admits before "
+                "warmup completes."
+            )
 
     def cleanup(self):
         self._blocks.clear()

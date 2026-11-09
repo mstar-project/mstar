@@ -37,11 +37,13 @@ def make_test_api_server(**overrides) -> APIServer:
     server.model = None
     server.model_name = "dummy"
     server.served_models = ServedModels.of("dummy", None)
+    server.openpi_policy = None   # no openpi: block
     # no LoRA block: no adapters to digest, as APIServer.__init__ leaves it
     server.lora_adapter_digests = {}
     server.client_streams = frozenset()
     server.takes_stream_input = False
     server._model_config = None   # max_call_input_bytes reads it on first use
+    server.max_concurrent_requests = None
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None
