@@ -7,10 +7,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
-from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfigType,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.resources.base import CGSlotSpec, Resource, build_resource
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep, lean_subsets
@@ -183,3 +189,75 @@ def test_the_declaration_check_compares_the_nodes_own_key_whatever_runs_lean():
         drive("other")
     with pytest.raises(NotImplementedError, match="reached plan"):
         drive("cfg")
+
+
+# ---- which twins are captured ----
+
+class _BatchedOnly(_Lean):
+    def lean_captures(self, config_type) -> bool:
+        return config_type == AcceleratorGraphConfigType.BASIC_BATCHED
+
+
+def _configs():
+    return [
+        BatchedAcceleratorGraphConfig(capture_graph_walk=WALK, capture_batch_sizes=[1, 4],
+                                      single_request_inputs=ARNodeInputs(input_seq_len=1)),
+        PackedAcceleratorGraphConfig(capture_graph_walk="prefill", capture_token_lengths=[16],
+                                     capture_batch_sizes=[1], make_node_input=lambda n: ARNodeInputs(input_seq_len=n)),
+    ]
+
+
+def _capture_runner(resources, steps=None, blocked=()):
+    """A runner over `_configs`, whose step drives ``steps[walk]`` (every resource by default)."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    def declare_step(graph_walk, **kwargs):
+        keys = resources.keys() if steps is None else steps[graph_walk]
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+
+    for key in blocked:
+        resources[key].can_capture = lambda: False
+    configs = _configs()
+    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step)
+    return AcceleratorGraphRunner(
+        submodule_name="N", submodule=submodule, resources=resources, step_runner=Mock(),
+        device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
+        num_slots=2,
+    )
+
+
+def _listed(specs):
+    return {(spec.bucket.graph_walk, spec.bs, spec.bucket.lean) for spec in specs if spec.slot == 0}
+
+
+def test_each_bucket_gets_a_twin_per_set_of_lean_resources_that_take_its_kind():
+    runner = _capture_runner({"a": _Lean(), "plain": _Plain(), "b": _BatchedOnly()})
+    listed = _listed(runner._get_slot_specs())
+    sets = {frozenset(), frozenset("ab"), frozenset("a"), frozenset("b")}
+    assert listed == {(WALK, bs, lean) for bs in (1, 4) for lean in sets} | {
+        ("prefill", 1, frozenset()), ("prefill", 1, frozenset("a")),
+    }, "b declines packed captures, so a prefill bucket gets a's twin alone"
+    assert _listed(_capture_runner({"plain": _Plain()})._get_slot_specs()) == {
+        (WALK, 1, frozenset()), (WALK, 4, frozenset()), ("prefill", 1, frozenset()),
+    }, "a node with no lean resource captures what it did"
+
+
+def test_a_twin_is_kept_only_where_the_configs_step_drives_its_resources():
+    runner = _capture_runner({"a": _Lean(), "b": _Lean()}, steps={WALK: ["a", "b"], "prefill": ["a"]})
+    specs = runner.prepare_for_capture()
+    assert _listed(specs) == {
+        (WALK, bs, lean) for bs in (1, 4) for lean in (frozenset(), frozenset("ab"), frozenset("a"), frozenset("b"))
+    } | {("prefill", 1, frozenset()), ("prefill", 1, frozenset("a"))}
+    # every plain bucket before any twin, each largest first
+    leans = [bool(spec.bucket.lean) for spec in specs]
+    assert leans == sorted(leans) and [s.bs for s in specs if not s.bucket.lean] == [4, 4, 1, 1, 1, 1]
+
+
+def test_a_blocked_config_reports_its_plain_buckets_alone():
+    runner = _capture_runner({"a": _Lean(), "x": _Plain()}, steps={WALK: ["a", "x"], "prefill": ["a"]},
+                             blocked=["x"])
+    specs = runner.prepare_for_capture()
+    assert _listed(specs) == {("prefill", 1, frozenset()), ("prefill", 1, frozenset("a"))}
+    assert {(b.graph_walk, b.bs, b.lean) for b in runner.dropped_buckets} == {
+        (WALK, 1, frozenset()), (WALK, 4, frozenset()),
+    }

@@ -365,33 +365,6 @@ def _delta_runs(pool, backend, tokens=2):
     return backend.calls > before
 
 
-def test_every_bucket_is_captured_again_under_a_base_only_key_beside_the_nodes_own():
-    """Each bucket under the node's own key (a model's cg_key_info) and under LoraBaseOnly
-    of it, sharing the config; a node without LoRA captures exactly what it did."""
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-
-    configs = [PackedAcceleratorGraphConfig(
-        capture_graph_walk="prefill", capture_token_lengths=[16, 32], capture_batch_sizes=[1, 2],
-        make_node_input=lambda n: ARNodeInputs(input_seq_len=n), additional_key_info=cfg,
-    ) for cfg in (True, False)]
-
-    def specs(lora_keys):
-        runner = object.__new__(AcceleratorGraphRunner)
-        runner._capture_configs, runner._num_slots = configs, 2
-        runner._submodule = SimpleNamespace(lora_keys=lora_keys)
-        runner._resources = {}
-        return runner._get_slot_specs()
-
-    plain, served = specs(()), specs((LORA,))
-    assert {s.bucket.cg_key_info for s in plain} == {True, False} and len(served) == 2 * len(plain)
-    own = {(s.bucket, s.slot, s.config_idx) for s in plain}
-    twins = {(s.bucket, s.slot, s.config_idx) for s in served} - own
-    assert twins == {
-        (BucketKey(b.graph_walk, b.bs, b.num_tokens, LoraBaseOnly(b.cg_key_info)), slot, idx) for b, slot, idx in own
-    }
-    assert str(LoraBaseOnly(True)) == "lora-base-only:True"
-
-
 def test_a_base_only_step_launches_no_delta_captured_or_eager(adapters):
     pool = LoraAdapterPool(P.make_spec(adapters[1]), "cpu", backend=(backend := _CountingBackend()))
     P.ingest(pool, "b", None)

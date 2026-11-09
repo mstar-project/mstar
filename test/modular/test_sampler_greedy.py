@@ -15,8 +15,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
-from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import GreedySample, SamplerStep, SamplingReqConfig
@@ -35,7 +33,6 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.submodule_base import ARNodeInputs
 
 CPU = torch.device("cpu")
 V = 64
@@ -109,35 +106,6 @@ def test_the_plan_refuses_a_greedy_lease_over_a_sampled_row(wide):
                       slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
     wide.plan(SamplerStep(), ctx)
     assert not wide._greedy_this_step
-
-
-# ---- which buckets capture it ----
-
-def _specs(resources, lora_keys=()):
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-
-    configs = [
-        BatchedAcceleratorGraphConfig(capture_graph_walk=WALK, capture_batch_sizes=[1, 4],
-                                      single_request_inputs=ARNodeInputs(input_seq_len=1)),
-        PackedAcceleratorGraphConfig(capture_graph_walk="prefill", capture_token_lengths=[16],
-                                     capture_batch_sizes=[1], make_node_input=lambda n: ARNodeInputs(input_seq_len=n)),
-    ]
-    runner = object.__new__(AcceleratorGraphRunner)
-    runner._capture_configs, runner._num_slots = configs, 2
-    runner._submodule = SimpleNamespace(lora_keys=lora_keys)
-    runner._resources = resources
-    return {(s.bucket.graph_walk, s.bucket.bs, s.bucket.cg_key_info) for s in runner._get_slot_specs()}
-
-
-def test_only_batched_buckets_are_captured_again_for_greedy_steps(wide):
-    plain = _specs({})
-    assert _specs({"sampler": wide}) == plain | {(w, bs, GreedySample()) for w, bs, k in plain if w == WALK}
-    narrow = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
-    assert _specs({"sampler": narrow}) == plain
-    # beside LoRA: every key the node captures gets its greedy twin
-    lora = _specs({"sampler": wide}, lora_keys=("lora",))
-    assert {k for w, bs, k in lora if w == WALK} == {None, LoraBaseOnly(), GreedySample(), GreedySample(LoraBaseOnly())}
-    assert {k for w, bs, k in lora if w == "prefill"} == {None, LoraBaseOnly()}
 
 
 # ---- steps flipping between the two captures ----
