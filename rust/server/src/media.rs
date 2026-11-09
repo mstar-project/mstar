@@ -92,14 +92,26 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 // Inbound: persist request media into upload_dir, return (modality, path)
 // ---------------------------------------------------------------------------
 
-/// Decode client base64 as `media_io._decode_base64_payload` does: whitespace
-/// removed (a line-wrapped payload), missing padding restored, then a strict
-/// decode of the alphabet.
+/// Client base64 decoded as the Python frontend's `_decode_base64_payload`
+/// does: whitespace anywhere is dropped (line-wrapped payloads), missing `=`
+/// padding is restored (some OpenAI clients strip it), and anything else
+/// outside the standard alphabet is refused.
 fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let mut compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-    let pad = (4 - compact.len() % 4) % 4;
-    compact.extend(std::iter::repeat_n('=', pad));
-    base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::engine::DecodePaddingMode;
+    // Python ignores the unused low bits of the last symbol too
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    // Python's `str.split()` whitespace: Unicode's plus the C0 separators
+    let compact: String = payload
+        .chars()
+        .filter(|c| !c.is_whitespace() && !('\u{1c}'..='\u{1f}').contains(c))
+        .collect();
+    LENIENT.decode(compact.as_bytes())
 }
 
 /// `media_io.BARE_REF_AUDIO_REFUSAL`.
@@ -950,6 +962,31 @@ mod tests {
             check_format("mp3", false, 24000, false).unwrap_err(),
             "response_format 'mp3' cannot be produced by this server; use one of: wav, pcm"
         );
+    }
+
+    #[test]
+    fn base64_decodes_what_the_python_frontend_decodes() {
+        // each payload's outcome in `media_io._decode_base64_payload` on CPython 3.12
+        let a: Option<&[u8]> = Some(b"a");
+        for (payload, want) in [
+            ("YQ==", a),
+            ("YQ", a), // the client stripped the padding
+            ("YQ=", a),
+            ("YR==", a), // unused low bits set
+            ("YQ\r\n==\n", a),
+            ("Y Q\u{a0}\u{b}\u{1c}\u{85}\u{3000}", a),
+            ("YWJjZA", Some(&b"abcd"[..])),
+            ("", Some(&b""[..])),
+            ("Y", None),
+            ("Y==", None),
+            ("YQ===", None),
+            ("YQ==YQ==", None),
+            ("====", None),
+            ("-_", None),
+            ("YQ\u{200b}", None),
+        ] {
+            assert_eq!(decode_b64_lenient(payload).ok().as_deref(), want, "{payload:?}");
+        }
     }
 
     #[test]

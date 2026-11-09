@@ -72,6 +72,7 @@ from mstar.model.cosyvoice3.components.flow import (
     NewFramesInputs,
     ReferenceVoice,
     SolveInputs,
+    native_convolutions,
 )
 from mstar.model.cosyvoice3.components.hift import (
     CapturedStream,
@@ -170,7 +171,10 @@ class ReferenceEncoder:
     @torch.no_grad()
     def tokens(self, wav24: torch.Tensor) -> torch.Tensor:
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
-        tokens, lens = self.tokenizer([wav16])
+        # Clips vary in length, and cuDNN plans anew per shape: native convolutions
+        # hold CAMPPlus to about 14 ms a clip, against 37 to 119 ms.
+        with native_convolutions():
+            tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
         frames = self._mel_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
@@ -189,7 +193,8 @@ class ReferenceEncoder:
         feat = feat[: 2 * tokens.numel()]
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
         fbank = kaldi_fbank_80(wav16)
-        embedding = self.campplus(fbank[None])[0]
+        with native_convolutions():
+            embedding = self.campplus(fbank[None])[0]
         return ReferenceVoice(prompt_tokens=tokens, prompt_feat=feat, embedding=embedding)
 
 
@@ -1029,6 +1034,10 @@ class FlowSubmodule(NodeSubmodule):
         del autocast_dtype, tp_world_size, kwargs
         regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
         if self.config.flow_cache_frames > 0:
+            if device.type == "cuda":
+                self.flow.decoder.estimator.prepare_fused(
+                    self.flow.decoder.time_grid(self.config.flow.cfm.n_timesteps, device, torch.float32, meanflow=False)
+                )
             regions[FLOW_NEW_FRAMES_REGION] = PiecewisePackedConfig(
                 capture_fn=self._new_frames_capture,
                 make_static_inputs=functools.partial(self._new_frames_static_inputs, device=device),

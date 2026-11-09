@@ -1703,3 +1703,28 @@ def test_offline_deployment_decodes_once_with_full_attention(model):
     assert [c.numel() for c in chunks if c.numel()] == [60 * 960]
     whole = (whole[0].clamp(-1, 1) * 32767).to(torch.int16)
     assert (torch.cat(chunks).int() - whole.int()).abs().max() <= 1
+
+
+def test_native_convolution_windows_nest_across_threads():
+    """Two threads' windows overlap; cuDNN comes back only when both have left."""
+    import threading
+
+    from mstar.model.cosyvoice3.components.flow import native_convolutions
+
+    before = torch.backends.cudnn.enabled
+    entered, release = threading.Event(), threading.Event()
+
+    def other():
+        with native_convolutions():
+            entered.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    entered.wait(5)
+    with native_convolutions():
+        assert not torch.backends.cudnn.enabled
+    assert not torch.backends.cudnn.enabled  # the other thread is still inside
+    release.set()
+    thread.join(5)
+    assert torch.backends.cudnn.enabled == before
