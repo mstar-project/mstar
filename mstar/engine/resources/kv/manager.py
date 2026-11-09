@@ -395,11 +395,12 @@ class ShortGrant(NamedTuple):
 class Earmark:
     """The pages ``rid``'s grant needed past its allotment, which the room it counted and the moves of ``victims``
     add to the allotment. ``granted`` counts the pages added so far. For a request that waits, ``pages`` is all it
-    asks for, which it takes whole."""
+    asks for, which it takes whole, and ``mark`` is the refusal `make_room` chose the victims for."""
     rid: str
     pages: int
     victims: set[str]
     granted: int = 0
+    mark: RoomMark | None = None
 
 
 @dataclass
@@ -4462,7 +4463,7 @@ class KVManager(AttentionResource):
             if pages <= self._room():
                 return Victims([], [], [])
             victims = self._choose(pages - self._room(), stalled, droppable)
-            return None if victims is None else self._earmark(Earmark(mark.rid, pages, set()), victims)
+            return None if victims is None else self._earmark(Earmark(mark.rid, pages, set(), mark=mark), victims)
 
     def _choose(self, pages_short: int, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """The fewest leading requests of ``newer`` whose moves free ``pages_short`` pages, or None when moving every
@@ -4575,8 +4576,13 @@ class KVManager(AttentionResource):
         if not earmark.victims:
             del self._earmarks[earmark.rid]
         if earmark.rid in self._asks:
-            if earmark.pages <= self._room():
-                self._admit(earmark.rid, earmark.pages)
+            # measured again, as a victim's move can make the pages a hit took for nothing evictable
+            mark = earmark.mark
+            pages = earmark.pages if mark is None else self._need(
+                mark.rid, mark.node_name, mark.graph_walk, mark.published,
+            )
+            if pages <= self._room():
+                self._admit(earmark.rid, pages)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
