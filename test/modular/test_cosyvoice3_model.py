@@ -60,7 +60,6 @@ from mstar.model.cosyvoice3.submodules import (
     PREV_TOKEN,
     PROMPT_TOKENS,
     SPEECH_TOKENS,
-    STEP_INDEX,
     TEXT_INPUTS,
     VOICE_KEY,
     FlowSubmodule,
@@ -853,6 +852,11 @@ def _info(rid: int, seed: int, limits=(0, 30), **knobs):
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)
 
 
+def _rows(out, rids) -> dict:
+    """A batched LM step's rows by request, as the engine hands them to postprocess."""
+    return {rid: {k: [v[i]] for k, v in out.row_outputs.items()} for i, rid in enumerate(rids)}
+
+
 def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int]]:
     """Prefill every request together, then batched decode steps until one stops."""
     rids = list(requests)
@@ -865,13 +869,15 @@ def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int
         prepared = [sub.prepare_inputs(walk, infos[rid], inputs[rid]) for rid in live]
         res.plan([p.input_seq_len for p in prepared])
         engine.request_ids = live
-        out = sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, prepared))
+        out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, prepared)), live)
         stopped = []
         for rid, p in zip(live, prepared, strict=True):
             sub.postprocess(rid, infos[rid], out[rid], inputs=p)
             tokens[rid].append(int(out[rid][SPEECH_TOKENS][0]))
             inputs[rid] = {PREV_TOKEN: out[rid][PREV_TOKEN]}
-            if sub.check_stop(rid, infos[rid], out[rid]):
+            infos[rid].graph_walk = walk
+            # the runtime ends the loop at its cap, the budget
+            if sub.check_stop(rid, infos[rid], out[rid]) or len(tokens[rid]) >= requests[rid][0]["limits"][1]:
                 stopped.append(rid)
         walk = "decode"
         if stopped:
@@ -1006,10 +1012,11 @@ def _lm_prefill_then_decode(sub, res, limits, **knobs):
     for walk in ("prefill", "decode"):
         prepared = sub.prepare_inputs(walk, info, inputs)
         res.plan([prepared.input_seq_len])
-        out = sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared]))[0]
+        out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared])), [0])[0]
         sub.postprocess(0, info, out, inputs=prepared)
         tokens.append(int(out[SPEECH_TOKENS][0]))
         inputs = {PREV_TOKEN: out[PREV_TOKEN]}
+        info.graph_walk = walk
     return tokens, sub.check_stop(0, info, out)
 
 
@@ -1022,55 +1029,83 @@ def test_lm_a_request_ended_by_its_prefill_token_adds_no_speech():
     with torch.no_grad():
         _fixed_logits(sub, favourite=cfg.lm.speech_token_size + 7, second=5)
         assert _lm_prefill_then_decode(sub, res, (0, 30)) == ([47, cfg.lm.eos_token], {DECODE_LOOP})
-        for limits, knobs in (((0, 1), {}), ((0, 1), {"ignore_eos": True})):
-            res.reset()
-            _fixed_logits(sub, favourite=5, second=6)
-            assert _lm_prefill_then_decode(sub, res, limits, **knobs) == ([5, cfg.lm.eos_token], {DECODE_LOOP})
+        res.reset()
+        _fixed_logits(sub, favourite=5, second=6)
+        assert _lm_prefill_then_decode(sub, res, (0, 1)) == ([5, cfg.lm.eos_token], {DECODE_LOOP})
+        # EOS doesn't stop a request that ignores it, but the loop's cap of one iteration does
+        res.reset()
+        assert _lm_prefill_then_decode(sub, res, (0, 1), ignore_eos=True) == ([5, cfg.lm.eos_token], set())
         res.reset()
         assert _lm_prefill_then_decode(sub, res, (0, 30)) == ([5, 5], set())
     assert filter_tokens(torch.tensor([5, cfg.lm.eos_token]), cfg).tolist() == [5]
 
 
-def test_lm_stop_judges_each_step_by_its_own_index():
-    """A speculative next step postprocessed before this step's stop check has
-    moved ``generated`` on; the cap still counts this step's tokens."""
-    cfg = _tiny_config()
-    sub, _ = _lm(cfg)
-    info = _info(4, 0, limits=(0, 4))
-    sub.prepare_inputs("prefill", info, _lm_request())
-    for _ in range(4):
-        sub.postprocess(4, info, {SPEECH_TOKENS: [torch.tensor([5])]})
-    out = {SPEECH_TOKENS: [torch.tensor([5])], STEP_INDEX: [torch.tensor([2])]}
-    assert sub.check_stop(4, info, out) == set()  # token 3 of 4
-    out[STEP_INDEX] = [torch.tensor([3])]
-    assert sub.check_stop(4, info, out) == {DECODE_LOOP}
-
-
 @pytest.mark.parametrize("budget", [1, 2, 6])
-def test_lm_caps_decode_where_its_stop_check_ends_it(model, budget):
+def test_the_prefill_and_the_loop_cap_spend_the_token_budget(model, budget):
     cfg = _tiny_config()
     sub, res = _lm(cfg)
     _fixed_logits(sub, favourite=5, second=6)
     info = _info(0, 0, limits=(0, budget), ras_window=0)
     engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
-    walk, inputs, iterations = "prefill", _lm_request(), 0
+    caps = model.get_loop_caps(**{MAX_SPEECH_TOKENS: budget})
+    assert model.get_loop_caps(max_new_tokens=budget) == caps
+    decode_steps = 0 if budget == 1 else caps[DECODE_LOOP]
+    walk, inputs = "prefill", _lm_request()
+    tokens = 0
     with torch.no_grad():
-        while True:
+        for step in range(decode_steps + 1):
             prepared = sub.prepare_inputs(walk, info, inputs)
             res.plan([prepared.input_seq_len])
-            out = sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared]))[0]
+            out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared])), [0])[0]
             sub.postprocess(0, info, out, inputs=prepared)
             inputs = {PREV_TOKEN: out[PREV_TOKEN]}
-            stop = sub.check_stop(0, info, out)
-            if walk == "decode":
-                iterations += 1
-                if stop:
-                    break
+            info.graph_walk = walk
+            stops = sub.check_stop(0, info, out)
+            tokens += 1
+            # a speech token ends nothing but the prefill of a one-token budget
+            assert stops == ({DECODE_LOOP} if budget == 1 and step == 0 else set())
             walk = "decode"
+    assert tokens == budget
 
-    caps = model.get_loop_caps(**{MAX_SPEECH_TOKENS: budget})
-    assert caps == {DECODE_LOOP: iterations}, "the cap and the stop check end decode on different iterations"
-    assert model.get_loop_caps(max_new_tokens=budget) == caps
+
+def _stop_info(limits, walk, **knobs) -> SimpleNamespace:
+    info = _info(0, 0, limits=limits, **knobs)
+    info.graph_walk = walk
+    return info
+
+
+def test_lm_stop_policy_runs_on_decode_only_and_reads_ignore_eos_from_step_metadata():
+    cfg = _tiny_config()
+    sub, _ = _lm(cfg)
+    assert sub.get_stop_policies("prefill") is None and sub.get_stop_policies("prefill_voice") is None
+    policy = sub.get_stop_policies("decode")[DECODE_LOOP]
+    assert policy.kind.name == "EOS" and policy.token_signal == SPEECH_TOKENS
+    assert policy.limits(_stop_info((0, 8), "decode", ignore_eos=True)).ignore_eos is True
+    assert policy.limits(_stop_info((0, 8), "decode")).ignore_eos is False
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_lm_stop_policy_agrees_with_check_stop(ignore_eos):
+    cfg = _tiny_config()
+    sub, _ = _lm(cfg)
+    info = _stop_info((0, 8), "decode", ignore_eos=ignore_eos)
+    sub.prepare_inputs("prefill", info, _lm_request())
+    policy = sub.get_stop_policies("decode")[DECODE_LOOP]
+    for token in range(cfg.lm.speech_token_size - 2, cfg.lm.speech_vocab_size):
+        declared = policy.stops(3, token, policy.limits(info))
+        assert declared == bool(sub.check_stop(0, info, {SPEECH_TOKENS: [torch.tensor([token])]})), token
+
+
+def test_the_lm_partition_carries_what_its_stop_policy_reads(model):
+    """The runtime registers a node's stop limits from its own partition's info alone, so
+    ``ignore_eos`` rides the LM's and Token2Wav's needs none."""
+    mk = {
+        "ignore_eos": True, "min_speech_tokens": 0, "max_speech_tokens": 8, "voice_key": 1, "prompt_mode": "zero_shot",
+    }
+    lm = model.get_initial_forward_pass_args(LM_PARTITION, ["text"], ["audio"], {}, model_kwargs=mk)
+    assert lm.step_metadata["ignore_eos"] is True
+    flow = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text"], ["audio"], {}, model_kwargs=mk)
+    assert "ignore_eos" not in flow.step_metadata
 
 
 @pytest.mark.parametrize("seconds", [0.5, 1.0 + 1 / SR, 7.3, 30.0])

@@ -1587,6 +1587,8 @@ methods are:
    resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
+   ``ignores_eos=`` replaces ``sampler`` for a node with no such resource: a callable on
+   the forward-pass info, which it reads for every partition of the request on the worker.
    The limits are computed from the request's forward-pass info whenever
    the worker receives it, not per step. Return ``{}`` for a
    walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
