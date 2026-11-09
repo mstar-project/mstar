@@ -192,6 +192,10 @@ LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
 SERVED_MODELS_ENV = "MSTAR_SERVED_MODELS"
 #: What ``/v1/audio/transcriptions`` needs from the model, as JSON (``transcription_facts``).
 TRANSCRIPTION_ENV = "MSTAR_TRANSCRIPTION"
+#: The deployment's openpi policy, as JSON (``openpi_facts``); unset serves no openpi socket.
+OPENPI_ENV = "MSTAR_OPENPI"
+#: The largest WebSocket message, in bytes (the config's ``ws_max_message_mb``).
+WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 
 
 class WindowOp(StrEnum):
@@ -262,16 +266,37 @@ def transcription_facts(server, adapter) -> dict | None:
     return facts
 
 
+def openpi_facts(policy) -> dict | None:
+    """``OPENPI_ENV``'s value for an ``OpenpiPolicy``: the block as the API server
+    checked it against its model, its metadata frame packed as this side packs
+    it. ``None`` (no ``openpi:`` block) serves no socket at ``/``."""
+    if policy is None:
+        return None
+    import base64
+
+    from mstar.api_server.openpi import pack
+
+    return {
+        "image_keys": list(policy.image_keys), "state_keys": list(policy.state_keys),
+        "state_kwarg": policy.state_kwarg, "action_horizon": policy.action_horizon,
+        "action_dim": policy.action_dim, "action_dims": policy.action_dims,
+        "metadata": base64.b64encode(pack(policy.metadata)).decode("ascii"),
+    }
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
                        sample_rate: int | None = None, served_models=None,
-                       transcription: dict | None = None) -> subprocess.Popen:
+                       transcription: dict | None = None, openpi: dict | None = None,
+                       ws_max_bytes: int | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
     request's ``model`` selects; ``None`` serves the base model alone.
-    ``transcription`` is ``transcription_facts``' for the served model."""
+    ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
+    ``openpi_facts``' for its policy, and ``ws_max_bytes`` the config's WebSocket
+    message limit."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -291,6 +316,12 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(TRANSCRIPTION_ENV, None)
     if transcription is not None:
         env[TRANSCRIPTION_ENV] = json.dumps(transcription)
+    env.pop(OPENPI_ENV, None)
+    if openpi is not None:
+        env[OPENPI_ENV] = json.dumps(openpi)
+    env.pop(WS_MAX_BYTES_ENV, None)
+    if ws_max_bytes is not None:
+        env[WS_MAX_BYTES_ENV] = str(int(ws_max_bytes))
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -299,6 +330,26 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)
     return proc
+
+
+def _stream_and_raw_inputs(msg: dict) -> dict:
+    """A submit's ``end_input``, ``file_streams`` and ``raw_inputs``, those it
+    carries: the frontend sends each only when set, so the others keep
+    ``submit_request``'s defaults. ``raw_inputs`` arrive as numpy's
+    ``(dtype.str, shape, bytes)`` and go on as the tensors the model loads."""
+    extra = {k: msg[k] for k in ("end_input", "file_streams") if msg.get(k) is not None}
+    if raw := msg.get("raw_inputs"):
+        import numpy as np
+        import torch
+
+        extra["raw_inputs"] = {
+            modality: [
+                torch.from_numpy(np.frombuffer(a["data"], dtype=np.dtype(a["dtype"])).reshape(a["shape"]).copy())
+                for a in arrays
+            ]
+            for modality, arrays in raw.items()
+        }
+    return extra
 
 
 class RustFrontendBridge:
@@ -367,6 +418,7 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
                 report_usage=bool(msg.get("report_usage")),
+                **_stream_and_raw_inputs(msg),
             )
         except (ValueError, TypeError) as e:
             # a refused input: an in-band error chunk carries its 400 to the client.

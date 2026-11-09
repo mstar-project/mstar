@@ -40,6 +40,7 @@ mod tokenizer;
 mod transcription;
 mod unicode_marks;
 mod utf8;
+mod ws;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -209,6 +210,9 @@ async fn main() {
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/audio/voices", get(audio_voices))
+        // long-lived sockets: outside the admission cap, as on the Python frontend
+        .route("/", get(ws::openpi::openpi_ws))
+        .route("/healthz", get(ws::openpi::healthz))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
@@ -1902,7 +1906,7 @@ async fn generate_finish(
         output_modalities,
         model_kwargs,
         parts,
-        report_usage: false,
+        ..SubmitArgs::default()
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);

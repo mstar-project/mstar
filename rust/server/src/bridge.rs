@@ -114,6 +114,14 @@ struct SubmitMsg<'a> {
     /// `submit_request`'s `report_usage`; left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     report_usage: bool,
+    /// `submit_request`'s `raw_inputs`, `end_input` and `file_streams`, each
+    /// left out when unset.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    raw_inputs: &'a BTreeMap<String, Vec<crate::adapters::RawArray>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_input: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_streams: Option<&'a Value>,
 }
 
 fn no_parts(parts: &&[Part]) -> bool {
@@ -338,6 +346,9 @@ impl Bridge {
             prompt_parts: &args.parts,
             streaming,
             report_usage: args.report_usage,
+            raw_inputs: &args.raw_inputs,
+            end_input: args.end_input.as_ref(),
+            file_streams: args.file_streams.as_ref(),
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         if self.mbox.send("bridge", &payload).is_err() {
@@ -551,6 +562,7 @@ mod tests {
     fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
+        let raw_inputs = BTreeMap::new();
         let msg = SubmitMsg {
             t: "submit",
             rid: "r",
@@ -566,8 +578,19 @@ mod tests {
             prompt_parts: parts,
             streaming: true,
             report_usage,
+            raw_inputs: &raw_inputs,
+            end_input: None,
+            file_streams: None,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_submit_without_raw_inputs_or_streams_leaves_those_keys_out() {
+        let sent = encoded(&[]);
+        for key in ["raw_inputs", "end_input", "file_streams"] {
+            assert!(sent.get(key).is_none(), "{key}");
+        }
     }
 
     #[test]
