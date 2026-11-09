@@ -540,8 +540,9 @@ class RealtimeTranscription:
             request=TranscriptionRequest(model=model_name),
             max_item_seconds=min(MAX_ITEM_SECONDS, getattr(adapter, "max_audio_seconds", None) or math.inf),
         )
-        # The running step runner's end, or None. Set by ``run`` before any event.
+        # Set when the running step runner ends; None with no runner.
         self._steps_end: asyncio.Event | None = None
+        # ``run``'s task group, set before any event.
         self._group = None
 
     async def send(self, event: dict) -> None:

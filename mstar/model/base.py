@@ -140,12 +140,8 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.api_server.request_types import PreprocessInput
-
-if TYPE_CHECKING:
-    from mstar.model.components.moe_parallel import MoeParallelConfig
-
-if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
