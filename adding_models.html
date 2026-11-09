@@ -889,7 +889,11 @@ anything loads.</p></li>
 <li><p>an <code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code> subclass in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>
 (<code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>), <em>only</em> if the model maps onto OpenAI semantics
 such as <code class="docutils literal notranslate"><span class="pre">chat.completions</span></code>, <code class="docutils literal notranslate"><span class="pre">audio.speech</span></code> or <code class="docutils literal notranslate"><span class="pre">images.generate</span></code>. A model reached
-only through <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> needs none.</p></li>
+only through <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> needs none. The adapter is ported to the Rust frontend in the
+same change (a type implementing <code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code> in <code class="docutils literal notranslate"><span class="pre">rust/server/src/adapters/</span></code> and its
+row in <code class="docutils literal notranslate"><span class="pre">ADAPTERS</span></code>, tested by
+<code class="docutils literal notranslate"><span class="pre">test/rust/test_rust_openai_adapters.py</span></code>): the Python HTTP frontend is being retired, and a
+surface only it serves is unfinished.</p></li>
 <li><p>the client-example tuples further down <code class="docutils literal notranslate"><span class="pre">mstar/cli/main.py</span></code>, so <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> prints a
 usage snippet. Cosmetic, but user-visible.</p></li>
 </ul>
@@ -4038,6 +4042,7 @@ consuming partition ends, later appends for its streams are answered as late.</p
       [ ] the client-example tuples lower down (cosmetic, user-visible)
 [ ] docs/models.rst                            — one row in the registry-key table
 [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+      [ ] and rust/server/src/adapters/ — the same adapter in the Rust frontend
 [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
 [ ] (optional) async partitions if pipelined
 </pre></div>

@@ -116,7 +116,11 @@ is **not** the only wiring step. A model also needs:
 - an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
   (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
   such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
-  only through ``POST /generate`` needs none.
+  only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
+  same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
+  row in ``ADAPTERS``, tested by
+  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
+  surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -3439,6 +3443,7 @@ Checklist
          [ ] the client-example tuples lower down (cosmetic, user-visible)
    [ ] docs/models.rst                            — one row in the registry-key table
    [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+         [ ] and rust/server/src/adapters/ — the same adapter in the Rust frontend
    [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 

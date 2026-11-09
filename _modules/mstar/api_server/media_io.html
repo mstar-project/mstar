@@ -1229,27 +1229,34 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="save_base64_audio">
-<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_base64_audio">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">save_base64_audio</span><span class="p">(</span><span class="n">b64</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">decoder</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Persist bare base64 that passes :func:`check_ref_audio`; return its path,</span>
-<span class="sd">    or None (leaving nothing behind) when it is not base64 or not loadable audio.</span>
+<span class="c1">#: The refusal of a bare-base64 ``ref_audio`` that is not audio the model decodes.</span>
+<span class="n">BARE_REF_AUDIO_REFUSAL</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="s2">"server file paths are refused; ref_audio must be a data URL, an http(s) URL "</span>
+    <span class="s2">"or base64 audio the model can decode"</span>
+<span class="p">)</span>
 
-<span class="sd">    A path such as ``/etc/passwd`` is valid base64 too, so the alphabet cannot</span>
-<span class="sd">    tell them apart; the decoder can. A clip that is audio but too long raises</span>
-<span class="sd">    :class:`RefAudioTooLongError`.</span>
-<span class="sd">    """</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">save_base64</span><span class="p">(</span><span class="n">b64</span><span class="p">,</span> <span class="s2">"wav"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="check_saved_ref_audio">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.check_saved_ref_audio">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_saved_ref_audio</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">decoder</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bare</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">""":func:`check_ref_audio` for a request's reference clip, saved at ``path``;</span>
+<span class="sd">    on failure the clip is deleted and ValueError says why. ``bare`` is a clip sent</span>
+<span class="sd">    as bare base64: a path such as ``/etc/passwd`` is valid base64 too, so the</span>
+<span class="sd">    alphabet cannot tell them apart and the decoder decides, and one that does not</span>
+<span class="sd">    open gets :data:`BARE_REF_AUDIO_REFUSAL`. A clip that opens but runs too long</span>
+<span class="sd">    raises :class:`RefAudioTooLongError` either way.</span>
+
+<span class="sd">    Both frontends call it: the Python adapters after saving the clip, and the Rust</span>
+<span class="sd">    frontend's bridge for a clip ``mstar-server`` saved, so the model's own loader</span>
+<span class="sd">    is the judge on both."""</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">check_ref_audio</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">decoder</span><span class="p">)</span>
     <span class="k">except</span> <span class="n">RefAudioTooLongError</span><span class="p">:</span>
         <span class="k">raise</span>
     <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span>
-    <span class="k">return</span> <span class="n">path</span></div>
+        <span class="k">if</span> <span class="n">bare</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">BARE_REF_AUDIO_REFUSAL</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+        <span class="k">raise</span></div>
 
 
 

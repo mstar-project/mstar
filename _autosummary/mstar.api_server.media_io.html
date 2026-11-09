@@ -722,6 +722,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.AudioTooLongError.status_code"><code class="docutils literal notranslate"><span class="pre">AudioTooLongError.status_code</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL"><code class="docutils literal notranslate"><span class="pre">BARE_REF_AUDIO_REFUSAL</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RemoteFetchError"><code class="docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -735,6 +736,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_audio_format"><code class="docutils literal notranslate"><span class="pre">check_audio_format()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_resample_rate"><code class="docutils literal notranslate"><span class="pre">check_resample_rate()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_saved_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_saved_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_torchcodec_capped"><code class="docutils literal notranslate"><span class="pre">decode_torchcodec_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
@@ -747,7 +749,6 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resample_kernel_size"><code class="docutils literal notranslate"><span class="pre">resample_kernel_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resolve_media_ref"><code class="docutils literal notranslate"><span class="pre">resolve_media_ref()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64_audio"><code class="docutils literal notranslate"><span class="pre">save_base64_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>
@@ -784,6 +785,15 @@ into a real audio container (WAV by default) and encode image bytes (PNG) as a
 <p>Only stdlib + numpy are required. <code class="docutils literal notranslate"><span class="pre">mp3</span></code> / <code class="docutils literal notranslate"><span class="pre">flac</span></code> / <code class="docutils literal notranslate"><span class="pre">ogg</span></code> encoding is opt-in
 and degrades to WAV when the optional <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> backend is unavailable, so
 the base install stays slim.</p>
+<p class="rubric">Module Attributes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL" title="mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BARE_REF_AUDIO_REFUSAL</span></code></a></p></td>
+<td><p>The refusal of a bare-base64 <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> that is not audio the model decodes.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -799,44 +809,44 @@ the base install stays slim.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.check_resample_rate" title="mstar.api_server.media_io.check_resample_rate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_resample_rate</span></code></a>(rate, target)</p></td>
 <td><p>Refuse a file rate outside <code class="docutils literal notranslate"><span class="pre">1..MAX_SAMPLE_RATE</span></code> Hz or whose resampling to <code class="docutils literal notranslate"><span class="pre">target</span></code> would cost more than <code class="xref py py-data docutils literal notranslate"><span class="pre">MAX_RESAMPLE_KERNEL</span></code> (every real rate, pull-down rates included, passes).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_audio" title="mstar.api_server.media_io.decode_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_audio</span></code></a>(path[, sample_rate, max_seconds])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.check_saved_ref_audio" title="mstar.api_server.media_io.check_saved_ref_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_saved_ref_audio</span></code></a>(path, decoder, bare)</p></td>
+<td><p><a class="reference internal" href="#mstar.api_server.media_io.check_ref_audio" title="mstar.api_server.media_io.check_ref_audio"><code class="xref py py-func docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a> for a request's reference clip, saved at <code class="docutils literal notranslate"><span class="pre">path</span></code>; on failure the clip is deleted and ValueError says why.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_audio" title="mstar.api_server.media_io.decode_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_audio</span></code></a>(path[, sample_rate, max_seconds])</p></td>
 <td><p>Decode an audio file to a float32 mono numpy waveform at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>, refused with <a class="reference internal" href="#mstar.api_server.media_io.AudioTooLongError" title="mstar.api_server.media_io.AudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">AudioTooLongError</span></code></a> past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_torchcodec_capped" title="mstar.api_server.media_io.decode_torchcodec_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_torchcodec_capped</span></code></a>(path, sample_rate)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_torchcodec_capped" title="mstar.api_server.media_io.decode_torchcodec_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_torchcodec_capped</span></code></a>(path, sample_rate)</p></td>
 <td><p>FFmpeg (torchcodec) decode of <code class="docutils literal notranslate"><span class="pre">path</span></code>: a float32 mono tensor at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>, the same samples <code class="docutils literal notranslate"><span class="pre">get_all_samples()</span></code> returns.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.modality_from_mime" title="mstar.api_server.media_io.modality_from_mime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modality_from_mime</span></code></a>(mime)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.modality_from_mime" title="mstar.api_server.media_io.modality_from_mime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modality_from_mime</span></code></a>(mime)</p></td>
 <td><p>Map a MIME type to one of our modality strings (image/audio/video).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.mux_mp4_with_pcm16" title="mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16</span></code></a>(video_mp4, pcm, sample_rate)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.mux_mp4_with_pcm16" title="mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16</span></code></a>(video_mp4, pcm, sample_rate)</p></td>
 <td><p>Mux an H.264 mp4 and raw interleaved 16-bit PCM into one mp4 with an AAC audio track (stream-copies the video).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_container" title="mstar.api_server.media_io.pcm16_to_container"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_container</span></code></a>(pcm, sample_rate[, fmt])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_container" title="mstar.api_server.media_io.pcm16_to_container"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_container</span></code></a>(pcm, sample_rate[, fmt])</p></td>
 <td><p>Encode raw 16-bit PCM into <code class="docutils literal notranslate"><span class="pre">fmt</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_wav_bytes" title="mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes</span></code></a>(pcm, sample_rate[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_wav_bytes" title="mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes</span></code></a>(pcm, sample_rate[, ...])</p></td>
 <td><p>Wrap raw little-endian 16-bit PCM (the model's audio output) into a WAV blob.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.png_to_data_url" title="mstar.api_server.media_io.png_to_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">png_to_data_url</span></code></a>(png_bytes)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.png_to_data_url" title="mstar.api_server.media_io.png_to_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">png_to_data_url</span></code></a>(png_bytes)</p></td>
 <td><p>Encode PNG image bytes (the model's image output) as a data URL.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.read_soundfile_capped" title="mstar.api_server.media_io.read_soundfile_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_soundfile_capped</span></code></a>(path[, max_seconds])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.read_soundfile_capped" title="mstar.api_server.media_io.read_soundfile_capped"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_soundfile_capped</span></code></a>(path[, max_seconds])</p></td>
 <td><p>libsndfile decode of <code class="docutils literal notranslate"><span class="pre">path</span></code>: float32 mono at the file's own rate.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.remove_uploads" title="mstar.api_server.media_io.remove_uploads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">remove_uploads</span></code></a>(file_paths, upload_dir)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.remove_uploads" title="mstar.api_server.media_io.remove_uploads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">remove_uploads</span></code></a>(file_paths, upload_dir)</p></td>
 <td><p>Delete a request's files under <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code> now.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resample_kernel_size" title="mstar.api_server.media_io.resample_kernel_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resample_kernel_size</span></code></a>(rate, target)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resample_kernel_size" title="mstar.api_server.media_io.resample_kernel_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resample_kernel_size</span></code></a>(rate, target)</p></td>
 <td><p>Floats in torchaudio's default sinc kernel resampling <code class="docutils literal notranslate"><span class="pre">rate</span></code> to <code class="docutils literal notranslate"><span class="pre">target</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
 <td><p>Resolve a media reference from a request: a data URL, or an http(s) URL when remote fetch is allowed.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
 <td><p>Persist a bare base64 blob with a known <code class="docutils literal notranslate"><span class="pre">fmt</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;wav&quot;</span></code>).</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64_audio" title="mstar.api_server.media_io.save_base64_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64_audio</span></code></a>(b64, upload_dir, decoder)</p></td>
-<td><p>Persist bare base64 that passes <a class="reference internal" href="#mstar.api_server.media_io.check_ref_audio" title="mstar.api_server.media_io.check_ref_audio"><code class="xref py py-func docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a>; return its path, or None (leaving nothing behind) when it is not base64 or not loadable audio.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_data_url" title="mstar.api_server.media_io.save_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_data_url</span></code></a>(data_url, upload_dir)</p></td>
 <td><p>Persist a <code class="docutils literal notranslate"><span class="pre">data:&lt;mime&gt;;base64,&lt;payload&gt;</span></code> URL.</p></td>
@@ -915,6 +925,12 @@ callers re-raise it rather than fall back to another decoder.</p>
 <span class="sig-name descname"><span class="pre">status_code</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">413</span></span><a class="headerlink" href="#mstar.api_server.media_io.AudioTooLongError.status_code" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">BARE_REF_AUDIO_REFUSAL</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'server</span> <span class="pre">file</span> <span class="pre">paths</span> <span class="pre">are</span> <span class="pre">refused;</span> <span class="pre">ref_audio</span> <span class="pre">must</span> <span class="pre">be</span> <span class="pre">a</span> <span class="pre">data</span> <span class="pre">URL,</span> <span class="pre">an</span> <span class="pre">http(s)</span> <span class="pre">URL</span> <span class="pre">or</span> <span class="pre">base64</span> <span class="pre">audio</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">can</span> <span class="pre">decode'</span></span><a class="headerlink" href="#mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL" title="Link to this definition">#</a></dt>
+<dd><p>The refusal of a bare-base64 <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> that is not audio the model decodes.</p>
 </dd></dl>
 
 <dl class="py exception">
@@ -1086,6 +1102,32 @@ resampling to <code class="docutils literal notranslate"><span class="pre">targe
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>target</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.check_saved_ref_audio">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">check_saved_ref_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bare</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#check_saved_ref_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.check_saved_ref_audio" title="Link to this definition">#</a></dt>
+<dd><p><a class="reference internal" href="#mstar.api_server.media_io.check_ref_audio" title="mstar.api_server.media_io.check_ref_audio"><code class="xref py py-func docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a> for a request’s reference clip, saved at <code class="docutils literal notranslate"><span class="pre">path</span></code>;
+on failure the clip is deleted and ValueError says why. <code class="docutils literal notranslate"><span class="pre">bare</span></code> is a clip sent
+as bare base64: a path such as <code class="docutils literal notranslate"><span class="pre">/etc/passwd</span></code> is valid base64 too, so the
+alphabet cannot tell them apart and the decoder decides, and one that does not
+open gets <a class="reference internal" href="#mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL" title="mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL"><code class="xref py py-data docutils literal notranslate"><span class="pre">BARE_REF_AUDIO_REFUSAL</span></code></a>. A clip that opens but runs too long
+raises <a class="reference internal" href="#mstar.api_server.media_io.RefAudioTooLongError" title="mstar.api_server.media_io.RefAudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a> either way.</p>
+<p>Both frontends call it: the Python adapters after saving the clip, and the Rust
+frontend’s bridge for a clip <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> saved, so the model’s own loader
+is the judge on both.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>decoder</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>bare</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1328,28 +1370,6 @@ probe for them.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.api_server.media_io.save_base64_audio">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">save_base64_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">b64</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#save_base64_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.save_base64_audio" title="Link to this definition">#</a></dt>
-<dd><p>Persist bare base64 that passes <a class="reference internal" href="#mstar.api_server.media_io.check_ref_audio" title="mstar.api_server.media_io.check_ref_audio"><code class="xref py py-func docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a>; return its path,
-or None (leaving nothing behind) when it is not base64 or not loadable audio.</p>
-<p>A path such as <code class="docutils literal notranslate"><span class="pre">/etc/passwd</span></code> is valid base64 too, so the alphabet cannot
-tell them apart; the decoder can. A clip that is audio but too long raises
-<a class="reference internal" href="#mstar.api_server.media_io.RefAudioTooLongError" title="mstar.api_server.media_io.RefAudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a>.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>b64</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>upload_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
-<li><p><strong>decoder</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.save_data_url">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">save_data_url</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data_url</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#save_data_url"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.save_data_url" title="Link to this definition">#</a></dt>
 <dd><p>Persist a <code class="docutils literal notranslate"><span class="pre">data:&lt;mime&gt;;base64,&lt;payload&gt;</span></code> URL. Returns (modality, path).</p>
@@ -1569,6 +1589,7 @@ sample.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.AudioTooLongError.status_code"><code class="docutils literal notranslate"><span class="pre">AudioTooLongError.status_code</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.BARE_REF_AUDIO_REFUSAL"><code class="docutils literal notranslate"><span class="pre">BARE_REF_AUDIO_REFUSAL</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RemoteFetchError"><code class="docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1582,6 +1603,7 @@ sample.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_audio_format"><code class="docutils literal notranslate"><span class="pre">check_audio_format()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_resample_rate"><code class="docutils literal notranslate"><span class="pre">check_resample_rate()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.check_saved_ref_audio"><code class="docutils literal notranslate"><span class="pre">check_saved_ref_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_torchcodec_capped"><code class="docutils literal notranslate"><span class="pre">decode_torchcodec_capped()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
@@ -1594,7 +1616,6 @@ sample.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resample_kernel_size"><code class="docutils literal notranslate"><span class="pre">resample_kernel_size()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.resolve_media_ref"><code class="docutils literal notranslate"><span class="pre">resolve_media_ref()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64_audio"><code class="docutils literal notranslate"><span class="pre">save_base64_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.schedule_upload_cleanup"><code class="docutils literal notranslate"><span class="pre">schedule_upload_cleanup()</span></code></a></li>

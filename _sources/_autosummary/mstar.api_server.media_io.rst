@@ -5,6 +5,12 @@ mstar.api\_server.media\_io
 
    
    
+   .. rubric:: Module Attributes
+
+   .. autosummary::
+   
+      BARE_REF_AUDIO_REFUSAL
+   
    
 
    
@@ -17,6 +23,7 @@ mstar.api\_server.media\_io
       check_audio_format
       check_ref_audio
       check_resample_rate
+      check_saved_ref_audio
       decode_audio
       decode_torchcodec_capped
       modality_from_mime
@@ -29,7 +36,6 @@ mstar.api\_server.media\_io
       resample_kernel_size
       resolve_media_ref
       save_base64
-      save_base64_audio
       save_data_url
       save_remote_url
       schedule_upload_cleanup
