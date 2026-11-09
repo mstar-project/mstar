@@ -2541,9 +2541,9 @@ logical pages, so raise it by ``P`` to use the memory placement frees (the pool 
 rank). Every resource over the pool must support it, or loading fails naming the one that doesn't.
 FlashInfer attention (``flashinfer``) with ``flashinfer_backend`` ``auto``, ``fa2`` or ``fa3``
 (``auto`` runs as ``fa2`` from SM100; after an unexplained one-off lockstep hang in an ``fa2``
-prefill over an SP-placed pool, ``fa2`` is refused there on SM90, where ``auto`` prefills on
-``fa3``; where FlashInfer has no ``fa3`` (below SM90 and from SM100), ``auto`` and ``fa2`` both
-prefill on ``fa2`` and warn at startup), RoPE positions and the recurrent state pool (GDN, KDA;
+prefill over an SP-placed pool (#1363), an SP-placed pool that prefills on ``fa2`` warns at
+startup: an explicit ``fa2`` on any architecture, and ``auto`` where FlashInfer has no ``fa3``
+(below SM90 and from SM100), while ``auto`` on SM90 prefills on ``fa3``), RoPE positions and the recurrent state pool (GDN, KDA;
 the same state on every SP partner) do; dense, flex, XPU, block-causal and MLA (``flashinfer_mla``)
 attention,
 cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
