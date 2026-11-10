@@ -989,10 +989,14 @@ config without one. Cloning a voice from a request's own ``ref_audio`` is not se
 video input are not supported.
 
 ``configs/step_audio2.yaml`` runs two workers on one GPU under MPS (the audio tower and the
-LLM, and the vocoder). Each spoken reply holds a slot of each ``t2w_*`` resource (~0.55 GiB
-in all with the default voices) while it speaks, so their ``max_slots`` cap the replies
-being voiced at once; ``t2w_state`` has one more than each ``t2w_*_kv`` (its sink), and
-startup refuses counts that disagree. Every node runs eagerly for now (no CUDA graphs).
+LLM, and the vocoder). Each spoken reply holds a slot of each ``t2w_*`` resource while it
+speaks, so their ``max_slots`` cap the replies being voiced at once. With the default
+voices a slot is 284 MiB of ``t2w_dit_kv`` (more for a longer voice), 64 MiB of
+``t2w_enc2_kv``, 48 MiB of ``t2w_enc1_kv`` and 1.3 MiB of ``t2w_state``, about 0.39 GiB a
+reply. ``t2w_state`` has one more slot than each ``t2w_*_kv`` (its sink), and startup
+refuses counts that disagree. The conformer's caches hold a whole reply, so a voice of 17 s
+or more does not fit the flow's relative position table at the reply cap, and startup
+refuses one. Every node runs eagerly for now (no CUDA graphs).
 
 Command A+ (``command_a_plus``)
 -------------------------------

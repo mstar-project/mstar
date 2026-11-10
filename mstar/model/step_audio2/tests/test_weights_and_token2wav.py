@@ -150,9 +150,22 @@ def test_step_audio2_keeps_the_conformer_caches_whole_up_to_its_cap():
     assert families["dit"].retention(2 * p) == CACHE_FAMILIES["dit"].retention(2 * p)
     cap = T2W_STREAMING.capacity(p)
     assert cap.enc_25hz == p + CONFORMER_REPLY_TOKENS + 27 and cap.enc_frames_50hz == 2 * cap.enc_25hz
-    # the reference's relative position table reaches 5000 frames back: a 16 s voice (400
-    # tokens) and a reply at the cap, plus a last window's 54 frames, still fit
-    assert 2 * (400 + CONFORMER_REPLY_TOKENS) + 2 * 27 <= 5000
+
+
+@pytest.mark.parametrize(("seconds", "fits"), [(9.04225, True), (16.99, True), (17.0, False), (30.0, False)])
+def test_a_voice_too_long_for_the_whole_conformer_caches_is_refused_at_startup(seconds, fits):
+    """Kept whole, the 50 Hz conformer cache of a reply at the cap retains ``2 P + 4096``
+    keys, and a step's band reads 54 positions further back: past the table's 5000 for a
+    voice of 17 s or more."""
+    from mstar.model.components.token2wav.keys import Token2WavKeys
+    from mstar.model.components.token2wav.resources import token2wav_resources
+
+    keys = Token2WavKeys(codes="c", state="s", kv={"enc1": "e1", "enc2": "e2", "dit": "d"})
+    if fits:
+        token2wav_resources(keys, "t2w", (1.0, seconds), 3, streaming=T2W_STREAMING)
+    else:
+        with pytest.raises(ValueError, match="too long for its enc2 conformer cache"):
+            token2wav_resources(keys, "t2w", (1.0, seconds), 3, streaming=T2W_STREAMING)
 
 
 def test_token2wav_resources_declare_the_conformer_caches_whole():
