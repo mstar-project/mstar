@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.api_server.request_types import ResultChunk
 from mstar.model.utils import TextChunkDetokenizer
 
 tokenizers = pytest.importorskip("tokenizers")
@@ -204,8 +205,8 @@ MODELS = [("bagel", "slow"), ("qwen3_5", "fast"), ("qwen3_omni", "fast")]
 
 def _chunks(model, ids, request_kwargs=None):
     return [
-        SimpleNamespace(
-            modality="text", metadata={},
+        ResultChunk(
+            request_id="r", modality="text",
             data=model.postprocess(torch.tensor([i]), "text", request_kwargs=request_kwargs),
         )
         for i in ids

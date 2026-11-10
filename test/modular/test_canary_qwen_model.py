@@ -367,4 +367,4 @@ def test_a_transcript_passes_the_data_worker_with_its_stop_ids(tmp_path, monkeyp
     chunks = [wt.out_queue.get_nowait() for _ in tokens]
     assert [c.modality for c in chunks] == ["text"] * len(tokens)
     assert b"".join(c.data for c in chunks) == b" the cat"
-    assert [c.metadata["stop_token"] for c in chunks] == [False] * (len(tokens) - 1) + [True]
+    assert [c.stopped for c in chunks] == [False] * (len(tokens) - 1) + [True]

@@ -203,17 +203,7 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
         return {"enable_thinking": False}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"reasoning.effort takes none, minimal, low, medium, high or xhigh; got {effort!r}")
-    return {"reasoning_effort": template_level(_EFFORT_RANK[effort], efforts, f"reasoning.effort={effort!r}")}
-
-
-def template_level(rank: int, efforts: tuple[str, ...], asked: str) -> str:
-    """The template's reasoning level for an effort of ``rank`` (0 low, 1 medium,
-    2 high, 3 the client's top), by GLM's level names; a template without that one
-    takes its lowest. High stays high: GLM's max nearly doubles an agent's output tokens."""
-    if not efforts:
-        raise ValueError(f"{asked}: this model has no reasoning levels")
-    wanted = ("low", "high", "high", "max")[rank]
-    return wanted if wanted in efforts else efforts[0]
+    return {"reasoning_effort": reply.template_level(_EFFORT_RANK[effort], efforts, f"reasoning.effort={effort!r}")}
 
 
 async def create_response(api, model_name, adapter, body, raw_request=None):

@@ -149,11 +149,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
-            cache = resources[KV_CACHE].layer_view() if self.config.dsa_long_context else None
-            if cache is not None and cache.device.type == "cuda" and cache.dtype != torch.bfloat16:
-                # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
-                raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
-                                 f"{cache.dtype}: set the node's dtype to bfloat16")
         super().bind_node_resources(resources)
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
@@ -372,7 +367,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # every MLA layer attends sparse over the DSA resource's plan, not a dense one; a
             # verify step's rows move on the device (_trim_on_device)
             del steps[ATTN]
-            steps[DSA] = DSAStep(mtp_trims=self.config.mtp_trims and graph_walk == "decode")
+            steps[DSA] = DSAStep(
+                rows_may_move=self.config.mtp_trims and graph_walk == "decode")
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)

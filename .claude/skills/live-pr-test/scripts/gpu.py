@@ -176,6 +176,12 @@ def eras(method, path, body=None, params=None, retry=True):
     return call(method, f"/v1/org/{_eras_org}{path}", body, params, retry)
 
 
+def tail_lines(text: str, limit: int) -> str:
+    """The last whole lines of `text` that fit in `limit` characters; one longer line is clipped."""
+    text = text.strip()
+    return text if len(text) <= limit else text[-limit:].partition("\n")[2] or text[-limit:]
+
+
 # ---------------------------------------------------------------- storage
 
 GLOBAL = "*"  # runpod_volumes() key for a global volume, which mounts in any data center
@@ -1021,6 +1027,15 @@ def running(cfg: dict) -> list[str]:
         return []
     return [f"eras:{i['id']}  {i.get('name')}  {i.get('status')}" for i in eras_items("/instances", 200)
             if str(i.get("name")).startswith(JOB_PREFIX) and i.get("status") not in ("ended", "releasing")]
+
+
+def release_by_name(cfg: dict, pr: int, tag: str) -> None:
+    """End whatever this tool launched on Eras for `pr` and `tag`, by its name, for a launch cancelled
+    before its instance was recorded."""
+    eras_cloud = Eras(cfg)
+    if eras_cloud.enabled():
+        for iid in eras_cloud.named(job_name(pr, tag)):
+            eras_cloud.release(iid, {})
 
 
 def cmd_list(args, cfg):

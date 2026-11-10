@@ -12,6 +12,7 @@ from contextlib import contextmanager
 
 import torch
 
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.dsa import paged, sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec, DSAStep
@@ -45,11 +46,33 @@ class DSAManager(Resource):
             raise ValueError(f"DSA's {INDEX_PLANES} rows are {width} wide (index_head_dim "
                              f"{d}, kpool {spec.config.kpool}); {spec.config.kv_cache} "
                              f"declares {planes.width}")
+        if spec.config.sm_scale is None:
+            raise ValueError("DSA attends at DSAConfig.sm_scale: declare it")
+        page, kpool = kv_config.tokens_per_page, spec.config.kpool
+        if page % kpool:
+            # a pool's key sits in its last token's row: pools must not straddle pages
+            raise ValueError(f"{spec.config.kv_cache} page_size={page} must be a multiple of "
+                             f"index_kpool={kpool}")
+        if (page // kpool) & (page // kpool - 1):
+            # flashinfer's page-table transform takes power-of-two pools per page
+            pools = "" if kpool == 1 else f" over index_kpool={kpool}"
+            raise ValueError(f"{spec.config.kv_cache} page_size={page}{pools} must be a power "
+                             "of two")
+        if info.device.type == "cuda":
+            from mstar.engine.resources.attn.flashinfer_mla import _flashinfer_at_least
+
+            if info.kv_dtype != torch.bfloat16:
+                # the kernels take bf16; the torch paths sync with the host and capture nothing
+                raise ValueError(f"DSA serves a bf16 KV cache on CUDA, not {info.kv_dtype}: set "
+                                 "the node's dtype to bfloat16")
+            if not _flashinfer_at_least("0.6.18"):
+                raise ValueError("DSA needs FlashInfer >= 0.6.18, whose "
+                                 "top_k_page_table_transform takes a page_size")
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
-        return cls(spec.config, kv_config, info.device)
+        return cls(spec.config, kv_config, info.device, spec.resource_key)
 
-    def __init__(self, config: DSAConfig, kv_config, device: torch.device):
+    def __init__(self, config: DSAConfig, kv_config, device: torch.device, name: str = "dsa"):
         self.config = config
         self.page_size = kv_config.tokens_per_page
         self.kv_rows = kv_config.max_seq_len  # cache rows a request may hold
@@ -65,12 +88,15 @@ class DSAManager(Resource):
         self._int_stager = PinnedStager(torch.int32)
         # (bucket, slot) -> the int32 rows a captured graph reads: pos, row_req, page_start, pages
         self._cg_rows: dict[tuple[BucketKey, int], torch.Tensor] = {}
-        # under CUDA graphs one sparse-attention plan per (walk, capture slot, rows), and per
-        # (walk, capture slot) the workspace and index buffer its plans share
+        # FlashInfer's workspaces: one per (walk, capture slot), one for eager steps
+        self._workspaces = WorkspacePool(device, config.workspace_mb, owner=name)
+        # (walk, capture slot, rows) -> its sparse-attention plan under CUDA graphs
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
-        self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        # an eager step's sparse plans, reused (one workspace)
-        self._eager = sparse_mla.EagerSparsePlans(device) if device.type == "cuda" else None
+        # (walk, capture slot) -> the index buffer its plans share
+        self._sparse_indices: dict[tuple[str, int], torch.Tensor] = {}
+        # an eager step's sparse plans, reused
+        self._eager = (sparse_mla.EagerSparsePlans(self._workspaces)
+                       if device.type == "cuda" else None)
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
@@ -118,6 +144,10 @@ class DSAManager(Resource):
         for spec in slots:
             self._cg_buffer(spec.bucket, spec.slot)
 
+    def seal_capture_buffers(self) -> None:
+        # a workspace a plan outgrew would move, and a captured graph holds its address
+        self._workspaces.seal()
+
     # -- the step ----------------------------------------------------------------------------
 
     def plan(self, step: DSAStep, ctx: StepContext) -> dict[str, DSAContext]:
@@ -126,7 +156,7 @@ class DSAManager(Resource):
         if self._preplanned is not None and not ctx.is_preplan:
             self._current, self._preplanned = dict(self._preplanned), None
             return self._current
-        plans = {label: self._plan_label(ctx, kv_out, step.mtp_trims)
+        plans = {label: self._plan_label(ctx, kv_out, step.rows_may_move)
                  for label, kv_out in ctx.plan_results[self.config.kv_cache].items()}
         if ctx.is_preplan:
             self._preplanned = plans
@@ -134,20 +164,21 @@ class DSAManager(Resource):
             self._current = dict(plans)
         return plans
 
-    def _plan_label(self, step_ctx: StepContext, kv_out, mtp_trims: bool = False) -> DSAContext:
+    def _plan_label(self, step_ctx: StepContext, kv_out,
+                    rows_may_move: bool = False) -> DSAContext:
         """One label's rows: per row its position and request, per request its first entry in
         the flat page list. Under a lease every row scores on its own, the score width spans
         the serving window (a prefill bucket's own rows) and the slot's sparse plan is
-        re-planned here; ``mtp_trims`` (``DSAStep``) plans it for each row's longest."""
+        re-planned here; ``rows_may_move`` (``DSAStep``) plans it for each row's longest."""
         lease = step_ctx.slot_lease
         graph = lease is not None and lease.bucket is not None
         walk = step_ctx.graph_walk
         topk, kpool = self.config.topk, self.config.kpool
         pos: list[int] = []
         row_req: list[int] = []
-        spans: list[tuple[int, int, int]] = []
+        spans: list[paged.DSASpan] = []
         for i, view in enumerate(kv_out.views):
-            spans.append((len(pos), view.to_compute, i))
+            spans.append(paged.DSASpan(len(pos), view.to_compute, i))
             pos.extend(range(view.length - view.to_compute, view.length))
             row_req.extend([i] * view.to_compute)
         n_real = rows = len(pos)
@@ -185,7 +216,7 @@ class DSAManager(Resource):
                 max_pools, needs_selection = self.kv_rows // kpool, True
             if (needs_selection or not self.config.dense_below_topk) and self._device.type == "cuda":
                 lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
-                if mtp_trims:
+                if rows_may_move:
                     # a row sits at or past its true position: plan it for the longest it can
                     # be, its spare entries masked (SparseGraphPlan.attend's valid)
                     lens = [min(p + 1, topk + kpool - 1) for p in pos]
@@ -206,16 +237,14 @@ class DSAManager(Resource):
         key = (walk, slot, rows)
         sparse_plan = self._sparse_plans.get(key)
         if sparse_plan is None:
-            buffers = self._sparse_buffers.get(key[:2])
-            if buffers is None or buffers[1].numel() < rows * width + 1:
+            indices = self._sparse_indices.get(key[:2])
+            if indices is None or indices.numel() < rows * width + 1:
                 # captures run largest first, so the first is the slot's size; +1: the
                 # plan's spare index entry
-                buffers = self._sparse_buffers[key[:2]] = (
-                    torch.empty(sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8,
-                                device=self._device),
-                    torch.zeros(rows * width + 1, dtype=torch.int32, device=self._device))
+                indices = self._sparse_indices[key[:2]] = torch.zeros(
+                    rows * width + 1, dtype=torch.int32, device=self._device)
             sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
-                rows, width, buffers[0], buffers[1])
+                rows, width, self._workspaces.get(walk, slot), indices)
         sparse_plan.plan(lens, self.num_heads, self.kv_lora_rank, self.kpe, self.config.sm_scale)
         return sparse_plan
 
@@ -260,7 +289,7 @@ class DSAManager(Resource):
         """Move this step's rows to the device positions ``pos``, each at or before the one the
         host planned (an MTP verify block placed after the last step's accepted rows, not its
         whole block): the cache slots its latents and index keys go to, and the positions it
-        selects and attends from. A captured plan stays as made (``DSAStep(mtp_trims=True)``):
+        selects and attends from. A captured plan stays as made (``DSAStep(rows_may_move=True)``):
         each row's entries past its own length attend the cache's spare row, whose rope slot
         gets ``pad_kpe`` for the caller's queries to mask. An eager plan takes exact rows, from
         one host read of ``pos``."""
@@ -293,10 +322,13 @@ class DSAManager(Resource):
                label: str | None = None) -> torch.Tensor:
         """``[rows, width]`` cache slots each row attends, scored over ``plane``'s keys."""
         return paged.select(q, w, self._need_kv().aux_view(INDEX_PLANES, plane),
-                            self.current(label), group)
+                            self.current(label), group,
+                            score_bytes=self.config.prefill_score_bytes,
+                            shard_min_rows=self.config.shard_min_rows)
 
     def attend(self, plane: int, q_nope: torch.Tensor, q_pe: torch.Tensor, slots: torch.Tensor,
-               sm_scale: float, label: str | None = None) -> torch.Tensor:
-        """Absorbed MLA of each row over its ``slots`` of ``plane``'s latents."""
+               *, label: str | None = None) -> torch.Tensor:
+        """Absorbed MLA of each row over its ``slots`` of ``plane``'s latents, at
+        ``config.sm_scale`` whether the step is captured or eager."""
         return paged.sparse_attend(q_nope, q_pe, self._need_kv().layer_view(plane), slots,
-                                   self.current(label), sm_scale)
+                                   self.current(label), self.config.sm_scale)

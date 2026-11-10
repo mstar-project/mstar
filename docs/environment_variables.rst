@@ -797,7 +797,8 @@ Worker scheduling
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary, and above one rank each step
        carries rank 0's snapshot slots taken so far, which the followers check. Logs a label
-       left under its footprint at removal. Tests and debugging only.
+       left under its footprint at removal. Above one rank, each follower stops if the
+       reservations it admits a step from differ from rank 0's. Tests and debugging only.
 
 Compilation
 -----------

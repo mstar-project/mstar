@@ -22,10 +22,6 @@ ARG_VALUE, ARG_VALUE_END = "<arg_value>", "</arg_value>"
 _CALL_TAGS = {"name": (ARG_KEY, CALL_END), "text": (CALL_END,), "args": (ARG_KEY, CALL_END),
               "key": (ARG_KEY_END, CALL_END), "value": (ARG_VALUE_END, CALL_END)}
 
-# what the templates read; others are dropped, as some would collide with
-# apply_chat_template's own arguments
-TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
-
 
 def template_messages(messages) -> list[dict]:
     """The messages as the templates read them: a call's ``arguments`` as the
@@ -216,25 +212,6 @@ class GlmReplyParser:
         out = self._drain(final=True)
         self._held_space = ""
         return out
-
-    def message(self, text: str) -> dict:
-        """The whole reply as a chat ``message``, from the deltas a stream sends."""
-        deltas = self.feed(text) + self.finish()
-        content = "".join(d.get("content", "") for d in deltas)
-        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
-        calls: dict[int, dict] = {}
-        for d in deltas:
-            for c in d.get("tool_calls", []):
-                if "id" in c:
-                    calls[c["index"]] = {"id": c["id"], "type": "function", "function": dict(c["function"])}
-                else:
-                    calls[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
-        message: dict = {"role": "assistant", "content": content or (None if calls else "")}
-        if reasoning:
-            message["reasoning_content"] = reasoning
-        if calls:
-            message["tool_calls"] = list(calls.values())
-        return message
 
     def _tags(self) -> tuple[str, ...]:
         calls = (CALL_START,) if self._tools else ()

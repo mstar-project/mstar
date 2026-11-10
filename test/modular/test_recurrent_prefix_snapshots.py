@@ -70,6 +70,9 @@ class _StubChains:
 
     def keyed_walks(self, label):
         return frozenset({WALK})
+    def bind_snapshots(self, pool):
+        del pool
+
 
 
 def _build(

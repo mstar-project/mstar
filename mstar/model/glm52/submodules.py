@@ -29,7 +29,6 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.model.glm52.config import (
@@ -59,16 +58,21 @@ _VERDICT_DEADLINE_S = 300.0
 
 
 class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
-    """Packed prefill capture without the buckets whose capture rows would pass the context
-    limit: ``distribute_tokens`` gives row 0 the remainder, and such a capture fails."""
+    """Packed prefill capture without the buckets it cannot replay, whichever ladder they came
+    from (the model's or the serving config's): one whose capture rows would pass the context
+    limit (``distribute_tokens`` gives row 0 the remainder, and such a capture fails), and one
+    of more than ``max_step_tokens``, whose step runs eager."""
 
-    def __init__(self, *, max_row_tokens: int, **kwargs):
+    def __init__(self, *, max_row_tokens: int, max_step_tokens: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.max_row_tokens = max_row_tokens
+        self.max_step_tokens = max_step_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n for n in super().get_total_tokens(bs)
-                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
+        tokens = [(n, n // self.total_tokens_multiplier) for n in super().get_total_tokens(bs)]
+        return [n for n, step in tokens
+                if distribute_tokens(step, bs)[0] <= self.max_row_tokens
+                and (self.max_step_tokens is None or step <= self.max_step_tokens)]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
@@ -176,17 +180,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _check_long_context(self, resources: dict[str, Any]) -> None:
         cfg = self.config
-        if cfg.prefill_chunk_tokens < 1:
-            raise ValueError(f"prefill_chunk_tokens={cfg.prefill_chunk_tokens} must be >= 1")
+        if cfg.prefill_window_tokens < 1:
+            raise ValueError(f"prefill_window_tokens={cfg.prefill_window_tokens} must be >= 1")
         kv = resources[KV_RESOURCE].config
         # the manager holds one page back as its sink
         if (kv.max_num_pages - 1) * kv.tokens_per_page < cfg.max_seq_len:
             logger.warning("%s: %d usable pages of %d tokens hold less than max_seq_len=%d: a "
                            "request that long waits for pages until it times out", KV_RESOURCE,
                            kv.max_num_pages - 1, kv.tokens_per_page, cfg.max_seq_len)
-        if kv.tokens_per_page & (kv.tokens_per_page - 1):
-            # flashinfer's page-table transform takes power-of-two pages
-            raise ValueError(f"{KV_RESOURCE} page_size={kv.tokens_per_page} must be a power of two")
 
     def declare_step(
         self,
@@ -205,7 +206,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         steps = {KV_RESOURCE: KVStep(), POS_RESOURCE: PositionStep()}
         long_context = self.config.dsa_long_context
         if not (long_context and graph_walk == "prefill"
-                and sum(inp.input_seq_len for inp in inputs) > self.config.prefill_chunk_tokens):
+                and sum(inp.input_seq_len for inp in inputs) > self.config.prefill_window_tokens):
             # a prefill in row chunks attends sparse on every row, so it plans no dense
             # attention (FlashInfer's MLA planner corrupts the heap near a million rows)
             steps[ATTN_RESOURCE] = AttentionStep(causal=True)
@@ -327,18 +328,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        prefill_buckets = list(self.PREFILL_TOKEN_BUCKETS)
-        if self.config.dsa_long_context:
-            # a captured prefill plans dense attention, which a step past
-            # prefill_chunk_tokens leaves unplanned (declare_step), and its sparse attention in
-            # one plan, which FlashInfer takes up to sparse_mla.MAX_ROWS rows
-            cap = min(self.config.prefill_chunk_tokens, sparse_mla.MAX_ROWS)
-            past = [n for n in prefill_buckets if n > cap]
-            if past:
-                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass %d tokens "
-                               "(prefill_chunk_tokens or sparse_mla.MAX_ROWS) and run eager",
-                               past, cap)
-                prefill_buckets = [n for n in prefill_buckets if n <= cap]
+        # a captured prefill plans dense attention, which a step past prefill_window_tokens
+        # leaves unplanned (declare_step): the capture config holds no such bucket
+        window = self.config.prefill_window_tokens if self.config.dsa_long_context else None
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -350,17 +342,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *([_PackedPrefillConfig(
+            _PackedPrefillConfig(
                 max_row_tokens=self._context_limit(),
+                max_step_tokens=window,
                 capture_graph_walk="prefill",
-                capture_token_lengths=prefill_buckets,
+                capture_token_lengths=list(self.PREFILL_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,
                 ),
                 capture_batch_sizes=list(prefill_batch_sizes),
                 **flags,
-            )] if prefill_buckets else []
             ),
         ]
         if self.config.dsa_long_context and self.mtp_k:
@@ -567,18 +559,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def _long_prefill(self, graph_walk: str, input_ids: torch.Tensor, dsa_ctx) -> bool:
-        """An eager prefill past prefill_chunk_tokens; a captured one (its rows score on their
+        """An eager prefill past prefill_window_tokens; a captured one (its rows score on their
         own, ``decode_rows``) never runs in chunks, whatever the bucket's size."""
         return (graph_walk == "prefill" and dsa_ctx is not None and not dsa_ctx.decode_rows
-                and input_ids.shape[0] > self.config.prefill_chunk_tokens)
+                and input_ids.shape[0] > self.config.prefill_window_tokens)
 
     def _prefill_rows_chunked(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor, rows: list[int],
     ) -> torch.Tensor:
         """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
-        ``prefill_chunk_tokens``, run over row chunks in turn: each writes its keys and latents
+        ``prefill_window_tokens``, run over row chunks in turn: each writes its keys and latents
         (``token_window``) before the next selects over them."""
-        chunk, kv = self.config.prefill_chunk_tokens, self._kv()
+        chunk, kv = self.config.prefill_window_tokens, self._kv()
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
@@ -696,10 +688,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         position_ids: torch.Tensor, kwargs: dict, dsa_ctx: DSAContext,
     ) -> dict[str, NameToTensorList]:
-        """``_mtp_prefill`` past ``prefill_chunk_tokens``: the trunk and then the MTP pass over
+        """``_mtp_prefill`` past ``prefill_window_tokens``: the trunk and then the MTP pass over
         each row chunk in turn. A request's last row pairs with its sampled token, unknown
         until every chunk has run, so its MTP row is written again once that token is in."""
-        lm, chunk, kv = self.language_model, self.config.prefill_chunk_tokens, self._kv()
+        lm, chunk, kv = self.language_model, self.config.prefill_window_tokens, self._kv()
         last = [r0 + n - 1 for r0, n, _ in dsa_ctx.spans]
         nxt = torch.roll(input_ids, -1)
         normed = []

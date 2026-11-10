@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from mstar.api_server import auth, entrypoint  # noqa: E402
+from mstar.api_server.request_types import ResultChunk  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 KEY = "s3cret-key"
@@ -123,7 +124,7 @@ class _GlmServer:
         pass
 
     async def iter_result_chunk_batches(self, request_id):
-        yield [types.SimpleNamespace(modality="text", data=b"Hm.</think>Hi.", metadata={"tokens": 3})]
+        yield [ResultChunk(request_id=request_id, modality="text", data=b"Hm.</think>Hi.", num_tokens=3)]
 
 
 _MESSAGES = {"model": "glm52", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}

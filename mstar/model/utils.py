@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import re
-from collections.abc import Container
+from collections.abc import Container, Mapping
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -505,9 +506,24 @@ class TextOutput(NamedTuple):
     derive their text paths from it."""
 
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
-    # ids that end a reply, dropped unless the request sets ``ignore_eos``; a reply
-    # that ends on none is reported as cut at its budget (``finish_reason: "length"``)
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+
+
+class ByteLevelTextOutput:
+    """``Model.text_output`` for a model over a byte-level BPE tokenizer: each
+    token's raw bytes with special tokens dropped, ``config.eos_token_ids``
+    ending a reply. Built on first use, as the host's ``tokenizer`` may load
+    lazily; a reduced model's byte ids (``_tokenizer_mode`` of ``"byte"``)
+    never touch it."""
+
+    @cached_property
+    def _text_output(self) -> TextOutput:
+        detokenizer = ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+        return TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+
+    def text_output(self) -> TextOutput:
+        return self._text_output
 
 
 def drop_stop_tokens(
@@ -685,6 +701,26 @@ def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
     missing = sorted({name for name, _ in module.named_parameters()} - loaded)
     if missing:
         raise KeyError(f"{what}: checkpoint is missing {len(missing)} parameters, e.g. {missing[:4]}")
+
+
+def long_context_kwargs(kwargs: Mapping[str, Any]) -> bool:
+    """Whether ``model_kwargs`` turn ``dsa_long_context`` on, after refusing the long-context
+    knobs a model would misread: one that only applies with it, a switch that is not a bool
+    (``bool("false")`` is True) and a count that is not an int (``int()`` takes True as 1 and
+    2.5 as 2)."""
+    on = kwargs.get("dsa_long_context", False)
+    long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
+                       if k in kwargs)
+    if long_only and not on:
+        # they size and split the long-context path only; without it they would be dropped
+        raise ValueError(f"{long_only} apply only with dsa_long_context")
+    for key in ("dsa_long_context", "dsa_shard_prefill"):
+        if key in kwargs and not isinstance(kwargs[key], bool):
+            raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+    for key in ("max_seq_len", "prefill_window_tokens"):
+        if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+            raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
+    return on
 
 
 def kv_pages(tokens: int, page_size: int, requests: int) -> int:

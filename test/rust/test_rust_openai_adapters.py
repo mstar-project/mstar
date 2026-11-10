@@ -25,6 +25,7 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from test_rust_frontend import (
+    _USAGE,
     BINARY,
     _Chunk,
     _free_port,
@@ -163,7 +164,7 @@ CHAT = {
 # ChatCompletionRequest's declared fields; the rest is model_extra.
 DECLARED = {"messages": None, "model": None, "temperature": None, "top_p": None,
             "max_tokens": None, "max_completion_tokens": None, "n": 1, "seed": None,
-            "stop": None, "stream": False, "modalities": None, "audio": None}
+            "stop": None, "stream": False, "stream_options": None, "modalities": None, "audio": None}
 
 
 def _python_request(body: dict):
@@ -294,8 +295,11 @@ class _PythonServer:
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
         self.served_models = ServedModels.of(model_name, None)
+        self.tail = []
 
     def submit_request(self, **kwargs):
+        if kwargs.get("report_usage"):
+            self.tail = [_Chunk("usage", b"", _USAGE)]
         return kwargs["request_id"]
 
     def submission_key(self, request_id):
@@ -305,11 +309,11 @@ class _PythonServer:
         pass
 
     async def collect_results(self, request_id, raw_request=None):
-        return [_Chunk("text", b"Hello "), _Chunk("text", b"world")]
+        return [_Chunk("text", b"Hello "), _Chunk("text", b"world"), *self.tail]
 
     async def iter_result_chunk_batches(self, request_id):
         yield [_Chunk("text", b"Hello ")]
-        yield [_Chunk("text", b"world")]
+        yield [_Chunk("text", b"world"), *self.tail]
 
 
 def _normalized(status, data: bytes, stream: bool):
@@ -335,6 +339,8 @@ def _image_chat(url: str) -> dict:
 PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
+    "chat-stream-usage": ({"messages": [{"role": "user", "content": "hi"}], "stream": True,
+                           "stream_options": {"include_usage": True}}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
     "json-mode": ({"messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}},
                   False),

@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 import torch
 
-from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
@@ -58,15 +57,14 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.multimodal import render_chat_template
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
-    ByteIdDetokenizer,
-    ByteLevelDetokenizer,
-    TextOutput,
+    ByteLevelTextOutput,
     capture_ladder,
     check_loaded,
     load_snapshot_tokenizer,
+    long_context_kwargs,
     process_weights_after_loading,
     read_fp8_block_quant_config,
     resolve_checkpoint,
@@ -83,7 +81,7 @@ DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 QUANT_METHODS = ("fp8",)
 
 
-class Glm5NextModel(Model):
+class Glm5NextModel(ByteLevelTextOutput, Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
     DECODE_LOOP = "decode_loop"
@@ -135,20 +133,7 @@ class Glm5NextModel(Model):
         if kwargs.get("prefill_capture_batch_sizes") is not None:
             self.config.prefill_capture_batch_sizes = capture_ladder(
                 "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
-        long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
-                           if k in kwargs)
-        if long_only and not kwargs.get("dsa_long_context", False):
-            # they size and split the long-context path only; without it they would be dropped
-            raise ValueError(f"{long_only} apply only with dsa_long_context")
-        for key in ("dsa_long_context", "dsa_shard_prefill"):
-            # bool("false") is True
-            if key in kwargs and not isinstance(kwargs[key], bool):
-                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
-        for key in ("max_seq_len", "prefill_window_tokens"):
-            # int() would take True as 1 and 2.5 as 2
-            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
-                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
-        if kwargs.get("dsa_long_context", False):
+        if long_context_kwargs(kwargs):
             # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
@@ -275,7 +260,7 @@ class Glm5NextModel(Model):
                     kv_cache=KV_CACHE,
                     topk=self.config.index_topk,
                     kpool=self.config.index_kpool,
-                    sm_scale=self.config.qk_head_dim ** -0.5,
+                    sm_scale=self.config.softmax_scale,
                     index_head_dim=self.config.index_head_dim,
                 ),
             ))
@@ -394,22 +379,14 @@ class Glm5NextModel(Model):
                 )
 
         if self._tokenizer_mode == "byte":
-            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO;
+            # the reply prefix (a forced tool call) follows the prompt
             vocab = self.config.vocab_size
-            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = render_chat_template(
-                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, TEMPLATE_KWARGS)
+            text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
+            input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
-        if prefix := kwargs.get("reply_prefix"):
-            # what the reply opens with, after the generation prompt (a forced tool call)
-            if self._tokenizer_mode == "byte":
-                prefix_ids = [min(b, self.config.vocab_size - 1) for b in prefix.encode("utf-8")]
-            else:
-                prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
-            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
+            input_ids = render_chat_template(
+                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, GLM_TEMPLATE_KWARGS)
 
         # Decode runs at least one step, and one more may already be scheduled
         # when it stops, so the prompt leaves two steps' tokens of the context
@@ -464,18 +441,6 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    # built on first use: the tokenizer it reads loads lazily
-    _text_output: TextOutput | None = None
-
-    def text_output(self) -> TextOutput:
-        if self._text_output is None:
-            # a reduced model's byte ids never touch the HF tokenizer
-            detokenizer = (
-                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
-            )
-            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
-        return self._text_output
 
     def postprocess(
         self,
