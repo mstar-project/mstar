@@ -875,12 +875,7 @@ The spec types are:
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
        a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
        kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
-       kernel must turn. ``fused=True`` rotates with torch ops over the float32 table
-       ``rope_table_dtype=torch.float32`` builds, instead of FlashInfer's kernel, so a
-       compiled forward fuses the rotation into the kernels around it (it adds no kernel of
-       its own), for small models whose steps are a few kernels a layer (MiniCPM-o's TTS);
-       a Qwen3 layer then keeps its unfused path. It takes standard non-interleaved float32
-       RoPE on CUDA only and refuses other configs. A model with learned position
+       kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
