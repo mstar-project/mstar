@@ -1270,8 +1270,7 @@ def cmd_check(args, cfg):
         except ApiError as e:
             print(f"{p.name}: {e}")
             continue
-        if stores is None:
-            print(f"{p.name}: key set; its boxes keep the HF cache on their own disk")
+        if stores is None:  # no team storage to check
             continue
         where = ", ".join(
             f"any data center (global volume {s['name']!r}, {s['id']})" if r == GLOBAL
