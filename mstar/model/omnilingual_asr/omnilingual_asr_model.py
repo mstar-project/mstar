@@ -72,6 +72,11 @@ class OmnilingualASRModel(Model):
       (320): padded audio per forward; a step over it runs as several forwards.
     """
 
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and the decode releases the GIL. Inline at c=32, a 300M request
+    # queued 84 of its 102 ms behind the ones before it.
+    PREPROCESS_PARALLEL = True
+
     def __init__(
         self,
         model_path_hf: str | None = None,

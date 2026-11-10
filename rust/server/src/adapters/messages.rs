@@ -199,6 +199,7 @@ pub(super) fn text_chat(
     );
     Ok(SubmitArgs {
         tokens: None,
+        report_usage: false,
         text,
         file_paths,
         input_modalities: in_mods,
@@ -268,6 +269,7 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
     );
     Ok(SubmitArgs {
         tokens: None,
+        report_usage: false,
         text,
         file_paths: BTreeMap::new(),
         // one per part, all text past the refusal: a model that rebuilds its turns from the modalities keeps them all

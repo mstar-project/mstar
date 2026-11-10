@@ -8,13 +8,15 @@ decoder can't read (:func:`decoding_upload`).
 
 The image, video and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
-against what the request's earlier files used.
+against what the request's other files use, whether finished or still loading.
 """
 import errno
 import os
 import struct
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import NamedTuple
 
 import torch
 
@@ -109,7 +111,12 @@ def check_media_limits() -> None:
         Image.MAX_IMAGE_PIXELS = limit
 
 
-_request_budget: ContextVar["RequestMediaBudget | None"] = ContextVar("mstar_request_media_budget", default=None)
+class _LoadingFile(NamedTuple):
+    budget: "RequestMediaBudget"
+    charges: dict[str, float]
+
+
+_loading_file: ContextVar[_LoadingFile | None] = ContextVar("mstar_request_loading_file", default=None)
 
 
 class RequestMediaBudget:
@@ -135,35 +142,43 @@ class RequestMediaBudget:
             )
         self.limits = {"image": max_image_pixels(), "video": max_video_bytes(), "audio": max_audio_seconds()}
         self.used = dict.fromkeys(self.limits, 0)
-        self._file = dict.fromkeys(self.limits, 0)
+        # one entry per file being loaded: files of a request may load at once
+        self._loading: list[dict[str, float]] = []
+        self._lock = threading.Lock()
 
     @contextmanager
     def file(self):
         """Load one file. It is charged the most any single check counted for
         it, so a header estimate and the decode after it are not added up."""
-        token = _request_budget.set(self)
+        charges = dict.fromkeys(self.limits, 0)
+        with self._lock:
+            self._loading.append(charges)
+        token = _loading_file.set(_LoadingFile(self, charges))
         try:
             yield
         finally:
-            _request_budget.reset(token)
-            for kind, amount in self._file.items():
-                self.used[kind] += amount
-                self._file[kind] = 0
+            _loading_file.reset(token)
+            with self._lock:
+                self._loading = [file for file in self._loading if file is not charges]
+                for kind, amount in charges.items():
+                    self.used[kind] += amount
 
-    def charge(self, kind: str, amount: float) -> None:
-        self._file[kind] = max(self._file[kind], amount)
-        if self.used[kind] + self._file[kind] > self.limits[kind]:
-            files, unit, env = self._LIMITS[kind]
-            raise ValueError(
-                f"the request's {files} decode to more than {self.limits[kind]} {unit} together; "
-                f"send fewer or smaller files (the limit is {env})"
-            )
+    def charge(self, charges: dict[str, float], kind: str, amount: float) -> None:
+        with self._lock:
+            charges[kind] = max(charges[kind], amount)
+            loading = sum(file[kind] for file in self._loading)
+            if self.used[kind] + loading > self.limits[kind]:
+                files, unit, env = self._LIMITS[kind]
+                raise ValueError(
+                    f"the request's {files} decode to more than {self.limits[kind]} {unit} together; "
+                    f"send fewer or smaller files (the limit is {env})"
+                )
 
 
 def _charge_request(kind: str, amount: float) -> None:
-    budget = _request_budget.get()
-    if budget is not None:
-        budget.charge(kind, amount)
+    file = _loading_file.get()
+    if file is not None:
+        file.budget.charge(file.charges, kind, amount)
 
 
 def check_file_counts(counts: dict[str, int], model_limits: dict[str, int]) -> None:

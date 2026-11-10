@@ -40,6 +40,7 @@ from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
     MediaPads,
+    MediaRun,
     expand_media_pads,
     media_layout,
     media_walk_name,
@@ -69,9 +70,7 @@ class CommandAPlusModel(Model):
         self.vision_config = config.vision_config
         # the image tower, whose output fills the image pads in prompt order;
         # it names the image walk, `prefill_image`
-        self.image_encoder = MediaEncoder(
-            "image", "vision_encoder", ("pixel_values",), "image_embeds", (self.vision_config.image_token_id,),
-        )
+        self.image_encoder = MediaEncoder("image", "vision_encoder", ("pixel_values",), "image_embeds")
         self.image_walk = media_walk_name((self.image_encoder,))
         self.max_seq_len = min(8192, self.config.max_position_embeddings) if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= self.config.max_position_embeddings:
@@ -268,7 +267,7 @@ class CommandAPlusModel(Model):
                     ids.numel(), ids.numel(), "text_inputs")
         layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
         # always set, so a layout the client sent never reaches the LLM
-        media = media_layout(pads, {self.image_encoder.pad_ids[0]: self.image_encoder.output})
+        media = media_layout(pads)
         return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
@@ -296,7 +295,7 @@ class CommandAPlusModel(Model):
         """Tile each image and write its one ``<|IMG_PATCH|>`` placeholder out as
         the processor lays it out: the image's start, each tile's pads ending
         in a line break, the image's end. Each tile is one run of pads."""
-        pad = self.image_encoder.pad_ids[0]
+        pad = self.vision_config.image_token_id
         positions = (ids == pad).nonzero().flatten().tolist()
         if len(positions) != len(images):
             raise ValueError(f"The prompt has {len(positions)} image placeholders for {len(images)} images")
@@ -322,7 +321,7 @@ class CommandAPlusModel(Model):
             pixel_values.append(tiles.to(torch.bfloat16))
             start = position + 1
         pieces.append(ids[start:])
-        runs = [tokens] * sum(len(tiles) for tiles in pixel_values)
+        runs = [MediaRun(tokens, self.image_encoder.output)] * sum(len(tiles) for tiles in pixel_values)
         return expand_media_pads(torch.cat(pieces), {pad: runs}), pixel_values
 
     def postprocess(self, output, modality, request_kwargs=None):

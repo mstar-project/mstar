@@ -60,6 +60,10 @@ class ParakeetModel(Model):
     MAX_CONCURRENT_REQUESTS = 128
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and the decode releases the GIL. Inline at c=32, a request queued
+    # 76 of its 100 ms behind the ones before it.
+    PREPROCESS_PARALLEL = True
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
 
     def __init__(

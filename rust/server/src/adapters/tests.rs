@@ -101,8 +101,14 @@ fn an_empty_unknown_or_misplaced_chat_part_is_refused() {
 }
 
 /// The surfaces a class serves: chat, speech, images, videos.
-fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 4] {
-    [adapter.supports_chat(), adapter.supports_speech(), adapter.supports_images(), adapter.supports_videos()]
+fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 5] {
+    [
+        adapter.supports_chat(),
+        adapter.supports_speech(),
+        adapter.supports_images(),
+        adapter.supports_videos(),
+        adapter.supports_transcriptions(),
+    ]
 }
 
 #[test]
@@ -114,17 +120,18 @@ fn each_ported_python_adapter_class_is_found_by_its_name_once() {
     for (class, adapter) in ADAPTERS {
         assert_eq!(surfaces(from_python(class).unwrap()), surfaces(*adapter), "{class}");
     }
-    for class in ["", "WhisperAdapter", "qwen3_5_0.8b", "bagel"] {
+    for class in ["", "Pi05Adapter", "qwen3_5_0.8b", "bagel"] {
         assert!(from_python(class).is_none(), "{class:?}");
     }
     // the surfaces of a few classes, as their Python attributes declare them
-    assert_eq!(surfaces(&Bagel), [true, false, true, false]);
-    assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false]);
-    assert_eq!(surfaces(&Qwen3_5), [true, false, false, false]);
-    assert_eq!(surfaces(&Cosmos3), [false, false, true, true]);
-    assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true]);
-    assert_eq!(surfaces(&Qwen3TTS), [false, true, false, false]);
-    assert_eq!(surfaces(&Orpheus), [false, true, false, false]);
+    assert_eq!(surfaces(&Bagel), [true, false, true, false, false]);
+    assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false, false]);
+    assert_eq!(surfaces(&Qwen3_5), [true, false, false, false, false]);
+    assert_eq!(surfaces(&Cosmos3), [false, false, true, true, false]);
+    assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true, false]);
+    assert_eq!(surfaces(&Qwen3TTS), [false, true, false, false, false]);
+    assert_eq!(surfaces(&Orpheus), [false, true, false, false, false]);
+    assert_eq!(surfaces(&Whisper), [false, false, false, false, true]);
 }
 
 fn speech(body: &str) -> SpeechRequest {
