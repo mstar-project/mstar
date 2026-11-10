@@ -22,12 +22,13 @@ _HOST_ROWS_RING = 4
 _HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_RING))
 
 
-def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
-    """Host buffer ``name``'s first value per row, a view; None without one."""
+def _host_column(host_rows: HostRows | None, name: str, width: int = 1) -> torch.Tensor | None:
+    """Host buffer ``name``'s first ``width`` values per row, a view; None without one."""
     buf = None if host_rows is None else host_rows.buffers.get(name)
     if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
         return None
-    return buf.reshape(buf.shape[0], -1)[:, 0]
+    rows = buf.reshape(buf.shape[0], -1)
+    return rows[:, 0] if width == 1 else rows[:, :width]
 
 
 class _LazyPerRid(Mapping):

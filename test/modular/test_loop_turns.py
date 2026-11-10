@@ -407,13 +407,26 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
     assert bound(sched, state).pick_chain_step(KEY, [7]).pick.room == 1
 
 
+def test_a_row_ready_at_the_chain_s_target_waits_out_a_run_owed_to_it():
+    """``ready_waits``: the step after one that ran once continues only its
+    own rows, and the waiting row keeps its place for the next step."""
+    runtime = _Runtime()
+    runtime.requests.update({1: None, 2: None})
+    sched, state = _scheduler(runtime, TURNS)
+    bound_sched = bound(sched, state)
+
+    assert bound_sched.pick_chain_step(KEY, [1]).pick.continuing == [1], "the chain's own row keeps its step"
+    owed = bound_sched.pick_chain_step(KEY, [1], continuing_only=True)
+    assert owed.pick.continuing == [1] and owed.pick.room == 1
+
+
 # ── the worker's side ───────────────────────────────────────────────────
 
 
 def _speculator(chain: ChainPick, prep, taken=None, asked=None) -> Speculator:
     asked = {} if asked is None else asked
 
-    def pick_chain_step(target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         asked["pick"] = next_iter_of
         return chain
 
@@ -445,7 +458,10 @@ _TARGET = SpeculationOutput(
 
 
 def _pending():
-    return SimpleNamespace(batch=ScheduledBatch(NODE, WALK, request_to_worker_graph={1: 0, 2: 0, 3: 0}))
+    return SimpleNamespace(
+        batch=ScheduledBatch(NODE, WALK, request_to_worker_graph={1: 0, 2: 0, 3: 0}),
+        node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=1)),
+    )
 
 
 def test_prep_gets_the_chains_rows_in_line_and_the_room():

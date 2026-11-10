@@ -410,6 +410,24 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        pays no scheduling gap between chunks; other ready work still goes first after
        every prompt step. Off, the next chunk waits for the current one to land. Naming
        a node or walk the model does not chunk fails loading.
+   * - ``step_repeats``
+     - *(optional, off by default)* Per node, ``{max: N, ready_waits: bool}``. A step of a decode Loop on
+       that node stands for up to ``N`` iterations: the host plans once, launches the captured step that
+       many times, and reads the stops when the step lands, so a row that stopped inside it costs the
+       iterations past its stop. Narrowed per step by the row's loop cap and by each resource
+       (``Resource.max_repeats``: free pages, log-prob rows, a prefix snapshot's page boundary); while
+       any request on the node uses a repetition penalty, every step on it runs once. With recurrent
+       prefix snapshots on (``prefix_slots``, as in ``qwen3_5_0.8b.yaml``), a step ends at the nearest
+       page edge of any of its rows, so the iterations a step runs fall as concurrency rises and reach
+       about one at a few dozen rows; measure with ``prefix_slots: 0`` too. ``ready_waits: true`` makes ready rows wait
+       for a full-length run after a step that ran once, trading admission latency for longer runs;
+       measure it, it is not a free improvement. Needs a ``TokenStop``, every output on the device,
+       resources that can all run on resident tables, and a decode kernel that reads its lengths per replay (for Whisper,
+       ``decode_tensor_cores: true`` on its attention resources). A node or walk that can't is refused at
+       load with the reason; a lockstep (TP/SP/CFG) node is refused. A ``SampledTokenDecoder`` node named here
+       runs the walks asked on resident tables, with the runtime's stop and its token looped back on
+       the device; another AR node must declare those itself (see :doc:`adding_models`), and a node
+       not named keeps its own token path. A step isn't rewound for a row that stopped inside it.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

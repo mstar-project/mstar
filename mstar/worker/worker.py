@@ -305,6 +305,9 @@ class Worker:
             device_capability=self.device_capability,
         )
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
+        if layout.step_repeats is not None:
+            for node, walks in layout.step_repeats.asked_walks().items():
+                self.engine_manager.get_engine(node).enable_repeats(node, walks)
 
         self.request_state = RequestStateManager(
             node_to_partition=node_to_partition,
@@ -509,7 +512,10 @@ class Worker:
         self.lockstep.verify_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
+        repeats = self.layout.step_repeats
         self.engine_manager.warmup_all()
+        if repeats is not None:
+            repeats.settle(self.executor.repeat_refusal)
 
         # Sync every worker before the main loop opens. Per-batch-size
         # captures inside CudaGraphRunner are already barriered on the

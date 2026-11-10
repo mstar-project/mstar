@@ -30,9 +30,11 @@ def input_metadata_and_fwd_info(
     per_request_inputs: dict[int, NameToTensorList],
     increment_loop_rids: list[int] | None = None,
     increment_loop_name: str | None = None,
+    increment_by: int = 1,
 ) -> tuple[dict[int, InputMetadata], dict[int, CurrentForwardPassInfo]]:
     """Per row, its forward-pass info and an ``InputMetadata`` with its own
-    copy of the loop counters (one iteration on for ``increment_loop_rids``)
+    copy of the loop counters (``increment_by`` iterations on for
+    ``increment_loop_rids``: the step in flight's, ``StepContext.repeats``)
     and the stream chunks it consumes."""
     meta = {}
     fwd_info = {}
@@ -51,7 +53,7 @@ def input_metadata_and_fwd_info(
     if increment_loop_rids is not None and increment_loop_name is not None:
         for rid in increment_loop_rids:
             meta[rid].dynamic_loop_iter_counts[increment_loop_name] = \
-                meta[rid].dynamic_loop_iter_counts.get(increment_loop_name, 0) + 1
+                meta[rid].dynamic_loop_iter_counts.get(increment_loop_name, 0) + increment_by
     return meta, fwd_info
 
 

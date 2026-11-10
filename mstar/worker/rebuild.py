@@ -128,11 +128,15 @@ class Rebuilds:
             tokens = host_rows.buffers.get(name)
             if not torch.is_tensor(tokens) or tokens.dim() == 0:
                 return
-            if tokens.dim() > 1 and tokens[0].numel() != 1:
+            # a step that repeated holds one id per replay and row, and a row's kept ids take them all
+            repeats = ctx.repeats
+            if tokens.dim() > 1 and tokens[0].numel() != repeats:
                 raise ValueError(self._not_one_id(node, name, tokens[0].numel()))
             # the sampler's [B] output skips the reshape, which costs more than the rest of this method
             values = tokens.tolist() if tokens.dim() == 1 else tokens.reshape(-1).tolist()
-            pairs = zip(host_rows.request_ids, values, strict=False)
+            pairs = [
+                (rid, values[i * repeats:(i + 1) * repeats]) for i, rid in enumerate(host_rows.request_ids)
+            ] if repeats > 1 else zip(host_rows.request_ids, values, strict=False)
         else:
             pairs = []
             for rid in node_batch.request_ids:
@@ -147,7 +151,10 @@ class Rebuilds:
             kept = kept_ids.get(rid)
             # the host rows are the forward's, which can hold a row the worker has since taken out of the step
             if kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids:
-                kept.sampled.append(token)
+                if isinstance(token, list):
+                    kept.sampled.extend(token)
+                else:
+                    kept.sampled.append(token)
 
     @staticmethod
     def _not_one_id(node: str, name: str, count: int) -> str:

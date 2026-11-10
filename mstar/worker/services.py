@@ -3,7 +3,7 @@ and the read-only facts about this worker's place in the deployment
 (``WorkerLayout``). Neither holds a component's state."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -13,6 +13,7 @@ import torch
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import refuse_combined_walks_across_tp_groups
 from mstar.worker.scheduling_policy import WalkPriority, resolve_walk_priorities
+from mstar.worker.step_repeats import StepRepeats, loop_signals, parse_step_repeats
 
 if TYPE_CHECKING:
     from mstar.communication.base import BaseCommunicator
@@ -94,6 +95,8 @@ class WorkerLayout:
     # the connections streaming into this worker, and their edges
     consumer_connections: tuple[Connection, ...] = ()
     streaming_edge_names: frozenset[str] = frozenset()
+    # which steps stand for several iterations; None for a deployment that asks for none
+    step_repeats: StepRepeats | None = None
 
     @property
     def followed_nodes(self) -> frozenset[str]:
@@ -149,6 +152,10 @@ class WorkerLayout:
                     conn for conn in topology.connections
                     if not node_names.isdisjoint(partition_nodes(conn.to_partition, model))
                 ]
+        streaming_edge_names = frozenset(conn.edge_name for conn in consumers)
+        step_repeats = None if model is None else _step_repeats(
+            model, (model_config or {}).get("step_repeats"), my_walks, parallel, streaming_edge_names,
+        )
         return cls(
             node_names=frozenset(node_names),
             my_walks=frozenset(my_walks),
@@ -164,8 +171,32 @@ class WorkerLayout:
             all_wg_nodes=all_wg_nodes,
             innermost_loop_by_node=MappingProxyType(innermost),
             consumer_connections=tuple(consumers),
-            streaming_edge_names=frozenset(conn.edge_name for conn in consumers),
+            streaming_edge_names=streaming_edge_names,
+            step_repeats=step_repeats,
         )
+
+
+def _step_repeats(
+    model: Model, block: object, my_walks: Collection[tuple[str, str]], parallel: Collection[str],
+    streamed: Collection[str],
+) -> StepRepeats | None:
+    """The serving config's ``step_repeats:`` on this worker, or None if it
+    asks for nothing here. Lockstep nodes are refused: only one rank's plan
+    and resources would decide how far a step runs."""
+    walks = model.get_graph_walk_graphs()
+    nodes = {node for section in walks.values() for node in section.get_nodes()}
+    configs = {node: c for node, c in parse_step_repeats(block, nodes).items() if c.max > 1}
+    mine = {node for node, _ in my_walks}
+    configs = {node: config for node, config in configs.items() if node in mine}
+    if refused := sorted(set(configs) & set(parallel)):
+        raise ValueError(f"step_repeats can't serve {refused}: repeats aren't supported on a lockstep (TP/SP/CFG) node")
+    if not configs:
+        return None
+    loops = {
+        (node, walk): signals for node, walk in sorted(my_walks) if node in configs
+        and walk in walks and (signals := loop_signals(walks[walk], node, streamed)) is not None
+    }
+    return StepRepeats(configs, loops)
 
 
 @dataclass(frozen=True)

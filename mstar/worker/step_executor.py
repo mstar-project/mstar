@@ -12,6 +12,7 @@ import time as _time
 from collections.abc import Collection
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, NamedTuple
 
 import torch
@@ -850,6 +851,9 @@ class StepExecutor:
         # Main loop only: the runtime holds `&mut self` across its GIL
         # release, so a concurrent caller gets "Already mutably borrowed"
         # rather than blocking.
+        if host_rows is not None and self._layout.step_repeats is not None:
+            info_of = partial(self.request_state.get_fwd_info, partition_name=batch_N.partition)
+            engine.record_tokens(batch_N.node_batch, host_rows, info_of)
         rt = self._graph_runtime
         _t_rt = _time.perf_counter() if self.timer.period else 0.0
         step = rt.begin_postprocess(request)
@@ -914,6 +918,22 @@ class StepExecutor:
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
+    def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why no step of this walk can stand for several iterations, or None:
+        its stop runs in the runtime and everything it routes stays on the device."""
+        if self._stop_token_signal.get((node_name, graph_walk)) is None:
+            return (
+                "node: its stop is its own check_stop, which reads one token a step"
+                " (declare a TokenStop without withhold)"
+            )
+        engine = self.engine_manager.get_engine(node_name)
+        signals = self._graph_runtime.get_output_signals(node_name, graph_walk)
+        if not self._body.all_on_device(engine, node_name, graph_walk, signals):
+            return "node: an output of it doesn't stay on the device between steps"
+        return engine.repeat_refusal(
+            node_name, graph_walk, self._layout.step_repeats.loop_back(node_name, graph_walk),
+        )
+
     def _runtime_stop_column(
         self, batch_N: PendingBatch, host_rows: "HostRows | None",
     ) -> tuple[bool, "torch.Tensor | None"]:
@@ -931,7 +951,7 @@ class StepExecutor:
         token_signal = self._stop_token_signal[key]
         if token_signal is None:
             return True, None
-        tokens = _host_column(host_rows, token_signal)
+        tokens = _host_column(host_rows, token_signal, batch_N.node_batch.step_context.repeats)
         return tokens is not None, tokens
 
     def _get_postprocess_request(
@@ -943,6 +963,7 @@ class StepExecutor:
         the runtime's check (``checked``: the model's, when the runtime does
         not check), and the host columns the runtime reads in place."""
         batch = batch_N.batch
+        repeats = batch_N.node_batch.step_context.repeats
         by_walk = batch.rids_by_walk()
         walks = list(by_walk) or [batch_N.graph_walk]
         if len(by_walk) <= 1:
@@ -992,7 +1013,7 @@ class StepExecutor:
         ):
             client = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
             signal = next((s for s in client if s in signals), None)
-            column = None if signal is None else _host_column(host_rows, client[signal])
+            column = None if signal is None else _host_column(host_rows, client[signal], repeats)
             if column is not None:
                 inline = InlineColumn(signal, column)
         return PostprocessRequest(
@@ -1007,7 +1028,8 @@ class StepExecutor:
             # done, so it rides the WGD that also counts this pass's last chunks
             partition_done=list(batch_N.node_batch.partition_done_rids),
             python_send=self.enable_prof,
-            loop_strides=batch.loop_strides(rids),
+            loop_strides=batch.loop_strides(rids, repeats),
+            token_width=repeats,
         )
 
     def _check_stops(

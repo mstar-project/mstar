@@ -42,7 +42,7 @@ def _strides(rows, chunk_ranges=None, chunkable=("prefill",)):
     batch = _batch(rows, chunk_ranges)
     # what the worker reads off its graphs at load, and stamps at submit
     batch.chunk_loop_walks = ChunkLoops((NODE, w) for w in chunkable).walks_by_node.get(NODE, frozenset())
-    return batch.loop_strides(list(rows))
+    return batch.loop_strides(list(rows), 1)
 
 
 def test_a_row_that_ran_whole_ends_its_loop():
@@ -86,7 +86,7 @@ def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
         request_to_worker_graph=dict.fromkeys(range(1, 21), 0),
         chunk_loop_walks=frozenset({"prefill"}),
     )
-    assert batch.loop_strides(list(range(1, 21))) is None
+    assert batch.loop_strides(list(range(1, 21)), 1) is None
     assert _CountingBatch.looked_up == 0
 
 
@@ -219,7 +219,7 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
         chunk_loops=ChunkLoops([(NODE, "prefill")]),
     )
 
-    target = w.speculator._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
+    target = w.speculator._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}), 1)
 
     assert target.info.graph_walk == "decode" and target.walk_rids == [2]
 
@@ -243,4 +243,4 @@ def test_a_submitted_step_carries_its_nodes_chunk_loop_walks():
     executor._submit_gpu_step(batch, node_batch, None, CHAIN_LANE)
 
     assert batch.chunk_loop_walks == {"prefill"}
-    assert batch.loop_strides([1]) == [CHUNK_LOOP_END]
+    assert batch.loop_strides([1], 1) == [CHUNK_LOOP_END]

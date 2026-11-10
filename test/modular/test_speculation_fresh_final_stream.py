@@ -125,7 +125,9 @@ def _pending():
             node_name=NODE, graph_walk=WALK, request_to_worker_graph={CONTINUING: 0},
         ),
         node_name=NODE, graph_walk=WALK, partition=PART, tp_seq=5,
-        node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)),
+        node_batch=SimpleNamespace(
+            commit_done=SimpleNamespace(is_set=lambda: True), step_context=SimpleNamespace(repeats=1),
+        ),
     )
 
 
@@ -136,7 +138,7 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
+        pick_chain_step=lambda target, continuing, *_, **__: ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),

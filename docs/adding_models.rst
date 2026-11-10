@@ -2596,6 +2596,39 @@ A packed region whose rows each attend within themselves passes ``attn_key`` (th
 attention resource) instead of a ``declare_step``: the config then declares one
 non-causal segment per row, or under ``one_row_per_step`` one per length of its row.
 
+Steps that stand for several iterations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A steady decode batch needs nothing from the host between iterations, so a deployment can
+ask its node to run several per step (``step_repeats:``, see :doc:`serving`): the host plans
+once, launches the step's capture that many times, and reads the stops when the step lands.
+A deployment that doesn't ask runs the node as before.
+
+A node needs a ``TokenStop`` (``ARNodeSubmodule.token_stop``) without ``withhold``; the runtime
+checks it on the walks a deployment asks to repeat that run on resident tables and loop their token
+back, and a walk that can't keeps the node's own ``check_stop``. A ``SampledTokenDecoder`` node needs nothing
+more: asked, its decode walk runs on resident tables and loops its token back on the device, even
+where its own path doesn't (Canary keeps main's routed token, a measured choice, unless asked). Any
+other AR node declares ``resident_walks`` and ``device_loopback`` itself, as Whisper does, or is
+refused at load with the reason. A deployment that doesn't ask runs the node as it declares.
+``ARNodeSubmodule.repeat_carry`` derives how each loop-back signal
+moves between replays from that loop-back; override it only if a signal moves another way. A node that keeps
+its tokens on the host implements ``record_tokens``, the only place it can read them now that the
+runtime checks the stop (``check_stop`` does not run); Whisper's word timestamps are the example.
+
+Every resource the step declares answers ``max_repeats(step, ctx)``: how many iterations the step
+can take with no host work between them. The default is 1, so a resource that says nothing keeps
+the step at one. It is asked per step and once at load, on the walk's template step, so a walk
+that could never repeat is refused with the resource named. A resource whose state outlives the
+Loop answers for it here: the recurrent pool ends a run on a row's next page boundary while it
+keeps prefix snapshots, so each page's snapshot is the state at that page. The step ends at the
+nearest such edge of any of its rows, so with snapshots on its runs shorten as concurrency rises.
+
+The graph must fit too: the Loop runs only this node, every output is a loop-back or a client
+token, and no input is streamed in. A step isn't rewound for a row that stopped inside it, so
+what such a row advanced past its stop must not be read again; a resource that keeps state for a
+later request (a prefix snapshot) files it only once the request's own tokens reach it.
+
 .. _config-yaml:
 
 Step 6 — Write a config YAML

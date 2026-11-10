@@ -49,6 +49,7 @@ from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
+from mstar.worker.step_repeats import RepeatConfig, StepRepeats  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
@@ -297,6 +298,26 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     wide = runner.repeat(lease, outputs, 3).check_stop_buffers
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
+
+
+@pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
+    (1, 0, True, 100, 8),
+    (0, 0, True, 100, 1),  # other ready work hasn't had its look in
+    (1, 1, True, 100, 1),  # a fresh row needs a plan of its own
+    (1, 0, False, 100, 1),
+    (1, 0, True, 3, 3),  # a row's cap ends the run, never passes it
+], ids=["steady", "chain_start", "fresh_row", "other_node", "near_cap"])
+def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_node, room, want):
+    rows = dict.fromkeys(range(2 + fresh), 0)
+    speculation = SimpleNamespace(
+        scheduled_batch=SimpleNamespace(
+            node_name="n", graph_walk=WALK, request_to_worker_graph=rows, chunk_ranges={},
+        ),
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
+    )
+    repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): None})
+    repeats._walks.add(("n", WALK))
+    assert repeats.ceiling(speculation, in_chain, lambda: room) == want
 
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():

@@ -172,6 +172,16 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
     assert not (kept[A].sampled or kept[B].sampled), "it kept a discarded sample"
 
 
+def test_a_step_that_repeated_keeps_each_iteration_s_sample():
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A)))
+    batch = _batch((R, A))
+    batch.step_context.repeats = 2
+    rebuilds.keep_samples(batch, {}, HostRows((R, A), {"new_token": torch.tensor([[4, 5], [6, 7]])}))
+    kept = rebuilds._kept[NODE]
+    assert (list(kept[R].sampled), list(kept[A].sampled)) == ([4, 5], [6, 7])
+
+
 def test_a_sample_is_kept_from_the_host_outputs_the_worker_copies_on_read():
     rebuilds = _rebuilds()
     rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))

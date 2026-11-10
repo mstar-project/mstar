@@ -213,3 +213,9 @@ def test_a_combined_walk_spanning_tp_groups_is_refused():
 
 def test_a_combined_walk_half_on_another_worker_is_not_refused():
     assert _derive(_model(combined=COMBINED), sharding=SPLIT).combined_walk_of == COMBINED
+
+
+def test_a_step_repeat_refuses_a_loop_whose_input_is_streamed_in():
+    """The streaming edges are declared on the topology, not on a walk built fresh."""
+    layout = _derive(_model(), model_config={"step_repeats": {"consumer": {"max": 8}}})
+    assert "streamed in" in layout.step_repeats.loops[("consumer", "consume")].refusal
