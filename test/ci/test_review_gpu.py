@@ -267,9 +267,10 @@ class TestStart(unittest.TestCase):
     ERAS = [{"id": f"eras:{i}", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0,
              "availability": "now", "vendor": "nvidia"} for i in ("l1", "l2")]
 
-    def start(self, cfg, launch_code=0, earlier=None, offers_answer=None, offers=None, **args):
+    def start(self, cfg, launch_code=0, earlier=None, offers_answer=None, offers=None, up=0, **args):
         """start's lt directory and the launches it tried; earlier: the earlier live test's comment. offers: by
-        vendor (default two Eras listings for NVIDIA); launch_code: gpu.py launch's exit, or by offer id."""
+        vendor (default two Eras listings for NVIDIA); launch_code: gpu.py launch's exit, or by offer id; up: the
+        bot's boxes already up."""
         offers = offers or {"nvidia": self.ERAS}
         launched = []
 
@@ -288,7 +289,8 @@ class TestStart(unittest.TestCase):
                   f"GET repos/{R}/issues[?]*": []}
         lt = Path(tempfile.mkdtemp())
         config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
-                                       tail_lines=gpu_review.gpu_py.tail_lines)
+                                       tail_lines=gpu_review.gpu_py.tail_lines, reap=lambda cfg: [],
+                                       running=lambda cfg: ["box"] * up)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"live_test": {
@@ -366,6 +368,18 @@ class TestStart(unittest.TestCase):
         self.assertIn("No AMD GPUs", (out / "amd/unavailable.md").read_text())
         with self.assertRaises(ValueError, msg="a vendor set the workflow never makes would reach the box"):
             self.start({}, vendors="amd")
+
+    def test_no_box_starts_unless_every_vendors_box_can(self):
+        mi300x = {"id": "digitalocean:gpu-mi300x1-192gb", "provider": "digitalocean", "gpu": "AMD MI300X",
+                  "count": 1, "usd_per_hour": 2.0, "availability": "available", "vendor": "amd"}
+        cfg = {"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}}
+        for name, offers, up, why in (("no AMD offer", {"nvidia": self.ERAS}, 0, "No AMD GPUs"),
+                                      ("one slot left", {"nvidia": self.ERAS, "amd": [mi300x]}, 1, "needs 2")):
+            with self.subTest(name):
+                out, launched = self.start(cfg, offers=offers, up=up, vendors="nvidia,amd")
+                self.assertEqual(launched, [], "an NVIDIA box would run for hours on a PR that can't be approved")
+                self.assertIn(why, (out / "amd/unavailable.md").read_text())
+                self.assertTrue((out / "nvidia/unavailable.md").exists(), "the PR wouldn't hear why NVIDIA didn't run")
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",

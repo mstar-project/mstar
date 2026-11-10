@@ -383,8 +383,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
           forced="", asked="", asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
-    description (pr-body.md) as data, and the box's own Anthropic key. A vendor with no GPUs free, or past
-    REVIEW_GPU_MAX_RUNS, gets an unavailable.md; exits 3, with `unavailable` set, when no box started."""
+    description (pr-body.md) as data, and the box's own Anthropic key. Every vendor's box or none: when one has no
+    GPUs free, or the boxes would go past REVIEW_GPU_MAX_RUNS, none starts. A box that then fails to start (its
+    offer taken meanwhile) gets an unavailable.md; exits 3, with `unavailable` set, when no box started."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks, vendors = branch(base), check_kinds(checks), vendor_list(vendors)
     since = commit(since) if since else ""
@@ -404,16 +405,57 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
     cfg = gpu_py.load_config()
+    found = {}  # vendor -> (the offers that can start now, the listing, what was left out and why)
     for vendor in vendors:
-        box = lt / vendor
-        box.mkdir(exist_ok=True)
-        (box / "brief.md").write_text(brief(pr, head_sha, main_sha, base, run, checks, since, forced, asked,
-                                            asked_checks, vendor, vendors))
+        (lt / vendor).mkdir(exist_ok=True)
+        (lt / vendor / "brief.md").write_text(brief(pr, head_sha, main_sha, base, run, checks, since, forced, asked,
+                                                    asked_checks, vendor, vendors))
         free, listing = free_offers(gpus, vendor)
         tried = []
         # The box's Anthropic key on Eras is a saved Eras secret: without it a box would be paid for and do nothing.
         if not cfg.get("eras", {}).get("run_secret_id") and any(o["provider"] == "eras" for o in free):
             tried, free = ["eras: ERAS_RUN_SECRET_ID is not set"], [o for o in free if o["provider"] != "eras"]
+        found[vendor] = free, listing, tried
+
+    def none_free(vendor):
+        _, listing, tried = found[vendor]
+        everything = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", "--all-regions",
+                                    check=False).stdout)
+        lines = [f"No {VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
+                 f"${listing['max_usd_per_hour']}/hr."]
+        lines += [f"- tried {t}" for t in tried]
+        lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
+                  for o in everything["offers"]] or [f"- no listing has that many {VENDORS[vendor]} GPUs"]
+        lines += [f"- {e}" for e in everything["errors"]]
+        unavailable(lt / vendor, "\n".join(lines))
+
+    def stop(why):
+        """No box starts: the PR is approvable only when every vendor's box passes, so one alone would be paid
+        for nothing."""
+        for vendor in vendors:
+            if not (lt / vendor / "unavailable.md").exists():
+                unavailable(lt / vendor, why)
+        out["unavailable"] = "true"
+        sys.exit(3)
+
+    for vendor in vendors:
+        if not found[vendor][0]:
+            none_free(vendor)
+    if any((lt / v / "unavailable.md").exists() for v in vendors):
+        stop("Not started: another vendor's box can't start, and the PR passes only when every box does.")
+    cap = cfg.get("budget", {}).get("max_running")
+    if cap is not None:  # every box this run needs, against budget.max_running, before any starts
+        try:
+            gpu_py.reap(cfg)
+            up = len(gpu_py.running(cfg))
+        except gpu_py.ApiError:
+            up = 0  # gpu.py launch counts again, and refuses
+        if up + len(vendors) > cap:
+            stop(f"The bot has {up} GPU boxes going and this run needs {len(vendors)}, past {cap} "
+                 "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
+    for vendor in vendors:
+        box = lt / vendor
+        free, _, tried = found[vendor]
         inputs = [x for f in (box / "brief.md", *(lt / f for f in ("findings.json", "pr-body.md", "run.json")),
                               BOX_COMMON) for x in ("--input", str(f))]
 
@@ -425,24 +467,15 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
             return r
 
         o, r = launch_first(free, launch)
-        if r and r.returncode == 4:  # budget.max_running
+        if r and r.returncode == 4:  # budget.max_running, reached since the check above
             unavailable(box, f"The bot already has {cfg['budget']['max_running']} GPU boxes going "
                              "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
-            continue
-        if o:
+        elif o:
             (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (box / "offer.json").write_text(json.dumps(o))
             print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
-            continue
-        everything = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", "--all-regions",
-                                    check=False).stdout)
-        lines = [f"No {VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
-                 f"${listing['max_usd_per_hour']}/hr."]
-        lines += [f"- tried {t}" for t in tried]
-        lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
-                  for o in everything["offers"]] or [f"- no listing has that many {VENDORS[vendor]} GPUs"]
-        lines += [f"- {e}" for e in everything["errors"]]
-        unavailable(box, "\n".join(lines))
+        else:
+            none_free(vendor)  # taken since the listing
     if not any((box / "instance").exists() for box in boxes(lt)):
         out["unavailable"] = "true"
         sys.exit(3)
