@@ -782,10 +782,13 @@ def test_pi05_model_loaded_via_remapper_matches_lerobot():
     # Now use the model's own get_submodule path
     vit_submodule = mstar_model.get_submodule("vit_encoder", device=str(device))
     llm_submodule = mstar_model.get_submodule("LLM", device=str(device))
+    action_submodule = mstar_model.get_submodule("action_expert", device=str(device))
     assert vit_submodule is not None
     assert llm_submodule is not None
+    assert action_submodule is not None
     vit_submodule = vit_submodule.to(device, dtype=dtype).eval()
     llm_submodule = llm_submodule.to(device, dtype=dtype).eval()
+    action_submodule = action_submodule.to(device, dtype=dtype).eval()
 
     # ----- Embed images via lerobot (its SigLIP weights are now in mstar
     # so this just runs the same encoder we loaded). For the prefix
@@ -851,12 +854,12 @@ def test_pi05_model_loaded_via_remapper_matches_lerobot():
             min_period=ref_config.min_period,
             max_period=ref_config.max_period,
         ).squeeze(0)
-        adarms_cond = llm_submodule.time_mlp(time_emb.to(dtype))
-        suffix = llm_submodule.action_in_proj(x_t[0])
-        suffix_out = llm_submodule.action_expert(
+        adarms_cond = action_submodule.time_mlp(time_emb.to(dtype))
+        suffix = action_submodule.action_in_proj(x_t[0])
+        suffix_out = action_submodule.action_expert(
             query_sequence=suffix, cache_handle=action_handle, adarms_cond=adarms_cond
         )
-        v_t = llm_submodule.action_out_proj(suffix_out)
+        v_t = action_submodule.action_out_proj(suffix_out)
         x_t = x_t + dt * v_t.unsqueeze(0)
         time = time + dt
     ours_actions = x_t

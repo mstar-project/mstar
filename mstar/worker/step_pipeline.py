@@ -31,6 +31,7 @@ from mstar.worker.input_ingest import InputIngest
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation, Speculator
@@ -72,7 +73,7 @@ class StepPipeline:
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
         lifecycle: RequestLifecycle, lockstep: Lockstep, admission: Admission,
         scheduler: MicroScheduler, executor: StepExecutor, ingest: InputIngest,
-        speculator: Speculator, *, metrics: WorkerMetrics | None = None,
+        speculator: Speculator, preemption: Preemption, *, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None, launch_wait_s: float = 0.0,
         enable_nvtx: bool = False,
     ):
@@ -98,6 +99,7 @@ class StepPipeline:
         self.executor = executor
         self.ingest = ingest
         self.speculator = speculator
+        self.preemption = preemption
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
         self._launch_wait_s = launch_wait_s
@@ -230,17 +232,17 @@ class StepPipeline:
 
         # 4. Non-speculative path: nothing pending, or speculation skipped.
         with timer.span("worker.schedule"):
-            batch = None
-            if yield_away_from_target is not None:
-                batch = self.scheduler.next_batch(exclude_target=yield_away_from_target)
-            if batch is None:
-                batch = self.scheduler.next_batch()
+            batch = self._next_batch(yield_away_from_target)
         self._batch = batch
+        if batch is None or batch.node_name not in self.lockstep.led:
+            self.lockstep.flush_moves()
         if batch is None:
             if self.side_pending is not None:
                 self._finish_side(block=True)
                 return
-            self.communicator.wait_for_work(10)
+            self._rebuilds.flush_idle()
+            # the next pass's `flush_idle` waits for the copies just started, so it needn't wait the tick too
+            self.communicator.wait_for_work(0 if self._rebuilds.copies_queued else 10)
             return
 
         if self.enable_nvtx:
@@ -269,6 +271,19 @@ class StepPipeline:
         if phase_period:
             timer.pass_done(len(batch.request_to_worker_graph), iter_start, iter_cpu)
 
+    def _next_batch(self, yield_away_from_target: tuple[str, str] | None) -> ScheduledBatch | None:
+        """The non-speculative path's step: one away from ``yield_away_from_target`` when given, else any.
+
+        A follower's first call can take a head of rank 0's with no rows, and rank 0 applied the removals
+        stamped with that head before it sent the next step, so this rank applies them before building it."""
+        if yield_away_from_target is not None:
+            batch = self.scheduler.next_batch(exclude_target=yield_away_from_target)
+            if batch is not None:
+                return batch
+            if self.is_tp_follower:
+                self._apply_removes(self.in_flight_rids)
+        return self.scheduler.next_batch()
+
     def _deferred_teardown(self, laps: PhaseLaps) -> None:
         # Everything below moves pages: the removes and drains directly, the
         # preamble through a follower's delta, the readiness scans through
@@ -277,11 +292,14 @@ class StepPipeline:
         self._await_admit_settled(self.pending)
         self._count_turn(self.pending)
         laps.skip()
+        # removals held for the journal would otherwise wait out a chain of another node's steps
+        self.lockstep.flush_moves(self.pending)
         self._apply_removes(self.in_flight_rids)
         # Requests a resource refused for good since last pass, in a readiness
         # scan or a step's admit (``Admission``), which failed them then.
         self._report_failures()
         self._apply_drains(self.in_flight_rids)
+        self.preemption.make_room()
         laps.lap("teardown")
 
     def _preamble(self, laps: PhaseLaps) -> None:
@@ -703,6 +721,8 @@ class StepPipeline:
         self._teardown(self.in_flight_rids.union(referenced_rids))
         node, walk = batch.node_name, batch.graph_walk
         batch_ids = set(batch.request_to_worker_graph)
+        if not self.lockstep.follows(node) and self.preemption.preempt(node_batch):
+            return
         self.admission.relieve(
             batch, node_batch, self.lifecycle.arrivals,
             last_in_line=partial(self.scheduler.last_in_line, node, walk),
@@ -747,7 +767,7 @@ class StepPipeline:
                 void = self.speculator.step_voids_head(pending) if outputs is not None else None
                 if void is not None and not self.speculator.prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
-                    self.lockstep.pop_follow_head()
+                    self.lockstep.void_follow_head()
                     logger.debug(
                         "Worker %s: dropped speculative head seq %d (parent %d %s)",
                         self.worker_id, head.spec_seq, s, void,
@@ -816,6 +836,9 @@ class StepPipeline:
 
         # the chain's rows: a side lane's step fails on its own (``_fail_side``)
         failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
+        if speculation is not None and not speculation.submitted:
+            # a follower's build holds the head's fresh rows with the chain's, and they go back as on rank 0
+            failed_rids -= speculation.scheduled_batch.request_to_worker_graph.keys() - speculation.continuing_rids
         for stale in in_flight:
             if stale is None:
                 continue
@@ -908,6 +931,10 @@ class StepPipeline:
         self._apply_drains(in_flight)
 
     def _apply_removes(self, in_flight: Collection[int]) -> None:
+        # Rank 0 tears down nothing while its journal holds moves: each follower replays them with the next step and
+        # tears down after the step a removal is stamped with, so the pages leave in the same order on every rank.
+        if self.lockstep.owes_moves():
+            return
         for rid in self.lifecycle.removes_ready(in_flight, self.lockstep.last_consumed_seq):
             self._tear_down_request(rid)
 
@@ -950,6 +977,7 @@ class StepPipeline:
         self.admission.clear(rid)
         self.lockstep.clear(rid, wire_rid)
         self._rebuilds.remove_request(rid)
+        self.preemption.remove_request(rid)
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on
