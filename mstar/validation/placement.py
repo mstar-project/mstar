@@ -255,10 +255,15 @@ def _walk_partitions(model: Model, walk_graphs: Mapping[str, GraphSection]) -> I
 
 def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[dict]) -> Iterator[str]:
     """A node of a walk in no node_group or in two (the later group silently
-    wins), a node_group naming a walk the model does not define, and a rank no
-    walk runs on: the deployment starts a worker per rank ``node_groups`` names
-    (``deployment_workers``), and this one would have nothing to do."""
+    wins), a node_group naming a node or a walk the model does not define, and
+    a rank no walk runs on: the deployment starts a worker per rank
+    ``node_groups`` names (``deployment_workers``), and this one would have
+    nothing to do."""
+    nodes = {node for graph in walk_graphs.values() for node in graph.get_nodes()}
     for i, group in enumerate(node_groups):
+        unknown_nodes = sorted(set(group["node_names"]) - nodes)
+        if unknown_nodes:
+            yield f"node_groups[{i}] lists nodes {unknown_nodes}, which this model does not define"
         unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
         if unknown:
             yield (

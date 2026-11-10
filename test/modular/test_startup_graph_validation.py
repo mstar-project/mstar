@@ -165,14 +165,6 @@ def test_a_rank_no_walk_runs_on_is_rejected(tmp_path):
         _validate(_ToyModel(_prefill_decode), cfg)
 
 
-def test_a_left_over_group_on_a_rank_a_walk_uses_is_accepted(tmp_path, monkeypatch):
-    cfg = _config(tmp_path, [
-        {"node_names": ["llm"], "ranks": [0]},
-        {"node_names": ["left_over"], "ranks": [0]},
-    ])
-    assert _start_conductor(_ToyModel(_prefill_decode), cfg, tmp_path, monkeypatch)._sorted_ranks == [0]
-
-
 def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
     cfg = _config(tmp_path, [
         {"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]},

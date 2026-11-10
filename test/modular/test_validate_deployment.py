@@ -764,3 +764,8 @@ def test_head_geometry_is_checked_before_workers_start(tmp_path, kind, qo_heads,
         problems = _problems(model, cfg)
         assert any(spec.resource_key in problem for problem in problems), problems
     assert spec.config == _head_spec(kind, qo_heads, kv_heads).config, "the check sharded the model's own config"
+
+
+def test_node_group_typo_is_not_silently_ignored(tmp_path):
+    config = _cfg(tmp_path, node_groups=[{"node_names": ["llm", "typo"], "ranks": [0]}])
+    assert any("typo" in p for p in _problems(_Model(), config))
