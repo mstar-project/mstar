@@ -157,29 +157,32 @@ fn silero() -> Option<&'static Mutex<Session>> {
                 eprintln!("WARNING: server_vad is unavailable: no Silero VAD weights (set MSTAR_SILERO_VAD_PATH or install mstar-ai[vad])");
                 return None;
             };
-            let mut s = match session(path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("WARNING: server_vad is unavailable: cannot load Silero VAD from {path}: {e}");
-                    return None;
+            match load_silero(path) {
+                Ok(s) => Some(Mutex::new(s)),
+                Err(why) => {
+                    eprintln!("WARNING: server_vad is unavailable: {why}");
+                    None
                 }
-            };
-            let want = vec![
-                ("input".to_string(), "tensor(float)".to_string()),
-                ("sr".to_string(), "tensor(int64)".to_string()),
-                ("state".to_string(), "tensor(float)".to_string()),
-            ];
-            if inputs_of(&s) != want {
-                eprintln!("WARNING: server_vad is unavailable: {path} is not the Silero VAD export this server runs (silero_vad.onnx)");
-                return None;
             }
-            if score(&mut s, &vec![0.0; CONTEXT + FRAME], &vec![0.0; STATE_LEN]).is_err() {
-                eprintln!("WARNING: server_vad is unavailable: {path} cannot score a silent frame");
-                return None;
-            }
-            Some(Mutex::new(s))
         })
         .as_ref()
+}
+
+/// The Silero session from `path`, or why it is not the export this server runs.
+fn load_silero(path: &str) -> Result<Session, String> {
+    let mut s = session(path).map_err(|e| format!("cannot load Silero VAD from {path}: {e}"))?;
+    let want = vec![
+        ("input".to_string(), "tensor(float)".to_string()),
+        ("sr".to_string(), "tensor(int64)".to_string()),
+        ("state".to_string(), "tensor(float)".to_string()),
+    ];
+    if inputs_of(&s) != want {
+        return Err(format!("{path} is not the Silero VAD export this server runs (silero_vad.onnx)"));
+    }
+    if score(&mut s, &vec![0.0; CONTEXT + FRAME], &vec![0.0; STATE_LEN]).is_err() {
+        return Err(format!("{path} cannot score a silent frame"));
+    }
+    Ok(s)
 }
 
 /// One Silero run: the speech probability and the new recurrent state.
@@ -1057,6 +1060,57 @@ mod tests {
         seg.feed(&append);
         seg.reset(0);
         assert!(seg.recent.is_empty());
+    }
+
+    // ── Silero, through ONNX Runtime ────────────────────────────────────────
+
+    #[test]
+    #[ignore = "needs ONNX Runtime and the silero-vad package's exports, named by MSTAR_REALTIME's onnxruntime and silero"]
+    fn only_the_silero_export_this_server_runs_is_loaded() {
+        let silero = facts()["silero"].as_str().expect("MSTAR_REALTIME names silero");
+        let dir = std::path::Path::new(silero).parent().unwrap();
+        for (file, loads) in [
+            ("silero_vad.onnx", true),
+            // lists sr before state; inputs go by name
+            ("silero_vad_op18_ifless.onnx", true),
+            ("silero_vad_half.onnx", false),
+            ("silero_vad_openvino_16k.onnx", false),
+            ("silero_vad_16k_sequence.onnx", false),
+        ] {
+            let path = dir.join(file);
+            match load_silero(path.to_str().unwrap()) {
+                Ok(_) => assert!(loads, "{file} loaded"),
+                Err(why) => {
+                    assert!(!loads, "{file}: {why}");
+                    assert!(why.contains("is not the Silero VAD export"), "{file}: {why}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs ONNX Runtime and Silero VAD, named by MSTAR_REALTIME's onnxruntime and silero"]
+    fn silero_streams_share_one_model_but_not_its_state() {
+        // streams interleaved through the one session score each frame as
+        // they would alone, and a reset starts a stream over
+        assert!(silero_available());
+        let frames: Vec<Vec<f32>> = (0..40)
+            .map(|k| (0..FRAME).map(|i| (((k * FRAME + i) as f32) * 0.07).sin() * (k % 5) as f32 * 0.1).collect())
+            .collect();
+        let alone: Vec<f64> = {
+            let mut v = Silero::new();
+            frames.iter().map(|f| v.prob(f)).collect()
+        };
+        let (mut a, mut b) = (Silero::new(), Silero::new());
+        let mut together = Vec::new();
+        for (f, g) in frames.iter().zip(frames.iter().rev()) {
+            together.push(a.prob(f));
+            b.prob(g);
+        }
+        assert_eq!(together, alone);
+        a.reset();
+        assert_eq!(frames.iter().map(|f| a.prob(f)).collect::<Vec<_>>(), alone);
+        assert!(alone.windows(2).any(|w| w[0] != w[1]), "the probabilities should depend on the audio");
     }
 
     // ── against the Python segmenter ────────────────────────────────────────
