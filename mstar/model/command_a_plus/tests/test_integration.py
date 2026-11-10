@@ -54,7 +54,8 @@ class ToyLM(nn.Module):
         super().__init__()
         self.embed = nn.Embedding.from_pretrained(torch.eye(vocab))
 
-    def forward(self, x):
+    def forward(self, x, *, label):
+        assert label == "main"
         return x
 
     def logits(self, x):
@@ -75,10 +76,8 @@ class NodeTests(unittest.TestCase):
 
     def bind(self, attention, sampler):
         """The node's handles over doubles, as the engine binds them at load."""
-        model = SimpleNamespace(config=self.config, max_seq_len=self.config.max_position_embeddings)
-        declared = CommandAPlusModel.declare_state(model)
         resources = {KV_CACHE: MemoryKV(), ROPE: None, LOCAL_ATTN: attention, GLOBAL_ATTN: attention, SAMPLER: sampler}
-        self.node.bind_node_state(node_handles(SimpleNamespace(declare_state=lambda: declared), "LLM", resources))
+        self.node.bind_node_state(node_handles(self.model, "LLM", resources))
 
     def begin_step(self, walk, rids, inputs):
         """What the engine does ahead of a forward."""
@@ -167,7 +166,7 @@ class ModelIntegrationTests(unittest.TestCase):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
         kv, pos, local, global_ = bind_test_resources(node.model.model, self.model.config)
-        local.select_last_hidden = lambda hidden: hidden[-1:]
+        local.select_last_hidden = lambda hidden, label: hidden[-1:]
         sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
         node.bind_node_state(node_handles(self.model, "LLM", resources))
@@ -339,18 +338,23 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertEqual((layout["offset"], layout["tokens"]), ([2, 7, 15], [4, 4, 4]))
         node = toy_node(self.model)
         # the media prompt reads where its stream's positions start
-        node.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-        ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
-        engine = ModelInputsFromEngine(["a"], {}, {
-            LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x: x),
+        node.bind_node_state(node_handles(self.model, "LLM", {
+            KV_CACHE: MemoryKV(), ROPE: SimpleNamespace(position=lambda rid, label: 0),
+            LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x, label: x), GLOBAL_ATTN: None,
             SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
-        })
+        }))
+        ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
+        engine = ModelInputsFromEngine(["a"], {}, {})
         inputs = node.prepare_inputs(
             "prefill_image", info("prefill_image", layout=layout), {"text_inputs": [ids], "image_embeds": [rows]},
         )
+        step = engine_step(node, graph_walk="prefill_image", request_ids=["a"], inputs=[inputs])
+        step.set_ctx(StepContext(("a",), "prefill_image", 0, False))
+        step.begin_calls()
         hidden = node.forward_batched(
             "prefill_image", engine, **node.preprocess("prefill_image", engine, [inputs]),
         ).row_outputs["new_token"]
+        step.end_calls()
         pads = ids == image
         torch.testing.assert_close(hidden[pads], rows)
         torch.testing.assert_close(hidden[~pads], torch.eye(self.model.config.vocab_size)[ids[~pads]])

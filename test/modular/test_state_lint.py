@@ -26,8 +26,11 @@ FORBIDDEN_ATTRIBUTES = {
 
 _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
 ALLOWED = {
-    ("mstar.engine.accelerator_graph_config", name): _CAPTURE
-    for name in ("AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE")
+    **{
+        ("mstar.engine.accelerator_graph_config", name): _CAPTURE
+        for name in ("AcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE")
+    },
+    ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
 }
 
 

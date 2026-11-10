@@ -367,7 +367,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
 def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
     reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
-    _assert_equal_per_key(node_resources(model), reference)
+    _assert_equal_per_key(enabled_resources(model, {}), reference)
     assert state_declaration_problems(model) == []
 
 
@@ -508,7 +508,7 @@ def test_qwen3_5_vision_region_steps_equal_the_hand_written_ones(monkeypatch):
     encoder = _qwen3_5_encoder(monkeypatch)
     config = encoder.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.bfloat16)[VISION_BLOCK_LOOP]
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._config, runner._lora_keys, runner._state_handles = config, (), encoder.state_handles
+    runner._config, runner._segment_keys, runner._state_handles = config, (), encoder.state_handles
     step = runner._region_step([7], [3, 5])
     reference = PiecewisePackedConfig(
         capture_fn=config.capture_fn, make_static_inputs=config.make_static_inputs, attn_key=VISION_ATTN,
@@ -565,7 +565,7 @@ def test_qwen3_5_vision_layout_converts_to_the_hand_written_one_with_no_keyed_sp
 def test_qwen3_5_request_settings_equal_the_hand_written_config():
     model = _qwen3_5(**QWEN3_5["9B"])
     kwargs = {"temperature": 0.0, "top_p": 0.5, "top_k": 3, "repetition_penalty": 1.3, "ignore_eos": True, "seed": 9}
-    configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
     reference = SamplingReqConfig(temperature=0.0, top_p=0.5, top_k=3, repetition_penalty=1.3, ignore_eos=True)
     assert configs == {SAMPLER: reference}
 
@@ -906,7 +906,7 @@ def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:
                 apply_penalty=True,
                 prefill_tracked_tokens={
                     rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True)
-                } if walk in command_a_plus_config.PREFILL_WALKS else {},
+                } if walk != "decode" else {},
             ),
         },
     )
@@ -917,7 +917,7 @@ def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:
 ])
 def test_command_a_plus_steps_equal_the_hand_written_ones(tmp_path, walk, lengths):
     model = _command_a_plus(tmp_path)
-    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, 0), model)
+    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, (model.image_encoder,)), model)
     rids = list(range(len(lengths)))
     inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in lengths]
     step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
