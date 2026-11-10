@@ -1,0 +1,389 @@
+"""MiniCPM-o: prompt layout, walk selection and step declarations, without weights.
+
+The resampler's sincos keys, the navit position buckets and the image
+slicing are checked against upstream's own formulas on the CPU. What needs
+the checkpoint's real tokenizer (not its weights) skips unless
+MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from mstar.model.components.qwen3_lm import Qwen3LMConfig
+from mstar.model.minicpm_o.components.vision import Resampler, navit_position_ids, slice_layout
+from mstar.model.minicpm_o.config import (
+    DECODE_LOOP,
+    LLM_SAMPLER,
+    PREFILL_WALKS,
+    AudioConfig,
+    MiniCPMOConfig,
+    ResamplerConfig,
+    VisionConfig,
+)
+
+CKPT = os.environ.get("MINICPM_O_CKPT")
+needs_ckpt = pytest.mark.skipif(not CKPT, reason="set MINICPM_O_CKPT to a MiniCPM-o 4.5 snapshot")
+
+
+# --- upstream formulas, copied for reference -------------------------------
+
+def upstream_sincos_table(embed_dim: int, h: int, w: int) -> np.ndarray:
+    grid = np.stack(np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32)), axis=0)
+
+    def axis(dim, pos):
+        omega = np.arange(dim // 2, dtype=np.float32)
+        omega /= dim / 2.0
+        omega = 1.0 / 10000 ** omega
+        out = np.einsum("hw,d->hwd", pos, omega)
+        return np.concatenate([np.sin(out), np.cos(out)], axis=-1)
+
+    return np.concatenate([axis(embed_dim // 2, grid[0]), axis(embed_dim // 2, grid[1])], axis=-1)
+
+
+def upstream_navit_ids(h: int, w: int, side: int) -> torch.Tensor:
+    # h and w are rows of the processor's int32 tgt_sizes
+    h, w = torch.tensor(h, dtype=torch.int32), torch.tensor(w, dtype=torch.int32)
+    boundaries = torch.arange(1 / side, 1.0, 1 / side)
+    bh = torch.bucketize(torch.arange(0, 1 - 1e-6, 1 / h), boundaries, right=True)
+    bw = torch.bucketize(torch.arange(0, 1 - 1e-6, 1 / w), boundaries, right=True)
+    return (bh[:, None] * side + bw).flatten()
+
+
+# --- CPU, no checkpoint ----------------------------------------------------
+
+@pytest.mark.parametrize("hw", [(26, 40), (36, 28), (1, 1), (70, 70), (5, 100)])
+def test_sincos_keys_match_upstream_table(hw):
+    """Per-patch keys, computed from (row, col), equal upstream's precomputed
+    table at those cells, including past its 70x70 default size."""
+    h, w = hw
+    resampler = Resampler(ResamplerConfig(embed_dim=256, kv_dim=16))
+    coords = slice_layout([(h, w)], VisionConfig()).grid_coords
+    got = resampler.sincos(coords)
+    want = torch.from_numpy(upstream_sincos_table(256, h, w)).reshape(h * w, -1)
+    assert torch.allclose(got, want, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3), (1, 25), (13, 49)])
+def test_navit_position_buckets_match_upstream(hw):
+    assert torch.equal(navit_position_ids(*hw, 70), upstream_navit_ids(*hw, 70))
+
+
+def test_slice_layout_concatenates_slices_in_order():
+    layout = slice_layout([(2, 3), (1, 2)], VisionConfig())
+    assert layout.seq_lengths == (6, 2)
+    assert layout.grid_coords.tolist()[:6] == [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]
+    assert layout.grid_coords.tolist()[6:] == [[0, 0], [0, 1]]
+
+
+def a_config(**kwargs) -> MiniCPMOConfig:
+    return MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(), **kwargs,
+    )
+
+
+def a_bare_model(**attrs):
+    """A MiniCPMOModel without its checkpoint: what reads only ``config``."""
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    model = object.__new__(MiniCPMOModel)
+    model.config = a_config()
+    for name, value in attrs.items():
+        setattr(model, name, value)
+    return model
+
+
+@pytest.mark.parametrize("walk", sorted(PREFILL_WALKS))
+def test_prefill_token_counts_toward_the_budget(walk):
+    """The prefill samples the reply's first token: a stop id there, or a
+    one-token budget, ends the reply, and decode runs one step fewer."""
+    from mstar.model.minicpm_o.submodules import LLMSubmodule
+    from mstar.model.submodule_base import END_PARTITION
+
+    llm = LLMSubmodule(torch.nn.Identity(), a_config(stop_token_ids=(7,)))
+
+    def stop(token, max_tokens):
+        info = SimpleNamespace(
+            graph_walk=walk, max_tokens=max_tokens, step_metadata={}, dynamic_loop_iter_counts={},
+            resource_configs={LLM_SAMPLER: SimpleNamespace(ignore_eos=False)},
+        )
+        return llm.check_stop("r", info, {"new_token": [torch.tensor([token])]})
+
+    assert stop(7, 8) == {END_PARTITION}
+    assert stop(3, 1) == {END_PARTITION}
+    assert stop(3, 8) == set()
+    model = a_bare_model()
+    assert model.get_loop_caps(max_output_tokens=8) == {DECODE_LOOP: 7}
+    assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
+
+
+@pytest.mark.parametrize("knob, value", [
+    ("max_slice_nums", "9"), ("max_slice_nums", 0), ("max_slice_nums", 1000), ("max_slice_nums", True),
+    ("enable_thinking", "false"),
+])
+def test_bad_request_knobs_are_refused(knob, value):
+    with pytest.raises(ValueError, match=knob):
+        a_bare_model().process_prompt("Hi.", ["text"], ["text"], **{knob: value})
+
+
+def test_min_p_is_served():
+    """Upstream's ``chat`` hands ``min_p`` to HF ``generate``, which honours it."""
+    from mstar.engine.resources import SamplerSpec
+
+    model = a_bare_model(max_seq_len=4096)
+    [spec] = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec)]
+    model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
+
+
+def test_an_attachment_tag_in_the_users_text_is_refused():
+    from mstar.model.minicpm_o import processor
+
+    with pytest.raises(ValueError, match="attachment tags"):
+        processor.expand_tags(f"{processor.IMAGE_TAG} {processor.IMAGE_TAG}", ["<image>"], [])
+
+
+def test_max_seq_len_sizes_the_kv_and_the_decode_loop(tmp_path):
+    from test_trust_remote_code import MINICPM_O_CONFIG, _tokenizer_dir
+
+    from mstar.engine.resources import KVSpec
+    from mstar.model.minicpm_o.config import LLM_KV
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    _tokenizer_dir(tmp_path, {}, {"config.json": json.dumps(MINICPM_O_CONFIG)})
+    model = MiniCPMOModel(str(tmp_path), max_seq_len=4096)
+    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
+    assert kv.config.max_seq_len == 4096
+    assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
+    with pytest.raises(ValueError, match="max_seq_len"):
+        MiniCPMOModel(str(tmp_path), max_seq_len=model.config.llm.max_position_embeddings + 1)
+
+
+@pytest.mark.parametrize("size, grid, slices, placeholder", [
+    # (width, height) -> the (cols, rows) grid, each slice's (h, w) in patches
+    # (the source, then the crops) and the placeholder text, worked by hand
+    # from upstream's get_sliced_grid, find_best_resize and get_refine_size
+    # tall: the source is 316x633 px, rounded to 322x630
+    ((500, 1000), (1, 2), [(45, 23), (32, 32), (32, 32)], "{h}<slice>{u}</slice>\n<slice>{u}</slice>"),
+    # 1x2 and 2x1 tie; the first found wins. Each crop is 600x300 px, sized to 632x316, then 630x322
+    ((600, 600), (1, 2), [(32, 32), (23, 45), (23, 45)], "{h}<slice>{u}</slice>\n<slice>{u}</slice>"),
+    ((896, 896), (2, 2), [(32, 32)] * 5, (
+        "{h}<slice>{u}</slice><slice>{u}</slice>\n<slice>{u}</slice><slice>{u}</slice>"
+    )),
+    # small: whole, upscaled to 547x365 px, rounded to 546x364
+    ((300, 200), None, [(26, 39)], "{h}"),
+])
+def test_image_slicing_matches_upstream(size, grid, slices, placeholder):
+    from PIL import Image
+
+    from mstar.model.minicpm_o import processor
+
+    # red rises left to right and green top to bottom, so a crop's colour says where it came from
+    w, h = size
+    ramp = np.zeros((h, w, 3), dtype=np.uint8)
+    ramp[..., 0], ramp[..., 1] = np.linspace(0, 255, w)[None, :], np.linspace(0, 255, h)[:, None]
+    images, got = processor.slice_image(Image.fromarray(ramp), processor.MAX_SLICE_NUMS, 14)
+    assert got == grid
+    assert [processor.slice_patches(image, 14)[1] for image in images] == slices
+    # the crops go row by row, as upstream's split_to_patches
+    where = [np.asarray(image, dtype=float).mean(axis=(0, 1))[[1, 0]].tolist() for image in images[1:]]
+    assert where == sorted(where)
+    u = "<unk>" * 64
+    want = placeholder.format(h=f"<image_id>3</image_id><image>{u}</image>", u=u)
+    assert processor.image_placeholder(3, grid, 64) == want
+
+
+# --- with the checkpoint's config and tokenizer ---------------------------
+
+@pytest.fixture(scope="module")
+def model():
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    return MiniCPMOModel(CKPT)
+
+
+def an_image(h=448, w=640):
+    return torch.rand(3, h, w, generator=torch.Generator().manual_seed(0))
+
+
+def a_clip(seconds=3.0):
+    return 0.1 * torch.randn(int(16000 * seconds), generator=torch.Generator().manual_seed(1))
+
+
+@needs_ckpt
+@pytest.mark.parametrize("max_slice_nums", [1, None])
+def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
+    from mstar.model.multimodal import PromptPart
+
+    prompt = model.process_prompt(
+        None, ["image", "text"], ["text"],
+        tensors={"image_inputs": [an_image()]},
+        prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
+        max_slice_nums=max_slice_nums,
+    )
+    out = prompt.new_input_tensors
+    ids = out["text_inputs"][0]
+    positions = out["image_positions"][0]
+    tgt = torch.tensor(prompt.metadata["image_tgt_sizes"])
+    assert positions.numel() == tgt.shape[0] * model.config.resampler.num_queries
+    unk = model.tokenizer.convert_tokens_to_ids("<unk>")
+    assert (ids[positions] == unk).all()
+    assert out["pixel_values"][0].shape[0] == int((tgt[:, 0] * tgt[:, 1]).sum())
+
+
+@needs_ckpt
+def test_chat_turns_keep_their_roles(model):
+    """A multi-turn chat renders as upstream's template renders its messages."""
+    from mstar.model.multimodal import PromptPart
+
+    turns = [("system", "Be brief."), ("user", "Hi."), ("assistant", "Hello."), ("user", "Name a colour.")]
+    out = model.process_prompt(
+        None, ["text"] * len(turns), ["text"], prompt_parts=[PromptPart("text", t, role=r) for r, t in turns],
+    ).new_input_tensors
+    want = model.tokenizer.apply_chat_template(
+        [{"role": r, "content": t} for r, t in turns], tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    assert out["text_inputs"][0].tolist() == model.tokenizer.encode(want)
+
+
+@needs_ckpt
+def test_audio_placeholders_line_up_with_pooled_tokens(model):
+    from mstar.model.multimodal import PromptPart
+
+    prompt = model.process_prompt(
+        None, ["text", "audio"], ["text"],
+        tensors={"audio_inputs": [a_clip()]},
+        prompt_parts=[PromptPart("text", "Transcribe."), PromptPart("audio")],
+    )
+    out = prompt.new_input_tensors
+    lens = prompt.metadata["audio_feature_lens"]
+    assert out["audio_positions"][0].numel() == sum(model.config.audio.pooled_tokens(n) for n in lens)
+    # audio anywhere turns upstream's speech template on: the prompt ends on <|tts_bos|>
+    assert out["text_inputs"][0][-1].item() == model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+
+
+@needs_ckpt
+@pytest.mark.parametrize("seconds", [(30.05,), (60.01,), (0.06,), (1.05, 1.05), (0.06, 2.0)])
+def test_audio_placeholders_line_up_for_any_clips(model, seconds):
+    """Pieces that pool to nothing (a sliver past a 30 s cut, a clip under
+    ~0.1 s) are left out, and clips of one message are encoded one by one, as
+    their placeholders are sized."""
+    from mstar.model.multimodal import PromptPart
+
+    clips = [a_clip(s) for s in seconds]
+    prompt = model.process_prompt(
+        None, ["text"] + ["audio"] * len(clips), ["text"],
+        tensors={"audio_inputs": clips},
+        prompt_parts=[PromptPart("text", "Transcribe.")] + [PromptPart("audio")] * len(clips),
+    )
+    out = prompt.new_input_tensors
+    audio = model.config.audio
+    if "audio_feature_lens" not in prompt.metadata:  # nothing long enough to encode
+        assert seconds == (0.06,)
+        return
+    lens = prompt.metadata["audio_feature_lens"]
+    assert min(audio.pooled_tokens(n) for n in lens) > 0
+    assert out["audio_positions"][0].numel() == sum(audio.pooled_tokens(n) for n in lens)
+    assert out["audio_features"][0].shape[-1] == sum(lens)
+
+
+@needs_ckpt
+def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
+    """The slice grids and mel lengths reach the encoders as step metadata,
+    and their segments cover the patches and frames the prompt carries."""
+    from mstar.model.minicpm_o.submodules import AudioEncoderSubmodule, VisionEncoderSubmodule
+    from mstar.model.multimodal import PromptPart
+
+    prompt = model.process_prompt(
+        None, ["image", "audio", "text"], ["text"],
+        tensors={"image_inputs": [an_image()], "audio_inputs": [a_clip()]},
+        prompt_parts=[PromptPart("image"), PromptPart("audio"), PromptPart("text", "What is this?")],
+    )
+    out = prompt.new_input_tensors
+    signals = {name: [None] for name in out}
+    prefill, _ = model.walk_plan("default", ["text"], ["text"], signals, prompt.metadata)
+    assert prefill.walk == "prefill_omni"
+    info = SimpleNamespace(step_metadata=prefill.step_metadata)
+    vision = VisionEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"pixel_values": out["pixel_values"]},
+    )
+    assert sum(vision.kwargs["seq_lengths"]) == vision.input_seq_len == out["pixel_values"][0].shape[0]
+    audio = AudioEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"audio_features": out["audio_features"]},
+    )
+    assert sum(audio.kwargs["mel_lens"]) == out["audio_features"][0].shape[-1]
+
+
+@needs_ckpt
+def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
+    """The LLM's layout: one span over every prompt row (placeholders included),
+    written by the prefill walk the request takes, then a row per decode step."""
+    from mstar.model.minicpm_o.config import LLM_KV
+    from mstar.model.multimodal import PromptPart
+
+    out = model.process_prompt(
+        None, ["image", "text"], ["text"],
+        tensors={"image_inputs": [an_image()]},
+        prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
+    )
+    (span,) = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    rows = out.new_input_tensors["text_inputs"][0].numel()
+    assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
+    assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
+    assert set(model.kv_labels()) == {LLM_KV}
+
+
+@needs_ckpt
+@pytest.mark.parametrize(
+    "tensors, walk",
+    [
+        ({"text_inputs"}, "prefill_text"),
+        ({"text_inputs", "pixel_values", "image_positions"}, "prefill_image"),
+        ({"text_inputs", "audio_features", "audio_positions"}, "prefill_audio"),
+        ({"text_inputs", "pixel_values", "image_positions", "audio_features", "audio_positions"}, "prefill_omni"),
+    ],
+)
+def test_the_plan_prefills_by_the_attachments_then_decodes_its_token(model, tensors, walk):
+    """The prefill walk the attachments pick, whose inputs the request's signals
+    all name (the conductor sends each input the signal of its name), then decode
+    fed the prefill's token."""
+    from mstar.conductor.request_info import FINAL_PREFILL
+    from mstar.graph.base import TensorPointerInfo
+
+    signals = {name: [TensorPointerInfo.__new__(TensorPointerInfo)] for name in tensors}
+    prefill, decode = model.walk_plan("default", ["text"], ["text"], signals, {})
+    assert (prefill.walk, prefill.step_metadata[FINAL_PREFILL]) == (walk, True)
+    assert (decode.walk, decode.bind) == ("decode", {"text_inputs": "new_token"})
+    produced = {"vision_embeds", "audio_embeds"}
+    for node in model.get_graph_walk_graphs()[walk].get_nodes().values():
+        assert set(node.input_names) - produced <= tensors
+
+
+@needs_ckpt
+def test_text_streamed_a_token_at_a_time_reassembles(model):
+    """Each decode step's token reaches the client alone: a character split
+    across tokens must join back whole, and the stop tokens are dropped."""
+    text = "Paris 🐱猫."
+    ids = model.tokenizer.encode(text, add_special_tokens=False) + list(model.config.stop_token_ids)
+    chunks = model.postprocess_inline(ids, "text", [None] * len(ids))
+    assert b"".join(chunks).decode("utf-8") == text
+    assert model.postprocess(torch.tensor(ids), "text") == text.encode("utf-8")
+
+
+@needs_ckpt
+def test_every_node_gets_only_its_resources(model):
+    by_node: dict[str, set[str]] = {}
+    for spec in model.get_node_resources():
+        for node in spec.nodes:
+            by_node.setdefault(node, set()).add(spec.resource_key)
+    assert by_node == {
+        "LLM": {"llm_kv", "llm_attn", "llm_pos", "llm_sampler"},
+        "vision_encoder": {"vision_attn", "resampler_attn"},
+        "audio_encoder": {"audio_attn"},
+    }
