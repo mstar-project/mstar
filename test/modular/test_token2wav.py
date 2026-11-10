@@ -798,6 +798,36 @@ def test_resources_declare_one_state_pool_and_a_cache_per_family():
     assert all(s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in kv.values())
 
 
+@pytest.mark.parametrize("t", [1, 25, 54])
+def test_band_fits_says_whether_the_band_stays_inside_the_position_table(t):
+    """``band_fits`` against the indices ``_band`` actually reads: past it they go negative,
+    which torch wraps to the table's other end without an error."""
+    from mstar.model.components.token2wav.flow import (
+        REL_POS_MAX_LEN,
+        band_fits,
+        band_offsets,
+        band_width,
+        rel_position_table,
+    )
+
+    center = rel_position_table(8).size(1) // 2
+    assert center == REL_POS_MAX_LEN - 1
+    edge = REL_POS_MAX_LEN - t
+    for max_keys in (0, 100, edge - 1, edge, edge + 1, 2 * REL_POS_MAX_LEN):
+        index = center + band_offsets(t, band_width(max_keys, t))
+        assert bool(index.min() >= 0) == band_fits(max_keys, t), max_keys
+
+
+def test_cut_conformer_caches_fit_the_position_table_for_any_served_voice():
+    """MiniCPM-o's caches are cut, so a voice longer than any served passes the check; one
+    of minutes, which the dense voice set-up could not hold either, does not."""
+    from mstar.model.components.token2wav.resources import token2wav_resources
+
+    token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 60.0), max_slots=9)
+    with pytest.raises(ValueError, match="too long"):
+        token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 150.0), max_slots=9)
+
+
 @pytest.mark.parametrize(
     ("state", "kv", "ok"), [(None, None, True), (17, 16, True), (16, 16, False), (17, None, False)],
 )

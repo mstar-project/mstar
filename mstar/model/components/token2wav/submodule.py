@@ -345,13 +345,13 @@ class Token2WavSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        return {"rows": [
-            (
-                inp.tensor_inputs["codes"].to(device) - self.code_offset,
-                inp.kwargs["last"], inp.kwargs.get("first", False),
-            )
-            for inp in inputs
-        ]}
+        rows = []
+        for inp in inputs:
+            codes = inp.tensor_inputs["codes"].to(device)
+            if self.code_offset:  # a kernel per row only for a stream that needs it
+                codes = codes - self.code_offset
+            rows.append((codes, inp.kwargs["last"], inp.kwargs.get("first", False)))
+        return {"rows": rows}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list | None = None, **kwargs,
