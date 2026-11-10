@@ -1440,7 +1440,7 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
 
 # where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
 THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
-    pytest.param(False, None, id="by_head-ulysses"),
+    pytest.param(False, "ulysses", id="by_head-ulysses"),
     pytest.param(True, "all_gather", id="by_position-all_gather"),
     pytest.param(True, "ring", id="by_position-ring"),
 ])

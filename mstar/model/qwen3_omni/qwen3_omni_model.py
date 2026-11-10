@@ -373,9 +373,11 @@ class Qwen3OmniModel(Model):
                     kv_cache=THINKER_KV
                 )
             ),
-            # every walk may split; over KV stored by position only where the deployment sets the
-            # shard's exchange to all_gather or ring. A decode step never does.
-            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0),
+            # every walk may split, where the deployment sets the shard's exchange: all_gather or
+            # ring over KV stored by position, ulysses over KV stored by head. A decode step never
+            # does. "none" by default, so a Thinker on SP ranks over KV stored by head is refused
+            # until a deployment opts into Ulysses, which has run on CPU only
+            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0, exchange="none"),
             PositionSpec(
                 resource_key=TALKER_POS,
                 nodes={"Talker"},

@@ -1059,17 +1059,20 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
-- ``configs/qwen3omni_thinker_tp4_sp2.yaml`` (pending GPU validation) runs the
+- ``configs/qwen3omni_thinker_tp4_sp2.yaml`` (GPU-tested before its last merge of main; a rerun is pending) runs the
   Thinker on 8 GPUs as 4 TP ranks by 2 SP ranks, for long prompts. Its KV pool
   is stored by position over each SP pair (``context_parallel``). A prefill of
   at least ``min_tokens`` tokens (on the ``thinker_shard`` resource) splits over
   the pair: each rank runs the layers on its half of the tokens, and attention
   gathers the step's queries, keys and values (``exchange: all_gather`` on
-  ``thinker_shard``; with its default, ``auto``, the Thinker runs every step copied). Decode and
+  ``thinker_shard``; with the Thinker's default, ``none``, it runs every step copied, and over KV
+  stored by head a Thinker on SP ranks is refused unless the deployment sets ``exchange: ulysses``,
+  which has run on CPU only). Decode and
   shorter prefills run copied on both ranks, each attending its half of the
   stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
-  ``min_tokens`` is a placeholder until measured. Chunked prefill is off on SP
-  ranks, so a prompt prefills in one step.
+  ``min_tokens`` is a placeholder: on 8 H100s all-gather prefilled faster than
+  the copied path from 16K-token prompts and slower at 4K to 8K, and the config isn't
+  tuned to that yet. Chunked prefill is off on SP ranks, so a prompt prefills in one step.
 - Numerics: the Thinker's q/k RMSNorm and multimodal RoPE run in one kernel
   with the KV write, in fp32 throughout and rounded once, where the unfused ops
   (and Hugging Face) round to bf16 after the norm and after each step of the
