@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_rebuild_policy import POLICY, _graphs
+from test_rebuild_policy import POLICY, _graphs, _kept, _record
 from test_scheduler_room import NODE, _rids
 from test_scheduler_room import _Engine as _RoomEngine
 from test_scheduler_room import _Runtime as _RoomRuntime
@@ -30,11 +30,11 @@ from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.testing_utils.worker import make_scheduler
 from mstar.worker.chunk_loops import ChunkLoops
-from mstar.worker.host_pool import HostCopy, HostSlice
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import MidPrefillRow
-from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import PlannedRow, RebuildCursor, Rebuilds
 
-PREFILL, DECODE, MIXED = POLICY.walk, "decode", "mixed"
+(PREFILL,), DECODE, MIXED = POLICY.walks, "decode", "mixed"
 R = "r"
 SIGNALS = ("new_token",)
 
@@ -88,7 +88,7 @@ class _Engine(_RoomEngine):
         return FULL_ADMIT_REBUILD if rid in self.dropped else FULL_ADMIT_OK
 
     def prepare_rebuild(self, node_name, rid, rebuild):
-        self.prepared.append((rid, list(rebuild.ids)))
+        self.prepared.append((rid, list(rebuild.sampled)))
 
     def admit_waiting(self, published_of):
         return []
@@ -101,7 +101,8 @@ def _scheduler(walks, combined=False, runtime_type=None, chunk_loops=None, **eng
     sched = make_scheduler(
         SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
         combined_walk_of={(NODE, PREFILL): MIXED, (NODE, DECODE): MIXED} if combined else None,
-        graph_runtime=runtime, request_state=state, rebuilds=Rebuilds({NODE: POLICY}, _graphs()),
+        graph_runtime=runtime, request_state=state,
+        rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu"))),
         chunk_loops=chunk_loops,
     )
     return sched, runtime, state, engine
@@ -109,20 +110,18 @@ def _scheduler(walks, combined=False, runtime_type=None, chunk_loops=None, **eng
 
 def _rebuilding(sched, rid=R, total=20, done=0):
     """``rid``'s rebuild on ``NODE``, ``done`` of its ``total`` tokens in."""
-    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(
-        PREFILL, total, total, array("i", range(total + 1)), torch.int64, done,
-    )
+    row = PlannedRow(PREFILL, total, total, _record(range(total)))
+    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor((row,), array("i", [total]), done=done)
 
 
 def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
     sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
-    prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
-    sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 24), prompt, None), array("i", [4]))
+    sched.rebuilds._kept[NODE]["d0"] = _kept([1, 2, 3], 4)
 
     sched.next_batch()
     sched.next_batch()
 
-    assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
+    assert engine.prepared == [("d0", [4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
     assert engine.readied.count("d0") == 1, "a waiting decode row asks the engine on every pass"
 
@@ -200,6 +199,8 @@ def test_a_prompt_dropped_mid_prefill_runs_its_chunks_again_up_to_where_its_loop
     sched, _, _, engine = _scheduler(
         {R: PREFILL}, runtime_type=_Prefilling, chunk_loops=ChunkLoops({(NODE, PREFILL)}), budget=8, dropped={R},
     )
+    # its one prefill step was recorded on its first chunk
+    sched.rebuilds._kept[NODE][R] = _kept(range(10))
 
     rebuild = sched.next_batch()
 
@@ -216,6 +217,7 @@ def test_a_prompt_rebuilt_mid_prefill_keeps_its_place_ahead_of_prompts_that_star
     sched, _, _, _ = _scheduler(
         {R: PREFILL}, runtime_type=_Prefilling, chunk_loops=ChunkLoops({(NODE, PREFILL)}), budget=8, dropped={R},
     )
+    sched.rebuilds._kept[NODE][R] = _kept(range(10))
     for rid in (R, "p"):
         sched.chunk_started[(rid, NODE)] = next(sched._chunk_starts)
 

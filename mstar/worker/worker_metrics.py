@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 class PreemptionCounts:
     """A node's preemptions since its worker started."""
     # `rebuild_tokens`: tokens the rebuild rows prefilled.
-    # `returns_preempted`: returned requests preempted again before they kept another token.
+    # `returns_preempted`: requests preempted again before they sampled a token since they were last preempted.
     victims: int = 0
     drops: int = 0
     rebuild_tokens: int = 0
@@ -97,7 +97,7 @@ class WorkerMetrics:
         ]
         # one kept-id pool serves every node here with a rebuild policy, and shows under each of them
         self._host_pool = rebuilds.pool
-        self._host_nodes = sorted(rebuilds.nodes & components) if rebuilds.pool is not None else []
+        self._host_nodes = sorted(rebuilds.nodes & components)
         # when the worker's last step finished postprocessing
         self._last_done = 0.0
         self._step_seconds = Histogram(catalog.STEP_SECONDS)

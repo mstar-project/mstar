@@ -20,7 +20,7 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import TensorAndMetadata
-from mstar.model.components.mrope import layout_extent
+from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -412,11 +412,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
 
-    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+    def media_advance(self, tokens: int, grid: list[int]) -> int:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        if not layout.get("grid"):  # a text prompt, the only kind a text-only checkpoint takes
-            return super().kv_layout(layout, length)
-        return super().kv_layout(layout, length, layout_extent(layout, self._merge(), length))
+        return image_position_advance(torch.tensor(grid), self._merge())
 
     def request_kwargs(self) -> frozenset[str]:
         return super().request_kwargs() | {"enable_thinking"}

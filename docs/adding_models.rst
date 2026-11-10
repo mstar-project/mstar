@@ -437,23 +437,36 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
-  node's outputs. ``length`` is the slots the write fills, ``advance`` how far it moves
+  node's outputs. A request whose spans are not all ``"ids"`` can be rebuilt at one rank when the
+  node's ``RebuildPolicy`` names their walks in ``walks``, whatever their kind: the worker keeps
+  host copies of what the node reads in each prefill step, and a rebuild row runs each step again
+  from them, in the order the layout's steps say (``opens_step``). The policy's ``copy_width``
+  gives, for each walk where the node reads more than the ids, how many values those copies hold
+  per KV slot, in the node's dtype, and startup raises without it. The last span must be an
+  ``"ids"`` span, and a label the request keys must be keyed over every span. Otherwise, in a pool
+  that decides admission, the request can only move to the host, into room the host sets aside for
+  the pages it holds, and reserves its whole footprint when the host can't. A rebuild row gives its
+  walk what the step read, under the step's metadata, and the last row's ids tensor gets the samples
+  appended, so the walk must read its prompt in that shape.
+  ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
 - ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
+- ``max_growth``: the most slots ``growth`` writes in all, for loops that end before their
+  caps, as Nemotron's do.
 - ``scratch``: the most KV slots one non-committing step writes past the committed length.
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
+The footprint adds the spans, the growth at each loop's iterations up to ``max_growth`` and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
@@ -1521,6 +1534,40 @@ forgets its host copy and its name's slot entry, and leaves the slot's weights a
 standing as they were. Neither touches what an admit decides from, and the next request
 that names the adapter is ingested after a reload, which reaches every rank after the
 unload did. Nothing per model is needed for either.
+
+Admission: capacity a request holds until it is removed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A resource whose capacity can run out before a request starts, and that the request then holds
+until it is removed (KV pages, recurrent-state slots, sampler rows), answers for that capacity
+through the admission hooks on ``Resource``. The runner's ``Admission`` decides who gets it and
+when: one arrival order across resources, and a request takes everything it asks for or nothing.
+Capacity a single step takes and gives back goes through ``admit`` and ``rollback_admit``
+instead.
+
+- ``ask(rid, node_name, graph_walk)`` returns ``ASKS`` while the request needs this resource's
+  capacity to start on the node, None when it needs none, or a failing outcome when it can
+  never fit.
+- ``reserve(rid, node_name, graph_walk, published)`` takes what the request asked for and returns
+  None, or returns a mark of what it didn't fit against.
+- ``unreserve(rid)`` gives back what ``reserve`` took, when another resource the request asks
+  didn't fit.
+- ``grew_since(mark)`` says whether a request that didn't fit against ``mark`` may fit now. The
+  runner tries a blocked queue again only once it is True, so a pass that changed nothing costs
+  one call.
+
+A request is admitted once it is first in every queue it waits in. A resource may also let a later
+request pass a first request that can't start, by overriding
+``reserve_past(rid, node_name, graph_walk, published)``. It takes the passer's capacity while
+leaving the first request what it needs, so passing can't starve that request, or returns a mark,
+and the runner tries a passing request again only once ``grew_since`` that mark. The runner calls
+it only while the first request can't start: a resource that lets requests pass refused it and
+hasn't grown since, or the oldest request holds back that resource's queue while it waits to return,
+and the passing request passes, or takes nothing, at that resource too. A resource that doesn't
+override it keeps strict order, and a request waiting in its queue can't pass anywhere. A resource
+that overrides it asks nothing more of a waiting request whose capacity it set aside on its own, as
+the KV cache does when it moves other requests for it, and the request may then start wherever it
+stands in that resource's queue.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -3392,7 +3439,7 @@ which declares the walks (``media_walks(max_iters, encoders)`` and
 ``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
 and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
-request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
+request's output budget less the prefill's token), the KV label and its layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
 the request's ``SAMPLING_KEYS`` over ``sampling_defaults``, which ``__init__`` reads
 from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
@@ -3403,11 +3450,12 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
 ``_prompt_ids`` and ``_create_submodule``. The scaffold's
-``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
-``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
-or the engine refuses to start; Muse Glimmer and Ripple-65B return ``{}`` until a drop has run
-through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = False``) has no
-``prefill_text`` walk, so the scaffold returns ``{}`` for it. ``media`` holds a
+``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
+walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
+holds a resource that can't drop returns ``{}``, or the engine refuses to start; Muse
+Glimmer and Ripple-65B return ``{}`` until a drop has run through a sliding-window pool,
+and Qwen3-ASR until one has run through its captured prefill. A model without text prompts
+(``TEXT_PROMPTS = False``) is rebuilt on its media walks alone. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
 nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
@@ -3421,11 +3469,11 @@ to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read 
 with its grid), and ``process_prompt`` returns the pads' layout as ``MEDIA_LAYOUT``
 metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
-schedule's walk and the KV layout's alike. ``kv_layout``'s ``advance``, how far the prompt
-moves the position counter, defaults to the prompt's length; under Qwen-style MRoPE it is
-the positions' extent instead, an image spanning ``max(h', w')`` positions rather than its
-tokens, which Qwen3.5 computes from the
-runs' grids in its ``kv_layout`` override. ``process_prompt`` also empties each sent
+schedule's walk and the KV layout's alike. ``kv_layout`` lays a media prompt's text out as
+``ids`` spans and each run of pads as a ``rows`` span, which moves the position counter by
+``media_advance``, the run's tokens by default. Under Qwen-style MRoPE it is the positions'
+extent instead, an image spanning ``max(h', w')`` positions rather than its tokens, which
+Qwen3.5's override computes from the run's grid. ``process_prompt`` also empties each sent
 attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are
 lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
 ``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT`` rather than a tensor, so a
