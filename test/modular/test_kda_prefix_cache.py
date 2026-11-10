@@ -597,6 +597,21 @@ def test_rank_0_gives_back_what_it_leased_for_a_row_its_step_leaves_out(_gdn_ran
     _agree(ranks, "b")
 
 
+def test_a_rebuilds_probe_on_rank_0_holds_nothing_the_other_ranks_dont(_gdn_ranks):
+    """A rebuild row is measured through `Engine.unserved_len`, and nothing gives back what that
+    probe would lease, so rank 0 takes no lease there: the rebuild's step leases as it is sent."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=16)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    # as MicroScheduler._measure_unstarted measures a rebuild row that has run no chunk
+    engines[leader].unserved_len(NODE, WALK, None, "b", len(b), len(b))
+    assert _held(leader) == _held(follower)
+
+
 def test_a_row_measured_past_pages_no_snapshot_ends_on_waits_holding_nothing(_gdn_ranks):
     """b shares a's first page, where no snapshot sits, so the pool cuts the hit to nothing: rank 0
     measures b from 0 and holds no page for it until its step is sent. That send leases the page
