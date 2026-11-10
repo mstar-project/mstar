@@ -279,7 +279,8 @@ def brief(pr, sha, main_sha, base, run, checks, since="", forced="", asked="", a
                  f"one is {bot.VENDORS[vendor]}'s, so test what runs on these GPUs, and name them in the report")
     if vendor == "amd":
         gpus += (". mstar's ROCm install may not build here: when bootstrap.sh stops on it, or torch sees no GPU, "
-                 "that is the environment, and the outcome is `unavailable`")
+                 "that is the environment, and the outcome is `unavailable`. Of the PR's changed tests that skip "
+                 "without CUDA, run only those that apply to ROCm, and mark the rest ➖ (the NVIDIA box runs them)")
     return f"""You are the live-test session for PR #{pr} of {REPO}, on a GPU box. Follow
 `main/.claude/skills/pr-review/SKILL.md` §7 and `main/.claude/skills/live-pr-test/SKILL.md` in
 cluster mode: the box is already provisioned, and it ends when you exit.
