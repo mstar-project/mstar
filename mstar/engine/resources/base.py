@@ -264,7 +264,7 @@ class Resource(ResidentHooks, ABC):
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> Any:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
         return the lease, or None. The followers' `adopt_cached_prefix` takes it back as it is,
-        so it must be an mstar dataclass or a plain msgpack value: a NamedTuple comes back a tuple."""
+        so it must be an mstar dataclass or a value the wire carries as data (`wire._dynamic`)."""
         return None
 
     def adopt_cached_prefix(

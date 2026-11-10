@@ -3388,8 +3388,9 @@ class KVManager(AttentionResource):
         part.released += k * page_size
         part.generation += 1
         # A window's pages only cycle: its allotment keeps room for the pages that replace these. A released
-        # page another stream still holds lent passes that room to it when its request has room left
-        # (`_hand_over`); otherwise `_release` trims the allotment by it.
+        # page another stream still holds lent passes to it (`_hand_over`): always to another stream of this
+        # request, and to another request's stream only while that request has room left. Otherwise `_release`
+        # trims the allotment by it.
         others = self._hand_over(rid, stream, freed) if group else ()
         self._release(rid, stream, freed)
         self._recount(rid, *others)
