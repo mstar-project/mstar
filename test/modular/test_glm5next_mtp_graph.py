@@ -27,7 +27,9 @@ from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights
 from mstar.model.glm5_next.submodules import HOLE_KPE, Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
+from mstar.utils.device import DeviceCapability
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
+from mstar.worker.host_copies import HostCopies, crop_to_spans
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and fused_decode._HAS_TRITON
@@ -99,9 +101,12 @@ class _NoTransfer:
 
 class _Engine:
     """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine
-    (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> unpack)."""
+    (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> collect), its spans
+    staged to the host and its outputs cut to them as the worker does. No stop check runs: a
+    request past max_tokens sends one token a step, and ``generate`` truncates. ``pin_argmax``
+    makes every draft and every verified token that id, so every draft is accepted."""
 
-    def __init__(self, k, seed=0, long_context=False):
+    def __init__(self, k, seed=0, long_context=False, pin_argmax=None):
         cfg = _config(k, long_context)
         with torch.device("meta"):
             lm = Glm5NextForCausalLM(cfg)
@@ -129,6 +134,12 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
+        if pin_argmax is not None:  # before the capture, which records it
+            self.sub._argmax = lambda hidden: torch.full(
+                hidden.shape[:1], pin_argmax, dtype=torch.long, device=hidden.device)
+        # rid -> its max_tokens; the rids served under ignore_eos
+        self.max_tokens: dict[str, int] = {}
+        self.ignore_eos: set[str] = set()
         trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
@@ -138,12 +149,14 @@ class _Engine:
             token_ladders={"prefill": [256]},
         )
         self.cg.warmup_and_capture(None)
+        self.copies = HostCopies(DEV, DeviceCapability.of(DEV))
 
     def info(self, rid, walk):
         return CurrentForwardPassInfo(
             request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0, random_seed=0,
-            max_tokens=MAX_TOKENS,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
+            max_tokens=self.max_tokens.get(rid, MAX_TOKENS),
+            resource_configs={SAMPLER: SamplingReqConfig(
+                temperature=0.0, ignore_eos=rid in self.ignore_eos)},
             dynamic_loop_iter_counts={"decode_loop": 0},
         )
 
@@ -168,6 +181,11 @@ class _Engine:
         """One step; returns ({rid: emitted tokens}, {rid: next input}, lease). The cache holds
         each prompt's first ``cached`` tokens, so the step is cut past them as the engine cuts a
         prompt past a prefix hit."""
+        outputs, lease = self.launch(walk, prompts, captured, slot, preplan, cached)
+        return self.land(outputs), self.next_inputs(outputs), lease
+
+    def launch(self, walk, prompts, captured, slot=0, preplan=False, cached=0):
+        """One step up to the worker's postprocess; returns (its outputs, lease)."""
         rids = list(prompts)
         if walk == "prefill" and not cached:
             for rid in rids:
@@ -185,7 +203,6 @@ class _Engine:
             assert lease is not None, "no captured bucket fits"
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=slot, capture=False,
                           slot_lease=lease)
-        real_inputs = inputs
         if lease is not None:
             inputs = self.cg.pad_inputs(lease, inputs)
             infos = self.cg.step_metadata(lease, rids, infos)
@@ -204,21 +221,35 @@ class _Engine:
                    else self.sub.forward_batched(walk, ei, **pre))
         self.runner.commit(step)
         raw = BatchedModelOutput.coerce(raw)
-        out_ids = self.cg.slot_for(lease).dummy_rids if lease is not None else padded
-        unpacked = self.sub.unpack_packed_outputs(
-            raw.packed_outputs, rids, [i.input_seq_len for i in real_inputs], real_inputs,
-            {rid: infos[rid] for rid in rids})
-        emitted, nxt = {}, {}
-        for i, rid in enumerate(rids):
-            # a prefill step hands its tokens over as rows, an MTP step per request
-            per_rid = raw.get(out_ids[i]) or {
-                name: [t[i : i + 1]] for name, t in (raw.row_outputs or {}).items()}
-            out = {**per_rid, **unpacked.get(rid, {})}
-            emitted[rid] = out["new_token"][0].tolist()
-            nxt[rid] = out.get("text_inputs", out["new_token"])[0].clone().to(DEV)
+        # As Engine._collect_outputs: every step hands its outputs over as rows, the real
+        # requests first, cloned once per row tensor; a span is a view, which the gpu thread
+        # copies to the host right behind the step.
+        rows = {name: t[:len(rids)].clone() for name, t in raw.row_outputs.items()}
+        outputs = BatchedModelOutput(
+            per_rid_outputs={rid: {name: [t[i : i + 1]] for name, t in rows.items()}
+                             for i, rid in enumerate(rids)},
+            output_spans={name: span[:len(rids)]
+                          for name, span in (raw.output_spans or {}).items()} or None,
+            span_request_ids=tuple(rids),
+        )
+        self.copies.stage_host_rows(outputs)
         if lease is not None:
             self.cg.release(lease, len(rids))
-        return emitted, nxt, lease
+        return outputs, lease
+
+    @staticmethod
+    def next_inputs(outputs):
+        return {rid: out.get("text_inputs", out["new_token"])[0].clone()
+                for rid, out in outputs.per_rid_outputs.items()}
+
+    @staticmethod
+    def land(outputs):
+        """What the step sends, once it has run: a verify step's tokens cut to their spans."""
+        torch.cuda.synchronize(DEV)
+        if outputs.output_spans:
+            crop_to_spans(outputs)
+        return {rid: out["new_token"][0].reshape(-1).tolist()
+                for rid, out in outputs.per_rid_outputs.items()}
 
     def generate(self, prompts, captured_decode, captured_prefill=False, preplan=False, cached=0):
         if cached:  # the rows a prefix hit hands the request
@@ -303,6 +334,47 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # the graph runner's padding streams stay resident; the requests' are gone
     assert not any(rid in kv._streams for rid in _prompts(lengths))
     assert pool.num_free_slots == pool.config.usable_slots
+
+
+def test_a_captured_verify_step_cuts_at_the_budget_and_a_stop_token():
+    """Every draft accepted and every token a stop token: a request under ignore_eos is sent
+    four tokens a step until its budget runs out inside a block, and one a stop token ends is
+    sent one, captured as eager. Cut only after the next step has replayed the same graph,
+    which rewrites the span on the device, a step's tokens are still its own: its span was
+    staged to the host behind it."""
+    stop = _config(3).eos_token_ids[0]
+    eng = _Engine(k=3, pin_argmax=stop)
+    eng.max_tokens["r0"] = 11
+    eng.ignore_eos |= {"r0", "r2"}
+    sent = {  # after the prefill's token; a spent budget still sends one
+        "r0": [4, 4, 2, 1, 1, 1, 1, 1], "r1": [1] * 8, "r2": [4, 4, 4, 4, 4, 3, 1, 1],
+    }
+
+    def run(captured, lagged):
+        """Tokens sent per decode step. ``lagged``: every step replays capture slot 0, and
+        is cut after the next one has."""
+        prompts = _prompts([30, 45, 20])
+        _, nxt, _ = eng.step("prefill", prompts, captured=False)
+        got, ahead = {rid: [] for rid in prompts}, []
+        for step in range(8):
+            outputs, _ = eng.launch("decode", nxt, captured, slot=0 if lagged else step % 2)
+            nxt = eng.next_inputs(outputs)
+            ahead.append(outputs)
+            for landing in ahead[:-1] if lagged else ahead:
+                for rid, toks in eng.land(landing).items():
+                    assert set(toks) == {stop}
+                    got[rid].append(len(toks))
+            ahead = ahead[-1:] if lagged else []
+        for rid, toks in (eng.land(ahead[0]) if ahead else {}).items():
+            got[rid].append(len(toks))
+        for rid in prompts:
+            eng.runner.remove_request(rid)
+            eng.sub.request_states.pop(rid, None)
+        return got
+
+    assert run(captured=False, lagged=False) == sent
+    assert run(captured=True, lagged=False) == sent
+    assert run(captured=True, lagged=True) == sent
 
 
 # past index_topk (64), several windows; "three" replays bucket 4 with a padding request

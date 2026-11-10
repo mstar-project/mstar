@@ -51,6 +51,7 @@ from mstar.model.glm5_next.config import (
     KDA,
     KDA_STATE,
     KV_CACHE,
+    MTP_BUDGET,
     MTP_DRAFT,
     MTP_HIDDEN,
     MTP_LEN,
@@ -190,6 +191,11 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             )
             kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
+            )
+            # what cuts a verify step's tokens on the device: the tokens the reply may still
+            # send, and whether a stop token ends it
+            kda_blocks[MTP_BUDGET] = RecurrentBlockConfig(
+                shape=(2,), dtype=torch.long, per_layer=False,
             )
         if self.config.mtp_trims:
             # each request's tokens in cache, which every verify step advances on device
