@@ -1251,8 +1251,8 @@ together. The add keeps nothing, so ``keep=True`` raises, and a read takes the a
    out = self.state.read(self.layer, q)
 
 On an array with ``max_len=0`` the calls add no break of their own. With ``compile_op`` set through
-``kernel_settings()``, as Qwen3.5 does, the read stays in a compiled caller's graph, so the region
-keeps one graph across the attention. Without it, the read breaks at the kernel. A step declares ``state={VISION_TOKENS: ArrayStep()}`` over segments that are the
+``kernel_settings()``, the read stays in a compiled caller's graph, so the region keeps one graph
+across the attention. Without it, the read breaks at the kernel. A step declares ``state={VISION_TOKENS: ArrayStep()}`` over segments that are the
 entire layout, and a captured region names the array (`Piecewise CUDA graphs (capturing an
 inner loop)`_).
 

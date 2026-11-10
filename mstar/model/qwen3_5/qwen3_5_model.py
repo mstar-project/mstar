@@ -163,7 +163,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             LINEAR_ATTN: {"splits": (MIXED_SPLIT,)},
         }
         if self.vision_config is not None:
-            settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling(), "compile_op": True}
+            settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling()}
         return settings
 
     def get_node_resources(self):

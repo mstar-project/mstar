@@ -360,7 +360,6 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
             num_kv_heads=vision.num_heads,
             head_dim=vision.head_dim,
             max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches,
-            compile_op=True,
         ),
     )
 
