@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 from typing import NamedTuple
 
 import torch
@@ -55,6 +55,7 @@ from mstar.model.base import (
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    TensorAndMetadata,
     keyed_labels,
     names_checkpoint,
     serving_resources,
@@ -690,6 +691,7 @@ class PreprocessWorkerThread:
     # sizes the pool (_size_prepare_pool); 1, inline, for a thread built
     # without __init__, which has no model to size it from.
     _prepare_workers: int | None = 1
+    _decode_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -829,6 +831,22 @@ class PreprocessWorkerThread:
         self._prepare_workers = workers
         if workers > 1:
             self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
+        model = self.model
+        if getattr(model, "PREPROCESS_PARALLEL_IMAGES", False) and not getattr(model, "PREPROCESS_PARALLEL", False):
+            logger.warning(
+                "%s sets PREPROCESS_PARALLEL_IMAGES without PREPROCESS_PARALLEL, so its images decode in turn",
+                type(model).__name__,
+            )
+        decode_workers = self._num_decode_workers()
+        if decode_workers > 1:
+            self._decode_pool = ThreadPool(max_workers=decode_workers, thread_name_prefix="mstar-decode")
+
+    def _num_decode_workers(self) -> int:
+        """As many as requests prepare at once: a decode has no intra-op work, so
+        these threads don't multiply by the process's intra-op count."""
+        if not getattr(self.model, "PREPROCESS_PARALLEL_IMAGES", False) or self._prepare_workers <= 1:
+            return 1
+        return self._prepare_workers
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -894,17 +912,22 @@ class PreprocessWorkerThread:
             input_metadata[key] = []
             if modality not in ("image", "audio", "video"):
                 continue
-            load = getattr(self.model, f"load_{modality}")
-            for filepath in paths:
-                with budget.file():
-                    if modality == "audio":
-                        check_audio_duration(filepath)
-                    out = load(filepath, self.device)
-                    if modality == "audio":
-                        charge_decoded_audio(out.data, out.metadata["sample_rate"])
+            load_file = partial(self._load_file, budget, modality)
+            # Image decoders release the GIL, so a request's images can overlap.
+            pool = self._decode_pool if modality == "image" and len(paths) > 1 else None
+            for out in (pool.map(load_file, paths) if pool is not None else map(load_file, paths)):
                 tensors[key].append(out.data)
                 input_metadata[key].append(out.metadata)
         return tensors, input_metadata
+
+    def _load_file(self, budget: RequestMediaBudget, modality: str, filepath: str) -> TensorAndMetadata:
+        with budget.file():
+            if modality == "audio":
+                check_audio_duration(filepath)
+            out = getattr(self.model, f"load_{modality}")(filepath, self.device)
+            if modality == "audio":
+                charge_decoded_audio(out.data, out.metadata["sample_rate"])
+        return out
 
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
@@ -2334,3 +2357,5 @@ class PreprocessWorkerThread:
             self._encode_pool.shutdown(wait=False, cancel_futures=True)
         if self._prepare_pool is not None:
             self._prepare_pool.shutdown(wait=False, cancel_futures=True)
+        if self._decode_pool is not None:
+            self._decode_pool.shutdown(wait=False, cancel_futures=True)

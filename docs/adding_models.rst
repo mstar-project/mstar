@@ -2858,6 +2858,10 @@ and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs
 a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
 
+A model that takes several images per request and whose ``load_image`` is mostly a decode can
+also set ``PREPROCESS_PARALLEL_IMAGES = True``, which decodes one request's images at once on a
+second pool the size of the prepare pool, unless ``preprocess_workers`` is 1.
+
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
