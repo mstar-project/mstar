@@ -887,8 +887,6 @@ def processed_logprobs(
     """Log-probs of ``tokens`` under the distribution they were drawn from:
     ``probs`` (after the penalty, temperature and min-p) filtered and floored
     as ``_filter_floor_and_draw`` does. 0 for greedy rows; graph-safe."""
-    import flashinfer
-
     tokens = tokens.long().view(-1, 1)
     floor = history is not None and history.stop_ids is not None
     if order is not None or floor:
@@ -898,8 +896,8 @@ def processed_logprobs(
         picked = filtered.gather(1, tokens)
     else:
         # FlashInfer's own order, as the draw: two renorms and no counting pass
-        first = flashinfer.sampling.top_k_renorm_probs(probs, torch.where(top_k > 0, top_k, probs.shape[1]))
-        then = flashinfer.sampling.top_p_renorm_probs(first, top_p)
+        first = _top_k_renorm_probs(probs, torch.where(top_k > 0, top_k, probs.shape[1]))
+        then = _top_p_renorm_probs(first, top_p)
         picked = torch.where(top_p[:, None] < 1.0, then.gather(1, tokens), first.gather(1, tokens))
     # a renormed near-certain token can land a ulp above 1
     return picked.squeeze(1).log().clamp_max(0)

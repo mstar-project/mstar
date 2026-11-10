@@ -430,6 +430,18 @@ def test_the_filtered_draw_reaches_flashinfers_kernels(stack, platform):
     assert rec.calls[-1][2] == {"seed": seed, "offset": offset}
 
 
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
+def test_processed_logprobs_renorms_through_the_dispatch(stack, platform):
+    """Plain top-k/top-p processed logprobs renorm through the dispatch, so
+    the fork's raise-under-dynamo renorms stay wrapped on AMD."""
+    rec = stack(platform, rocm_fork=platform.is_rocm())
+    probs = torch.full((2, 8), 0.125)
+    sampler_utils.processed_logprobs(
+        probs, torch.zeros(2, dtype=torch.long), torch.full((2,), 4), torch.full((2,), 0.5),
+    )
+    assert [name for name, _, _ in rec.calls] == ["sampling.top_k_renorm", "sampling.top_p_renorm"]
+
+
 def test_amd_renorms_run_outside_dynamo(stack):
     stack(RocmPlatform())
     seen = []
