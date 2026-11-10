@@ -285,11 +285,13 @@ class CommGroup:
         """``rms_norm(all_reduce(x))``, a norm before the residual add, in the
         same fused kernel: it always adds a residual, so this adds zeros."""
         ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
-        if ws is not None and x.shape[0] <= ws.max_tokens and x.is_contiguous():
+        zeros = None if ws is None or x.shape[0] > ws.max_tokens else ws.zeros[: x.shape[0]]
+        # the strategy's own bound can be below the zeros' (AITER's is at most 80 rows)
+        if zeros is not None and ws.fusion.accepts(x, zeros, weight_bias):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
             return allreduce_add_rmsnorm(
-                x, ws.zeros[: x.shape[0]], weight, eps, weight_bias, ws.fusion.ws_id,
+                x, zeros, weight, eps, weight_bias, ws.fusion.ws_id,
             )[0]
         return _rms_norm(self.all_reduce(x), weight, eps, weight_bias)
 

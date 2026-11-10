@@ -647,6 +647,10 @@ def test_the_rest_keep_the_collective_and_a_separate_norm(monkeypatch, weight_bi
     want = want_r * torch.rsqrt(want_r.pow(2).mean(-1, keepdim=True) + 1e-6) * (w + weight_bias)
     torch.testing.assert_close(r, want_r)
     torch.testing.assert_close(normed, want)
+    # the norm without a residual too, though the rows fit the workspace's zeros
+    want = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (w + weight_bias)
+    torch.testing.assert_close(group.allreduce_rmsnorm(x, w, 1e-6, weight_bias), want)
+    assert fusion.runs == 0
 
 
 def test_without_a_fusion_capture_scopes_are_plain(monkeypatch):
