@@ -42,6 +42,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
@@ -577,6 +578,70 @@ def test_the_captured_kernels_match_the_torch_ops():
     assert run(torch.device("cuda")) == run(CPU)
 
 
+
+def test_the_host_lengths_of_a_graph_indexed_step_match_the_host_plan():
+    """What the KV plan hands an attention that reads its pages off the tables:
+    the same indptr, lengths and last page lengths as the full host plan of the
+    step, padding rows included."""
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    rids = [1, 2, 3]
+    for t in range(12):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, run=False)
+        _promote(live, planner, a)
+        got = live["kv"]._resident.decode_indptrs(a.ctx.resident_plan, 4)
+        b = _captured_step(ref, None, rids, slot=t % 2, bs=4, run=False)
+        want = b.ctx.plan_results["kv"]["main"].cpu_indptrs
+        for field in ("qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "kv_lens"):
+            assert getattr(got, field).tolist() == getattr(want, field).tolist(), (t, field)
+        _replay(live, planner, a, promote=False)
+        _replay(ref, None, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("appends", [True, False])
+def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(appends):
+    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
+    from mstar.engine.resources.kv.resident import KVResidentTables
+
+    cuda = torch.device("cuda")
+    stride, block_col, page = 40, 2, 4
+    store = torch.zeros(6 * stride, dtype=torch.long, device=cuda)
+    lens = {1: 9, 3: 0, 4: 4, 5: 130}
+    for slot, n in lens.items():
+        store[slot * stride + 1] = n
+        cols = n // page + 1
+        store[slot * stride + block_col: slot * stride + block_col + cols] = torch.arange(
+            100 * slot, 100 * slot + cols,
+        )
+    order = [5, 1, 3, 4]
+    bs = 6  # two padding rows, at the trash row
+    slots = torch.tensor(order + [TRASH_SLOT] * (bs - len(order)), device=cuda)
+    kv_len = store[slots * stride + 1].clone()
+    capacity = 64
+    attn = SimpleNamespace(
+        _paged_kv_indptr_buf=torch.full((bs + 1,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_indices_buf=torch.full((capacity,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_last_page_len_buf=torch.full((bs,), -1, dtype=torch.int32, device=cuda),
+    )
+    FlashInferDecodeWrapper.gather_resident(
+        SimpleNamespace(attn_wrapper=attn, page_size=page), store, slots, kv_len, stride, block_col, appends=appends,
+    )
+
+    host_len = torch.zeros(6, dtype=torch.long).numpy()
+    for slot, n in lens.items():
+        host_len[slot] = n
+    tables = SimpleNamespace(host_len=host_len, page_size=page, key="kv", _qo_indptr={})
+    streams = {"kv": SimpleNamespace(reads=not appends)}
+    plan = SimpleNamespace(slots=torch.tensor(order).numpy(), writes=SimpleNamespace(streams=streams))
+    want = KVResidentTables.decode_indptrs(tables, plan, bs)
+    assert attn._paged_kv_indptr_buf.tolist() == want.paged_kv_indptr.tolist()
+    assert attn._paged_kv_last_page_len_buf.tolist() == want.paged_kv_last_page_len.tolist()
+    read = {s: max(lens[s] + appends, 1) for s in order}
+    pages = [list(range(100 * s, 100 * s + (read[s] - 1) // page + 1)) for s in order]
+    pages += [[SINK_PAGE]] * (bs - len(order))
+    end = int(want.paged_kv_indptr[-1])
+    assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
+
 # ---- slots ----
 
 def test_a_freed_slot_waits_for_the_last_step_that_read_it():
@@ -949,8 +1014,7 @@ def test_a_stream_wider_than_a_row_raises():
 # ---- what a raise in the plan leaves ----
 
 def _preplan_worker(engine):
-    worker = make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
-    return worker
+    return make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
 
 
 def _preplan_engine(res, planner):
@@ -1026,7 +1090,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
         raise RuntimeError("raised mid pre-plan")
 
     monkeypatch.setattr(target, name, boom)
-    assert _preplan_worker(engine)._preplan_spec(None, SimpleNamespace(node_batch=batch)) is False
+    assert _preplan_worker(engine).executor._preplan_spec(None, SimpleNamespace(node_batch=batch)) is False
     monkeypatch.setattr(target, name, real)
 
     assert batch.preplan_event is None and batch.preplanned_rids is None and batch.step is None
@@ -1121,7 +1185,7 @@ def _refused_worker(engine, line):
     ``line`` the requests in the order a step reaches them."""
     pushed = []
     worker = make_worker(
-        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         scheduler=SimpleNamespace(
             could_refill=lambda *a: False,
@@ -1137,7 +1201,7 @@ def _refused_worker(engine, line):
 def _refused(batch, outcome_reason, failed_resource):
     return SimpleNamespace(
         node_name=batch.node_name, admit_error=outcome_reason, failed_resource=failed_resource,
-        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(), no_forward_rids=set(),
     )
 
 
@@ -1172,7 +1236,7 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
 
     worker = _refused_worker(engine, line=[1, 2, 3])
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
-    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
     assert worker.pushed == [[1, 2]] and list(worker.admission.held_until) == [3]
     assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
@@ -1216,10 +1280,81 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
     batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
-    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
     assert worker.pushed == [[2]]
     assert list(worker.admission.held_until) == [2]
     assert engine.residency("n", 1) is Residency.RESIDENT
+
+
+def test_an_offload_another_node_causes_gives_the_slot_up():
+    """Node ``m`` shares ``n``'s KV pool and plans on the host. Its refused admit
+    picks ``n``'s request as the victim (eviction searches every request the pool
+    holds) and offloads it through ``m``: the slot must go on ``n``'s planner,
+    or its row would name pages the pool has freed, and the reload is written
+    whole."""
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    live = _resources(max_num_pages=8)
+    owned = {k: live[k] for k in ("kv", "pool", "rope")}
+    planner = ResidentPlanner("n", {WALK}, owned, CPU, max_bs=4)
+    for rid, tokens in ((1, 7), (2, 7), (3, 11)):
+        _ingest(live, rid)
+        step, ctx = _host_step(live, [rid], [tokens])
+        planner.commit(step, ctx)
+    kv = live["kv"]
+    _HostPagesKV(kv)
+    _captured_step(live, planner, [1, 2, 3], slot=0, bs=3)
+    assert planner.slot_of(3) is not None and kv._arena.num_free == 0
+    engine = make_engine(
+        _resources=owned,
+        _submodules={
+            "n": make_mgmt(resources=owned, resident=planner),
+            "m": make_mgmt(resources={"kv": kv}, resident=None),
+        },
+        _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+        _resource_planners=dict.fromkeys(owned, planner),
+    )
+
+    # a step of m's over n's two short rows, crossing a page: the pool refuses
+    step = SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in (1, 2)], steps={"kv": KVStep()})
+    step.set_ctx(StepContext(request_ids=(1, 2), graph_walk="other", slot=0, capture=False))
+    outcome = StepRunner({"kv": kv}).admit(step)
+    assert not outcome.ok and outcome.failed_resource == "kv"
+
+    worker = _refused_worker(engine, line=[1, 2, 3])
+    batch = ScheduledBatch(node_name="m", graph_walk="other", request_to_worker_graph={1: "g", 2: "g"})
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    assert engine.residency("m", 3) is Residency.ON_HOST
+    assert planner.slot_of(3) is None, "the offload left n's row naming freed pages"
+
+    for key in ("kv", "pool", "rope"):
+        live[key].remove_request(2)
+    planner.release(2)
+    assert engine.reload_request("n", 3)
+    s = _captured_step(live, planner, [3], slot=0, bs=1)
+    assert s.ctx.resident_plan.taken == {3}
+    assert kv._resident.host_len[planner.slot_of(3)] == kv._streams[3]["main"].stored_len
+    _assert_step_read_its_streams(live, s, [3])
+    _assert_row(planner, live, 3)
+
+
+def test_a_host_step_of_another_node_over_a_held_row_marks_it():
+    """A node sharing the resident node's pool, without a planner, runs a host
+    step: over a row the planner holds it marks the row as the node's own host
+    step would; over other rows nothing."""
+    live, ref, planner = _setup({1: 9, 2: 9})
+    del ref
+    _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    commits = planner._commits
+    _ingest(live, 3)
+    other, ctx = _host_step(live, [3], [5])
+    planner.note_foreign_step(other, ctx)
+    assert planner._commits == commits and not planner._moved and not planner._stale
+    step, ctx = _host_step(live, [1, 2], [1, 4])
+    planner.note_foreign_step(step, ctx)
+    assert planner._commits == commits
+    assert planner._moved == {1} and planner._stale == {2}
 
 
 def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
@@ -1518,6 +1653,9 @@ def test_capture_refuses_two_labels_on_one_resource():
 class _Fmha:
     """A captured fmha decode wrapper's gather, recorded."""
 
+    plans_in_graph = True
+    supports_gather_resident = False
+
     def __init__(self):
         self.calls = []
 
@@ -1592,11 +1730,7 @@ def test_the_fmha_gather_kernel_reads_the_second_pools_table():
     assert wrapper._table[2, :1].tolist() == rows[0, 10:11].tolist()
 
 
-class _Attention(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
-
+class _Attention(StubResource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
@@ -1629,17 +1763,20 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
     assert manager.resident_refusal() is None
     manager._query_kv_cache_name = "ctx"
     assert "second stream" in manager.resident_refusal()
-    step = SimpleNamespace(reads_tables=False, host_planned=False)
+    manager._query_kv_cache_name = "kv"
+    manager._cg_plan_states = {}
+    streams = {"kv": SimpleNamespace(label="main")}
+    step = SimpleNamespace(
+        reads_tables=False, host_planned=False, bucket="b", slot=0, streams=streams, lengths_only=set(),
+    )
     FlashInferCrossManager.resident_gather(manager, step)
-    assert step.host_planned and not step.reads_tables
+    assert step.host_planned and not step.reads_tables and not step.lengths_only
 
 
 # ---- refusals ----
 
-class _Spare(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
+class _Spare(StubResource):
+    pass
 
 
 def _build(resources, nodes=None, walks=(WALK,), max_bs=4):
@@ -1675,10 +1812,27 @@ def test_a_resource_without_a_table_refuses():
     assert planner is None and "_Spare keeps no resident table" in why
 
 
-def test_a_pool_shared_by_nodes_refuses():
+def test_a_pool_shared_with_a_host_planned_node_builds():
     res = _resources()
-    planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("a", "b")})
-    assert planner is None and "shared by nodes" in why
+    planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("n", "m")})
+    assert planner is not None and why == ""
+
+
+def test_a_pool_shared_with_another_resident_node_refuses():
+    # a resource binds one planner's tables
+    res = _resources()
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n", "m")}, CPU, 4, resident_nodes={"m"})
+    assert planner is None and "shared with resident node(s) ['m']" in why
+
+
+def test_a_pool_shared_with_a_lockstep_node_refuses():
+    # offloads are journalled per node, so a follower's replay order across nodes is undefined
+    res = _resources()
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n", "m")}, CPU, 4, sharded_nodes={"m"})
+    assert planner is None and "in lockstep" in why
+    # unshared, a lockstep node keeps its planner
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n",)}, CPU, 4, sharded_nodes={"n"})
+    assert planner is not None
 
 
 def test_a_pool_read_across_nodes_refuses():
@@ -1862,7 +2016,7 @@ def _qwen35_llm():
 def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
     submodules, llm = _qwen35_llm()
     monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
-    assert llm.resident_walks(None) == {"decode"}
+    assert llm.resident_walks(llm) == {"decode"}
     assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
     assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
 
@@ -1923,3 +2077,66 @@ def test_the_knob_defaults_to_auto(monkeypatch):
 def test_the_slot_count_is_no_knob():
     with pytest.raises(ValueError):
         knobs.check({"resident_slots": 8})
+
+
+def test_cross_attention_packs_a_resident_steps_queries_off_its_rows():
+    """A resident step's query pool may hand back lengths only, with no views."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name = "ctx", "kv"
+    cross._resident_qo_indptr = {}
+    plan = SimpleNamespace(writes=SimpleNamespace(streams={"kv": SimpleNamespace(label="main")}))
+    ctx = SimpleNamespace(resident=object(), resident_plan=plan, padded_request_ids=[3, 5, 9])
+    packings = cross._query_packings(SimpleNamespace(), ctx)
+    assert list(packings) == ["main"]
+    assert packings["main"].request_ids == [3, 5, 9]
+    assert packings["main"].qo_indptr.tolist() == [0, 1, 2, 3]
+
+
+def test_cross_attention_schedules_a_context_once_per_lengths():
+    """A context's schedule reads only its lengths, so a steady step plans nothing; a full
+    plan on the wrapper in between starts over."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name, cross._context_label = "ctx", "kv", "context"
+    cross._resident_qo_indptr, cross._scheduled_lens, cross._last_plans = {}, {}, {}
+    cross._current_plan_states, cross._preplan_states, cross._preplanned = {}, {}, False
+    cross.reset_default_cursors = lambda: None
+    planned = []
+    wrapper = SimpleNamespace(plan_schedule=lambda indptr, lens: planned.append(lens.tolist()))
+    cross._wrapper_for = lambda *args, **kwargs: ("key", wrapper)
+    lease = SimpleNamespace(bucket="bucket", slot=0)
+    resident = SimpleNamespace(lengths_only={("bucket", "ctx")})
+    streams = {"kv": SimpleNamespace(label="main")}
+
+    def plan(lens):
+        out = SimpleNamespace(cpu_indptrs=SimpleNamespace(
+            paged_kv_indptr=torch.arange(len(lens) + 1, dtype=torch.int32),
+            kv_lens=torch.tensor(lens, dtype=torch.int32),
+        ))
+        cross.plan(SimpleNamespace(segments=None, context_only=False), SimpleNamespace(
+            slot_lease=lease, is_preplan=False, plan_phase="res.plan", resident=resident,
+            resident_plan=SimpleNamespace(writes=SimpleNamespace(streams=streams)),
+            padded_request_ids=list(range(len(lens))), plan_results={"ctx": {"context": out}}, slot=0,
+            force_prefill=False,
+        ))
+
+    plan([1500, 1500, 1])
+    plan([1500, 1500, 1])
+    assert planned == [[1500, 1500, 1]]
+    plan([1500, 1, 1])
+    assert planned == [[1500, 1500, 1], [1500, 1, 1]]
+
+
+def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
+    """A cross attention whose query side keeps no KV cache has no stream on the
+    resident step to read: it stays host planned rather than looking one up."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    manager._query_kv_cache_name, manager._kv_cache_name, manager._cg_plan_states = None, "ctx", {}
+    step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
+    manager.resident_gather(step)
+    assert step.host_planned and not step.lengths_only

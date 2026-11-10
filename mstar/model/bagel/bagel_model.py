@@ -42,14 +42,18 @@ processed causally, then each image is processed bidirectionally.
 
 import json
 import logging
+import math
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.errors import EntryNotFoundError
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -108,16 +112,16 @@ from mstar.model.bagel.submodules import (
 )
 from mstar.model.base import (
     DECODE,
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    WalkStep,
     prompt_spans,
 )
-from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -129,11 +133,13 @@ from mstar.model.multimodal import (
     find_media_spans,
     parts_from_modalities,
     prefill_plan,
+    span_name,
     split_around_spans,
+    split_spans,
 )
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.model.utils import TextOutput
+from mstar.model.utils import TextOutput, load_generation_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +177,67 @@ def uses_role_turns(parts: list[PromptPart], understanding: bool) -> bool:
     """
     turns = chat_turns(parts)
     return understanding and bool(turns) and any(part.modality == TEXT for part in turns[-1].parts)
+
+
+# ---------------------------------------------------------------------------
+# Request knobs
+# ---------------------------------------------------------------------------
+
+# sampling knobs a request may set; unset ones take the checkpoint's value
+SAMPLING_KEYS = (
+    "temperature", "top_k", "top_p", "min_p", "repetition_penalty",
+    "ignore_eos", "penalize_prompt",
+)
+CFG_RENORM_TYPES = ("global", "channel", "text_channel")
+IMAGE_PREPROCESS_MODES = ("default", "vllm")
+
+
+def _is_real(value) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _is_side(value, max_side: int, stride: int) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, int)
+        and stride <= value <= max_side and value % stride == 0
+    )
+
+
+# every BAGEL knob a request may set -> (check(value, max_side, stride), what it must be)
+IMAGE_KNOBS = {
+    "cfg_text_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_img_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_interval": (
+        lambda v, *_: isinstance(v, (list, tuple)) and len(v) == 2
+        and all(_is_real(x) for x in v) and 0 <= v[0] <= v[1] <= 1,
+        "[lo, hi] with 0 <= lo <= hi <= 1",
+    ),
+    "cfg_renorm_type": (lambda v, *_: v in CFG_RENORM_TYPES, f"one of {list(CFG_RENORM_TYPES)}"),
+    "cfg_renorm_min": (lambda v, *_: _is_real(v) and 0 <= v <= 1, "a number in [0, 1]"),
+    "think_mode": (lambda v, *_: isinstance(v, bool), "true or false"),
+    "image_preprocess": (
+        lambda v, *_: v in IMAGE_PREPROCESS_MODES, f"one of {list(IMAGE_PREPROCESS_MODES)}",
+    ),
+    "width": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+    "height": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+}
+
+
+def check_request_kwargs(model_kwargs: dict | None, max_side: int, stride: int) -> None:
+    """Raise ``ValueError`` on a BAGEL knob outside its allowed values.
+
+    Sampling knobs are checked at the API boundary and by the sampler.
+    ``max_side`` and ``stride`` bound ``width`` / ``height`` (see ``BagelModel.image_sides``).
+    """
+    for key, value in (model_kwargs or {}).items():
+        if key in IMAGE_KNOBS and value is not None:  # an explicit null is the default
+            ok, rule = IMAGE_KNOBS[key]
+            if not ok(value, max_side, stride):
+                rule = rule.format(max_side=max_side, stride=stride)
+                raise ValueError(f"{key} must be {rule}; got {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +369,20 @@ class BagelModel(Model):
     their three nodes exist only when a deployment places the guidance
     branches apart).
 
-    Graph walk transitions are schedule-driven (no BOI token detection). The
-    output mode is known upfront from the API request's output_modalities.
-    Prefill steps are constructed as a sequential schedule that walks
-    through interleaved text and image inputs.
+    The walk plan is schedule-driven (no BOI token detection). The output
+    mode is known upfront from the API request's output_modalities. Prefill
+    steps are constructed as a sequential schedule that walks through
+    interleaved text and image inputs.
     """
+
+    DECODE_LOOP = "decode_loop"
+
+    # the prompt lists whose entries each prefill in a walk of their own
+    SPANS = ("text_inputs", "image_inputs")
+
+    # the checkpoint's sampling switches over the config's recipe, set by __init__ (`_load_sampling_defaults`);
+    # a model built without it samples with the config's
+    sampling_defaults: Mapping[str, object] = MappingProxyType({})
 
 
     INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)
@@ -330,6 +406,7 @@ class BagelModel(Model):
             self.config = load_bagel_config(json.load(f))
         if accelerator_graph is not None:
             self.config.accelerator_graph = accelerator_graph
+        self.sampling_defaults = self._load_sampling_defaults(model_path_hf, cache_dir)
 
         self.model_path_hf = model_path_hf
 
@@ -367,6 +444,22 @@ class BagelModel(Model):
         # The separate image-generation placement needs serial denoising
         # until its published KV handoff and speculative scheduling agree.
         self._image_gen_remote_handoff = False
+
+    def _load_sampling_defaults(self, repo_id: str, cache_dir: str | None) -> dict:
+        """BAGEL's recipe from the config; ``generation_config.json`` can only turn sampling off.
+
+        BAGEL-7B-MoT ships Qwen2.5-7B-Instruct's file (0.7 / top_k 20 / top_p 0.8),
+        the backbone's chat preset, so its knob values are not read.
+        """
+        defaults = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id, filename="generation_config.json", cache_dir=cache_dir,
+            )
+        except EntryNotFoundError:
+            return defaults
+        defaults.update(load_generation_defaults(Path(path).parent, switch_only=True))
+        return defaults
 
     def _image_gen_phases(self, window) -> tuple[ImageGenPhase, ...]:
         """The request's denoise walks on this deployment (`image_gen_phases`)."""
@@ -670,9 +763,8 @@ class BagelModel(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
-        Returns model-specific keys matching get_forward_pass_inputs:
-            "text_inputs"    - one tokenized span per text step of the plan
-            "system_prompt"  - tokenized system prompt (think_mode only)
+        Each text span and each image is a signal of its own (`split_spans`:
+        ``text_inputs.N``, ``image_inputs.N``), which its prefill walk reads.
 
         The prompt is rendered once with a placeholder per image, tokenized
         once, and sliced around those placeholders, so text written between two
@@ -681,15 +773,15 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        check_request_kwargs(kwargs, *self.image_sides)
         params = self._request_params(input_modalities, output_modalities, kwargs)
         if "image" in output_modalities:
             image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
-            for key in ("width", "height"):
-                value = params[key]
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
+        # nothing to prefill (blank text is the template alone): a 400 here, before admission
+        if (prompt is None or not prompt.strip()) and "image" not in input_modalities:
+            raise ValueError("BAGEL requires a text prompt or an image")
         is_understanding = (output_modalities or ["text"])[0] == "text"
         if prompt is None and "image" in input_modalities and is_understanding:
             # an image-only chat still opens its reply
@@ -751,7 +843,7 @@ class BagelModel(Model):
             and tensors.get("image_inputs")
         ):
             result["image_inputs"] = [
-                self._resize_to_fit(img, params["width"], params["height"])
+                self._resize_to_fit(img, params["width"], params["height"], self.image_sides[0])
                 for img in tensors["image_inputs"]
             ]
 
@@ -764,10 +856,15 @@ class BagelModel(Model):
             if any(side < 16 for side in sides):
                 raise ValueError(f"BAGEL's output image must be at least 16 pixels a side, got {list(sides)} (h, w)")
         if tensors is None:
-            return result
+            return split_spans(result, self.SPANS)[0]
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
+            # the prompt branch checks this; without it a declared image that never came is an IndexError
+            check_attachments(parts, {"image": len(images)})
             role_turns = uses_role_turns(parts, is_understanding)
+        if images:
+            # split into spans below, in place of the loaded list
+            result["image_inputs"] = images
         metadata = {ROLE_TURNS: role_turns}
         window = None
         if "image" in output_modalities:
@@ -776,9 +873,8 @@ class BagelModel(Model):
                 params["cfg_text_scale"], params["cfg_img_scale"],
             )
             metadata[CFG_WINDOW] = tuple(window)
-        metadata["kv_layout"] = {
-            "kv": self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns),
-        }
+        layout = self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns)
+        result, metadata["kv_layout"] = split_spans(result, self.SPANS, {"kv": layout})
         return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
@@ -844,18 +940,25 @@ class BagelModel(Model):
             ),
         }
 
+    @property
+    def image_sides(self) -> tuple[int, int]:
+        """``(max_side, stride)`` of an image in pixels: the latent grid times its downsample."""
+        stride = self.config.latent_downsample
+        return self.config.max_latent_size * stride, stride
+
     @staticmethod
     def _resize_to_fit(
         image: torch.Tensor,
         max_width: int,
         max_height: int,
+        max_side: int,
     ) -> torch.Tensor:
         """Resize a c x h x w image to the largest size fitting within
         max_width x max_height while preserving aspect ratio. Both dimensions
-        are capped at 1024.
+        are capped at ``max_side``.
         """
         _, h, w = image.shape
-        scale = min(1024 / w, 1024 / h, max_width / w, max_height / h)
+        scale = min(max_side / w, max_side / h, max_width / w, max_height / h)
         new_h = max(1, round(h * scale))
         new_w = max(1, round(w * scale))
         if new_h == h and new_w == w:
@@ -885,8 +988,9 @@ class BagelModel(Model):
         if modality == "text":
             return super().postprocess(output, modality, request_kwargs)
         if modality == "image":
-            # truncated to uint8, through the shared writer: PIL's default PNG encode
-            # (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
+            # truncated to uint8 here, as the reference does (inside the node's compiled
+            # forward, bf16 pixels would round differently), through the shared writer:
+            # PIL's default PNG encode (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
             return encode_image((output[0] * 255).to(torch.uint8), request_kwargs)
         raise ValueError(f"Unsupported modality: {modality!r}")
 
@@ -923,14 +1027,18 @@ class BagelModel(Model):
         }}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # The stop check allows max_tokens - 1 iterations, and a loop runs at least one.
-        caps = {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        caps = super().get_loop_caps(**model_kwargs)
         if (window := model_kwargs.get(CFG_WINDOW)) is not None:
             # each denoise walk runs exactly its phase's steps
             caps.update(
                 (denoise_loop(phase.walk), phase.steps) for phase in self._image_gen_phases(window) if phase.steps
             )
         return caps
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            *SAMPLING_KEYS, "max_output_tokens", *IMAGE_KNOBS, *OUTPUT_FORMAT_KWARGS,
+        })
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -982,8 +1090,7 @@ class BagelModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource knobs a new request is opened with.
 
@@ -996,10 +1103,12 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import active_labels
 
         model_kwargs = model_kwargs or {}
-        request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
-        cfg = request["requires_cfg"]
+        # the guidance `walk_plan` settles, from the same request
+        target_output = output_modalities[0]
+        window = self._cfg_window(target_output, model_kwargs)
+        cfg = guided(window)
         # only a generation's CFG walks run the CFG nodes
-        nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
+        nodes = self._LLM_NODES if self._has_cfg_parallel and target_output == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
@@ -1010,7 +1119,7 @@ class BagelModel(Model):
                 # label each. (A remote LLM, on an LLM-disaggregated deployment, may also
                 # run decode, which reads cfg_img, and its single-node denoise walks still
                 # name both labels per request, not per walk.)
-                cfg_walk = next(p.walk for p in request["image_gen_phases"] if p.walk in CFG_WALKS)
+                cfg_walk = next(p.walk for p in self._image_gen_phases(window) if p.walk in CFG_WALKS)
                 branch_labels = list(NODE_TO_CFG_LABEL.values())[1:CFG_WALKS[cfg_walk]]
             for (node, walk), labels in {
                 ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
@@ -1060,6 +1169,8 @@ class BagelModel(Model):
                 top_p=sampling.top_p,
                 ignore_eos=sampling.ignore_eos,
                 repetition_penalty=sampling.repetition_penalty,
+                min_p=sampling.min_p,
+                penalize_prompt=sampling.penalize_prompt,
             ),
         }
 
@@ -1312,56 +1423,52 @@ class BagelModel(Model):
         is_understanding: bool,
         role_turns: bool,
         think_mode: bool = False,
-    ):
-        """Sequential list of ``(graph_walk_name, input tensor info)``.
+    ) -> list[tuple[str, str, str]]:
+        """Sequential list of ``(graph_walk_name, input name, span signal)``.
 
         Walks the prefill plan, so attachments prefill where they were written
         and N of them get N walks. Role turns open with the system span ahead
         of them; any other prompt keeps the order it was written in, after the
         think-mode span when there is one.
         """
-        texts = list(input_signals.get("text_inputs", []))
-        images = input_signals.get("image_inputs", [])
+        def spans(name: str) -> list[str]:
+            out = []
+            while span_name(name, len(out)) in input_signals:
+                out.append(span_name(name, len(out)))
+            return out
 
-        schedule: list[tuple[str, TensorPointerInfo]] = []
+        texts, images = spans("text_inputs"), spans("image_inputs")
+        schedule: list[tuple[str, str, str]] = []
         if think_mode and not role_turns and texts:
-            schedule.append(("prefill_text", texts.pop(0)))
+            schedule.append(("prefill_text", "text_inputs", texts.pop(0)))
 
         plan = prefill_plan(parts_from_modalities(input_modalities), leading_text=role_turns)
         for step in plan:
             pool = texts if step.modality == "text" else images
-            if step.index >= len(pool):
-                # ``check_plan`` already failed a mismatch at intake, where a
-                # 400 can still be returned. This runs in the conductor, whose
-                # loop only logs — raising here orphans the request and hangs
-                # the client instead. Same choice as Qwen3-Omni's builder.
-                logger.warning(
-                    "BAGEL prefill plan wants a %s span at index %d but the "
-                    "prompt produced %d; skipping it",
-                    step.modality, step.index, len(pool),
-                )
+            if step.index >= len(pool) and step.modality == "text":
+                # a request without text has no span for the plan's text step
                 continue
+            if step.index >= len(pool):
+                # ``check_plan`` fails this at intake; a ValueError here is a 400 too
+                raise ValueError(
+                    f"BAGEL prefill plan wants a {step.modality} span at index "
+                    f"{step.index} but the prompt produced {len(pool)}"
+                )
             if step.modality == "text":
-                schedule.append(("prefill_text", texts[step.index]))
+                schedule.append(("prefill_text", "text_inputs", texts[step.index]))
             else:
                 if not is_understanding:
                     # Generation/editing: VAE encode the image
-                    schedule.append(("prefill_vae", images[step.index]))
-                schedule.append(("prefill_vit", images[step.index]))
+                    schedule.append(("prefill_vae", "image_inputs", images[step.index]))
+                schedule.append(("prefill_vit", "image_inputs", images[step.index]))
         return schedule
 
     def _request_params(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
     ) -> dict:
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        params["width"] = 1024
-        params["height"] = 1024
-        params["image_preprocess"] = "default"
-        overridable_keys += ["width", "height", "image_preprocess"]
+        max_side, _ = self.image_sides
+        params = {"width": max_side, "height": max_side, "image_preprocess": "default"}
+        params.update({k: getattr(self.config, k) for k in IMAGE_KNOBS if k not in params})
 
         if "image" in input_modalities and "image" in output_modalities:
             params["cfg_img_scale"] = 2.0
@@ -1369,134 +1476,49 @@ class BagelModel(Model):
             params["cfg_renorm_type"] = "text_channel"
 
         if model_kwargs:
-            for key in overridable_keys:
+            for key in IMAGE_KNOBS:
                 if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return params
 
-    def _get_step_metadata(
-        self, full_metadata: CurrentForwardConductorMetadata,
-    ) -> dict:
-        return {
-            "is_prefill": full_metadata.is_prefill,
-            "requires_cfg": full_metadata.kwargs["requires_cfg"],
-            "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
-            "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
-            "cfg_interval": full_metadata.kwargs["cfg_interval"],
-            "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
-            "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
-            "width": full_metadata.kwargs["width"],
-            "height": full_metadata.kwargs["height"],
-            "image_preprocess": full_metadata.kwargs["image_preprocess"],
-        }
+    def _cfg_window(self, target_output: str, model_kwargs: dict) -> CFGWindow | None:
+        """An image request's `CFGWindow`, which process_prompt resolved with its
+        guidance kwargs; None for a text reply."""
+        if target_output != "image":
+            return None
+        return CFGWindow(*model_kwargs[CFG_WINDOW])
 
-    @staticmethod
-    def _image_gen_phase(metadata: CurrentForwardConductorMetadata) -> ImageGenPhase:
-        return metadata.kwargs["image_gen_phases"][metadata.kwargs["image_gen_phase"]]
-
-    @staticmethod
-    def _prefill_token_metadata(sample_prefill_token: bool, target_output: str) -> dict:
-        """Whether this pass samples the reply's first token, and whether a stop
-        there ends the request: only for a text reply, which has no walk after
-        decode."""
-        return {
-            "sample_prefill_token": sample_prefill_token,
-            "prefill_stop_ends": sample_prefill_token and target_output == "text",
-        }
-
-    def _get_fwd_pass_inputs(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """Construct the external inputs for the current forward pass.
-
-        The conductor calls this to determine what tensors to send to
-        workers at the start of each forward pass. For prefill graph walks,
-        the schedule entry determines which input to route; for decode
-        and image_gen, the previous output feeds back in.
-
-        persist_signals key conventions:
-            "text_inputs"    - list of per-turn text TensorPointerInfos
-            "image_inputs"   - list of per-image TensorPointerInfos
-            "system_prompt"  - tokenized system prompt (if think_mode)
-            "new_token"      - last generated token (during decode)
-            "latents", "time_index" - where the previous denoise walk left off
-        """
-        graph_walk = metadata.graph_walk
-
-        if metadata.is_prefill:
-            schedule = metadata.kwargs["prefill_schedule"]
-            step = metadata.kwargs["prefill_step"]
-            input_tensor_info = [schedule[step][1]]
-
-            if graph_walk == "prefill_text":
-                graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            elif graph_walk == "prefill_vit":
-                graph_edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            elif graph_walk == "prefill_vae":
-                graph_edge = GraphEdge(next_node="vae_encoder", name="image_inputs")
-            else:
-                raise ValueError(f"Unrecognized prefill graph_walk {graph_walk}")
-            graph_edge.tensor_info = input_tensor_info
-            return [graph_edge]
-
-        elif graph_walk == DECODE:
-            graph_edge = GraphEdge(
-                next_node="LLM", name="text_inputs",
-                tensor_info=persist_signals.get("new_token", [])
-            )
-            return [graph_edge]
-
-        elif graph_walk in DENOISE_WALKS:
-            # The previous denoise walk's persisted latents and time_index; the
-            # request's first has none, and its nodes seed them.
-            return [
-                GraphEdge(next_node=node, name=name, tensor_info=list(persist_signals.get(name, [])))
-                for node in self._denoise_nodes(graph_walk) for name in ("latents", "time_index")
-            ]
-
-        elif graph_walk == IMAGE_DECODE:
-            # time_index, persisted beside them, is left to the request's teardown
-            return [GraphEdge(next_node="vae_decoder", name="latents",
-                              tensor_info=list(persist_signals.get("latents", [])))]
-
-        return []
-
-    def _get_unpersist_tensors(
-        self, graph_walk: str, inputs: list[GraphEdge]
-    ) -> list[TensorPointerInfo]:
-        """
-        Lists the tensors that will be used for the last time in this forward pass
-        """
-        if graph_walk == "prefill_vae":
-            # If we have prefill_vae, we know that the image input will be
-            # passed into the ViT encoder for the next forward pass, so it
-            # has to stick around
-            return []
-        # otherwise, we can un-persist all tensors
-        return sum(
-            [inp.tensor_info for inp in inputs], start=[]
-        )
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One prefill walk per span of the schedule, then decode for a text
+        reply, decode then image generation for a think-then-image request, or
+        straight to image generation: the request's denoise walks, in the order
+        of its `image_gen_phases`.
+
+        Every step carries the request's guidance and image params. The step
+        before decode, the one that samples the reply's first token, is marked
+        `FINAL_PREFILL`; ``prefill_stop_ends`` says whether a stop there ends
+        the request, which only a text reply's does: a think-then-image
+        request still has its image to make.
+        """
         target_output = output_modalities[0]  # "text" or "image"
+        check_request_kwargs(model_kwargs, *self.image_sides)
         params = self._request_params(input_modalities, output_modalities, model_kwargs)
-
-        if "image" in output_modalities and input_signals.get("image_inputs"):
-            image = input_signals["image_inputs"][0]
-            params["height"] = image.dims[1]
-            params["width"] = image.dims[2]
+        image = input_signals.get(span_name("image_inputs", 0))
+        if "image" in output_modalities and image:
+            params["height"], params["width"] = image[0].dims[1], image[0].dims[2]
             logger.info(f"Will generate an image of shape {params['height']} x {params['width']}")
+        think_mode = params.pop("think_mode")
+        window = self._cfg_window(target_output, model_kwargs)
+        params["requires_cfg"] = guided(window)
+        params["prefill_stop_ends"] = target_output == "text"
 
-        think_mode = params.pop("think_mode") # used for schedule logic, not stored in params
         schedule = self._build_prefill_schedule(
             input_modalities=input_modalities,
             input_signals=input_signals,
@@ -1504,148 +1526,38 @@ class BagelModel(Model):
             role_turns=(model_kwargs or {})[ROLE_TURNS],
             think_mode=think_mode,
         )
-
-        first_graph_walk = schedule[0][0] if schedule else DECODE
-        kwargs = {
-            "prefill_schedule": schedule,
-            "prefill_step": 0,
-            "target_output": target_output,
-            "num_timesteps": self.config.num_timesteps,
-            "think_mode": think_mode,
-            **params,  # CFG params  + gen width / height
-        }
-        kwargs["requires_cfg"] = False
-        if target_output == "image":
-            # process_prompt resolved the window with the request's guidance kwargs
-            window = CFGWindow(*(model_kwargs or {})[CFG_WINDOW])
-            kwargs["requires_cfg"] = guided(window)
-            kwargs["image_gen_phases"] = self._image_gen_phases(window)
-            kwargs["image_gen_phase"] = 0
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=first_graph_walk,
-            is_prefill=bool(schedule),
-            kwargs=kwargs,
-        )
-        step_metadata =  self._get_step_metadata(full_metadata)
-
-        sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
-        step_metadata.update(self._prefill_token_metadata(sample_prefill_token, target_output))
-
-        inputs = self._get_fwd_pass_inputs(
-            full_metadata, input_signals
-        )
-        unpersist_tensors = self._get_unpersist_tensors(first_graph_walk, inputs)
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        """Advance graph walk transitions. Schedule-driven, no BOI detection.
-
-        During prefill, steps through the schedule one entry at a time.
-        After all prefill steps, transitions to:
-          - decode (text output)
-          - decode (image output + think_mode: think first, then generate)
-          - the first denoise walk (image output, no think_mode)
-
-        During decode:
-          - Text output: EOS marks request complete.
-          - Image output + think_mode: EOS transitions to the first denoise
-            walk (thinking is done, now generate the image).
-
-        The denoise walks run in the order of ``image_gen_phases``; after the
-        last, marks request complete (one image per request).
-        """
-        metadata = partition_metadata
-        request_done = False
-
-        has_text_output = (
-            metadata.kwargs.get("think_mode", False) or metadata.kwargs["target_output"] != "image"
-        )
-        sample_prefill_token = False
-
-        if metadata.is_prefill:
-            step = metadata.kwargs["prefill_step"] + 1
-            schedule = metadata.kwargs["prefill_schedule"]
-
-            sample_prefill_token = has_text_output and (
-                step == len(schedule) - 1
-            )
-
-            if step < len(schedule):
-                # More prefill steps remaining
-                metadata.kwargs["prefill_step"] = step
-                metadata.graph_walk = schedule[step][0]
-            else:
-                # All prefill done -- transition based on target_output
-                metadata.is_prefill = False
-                target = metadata.kwargs["target_output"]
-                if target == "text":
-                    metadata.graph_walk = DECODE
-                elif target == "image":
-                    if metadata.kwargs.get("think_mode", False):
-                        # Think first: decode to generate reasoning, then
-                        # EOS triggers transition to image_gen.
-                        metadata.graph_walk = DECODE
-                    else:
-                        metadata.graph_walk = self._image_gen_phase(metadata).walk
-        elif metadata.graph_walk == DECODE:
-            target = metadata.kwargs["target_output"]
-            if metadata.kwargs.get("think_mode", False) and target == "image":
-                # Thinking graph walk complete — transition to image generation.
-                metadata.graph_walk = self._image_gen_phase(metadata).walk
-            else:
-                request_done = True
-
-        elif metadata.graph_walk in DENOISE_WALKS or metadata.graph_walk == IMAGE_DECODE:
-            phase = metadata.kwargs["image_gen_phase"] + 1
-            if phase < len(metadata.kwargs["image_gen_phases"]):
-                metadata.kwargs["image_gen_phase"] = phase
-                metadata.graph_walk = self._image_gen_phase(metadata).walk
-            else:
-                # the image is out (one per request)
-                request_done = True
-
-        step_metadata =  self._get_step_metadata(metadata)
-        step_metadata.update(
-            self._prefill_token_metadata(sample_prefill_token, metadata.kwargs["target_output"])
-        )
-        inputs = self._get_fwd_pass_inputs(
-            metadata, persist_signals
-        )
-        unpersist_tensors = self._get_unpersist_tensors(
-            metadata.graph_walk, inputs
-        )
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-            request_done=request_done
-        )
+        decode = WalkStep(DECODE, bind={"text_inputs": "new_token"}, step_metadata=params)
+        # the denoise walks, in the order of the request's `image_gen_phases`
+        image_gen = [
+            WalkStep(phase.walk, step_metadata=params) for phase in self._image_gen_phases(window)
+        ] if window is not None else []
+        if target_output == "text":
+            after = [decode]
+        else:
+            after = [decode, *image_gen] if think_mode else image_gen
+        if not schedule and after[0] is not decode:
+            # a request with nothing to prefill opens on decode, its last walk
+            after = [decode]
+        first_token = after[0] is decode
+        if first_token and schedule and self.get_max_output_tokens(**(model_kwargs or {})) == 1:
+            # the last prefill samples the only token asked for: no decode step follows
+            # it (a think-then-image request goes straight to its image)
+            after = after[1:]
+        return [
+            WalkStep(walk, bind={name: span}, step_metadata={
+                **params, FINAL_PREFILL: first_token and k == len(schedule) - 1,
+            })
+            for k, (walk, name, span) in enumerate(schedule)
+        ] + after
 
     def get_sampling_config(
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
-        keys = [
-            "temperature", "top_k", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
-        params = {k: getattr(self.config, k) for k in keys}
+        params = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
+        params.update(self.sampling_defaults)
         if model_kwargs:
-            for key in keys:
+            for key in SAMPLING_KEYS:
                 if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return SamplingConfig(

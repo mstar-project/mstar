@@ -80,7 +80,6 @@ from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig  
 from mstar.model.qwen3_omni.submodules import Code2WavSubmodule  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards  # noqa: E402
-from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo  # noqa: E402
 
 
@@ -110,9 +109,7 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple[Str
     cfg = submodule.config.code2wav
     buffer = StreamBuffer(
         request_id="r", edge_name="codec_tokens", from_partition="Talker",
-        policy=ScheduledLeftContextChunkPolicy(
-            schedule=cfg.codec_chunk_schedule, chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames,
-        ),
+        policy=cfg.chunk_policy(),
     )
     for i, frame in enumerate(frames):
         buffer.pre_read_register(f"t{i}")
@@ -124,13 +121,15 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple[Str
     while buffer.has_chunk_ready():
         chunk = buffer.pop_chunk()
         meta = {"r": InputMetadata(stream_chunks={"codec_tokens": chunk.info})}
-        key = submodule.cg_key_info("code2wav_chunk", {"r": fwd_info}, per_request_input_metadata=meta)
         engine_inputs = ModelInputsFromEngine(
-            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta, captured=key is None,
+            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta, captured=True,
         )
         item = submodule.prepare_inputs(
             "code2wav_chunk", fwd_info, {"codec_tokens": [chunk.data["data"]]}, input_metadata=meta["r"],
         )
+        if item is None:
+            # declined like the engine declines it: no new frame, so no forward and no audio
+            continue
         with torch.no_grad():
             outputs = submodule.forward_batched(
                 "code2wav_chunk", engine_inputs, **submodule.preprocess("code2wav_chunk", engine_inputs, [item]),

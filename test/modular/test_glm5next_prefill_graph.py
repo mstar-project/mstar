@@ -115,7 +115,7 @@ def test_static_layout_matches_the_exact_one(lengths, pad_rows, bucket):
 # --- the submodule captured by the engine's runner ---------------------------
 
 
-def _config(buckets, batch_sizes):
+def _config(batch_sizes):
     n = 5  # layers 0-2 dense KDA, 3 MLA + MoE, 4 KDA + MoE
     return Glm5NextModelConfig(
         vocab_size=512, hidden_size=256, num_hidden_layers=n,
@@ -128,8 +128,7 @@ def _config(buckets, batch_sizes):
         intermediate_size=512, moe_intermediate_size=256, n_routed_experts=16,
         num_experts_per_tok=4, eos_token_ids=(1,), pad_token_id=0,
         quantization_config=Fp8BlockQuantConfig(), moe_quant_kernel="auto",
-        prefill_graphs=True, prefill_token_buckets=buckets,
-        prefill_capture_batch_sizes=batch_sizes,
+        prefill_graphs=True, prefill_capture_batch_sizes=batch_sizes,
     )
 
 
@@ -154,7 +153,7 @@ class _Engine:
 
     def __init__(self, buckets, batch_sizes, seed=0):
         torch.manual_seed(seed)
-        self.cfg = cfg = _config(buckets, batch_sizes)
+        self.cfg = cfg = _config(batch_sizes)
         with torch.device("meta"):
             lm = Glm5NextForCausalLM(cfg)
         lm = lm.to(torch.bfloat16)
@@ -182,6 +181,8 @@ class _Engine:
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,
             joint_comm_group=trivial, num_slots=1,
+            # the serving config's prefill_token_buckets, as the engine hands it over
+            token_ladders={"prefill": buckets},
         )
         self.cg.warmup_and_capture(None)
 

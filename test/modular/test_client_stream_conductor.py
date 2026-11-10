@@ -25,17 +25,18 @@ import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.communication import wire  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.request_info import (  # noqa: E402
-    CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
+    WalkStep,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
-from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
+from mstar.model.base import Model  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
+    ClientAudio,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -99,7 +100,7 @@ class _DuplexToy(StubModel):
         ))}
 
     def get_partitions(self):
-        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen")]
+        return [PartitionDefinition(name="Ear", graph_walks={"listen"})]
 
     def get_partition_topology(self):
         return PartitionTopology(partitions=["Ear"], connections=[
@@ -107,23 +108,11 @@ class _DuplexToy(StubModel):
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
         ])
 
-    def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,
-                                      input_signals, model_kwargs=None):
-        return _fwd()
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals,
-                                        incoming_connections=None):
-        return _fwd()
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        return [WalkStep("listen")]
 
     def process_stream_chunk(self, chunk):
         return {"audio_in": chunk.tensors["audio_inputs"]}
-
-
-def _fwd():
-    return ForwardPassArgs(
-        full_metadata=CurrentForwardConductorMetadata(graph_walk="listen", is_prefill=False),
-        inputs=[], unpersist_tensors=[],
-    )
 
 
 def _conductor(tmp_path, monkeypatch, model=None, **config) -> Conductor:
@@ -315,10 +304,11 @@ def _stub_worker(sbuf):
     request_state = SimpleNamespace(per_request_info={7: req_info})
     stub = make_worker(
         worker_id="worker_0",
-        _graph_runtime=SimpleNamespace(get_rid_handle=lambda rid: 7 if rid == "r" else None),
+        graph_runtime=SimpleNamespace(get_rid_handle=lambda rid: 7 if rid == "r" else None),
         request_state=request_state,
         streams=StreamBufferManager(request_state, None, []),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             start_read_tensors=lambda rid, edges, graph_walk=None: edges and reads.append(
                 [info.uuid for edge in edges for info in edge.tensor_info]
             ) or [],
@@ -363,7 +353,7 @@ def test_a_client_stream_has_one_consumer(tmp_path, monkeypatch):
             return walks
 
         def get_partitions(self):
-            return [PartitionDefinition(name="Ear", graph_walks={"listen", "listen2"}, initial_walk="listen")]
+            return [PartitionDefinition(name="Ear", graph_walks={"listen", "listen2"})]
 
     assert _refused(_TwoEars(), "exactly one consuming node")
 
@@ -384,6 +374,42 @@ def test_client_streams_without_process_stream_chunk_fail_at_startup():
         process_stream_chunk = Model.process_stream_chunk
 
     assert _refused(_NoHook(), "process_stream_chunk")
+
+
+def test_a_client_stream_that_declares_audio_needs_looped_output():
+    """/v1/realtime would fail such a call at the first chunk without a loop
+    step, and mis-pair its text and audio unless the loop steps once per item
+    from the stream. Turn tokens are not needed to start: only a conversation
+    needs them."""
+    class _Unmarked(_DuplexToy):
+        def get_partition_topology(self):
+            conn = _client_connection("audio_in")
+            conn.audio = ClientAudio(16000, 1280)
+            return PartitionTopology(partitions=["Ear"], connections=[conn])
+
+    class _Marked(_Unmarked):
+        turn_tokens = (1, 2)
+
+    class _Unlooped(_Marked):
+        def get_graph_walk_graphs(self):
+            return {"listen": super().get_graph_walk_graphs()["listen"].section}
+
+    class _AtLoopExit(_Marked):
+        def get_graph_walk_graphs(self):
+            return {"listen": Loop(
+                name="listen_loop", max_iters=1000, section=super().get_graph_walk_graphs()["listen"].section,
+                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="text", output_modality="text")])}
+
+    class _TwoFramesAStep(_Marked):
+        def get_partition_topology(self):
+            topology = super().get_partition_topology()
+            topology.connections[0].chunk_policy_factory = lambda: FixedChunkPolicy(chunk_size=2)
+            return topology
+
+    assert _refused(_Unlooped(), "['ear'] emit outside one")
+    assert _refused(_AtLoopExit(), "['listen_loop'] emit outside one")
+    assert _refused(_TwoFramesAStep(), "['Ear'] do not")
+    assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
 
 
 def test_each_client_stream_into_no_partition_fails_at_startup():
@@ -544,9 +570,17 @@ def test_bad_client_stream_settings_fail_startup(config, match):
     assert _refused(_Bounded(ClientStreamLimits()), match, config)
 
 
-def test_only_a_client_stream_takes_limits():
-    with pytest.raises(ValueError, match="not a client stream"):
+@pytest.mark.parametrize("producer, declared, match", [
+    ("A", {"limits": ClientStreamLimits(max_items=1)}, "not a client stream"),
+    ("A", {"audio": ClientAudio(16000, 1280)}, "not a client stream"),
+    *((CLIENT, {"audio": ClientAudio(16000, frame)}, "frame_samples must be a positive integer")
+      for frame in (0, -4, True, 2.5)),
+    *((CLIENT, {"audio": ClientAudio(rate, 1280)}, "sample_rate must be a positive integer")
+      for rate in (0, 16000.0, False)),
+])
+def test_a_topology_refuses_a_stream_declaration_it_cannot_serve(producer, declared, match):
+    with pytest.raises(ValueError, match=match):
         PartitionTopology(partitions=["A", "B"], connections=[Connection(
-            from_partition="A", to_partition="B", edge_name="x",
-            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=ClientStreamLimits(max_items=1),
+            from_partition=producer, to_partition="B", edge_name="x",
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), **declared,
         )])

@@ -214,7 +214,7 @@ def cosmos_policy():
 
 def waypoint_rollout(mouse, size):
     actions = [{"mouse": [mouse, 0], "buttons": [], "scroll": 0}] * 2
-    return generate("", "video_frame", {"num_steps": 2, "seed": 7, "actions": actions},
+    return generate("", "video_frame", {"seed": 7, "actions": actions},
                     lambda: ("seed.png", scene_png(*size)), streaming=True)
 
 
@@ -249,8 +249,7 @@ def vjepa2_ac_case(name, scale):
         Expect("float32", modality="video", count=8192 * 1408))  # predicted tokens x hidden size
 
 
-QWEN_TTS = dict(language="English", temperature=0, talker_temperature=0, subtalker_dosample=False,
-                do_sample=False, max_output_tokens=256)
+QWEN_TTS = dict(language="English", temperature=0, code_predictor_temperature=0, max_output_tokens=256)
 CHATTERBOX = ("pyloudnorm", "perth")
 
 MODELS: dict[str, ModelSpec] = {m.name: m for m in [
@@ -284,7 +283,7 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
     ModelSpec("qwen3tts_voicedesign", "configs/qwen3tts_voicedesign.yaml", (
         Case("voice_design", "speech", speech(instructions="A clear, friendly adult female voice.",
-                                              language="English", do_sample=False, subtalker_dosample=False), SPEECH),
+                                              language="English", temperature=0, code_predictor_temperature=0), SPEECH),
     ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
     ModelSpec("kokoro", "configs/kokoro.yaml", (
         Case("text_to_speech", "speech", speech(voice="af_heart", speed=1.0), SPEECH),
@@ -293,10 +292,10 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
         Case("text_to_speech", "speech", speech(voice="tara", temperature=0), SPEECH),
     ), "speech", gated=("canopylabs/orpheus-3b-0.1-ft",), peak_vram_gb=38.2),
     ModelSpec("chatterbox", "configs/chatterbox.yaml", (
-        Case("text_to_speech", "speech", speech(voice="default", do_sample=False), SPEECH),
+        Case("text_to_speech", "speech", speech(voice="default", temperature=0), SPEECH),
     ), "speech", requires=CHATTERBOX, peak_vram_gb=18.9),
     ModelSpec("chatterbox_multilingual", "configs/chatterbox_multilingual.yaml", (
-        Case("text_to_speech", "speech", speech(voice="default", language_id="en", do_sample=False), SPEECH),
+        Case("text_to_speech", "speech", speech(voice="default", language_id="en", temperature=0), SPEECH),
     ), "speech", requires=(*CHATTERBOX, "pykakasi", "spacy_pkuseg"), peak_vram_gb=18.9),
     ModelSpec("chatterbox_turbo", "configs/chatterbox_turbo.yaml", (
         Case("text_to_speech", "speech", speech(voice="default"), SPEECH),

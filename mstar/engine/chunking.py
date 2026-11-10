@@ -106,6 +106,40 @@ class ChunkingManagement:
                 return self._overrides[key]
         return budget
 
+    def max_step_tokens(self, node_name: str, graph_walk: str, max_rows: int) -> int | None:
+        """The most tokens the scheduler gives a step of ``graph_walk`` of at
+        most ``max_rows`` rows, None where it runs under no budget.
+
+        That is the budget it was scheduled under: that of the combined walk
+        it runs in, if any (a combined batch whose rows share one real walk
+        runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
+        ran under the combined walk's budget). For a combined walk's step, or
+        more, by what a speculation chain's rows, one-token decode rows, take
+        of ``min_chunk_tokens``. A real walk's step carries no chain rows of
+        its own node: decode rows beside a prompt make the step the combined
+        walk's (`MicroScheduler.label_for`), and a same-node chain on a prompt
+        walk continues no row, its rows mid-prefill being the step's own.
+
+        None too where the step may hold a prompt of a walk whose chunking
+        the serving config turned off: it runs whole, however long."""
+        members = [
+            walk for (node, walk), combined in self._combined_walk_of.items()
+            if node == node_name and combined == graph_walk
+        ]
+        if any(
+            self.policy(node_name, walk).chunkable and not self.chunkable(node_name, walk)
+            for walk in members or [graph_walk]
+        ):
+            return None
+        walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
+        budget = self.max_batch_tokens(node_name, walk)
+        if budget is None or not members:
+            return budget
+        # the chain's rows come off the budget first (`MicroScheduler._build_step`),
+        # and `batch_builder._run_head` still runs a prompt `min_chunk_tokens` where
+        # they leave it less
+        return max(budget, max_rows - 1 + self.min_chunk_tokens(budget))
+
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
@@ -167,11 +201,30 @@ class ChunkingManagement:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._overrides[(node, walk)] = budget
 
-    def min_chunk_tokens(self, budget: int) -> int:
+    def min_chunk_tokens(self, budget: int, align: int = 1) -> int:
         """The fewest tokens the scheduler cuts a row to under ``budget``, or
         the whole budget when that is smaller. Without a floor, decode rows
-        that fill the budget leave a prompt a token or two a step."""
-        return min(self._min_chunk_tokens, budget)
+        that fill the budget leave a prompt a token or two a step. A cut is a
+        multiple of ``align`` (`Engine.chunk_alignment`), so the floor rounds up
+        to one, within the budget: a floor between two multiples would leave the
+        oldest prompt's share of a step too small to cut."""
+        floor = min(self._min_chunk_tokens, budget)
+        if align > 1:
+            floor = max(align, min(-(-floor // align) * align, budget - budget % align))
+        return floor
+
+    def cut_budgets(self) -> dict[tuple[str, str], int]:
+        """(node, walk) -> budget, for each budget that cuts a prompt: a chunkable
+        walk's own, and that of the combined walk it runs in."""
+        out: dict[tuple[str, str], int] = {}
+        for node, walk in self._policies:
+            if not self.chunkable(node, walk):
+                continue
+            for key in ((node, walk), (node, self._combined_walk_of.get((node, walk)))):
+                budget = self.max_batch_tokens(*key) if key[1] is not None else None
+                if budget is not None:
+                    out[key] = budget
+        return out
 
     def walk_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
         """Under a combined walk on a node with ``can_override_mixed_max_tokens``:

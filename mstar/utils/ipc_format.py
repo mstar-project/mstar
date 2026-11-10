@@ -43,6 +43,8 @@ class WorkerMessageType(Enum):
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
     CLIENT_STREAM_ROUTE = "client_stream_route"
+    LOAD_LORA_ADAPTER = "load_lora_adapter"
+    UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
 
 
 @dataclass
@@ -299,6 +301,9 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
+    LOAD_LORA_ADAPTER = "load_lora_adapter"
+    UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
+    LORA_ADAPTER_ACK = "lora_adapter_ack"
 
 
 @dataclass
@@ -332,7 +337,6 @@ class WorkerGraphsDone(MessageBody):
     # The walk the completed pass ran under. The conductor follows it for a
     # partition whose walk the stream drives.
     graph_walk: str = field(default="")
-    stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     # Stream edge -> destination worker -> items sent since the last report.
     # Every rank reports its own.
     stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -385,6 +389,37 @@ class EnableMetrics(MessageBody):
     """Start the workers' histograms and counters. The API server sends it to
     the conductor after its warmup requests; the conductor forwards it to
     every worker (``WorkerMetrics.start_counting``)."""
+
+
+@dataclass
+class LoadLoraAdapter(MessageBody):
+    """Serve a LoRA adapter from now on (``POST /v1/load_lora_adapter``). The API server
+    sends it to the conductor, which forwards it to every worker hosting the LoRA pool
+    and answers once all of them have acknowledged. ``op_id`` pairs the acks and the
+    answer with the request; ``lora_path`` is a safetensors file every process can read.
+    ``lora_digest`` (hex) is the digest of the weights the API server checked and keys
+    the prefix cache under: a worker reading other weights refuses the load.
+    """
+    op_id: str
+    lora_name: str
+    lora_path: str
+    lora_digest: str
+
+
+@dataclass
+class UnloadLoraAdapter(MessageBody):
+    """Stop serving a LoRA adapter to new requests (``POST /v1/unload_lora_adapter``);
+    routed like ``LoadLoraAdapter``."""
+    op_id: str
+    lora_name: str
+
+
+@dataclass
+class LoraAdapterAck(MessageBody):
+    """A worker's answer to a load or unload: ``error`` is None when it succeeded."""
+    op_id: str
+    worker_id: str
+    error: str | None = None
 
 
 @dataclass

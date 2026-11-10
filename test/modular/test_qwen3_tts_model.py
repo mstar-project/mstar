@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,6 @@ import pytest
 import torch
 import yaml
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -22,7 +22,9 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.model.base import ClientChunk
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.qwen3_tts import qwen3_tts_model
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
@@ -41,7 +43,7 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSTalkerConfig,
 )
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, clip_digest
-from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
+from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule, text_stream_start
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -55,6 +57,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
+from mstar.validation.client_streams import check_client_streams
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 
@@ -66,7 +69,8 @@ USER_SUFFIX = [151645, 198]
 
 
 class _TokenizerStub:
-    """Tokenizes the two reference templates: fixed ChatML wrappers, one id per word."""
+    """Tokenizes the reference templates (fixed ChatML wrappers) and live text
+    appends (bare), one id per word."""
 
     def __init__(self):
         self.texts = []
@@ -86,10 +90,11 @@ class _TokenizerStub:
             # the reference transcript turn (voice clone)
             body = text[len("<|im_start|>assistant\n"):-len("<|im_end|>\n")]
             prefix, suffix = ASSISTANT_PREFIX, USER_SUFFIX
-        else:
-            assert text.startswith("<|im_start|>user\n")
+        elif text.startswith("<|im_start|>user\n"):
             body = text[len("<|im_start|>user\n"):-len("<|im_end|>\n")]
             prefix, suffix = USER_PREFIX, USER_SUFFIX
+        else:
+            body, prefix, suffix = text, [], []
         words = [1000 + i for i, _ in enumerate(body.split())]
         return {"input_ids": torch.tensor([prefix + words + suffix])}
 
@@ -227,8 +232,8 @@ def test_qwen3_tts_declares_talker_and_codec_graphs():
     assert [part.name for part in model.get_partitions()] == ["Talker", "Codec"]
     topology = model.get_partition_topology()
     assert topology.partitions == ["Talker", "Codec"]
-    assert len(topology.connections) == 1
-    assert topology.connections[0].edge_name == "codec_tokens"
+    assert [c.edge_name for c in topology.connections] == ["text_in", "codec_tokens"]
+    assert check_client_streams(model, {}) == []
 
 
 def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
@@ -404,13 +409,12 @@ def test_qwen3_tts_process_prompt_matches_official_template():
         "<|im_start|>assistant\n你好<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
-    assert list(result.new_input_tensors) == ["text_inputs"]
     assert result.new_input_tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
+    assert result.new_input_tensors["text_in"] == []   # the prefill takes the whole text
     # CustomVoice default: whole text in the prefill (stream_text = 0); no
     # reference transcript or frames. Host values, for the prefill's step metadata.
     assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
     }
 
 
@@ -465,6 +469,8 @@ def test_qwen3_tts_1p7b_custom_voice_prepends_instruction_turn():
     assert result.new_input_tensors["text_inputs"][0].tolist() == instruct_ids + assistant_ids
     assert result.metadata[PROMPT_LAYOUT_KEY] == [len(instruct_ids), 3, 1, 0, 0]
     assert result.metadata[SPEAKER_ID_KEY] == 3061
+    # streamed text: the prefill takes the first token, the decode the rest
+    assert [t.tolist() for t in result.new_input_tensors["text_in"]] == [[1001], [1002]]
 
 
 def test_qwen3_tts_voice_design_requires_instruct_and_has_no_speakers():
@@ -513,7 +519,8 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     ref_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + USER_SUFFIX  # same <|im_end|>\n tail
     assistant_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + ASSISTANT_SUFFIX
     assert model.tokenizer.texts[-1] == "<|im_start|>assistant\nthe reference says<|im_end|>\n"
-    assert list(result.new_input_tensors) == ["text_inputs"]
+    # transcript + text + TTS EOS (7) fit beside codec BOS + 13 frames: nothing streams
+    assert result.new_input_tensors["text_in"] == []
     assert result.new_input_tensors["text_inputs"][0].tolist() == assistant_ids + ref_ids
     assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         # [instruct_len, text_len, stream_text (Base default: streaming), ref_text_len, ref_frames]
@@ -522,7 +529,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         LANGUAGE_ID_KEY: model.config.talker.codec_language_id["english"],
         REF_CLIP_KEY: clip_digest(clip),
         # All 13 reference frames lead the codec stream as context (fewer than left_context).
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 13,
+        "stream_lead_items": {"codec_tokens": 13},
     }
 
     xvec = model.process_prompt(
@@ -531,7 +538,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     )
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
-    assert xvec.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == 0   # no stream lead
+    assert "stream_lead_items" not in xvec.metadata   # no stream lead
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -574,7 +581,7 @@ def test_qwen3_tts_reference_bounds_are_inclusive():
         )
         assert result.metadata[PROMPT_LAYOUT_KEY][-1] == frames
         # only the last left_context (72) frames lead the codec stream
-        assert result.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == min(frames, 72)
+        assert result.metadata["stream_lead_items"] == {"codec_tokens": min(frames, 72)}
 
 
 def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monkeypatch):
@@ -597,7 +604,7 @@ def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monk
     assert model.load_audio(str(ok), "cpu").data.shape == (2 * 24000,)
 
 
-def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
+def test_qwen3_tts_base_declares_clone_walks_and_plans_them_for_reference_audio():
     model = _variant_model("base")
     walks = model.get_graph_walk_graphs()
     assert "talker_prefill_clone" in walks and "codec_chunk_clone" not in walks
@@ -608,36 +615,15 @@ def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
     # Non-Base variants do not even declare the clone walks (config-driven).
     assert "talker_prefill_clone" not in _variant_model("voice_design").get_graph_walk_graphs()
 
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in (*Qwen3TTSModel.PREFILL_INPUTS, "audio_inputs")
-    }
     prompt = {PROMPT_LAYOUT_KEY: [0, 3, 1, 9, 13], SPEAKER_ID_KEY: -1, LANGUAGE_ID_KEY: -1, REF_CLIP_KEY: "clip"}
-    talker = model.get_initial_forward_pass_args(
-        "Talker", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs=prompt,
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = {(edge.name, edge.next_node) for edge in talker.inputs}
-    assert routes == {("audio_inputs", "RefEncoder"), ("text_inputs", "Talker")}
+    talker = model.walk_plan("Talker", ["audio", "text"], ["audio"], {}, prompt)
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # The layout and the clip's key reach the RefEncoder and the Talker as step metadata.
-    assert {key: talker.step_metadata[key] for key in prompt} == prompt
-    codec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 40},
-    )
-    # The codec runs its one walk; the reference frames leading its stream are
-    # announced so the worker primes the stream with them as context.
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == [] and codec.unpersist_tensors == []
-    assert codec.stream_lead_items == {"codec_tokens": 40}
-    xvec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={},
-    )
-    assert xvec.stream_lead_items == {}
-    rearmed = model.get_partition_forward_pass_args("Codec", codec.full_metadata, persist_signals={})
-    assert rearmed.full_metadata.graph_walk == "codec_chunk" and rearmed.inputs == []
+    assert talker[0].step_metadata == prompt
+    # the decode reads where its text stream ends from the layout
+    assert talker[1].step_metadata == {PROMPT_LAYOUT_KEY: prompt[PROMPT_LAYOUT_KEY]}
+    # The codec runs its one walk
+    assert [step.walk for step in model.walk_plan("Codec", ["audio", "text"], ["audio"], {}, {})] == ["codec_chunk"]
 
     # The Base deployment maps the extra node and walks.
     deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
@@ -716,91 +702,36 @@ def test_qwen3_tts_rejects_unsupported_requests(
         )
 
 
-def test_qwen3_tts_initial_partition_args_route_expected_inputs():
-    model = _make_model()
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in Qwen3TTSModel.PREFILL_INPUTS
-    }
-    assert Qwen3TTSModel.PREFILL_INPUTS == ("text_inputs",)
+@pytest.mark.parametrize("kwargs, live", [
+    ({}, True),
+    ({"non_streaming_mode": True}, False),
+    ({"ref_text": "the reference says"}, False),
+])
+def test_qwen3_tts_live_text_streams_one_item_per_token(kwargs, live):
+    """An append's tokens join text_in, one item each; a live opening in a
+    layout that puts the whole text in the prefill is a 400, and one-shot it
+    is served."""
+    model = _variant_model("base")
+    clip = torch.zeros(24000 + 1)
 
-    prompt = {PROMPT_LAYOUT_KEY: [0, 4, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
-    talker = model.get_initial_forward_pass_args(
-        "Talker",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-        model_kwargs={"subtalker_top_k": 7, **prompt},
+    def opening(open_streams):
+        return model.process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [clip]}, x_vector_only_mode="ref_text" not in kwargs,
+            open_streams=open_streams, **kwargs,
+        )
+
+    one_shot = opening(frozenset())
+    if not live:
+        with pytest.raises(ValueError, match="takes live text only"):
+            opening(frozenset({"text_in"}))
+        return
+    opening(frozenset({"text_in"}))
+    chunk = ClientChunk(
+        text="big world", tensors={}, input_metadata={}, streams={}, model_kwargs={},
+        request_kwargs=one_shot.metadata,
     )
-    assert talker.full_metadata.graph_walk == "talker_prefill"
-    assert [edge.name for edge in talker.inputs] == list(pointers)
-    assert talker.step_metadata == {"is_prefill": True, **prompt}
-    # Residual-group sampling rides the code predictor's own per-request
-    # sampler config, not step metadata.
-    assert "subtalker_sampling" not in talker.step_metadata
-    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
-    assert configs[CODE_PRED_SAMPLER].top_k == 7
-
-    codec = model.get_initial_forward_pass_args(
-        "Codec",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-    )
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == []
-    assert codec.request_done is False
-
-
-def test_qwen3_tts_talker_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_prefill",
-        is_prefill=True,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={"talker_input_embeds": []},
-    )
-
-    assert result.full_metadata.graph_walk == "talker_decode"
-    assert result.full_metadata.is_prefill is False
-    assert result.inputs[0].name == "talker_input_embeds"
-    assert result.request_done is False
-
-
-def test_qwen3_tts_talker_decode_marks_partition_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
-
-
-def test_qwen3_tts_postprocess_encodes_pcm16():
-    model = _make_model()
-
-    output = model.postprocess(
-        torch.tensor([-1.0, 0.0, 1.0]),
-        modality="audio",
-    )
-
-    expected = torch.tensor([-32767, 0, 32767], dtype=torch.int16)
-    assert output == expected.numpy().tobytes()
+    assert [t.tolist() for t in model.process_stream_chunk(chunk)["text_in"]] == [[1000], [1001]]
 
 
 def _tiny_model_config() -> Qwen3TTSModelConfig:
@@ -861,37 +792,15 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     embeds = submodule._build_prefill(
         request_id="request",
         text_ids=torch.arange(1, 13),
-        prompt_layout=[0, 4, 1],
+        prompt_layout=[0, 4, 1, 0, 0],
         speaker_id=40,
         language_id=-1,
     )
 
     # role(3) + [nothink, think_bos, think_eos, speaker, pad](5) + first text token
     assert embeds.shape == (9, 16)
-    state = submodule.request_state("request")
-    assert state["trailing_text_hidden"].shape == (4, 16)
-    assert state["tts_pad_embed"].shape == (16,)
-
-
-def test_qwen3_tts_decode_feeds_its_iterations_text_token_however_often_it_is_prepared():
-    """A refused admit prepares the step's decode rows again: each must feed
-    its own iteration's text token again, not skip to the next one."""
-    config = _tiny_model_config()
-    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
-    hidden = config.talker.hidden_size
-    trailing, pad = torch.randn(3, hidden), torch.randn(hidden)
-    submodule.request_state("r").add_all(generated_frames=1, trailing_text_hidden=trailing, tts_pad_embed=pad)
-
-    def text_condition(iteration: int) -> torch.Tensor:
-        return submodule.prepare_inputs(
-            "talker_decode", SimpleNamespace(request_id="r", rid_handle="r"),
-            {"talker_input_embeds": [torch.zeros(1, hidden)]},
-            input_metadata=InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": iteration}),
-        ).kwargs["text_condition"]
-
-    for iteration in (0, 0, 1, 2, 2):   # iterations 0 and 2 refused once
-        assert torch.equal(text_condition(iteration), trailing[iteration])
-    assert torch.equal(text_condition(3), pad)   # the text is used up
+    # the decode streams the other three, then TTS EOS
+    assert text_stream_start([0, 4, 1, 0, 0]) == 1
 
 
 def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
@@ -905,7 +814,7 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
     embeds = submodule._build_prefill(
         request_id="request",
         text_ids=torch.arange(1, 13),
-        prompt_layout=[0, 4, 0],
+        prompt_layout=[0, 4, 0, 0, 0],
         speaker_id=40,
         language_id=41,
     )
@@ -913,17 +822,43 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
     # role(3) + [think, think_bos, lang, think_eos, speaker, pad](6)
     # + (4 text + tts_eos) over codec pads (5) + (tts_pad + codec_bos)(1)
     assert embeds.shape == (15, 16)
-    state = submodule.request_state("request")
-    # Nothing streams: every decode frame adds the TTS PAD embedding.
-    assert state["trailing_text_hidden"].shape == (0, 16)
-    prepared = submodule.prepare_inputs(
-        "talker_decode",
-        SimpleNamespace(request_id="request", rid_handle="request"),
-        {"talker_input_embeds": [torch.zeros(1, 16)]},
+    # nothing streams
+    assert text_stream_start([0, 4, 0, 0, 0]) is None
+
+
+@pytest.mark.parametrize("layout, first_empty", [
+    ([0, 4, 1, 0, 0], "eos"),    # streamed text: TTS EOS follows the last token
+    ([0, 4, 0, 0, 0], "pad"),    # the prefill took the text and TTS EOS
+])
+def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_empty):
+    """Each decode frame adds one text token: the stream's next one, then TTS
+    EOS once past its end (unless the prefill took it), then TTS PAD. TTS EOS
+    counts as fed only once its step has run, so a step prepared twice (an
+    admit retry) adds the same token both times."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
+    submodule.request_state("r").add("generated_frames", 0)
+    info = SimpleNamespace(
+        request_id="r", rid_handle="r", graph_walk="talker_decode", step_metadata={PROMPT_LAYOUT_KEY: layout},
     )
-    # The condition rides the row; preprocess adds it for the batch.
-    assert torch.equal(prepared.kwargs["text_condition"], state["tts_pad_embed"])
-    assert torch.equal(prepared.input_embeds[0] + prepared.kwargs["text_condition"], state["tts_pad_embed"])
+    loop_back = {"talker_input_embeds": [torch.zeros(1, 16)]}
+
+    def prepare(fed=()):
+        return submodule.prepare_inputs("talker_decode", info, {**loop_back, "text_in": list(fed)})
+
+    def ran(prepared):
+        submodule.postprocess("r", info, {}, inputs=prepared)
+
+    tokens = {"eos": config.tts_eos_token_id, "pad": config.tts_pad_token_id}
+    # two tokens streamed, then the stream's empty chunks
+    for token in (7, 8):
+        step = prepare([torch.tensor([token])])
+        assert int(step.kwargs["text_id"]) == token
+        ran(step)
+    retried, step = prepare(), prepare()
+    assert int(retried.kwargs["text_id"]) == int(step.kwargs["text_id"]) == tokens[first_empty]
+    ran(step)
+    assert int(prepare().kwargs["text_id"]) == tokens["pad"]
 
 
 def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
@@ -939,7 +874,7 @@ def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
     embeds = submodule._build_prefill(
         request_id="request",
         text_ids=text_ids,
-        prompt_layout=[6, 4, 1],
+        prompt_layout=[6, 4, 1, 0, 0],
         speaker_id=-1,
         language_id=-1,
     )
@@ -952,7 +887,7 @@ def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
         submodule._build_prefill(
             request_id="request",
             text_ids=text_ids,
-            prompt_layout=[6, 3, 1],
+            prompt_layout=[6, 3, 1, 0, 0],
             speaker_id=-1,
             language_id=-1,
         )
@@ -978,21 +913,22 @@ def test_qwen3_tts_talker_builds_in_context_clone_prefill():
         )
 
     # Streaming text (Base default): text (2 ref + 4 + eos = 7) longer than
-    # codec (bos + 5 frames = 6) -> 6 in the prefill, 1 trailing.
+    # codec (bos + 5 frames = 6) -> 6 in the prefill, TTS EOS streams.
     embeds = build([0, 4, 1, 7, 5])
     # role(3) + [nothink, think_bos, think_eos, xvec, pad](5) + icl(6)
     assert embeds.shape == (3 + 5 + 6, 16)
+    assert text_stream_start([0, 4, 1, 7, 5]) == 6
     state = submodule.request_state("clone")
-    assert state["trailing_text_hidden"].shape == (1, 16)
     assert torch.equal(state["reference_frames"], ref_codes)
     # The x-vector occupies the speaker slot right after the three think tags.
     tags = embeds[3:3 + 5]
-    assert torch.allclose(tags[3], speaker_embed.to(tags.dtype) + state["tts_pad_embed"], atol=1e-5)
+    pad = submodule._special_text_embeds(tags.dtype)[2][0, 0]
+    assert torch.allclose(tags[3], speaker_embed.to(tags.dtype) + pad, atol=1e-5)
 
     # Non-streaming: (text + eos) over codec pads, then (bos + frames) + tts pad.
     embeds = build([0, 4, 0, 7, 5])
     assert embeds.shape == (3 + 5 + 7 + 6, 16)
-    assert submodule.request_state("clone")["trailing_text_hidden"].shape == (0, 16)
+    assert text_stream_start([0, 4, 0, 7, 5]) is None
 
     # Text shorter than the codec span: padded with TTS PAD, nothing trails.
     short = torch.cat([torch.tensor([1, 2, 3, 4, 8, 9, 10, 11, 12]), reference])
@@ -1001,7 +937,7 @@ def test_qwen3_tts_talker_builds_in_context_clone_prefill():
         speaker_id=-1, language_id=-1, speaker_embed=speaker_embed, ref_codes=ref_codes,
     )
     assert embeds.shape == (3 + 5 + 6, 16)
-    assert submodule.request_state("clone")["trailing_text_hidden"].shape == (0, 16)
+    assert text_stream_start([0, 1, 1, 7, 5]) is None
 
     # x-vector only: standard layout with the x-vector in the speaker slot.
     embeds = submodule._build_prefill(
@@ -1222,15 +1158,11 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
         config,
     )
     real_state = submodule.request_state("real")
-    real_state.add_all(
-        generated_frames=config.generation.min_new_tokens,
-        trailing_text_hidden=torch.zeros(1, config.talker.hidden_size),
-        tts_pad_embed=torch.zeros(config.talker.hidden_size),
-    )
+    real_state.add("generated_frames", config.generation.min_new_tokens)
     prepared = submodule.prepare_inputs(
         "talker_decode",
         SimpleNamespace(request_id="real", rid_handle="real"),
-        {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
+        {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)], "text_in": [torch.tensor([5])]},
     )
     packed = submodule.preprocess(
         "talker_decode",
@@ -1272,7 +1204,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         ARNodeInputs(
             input_embeds=torch.zeros(1, 16),
             input_seq_len=1,
-            kwargs={"suppress_eos": True, "text_condition": torch.zeros(16)},
+            kwargs={"suppress_eos": True, "text_id": torch.zeros(1, dtype=torch.long)},
         )
         for _ in range(2)
     ]
@@ -1296,14 +1228,14 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64, 96, 128]
     assert submodule.max_batch_size("talker_decode") == 128
     template_kwargs = graph_config.single_request_inputs.kwargs
-    assert set(template_kwargs) == {"suppress_eos", "text_condition"}
+    # padding rows add a text token, as a prepared decode row does
+    assert set(template_kwargs) == {"suppress_eos", "text_id"}
     assert template_kwargs["suppress_eos"] is True
-    assert torch.equal(template_kwargs["text_condition"], torch.zeros(16))
     assert not graph_config.single_request_inputs.tensor_inputs
     # Prefill replays a packed capture: token buckets, padding rows shaped like
     # a prepared prefill (embeds + the dynamic EOS-suppression key).
     prefill_config = configs["talker_prefill"]
-    assert prefill_config.capture_token_lengths == [32, 64, 128, 256, 512, 1024]
+    assert prefill_config.capture_token_lengths == {1: [32, 64, 128, 256, 512, 1024]}
     assert prefill_config.capture_batch_sizes == [1, 2, 4, 8]
     padding = prefill_config.make_node_input(7)
     assert padding.input_embeds.shape == (7, 16) and padding.input_seq_len == 7
@@ -1347,24 +1279,39 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
         return SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata=step_metadata)
 
     def decode_row(rid: str, generated_frames: int) -> ARNodeInputs:
-        submodule.request_state(rid).add_all(
-            generated_frames=generated_frames,
-            trailing_text_hidden=torch.randn(2, hidden), tts_pad_embed=torch.randn(hidden),
+        submodule.request_state(rid).add("generated_frames", generated_frames)
+        return submodule.prepare_inputs(
+            "talker_decode", info(rid),
+            {"talker_input_embeds": [torch.randn(1, hidden)], "text_in": [torch.tensor([generated_frames])]},
         )
-        return submodule.prepare_inputs("talker_decode", info(rid), {"talker_input_embeds": [torch.randn(1, hidden)]})
 
     frames = [0, min_frames, 1, min_frames + 5, min_frames - 1]
     flags = [n < min_frames for n in frames]
     rows = [decode_row(f"d{i}", n) for i, n in enumerate(frames)]
-    assert all(not row.tensor_inputs for row in rows)
     packed = submodule.preprocess("talker_decode", engine_inputs, rows)
+
+    def text_conditions(decode_rows: list[ARNodeInputs]) -> torch.Tensor:
+        # the rows' text_in tokens, projected in one call as preprocess does
+        return submodule._project_text(torch.cat([row.kwargs["text_id"] for row in decode_rows]))
+
+    # the forward projects the decode rows' text ids
+    _assert_same_tensor(packed["text_ids"], torch.tensor(frames))
     _assert_same_tensor(packed["suppress_eos"], _old_flags(flags))
     _assert_same_tensor(packed["last_token_indices"], torch.arange(len(rows)))
-    _assert_same_tensor(
-        packed["input_embeds"],
-        torch.cat([row.input_embeds for row in rows])
-        + torch.stack([row.kwargs["text_condition"] for row in rows]),
-    )
+    _assert_same_tensor(packed["input_embeds"], torch.cat([row.input_embeds for row in rows]))
+
+    seen = []
+
+    def main_input(input_embeds, label):
+        seen.append(input_embeds)
+        raise RuntimeError("the main Talker ran")
+
+    # the decode forward adds the rows' text conditions before the main Talker
+    submodule.model.forward = main_input
+    with pytest.raises(RuntimeError, match="the main Talker ran"):
+        submodule.forward_batched("talker_decode", engine_inputs, **packed)
+    del submodule.model.forward
+    _assert_same_tensor(seen[0], packed["input_embeds"] + text_conditions(rows))
 
     def prefill_row(rid, walk, text_ids, layout, speaker_id, language_id, **inputs) -> ARNodeInputs:
         metadata = {PROMPT_LAYOUT_KEY: layout, SPEAKER_ID_KEY: speaker_id, LANGUAGE_ID_KEY: language_id}
@@ -1409,9 +1356,10 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     for row, walk in zip(mixed_rows, walks, strict=False):
         row.graph_walk = walk  # the engine stamps a mixed step's rows with their own walk
     packed = submodule.preprocess(TALKER_MIXED, engine_inputs, mixed_rows)
+    conditions = text_conditions([rows[0], rows[1]])
     _assert_same_tensor(packed["input_embeds"], torch.cat([
-        rows[0].input_embeds + rows[0].kwargs["text_condition"], prefill[0].input_embeds,
-        rows[1].input_embeds + rows[1].kwargs["text_condition"], prefill[2].input_embeds,
+        rows[0].input_embeds + conditions[:1], prefill[0].input_embeds,
+        rows[1].input_embeds + conditions[1:], prefill[2].input_embeds,
     ]))
     _assert_same_tensor(packed["last_token_indices"], torch.tensor([1, 15, 1, 14, 0, 0]).cumsum(0) - 1)
     _assert_same_tensor(packed["suppress_eos"], _old_flags([flags[0], True, flags[1], True, True, True]))
@@ -1655,7 +1603,7 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     model = _make_model()
     generation = model.config.generation
 
-    default = model.get_request_resource_configs({})[CODE_PRED_SAMPLER]
+    default = model.get_request_resource_configs([], [], {})[CODE_PRED_SAMPLER]
     assert default.temperature == generation.subtalker_temperature
     assert default.top_k == generation.subtalker_top_k
     assert default.top_p == generation.subtalker_top_p
@@ -1663,32 +1611,55 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     assert default.repetition_penalty == 1
 
     overridden = model.get_request_resource_configs(
-        {},
-        {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
+        [], [],
+        {"code_predictor_temperature": 0.5, "code_predictor_top_k": 3, "code_predictor_top_p": 0.25},
     )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
-    # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
+    # Greedy is temperature 0; a client do_sample switch is not read.
     greedy = model.get_request_resource_configs(
-        {}, {"subtalker_dosample": False}
-    )[CODE_PRED_SAMPLER]
-    assert greedy.temperature == 0.0
+        [], [], {"code_predictor_temperature": 0.0, "subtalker_dosample": False, "do_sample": False}
+    )
+    assert greedy[CODE_PRED_SAMPLER].temperature == 0.0
+    assert greedy[TALKER_SAMPLER].temperature == generation.temperature
 
     # Two samplers, one per head; only the Talker's carries a vocab for the
     # repetition penalty (see get_node_resources).
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {TALKER_SAMPLER, CODE_PRED_SAMPLER}
     specs = {
         spec.resource_key: spec for spec in model.get_node_resources()
         if isinstance(spec, SamplerSpec)
     }
     assert specs[TALKER_SAMPLER].vocab_size is not None
-    assert specs[CODE_PRED_SAMPLER].enable_repetion_penalty is False
+    assert specs[CODE_PRED_SAMPLER].enable_repetition_penalty is False
 
     # The conductor seeds each stream; they are seeded independently.
     configs[TALKER_SAMPLER].apply_conductor_config(seed=99)
     assert configs[TALKER_SAMPLER].seed == 99
     assert configs[CODE_PRED_SAMPLER].seed != 99
+
+
+def test_qwen3_tts_checkpoint_min_p_turns_the_capability_on():
+    model = _make_model()
+    model._generation_defaults_cache = {
+        **model._generation_defaults(), "min_p": 0.05, "code_predictor_min_p": 0.1,
+    }
+    specs = {
+        spec.resource_key: spec for spec in model.get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert specs[TALKER_SAMPLER].enable_min_p and specs[CODE_PRED_SAMPLER].enable_min_p
+    # a plain request takes those defaults and is not refused
+    for key, config in model.get_request_resource_configs([], [], {}).items():
+        config.validate(specs[key])
+    # without them the capability stays off
+    plain = {
+        spec.resource_key: spec for spec in _make_model().get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert not plain[TALKER_SAMPLER].enable_min_p and not plain[CODE_PRED_SAMPLER].enable_min_p
+
 
 
 def test_the_reference_audio_encoder_loads_the_flat_mimi_checkpoint(tmp_path):
@@ -1856,7 +1827,9 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     fwd_info = SimpleNamespace(request_id="request", rid_handle="request")
 
     def prepare(codes, context):
-        chunk = StreamChunkInfo(start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False)
+        chunk = StreamChunkInfo(
+            start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False,
+        )
         return submodule.prepare_inputs(
             "codec_chunk", fwd_info, {"codec_tokens": [codes]},
             input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk}),
@@ -2105,12 +2078,15 @@ def test_qwen3_tts_streamed_codec_audio_matches_one_whole_decode(captured):
                 continue
             chunk = stream.pop_chunk()
             data = chunk.data["data"]
-            # a drained stream's final flush has no frames: the worker hands over an empty input
-            items[rid] = submodule.prepare_inputs(
+            item = submodule.prepare_inputs(
                 "codec_chunk", SimpleNamespace(request_id=rid, rid_handle=rid),
                 {"codec_tokens": [] if data is None else [data.reshape(-1, 4)]},
                 input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk.info}),
             )
+            # a drained stream's frameless final flush is declined: no step, no audio
+            assert (item is None) == (data is None)
+            if item is not None:
+                items[rid] = item
             if chunk.is_final:
                 del streams[rid]
         if items:
@@ -2124,36 +2100,6 @@ def test_qwen3_tts_streamed_codec_audio_matches_one_whole_decode(captured):
             assert expected.float().std() > 1000   # a real signal, not silence or clipping
             assert got.shape == expected.shape, (rid, got.shape, expected.shape)
             assert (got.int() - expected.int()).abs().max().item() <= 1, rid
-
-
-def test_qwen3_tts_codec_ends_a_stream_on_an_empty_final_flush():
-    """A stream whose last chunk was popped before the producer finished ends on
-    a final flush with no frames (no context rides it): the codec emits nothing
-    for it, and the stream ends."""
-    config = _tiny_model_config()   # schedule (1,), chunk 3
-    codec = config.codec
-    submodule = _tiny_codec(config)
-    driver = _CodecDriver(submodule)
-    stream = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
-                          policy=ScheduledLeftContextChunkPolicy(codec.chunk_schedule, codec.chunk_frames, 0))
-    fwd = SimpleNamespace(request_id="r", rid_handle="r")
-    for i in range(4):
-        stream.pre_read_register(f"t{i}")
-        stream.put(f"t{i}", torch.randint(0, 32, (4,)))
-    audio = []
-    while stream.has_chunk_ready():
-        chunk = stream.pop_chunk()
-        item = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [chunk.data["data"].reshape(-1, 4)]},
-                                        input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk.info}))
-        audio.append(driver.step({"r": item})["r"]["audio_chunk"][0])
-    stream.signal_done(4)
-    final = stream.pop_chunk()
-    assert final.data["data"] is None and final.is_final
-    item = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": []},
-                                    input_metadata=InputMetadata(stream_chunks={"codec_tokens": final.info}))
-    assert (item.kwargs["frames"], item.kwargs["is_final"]) == (0, True)
-    assert driver.step({"r": item})["r"]["audio_chunk"][0].numel() == 0
-    assert sum(a.numel() for a in audio) == 4 * submodule.total_upsample
 
 
 def test_qwen3_tts_codec_state_is_the_declared_pool_and_released_with_the_request():
@@ -2264,17 +2210,6 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
     }) == 3
 
-    # A stream whose only frame was a withheld EOS ends with an empty chunk: no audio.
-    empty = submodule.prepare_inputs(
-        "codec_chunk", SimpleNamespace(request_id="empty", rid_handle="empty"), {},
-        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, 0, True)}),
-    )
-    assert empty.tensor_inputs["codec_tokens"].shape == (0, 4)
-    assert empty.kwargs["frames"] == empty.kwargs["context"] == 0 and empty.kwargs["bucket"] == 1
-    outputs = {"audio_chunk": [torch.arange(4)]}
-    submodule.postprocess("empty", None, outputs, inputs=empty)
-    assert outputs["audio_chunk"][0].numel() == 0
-
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(
         "codec_chunk", SimpleNamespace(request_id="one", rid_handle="one"), {"codec_tokens": [codes[:1]]},
@@ -2328,11 +2263,11 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
 
 
 @pytest.mark.parametrize("num_frames", [0, 1, 2, 3, 4, 5, 6, 7, 8])
-def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_frames):
+def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_frames, monkeypatch):
     """The Talker's stop check withholds its EOS frame, so the codec's windows
-    hold only frames and each frame's audio comes out once. Off a window
-    boundary the final chunk carries the last frames; a stream whose first
-    frame was EOS ends with an empty chunk that emits nothing."""
+    hold only frames and each frame's audio comes out once. The final chunk
+    carries the last frames; when the stream's first frame was EOS it carries
+    none, and the codec declines it before building any tensor."""
     config = _tiny_model_config()
     talker = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     info = SimpleNamespace(
@@ -2359,8 +2294,12 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
 
     codec = _tiny_codec(config)
     driver = _CodecDriver(codec)
+    if num_frames == 0:
+        def no_device():
+            raise AssertionError("the codec built a device tensor")
+        monkeypatch.setattr(codec, "get_device", no_device)
     fwd = SimpleNamespace(request_id="r", rid_handle="r")
-    windows = []
+    windows, declined = [], False
     while stream.has_chunk_ready():
         chunk = stream.pop_chunk()
         data = chunk.data["data"]
@@ -2369,6 +2308,11 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
         item = codec.prepare_inputs(
             "codec_chunk", fwd, inputs, input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk.info}),
         )
+        if item is None:   # declined: no forward, and the stream still ends
+            assert chunk.is_final and chunk.num_items == chunk.context_items
+            windows.append((chunk.info, 0))
+            declined = True
+            continue
         assert item.kwargs["frames"] == chunk.num_items
         assert (item.tensor_inputs["codec_tokens"][:chunk.num_items, 0] != eos).all()
         row = driver.step({"r": item})["r"]
@@ -2378,9 +2322,7 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     assert final.is_final
     assert sum(samples for _, samples in windows) == num_frames * codec.total_upsample
     assert final_samples == (final.num_items - final.context_items) * codec.total_upsample
-    # the ramp's new frames per window: 1, 3, then 3 a window
-    if num_frames not in (0, 1, 4, 7):
-        assert final_samples > 0
+    assert declined == (final_samples == 0) == (num_frames == 0)
     if num_frames == 0:
         assert windows == [(StreamChunkInfo(0, 0, 0, True), 0)]
 
@@ -2521,10 +2463,7 @@ def _ref_info(rid: str, clip: torch.Tensor, layout: list[int]) -> SimpleNamespac
 
 
 def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2535,7 +2474,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
     prepared = submodule.prepare_inputs(
@@ -2562,10 +2501,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
 
 
 def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2576,7 +2512,7 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
 
@@ -2618,3 +2554,136 @@ def test_qwen3_tts_codec_dtype_option():
     assert codec_dtype(torch.float16) is torch.float16
     with pytest.raises(ValueError, match="codec_dtype"):
         codec_dtype("int8")
+
+
+
+# ── generation-input contract ───────────────────────────────────────────────
+
+CONTRACT_GENERATION_CONFIG = {
+    "do_sample": True, "repetition_penalty": 1.05, "temperature": 0.9, "top_p": 1.0,
+    "top_k": 50, "subtalker_dosample": True, "subtalker_temperature": 0.9,
+    "subtalker_top_p": 1.0, "subtalker_top_k": 50, "max_new_tokens": 8192,
+}
+
+
+def _contract_model(local_dir=None) -> Qwen3TTSModel:
+    model = object.__new__(Qwen3TTSModel)
+    model.config = Qwen3TTSModelConfig()
+    model.local_dir = str(local_dir) if local_dir is not None else None
+    model._submodule_cache = {}
+    return model
+
+
+def _contract_with_generation_config(tmp_path, **overrides) -> Qwen3TTSModel:
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({**CONTRACT_GENERATION_CONFIG, **overrides})
+    )
+    model = _contract_model(tmp_path)
+    # as __init__ does; the other checkpoint files are optional
+    model.config = Qwen3TTSModelConfig.from_pretrained(tmp_path)
+    return model
+
+
+def test_released_defaults():
+    configs = _contract_model().get_request_resource_configs([], [], {})
+    talker, code_pred = configs[TALKER_SAMPLER], configs[CODE_PRED_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.top_p, talker.repetition_penalty) == (
+        0.9, 50, 1.0, 1.05,
+    )
+    assert (code_pred.temperature, code_pred.top_k, code_pred.top_p) == (0.9, 50, 1.0)
+    assert code_pred.repetition_penalty == 1
+
+
+def test_checkpoint_do_sample_false_is_a_temperature_zero_default(tmp_path):
+    model = _contract_with_generation_config(
+        tmp_path, do_sample=False, subtalker_dosample=False, top_k=20, max_new_tokens=100,
+    )
+    configs = model.get_request_resource_configs([], [], {})
+    assert configs[TALKER_SAMPLER].temperature == 0.0
+    assert configs[TALKER_SAMPLER].top_k == 20
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.0
+    assert model.get_max_output_tokens() == 100
+    # a request still samples by naming a temperature
+    configs = model.get_request_resource_configs([], [], {"temperature": 0.5, "code_predictor_temperature": 0.6})
+    assert configs[TALKER_SAMPLER].temperature == 0.5
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.6
+
+
+def test_client_do_sample_switches_are_not_read():
+    model = _contract_model()
+    configs = model.get_request_resource_configs([], [], {"do_sample": False, "subtalker_dosample": False})
+    assert configs[TALKER_SAMPLER].temperature == 0.9
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.9
+    assert "do_sample" not in model.request_kwargs()
+    assert "subtalker_dosample" not in model.request_kwargs()
+
+
+def test_stage_prefixed_key_wins_over_plain():
+    configs = _contract_model().get_request_resource_configs([], [], {
+        "temperature": 0.3, "talker_temperature": 0.4, "top_k": 9, "penalize_prompt": False,
+    })
+    talker = configs[TALKER_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.penalize_prompt) == (0.4, 9, False)
+    # plain keys stay on the Talker
+    assert configs[CODE_PRED_SAMPLER].top_k == 50
+
+
+def test_subtalker_is_a_deprecated_alias(caplog, monkeypatch):
+    monkeypatch.setattr(qwen3_tts_model, "_warned_deprecated", set())
+    model = _contract_model()
+    with caplog.at_level(logging.WARNING, logger=qwen3_tts_model.__name__):
+        old = model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
+        model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
+    assert old[CODE_PRED_SAMPLER].top_k == 7
+    assert sum("deprecated" in r.message for r in caplog.records) == 1
+    both = model.get_request_resource_configs([], [], {"subtalker_top_k": 7, "code_predictor_top_k": 3})
+    assert both[CODE_PRED_SAMPLER].top_k == 3
+
+
+def test_frame_default_and_request_cap():
+    model = _contract_model()
+    assert model.get_max_output_tokens() == 8192
+    assert model.get_max_output_tokens(max_output_tokens=12) == 12
+    # the API folds max_new_tokens into max_output_tokens; the model reads only the latter
+    assert model.get_max_output_tokens(max_new_tokens=12) == 8192
+
+
+@pytest.mark.parametrize("voice", ["", 3])
+@pytest.mark.parametrize("key", ["voice", "speaker"])
+def test_empty_or_non_string_voice_is_a_400(key, voice):
+    with pytest.raises(ValueError, match="voice must be a non-empty name"):
+        _contract_model()._resolve_speaker({key: voice})
+
+
+def test_absent_voice_is_the_default_and_unknown_is_a_400():
+    model = _contract_model()
+    assert model._resolve_speaker({})[0] == model.config.default_speaker
+    with pytest.raises(ValueError, match="Unsupported Qwen3-TTS speaker"):
+        model._resolve_speaker({"voice": "alloy"})
+
+
+@pytest.mark.parametrize("key", ["non_streaming_mode", "x_vector_only_mode"])
+def test_boolean_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._flag({key: "false"}, key, False)
+    assert qwen3_tts_model._flag({key: True}, key, False) is True
+    assert qwen3_tts_model._flag({}, key, False) is False
+
+
+@pytest.mark.parametrize("key", ["language", "instruct", "ref_text"])
+def test_string_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._text({key: 5}, key, "")
+
+
+def test_request_kwargs_spot_checks():
+    declared = _contract_model().request_kwargs()
+    for key in (
+        "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt",
+        "talker_temperature", "code_predictor_temperature", "code_predictor_top_k",
+        "subtalker_top_p", "ignore_eos", "max_output_tokens", "seed", "voice", "speaker",
+        "language", "instruct", "instructions", "non_streaming_mode", "ref_text",
+        "x_vector_only_mode",
+    ):
+        assert key in declared, key
+    assert "max_new_tokens" not in declared

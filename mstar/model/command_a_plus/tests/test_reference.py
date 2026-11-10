@@ -112,7 +112,7 @@ class ReferenceTests(unittest.TestCase):
             hidden = actual(actual.model.embed_tokens(tokens[start:stop]), label="main")
             result = reference(tokens[None, start:stop], past_key_values=cache, use_cache=True)
             cache = result.past_key_values
-            observed["logits"] = actual.compute_logits(hidden)
+            observed["logits"] = actual.logits(hidden)
             expected["logits"] = result.logits.squeeze(0)
             self.compare(observed, expected, errors, 2e-5)
             torch.testing.assert_close(observed["logits"].argmax(-1), expected["logits"].argmax(-1))
@@ -156,7 +156,7 @@ class ReferenceTests(unittest.TestCase):
         )) for key, spec in specs.items()}
         runner = StepRunner(resources)
         self.addCleanup(lambda: [resource.cleanup() for resource in resources.values()])
-        node = CommandAPlusLLMSubmodule(actual, actual.config, raw["image_token_id"]).eval()
+        node = CommandAPlusLLMSubmodule(actual, actual.config, (model.image_encoder,)).eval()
         node.bind_node_resources(resources)
         observed, handles = observe(actual)
         expected, ref_handles = observe(reference)
@@ -185,6 +185,7 @@ class ReferenceTests(unittest.TestCase):
                     self.assertTrue(admitted.ok and admitted.ready, admitted)
                     runner.plan(step)
                     output = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))
+                    predicted = output.row_outputs["new_token"]
                     runner.commit(step)
                     per_request, ref_logits = [], []
                     for index, row in enumerate(rows):
@@ -195,10 +196,9 @@ class ReferenceTests(unittest.TestCase):
                     combined = {key: torch.cat([item[key] for item in per_request]) for key in expected}
                     self.compare(observed, combined, errors, 0.03)
                     ends = torch.tensor([len(rows[0])-1, sum(map(len, rows))-1], device="cuda")
-                    logits = actual.compute_logits(observed["norm"][ends])
+                    logits = actual.logits(observed["norm"][ends])
                     ref_logits = torch.stack(ref_logits)
                     self.compare({"logits": logits}, {"logits": ref_logits}, errors, 0.01)
-                    predicted = torch.cat([output[rid]["new_token"][0] for rid in rids])
                     torch.testing.assert_close(predicted.long(), logits.argmax(-1))
                     for row, token in enumerate(predicted.long()):
                         if token != ref_logits[row].argmax():
@@ -215,7 +215,7 @@ class ReferenceTests(unittest.TestCase):
                             first_logits = logits.clone()
                         else:
                             torch.testing.assert_close(logits, first_logits, atol=0, rtol=0)
-                    rows = [output[rid]["new_token"][0] for rid in rids]
+                    rows = list(predicted.split(1))
                     torch.cuda.synchronize()
             finally:
                 for rid in rids:
