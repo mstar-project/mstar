@@ -3,7 +3,7 @@
 A submodule returns a fixed-width output and a ``[bs, 2]`` span per row; the
 worker cuts each row to its span once the step has run, before the stop check
 and the store see it. Drives the real ``Engine`` (declare, admit, plan,
-forward, commit, collect) and the real ``Worker._postprocess_batch`` up to the
+forward, commit, collect) and the real ``StepExecutor.postprocess`` up to the
 store, which is stubbed to capture what it would send. CPU only.
 """
 
@@ -19,7 +19,6 @@ torch = pytest.importorskip("torch")
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
-    Resource,
     ResourceStep,
     Segment,
     StepContext,
@@ -31,24 +30,21 @@ from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans, _refuse_unroutable_withholds  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
+from mstar.worker.step_executor import PendingBatch, StepExecutor  # noqa: E402
 
 NODE, WALK = "vocoder", "synth"
 WIDTH = 12  # every row is padded to this, as a captured graph would be
 
 
-class _Recorder(Resource):
+class _Recorder(StubResource):
     """Records the lifecycle calls the step drives."""
 
     def __init__(self):
         self.calls: list[str] = []
-
-    @classmethod
-    def build(cls, spec, device, comm_group, **engine_kwargs):
-        raise NotImplementedError
 
     def admit(self, step, ctx):
         self.calls.append("admit")
@@ -148,34 +144,30 @@ class _Runtime(SimpleNamespace, PhasedPostprocess):
     """Stubbed phase methods under the reference begin / resume."""
 
 
-def _worker(engine: Engine) -> tuple[Worker, dict]:
+def _executor(engine: Engine) -> tuple[StepExecutor, dict]:
     stored: dict = {}
 
     def store(rids, outputs, signals, **kwargs):
         stored.update({rid: outputs.get(rid) for rid in rids}, signals=signals)
         raise _ReachedStoreError
 
-    worker = Worker.__new__(Worker)
-    worker._phase_period = 0
-    worker.enable_nvtx = False
-    worker.enable_prof = False
-    worker.device = torch.device("cpu")
-    worker._graph_runtime = _Runtime(
-        cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
-        clear_pending_loop_stops=lambda: None,
-        stop_loops_batched=lambda **kwargs: [],
-        supports_inline_emit=False,
+    worker = make_worker(
+        device=torch.device("cpu"),
+        graph_runtime=_Runtime(
+            cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
+            clear_pending_loop_stops=lambda: None,
+            stop_loops_batched=lambda **kwargs: [],
+            supports_inline_emit=False,
+        ),
+        tensor_manager=SimpleNamespace(
+            get_tensor=None,
+            cleanup_collectable=lambda *args: None,
+            store_and_return_tensor_info_batch=store,
+        ),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        request_state=SimpleNamespace(buffer_publish_info=lambda *args: None),
     )
-    worker.tensor_manager = SimpleNamespace(
-        cleanup_collectable=lambda *args: None,
-        store_and_return_tensor_info_batch=store,
-    )
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._innermost_loop_by_node, worker._rebuilds = {}, Rebuilds({}, {})
-    worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
-    worker.scheduler = SimpleNamespace(failed_rids=set())
-    return worker, stored
+    return worker.executor, stored
 
 
 def _run_step(sub: _SpanningVocoder, samples: dict[int, torch.Tensor]):
@@ -185,7 +177,7 @@ def _run_step(sub: _SpanningVocoder, samples: dict[int, torch.Tensor]):
     engine.prepare_inputs(batch)
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None and not batch.failed_requests
-    worker, stored = _worker(engine)
+    executor, stored = _executor(engine)
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK, request_to_worker_graph=dict.fromkeys(samples, 0),
@@ -195,7 +187,7 @@ def _run_step(sub: _SpanningVocoder, samples: dict[int, torch.Tensor]):
     )
     uncut = {rid: out["audio"][0] for rid, out in outputs.per_rid_outputs.items()}
     with pytest.raises(_ReachedStoreError):
-        worker._postprocess_batch(pending, outputs)
+        executor.postprocess(pending, outputs)
     return stored, uncut, recorder
 
 
@@ -366,15 +358,12 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages a CUDA span to pinned host memory")
 def test_gpu_thread_stages_spans_to_the_host_behind_the_step():
     from mstar.utils.device import DeviceCapability
+    from mstar.worker.host_copies import HostCopies
 
-    worker = Worker.__new__(Worker)
-    worker.device = torch.device("cuda", torch.cuda.current_device())
-    worker.device_capability = DeviceCapability(worker.device)
-    worker._host_rows_slot = 0
-    worker._pinned_d2h_buffers = __import__("collections").defaultdict(list)
-    spans = torch.tensor([[3, 9], [0, 5]], device=worker.device)
+    device = torch.device("cuda", torch.cuda.current_device())
+    spans = torch.tensor([[3, 9], [0, 5]], device=device)
     outputs = BatchedModelOutput(output_spans={"audio": spans}, span_request_ids=(1, 2))
-    worker._stage_host_rows(outputs)
+    HostCopies(device=device, device_capability=DeviceCapability.of(device)).stage_host_rows(outputs)
     torch.cuda.current_stream().synchronize()
     host = outputs.host_spans["audio"]
     assert host.device.type == "cpu" and host.is_pinned()

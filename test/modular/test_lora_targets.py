@@ -29,13 +29,11 @@ from safetensors.torch import save_file  # noqa: E402
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.distributed.utils import split_tensor_along_last_dim  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionStep  # noqa: E402
-from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.config import describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.ops import lora_gather_shrink  # noqa: E402
-from mstar.engine.resources.lora.serving import declared_lora_specs  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_adapter, inspect_keys  # noqa: E402
-from mstar.engine.resources.step import Segment, SubmoduleStep  # noqa: E402
+from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep  # noqa: E402
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding  # noqa: E402
 from mstar.model.components.distributed.linear import (  # noqa: E402
     ColumnParallelLinear,
@@ -51,12 +49,12 @@ from mstar.model.components.lora.modules import (  # noqa: E402
     PER_SEGMENT,
     _target_names,
     bind_module_lora,
-    link_lora_specs,
+    join_lora_specs,
     module_lora_spec,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
-from mstar.testing_utils.model import make_model
+from mstar.testing_utils.model import make_model  # noqa: E402
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -120,6 +118,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -264,10 +265,8 @@ def _build(case: Case, group: CommGroup, weights) -> _Root:
 
 
 def _spec(case: Case):
-    with torch.device("meta"):
-        root = _Root(case, CommGroup.trivial())
     return module_lora_spec(
-        root, resource_key="lora", nodes={"N"}, root_path="inner",
+        lambda group: _Root(case, group), nodes={"N"}, root_path="inner",
         rules=CheckpointRules(stacked_params=case.stacked), embeddings=True, rows=case.rows,
     )
 
@@ -284,7 +283,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
         unbound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
         lora_pool = pool(spec, rank, world)
         plan([lora_pool], ROWS)
-        assert bind_module_lora(_Node(root), {"lora": lora_pool}) == ("lora",)
+        bind_module_lora(_Node(root), {"lora": lora_pool})
         off_vocab = None
         bound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
         if case.kind == "embedding":
@@ -407,7 +406,8 @@ def _guards(module, x) -> list[str]:
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
+# fused_column_whole is fused_column's module under another checkpoint layout, which this never reads
+@pytest.mark.parametrize("name", sorted(set(CASES) - {"fused_column_whole"}))
 def test_unbound_module_runs_the_pre_lora_forward(name):
     """Same aten ops and outputs (under TP its collectives too), dynamo graph, and no guard
     on LoRA: a deployment without a lora block traces as it did before."""
@@ -486,12 +486,12 @@ class _Declaring(NodeSubmodule):
 
 def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
     """From the step's segments, under each pool bound to the node's modules; a step's own
-    LoraStep is kept, and a step that is None or declares no segments gets none, so an
-    adapted module run under it refuses."""
+    step under the pool's key is kept, and a step that is None or declares no segments
+    gets none, so an adapted module run under it refuses."""
     case = CASES["linear"]
     paths, _ = _adapters(case, tmp_path)
     segments = [Segment("r0", "main", 3), Segment("r0", "uncond", 3), Segment("r1", "main", 2)]
-    own = LoraStep(segments=(Segment("r0", "main", 6),))
+    own = ResourceStep(segments=(Segment("r0", "main", 6),))
     node = _Declaring(_build(case, CommGroup.trivial(), _weights(case)), {
         "packed": SubmoduleStep(segments=segments, steps={"attn": AttentionStep(causal=False)}),
         "own": SubmoduleStep(segments=segments, steps={"lora": own}),
@@ -499,7 +499,7 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
         "unsegmented": SubmoduleStep(steps={"attn": AttentionStep(segments=segments, causal=False)}),
     })
     node.bind_node_resources({"lora": pool(serve(_spec(case), paths))})
-    assert node.lora_keys == ("lora",)
+    assert node.segment_keys == ("lora",)
 
     def declared(walk):
         return engine_step(node, graph_walk=walk, request_ids=["r0", "r1"], inputs=[])
@@ -513,12 +513,11 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
         node.inner.layers[0].fc(rand(1, HIDDEN, seed=0))
 
 
-def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():
-    """Nothing would bind its nodes' modules: refused before any worker starts."""
-    hand = replace(_spec(CASES["qkv"]), module_map=lambda m: None)
-    model = make_model(get_lora_specs=lambda: [hand])
+def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_at_bind():
+    """Nothing would bind its nodes' modules: refused before any step runs."""
+    hand = replace(serve(_spec(CASES["qkv"]), {}), module_map=lambda m: None)
     with pytest.raises(ValueError, match="module_lora_spec"):
-        declared_lora_specs(model, {"resources": {"lora": {"adapters": {}}}})
+        bind_module_lora(nn.Module(), {"lora": pool(hand)})
 
 
 def test_target_names_widen_a_role_outside_every_stack():
@@ -527,31 +526,25 @@ def test_target_names_widen_a_role_outside_every_stack():
     assert sorted(names.values()) == ["layers_attn_proj", "root_attn_proj"]
 
 
-def test_linked_specs_leave_a_module_to_the_spec_that_places_it():
-    """A spec with no adapter roots beside one whose checkpoint prefix claims every
+def test_a_joined_spec_leaves_a_module_to_the_node_that_places_it():
+    """A node with no adapter roots beside one whose checkpoint prefix claims every
     module: each keeps what it places."""
     def spec(stack: str, node: str, rules: CheckpointRules):
         with torch.device("meta"):
             root = nn.Module()
             layer = _with(nn.Module(), lambda m: setattr(m, "q", nn.Linear(HIDDEN, HIDDEN)))
             setattr(root, stack, nn.ModuleList([layer]))
-        return module_lora_spec(root, resource_key=node, nodes={node}, root_path="", rules=rules)
+        return module_lora_spec(lambda _: root, nodes={node}, root_path="", rules=rules, names={"q": f"{node}_q"})
 
-    text, vision = link_lora_specs([
+    joined = join_lora_specs(
         spec("layers", "text", CheckpointRules(remap=lambda n: n)),
         spec("blocks", "vision", CheckpointRules(prefix="model.visual.")),
-    ])
+    )
+    assert joined.module_map("layers.0.q").target == "text_q"
+    assert joined.module_map("model.visual.blocks.0.q").target == "vision_q"
+    text, vision = joined.for_node("text"), joined.for_node("vision")
     assert not text.ignored_modules("layers.0.q") and vision.ignored_modules("layers.0.q")
     assert text.ignored_modules("model.visual.blocks.0.q") and not vision.ignored_modules("model.visual.blocks.0.q")
-
-
-def test_a_deferred_embedding_is_served_without_embeddings():
-    with torch.device("meta"):
-        root = nn.Module()
-        root.embed_tokens = VocabParallelEmbedding(32, HIDDEN)
-        root.fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", deferred=["embed_tokens"])
-    assert set(spec.targets) == {"embed_tokens", "fc"} and spec.module_map.deferred == {"embed_tokens"}
 
 
 def test_an_exclude_pattern_matching_no_module_is_refused():
@@ -560,7 +553,7 @@ def test_an_exclude_pattern_matching_no_module_is_refused():
         root = nn.Module()
         root.text_proj = nn.Linear(HIDDEN, HIDDEN)
     with pytest.raises(ValueError, match=r"`exclude` patterns \['text_projection'\]"):
-        module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", exclude={"text_projection": "-"})
+        _ = module_lora_spec(lambda _: root, nodes={"N"}, root_path="", exclude={"text_projection": "-"}).targets
 
 
 def test_a_stack_is_a_module_list_whatever_its_name():
@@ -569,7 +562,7 @@ def test_a_stack_is_a_module_list_whatever_its_name():
         root.transformer_blocks = nn.ModuleList(
             _with(nn.Module(), lambda m: setattr(m, "fc", nn.Linear(HIDDEN, HIDDEN))) for _ in range(3))
         root.head = nn.Linear(HIDDEN, 4)
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="")
     assert set(spec.targets) == {"fc", "head"} and spec.num_layers == 3
 
 
@@ -578,11 +571,11 @@ def test_a_module_list_whose_entries_differ_in_shape_gives_each_entry_a_target()
         root = nn.Module()
         root.stages = nn.ModuleList(
             _with(nn.Module(), lambda m, d=d: setattr(m, "fc", nn.Linear(d, d))) for d in (HIDDEN, 2 * HIDDEN))
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", rows={"fc": PER_SEGMENT})
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="", rows={"fc": PER_SEGMENT})
     assert set(spec.targets) == {"stages_0_fc", "stages_1_fc"}
     assert all(t.per_segment for t in spec.targets.values())  # `rows` keys the stack's role
     with pytest.raises(ValueError, match="differ in shape"):  # one name cannot name several targets
-        module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="", names={"fc": "fc"})
+        _ = module_lora_spec(lambda _: root, nodes={"N"}, root_path="", names={"fc": "fc"}).targets
 
 
 # --- what the module walk refuses ----------------------------------------------------------
@@ -636,7 +629,8 @@ def _refusing_root(case: Refused) -> nn.Module:
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name, tmp_path):
     reason = REFUSED[name].reason
-    spec = module_lora_spec(_refusing_root(REFUSED[name]), resource_key="lora", nodes={"N"}, root_path="")
+    root = _refusing_root(REFUSED[name])
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="")
     assert set(spec.targets) == {"fc"} and reason in spec.module_map.unservable["layers.0.bad"]
     path = write_peft(tmp_path / "a.safetensors", {
         "layers.0.fc": (rand(2, HIDDEN, seed=1), rand(HIDDEN, 2, seed=2)),
@@ -649,15 +643,36 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
         spec.check_adapter("a", info)
 
 
+def test_a_deployment_without_a_lora_block_never_builds_the_root():
+    """Every deployment of a model declares its LoRA spec; the root is built and walked
+    only once the spec is read, which only a deployment opting into LoRA does."""
+    from mstar.model.base import serving_resources
+
+    built = []
+
+    def build(group):
+        built.append(group)
+        root = nn.Module()
+        root.layers = nn.ModuleList([nn.Module()])
+        root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
+        return root
+
+    model = make_model(get_node_resources=lambda: [module_lora_spec(build, nodes={"N"}, root_path="")])
+    assert serving_resources(model, {"resources": {}}) == [] and not built
+    (spec,) = serving_resources(model, {"resources": {"lora": {}}})
+    assert set(spec.targets) == {"fc"} and len(built) == 1
+
+
 def test_a_module_declaring_a_child_it_does_not_have_unservable_is_refused():
     """A typo or a later rename would otherwise drop the refusal, and the adapter would
     validate and do nothing."""
     class _ReadsGone(nn.Module):
         lora_unservable = {"gone": "run through its weight, never its own forward"}
 
+    root = _refusing_root(Refused(lambda: nn.Linear(HIDDEN, HIDDEN), "", _ReadsGone))
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="")
     with pytest.raises(ValueError, match="_ReadsGone.lora_unservable names 'gone'"):
-        module_lora_spec(_refusing_root(Refused(lambda: nn.Linear(HIDDEN, HIDDEN), "", _ReadsGone)),
-                         resource_key="lora", nodes={"N"}, root_path="")
+        assert spec.targets  # the walk runs when the spec is first read
 
 
 def _code_predictor() -> nn.Module:
@@ -687,14 +702,6 @@ def _bagel_patch_embed() -> nn.Module:
     from mstar.model.bagel.config import BagelViTConfig
 
     return BagelVisionEmbeddings(BagelViTConfig(hidden_size=HIDDEN, image_size=4, patch_size=2))
-
-
-def _qwen3_vit_patch_embed() -> nn.Module:
-    from types import SimpleNamespace
-
-    from mstar.model.components.qwen3_vit import VisionPatchEmbed
-
-    return VisionPatchEmbed(SimpleNamespace(in_channels=3, temporal_patch_size=2, patch_size=2, hidden_size=HIDDEN))
 
 
 def _omnivoice() -> nn.Module:
@@ -729,7 +736,6 @@ ANNOTATED = {
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
     "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
     "bagel_converted_patch_embed": (_bagel_patch_embed, {"patch_embedding"}),
-    "qwen3_vit_patch_embed": (_qwen3_vit_patch_embed, {"proj"}),
     "omnivoice_fused": (_omnivoice, {f"model.llm.layers.0.{p}" for p in (
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj")}),
 }
@@ -741,7 +747,7 @@ def test_children_run_other_than_through_their_forward_are_refused(name):
     with torch.device("meta"):
         root = nn.Module()
         root.m, root.fc = build(), nn.Linear(HIDDEN, HIDDEN)
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="")
     declared = {r for m in root.modules() for r in getattr(m, "lora_unservable", {}).values()}
     refused = {p.removeprefix("m.") for p, r in spec.module_map.unservable.items() if r in declared}
     assert refused == children and not any(p.removeprefix("m.") in children for p in spec.module_map.bindings)
@@ -770,10 +776,13 @@ def test_absorbed_mla_refuses_the_projections_it_folds_at_load(absorb):
 
     cfg = Glm52ModelConfig.reduced()
     cfg.mla_absorb = absorb
-    with torch.device("meta"):
+
+    def build(_):
         root = nn.Module()
         root.layers = nn.ModuleList([MLAAttention(cfg, kv_key="kv", attn_key="attn", pos_key="pos")])
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+        return root
+
+    spec = module_lora_spec(build, nodes={"N"}, root_path="")
     folded = {"q_a_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
     assert set(spec.targets) == {"q_b_proj", "o_proj"} | (set() if absorb else folded)
     refused = {p.removeprefix("layers.0.") for p, r in spec.module_map.unservable.items() if "mla_absorb" in r}
@@ -844,16 +853,20 @@ def test_header_refusals_reach_the_client_as_themselves():
         root = nn.Module()
         root.layers = nn.ModuleList([nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = serve(module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path=""), {})
+    spec = serve(module_lora_spec(lambda _: root, nodes={"N"}, root_path=""), {})
     key = "base_model.model.layers.0.fc.lora_{}.weight"
     bad = inspect_keys(spec, [(key.format("A"), (4, 2 * HIDDEN)), (key.format("B"), (HIDDEN, 4))])
     with pytest.raises(ValueError, match="does not fit") as misfit:
         spec.check_adapter("x", bad)
     with pytest.raises(ValueError, match="DoRA") as dora:
-        inspect_keys(spec, [("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,))])
+        inspect_keys(spec, [
+            (key.format("A"), (4, HIDDEN)), (key.format("B"), (HIDDEN, 4)),
+            ("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,)),
+        ])
     for exc in (misfit.value, dora.value):
         assert describe_load_error(exc) == str(exc)
     assert "/srv" not in describe_load_error(OSError("/srv/adapters/x: permission denied"))
+    assert describe_load_error(ValueError("bad /srv/adapters/x.safetensors")) == "bad x.safetensors"
 
 
 def test_gather_shrink_op_matches_its_fake():

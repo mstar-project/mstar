@@ -52,7 +52,7 @@ def _config(k):
         intermediate_size=512, moe_intermediate_size=256, n_routed_experts=16,
         num_experts_per_tok=4, eos_token_ids=(1,), pad_token_id=0,
         quantization_config=Fp8BlockQuantConfig(), moe_quant_kernel="auto",
-        prefill_graphs=True, prefill_token_buckets=[256], prefill_capture_batch_sizes=[2, 4],
+        prefill_graphs=True, prefill_capture_batch_sizes=[2, 4],
         mtp_num_draft_tokens=k,
     )
 
@@ -123,11 +123,13 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
-        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,
             joint_comm_group=trivial, num_slots=2,
+            # the serving config's prefill_token_buckets, as the engine hands it over
+            token_ladders={"prefill": [256]},
         )
         self.cg.warmup_and_capture(None)
 

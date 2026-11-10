@@ -750,6 +750,112 @@ def test_repeats_survive_server_keepalive_expiry_during_scoring(tmp_path, monkey
     assert [rep.metrics["errors"] for rep in r.repeats] == [0, 0, 0]
 
 
+NANO_SERVER = r"""
+import json, sys
+from aiohttp import web
+
+# Nano-vLLM-VoxCPM's demo /generate: its prompt rules, and PCM16 at the header's rate.
+async def health(request):
+    return web.json_response({"status": "ok"})
+
+async def generate(request):
+    body = await request.json()
+    with open(sys.argv[2], "a") as f:
+        f.write(json.dumps(body) + "\n")
+    has_wav = body.get("prompt_wav_base64") is not None
+    if has_wav and not body.get("prompt_text"):
+        return web.json_response({"detail": "wav prompt requires non-empty prompt_text"}, status=400)
+    if not has_wav and body.get("prompt_text"):
+        return web.json_response({"detail": "prompt_text is not allowed for zero-shot"}, status=400)
+    encoding = "mp3" if "old" in body["target_text"] else "s16le"  # nano before 2.0.3 ignored response_format
+    resp = web.StreamResponse(
+        headers={"X-Audio-Sample-Rate": "48000", "X-Audio-Encoding": encoding, "Content-Type": "audio/pcm"}
+    )
+    await resp.prepare(request)
+    for _ in range(2):
+        await resp.write(b"\x10\x00" * 2400)
+    if "cut" in body["target_text"]:
+        request.transport.close()  # the stream dies before it ends
+        return resp
+    await resp.write_eof()
+    return resp
+
+app = web.Application()
+app.add_routes([web.get("/health", health), web.post("/generate", generate)])
+web.run_app(app, host="127.0.0.1", port=int(sys.argv[1]), print=None)
+"""
+
+
+@pytest.fixture
+def nano(tmp_path):
+    script, bodies = tmp_path / "nano_server.py", tmp_path / "bodies.jsonl"
+    script.write_text(NANO_SERVER)
+    clip = tmp_path / "ref.wav"
+    audio.write_wav(clip, np.zeros(1600, np.float32), 16000)
+    items = [Item("withtext", text="hello there", ref_audio=str(clip), ref_text="the reference"),
+             Item("bare", text="hello again", ref_audio=str(clip))]
+    save_manifest(items, tmp_path / "m.jsonl")
+
+    def run(*flags, label="nano"):
+        serve = f"{sys.executable} {script} {{port}} {bodies}"
+        _run_cli(["run", "tts", "--engine", "nanovllm-voxcpm", "--serve-cmd", serve,
+                  "--data", str(tmp_path / "m.jsonl"), "--repeats", "1", "--warmup", "0", "--asr-judge", "none",
+                  "--sim-judge", "none", "--seed", "3", "--label", label, "--out", str(tmp_path), *flags])
+        rows = {row["id"]: row for row in RunResult.load(tmp_path / f"tts-{label}-c1.json").repeats[0].requests}
+        sent = {json.loads(line)["target_text"]: json.loads(line) for line in bodies.read_text().splitlines()}
+        bodies.unlink()
+        return rows, sent
+
+    return run, clip
+
+
+def test_nano_clones_run_the_mode_mstars_voxcpm2_runs(nano):
+    """A clip with its transcript: reference block and continuation prompt; a bare
+    clip: the reference block alone, which nano serves without a transcript."""
+    import base64
+
+    run, clip = nano
+    rows, sent = run("--clone")
+    want = base64.b64encode(clip.read_bytes()).decode()
+    assert all(row["ok"] for row in rows.values()), rows
+    full, bare = sent["hello there"], sent["hello again"]
+    assert full["ref_audio_wav_base64"] == full["prompt_wav_base64"] == want
+    assert full["prompt_text"] == "the reference" and full["ref_audio_wav_format"] == full["prompt_wav_format"] == "wav"
+    assert bare["ref_audio_wav_base64"] == want and not {"prompt_wav_base64", "prompt_text"} & bare.keys()
+    assert {full["seed"], bare["seed"]} == {3, 4}
+
+
+def test_nano_audio_is_timed_at_the_rate_its_header_names(nano):
+    run, _ = nano
+    rows, sent = run(label="zs")
+    assert not any(k.startswith(("ref_", "prompt_")) for body in sent.values() for k in body)
+    row = rows["withtext"]
+    assert row["ok"] and row["sample_rate"] == 48000 and row["audio_s"] == pytest.approx(0.1)
+    assert 0 < row["ttfa_s"] <= row["e2e_s"]
+
+
+def test_nano_refuses_flags_its_route_has_no_field_for(nano):
+    run, _ = nano
+    with pytest.raises(ValueError, match="--voice"):
+        run("--voice", "alloy", label="v")
+
+
+def test_a_nano_stream_cut_short_is_an_error(tmp_path, nano):
+    run, _ = nano
+    save_manifest([Item("cut", text="cut me off")], tmp_path / "m.jsonl")
+    rows, _ = run(label="cut")
+    assert not rows["cut"]["ok"]
+
+
+def test_a_nano_server_that_streams_anything_but_pcm16_is_an_error(tmp_path, nano):
+    """Nano before 2.0.3 streams MP3 whatever response_format says, under the same
+    rate header: read as PCM16 it would be audio of the wrong length, not an error."""
+    run, _ = nano
+    save_manifest([Item("old", text="an old server")], tmp_path / "m.jsonl")
+    rows, _ = run(label="old")
+    assert not rows["old"]["ok"] and rows["old"]["error"] == "not a PCM16 stream"
+
+
 def test_cli_refuses_abbreviated_flags_and_labels_never_carry_paths(tmp_path, fake_cmd):
     from benchmark.eval.cli import build_parser
 

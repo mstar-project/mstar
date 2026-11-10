@@ -1,0 +1,24 @@
+model: "minimax_h3"
+
+# See minimax_h3.yaml.
+max_seq_len: 8192
+
+# MiniMax-H3 (FL2VA) on 8 GPUs: the DiT Ulysses SP8 (56 heads, 7 per rank after the exchange),
+# each rank holding the whole DiT and an eighth of the packed rows. The video decode runs as a
+# node of the same SP instance, each rank decoding its share of the clips, so rank 0 schedules
+# it between denoise steps on all eight. Both compiled. The Qwen3-VL-32B conditioner and the
+# audio decoder on rank 0, the keyframe encoder on rank 1.
+model_kwargs:
+  attention_backend: flashinfer
+  compile: true
+  vae_tile_batch: 28
+  vae_compile: true
+
+node_groups:
+  - node_names: [dit, vae_decoder]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    sp_size: 8
+  - node_names: [text_encoder, audio_decoder]
+    ranks: [0]
+  - node_names: [vae_encoder]
+    ranks: [1]

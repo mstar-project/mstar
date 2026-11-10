@@ -31,7 +31,7 @@ import torch
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
-from mstar.engine.resources import NodeResourceSpec, Resource
+from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -51,6 +51,7 @@ from mstar.model.submodule_base import ChunkingPolicy
 from mstar.streaming.topology import StreamingGraphEdge
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import StubModel, make_model
+from mstar.testing_utils.resource import StubResource
 from mstar.validation.resources import _unservable_walks, streamed_partitions
 
 KV = "kv"
@@ -382,12 +383,8 @@ def test_the_engine_hands_each_cache_the_walks_its_streams_name():
 # ── which resources are offered the root ────────────────────────────────
 
 
-class _Plain(Resource):
+class _Plain(StubResource):
     """Keeps nothing across requests, so has nothing to open."""
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
 
 class _Recording(_Plain):
@@ -460,7 +457,7 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
     }
     walks = ("prefill", "prefill_image")
     label = KVLabel(keys=PrefixKeys("text_inputs", walks))
-    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
+    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs))
     return make_model(
         kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
         get_partitions=lambda: [partition],
