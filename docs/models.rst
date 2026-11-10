@@ -2335,7 +2335,8 @@ guided), ``vae_encoder`` (each reference at ~1024^2, through the Wan2.1-architec
 as at timestep 0) and ``vae_decoder``. Guidance is the scaffold's: both prompts run as rows of
 one forward (``cfg_size: 2`` puts one on each GPU) and combine with Qwen-Image's
 norm-rescaled CFG. Edit-2509 is the same pipeline without the timestep-0 references and loads
-with ``model_path_hf: Qwen/Qwen-Image-Edit-2509``.
+with ``model_path_hf: Qwen/Qwen-Image-Edit-2509``. Install its runtime with
+``pip install -e ".[qwen_image_edit]"``.
 
 Request knobs: ``height`` / ``width`` (default: the last image's aspect at ~1024^2; floored to
 16 as the pipeline does), ``num_inference_steps`` (40), ``guidance_scale`` (true CFG, 4.0; 1

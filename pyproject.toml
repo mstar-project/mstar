@@ -385,6 +385,18 @@ flux2_klein = [
     "transformers",
 ]
 
+qwen_image_edit = [
+    # Qwen-Image-Edit-2511/2509: serving loads the VAE as diffusers' AutoencoderKLWan, whose
+    # QwenImageEditPlusPipeline (0.39) is also the tests' parity oracle; transformers provides
+    # the Qwen2.5-VL processor (chat template and image patches).
+    "diffusers>=0.39",
+    "flashinfer-python==0.7.2",
+    "huggingface-hub",
+    "Pillow>=12.3.0",
+    "safetensors",
+    "transformers",
+]
+
 vjepa2_ac = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
