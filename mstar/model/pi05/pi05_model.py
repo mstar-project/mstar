@@ -657,7 +657,7 @@ class Pi05Model(Model):
         if node_name == "vit_encoder":
             return NodePrecision(
                 torch.bfloat16,
-                fp32_modules=("encoder.embeddings.patch_embedding", "encoder.embeddings.position_embedding"),
+                fp32_modules=("*embeddings.patch_embedding", "*embeddings.position_embedding"),
                 autocast=False,
             )
         expert = "paligemma" if node_name == "LLM" else "action_expert"

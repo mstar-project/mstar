@@ -17,6 +17,7 @@ from mstar.engine.resources import KVSpec
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import StubModel
 from mstar.worker.engine_manager import EngineManager
 
 
@@ -101,7 +102,7 @@ def test_meta_cast_never_materialises_bf16_params_in_fp32():
 # --- YAML -------------------------------------------------------------------------
 
 
-class _Model:
+class _Model(StubModel):
     """A model that declares each node's policy up front; an undeclared node
     gets ``Model``'s default."""
 
@@ -119,24 +120,6 @@ class _Model:
 
     def get_node_resources(self):
         return self._resources
-
-    def kv_labels(self):
-        return {}
-
-    def get_graph_walk_graphs(self):
-        return {}
-
-    def combined_walk_of(self):
-        return {}
-
-    def chunking_policy_of(self):
-        return {}
-
-    def checkpoint_path(self):
-        return None
-
-    def preprocess_fingerprint(self):
-        return ""
 
 
 def _build(model, nodes, model_config=None) -> EngineManager:

@@ -92,12 +92,13 @@ def test_the_block_loop_runs_in_bf16_without_autocast():
     dtype: the block loop's replay buffers must still be bf16, the tower's
     own dtype, not the fp32 a bare ``torch.zeros`` would make."""
     from mstar.engine.accelerator_graph_config import PiecewiseCaptureShape
-    from mstar.engine.node_dtype import resolve_node_dtype
+    from mstar.model.cosmos3.cosmos3_model import VISION_ENCODER_NODE, Cosmos3Model
     from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
 
     model = _tower().to(torch.bfloat16)
     node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=model.config))
-    dtype = resolve_node_dtype(node, torch.bfloat16)
+    # the dtype the engine hands the node: its param dtype, None as it keeps its own
+    dtype = Cosmos3Model.get_node_precision(None, VISION_ENCODER_NODE).param_dtype
     assert dtype is None
     (config,) = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), dtype).values()
     buffers = config.make_static_inputs(PiecewiseCaptureShape(bs=1, seq_lens=[16], total_tokens=16))

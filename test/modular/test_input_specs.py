@@ -14,6 +14,7 @@ from mstar.engine.input_spec import ResolvedSpec, TensorSpec, apply_input_specs,
 from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import StubModel
 from mstar.worker.engine_manager import EngineManager
 
 BF16 = NodePrecision(torch.bfloat16)
@@ -49,6 +50,7 @@ class _Batch:
         self.failed_requests = {}
         self.inputs = None
         self.running_batched = None
+        self.input_ready = ()
         self.chunk_ranges = {}
         self.first_chunk_rids = set()
 
@@ -131,33 +133,12 @@ class _SpecNode(NodeSubmodule):
         raise NotImplementedError
 
 
-class _Model:
+class _Model(StubModel):
     def get_node_precision(self, node_name):
         return NodePrecision(torch.bfloat16)
 
     def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
         return _SpecNode()
-
-    def get_node_resources(self):
-        return []
-
-    def kv_labels(self):
-        return {}
-
-    def get_graph_walk_graphs(self):
-        return {}
-
-    def combined_walk_of(self):
-        return {}
-
-    def chunking_policy_of(self):
-        return {}
-
-    def checkpoint_path(self):
-        return None
-
-    def preprocess_fingerprint(self):
-        return ""
 
 
 def test_the_load_resolves_param_against_the_yaml_precision():

@@ -79,11 +79,6 @@ def validate_deployment(
     problems = list(check_knobs())
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
-    try:
-        # every placed node's precision, the deployment's blocks over the model's
-        deployment_precisions(model, config)
-    except (ValueError, TypeError) as e:
-        problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
     unpausable = config.get("unpausable_outputs", [])
@@ -120,6 +115,13 @@ def validate_deployment(
     problems += routing_weights_problems(config)
     malformed = node_groups_problems(config)
     problems += malformed
+    if not malformed:
+        try:
+            # every placed node's precision, the deployment's blocks over the model's;
+            # read only once node_groups can be
+            deployment_precisions(model, config)
+        except (ValueError, TypeError) as e:
+            problems.append(str(e))
     deployment = None
     if not malformed:
         # refuses the placement (check_placement) once the model has read it

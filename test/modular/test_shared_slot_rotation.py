@@ -80,7 +80,7 @@ class _Node(NodeSubmodule):
 
 def test_an_engine_gives_the_nodes_of_a_shared_resource_one_rotation(monkeypatch):
     monkeypatch.setattr(engine_module, "build_resource", _PrePlanning.build)
-    engine = Engine(None, autocast_dtype=None)
+    engine = Engine(None)
     engine.load_model(
         {"prefix": _Node(), "action": _Node()},
         [SamplerSpec(resource_key="kv", nodes={"prefix", "action"}, vocab_size=None)],

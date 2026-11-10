@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
@@ -53,6 +54,11 @@ class RippleModel(MultimodalDecoderModel):
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
         return {}
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 under bf16 autocast, as the model has served."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=True)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config

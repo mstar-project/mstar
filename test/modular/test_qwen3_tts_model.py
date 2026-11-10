@@ -2553,8 +2553,8 @@ def test_qwen3_tts_node_precision_keeps_ref_encoder_islands_fp32():
     load)."""
     from mstar.engine.precision import apply_precision
     from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
         Qwen3TTSSpeakerEncoder,
+        speaker_mel,
     )
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
@@ -2566,7 +2566,7 @@ def test_qwen3_tts_node_precision_keeps_ref_encoder_islands_fp32():
         enc_se_channels=8, enc_attention_channels=8,
     )
     submodule = apply_precision(RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config),
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config),
         _FakeCodecEncoder(config.codec.num_quantizers), config,
     ), model.get_node_precision("RefEncoder"))
     assert {t.dtype for t in submodule.speaker_encoder.state_dict().values()} == {torch.bfloat16}

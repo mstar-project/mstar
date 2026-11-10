@@ -29,6 +29,7 @@ from transformers import Qwen2Tokenizer
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -437,6 +438,12 @@ class MiniCPMOModel(Model):
     # ------------------------------------------------------------------
     # Submodules
     # ------------------------------------------------------------------
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 under bf16 autocast, as the model has served; the resampler's
+        sincos frequencies stay fp32, as upstream builds them."""
+        fp32 = ("model.resampler.omega",) if node_name == VISION else ()
+        return NodePrecision(torch.bfloat16, fp32_modules=fp32, autocast=True)
 
     def get_default_sharding_config(self) -> ShardingConfig:
         return ShardingConfig(groups=[], tp_enabled_nodes={LLM}, shard_dim={})

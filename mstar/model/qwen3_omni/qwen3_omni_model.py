@@ -121,8 +121,8 @@ logger = logging.getLogger(__name__)
 
 # In a prefill schedule entry: how many of the step's text tensors lead its attachment
 TEXT_BEFORE = "text_before"
-# the vision tower's rotary frequencies, in the vision_encoder node
-VISION_ROTARY_FREQS = "vision_encoder.rotary_pos_emb.inv_freq"
+# the vision tower's rotary frequencies, as the vision_encoder node holds the tower
+VISION_ROTARY_FREQS = "model.rotary_pos_emb.inv_freq"
 
 # Code2Wav streaming knobs a deployment YAML's ``model_kwargs`` may set; the
 # rest of the Code2Wav config comes from the checkpoint.
@@ -1580,7 +1580,7 @@ class Qwen3OmniModel(Model):
             tower = Qwen3OmniVisionTower(self.config.vision, attn_key=VISION_ATTN)
         # the node's policy, rooted at the tower: its fp32 rotary table survives
         tower = apply_precision(tower, NodePrecision(
-            autocast_dtype, fp32_modules=(VISION_ROTARY_FREQS.removeprefix("vision_encoder."),),
+            autocast_dtype, fp32_modules=(VISION_ROTARY_FREQS.removeprefix("model."),),
         ))
         prefix = "thinker.visual."
         weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)

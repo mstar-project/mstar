@@ -153,11 +153,6 @@ logger = logging.getLogger(__name__)
 # embedder, which diffusers keeps fp32 (``_keep_in_fp32_modules``); the
 # multi-step video denoise scrambles when it runs in bf16.
 TRANSFORMER_PRECISION = NodePrecision(torch.bfloat16, fp32_modules=("time_embedder",), autocast=False)
-# The vision tower + projector: bf16, but the tower's last LayerNorm and the
-# projector's norm read it in fp32, as they did under autocast.
-VISION_PRECISION = NodePrecision(
-    torch.bfloat16, fp32_modules=("visual.post_layernorm", "projector.norm"), autocast=False,
-)
 
 
 def _under(attr: str, precision: NodePrecision) -> NodePrecision:
@@ -1946,7 +1941,9 @@ class Cosmos3Model(Model):
         if node_name in (DIT_NODE, REASONER_NODE):
             return _under("transformer", TRANSFORMER_PRECISION)
         if node_name == VISION_ENCODER_NODE:
-            return _under("vision_model", VISION_PRECISION)
+            # the tower is built bf16 and runs so, norms included: autocast's
+            # fp32 norm outputs cost ~18% of its block loop for the same rounding
+            return NodePrecision(None)
         if node_name in (VAE_DECODER_NODE, VAE_DECODER_AR_NODE):
             return NodePrecision(None)
         return NodePrecision(torch.bfloat16)
@@ -2120,7 +2117,8 @@ class Cosmos3Model(Model):
 
         with torch.device("meta"):
             model = Cosmos3VisionModel(self.config.reasoner)
-        apply_precision(model, VISION_PRECISION)
+        # bf16 throughout, norms included; cast on meta so storage is allocated once
+        apply_precision(model, NodePrecision(torch.bfloat16, autocast=False))
         if self.skip_weight_loading:
             return model.to_empty(device=device)
         model.to_empty(device=device)

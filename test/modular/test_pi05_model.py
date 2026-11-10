@@ -73,12 +73,14 @@ def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_thre
     """The ViT node opts out of the engine's autocast and runs in openpi's
     precision: bfloat16 except the patch and position embeddings."""
     from mstar.engine.accelerator_graph_runner import autocast_scope
+    from mstar.engine.precision import apply_precision
 
     class Encoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.embeddings = torch.nn.Module()
             self.embeddings.patch_embedding = torch.nn.Linear(3, 4)
+            self.embeddings.position_embedding = torch.nn.Embedding(1, 4)
             self.projection = torch.nn.Linear(4, 8)
 
         def forward(self, pixels):
@@ -88,9 +90,11 @@ def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_thre
 
     with torch.random.fork_rng(devices=[]), torch.no_grad():
         torch.manual_seed(19)
-        submodule = Pi05ViTEncoderSubmodule(
+        precision = Pi05Model.get_node_precision(None, "vit_encoder")
+        # as the engine manager loads the node
+        submodule = apply_precision(Pi05ViTEncoderSubmodule(
             Encoder(), Pi05Config(vit_image_size=4, num_cameras=2),
-        ).to("cpu").eval()
+        ).to("cpu"), precision).eval()
         assert submodule.encoder.embeddings.patch_embedding.weight.dtype == torch.float32
         assert submodule.encoder.projection.weight.dtype == torch.bfloat16
         images = torch.linspace(-1, 1, batch_size * 96).reshape(batch_size, 2, 3, 4, 4)
@@ -101,7 +105,7 @@ def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_thre
         with autocast_scope(None, "cpu"):
             reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
         with autocast_scope(torch.bfloat16, "cpu"):
-            with autocast_scope(Pi05Model.get_node_precision(None, "vit_encoder").autocast_dtype, "cpu"):
+            with autocast_scope(precision.autocast_dtype, "cpu"):
                 if batched:
                     outputs = submodule.forward_batched("prefill", engine_inputs, images)
                     actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
