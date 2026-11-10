@@ -233,10 +233,10 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         # rounding through bf16 is part of what the checkpoint saw.
         timestep_in = timestep.to(latents.dtype) / 1000
         if self._compile:
-            key = (tuple(model_input.shape), tuple(text_embeds.shape))
-            if key not in self._compiled_shapes:
-                self._compiled_shapes.add(key)
-                logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
+            shape = (tuple(model_input.shape), tuple(text_embeds.shape))
+            if shape not in self._compiled_shapes:
+                self._compiled_shapes.add(shape)
+                logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", shape)
         transformer = self.bf16_transformer if key.dtype == BF16 else self.transformer
         velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
         return velocity[:, : latents.shape[1]]

@@ -743,3 +743,27 @@ def test_a_dropped_guidance_scale_is_always_reported(caplog):
     with caplog.at_level(logging.WARNING):
         model.process_prompt("a cat", ["text"], ["image"])
     assert not [r for r in caplog.records if "guidance_scale" in r.message]
+
+
+def test_the_compiled_dit_runs_a_step(monkeypatch):
+    """Compile is on by default; the per-shape log once rebound the step key to a shape tuple, so every
+    compiled step failed on ``key.dtype``."""
+    from mstar.model.components.diffusion.denoise_loop import StepKey
+    from mstar.model.flux2_klein import submodules
+
+    monkeypatch.setattr(submodules, "compile_transformer_forward", lambda module, **kw: None)  # no inductor on CPU
+    config = Flux2KleinConfig()
+
+    class Transformer(torch.nn.Module):
+        dtype = torch.float32
+
+        def forward(self, model_input, text_embeds, timestep, rope, ragged=None):
+            return model_input * 2
+
+    dit = submodules.KleinDenoiseSubmodule(Transformer(), config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+    assert dit._compile
+    key = StepKey(KleinShape(grid=(2, 2), text_len=3))
+    latents = torch.ones(1, 4, config.transformer.in_channels)
+    text = torch.zeros(1, 3, config.transformer.joint_attention_dim)
+    out = dit.model_output(None, key, latents, torch.full((1,), 500.0), text_embeds=text)
+    assert torch.equal(out, latents * 2)
