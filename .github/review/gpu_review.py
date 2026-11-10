@@ -578,10 +578,12 @@ PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
 def exact_lines(values):
-    """What the box's text is redacted of, the same everywhere: the non-empty lines of each of `values`, since text
-    redacted line by line never holds a value with a newline in it whole; longest first, so a value that holds
-    another is replaced before it."""
-    return sorted({part for value in values for part in value.split("\n") if part}, key=len, reverse=True)
+    """What the box's text is redacted of, the same everywhere: the lines of each of `values`, stripped (a "\r"
+    would never match, a line of spaces would blank every space) and non-empty, since text redacted line by line
+    never holds a value with a newline in it whole; longest first, so a value that holds another is replaced
+    before it."""
+    parts = dict.fromkeys(part.strip() for value in values for part in value.split("\n"))
+    return sorted(filter(None, parts), key=len, reverse=True)
 
 
 def print_progress(lines, exact, label):
