@@ -329,15 +329,25 @@ class TestHealth(unittest.TestCase):
 
     def test_a_gpu_it_cannot_match_exits_before_anything_is_loaded(self):
         g, burned = HEALTH["main"].__globals__, []
-        saved = {k: g[k] for k in ("visible_uuids", "burn")}
+        saved = {k: g[k] for k in ("visible_uuids", "burn", "on_rocm")}
         self.addCleanup(g.update, saved)
-        g.update(visible_uuids=lambda: ["mig-1234"], burn=lambda i, stop: burned.append(i))
+        g.update(visible_uuids=lambda: ["mig-1234"], burn=lambda i, stop: burned.append(i), on_rocm=lambda: False)
         smi = subprocess.CompletedProcess([], 0, stdout=self.SMI)
         with unittest.mock.patch("subprocess.run", return_value=smi), \
                 unittest.mock.patch("sys.argv", ["gpu_health.py"]):
             with self.assertRaises(SystemExit):
                 HEALTH["main"]()
         self.assertEqual(burned, [], "the burn started before the GPU mapping was checked, so a mismatch hangs")
+
+    def test_on_rocm_it_says_unchecked_rather_than_crash_or_pass(self):
+        g, burned = HEALTH["main"].__globals__, []
+        self.addCleanup(g.update, {k: g[k] for k in ("on_rocm", "burn")})
+        g.update(on_rocm=lambda: True, burn=lambda i, stop: burned.append(i))
+        with unittest.mock.patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi")), \
+                unittest.mock.patch("sys.argv", ["gpu_health.py"]), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(HEALTH["main"](), 0, "an AMD box would fail its health check for want of nvidia-smi")
+        self.assertIn("unchecked", out.getvalue(), "a ROCm box's perf cells would carry no caveat")
+        self.assertEqual(burned, [])
 
 
 if __name__ == "__main__":
