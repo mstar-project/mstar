@@ -191,7 +191,7 @@ def _split_exchanges(rank, world, total, rows, captured):
         # the capture itself, on what its warm-up above compiled
         with torch.compiler.set_stance("fail_on_recompile"):
             torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
-        assert _debug_get_cache_entry_list(CommGroup.all_to_all.__code__)
+        assert _debug_get_cache_entry_list(CommGroup.all_to_all.__wrapped__.__code__)
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
     q_short = torch.randn(b * 5, HEADS, 4, generator=gen)
@@ -396,20 +396,22 @@ def _compiled_packs(rank, world):
     remainder by the group size, may recompile (``sp_seq_split`` and ``gather_sequence`` are
     branch-free)."""
     group = _group(rank, world)
+    attend = _rows_attention(1, causal=False)
 
     def stack(q, k, v):
-        r = SeqRange(group, tuple(sp_seq_split(q.shape[0], world)), None, False)
-        q, k, v = (t.narrow(0, r.start, r.count) for t in (q, k, v))
+        sizes = sp_seq_split(q.shape[0], world)
+        q, k, v = (t.narrow(0, sum(sizes[:rank]), sizes[rank]) for t in (q, k, v))
         for _ in range(2):
-            q = ulysses(_rows_attention(1, causal=False), q, k, v, r)
-        return gather_sequence(group, q, r.counts)
+            # the Ulysses exchange around each attention (`ulysses`, eager here)
+            heads = group.all_to_all((q, k, v), scatter_dim=1, gather_dim=0, gather_sizes=sizes)
+            q = group.all_to_all(attend(*heads), scatter_dim=0, gather_dim=1, scatter_sizes=sizes)
+        return gather_sequence(group, q, sizes)
 
     # Serving compiles once, at one even pack (Cosmos3's `warmup_compiles`, two equal requests),
     # with the length dynamic; every later length, uneven split or not, reuses that compile. 30
     # splits evenly at SP2 and SP3 into shards that match no other dimension: a warm-up pack that
     # does match one is `warmup_compiles`'s to handle (test_denoise_compile.py).
     compiled = torch.compile(stack, backend="eager", dynamic=True)
-    attend = _rows_attention(1, causal=False)
     for i, total in enumerate((30, 7, 9, 22, 13, 8, 31, 10, 12)):
         q, k, v = (_full(total, batched=False, seed=seed) for seed in range(3))
         with torch.compiler.set_stance("fail_on_recompile" if i >= 1 else "default"):

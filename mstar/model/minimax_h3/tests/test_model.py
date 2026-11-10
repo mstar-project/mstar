@@ -578,7 +578,9 @@ def _sp_cfg():
 
     from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG
 
-    return replace(CFG, num_attention_heads=8)  # Ulysses splits the heads over the ranks
+    # Ulysses splits the heads over the ranks; a head dim FlashInfer has kernels for, so its CPU
+    # math (the ragged resource's kernel here) attends it unpadded
+    return replace(CFG, num_attention_heads=8, attention_head_dim=64)
 
 
 def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
@@ -805,7 +807,7 @@ class _StubDiT:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, inputs, layout, attend):
+    def __call__(self, inputs, layout, attend, shard=None):
         self.calls.append(inputs)
         return torch.zeros_like(inputs.video), torch.zeros_like(inputs.audio)
 

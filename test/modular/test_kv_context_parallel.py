@@ -331,9 +331,11 @@ def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, a
 def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
     """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
     can't own one."""
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
+    from mstar.model.base import enabled_resources
+
+    groups = _sp_groups(NODE)
+    # what a deployment without a `lora:` block builds
+    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
     specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
     with pytest.raises(ValueError, match="does not support steps split over SP ranks"):

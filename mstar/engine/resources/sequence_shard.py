@@ -452,7 +452,9 @@ def ulysses(run: Callable, q, k, v, r: SeqRange):
     that dim dynamic, a slower kernel than eager. Any other step stays eager: its token counts vary,
     so compiling would stall on each new one and gain nothing per step."""
     _check_entry(r, q, k, v)
-    all_to_all = compiled(CommGroup.all_to_all) if r.captured else CommGroup.all_to_all
+    # `CommGroup.all_to_all` is eager to every other caller (torch.compiler.disable): the capture
+    # compiles the function under it
+    all_to_all = compiled(CommGroup.all_to_all.__wrapped__) if r.captured else CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
     exchanged = all_to_all(

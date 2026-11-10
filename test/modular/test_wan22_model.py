@@ -107,11 +107,11 @@ def test_wan22_declares_expected_nodes():
 
 
 def test_wan22_declares_only_dit_attention_resources():
-    """Nothing here is cached across steps: the only resource is the dit's
-    cacheless self-attention, and the sdpa backend declares none."""
+    """Nothing here is cached across steps: the only resources are the dit's
+    sequence shard and cacheless self-attention, and the sdpa backend declares none."""
     model = _make_model()
     specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SELF_ATTN]
+    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SEQ_SHARD, Wan22DitSubmodule.SELF_ATTN]
     assert all(spec.nodes == {"dit"} for spec in specs)
     model.config = Wan22Config(attention_backend="sdpa")
     assert model.get_node_resources() == []
@@ -853,7 +853,7 @@ class _BranchEcho(torch.nn.Module):
     """A dit stand-in whose prediction is each row's text embedding, broadcast."""
     dtype = torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn, shard=None):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 
@@ -911,6 +911,6 @@ def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
         graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
+    assert set(step.steps) == {Wan22DitSubmodule.SEQ_SHARD, Wan22DitSubmodule.SELF_ATTN}
     sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
     assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None

@@ -469,7 +469,9 @@ def test_a_sharded_signal_into_an_instance_wider_than_tp_is_refused(axis, tmp_pa
     only the TP ranks split the weights."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1, 2, 3], "tp_size": 2, f"{axis}_size": 2}],
                sharding_config={"shard_dim": {"x": 1}})
-    _refused(_WideModel(), cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
+    # a node SP ranks can run: a sequence shard and an attention that takes it
+    model = _WideModel(specs=[SeqShardSpec("shard", {"llm"}, ("main",), 0), _ulysses(4)])
+    _refused(model, cfg, r"node 'llm' takes or emits \['x'\], which have a shard_dim")
 
 
 def test_model_yaml_hook_refusal_is_reported(tmp_path):
