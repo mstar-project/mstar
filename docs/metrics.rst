@@ -266,6 +266,11 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    Gauge. Pages the prefix cache names. Running requests may also hold some of them;
    the cache frees the others when a request needs the room.
 
+``mstar_kv_pages_lent{model_name, component, resource}``
+   Gauge. Pages guaranteed requests were allotted and haven't written that preemptible
+   requests borrowed. A guaranteed request takes them back by moving a borrower when it
+   needs them and no page is free.
+
 ``mstar_rebuild_host_bytes_used{model_name, component}``
    Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids and host
    copies, which a request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
@@ -299,9 +304,9 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    cuts to 0 still counts.
 
 ``mstar_kv_preemptions_total{model_name, component}``
-   Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short
-   of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves
-   itself to the host to wait.
+   Counter. Requests chosen to move to the host or drop because a request's grant ran short of KV pages, on a
+   single rank: past its reservation, or for a guaranteed request into pages it lent. Their pages go to the
+   request that ran short, which counts too when it moves itself to the host to wait.
 
 ``mstar_kv_drops_total{model_name, component}``
    Counter. Chosen requests whose KV was dropped. A request leaves before its drop when
@@ -320,6 +325,14 @@ TP, SP or CFG instance count once: the instance's first rank reports.
 ``mstar_kv_returns_preempted_total{model_name, component}``
    Counter. Requests preempted again before they sampled a token since they were last preempted. Only
    requests that keep a rebuild log are counted.
+
+``mstar_kv_take_backs_total{model_name, component}``
+   Counter. Preempted requests that moved so a guaranteed request could take back pages
+   it lent. They count in ``mstar_kv_preemptions_total`` too.
+
+``mstar_kv_take_back_waits_total{model_name, component}``
+   Counter. Guaranteed requests that waited to take back pages they lent, since no request
+   holding them could move yet. Each wait holds up a stream that can't pause.
 
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not

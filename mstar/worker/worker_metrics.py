@@ -49,11 +49,15 @@ class PreemptionCounts:
     """A node's preemptions since its worker started."""
     # `rebuild_tokens`: tokens the rebuild rows prefilled.
     # `returns_preempted`: requests preempted again before they sampled a token since they were last preempted.
+    # `take_backs`: victims moved so a guaranteed request takes back pages it lent.
+    # `take_back_waits`: guaranteed requests that waited because no request holding what they lent could move.
     victims: int = 0
     drops: int = 0
     rebuild_tokens: int = 0
     preempted_again: int = 0
     returns_preempted: int = 0
+    take_backs: int = 0
+    take_back_waits: int = 0
 
 
 class WorkerMetrics:
@@ -105,12 +109,13 @@ class WorkerMetrics:
         self._kv_used = Gauge(catalog.KV_PAGES_USED)
         self._kv_total = Gauge(catalog.KV_PAGES_TOTAL)
         self._kv_cached = Gauge(catalog.KV_PAGES_CACHED)
+        self._kv_lent = Gauge(catalog.KV_PAGES_LENT)
         self._prefix_query = Counter(catalog.PREFIX_CACHE_QUERY_TOKENS)
         self._prefix_hit = Counter(catalog.PREFIX_CACHE_HIT_TOKENS)
         self._pending = Gauge(catalog.COMPONENT_PENDING_STEPS)
         self._preemption_counters = [Counter(family) for family in (
             catalog.KV_PREEMPTIONS, catalog.KV_DROPS, catalog.KV_REBUILD_TOKENS, catalog.KV_PREEMPTED_AGAIN,
-            catalog.KV_RETURNS_PREEMPTED,
+            catalog.KV_RETURNS_PREEMPTED, catalog.KV_TAKE_BACKS, catalog.KV_TAKE_BACK_WAITS,
         )]
         self._rebuild_pages = Counter(catalog.KV_REBUILD_CACHED_PAGES)
         self._host_used = Gauge(catalog.REBUILD_HOST_BYTES_USED)
@@ -169,6 +174,7 @@ class WorkerMetrics:
                 self._kv_used.set(labels, counts.used)
                 self._kv_total.set(labels, counts.total)
                 self._kv_cached.set(labels, counts.cached)
+                self._kv_lent.set(labels, counts.lent)
             if self._prefix_base is None:
                 continue
             base = self._prefix_base[i]
@@ -202,7 +208,7 @@ class WorkerMetrics:
                 self._host_used.set((node,), used)
                 self._host_total.set((node,), total)
         return [
-            self._kv_used.snapshot(), self._kv_total.snapshot(), self._kv_cached.snapshot(),
+            self._kv_used.snapshot(), self._kv_total.snapshot(), self._kv_cached.snapshot(), self._kv_lent.snapshot(),
             self._step_seconds.snapshot(), self._batch_size.snapshot(),
             self._prefix_query.snapshot(), self._prefix_hit.snapshot(),
             *(counter.snapshot() for counter in self._preemption_counters), self._rebuild_pages.snapshot(),

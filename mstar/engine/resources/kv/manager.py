@@ -351,6 +351,8 @@ class KVPageCounts(NamedTuple):
     total: int
     # pages the prefix index names; some may also be in ``used`` by a request
     cached: int
+    # pages guaranteed requests were allotted and haven't written that preemptible requests hold
+    lent: int
 
 
 class Reservation(NamedTuple):
@@ -401,11 +403,13 @@ class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
     their own, already given back their allotment to ask again. When no move covers the shortage, ``to_host``
     holds the request that ran short if the host takes it whole, and otherwise ``waits`` is the pages it asks
-    the pool for instead. ``waits`` is 0 otherwise."""
+    the pool for instead. ``waits`` is 0 otherwise. ``takes_back`` is set when the request is guaranteed, so the
+    moves take back pages it lent."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
     waits: int = 0
+    takes_back: bool = False
 
 
 class StalledMoves(NamedTuple):
@@ -936,6 +940,8 @@ class KVManager(AttentionResource):
         return KVPageCounts(
             used=self.config.pages_of(total - self._arena.num_free), total=self.config.pages_of(total),
             cached=0 if index is None else index.num_pages(),
+            # borrowers grow only into what guaranteed requests lend once the room runs out
+            lent=self.config.pages_of(min(self._borrowable, max(0, -self._room()))),
         )
 
     def resolve_cached_prefix(
@@ -4809,7 +4815,7 @@ class KVManager(AttentionResource):
                 if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
                     self._host(rid, [rid])
                     return Victims([rid], [], [])
-                return Victims([], [], [], waits=short.pages)
+                return Victims([], [], [], waits=short.pages, takes_back=rid in self._guaranteed)
             self._claim(rid, claim)
             return self._earmark(Earmark(rid, max(pages_short, self._allotments[rid].lends), set()), victims)
 
@@ -4932,7 +4938,7 @@ class KVManager(AttentionResource):
             self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
         self._host(earmark.rid, victims.to_host)
-        return victims
+        return victims._replace(takes_back=earmark.rid in self._guaranteed)
 
     def _mark_victims(self, earmark: Earmark, victims: list[str]) -> None:
         """Earmark what ``victims`` free for ``earmark.rid``. A victim that holds no page of its own gives back its

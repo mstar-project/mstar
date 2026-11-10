@@ -2114,7 +2114,7 @@
     {
       "type": "timeseries",
       "title": "KV cache pages and rebuild host pool used",
-      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped).",
+      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped); lent: share guaranteed requests were allotted and haven't written that preemptible requests borrowed.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2222,6 +2222,16 @@
           },
           "expr": "sum by (component) (mstar_rebuild_host_bytes_used{model_name=~\"$model\"}) / sum by (component) (mstar_rebuild_host_bytes_total{model_name=~\"$model\"})",
           "legendFormat": "{{component}} rebuild host pool",
+          "range": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component, resource) (mstar_kv_pages_lent{model_name=~\"$model\"}) / sum by (component, resource) (mstar_kv_pages_total{model_name=~\"$model\"})",
+          "legendFormat": "{{component}}/{{resource}} lent",
           "range": true
         }
       ],
@@ -2590,7 +2600,7 @@
     {
       "type": "timeseries",
       "title": "KV preemptions per second",
-      "description": "Requests chosen to drop when a grant past a reservation ran short of KV pages, those dropped, requests preempted a second time, and returned requests preempted again before they kept another token.",
+      "description": "Requests chosen to drop when a grant ran short of KV pages, those dropped, requests preempted a second time, returned requests preempted again before they kept another token, requests moved so a guaranteed request takes back pages it lent, and guaranteed requests that waited to take them back.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2670,6 +2680,26 @@
           },
           "expr": "sum by (component) (rate(mstar_kv_returns_preempted_total{model_name=~\"$model\"}[1m]))",
           "legendFormat": "{{component}} returns preempted again",
+          "range": true
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_take_backs_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} moved for a take-back",
+          "range": true
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_take_back_waits_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} take-back waits",
           "range": true
         }
       ],
