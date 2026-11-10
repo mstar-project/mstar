@@ -100,7 +100,8 @@ class MediaIntake:
     each attachment. ``opens`` are the ids a placeholder follows in the
     rendered prompt, for a template that writes its own sentinels around a
     pad users may also type (MiniCPM-o's ``<unk>``): a pad right after none
-    of them stays a token. Intakes sharing a pad declare them all or none.
+    of them stays a token. Intakes sharing a pad declare them all or none,
+    and the same sentinels, which setting a model's ``media`` checks.
     """
 
     modality: str
@@ -138,8 +139,10 @@ class MultimodalDecoderModel(Model):
     # comes too); workers fetch the full snapshot (`_resolve_weights`)
     METADATA_FILES: tuple[str, ...]
 
-    # one per attachment modality the model takes, set by its `__init__`
-    media: tuple[MediaIntake, ...] = ()
+    # set through `media`
+    _media: tuple[MediaIntake, ...] = ()
+    _sentinels: Mapping[int, tuple[int, int]] = MappingProxyType({})
+    _opens: Mapping[int, frozenset[int]] = MappingProxyType({})
     # False for a model every prompt of which carries media (an audio-only
     # STT checkpoint): no text-only prefill walk, no mixed step, no prefix keys
     # (only a text span is keyed), and its LLM node, given this as its
@@ -179,6 +182,28 @@ class MultimodalDecoderModel(Model):
         from huggingface_hub import snapshot_download
 
         return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
+
+    @property
+    def media(self) -> tuple[MediaIntake, ...]:
+        """One `MediaIntake` per attachment modality the model takes, set by
+        its `__init__`."""
+        return self._media
+
+    @media.setter
+    def media(self, media: Sequence[MediaIntake]) -> None:
+        # intakes sharing a pad must agree on how it is wrapped and found, checked
+        # here once rather than per prompt
+        sentinels: dict[int, tuple[int, int]] = {}
+        opens: dict[int, frozenset[int]] = {}
+        for m in media:
+            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
+            if any(bool(o.opens) != bool(m.opens) for o in media if o.pad == m.pad):
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} declare opens all or none")
+            if m.opens:
+                opens[m.pad] = opens.get(m.pad, frozenset()) | m.opens
+        self._media = tuple(media)
+        self._sentinels, self._opens = sentinels, opens
 
     @property
     def encoders(self) -> tuple[MediaEncoder, ...]:
@@ -345,15 +370,6 @@ class MultimodalDecoderModel(Model):
             given = loaded.get(f"{m}_inputs") or ()
             return given[i] if i < len(given) else {}
 
-        sentinels: dict[int, tuple[int, int]] = {}
-        opens: dict[int, frozenset[int]] = {}
-        for m in self.media:
-            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
-                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
-            if any(bool(o.opens) != bool(m.opens) for o in self.media if o.pad == m.pad):
-                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} declare opens all or none")
-            if m.opens:
-                opens[m.pad] = opens.get(m.pad, frozenset()) | m.opens
         ids = self._prompt_ids(parts, raw, **kwargs)
         # before any attachment is prepared: user text that spells a placeholder
         # (per pad id, which intakes may share)
@@ -362,7 +378,7 @@ class MultimodalDecoderModel(Model):
             want[intake.pad] = want.get(intake.pad, 0) + sum(
                 1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i), kwargs) for i in range(len(raw[m]))
             )
-        hits = ids[placeholders(ids, want, opens)].tolist()
+        hits = ids[placeholders(ids, want, self._opens)].tolist()
         for pad, n in want.items():
             found = hits.count(pad)
             if found != n:
@@ -385,7 +401,7 @@ class MultimodalDecoderModel(Model):
             ]
             for name, tensor in prepared.inputs.items():
                 inputs.setdefault(name, []).append(tensor)
-        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels, opens), inputs)
+        return MediaPrompt(expand_media_pads(ids, pad_runs, self._sentinels, self._opens), inputs)
 
     def max_input_files(self) -> dict[str, int]:
         # an attachment no intake takes, refused before any file is decoded
