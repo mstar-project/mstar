@@ -239,6 +239,7 @@ def vae_pixels(image: torch.Tensor) -> torch.Tensor:
     """uint8 ``[C, H, W]`` -> ``[1, C, 1, H, W]`` fp32 in ``[-1, 1]``, as diffusers' ``VaeImageProcessor.preprocess``
     hands an image to a pipeline's VAE: divided on the host (CUDA divides by a scalar through its reciprocal, which
     rounds differently) and laid out NHWC (the processor's numpy image; cuDNN picks the VAE's convolution kernels by
-    layout). Both change the latents' bits."""
+    layout). Both change the latents' bits. An image already on the GPU is copied back for the divide: one wait
+    per reference image, in an encoder node that runs once per request."""
     pixels = image.cpu().permute(1, 2, 0).contiguous().float() / 255.0
     return (2.0 * pixels - 1.0)[None].permute(0, 3, 1, 2).unsqueeze(2)

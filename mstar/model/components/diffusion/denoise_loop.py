@@ -233,6 +233,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self.step_scalars: Mapping[str, StepScalar] = {
             **self.STEP_SCALARS, **{name: StepScalar(f"guidance:{name}", broadcast=False) for name in scales},
         }
+        # What the scaffold stages itself, which a model's request_inputs must not name
+        self._staged_names = frozenset({*self.step_scalars, *self.loop_back_names})
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -505,7 +507,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             )
         key = self.step_key(fwd_info, bucket_key)
         conditioning = self.request_inputs(fwd_info, inputs, key)
-        shadowed = conditioning.keys() & {*self.step_scalars, *self.loop_back_names}
+        shadowed = conditioning.keys() & self._staged_names
         if shadowed:
             raise ValueError(
                 f"{type(self).__name__}.request_inputs returned {sorted(shadowed)}, the name of a step scalar or "
