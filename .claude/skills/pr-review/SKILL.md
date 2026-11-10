@@ -593,8 +593,8 @@ the last review.
     or code no served request runs); never a change to what a model or the server does, however
     small. The bot never approves a `none`: approval needs a live test that passed on the commit.
     The reason says why in one sentence. A change to tests that skip without CUDA gets at
-    least `targeted`: the live test runs CI's tests on the box's GPUs, and GitHub's CPU job never
-    does.
+    least `targeted`: the live test runs the changed tests on the box's GPUs, which GitHub's CPU
+    job never does.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
@@ -616,12 +616,11 @@ judgement, as the summary's status line counts them) and no skipped file. Otherw
 and asks for `/review` again; an open question and the design risk don't hold it back, though both
 still stop approval.
 
-The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
-ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
-the live test runs in full, with both kinds of check, whatever the review asked for, so a failure is
-never hidden behind a narrower run; and so does a re-review's `targeted` when no live test ran
-before it, since no GPU run covered the commits that review built on, and its `none` too unless the
-PR changes only docs, tests and benchmarks. A re-review with `untestable` set is exempt from both:
+The bot overrides the review's call in one case: when the PR's last live test failed or was
+partial, the live test runs in full, with both kinds of check, whatever the review asked for, so a
+failure is never hidden behind a narrower run. An earlier live test that was unavailable or ended
+with no verdict leaves your call as it is unless a conclusive one before it failed or was partial; so
+does none at all. A re-review with `untestable` set is exempt:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
 run" with your reason, and a person approves.

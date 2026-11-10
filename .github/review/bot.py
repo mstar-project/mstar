@@ -633,12 +633,14 @@ def touched_files(diff_text):
 
 
 def last_live_test(comments):
-    """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
-    "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
+    """The bot's last conclusive live-test comment among `comments` ({"user": login, "body": text}), {"sha",
+    "verdict", "body"}, or None: one whose verdict says how the code did. An `unavailable` run (no GPUs) or one
+    with no verdict (the box died) says nothing, so a fail before it still stands. Only its first line, the
+    marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
-        if m and c["user"] in BOT_USERS:
+        if m and c["user"] in BOT_USERS and m[2] not in ("unavailable", "none"):
             last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
     return last
 

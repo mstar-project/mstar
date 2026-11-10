@@ -227,7 +227,7 @@ jobs:
       main_sha: ${{ steps.base.outputs.commit }}
       # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
       result: ${{ steps.post.outputs.result }}
-      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      # Built on an earlier review: one naming something untestable isn't made full (gpu_review.py, carry).
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.
       above: ${{ steps.diff.outputs.above }}
@@ -555,8 +555,7 @@ jobs:
 
       # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
       # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
-      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
-      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
+      # call stands unless the PR's last conclusive live test failed or was partial: then the live
       # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
       # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.
