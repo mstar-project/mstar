@@ -92,8 +92,10 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sysconfig
+import threading
 from enum import StrEnum
 from pathlib import Path
 
@@ -943,10 +945,20 @@ class RustFrontendBridge:
         pin = getattr(self.server, "pin_result_thread", None)
         if pin is not None:
             pin()
+        # SIGINT and SIGTERM end the loop, as uvicorn's handlers end its server:
+        # asyncio.run installs a SIGINT handler only over Python's default one,
+        # and a server started as a background job inherits SIGINT ignored
+        stop = lambda signum, frame: setattr(self, "running", False)  # noqa: E731
+        handled = (signal.SIGINT, signal.SIGTERM)
+        on_main = threading.current_thread() is threading.main_thread()
+        previous = {sig: signal.signal(sig, stop) for sig in handled} if on_main else {}
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:
             pass
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
     def stop(self) -> None:
         self.running = False
