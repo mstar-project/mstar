@@ -208,7 +208,8 @@ def test_build_refusals():
     with pytest.raises(ValueError, match="differ in length"):
         LongRoPE((1.0,), (1.0, 2.0), 16, 64)
     rope = manager()
-    assert rope.resident_refusal() is not None
+    # its rows keep their table ids on resident tables (test_resident_planning.py)
+    assert rope.resident_refusal() is None
     # its rows are table ids, not positions: a fused kernel must not read it by position
     assert rope.cos_sin_table is None and rope.fusable_rope_theta(32) is None
 

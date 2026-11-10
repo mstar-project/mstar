@@ -427,6 +427,10 @@ class RopeManager(PositionManager):
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=self._resident_label(step))
+        self._gather_offset(step, self._resident_delta, self._static_buffer(key, step.bucket.num_tokens))
+
+    def _resident_label(self, step: "CapturedResidentStep") -> str:
         own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
         if own.label != pool.label or own.reads or pool.reads:
             # the offset holds only while both advance a token a step, as one stream
@@ -434,11 +438,13 @@ class RopeManager(PositionManager):
                 f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
                 "a resident step's positions advance with the stream their KV cache appends to"
             )
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
-        table = self._resident_delta
+        return own.label
+
+    def _gather_offset(self, step: "CapturedResidentStep", table, out: torch.Tensor) -> None:
+        """``out[i]``: row ``i``'s cell of ``table`` plus its stored length."""
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
-            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
+            out, plus=step.buffers.kv_len[self._kv_cache_name],
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
@@ -755,7 +761,9 @@ class LongRopeManager(RopeManager):
     context rotates with the long half for its whole life, so its rows' table ids sit
     ``max_seq_len`` past their positions. The ids are planned beside the positions,
     which `pos_ids` keeps publishing unchanged; the spec names the choice in the
-    request's prefix keys (`PositionSpec.prefix_variant`).
+    request's prefix keys (`PositionSpec.prefix_variant`). On resident tables a row
+    keeps its table id's offset from the stored length beside its position's, so a
+    replay builds both from the row.
     """
 
     def __init__(
@@ -807,8 +815,25 @@ class LongRopeManager(RopeManager):
         # indexed by table id, not by position: no fused kernel may read it by position
         return None
 
-    def resident_refusal(self) -> str | None:
-        return "LongRoPE's per-request table rows are host-planned"
+    # Resident planning: the table id runs ahead of the position by the request's
+    # half of the table, fixed at ingest, so a row keeps that offset too
+
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        super().bind_resident(planner, key)
+        self._resident_table_delta = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        super().resident_row(rid, slot, row, writes)
+        half = self._max_seq_len if rid in self._long_rids else 0
+        row[self._resident_table_delta.col] = row[self._resident_delta.col] + half
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # the two rows of the buffer `_stage_rows` plans into, which the capture reads
+        width = step.bucket.num_tokens
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=f"{self._resident_label(step)}{_TABLE_IDS}")
+        positions, table_ids = self._static_buffer(key, 2 * width).view(2, width)
+        self._gather_offset(step, self._resident_delta, positions)
+        self._gather_offset(step, self._resident_table_delta, table_ids)
 
     def ingest_request(self, rid: str, overrides: PositionReqConfig | None = None):
         super().ingest_request(rid, overrides)
