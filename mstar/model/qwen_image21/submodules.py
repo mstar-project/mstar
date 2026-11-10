@@ -114,6 +114,22 @@ class QwenImage21TextEncoderSubmodule(NodeSubmodule):
 # vae_encoder / vae_decoder
 # ---------------------------------------------------------------------------
 
+# the latent grid the compiled encoder and decoder are warmed on (1024 x 768 pixels): not square, so the dynamic
+# graph keeps height and width apart and serves every size
+_WARM_GRID = (64, 48)
+
+
+def _encode_mode(vae: nn.Module, pixels: torch.Tensor) -> torch.Tensor:
+    """``vae.encode(pixels).latent_dist.mode()`` for one frame, bit for bit, without its feature cache: a
+    one-frame encode only writes the cache (a clone of every conv input), never reads it back."""
+    return vae.quant_conv(vae.encoder(pixels, None, None)).chunk(2, dim=1)[0]
+
+
+def _decode(vae: nn.Module, z: torch.Tensor) -> torch.Tensor:
+    """``vae.decode(z)`` for one frame, bit for bit, without its feature cache (as ``_encode_mode``)."""
+    return vae.decoder(vae.post_quant_conv(z), None, None, True).clamp(-1.0, 1.0)
+
+
 class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
     """RGBA uint8 ``[4, H, W]`` references -> their normalized latents (the posterior's mode) as
     rows ``[h * w, C]``, every reference end to end. Images differ in size: one encode each."""
@@ -121,9 +137,17 @@ class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    def __init__(self, vae: nn.Module):
+    def __init__(self, vae: nn.Module, compile: bool = False):
         super().__init__()
         self.vae = vae
+        self._compile = compile
+
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        if not self._compile:
+            return {}
+        h, w = (n * self.vae.spatial_compression_ratio for n in _WARM_GRID)
+        pixels = torch.zeros(1, self.vae.config.in_channels, 1, h, w, device=self.get_device(), dtype=self.vae.dtype)
+        return {"vae.encoder": [(pixels, None, None)]}
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={f"image_{i}": img for i, img in enumerate(inputs[REF_PIXELS])})
@@ -134,7 +158,7 @@ class QwenImage21VaeEncoderSubmodule(NodeSubmodule):
         mean, std = latent_affine(self.vae, dtype, device)[0], latent_std(self.vae, dtype, device)
         for key in sorted(images, key=lambda name: int(name.split("_")[1])):
             pixels = vae_pixels(images[key]).to(device=device, dtype=dtype)
-            latents = (self.vae.encode(pixels).latent_dist.mode() - mean) / std
+            latents = (_encode_mode(self.vae, pixels) - mean) / std
             rows.append(latents.flatten(2).transpose(1, 2)[0])
         return {REF_LATENTS: [torch.cat(rows)]}
 
@@ -146,9 +170,16 @@ class QwenImage21VaeDecoderSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    def __init__(self, vae: nn.Module):
+    def __init__(self, vae: nn.Module, compile: bool = False):
         super().__init__()
         self.vae = vae
+        self._compile = compile
+
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        if not self._compile:
+            return {}
+        x = torch.zeros(1, self.vae.config.z_dim, 1, *_WARM_GRID, device=self.get_device(), dtype=self.vae.dtype)
+        return {"vae.decoder": [(x, None, None, True)]}
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         target = RequestLayout.from_metadata(fwd_info.step_metadata[LAYOUT]).target
@@ -167,7 +198,7 @@ class QwenImage21VaeDecoderSubmodule(NodeSubmodule):
         device, dtype = self.get_device(), self.vae.dtype
         z = latents.to(device=device, dtype=dtype).transpose(0, 1).reshape(1, -1, 1, h, w)
         z = z * latent_std(self.vae, dtype, device) + latent_affine(self.vae, dtype, device)[0]
-        image = self.vae.decode(z, return_dict=False)[0][:, :, 0]
+        image = _decode(self.vae, z)[:, :, 0]
         return {IMAGE_OUTPUT: [pixels_to_uint8(image)[0]]}
 
 

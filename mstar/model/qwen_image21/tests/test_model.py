@@ -179,6 +179,24 @@ def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
     assert torch.equal(ours, ref) and ours.stride() == ref.stride()
 
 
+def test_the_cache_free_vae_calls_are_diffusers_encode_and_decode_to_the_bit():
+    """The nodes call the VAE's encoder and decoder without the one-frame feature cache diffusers passes
+    (written, never read, for one frame); a diffusers change that reads it would break parity here."""
+    vae_module = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_qwenimage21")
+    from mstar.model.qwen_image21.submodules import _decode, _encode_mode
+
+    torch.manual_seed(0)
+    vae = vae_module.AutoencoderKLQwenImage21(
+        base_dim=8, decoder_base_dim=12, z_dim=4, dim_mult=[1, 2, 2, 2, 2], num_res_blocks=1,
+        latents_mean=[0.0] * 4, latents_std=[1.0] * 4,
+    ).eval()
+    pixels = torch.rand(1, 4, 1, 48, 32) * 2 - 1
+    with torch.no_grad():
+        mode = vae.encode(pixels).latent_dist.mode()
+        assert torch.equal(_encode_mode(vae, pixels), mode)
+        assert torch.equal(_decode(vae, mode), vae.decode(mode, return_dict=False)[0])
+
+
 @pytest.mark.parametrize("layout", ["preprocessor_config", "processor_config"])
 def test_config_reads_the_pixel_bounds_from_either_processor_layout(tmp_path, layout):
     """The base repo saves the image processor alone, the Turbo repo inside its whole processor."""

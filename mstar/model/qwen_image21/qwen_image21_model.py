@@ -147,7 +147,7 @@ class QwenImage21Model(Model):
         max_num_pages: int = 512,
         max_batch_size: int = 4,
         accelerator_graph: bool = False,
-        compile_transformer: bool = False,
+        compile: bool = False,
         capture_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         async_scheduling: bool = True,
@@ -161,7 +161,9 @@ class QwenImage21Model(Model):
         self.max_num_pages = int(max_num_pages)
         self.max_batch_size = int(max_batch_size)
         self.accelerator_graph = bool(accelerator_graph)
-        self.compile_transformer = bool(compile_transformer)
+        # torch.compile the denoise target's blocks and the VAE's encoder and decoder (not bit-exact: gated
+        # against the fp32 pipeline)
+        self.compile = bool(compile)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4])]
         self.async_scheduling = bool(async_scheduling)
@@ -534,14 +536,14 @@ class QwenImage21Model(Model):
                 weight_loader.build_vision_tower(snapshot, device),
             )
         if node_name == VAE_ENCODER_NODE:
-            return QwenImage21VaeEncoderSubmodule(weight_loader.build_vae(snapshot, device))
+            return QwenImage21VaeEncoderSubmodule(weight_loader.build_vae(snapshot, device), compile=self.compile)
         if node_name == VAE_DECODER_NODE:
-            return QwenImage21VaeDecoderSubmodule(weight_loader.build_vae(snapshot, device))
+            return QwenImage21VaeDecoderSubmodule(weight_loader.build_vae(snapshot, device), compile=self.compile)
         if node_name == DIT_NODE:
             return QwenImage21DenoiseSubmodule(
                 weight_loader.build_transformer(config.transformer, snapshot, device, comm_group=tp_group), config,
                 loop_name=DENOISE_LOOP, max_batch_size=self.max_batch_size,
-                compile_transformer=self.compile_transformer,
+                compile_transformer=self.compile,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Qwen-Image-2.1 has no submodule for node %r; running it dummy", node_name)
