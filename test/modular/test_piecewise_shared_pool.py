@@ -146,3 +146,31 @@ def test_run_without_a_graph_declares_the_step_a_replay_does():
     assert set(step.steps) == {"a"}
     assert step.ctx.force_prefill and step.ctx.slot_lease is None and tuple(step.ctx.request_ids) == (7, 8)
     assert step_runner.plan.called and step_runner.commit.called
+
+
+def test_run_without_a_graph_declares_each_labeled_layout():
+    """A region that plans several ragged layouts passes ``label_seq_lens`` to
+    ``declare_step`` on an eager run too, as a replay does."""
+    from unittest import mock
+
+    from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+    from mstar.engine.resources.step import ADMIT_OK
+
+    seen = {}
+
+    def declare(request_ids, seq_lens, label_seq_lens=None):
+        seen["labels"] = label_seq_lens
+        return mock.Mock()
+
+    step_runner = mock.Mock()
+    step_runner.admit.return_value = ADMIT_OK
+    runner = PiecewiseAcceleratorGraphRunner(
+        label="r", config=PiecewisePackedConfig(
+            capture_fn=lambda call: {"y": call.static_inputs["x"]}, make_static_inputs=lambda shape: {},
+            declare_step=declare, total_tokens=[16], capture_batch_sizes=[], eager_fallback=True,
+        ),
+        resources={}, step_runner=step_runner, device=torch.device("cpu"), autocast_dtype=None, num_slots=1,
+    )
+    labels = {"windows": [4, 4], "frames": [2, 6]}
+    runner.run(static_inputs={"x": torch.ones(8, 4)}, request_ids=[7, 8], seq_lens=[3, 5], label_seq_lens=labels)
+    assert seen["labels"] == labels

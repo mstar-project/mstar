@@ -43,8 +43,10 @@ def _build(monkeypatch) -> Worker:
     monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
         set_node_metadata=lambda **metadata: None, set_inline_streams=lambda keys: None,
     ))
+    # an engine with no paged KV cache to preempt in
     monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(
         side_keys=(), inline_streams=InlineStreams(frozenset(), {}),
+        engine=SimpleNamespace(paged_kv_caches=list, host_allowance=None, node_dtype=lambda node: None),
     ))
     monkeypatch.setattr(Worker, "_plan_step_cpus", lambda self, *a: (None, frozenset()))
     return Worker(

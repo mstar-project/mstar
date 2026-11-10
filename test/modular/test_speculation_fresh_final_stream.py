@@ -163,6 +163,7 @@ def _follower_speculation(final: bool):
             {FRESH: 0}, _fresh_edges(final), ("prev_text",),
         ),
         pop_follow_head=lambda: head,
+        follow_rebuilds=lambda node, rids: frozenset(),
     )
     scheduler = SimpleNamespace(combined_walk_of={}, note_follow_pop=lambda key: None, rebuilds=Rebuilds({}, {}))
     scheduler._key = MicroScheduler._key.__get__(scheduler)

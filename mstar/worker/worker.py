@@ -18,6 +18,9 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.engine import Engine
+from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -48,7 +51,14 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.phase_timer import PhaseTimer
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds
+from mstar.worker.preemption import Preemption
+from mstar.worker.rebuild import (
+    DEFAULT_REBUILD_HOST_MB,
+    DEFAULT_REBUILD_MEDIA_HOST_MB,
+    Rebuilds,
+    node_writes,
+    policies_run_here,
+)
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import (
@@ -105,20 +115,36 @@ def _make_graph_runtime(
 
 
 def _make_rebuilds(
-    model: Model | None, model_config: dict | None, node_names: set[str], lockstep_nodes: set[str],
-    device: torch.device,
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
+    device: torch.device, engine: Engine, followed: frozenset[str] = frozenset(),
 ) -> Rebuilds:
-    """What a dropped request is rebuilt from, on each node here whose model declares how."""
-    policies = model.rebuild_policies() if model is not None else {}
-    # A lockstep node's KV refuses every drop, so its requests keep no ids.
-    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
-    host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-        raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-    return Rebuilds(
-        policies, model.get_graph_walk_graphs() if model is not None else {},
-        HostPool(host_mb << 20, device) if host_mb and policies.keys() & node_names else None,
+    """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
+
+    A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
+    rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
+    graphs = model.get_graph_walk_graphs() if model is not None else {}
+    policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
+    copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
+    host_mb = _serving_mb(
+        model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
     )
+    if not host_mb:
+        policies = {}
+    nbytes = host_mb << (21 if followed & policies.keys() else 20)
+    return Rebuilds(
+        policies, graphs, HostPool(nbytes, device) if policies else None, engine.host_allowance,
+        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None}, followed,
+    )
+
+
+def _serving_mb(model_config: dict | None, key: str, default: int) -> int:
+    value = (model_config or {}).get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key}: {value!r} is not a non-negative int")
+    return value
+
+
 def _wait_ms(raw: str) -> float:
     """Milliseconds for ``Event.wait``, which overflows past TIMEOUT_MAX."""
     value = float(raw)
@@ -322,7 +348,10 @@ class Worker:
             tensor_streams=self.engine_manager.inline_streams.tensor_streams,
         )
         self.layout = layout
-        self._rebuilds = _make_rebuilds(model, model_config, node_names, layout.parallel_nodes, self.device)
+        self._rebuilds = _make_rebuilds(
+            model, model_config, layout.my_walks, layout.parallel_nodes, self.device, self.engine_manager.engine,
+            layout.followed_nodes,
+        )
         services = WorkerServices(
             worker_id=worker_id,
             device=device,
@@ -344,6 +373,7 @@ class Worker:
             async_sched=tp_async_sched_setting(
                 os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
             ),
+            wg_instances=all_worker_graph_ids_to_instances,
         )
         # without these the runtime sees no parallel node, and its speculation
         # filter never holds one to the leader
@@ -356,6 +386,11 @@ class Worker:
             services=services, layout=layout, lifecycle=self.lifecycle, lockstep=self.lockstep,
             admission=self.admission, model_config=model_config,
         )
+        self.preemption = Preemption(
+            self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self.admission.log_throttled,
+            self._rid_str,
+        )
+        self._set_kv_writes(model, layout.my_walks)
         if layout.side_keys:
             logger.info(
                 "Worker %s: %s run beside the chain on a side stream",
@@ -371,11 +406,12 @@ class Worker:
         self.ingest = InputIngest(
             services=services, layout=layout, lifecycle=self.lifecycle, lockstep=self.lockstep,
             wakeup_event=self.wakeup_event, metrics=self._metrics, enable_nvtx=self.enable_nvtx,
+            set_rebuildable=self._set_rebuildable,
         )
         self.executor = StepExecutor(
             services=services, layout=layout, timer=self.timer, lockstep=self.lockstep,
-            lifecycle=self.lifecycle, wakeup_event=self.wakeup_event, metrics=self._metrics,
-            profile_info=self.profile_info, device_capability=self.device_capability,
+            lifecycle=self.lifecycle, preemption=self.preemption, wakeup_event=self.wakeup_event,
+            metrics=self._metrics, profile_info=self.profile_info, device_capability=self.device_capability,
             enable_nvtx=self.enable_nvtx, enable_prof=enable_prof, step_cpus=step_cpus,
             process_cpus=process_cpus,
         )
@@ -388,7 +424,8 @@ class Worker:
         self.pipeline = StepPipeline(
             services=services, layout=layout, timer=self.timer, lifecycle=self.lifecycle,
             lockstep=self.lockstep, admission=self.admission, scheduler=self.scheduler,
-            executor=self.executor, ingest=self.ingest, speculator=self.speculator, metrics=self._metrics,
+            executor=self.executor, ingest=self.ingest, speculator=self.speculator, preemption=self.preemption,
+            metrics=self._metrics,
             profile_info=self.profile_info, launch_wait_s=launch_wait_s, enable_nvtx=self.enable_nvtx,
         )
 
@@ -403,6 +440,7 @@ class Worker:
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
             enable_transfers=self.tensor_manager.enable_transfer_metrics,
+            preemptions=self.preemption.counts,
         )
 
     def _rid_str(self, request_id: int) -> str:
@@ -431,28 +469,26 @@ class Worker:
         if keys:
             engine.never_publish(keys)
 
-    def _drop(self, request_id: int, node_name: str) -> int:
-        """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
-        the pages freed."""
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        why = self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
-        if why is not None:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, "
-                f"since {why}"
-            )
-        backlogged = any(
-            request_id in batch.request_to_worker_graph
-            for (node, _), batch in self.scheduler.backlog.items() if node == node_name
-        )
-        if request_id in self.pipeline.in_flight_rids or backlogged:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step or a backlog on "
-                f"{node_name}"
-            )
-        return self.engine_manager.get_engine(node_name).drop_request(
-            node_name, request_id, self._rebuilds.tokens(request_id, node_name),
-        )
+    def _set_kv_writes(self, model: Model | None, my_walks: frozenset[tuple[str, str]]) -> None:
+        """Record what each node of each paged KV cache writes here, and give each cache the loops that grow it
+        in a walk this worker runs on one of its nodes."""
+        labels = model.kv_labels() if model is not None else {}
+        # key -> node -> its `NodeWrites`
+        self._kv_writes = {}
+        for kv in self.engine_manager.engine.paged_kv_caches():
+            self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
+            kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
+
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> frozenset[str]:
+        kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
+        layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
+        unpausable = any(config.unpausable for config in kv_configs.values())
+        ingested = self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable)
+        for key, rebuildable in ingested.rebuildable.items():
+            if key in configs:
+                configs[key].rebuildable = rebuildable
+        return ingested.unheld
+
     def _plan_step_cpus(
         self, worker_ids: list[str], local_worker_devices: list[str] | None,
     ) -> tuple[cpus.StepCpus | None, frozenset[int]]:

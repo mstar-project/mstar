@@ -25,6 +25,7 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from test_rust_frontend import (
+    _USAGE,
     BINARY,
     _Chunk,
     _free_port,
@@ -46,9 +47,11 @@ ROUTES = {
     "speech": ("/v1/audio/speech", {"input": "hi"}),
     "images": ("/v1/images/generations", {"prompt": "a cat"}),
     "videos": ("/v1/videos/generations", {"prompt": "a cat"}),
+    # a JSON body carries no upload: a served route refuses it with a 400, not a 404
+    "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-# /v1/audio/transcriptions and /v1/realtime have no route there at all.
+# /v1/realtime has no route there at all yet.
 NOT_PORTED: set[tuple[str, str]] = set()
 
 
@@ -123,13 +126,14 @@ def test_a_model_without_an_adapter_gets_the_python_frontend_s_404():
 
 
 def test_a_class_with_no_port_is_a_404_naming_it_and_a_startup_warning():
-    with _mock_server("WhisperAdapter") as (port, proc):
+    # every registry class is ported; a class from a newer Python side has none
+    with _mock_server("FutureAdapter") as (port, proc):
         status, data = _post(port, *ROUTES["chat"])
         proc.terminate()
         _, stderr = proc.communicate(timeout=10)
     assert status == 404
-    assert "WhisperAdapter" in json.loads(data)["error"]["message"]
-    assert "some_model's OpenAI adapter WhisperAdapter has no port in this frontend" in stderr
+    assert "FutureAdapter" in json.loads(data)["error"]["message"]
+    assert "some_model's OpenAI adapter FutureAdapter has no port in this frontend" in stderr
 
 
 # ── a chat reaches the backend as the Python adapter builds it ──────────────
@@ -163,7 +167,7 @@ CHAT = {
 # ChatCompletionRequest's declared fields; the rest is model_extra.
 DECLARED = {"messages": None, "model": None, "temperature": None, "top_p": None,
             "max_tokens": None, "max_completion_tokens": None, "n": 1, "seed": None,
-            "stop": None, "stream": False, "modalities": None, "audio": None}
+            "stop": None, "stream": False, "stream_options": None, "modalities": None, "audio": None}
 
 
 def _python_request(body: dict):
@@ -294,16 +298,19 @@ class _PythonServer:
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
         self.served_models = ServedModels.of(model_name, None)
+        self.tail = []
 
     def submit_request(self, **kwargs):
+        if kwargs.get("report_usage"):
+            self.tail = [_Chunk("usage", b"", _USAGE)]
         return kwargs["request_id"]
 
     async def collect_results(self, request_id, raw_request=None):
-        return [_Chunk("text", b"Hello "), _Chunk("text", b"world")]
+        return [_Chunk("text", b"Hello "), _Chunk("text", b"world"), *self.tail]
 
     async def iter_result_chunk_batches(self, request_id):
         yield [_Chunk("text", b"Hello ")]
-        yield [_Chunk("text", b"world")]
+        yield [_Chunk("text", b"world"), *self.tail]
 
 
 def _normalized(status, data: bytes, stream: bool):
@@ -329,6 +336,8 @@ def _image_chat(url: str) -> dict:
 PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
+    "chat-stream-usage": ({"messages": [{"role": "user", "content": "hi"}], "stream": True,
+                           "stream_options": {"include_usage": True}}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
     "json-mode": ({"messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}},
                   False),

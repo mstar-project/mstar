@@ -14,6 +14,10 @@ TOKENS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_token
 # The same counts in the result message's per-model ``modelUsage``.
 MODEL_USAGE = {"input_tokens": "inputTokens", "cache_creation_input_tokens": "cacheCreationInputTokens",
                "cache_read_input_tokens": "cacheReadInputTokens", "output_tokens": "outputTokens"}
+# List prices in $/MTok for (input, cache write, cache read, output), in TOKENS' order. A run cut off before
+# its result has no total_cost_usd and is the most expensive kind, so its tokens are priced instead of counted
+# as $0; a model not listed is priced as Opus, the model the bot runs. Cache writes at the 5-minute rate.
+PRICES = {"claude-opus-5-5": (4.0, 5.0, 0.2, 20.0), "claude-sonnet-5-5": (2.0, 2.5, 0.2, 10.0)}
 # The prompt asks for notes that start with "Progress:"; tolerate Markdown around it.
 PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
 NOTE_CHARS = 30000
@@ -88,7 +92,7 @@ def usage(messages):
         u, mid = m["message"].get("usage"), m["message"].get("id")
         if not isinstance(u, dict) or not mid:
             continue
-        seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0))
+        seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0) | {"model": m["message"].get("model")})
         for k in TOKENS:
             if isinstance(u.get(k), int):
                 # Lines of one response repeat its usage; output_tokens can grow along them.
@@ -102,13 +106,17 @@ def usage(messages):
         counts, source = list(models.values()), "result"
     else:
         models, counts, source = {}, list(calls.values()), "messages"
+    cost = result.get("total_cost_usd")
+    if cost is None:
+        cost = sum(c[k] * price for c in calls.values()
+                   for k, price in zip(TOKENS, PRICES.get(c["model"], PRICES["claude-opus-5-5"]), strict=True)) / 1e6
     return {
         "api_calls": len(calls),
         **{k: sum(c[k] for c in counts) for k in TOKENS},
         "tokens_from": source,
         "models": models,
         "num_turns": result.get("num_turns"),
-        "total_cost_usd": result.get("total_cost_usd"),
+        "total_cost_usd": cost,
         "subtype": result.get("subtype"),
     }
 
@@ -199,21 +207,28 @@ def newest(texts, limit):
 
 def diff_paths(diff_text):
     """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
-    nothing to open)."""
-    lines = diff_text.splitlines()
+    nothing to open). Lines end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on
+    those) could start a line that looks like a header."""
+    lines = diff_text.split("\n")
     paths = []
     for before, line in zip(lines, lines[1:], strict=False):
         if not (before.startswith("--- ") and line.startswith("+++ ")):
             continue
-        path = line[len("+++ "):].rstrip("\t\r")
-        if path.startswith('"'):
-            # Git quotes a path with unusual characters, as a C string of its UTF-8 bytes.
-            if len(path) < 2 or not path.endswith('"'):
-                continue
-            path = C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
-        if path.startswith("b/"):
+        path = unquoted(line[len("+++ "):])
+        if path and path.startswith("b/"):
             paths.append(path[len("b/"):])
     return paths
+
+
+def unquoted(path):
+    """A path as a diff header prints it, trailing tab or CR dropped and unquoted: git quotes a path with unusual
+    characters, as a C string of its UTF-8 bytes. None when the quote doesn't close."""
+    path = path.rstrip("\t\r")
+    if not path.startswith('"'):
+        return path
+    if len(path) < 2 or not path.endswith('"'):
+        return None
+    return C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
 
 
 def numbered(diff_text, left=True):
