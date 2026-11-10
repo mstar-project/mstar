@@ -237,7 +237,7 @@ def _apply_kernel_settings(
 ) -> None:
     """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
     other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
-    owners = {array.name: (array, None) for array in arrays} | {
+    owners = {array.name: (array, storage_of(array)) for array in arrays} | {
         bound.key: (array, bound.binding)
         for array in arrays for bound in _bindings(storage_of(array), array) if bound.binding.kernel_settings
     }
@@ -246,31 +246,14 @@ def _apply_kernel_settings(
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read or update of the declarations that takes kernel "
                              f"settings, and no array, of {sorted(owners)}")
-        array, binding = owners[key]
-        # an update's settings go on its own spec, and a read on SDPA has no spec to set
-        spec = by_key.get(resource_of.get(key, key))
-        if binding is not None:
-            allowed = binding.kernel_settings
-        elif isinstance(spec, KVSpec):
-            allowed = {"max_num_pages"}
-        elif isinstance(spec, RecurrentStateSpec):
-            allowed = {"max_slots"}
-        else:
-            allowed = set()    # a host-only Value or an array with max_len 0 has no pool
-        refused = settings.keys() - allowed
+        array, owner = owners[key]
+        refused = settings.keys() - owner.kernel_settings
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
-                             f"it may set only {sorted(allowed)}")
-        if binding is not None:
-            for field, value in settings.items():
-                if spec is not None:
-                    setattr(spec.config, field, value)
-        elif settings:
-            try:
-                # the spec's own YAML path, so a value here means what the same key under `resources:` means
-                spec.apply_yaml_overrides(**settings)
-            except ValueError as e:
-                raise ValueError(f"Array {key!r}: kernel_settings[{key!r}]: {e}") from e
+                             f"it may set only {sorted(owner.kernel_settings)}")
+        # A read's settings go on the spec of the resource it runs on, which SDPA has none of. An update's or an
+        # array's go on its own spec.
+        owner.set_kernel_settings(array, by_key.get(resource_of.get(key, key)), settings)
 
 
 def node_handles(
@@ -518,6 +501,12 @@ class OpBinding:
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         """What a handle calls to run the op."""
         return resources[key]
+
+    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Set ``settings`` on the op's ``spec``, which is None for a read on SDPA."""
+        if spec is not None:
+            for field, value in settings.items():
+                setattr(spec.config, field, value)
 
 
 class PagedAttend(OpBinding):
@@ -951,6 +940,8 @@ class Storage(ABC):
     """How today's resources hold one kind of array: its specs, its own step, its layouts and its handle."""
 
     handle_class: ClassVar[type[ArrayHandle]]
+    # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
+    kernel_settings: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
@@ -983,11 +974,21 @@ class Storage(ABC):
         """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
         return None
 
+    def set_kernel_settings(self, array: Array, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
+        `resources:` means."""
+        if settings:
+            try:
+                spec.apply_yaml_overrides(**settings)
+            except ValueError as e:
+                raise ValueError(f"Array {array.name!r}: kernel_settings[{array.name!r}]: {e}") from e
+
 
 class PagedStorage(Storage):
     """An append-only array that keeps entries, in a pool of KV pages."""
 
     handle_class = PagedArrayHandle
+    kernel_settings = frozenset({"max_num_pages"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         return Resolved(
@@ -1037,6 +1038,7 @@ class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool that links to the paged array on its nodes."""
 
     handle_class = ValueHandle
+    kernel_settings = frozenset({"max_slots"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         return Resolved({array.name: self._specs(array, declared) for array in arrays}, {}, {})
