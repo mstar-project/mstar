@@ -7,8 +7,8 @@
 //! open), the client gets an `error`, the rest of the item's audio is dropped,
 //! and its commit reports it failed.
 //!
-//! The session is the re-decoding one's ([`super::Realtime`]), with this call
-//! in place of its steps: the same events, formats, caps and turn detection.
+//! The session is [`super::Realtime`]'s; `Live` is its [`super::ItemDecoder`]:
+//! the same events, formats, caps and turn detection.
 
 use axum::extract::ws::WebSocket;
 use futures::StreamExt;
@@ -26,7 +26,7 @@ const REDECODE_KNOBS: [&str; 3] = ["chunk_seconds", "unfixed_chunks", "unfixed_t
 
 const ENDED_EARLY: &str = "this item's transcription ended before its commit";
 
-/// The open item's call.
+/// A live session's decoder: the open item's call.
 pub(super) struct Live {
     facts: &'static LiveFacts,
     /// the call's submission while it takes the item's audio
@@ -84,6 +84,7 @@ impl ItemDecoder for Live {
             (None, _) => true,
             (Some(sub), bridge) => {
                 let mut op = Map::new();
+                op.insert("stream".into(), Value::from(rt.d.facts.stream.as_str()));
                 op.insert("end_input".into(), Value::Bool(true));
                 let reply = match bridge {
                     Some(bridge) => bridge.live(sub, "append", op, crate::BRIDGE_PROBE_TIMEOUT * 5).await,

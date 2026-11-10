@@ -656,8 +656,9 @@ class RustFrontendBridge:
 
     def _live(self, msg: dict) -> None:
         """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
-        conversation, whose appends carry ``audio``: float32 samples for the
-        ``ClientAudio`` stream ``stream``), answered as the Python route would
+        conversation, whose ops name its ``ClientAudio`` stream ``stream`` and
+        whose appends carry ``audio``, float32 samples for it; its commit is an
+        ``end_input`` append with none), answered as the Python route would
         act on it. The call is the submission its ``call`` names; one that has
         ended has no key and takes nothing."""
         key = self._keys.get(msg.get("call"))
@@ -699,8 +700,10 @@ class RustFrontendBridge:
                 except ValueError as exc:  # the client's fault
                     meta = {"error": scrub_paths(str(exc)), "status": 400}
                 except Exception as exc:  # noqa: BLE001 — the append fails, the bridge goes on
-                    route = "realtime" if audio else "generate/ws"
-                    text, error_id = client_error_text(exc, f"{route} append failed", log=logger, type_name=False)
+                    # a realtime op names its stream; its commit carries no audio
+                    what = "generate/ws append" if not msg.get("stream") else \
+                        "realtime append" if audio else "realtime commit"
+                    text, error_id = client_error_text(exc, f"{what} failed", log=logger, type_name=False)
                     meta = {"error": text, "status": 500, "error_id": error_id}
         except Exception as exc:  # noqa: BLE001 — an unknown op included
             text, _ = client_error_text(exc, f"live {msg.get('op')!r} failed", log=logger, type_name=False)
