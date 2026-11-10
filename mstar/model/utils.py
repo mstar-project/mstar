@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -507,6 +508,22 @@ class TextOutput(NamedTuple):
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+
+
+class ByteLevelTextOutput:
+    """``Model.text_output`` for a model over a byte-level BPE tokenizer: each
+    token's raw bytes with special tokens dropped, ``config.eos_token_ids``
+    ending a reply. Built on first use, as the host's ``tokenizer`` may load
+    lazily; a reduced model's byte ids (``_tokenizer_mode`` of ``"byte"``)
+    never touch it."""
+
+    @cached_property
+    def _text_output(self) -> TextOutput:
+        detokenizer = ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+        return TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+
+    def text_output(self) -> TextOutput:
+        return self._text_output
 
 
 def drop_stop_tokens(

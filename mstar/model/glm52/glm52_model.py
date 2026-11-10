@@ -50,9 +50,7 @@ from mstar.model.glm52.config import (
 from mstar.model.multimodal import PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
-    ByteIdDetokenizer,
-    ByteLevelDetokenizer,
-    TextOutput,
+    ByteLevelTextOutput,
     capture_ladder,
     load_snapshot_tokenizer,
     read_fp8_block_quant_config,
@@ -78,7 +76,7 @@ QUANT_METHODS = ("fp8",)
 DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
-class Glm52Model(Model):
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
     DECODE_LOOP = "decode_loop"
@@ -442,18 +440,6 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    # built on first use: the tokenizer it reads loads lazily
-    _text_output: TextOutput | None = None
-
-    def text_output(self) -> TextOutput:
-        if self._text_output is None:
-            # a reduced model's byte ids never touch the HF tokenizer
-            detokenizer = (
-                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
-            )
-            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
-        return self._text_output
 
     def postprocess(
         self,
