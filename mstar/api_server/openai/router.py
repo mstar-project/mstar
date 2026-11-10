@@ -225,9 +225,10 @@ async def audio_transcriptions(request: Request):
 async def realtime(websocket: WebSocket):
     """OpenAI Realtime API. A full-duplex model (one whose client stream
     declares ``ClientAudio``) serves a conversation; ``?intent=transcription``
-    streams speech-to-text with partial results, for a model whose adapter
-    can continue a hypothesis. An omitted ``intent`` is the one the model
-    serves. See ``serving_realtime``."""
+    streams speech-to-text with partial results, for a model that hears audio
+    as it comes (``Model.live_transcription_stream``: its stream's text) or
+    whose adapter can continue a hypothesis (re-decoding). An omitted
+    ``intent`` is the one the model serves. See ``serving_realtime``."""
     intent = websocket.query_params.get("intent")
     api = _api()
     audio = api.client_audio if api is not None else []

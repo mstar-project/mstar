@@ -91,6 +91,8 @@ class ParakeetModel(Model):
     MAX_CONCURRENT_REQUESTS = 128
     # the longest live call: its loops' ceiling and its client stream's bound
     MAX_LIVE_SECONDS = 3600
+    # live streams the stream encoder's steps are captured for, batched together
+    LIVE_CAPTURE_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
@@ -370,7 +372,7 @@ class ParakeetModel(Model):
                 self._encoder(device, autocast_dtype),
                 NemoLogMel(num_mel_bins=self.config.encoder.num_mel_bins, normalize=False, device=device), None,
                 input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
-                batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
+                batch_sizes=list(self.LIVE_CAPTURE_BATCH_SIZES), item_per_step=True,
                 lookahead=self.config.live_encoder.lookahead,
             )
         if node_name == "transducer":
