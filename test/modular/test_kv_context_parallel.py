@@ -49,8 +49,9 @@ from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVSt
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
-from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.model.base import declared_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
 from mstar.model.submodule_base import NodeInputs
 
@@ -254,8 +255,7 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
     groups = _sp_groups(NODE)
     # Qwen3.5's own declarations (dummy shapes) with its pool placed, as on SP ranks, and a
     # dependent without support
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
-    apply_yaml_overrides(specs, {"resources": {
+    specs = declared_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {"resources": {
         KV_CACHE: {"context_parallel": True, "max_num_pages": 8}, GDN_STATE: {"max_slots": 4},
     }})
     kv_spec, = (spec for spec in specs if spec.resource_key == KV_CACHE)
@@ -775,14 +775,14 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
-    kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
+    kv = types.SimpleNamespace(can_capture=lambda: True, lean_capture=False, placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
     step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
     runner = AcceleratorGraphRunner(
         submodule_name="t3", resources={"kv": kv}, step_runner=mock.Mock(), device=CPU, autocast_dtype=None,
         submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config],
-                                        declare_step=lambda **kwargs: step),
+                                        declare_step=lambda **kwargs: step, compiled_entries_per_shape=1),
         joint_comm_group=joint, num_slots=1, head_shards=1,
     )
     if len(batch_sizes) == 1:
