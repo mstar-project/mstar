@@ -18,7 +18,7 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.model.media_limits import VideoBudget, decoding_upload, ffmpeg_unavailable
+from mstar.model.media_limits import RGB_BYTES, VideoBudget, decoding_upload, ffmpeg_unavailable
 
 
 class SampledVideo(NamedTuple):
@@ -77,7 +77,7 @@ def sample_video(path: str, video_processor) -> SampledVideo:
         # holds before any frame is in memory
         if not (metadata.height and metadata.width):
             raise ValueError(f"Qwen3.5 video {path!r} has no frame size in its header")
-        budget.add(metadata.height, metadata.width, len(indices))
+        budget.add(metadata.height * metadata.width * RGB_BYTES * len(indices), frames=len(indices))
         return indices
 
     with decoding_upload(path, "the video"):

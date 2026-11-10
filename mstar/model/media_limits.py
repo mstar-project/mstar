@@ -39,12 +39,10 @@ DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
 # Video-MME clip fits. A loader that also holds their float32 copy is charged
 # for it, so it fits a fifth as many pixels.
 DEFAULT_MAX_VIDEO_BYTES = 3 << 30
-# host bytes a decoded RGB pixel takes: uint8 as the decoder returns it, and
-# with the float32 copy a loader converts it to beside it
+# host bytes of a decoded pixel: uint8 RGB, as every video decoder here returns it
 RGB_BYTES = 3
-RGB_AND_FLOAT_BYTES = RGB_BYTES + 3 * 4
-# the least a decoded frame counts against the video cap
-MIN_FRAME_PIXELS = 64 * 64
+# the least a decoded frame counts against the video cap: a 64x64 frame
+MIN_FRAME_BYTES = 64 * 64 * RGB_BYTES
 DEFAULT_MAX_MEDIA_FILES = 16
 # twice the transcription endpoint's 30 min upload cap, so one such upload fits
 # whatever its decoded length rounds to
@@ -543,22 +541,24 @@ def probe_video(filepath: str) -> tuple[int, float, int, int] | None:
 
 
 class VideoBudget:
-    """Counts the host bytes decoded frames take against ``max_video_bytes()``,
-    so a loader stops before it holds more than the cap whatever the container
-    claims. ``bytes_per_pixel`` is what the loader holds per decoded pixel:
-    ``RGB_BYTES`` for uint8 frames, ``RGB_AND_FLOAT_BYTES`` when it also makes
-    their float32 copy.
+    """Counts the host bytes a loader holds for a video's frames against
+    ``max_video_bytes()``, so it stops before it holds more than the cap
+    whatever the container claims. The loader adds each tensor's ``nbytes``
+    as it decodes it, and a copy's size before making it; a check from the
+    header adds what the decoder will return for the frames it will decode.
 
-    A frame counts as at least ``MIN_FRAME_PIXELS``: each decoded frame costs
-    about 2 KB of tensor and frame objects whatever its size, so a clip of
-    millions of 2x2 frames would otherwise pass the cap at hundreds of GB."""
+    Bytes that hold decoded frames count at least ``MIN_FRAME_BYTES`` a frame:
+    each costs about 2 KB of tensor and frame objects whatever its size, so a
+    clip of millions of 2x2 frames would otherwise pass the cap at hundreds of
+    GB."""
 
     def __init__(self) -> None:
         self.limit = max_video_bytes()
         self.bytes = 0
 
-    def add(self, height: int, width: int, frames: int = 1, bytes_per_pixel: int = RGB_BYTES) -> None:
-        self.bytes += max(int(height) * int(width), MIN_FRAME_PIXELS) * int(frames) * bytes_per_pixel
+    def add(self, nbytes: int, frames: int = 0) -> None:
+        """Count ``nbytes`` more, which hold ``frames`` decoded frames."""
+        self.bytes += max(int(nbytes), int(frames) * MIN_FRAME_BYTES)
         if self.bytes > self.limit:
             raise ValueError(
                 f"video decodes to more than {self.limit} bytes; send a shorter "

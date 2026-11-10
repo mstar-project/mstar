@@ -70,7 +70,7 @@ from mstar.model.base import (
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
-from mstar.model.media_limits import RGB_AND_FLOAT_BYTES, VideoBudget, probe_video
+from mstar.model.media_limits import RGB_BYTES, VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -974,7 +974,8 @@ class Qwen3OmniModel(Model):
         if probe is not None:
             total, fps, height, width = probe
             sampled = smart_nframes({"video": filepath}, total_frames=total, video_fps=fps)
-            VideoBudget().add(height, width, sampled, bytes_per_pixel=RGB_AND_FLOAT_BYTES)
+            rgb = height * width * RGB_BYTES * sampled
+            VideoBudget().add(rgb + rgb * torch.float32.itemsize, frames=sampled)
         with header_charged(probe is not None):
             video_input, video_sample_fps = fetch_video(
                 {"video": filepath},

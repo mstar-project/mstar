@@ -5,7 +5,7 @@ from functools import wraps
 
 import torch
 
-from mstar.model.media_limits import RGB_AND_FLOAT_BYTES, RGB_BYTES, VideoBudget
+from mstar.model.media_limits import VideoBudget
 
 # the readers that decode only the frames fetch_video samples
 SAMPLED_READERS = ("decord", "torchcodec")
@@ -77,8 +77,8 @@ def read_video_whole_budgeted(ele: dict) -> tuple[torch.Tensor, dict, float]:
                 continue
             if end is not None and frame.time is not None and frame.time > end:
                 break
-            budget.add(frame.height, frame.width)
             frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+            budget.add(frames[-1].nbytes, frames=1)
     if not frames:
         raise ValueError("no video frames could be decoded")
     total = len(frames)
@@ -86,8 +86,7 @@ def read_video_whole_budgeted(ele: dict) -> tuple[torch.Tensor, dict, float]:
     idx = torch.linspace(0, total - 1, nframes).round().long()
     # fetch_video's bicubic resize makes a float32 copy of the sampled frames; with
     # the whole clip charged, that covers their stack here and the uint8 beside it there
-    for i in idx.tolist():
-        budget.add(*frames[i].shape[-2:], bytes_per_pixel=RGB_AND_FLOAT_BYTES - RGB_BYTES)
+    budget.add(sum(frames[i].numel() for i in idx.tolist()) * torch.float32.itemsize)
     video = torch.stack([frames[i] for i in idx.tolist()])
     metadata = dict(fps=fps, frames_indices=idx, total_num_frames=total, video_backend="torchvision")
     return video, metadata, nframes / max(total, 1e-6) * fps

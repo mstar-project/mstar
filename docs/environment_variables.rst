@@ -480,10 +480,10 @@ so attaching more files does not multiply them.
    * - ``MSTAR_MAX_VIDEO_BYTES``
      - ``3221225472``
      - Host bytes a request's videos may decode to (see
-       :func:`mstar.model.media_limits.max_video_bytes`), summed over the
-       frames the model's loader decodes, each frame counting as at least
-       64x64: 3 bytes a pixel for uint8 frames, 15 for a loader that also
-       holds their float32 copy. Over it, the request gets a 400. At 1080p30
+       :func:`mstar.model.media_limits.max_video_bytes`): the bytes the
+       model's loader holds for the frames it decodes, 3 a pixel as uint8
+       and 15 with their float32 copy beside them, each frame counting as at
+       least a 64x64 uint8 frame. Over it, the request gets a 400. At 1080p30
        the default refuses clips over about 3.5 s on Cosmos3, which decodes
        every frame and converts it to float; over about 52 s on Qwen3-Omni,
        which decodes 2 frames a second and resizes them through a float32

@@ -129,7 +129,7 @@ from mstar.model.cosmos3.submodules import (
     sound_frames,
 )
 from mstar.model.keys import ROPE, VISION_ATTN
-from mstar.model.media_limits import RGB_AND_FLOAT_BYTES, UndecodableMediaError, VideoBudget
+from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     TEXT,
@@ -1251,8 +1251,9 @@ class Cosmos3Model(Model):
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             fps = float(rate) if rate else None
             for frame in container.decode(stream):
-                budget.add(frame.height, frame.width, bytes_per_pixel=RGB_AND_FLOAT_BYTES)
                 frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+                # held as uint8, then beside its float32 copy
+                budget.add(frames[-1].nbytes + frames[-1].numel() * torch.float32.itemsize, frames=1)
         if not frames:
             raise ValueError(f"no video frames decoded from {filepath}")
         video = torch.stack(frames)

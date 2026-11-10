@@ -14,8 +14,7 @@ import torch
 from mstar.model.base import Model
 from mstar.model.media_limits import (
     DEFAULT_MAX_IMAGE_PIXELS,
-    MIN_FRAME_PIXELS,
-    RGB_AND_FLOAT_BYTES,
+    MIN_FRAME_BYTES,
     RGB_BYTES,
     RequestMediaBudget,
     VideoBudget,
@@ -35,6 +34,10 @@ _spec = importlib.util.spec_from_file_location(
 _video_reader = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_video_reader)
 read_video_whole_budgeted = _video_reader.read_video_whole_budgeted
+
+# the bytes a decoded 64x64 frame takes, and with its float32 copy beside it
+FRAME_64 = 64 * 64 * RGB_BYTES
+FRAME_64_AND_FLOAT = FRAME_64 * (1 + torch.float32.itemsize)
 
 
 def _png(path, width, height, *, rows=None):
@@ -415,10 +418,10 @@ def test_cosmos3_pyav_fallback_stops_at_the_budget(tmp_path, monkeypatch):
     path = _mp4(tmp_path / "clip.mp4", frames=10)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
     model = object.__new__(Cosmos3Model)
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(4 * FRAME_64_AND_FLOAT))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         model.load_video(path, "cpu")
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 10 * RGB_AND_FLOAT_BYTES))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(10 * FRAME_64_AND_FLOAT))
     assert model.load_video(path, "cpu").data.shape[0] == 10
 
 
@@ -449,16 +452,16 @@ def test_cosmos3_pyav_fallback_frees_its_frames_before_the_float_copy(tmp_path, 
 
 def test_a_tiny_frame_counts_as_the_minimum(monkeypatch):
     """Millions of 2x2 frames fit 3 GiB at 3 bytes a pixel but cost about 2 KB each once
-    decoded; every frame is charged at least MIN_FRAME_PIXELS."""
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(MIN_FRAME_PIXELS * 100 * RGB_BYTES))
+    decoded; every frame is charged at least MIN_FRAME_BYTES."""
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(MIN_FRAME_BYTES * 100))
     budget = VideoBudget()
-    budget.add(2, 2, 100)
+    budget.add(2 * 2 * RGB_BYTES * 100, frames=100)
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
-        budget.add(2, 2)
+        budget.add(2 * 2 * RGB_BYTES, frames=1)
     budget = VideoBudget()
-    budget.add(64, 64, 100)  # a frame at the minimum counts as itself
+    budget.add(FRAME_64 * 100, frames=100)  # a frame at the minimum counts as itself
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
-        budget.add(64, 64)
+        budget.add(FRAME_64, frames=1)
 
 
 def test_cosmos3_pyav_fallback_counts_tiny_frames(tmp_path, monkeypatch):
@@ -467,8 +470,8 @@ def test_cosmos3_pyav_fallback_counts_tiny_frames(tmp_path, monkeypatch):
     path = _mp4(tmp_path / "tiny.mp4", frames=30, side=16)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
     model = object.__new__(Cosmos3Model)
-    # 30 frames of 16x16 are 7,680 pixels by area, but 30 minimum frames are over 20
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(MIN_FRAME_PIXELS * 20 * RGB_AND_FLOAT_BYTES))
+    # 30 frames of 16x16 and their float32 copies are 115 KB, but 30 minimum frames are over 20
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(MIN_FRAME_BYTES * 20))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         model.load_video(path, "cpu")
 
@@ -534,7 +537,7 @@ def test_qwen3_omni_without_a_header_count_decodes_with_the_counting_reader(tmp_
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         load_video(None, mkv, "cpu")
     # the whole clip, then the float32 copy fetch_video's resize makes of the 4 sampled frames
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12)))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(10 * FRAME_64 + 4 * FRAME_64 * torch.float32.itemsize))
     assert tuple(load_video(None, mkv, "cpu").data.shape) == (4, 3, 64, 64)
     assert sampled == []
 
@@ -542,11 +545,11 @@ def test_qwen3_omni_without_a_header_count_decodes_with_the_counting_reader(tmp_
     # float32 copy, and the sampled reader then runs
     mp4 = _mp4(tmp_path / "clip.mp4", frames=10)
     assert probe_video(mp4) is not None
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES - 1))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(4 * FRAME_64_AND_FLOAT - 1))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         load_video(None, mp4, "cpu")
     assert sampled == []
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(4 * FRAME_64_AND_FLOAT))
     load_video(None, mp4, "cpu")
     assert sampled == [mp4]
     assert vision.VIDEO_READER_BACKENDS["decord"].__wrapped__ is decord
@@ -566,10 +569,10 @@ def test_the_whole_clip_reader_counts_frames_as_it_decodes(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         read_video_whole_budgeted({"video": path})
     # the whole clip, then the float32 copy fetch_video's resize makes of the 4 sampled frames
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12) - 1))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(10 * FRAME_64 + 4 * FRAME_64 * torch.float32.itemsize - 1))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         read_video_whole_budgeted({"video": path})
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12)))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(10 * FRAME_64 + 4 * FRAME_64 * torch.float32.itemsize))
     video, metadata, sample_fps = read_video_whole_budgeted({"video": f"file://{path}"})
     assert video.shape == (4, 3, 64, 64) and video.dtype == torch.uint8
     assert metadata["total_num_frames"] == 10 and metadata["frames_indices"].tolist() == [0, 3, 6, 9]
@@ -781,19 +784,19 @@ def test_a_video_is_charged_its_largest_check_not_their_sum(monkeypatch):
     monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 100 * RGB_BYTES))
     budget = RequestMediaBudget(num_files=2)
     with budget.file():
-        VideoBudget().add(64, 64, 60)
+        VideoBudget().add(FRAME_64 * 60, frames=60)
         decode = VideoBudget()
         for _ in range(60):
-            decode.add(64, 64)
-    assert budget.used["video"] == 64 * 64 * 60 * RGB_BYTES
+            decode.add(FRAME_64, frames=1)
+    assert budget.used["video"] == FRAME_64 * 60
     with budget.file(), pytest.raises(ValueError, match="videos decode to more than .* together"):
-        VideoBudget().add(64, 64, 60)
+        VideoBudget().add(FRAME_64 * 60, frames=60)
 
 
 def test_outside_a_request_each_file_is_checked_alone(monkeypatch):
     monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 100 * RGB_BYTES))
     for _ in range(3):
-        VideoBudget().add(64, 64, 60)
+        VideoBudget().add(FRAME_64 * 60, frames=60)
 
 
 def test_vjepa2_without_frame_size_in_the_header_decodes_one_frame_to_check(monkeypatch):
@@ -824,7 +827,7 @@ def test_video_decodes_thread_within_the_cpus_the_plan_leaves(monkeypatch, plan,
 
     monkeypatch.setattr(torch, "get_num_threads", lambda: 1)
     monkeypatch.setattr(cpu_plan, "_plan", plan)
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(4 * FRAME_64_AND_FLOAT))
     opened = []
     _fake_torchcodec(monkeypatch, [], opened=opened)
     vjepa2 = object.__new__(VJepa2Model)

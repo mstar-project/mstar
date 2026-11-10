@@ -39,7 +39,6 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import (
-    RGB_AND_FLOAT_BYTES,
     VideoBudget,
     decoding_upload,
     read_image,
@@ -1108,8 +1107,8 @@ class Model(ABC):
         with decoding_upload(filepath, "the video", ffmpeg=True):
             decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
             for frame in decoder:
-                # each frame is held as uint8, then beside its float copy
-                budget.add(*frame.shape[-2:], bytes_per_pixel=RGB_AND_FLOAT_BYTES)
+                # each frame is held as uint8, then beside its float32 copy
+                budget.add(frame.nbytes + frame.numel() * torch.float32.itemsize, frames=1)
                 frames.append(frame)
         video = torch.stack(frames)
         del frames

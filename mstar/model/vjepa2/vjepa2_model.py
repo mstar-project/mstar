@@ -64,7 +64,7 @@ from mstar.model.base import (
     video_metadata_dict,
 )
 from mstar.model.components.video_decode import decode_frames_at
-from mstar.model.media_limits import VideoBudget, decoding_upload, video_decode_threads
+from mstar.model.media_limits import RGB_BYTES, VideoBudget, decoding_upload, video_decode_threads
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -675,7 +675,7 @@ class VJepa2Model(Model):
         if not (height and width):
             height, width = decoder[indices[0]].shape[-2:]
         # charged for every sampled frame, though a rollout decodes fewer
-        VideoBudget().add(height, width, len(indices))
+        VideoBudget().add(int(height) * int(width) * RGB_BYTES * len(indices), frames=len(indices))
 
         try:
             metadata = video_metadata_dict(metadata_obj) if metadata_obj is not None else {}
