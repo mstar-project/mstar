@@ -3,7 +3,8 @@
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 ``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
-``image_url`` data-URL content parts. An adapter's output parser splits a text
+``image_url`` data-URL content parts, and the closing ``usage`` chunk into
+``usage`` and ``finish_reason``. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 
 A streamed reply, and a whole one that is parsed or has stop strings, is read
@@ -18,11 +19,11 @@ import base64
 from mstar.api_server import media_io
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.request_types import USAGE
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     audio_format = _audio_format(req, sample_rate)
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
@@ -35,6 +36,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         model_name = reply.submit(api, request_id, model_name, req, args)
         if req.stream:
             events = await reply.stream_events(api, request_id, raw_request, parser, stops)
+            include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return reply.sse_response(api, request_id, _stream_events(events, model_name, request_id, include_usage))
         if parser is not None or stops:
             # read chunk by chunk, so a stop string ends the request as it appears
@@ -102,11 +104,12 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
-            usage.add(c)
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
             images.append(c.data)
+        elif c.modality == USAGE:
+            usage.close(c.metadata)
 
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
@@ -133,7 +136,7 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": reply.finish_reason(None, usage)}],
+        "choices": [{"index": 0, "message": message, "finish_reason": usage.finish_reason}],
         "usage": _usage(usage),
     }
 

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from fastapi import HTTPException
 
+from mstar.api_server.request_types import USAGE
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
@@ -35,22 +36,25 @@ _DISCONNECT_POLL_S = 0.05
 
 @dataclass
 class Usage:
-    """Token counts and why the reply ended, from the text chunks' metadata
-    (see the data worker's ``_text_usage``)."""
+    """A reply's token counts and why the engine ended it. The text chunks add
+    up ``completion`` as they are read and carry ``prompt`` (``ResultChunk``'s
+    ``num_tokens`` and ``prompt_tokens``), so a stream can open with the
+    prompt's count and a reply its handler ends early has both. The ``usage``
+    chunk that closes a reply which ran to its end (``APIServer.submit_request``'s
+    ``report_usage``) restates them and gives its ``finish_reason``."""
 
     prompt: int = 0
     completion: int = 0
-    stopped: bool = True
+    # ``length`` once the closing chunk says the reply used its whole budget
+    finish_reason: str = "stop"
     # of ``completion``, the tokens of the chunks that began inside the
     # reasoning (the one that closes it too; under MTP a chunk can straddle)
     reasoning: int = 0
 
-    def add(self, chunk) -> None:
-        meta = chunk.metadata or {}
-        self.prompt = meta.get("prompt_tokens", self.prompt)
-        self.completion += meta.get("tokens", 0)
-        if "stop_token" in meta:
-            self.stopped = meta["stop_token"]
+    def close(self, reported: dict) -> None:
+        """Takes the closing ``usage`` chunk's metadata."""
+        self.prompt, self.completion = reported["prompt_tokens"], reported["completion_tokens"]
+        self.finish_reason = reported["finish_reason"]
 
 
 @dataclass
@@ -168,6 +172,7 @@ def submit(api, request_id: str, model_name: str, req, args) -> str:
         prompt_parts=args.prompt_parts,
         streaming=bool(req.stream),
         request_id=request_id,
+        report_usage=True,
     )
     return (model_kwargs or {}).get(LORA_ADAPTER_KWARG) or model_name
 
@@ -189,7 +194,7 @@ def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
 def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
     if parser is not None and parser.finish_reason == "tool_calls":
         return "tool_calls"
-    return "stop" if stop_string is not None or usage.stopped else "length"
+    return "stop" if stop_string is not None else usage.finish_reason
 
 
 def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
@@ -229,9 +234,11 @@ async def _events(batches, served, parser, stops, usage):
             events: list = []
             for c in batch:
                 if c.modality == "text":
-                    usage.add(c)
+                    usage.completion += c.num_tokens
+                    if c.prompt_tokens is not None:
+                        usage.prompt = c.prompt_tokens
                     if parser is not None and parser.reasoning:
-                        usage.reasoning += (c.metadata or {}).get("tokens", 0)
+                        usage.reasoning += c.num_tokens
                     piece = text.feed(c.data)
                     if not piece:
                         continue
@@ -240,6 +247,8 @@ async def _events(batches, served, parser, stops, usage):
                         break
                     if parser is not None and parser.done:
                         break
+                elif c.modality == USAGE:
+                    usage.close(c.metadata)
                 elif c.modality == "error":
                     # the iterator's last chunk, so the loop ends on its own: breaking
                     # out would trip the iterator's abort on a request already gone

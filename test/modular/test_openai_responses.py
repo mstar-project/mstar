@@ -141,7 +141,7 @@ def test_what_needs_state_or_a_server_tool_is_a_400(client_and_stub, field, mess
 
 def test_a_reply_is_a_response_with_reasoning_message_and_call(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"List ", 2), (b"it.</think>", 2), (b"Listing.", 2), (CALL, 20), stop=True)
+    stub.next_chunks = _usage_chunks((b"List ", 2), (b"it.</think>", 2), (b"Listing.", 2), (CALL, 20))
     r = client.post("/v1/responses", json=_codex())
     assert r.status_code == 200
     resp = r.json()
@@ -164,7 +164,7 @@ def test_a_reply_is_a_response_with_reasoning_message_and_call(client_and_stub):
 
 def test_a_reply_cut_off_by_max_output_tokens_is_incomplete(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (CALL[:70], 7), stop=False)
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (CALL[:70], 7), finish="length")
     resp = client.post("/v1/responses", json=_codex(max_output_tokens=9)).json()
     assert resp["status"] == "incomplete" and resp["incomplete_details"] == {"reason": "max_output_tokens"}
     call = resp["output"][-1]
@@ -174,7 +174,7 @@ def test_a_reply_cut_off_by_max_output_tokens_is_incomplete(client_and_stub):
 def test_the_stream_is_the_responses_event_sequence(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _usage_chunks((b"List ", 2), (b"it.</think>", 2), (b"Listing.", 2), (CALL[:50], 8),
-                                     (CALL[50:], 12), stop=True)
+                                     (CALL[50:], 12))
     r = client.post("/v1/responses", json=_codex(stream=True))
     assert r.headers["content-type"].startswith("text/event-stream")
     events = _events(r.text)
@@ -204,7 +204,7 @@ def test_the_stream_is_the_responses_event_sequence(client_and_stub):
 
 def test_a_stream_reports_a_failure_as_response_failed(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = [_Chunk("text", b"Hm", {"tokens": 1, "prompt_tokens": 3}),
+    stub.next_chunks = [_Chunk("text", b"Hm", num_tokens=1, prompt_tokens=3),
                         _Chunk("error", b"worker died", {"status": 500})]
     events = _events(client.post("/v1/responses", json=_codex(stream=True)).text)
     assert events[-1]["type"] == "response.failed"

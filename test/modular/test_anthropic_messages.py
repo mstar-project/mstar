@@ -14,18 +14,23 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.request_types import USAGE, ResultChunk  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality, self.data, self.metadata = modality, data, metadata or {}
+class _Chunk(ResultChunk):
+    """A result chunk, its request's id left out."""
+
+    def __init__(self, modality, data, metadata=None, **fields):
+        super().__init__(request_id="r", modality=modality, data=data, metadata=metadata or {}, **fields)
 
 
-def _usage_chunks(*parts, stop=True):
-    """Text chunks as the data worker tags them: per-chunk token counts and the prompt's."""
-    return [_Chunk("text", text, {"tokens": n, "prompt_tokens": 11, "stop_token": stop and i == len(parts) - 1})
-            for i, (text, n) in enumerate(parts)]
+def _usage_chunks(*parts, finish="stop"):
+    """A reply as the API server hands it out: text chunks, each ``(text, tokens)``, that
+    carry their token count and the prompt's, then the usage chunk that closes a reply
+    the engine ended (a handler that ends it first never reads that one)."""
+    usage = {"prompt_tokens": 11, "completion_tokens": sum(n for _, n in parts), "finish_reason": finish}
+    return [*(_Chunk("text", text, num_tokens=n, prompt_tokens=11) for text, n in parts), _Chunk(USAGE, b"", usage)]
 
 
 class _StubAPI:
@@ -342,7 +347,7 @@ def test_a_stop_sequence_list_past_a_cap_is_a_400(client_and_stub):
 
 def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9), stop=True)
+    stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9))
     r = client.post("/v1/messages", json=_body(tools=[WEATHER]))
     assert r.status_code == 200
     msg = r.json()
@@ -358,26 +363,28 @@ def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 256
 
 
-@pytest.mark.parametrize("stop, reason", [(True, "end_turn"), (False, "max_tokens")])
-def test_why_a_reply_ended(client_and_stub, stop, reason):
+@pytest.mark.parametrize("finish, reason", [("stop", "end_turn"), ("length", "max_tokens")])
+def test_why_a_reply_ended(client_and_stub, finish, reason):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"Hello", 1), stop=stop)
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"Hello", 1), finish=finish)
     assert client.post("/v1/messages", json=_body()).json()["stop_reason"] == reason
 
 
 def test_a_stop_sequence_ends_the_reply_and_is_named(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"one two", 2), (b" three", 1), stop=False)
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"one two", 2), (b" three", 1), finish="length")
     msg = client.post("/v1/messages", json=_body(stop_sequences=["two"])).json()
     assert msg["content"][-1] == {"type": "text", "text": "one "}
     assert (msg["stop_reason"], msg["stop_sequence"]) == ("stop_sequence", "two")
+    # the request's usage chunk is never read: the counts came with the text
+    assert msg["usage"] == {"input_tokens": 11, "output_tokens": 4}
     assert stub.aborted == [stub.last_submit["request_id"]]
     assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
 
 
 def test_a_call_cut_off_by_max_tokens_has_no_tool_use(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (CALL[:60], 6), stop=False)
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (CALL[:60], 6), finish="length")
     msg = client.post("/v1/messages", json=_body(tools=[WEATHER])).json()
     assert [b["type"] for b in msg["content"]] == ["thinking"] and msg["stop_reason"] == "max_tokens"
 
@@ -385,7 +392,7 @@ def test_a_call_cut_off_by_max_tokens_has_no_tool_use(client_and_stub):
 def test_the_stream_is_anthropics_event_sequence(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _usage_chunks((b"Need ", 1), (b"weather.</think>", 3), (b"Checking.", 2),
-                                     (CALL[:45], 5), (CALL[45:], 4), stop=True)
+                                     (CALL[:45], 5), (CALL[45:], 4))
     r = client.post("/v1/messages", json=_body(tools=[WEATHER], stream=True))
     assert r.headers["content-type"].startswith("text/event-stream")
     events = _events(r.text)
@@ -411,7 +418,7 @@ def test_the_stream_is_anthropics_event_sequence(client_and_stub):
 
 def test_a_stream_reports_a_failure_in_band(client_and_stub):
     client, stub = client_and_stub
-    stub.next_chunks = [_Chunk("text", b"Hi</think>", {"tokens": 1, "prompt_tokens": 3}),
+    stub.next_chunks = [_Chunk("text", b"Hi</think>", num_tokens=1, prompt_tokens=3),
                         _Chunk("error", b"worker died", {"status": 500})]
     events = _events(client.post("/v1/messages", json=_body(stream=True)).text)
     assert events[-1] == {"type": "error", "error": {"type": "api_error", "message": "worker died"}}

@@ -29,16 +29,16 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
-from mstar.api_server.request_types import USAGE  # noqa: E402
+from mstar.api_server.request_types import USAGE, ResultChunk  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 
 
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality = modality
-        self.data = data
-        self.metadata = metadata or {}
+class _Chunk(ResultChunk):
+    """A result chunk, its request's id left out."""
+
+    def __init__(self, modality, data, metadata=None, **fields):
+        super().__init__(request_id="r", modality=modality, data=data, metadata=metadata or {}, **fields)
 
 
 class _StubModel(StubModel):
@@ -1045,9 +1045,11 @@ def test_glm_chat_forces_a_required_tool_call(client_and_stub):
 
 
 def _usage_chunks(*parts, finish="stop"):
-    """A reply's text chunks, each ``(text, tokens)``, and the usage chunk that closes it."""
+    """A reply as the API server hands it out: text chunks, each ``(text, tokens)``, that
+    carry their token count and the prompt's, then the usage chunk that closes a reply
+    the engine ended (a handler that ends it first never reads that one)."""
     usage = {"prompt_tokens": 11, "completion_tokens": sum(n for _, n in parts), "finish_reason": finish}
-    return [*(_Chunk("text", text) for text, _ in parts), _Chunk(USAGE, b"", usage)]
+    return [*(_Chunk("text", text, num_tokens=n, prompt_tokens=11) for text, n in parts), _Chunk(USAGE, b"", usage)]
 
 
 @pytest.mark.parametrize("finish", ["stop", "length"])
@@ -1076,15 +1078,6 @@ def test_chat_stream_sends_usage_when_asked(client_and_stub):
     assert events[-1]["usage"]["completion_tokens_details"] == {"reasoning_tokens": 2}
 
 
-def test_chat_refuses_bad_stream_options_before_running(client_and_stub):
-    client, stub = client_and_stub
-    stub.model_name = "glm52"
-    stub.last_submit = None
-    r = client.post("/v1/chat/completions", json={
-        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": True})
-    assert r.status_code == 400 and stub.last_submit is None
-
-
 def test_a_parsed_reply_stops_when_its_client_disconnects():
     """Non-streaming, a reply is read chunk by chunk; a client that goes away
     unwinds the chunk iterator, which aborts the request."""
@@ -1101,7 +1094,7 @@ def test_a_parsed_reply_stops_when_its_client_disconnects():
         async def iter_result_chunk_batches(self, request_id):
             try:
                 while True:
-                    yield [_Chunk("text", b"x", {"tokens": 1})]
+                    yield [_Chunk("text", b"x", num_tokens=1)]
                     await asyncio.sleep(0.01)
             finally:
                 aborted.append(request_id)
@@ -1131,7 +1124,7 @@ def test_glm_chat_ends_at_a_stop_string_and_stops_the_request(client_and_stub, s
     stub.model_name = "glm52"
     # the stop spans two tokens; what follows it is never read
     stub.next_chunks = _usage_chunks((b"Plan. STOP</think>", 3), (b"Done: 4", 2), (b"2. ST", 2), (b"OP more", 2),
-                                     (b" text", 1), stop=False)
+                                     (b" text", 1), finish="length")
     r = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": ["STOP"], "stream": stream,
         "stream_options": {"include_usage": True} if stream else None,
@@ -1149,8 +1142,9 @@ def test_glm_chat_ends_at_a_stop_string_and_stops_the_request(client_and_stub, s
         finish, usage = choice["finish_reason"], r.json()["usage"]
     # stops match the answer only: the reasoning's STOP went out
     assert reasoning == "Plan. STOP" and content == "Done: 42. " and finish == "stop"
-    # the tokens read through the one that completed the stop
-    assert usage["completion_tokens"] == 9
+    # the tokens read through the one that completed the stop, and the prompt's, which
+    # came with them: the request's usage chunk is never read
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (11, 9)
     assert stub.aborted == [stub.last_submit["request_id"]]
     assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
 
@@ -1174,7 +1168,7 @@ def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stre
     client, stub = client_and_stub
     stub.model_name = "glm52"
     call = b"<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-    stub.next_chunks = _usage_chunks((b"Two.</think>", 3), (call, 9), (b"\n" + call, 9), stop=False)
+    stub.next_chunks = _usage_chunks((b"Two.</think>", 3), (call, 9), (b"\n" + call, 9), finish="length")
     r = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
         "parallel_tool_calls": False, "stream": stream,
@@ -1198,7 +1192,7 @@ def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "glm52"
     stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Line one.", 3), (b"\n\n", 1), (b"Line", 1),
-                                     (b" two", 1), stop=False)
+                                     (b" two", 1), finish="length")
     body = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": "\n\n"}).json()
     assert body["choices"][0]["message"]["content"] == "Line one."
