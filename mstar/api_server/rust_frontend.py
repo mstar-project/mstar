@@ -77,8 +77,8 @@ only, one map of ``PromptPart``'s fields per part. The bridge mesh lives in
 its own socket dir (private to the frontend/bridge pair), so entity names
 never collide with the conductor/worker mesh.
 
-Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the
-``mstar-server`` binary + this loop. Everything else in the process
+``mstar-serve`` runs the ``mstar-server`` binary + this loop in place of
+``uvicorn.run`` (unless ``--python-frontend``). Everything else in the process
 (preprocess worker, conductor spawn, tensor transport) is identical. The
 frontend enforces the API key (``--api-key`` / ``MSTAR_API_KEY``) itself; the
 bridge socket is private to the pair.

@@ -97,6 +97,8 @@ async fn main() {
         eprintln!("{USAGE}\nbuilt from sources {sources}");
         std::process::exit(2);
     };
+    // first, so a launcher that dies while the facts load is still noticed
+    exit_with_launcher();
     if model_name == "-h" || model_name == "--help" {
         println!("{USAGE}\nbuilt from sources {sources}");
         return;
@@ -175,11 +177,14 @@ async fn main() {
         served,
     };
 
-    // Allow-all CORS, matching mstar's CORSMiddleware configuration.
+    // Allow-all CORS, matching mstar's CORSMiddleware configuration. A
+    // preflight's requested headers are echoed, as Starlette echoes them for
+    // `allow_headers=["*"]`: browsers don't let a literal `*` cover
+    // `Authorization`, so a page sending the API key would fail the preflight.
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers(tower_http::cors::AllowHeaders::mirror_request());
 
     // Admission control: bound concurrent generation requests; past the cap
     // clients get an immediate 503 instead of queueing into the timeout.
@@ -258,7 +263,15 @@ async fn main() {
     let app = tower::Layer::layer(&tower::util::MapRequestLayer::new(move |req: Request<Body>| {
         strip_root_path(&root_path, req)
     }), app);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            // a port another server took while the model loaded, most often;
+            // mstar serve exits nonzero when this process does
+            eprintln!("mstar-server: could not listen on http://{addr}: {e}");
+            std::process::exit(3);
+        }
+    };
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, axum::ServiceExt::<Request<Body>>::into_make_service(app))
         // Disable Nagle: SSE/NDJSON streams write many small chunks, and
@@ -267,6 +280,26 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+/// Exits once the process that launched this one is gone (`mstar serve`
+/// killed with SIGKILL, which runs no cleanup), so the port and the bridge's
+/// socket are not held for a deployment that no longer exists.
+fn exit_with_launcher() {
+    #[cfg(unix)]
+    {
+        let launcher = std::os::unix::process::parent_id();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                if std::os::unix::process::parent_id() != launcher {
+                    eprintln!("mstar-server: its launcher (pid {launcher}) exited; stopping");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -516,7 +549,7 @@ fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenA
     } else {
         format!(
             "Model '{}' has an OpenAI adapter ({}) the Rust frontend does not serve; \
-             use POST /generate, or serve without --rust-frontend",
+             use POST /generate, or serve with --python-frontend",
             st.model_name, st.python_adapter
         )
     };
