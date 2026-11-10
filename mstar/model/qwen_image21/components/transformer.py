@@ -262,7 +262,17 @@ class QwenImage21Transformer(nn.Module):
         blocks = self.transformer_blocks
         for i, block in enumerate(blocks):
             attend.set_layer_idx(i)
-            hidden = block(hidden, self.prefix_modulation, rope, attend, last_prefix=i == len(blocks) - 1)
+            # the class's forward: a span's length varies per request, so the prefix runs eager even when
+            # compile_target_blocks compiled the blocks' instance forward
+            last = i == len(blocks) - 1
+            hidden = Block.forward(block, hidden, self.prefix_modulation, rope, attend, last_prefix=last)
+
+    def compile_target_blocks(self) -> None:
+        """Compile each block for the target pass: its shapes are fixed per latent grid and batch, and the
+        attention stays an eager call between two compiled graphs. The prefix pass keeps the eager forward."""
+        from mstar.model.components.diffusion.compile_utils import compile_blocks
+
+        compile_blocks(self.transformer_blocks, dynamic=False)
 
     def target(
         self, latents: torch.Tensor, timestep: torch.Tensor, positions: torch.Tensor, attend: Attend,

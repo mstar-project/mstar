@@ -147,6 +147,7 @@ class QwenImage21Model(Model):
         max_num_pages: int = 512,
         max_batch_size: int = 4,
         accelerator_graph: bool = False,
+        compile_transformer: bool = False,
         capture_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         async_scheduling: bool = True,
@@ -160,6 +161,7 @@ class QwenImage21Model(Model):
         self.max_num_pages = int(max_num_pages)
         self.max_batch_size = int(max_batch_size)
         self.accelerator_graph = bool(accelerator_graph)
+        self.compile_transformer = bool(compile_transformer)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4])]
         self.async_scheduling = bool(async_scheduling)
@@ -539,6 +541,7 @@ class QwenImage21Model(Model):
             return QwenImage21DenoiseSubmodule(
                 weight_loader.build_transformer(config.transformer, snapshot, device, comm_group=tp_group), config,
                 loop_name=DENOISE_LOOP, max_batch_size=self.max_batch_size,
+                compile_transformer=self.compile_transformer,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Qwen-Image-2.1 has no submodule for node %r; running it dummy", node_name)

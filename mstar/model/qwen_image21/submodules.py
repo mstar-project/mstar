@@ -294,9 +294,12 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
     cuts_tensor_inputs = True
     GUIDANCE = Guidance(branches=({FRAME: MAIN_FRAME}, {FRAME: UNCOND_FRAME}), combine=cfg)
 
-    def __init__(self, transformer: QwenImage21Transformer, config: QwenImage21Config, *, loop_name: str, **kwargs):
+    def __init__(self, transformer: QwenImage21Transformer, config: QwenImage21Config, *, loop_name: str,
+                 compile_transformer: bool = False, **kwargs):
         super().__init__(loop_name=loop_name, **kwargs)
         self.transformer = transformer
+        if compile_transformer:
+            transformer.compile_target_blocks()
         self.qi_config = config
         self.prefix_pass = PrefixPass(self)
         self._attend: AttentionCallable | None = None
