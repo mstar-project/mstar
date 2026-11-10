@@ -158,6 +158,23 @@ def test_the_per_clip_layout_reproduces_the_padded_batch(tiny_tower, lengths):
     torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
 
 
+@pytest.mark.parametrize("quantum", [2, 8, 64])
+@pytest.mark.parametrize("lengths", [[40], [41], [57, 23], [50, 49, 13], [9, 10]])
+def test_convolutions_at_padded_widths_give_the_same_tokens(tiny_tower, lengths, quantum):
+    """Padding each clip's convolution inputs on to a multiple of ``quantum`` changes only the
+    widths the kernels run at: the masked conv1 tail reads to conv2 as its own zero padding,
+    and the adapter keeps the unpadded conv's outputs."""
+    gen = torch.Generator().manual_seed(sum(lengths) + quantum)
+    mels = [torch.randn(TINY.n_mels, n, generator=gen, dtype=torch.float64) for n in lengths]
+    layout = request_layout(lengths)
+    for block in tiny_tower.encoder.blocks:
+        block.self_attn.bind_resources({"attn": KeyPrefix(layout)})
+    with torch.inference_mode():
+        want = tiny_tower(mels, layout)
+        got = tiny_tower(mels, layout, quantum)
+    torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
+
+
 def test_dropping_the_mask_moves_the_kept_tokens(tiny_tower):
     """The negative control: every post-conv frame a key."""
     mels = [torch.randn(TINY.n_mels, 41, generator=torch.Generator().manual_seed(1), dtype=torch.float64)]
