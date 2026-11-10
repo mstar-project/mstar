@@ -244,7 +244,6 @@ pub struct WorkerGraphsDone<'a> {
     pub partition_name: &'a str,
     pub partition_done: bool,
     pub graph_walk: &'a str,
-    pub stream_tokens_consumed: &'a [(String, i64)],
     /// `dict[str, dict[str, int]]`: stream edge -> destination worker -> items.
     pub stream_items_sent: Vec<(Sym, Vec<(Sym, i64)>)>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
@@ -280,9 +279,6 @@ impl WorkerGraphsDone<'_> {
             w_str(m.key("partition_name"), self.partition_name);
             w_bool(m.key("partition_done"), self.partition_done);
             w_str(m.key("graph_walk"), self.graph_walk);
-            str_counts(
-                m.key("stream_tokens_consumed"), self.stream_tokens_consumed,
-            );
             w_map(m.key("stream_items_sent"), self.stream_items_sent.len() as u32);
             for (edge, per_worker) in &self.stream_items_sent {
                 w_str(m.buf(), it.name(*edge));

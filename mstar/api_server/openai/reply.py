@@ -145,7 +145,7 @@ def submit(api, request_id: str, model_name: str, req, args) -> str:
     """Submits a chat request's ``args`` under the LoRA adapter its ``model``
     field or ``lora_adapter`` kwarg picks. Returns the model name the reply
     reports: the adapter that served it, as vLLM's does, else ``model_name``."""
-    model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+    model_kwargs = api.lora_kwargs(req.model, args.model_kwargs).model_kwargs
     api.submit_request(
         text=args.text,
         file_paths=args.file_paths,

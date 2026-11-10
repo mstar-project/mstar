@@ -33,34 +33,15 @@ def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match
         _submodule(cfg).bind_node_resources(resources)
 
 
-def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag):
+def test_long_context_captures_no_prefill_bucket_past_the_chunk():
     import torch
 
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
     sub = _submodule(cfg)
     sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
+               for ladder in c.capture_token_lengths.values() for n in ladder]
     assert prefill and max(prefill) <= chunk
 
-
-def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan(torch_flag):
-    """A captured prefill attends in one sparse plan, which FlashInfer takes up to
-    sparse_mla.MAX_ROWS rows; a longer bucket runs eager, whose plan takes chunks."""
-    import torch
-
-    from mstar.engine.resources.dsa import sparse_mla
-
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144,
-                           prefill_chunk_tokens=4 * sparse_mla.MAX_ROWS,
-                           prefill_batched_token_buckets=[1024, 2 * sparse_mla.MAX_ROWS])
-    sub = _submodule(cfg)
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
-    assert 1024 in prefill and max(prefill) <= sparse_mla.MAX_ROWS

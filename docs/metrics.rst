@@ -254,7 +254,7 @@ Engine workers
 
 From the workers' numbers, forwarded in the conductor's status message, so up to two
 seconds old. A node with replicas on several workers shows their sum. The ranks of a
-tensor or sequence parallel instance count once: the instance's first rank reports.
+TP, SP or CFG instance count once: the instance's first rank reports.
 
 ``mstar_kv_pages_used{model_name, component, resource}``
    Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
@@ -268,6 +268,15 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 ``mstar_kv_pages_cached{model_name, component, resource}``
    Gauge. Pages the prefix cache names. Running requests may also hold some of them;
    the cache frees the others when a request needs the room.
+
+``mstar_rebuild_host_bytes_used{model_name, component}``
+   Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids, which a
+   request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
+   keeps no ids, so its request is never dropped. One pool serves every node of a worker
+   that declares a rebuild policy, and shows under each.
+
+``mstar_rebuild_host_bytes_total{model_name, component}``
+   Gauge. Bytes of the rebuild host pool, the serving config's ``rebuild_host_mb``.
 
 ``mstar_step_seconds{model_name, component, graph_walk}``
    Histogram, seconds, engine steps that ran a forward. From when the worker hands the

@@ -11,9 +11,14 @@ Two stubs that exist purely so test imports survive on local macOS dev:
    minimal stub so the import succeeds; tests that exercise the kernels
    themselves still need a real GPU.
 
-And one autouse fixture that clears the cached platform around every test.
+And two autouse fixtures: one clears the cached platform around every test, and one
+keeps a test marked ``gpu_exclusive`` from sharing the GPU with any other test of the
+session (``_gpu_neighbours``).
 """
+import fcntl
+import os
 import sys
+import tempfile
 import types
 from typing import NamedTuple
 
@@ -138,3 +143,71 @@ def _fresh_platform():
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()
+
+
+# --- tests that read device-wide GPU memory ----------------------------------
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "gpu_exclusive: reads device-wide GPU memory, so no other test of the session runs beside it",
+    )
+
+
+@pytest.fixture(scope="session")
+def _gpu_locks():
+    """A gate and a lock that every process of this test session opens (xdist's workers
+    name the session alike), or None with no GPU visible."""
+    if not torch.cuda.is_available():
+        yield None
+        return
+    session = os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"pid{os.getpid()}"
+    base = os.path.join(tempfile.gettempdir(), f"mstar_gpu_tests_{session}")
+    gate, lock = (os.open(f"{base}.{name}", os.O_RDWR | os.O_CREAT, 0o600) for name in ("gate", "lock"))
+    try:
+        yield gate, lock
+    finally:
+        os.close(gate)
+        os.close(lock)
+
+
+@pytest.fixture(autouse=True)
+def _gpu_neighbours(request, _gpu_locks):
+    """With a GPU visible, a test marked ``gpu_exclusive`` holds the session's lock
+    exclusively and every other test holds it shared, so the first runs with nothing
+    of the session beside it on the GPU: device-wide free memory counts every other
+    xdist worker's allocations. A test that holds the gate exclusively stops new ones
+    from starting while it waits out those running."""
+    if _gpu_locks is None:
+        yield
+        return
+    gate, lock = _gpu_locks
+    if request.node.get_closest_marker("gpu_exclusive") is not None:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        return
+    fcntl.flock(gate, fcntl.LOCK_SH)
+    fcntl.flock(lock, fcntl.LOCK_SH)
+    fcntl.flock(gate, fcntl.LOCK_UN)
+    try:
+        yield
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+# --- host GPUs -----------------------------------------------------------------
+
+@pytest.fixture
+def no_host_gpus(monkeypatch, tmp_path):
+    """Make ``nvidia-smi`` fail, as on a host with no GPU. For tests whose eval jobs start
+    only fake servers, which would otherwise wait on another process's GPU memory."""
+    bin_dir = tmp_path / "no_host_gpus"
+    bin_dir.mkdir()
+    (bin_dir / "nvidia-smi").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")

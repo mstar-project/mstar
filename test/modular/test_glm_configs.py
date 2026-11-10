@@ -141,7 +141,7 @@ def test_glm53_prefill_ladder_takes_every_step(name, overrides):
 
     cfg = _config(name, overrides)
     model = _model(cfg)
-    top = max(model.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS)
+    top = max(cfg.get("prefill_token_buckets", {}).get("LLM", {}).get("prefill") or PREFILL_TOKEN_BUCKETS)
     rows = max(model.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
     if model.config.dsa_long_context:
         assert top <= sparse_mla.MAX_ROWS

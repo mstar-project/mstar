@@ -29,8 +29,8 @@ admit fails it before handing out any slot, so it takes none that a counted row 
 Only the rank that chooses batches decides (a lockstep instance's leader), so no other
 rank keeps reservations; the admit refusal stays as a backstop.
 
-A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
-node, and each admits only its own node's rows. A request holds a slot in each until it
+A spec over several nodes (an LLM and its vision encoder) builds a pool per node
+(``LoraSpec.for_node``), and each admits only its own node's rows. A request holds a slot in each until it
 is removed (none in a pool whose targets its adapter has nothing for), but where the
 graph runs the encoder once, before the LLM (Qwen3.5), it takes them in that order and a
 row holding an LLM slot never waits on the encoder's pool, so the two pools' waits
@@ -71,13 +71,12 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.distributed.base import PARALLEL_AXES
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
-    LoraBaseOnly,
     LoraReqConfig,
     LoraSpec,
-    LoraStep,
     describe_load_error,
 )
 from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore, adapter_targets
@@ -89,6 +88,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
+    ResourceStep,
     StepContext,
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
@@ -139,11 +139,10 @@ class _Copy(NamedTuple):
 
 
 class _Served(NamedTuple):
-    """Where an adapter is read from, and what its weights must digest to (None until
-    its first read, for an adapter that arrived without one)."""
+    """Where an adapter is read from, and what its weights must digest to."""
 
     path: str
-    digest: bytes | None
+    digest: bytes
 
 
 @dataclass(frozen=True)
@@ -169,9 +168,10 @@ class LoraLayerDelta:
 
     A layer computes its base output, then calls this before anything consumes ``y`` —
     for a row-parallel linear, before its all-reduce. Rows on the base model address the
-    zero adapter, which the kernels skip; a step with no adapter row at all returns ``y``
-    untouched (``LoraAdapterPool.active``). The layer's slot weights are views resolved
-    once, here; a call reads only the step's addressing.
+    zero adapter, which the kernels skip; a step that runs the pool lean
+    (``StepContext.lean``: no row names an adapter) returns ``y`` untouched
+    (``LoraAdapterPool.active``). The layer's slot
+    weights are views resolved once, here; a call reads only the step's addressing.
     """
 
     def __init__(self, pool: "LoraAdapterPool", target: str, layer_idx: int):
@@ -200,7 +200,7 @@ class LoraLayerDelta:
                 "belongs in preprocess or the forward"
             )
         if not self._pool.active:
-            # a base-only step: no row names an adapter, so nothing is launched
+            # a lean step: no row names an adapter, so nothing is launched
             return y
         if self._embedding:
             x = x.reshape(-1)
@@ -278,20 +278,29 @@ class LoraAdapterPool(Resource):
     # holds no per-token state, so a request whose prompt prefix was served from the cache
     # runs here exactly as one that computed it
     prefix_skip_safe = True
+    # a step none of whose rows names an adapter runs no delta (`lean_for`), so each
+    # bucket, piecewise regions' included, has a twin with no LoRA kernel
+    lean_capture = True
+    # a node's rows are its segments' tokens, so it declares nothing for the pool
+    steps_from_segments = True
+    # a dropped request keeps its adapter and slot, and its rebuild runs under that adapter
+    supports_drop = True
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            if joint.sp_group.world_size > 1:
-                raise ValueError(
-                    f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
-                    f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
-                    "support: its rows are laid out per request, while each SP rank holds "
-                    "a shard of the tokens. Serve this node without SP, or drop the "
-                    "'lora:' block"
-                )
+            # its rows are laid out per request over the whole batch; every axis but TP
+            # (cfg branches, sp token shards) hands each rank only part of it
+            for axis in PARALLEL_AXES:
+                if axis != "tp" and (size := getattr(joint, f"{axis}_group").world_size) > 1:
+                    raise ValueError(
+                        f"LoRA resource {spec.resource_key!r} serves a node at {axis}_size {size}, "
+                        "which LoRA does not support: its rows are laid out per request over the "
+                        f"whole batch, while each {axis.upper()} rank runs only part of it. Serve "
+                        f"this node at {axis}_size 1, or drop the 'lora:' block"
+                    )
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
@@ -320,6 +329,7 @@ class LoraAdapterPool(Resource):
         chooses batches, and so admits requests (``ask``): False on a lockstep instance's
         followers."""
         self.spec = spec
+        self.resource_key = spec.resource_key
         self._device = torch.device(device)
         self.dtype = spec.dtype or dtype
         if self.dtype is None:
@@ -358,11 +368,18 @@ class LoraAdapterPool(Resource):
 
         self._slots = [SlotState(index=i) for i in range(num_slots)]
         self._resident: dict[str, int] = {}  # adapter -> slot
+        unpinned = sorted(set(spec.adapters) - set(spec.adapter_digests))
+        if unpinned:
+            # each rank would serve whatever its own read finds
+            raise ValueError(
+                f"LoRA adapters {unpinned} have no pinned digest: the API server resolves "
+                "the serving config's adapters (resolve_lora_adapters)"
+            )
         # adapter -> where it is read from: those a new request may name, and those
         # unloaded while live requests still named them, kept until the last of those
         # requests is removed
         self._serving: dict[str, _Served] = {
-            name: _Served(path, spec.adapter_digests.get(name))
+            name: _Served(path, spec.adapter_digests[name])
             for name, path in spec.adapters.items()
         }
         # adapters with nothing for this spec's targets (rank 0 here, e.g. a text-only
@@ -419,8 +436,7 @@ class LoraAdapterPool(Resource):
         # read adapters ahead, so a first request finds its adapter in the host tier
         for name in [n for n in self._serving if n not in self._empty][:spec.cpu_capacity]:
             served = self._serving[name]
-            adapter = self._store.load(name, served.path, served.digest)
-            self._pin_digest(name, served, adapter.digest)
+            self._store.load(name, served.path, served.digest)
 
         logger.info(
             "LoRA pool: %d slots (+ zero adapter), max rank %d, targets %s, %.2f MiB",
@@ -459,15 +475,15 @@ class LoraAdapterPool(Resource):
             raise RuntimeError(
                 "the LoRA pool has no plan for this step: the step running the adapted "
                 "module (the node's, or a piecewise region's) is None or declares no "
-                "segments to lay its LoRA rows out from"
+                "segments to lay its rows out from"
             )
         return self._current[grouping]
 
     @contextmanager
-    def base_only(self) -> Iterator[None]:
-        """A forward outside any step (a compile's warm-up) on this thread, as a base-only
-        step: its deltas add nothing. A compile traced here takes the base-only branch,
-        so the first step with an adapter row compiles its own."""
+    def outside_step(self) -> Iterator[None]:
+        """A forward outside any step (a compile's warm-up) on this thread, as a lean
+        step: its deltas add nothing. A compile traced here takes the lean branch, so the
+        first step with an adapter row compiles its own."""
         saved = self._current, self._plan_thread, self.active
         self._current, self._plan_thread, self.active = {}, threading.get_ident(), False
         try:
@@ -492,12 +508,21 @@ class LoraAdapterPool(Resource):
     # Request lifecycle
 
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
-        adapter = overrides.adapter if isinstance(overrides, LoraReqConfig) else None
+        config = overrides if isinstance(overrides, LoraReqConfig) else None
+        adapter = None if config is None else config.adapter
         with self._lock:
-            if adapter is not None and adapter not in self._serving:
-                raise ValueError(
-                    f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
-                )
+            if adapter is not None:
+                served = self._serving.get(adapter)
+                if served is None:
+                    raise ValueError(
+                        f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
+                    )
+                if config.digest is not None and served.digest != config.digest:
+                    # its prompt was keyed under the weights it was selected on
+                    raise ValueError(
+                        f"LoRA adapter {adapter!r} was loaded again with other weights after "
+                        "this request selected it; send the request again"
+                    )
             self._adapter_of[rid] = adapter
             if adapter is None:
                 self._row_slot[rid] = ZERO_SLOT
@@ -530,11 +555,11 @@ class LoraAdapterPool(Resource):
         """Whether a new request may name ``adapter`` here."""
         return adapter in self._serving
 
-    def load_adapter(self, name: str, path: str, digest: bytes | None = None) -> None:
+    def load_adapter(self, name: str, path: str, digest: bytes) -> None:
         """``load_adapter_async``, waited on."""
         self.load_adapter_async(name, path, digest).result()
 
-    def load_adapter_async(self, name: str, path: str, digest: bytes | None = None) -> Future:
+    def load_adapter_async(self, name: str, path: str, digest: bytes) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, check it against the
         spec (and against ``digest``, the weights the API server checked), and only then
         make it servable. The read is not kept, since the host tier holds only what
@@ -546,14 +571,14 @@ class LoraAdapterPool(Resource):
             self._refuse_reload(name)
             return self._executor().submit(self._load, name, path, digest)
 
-    def _load(self, name: str, path: str, digest: bytes | None) -> None:
+    def _load(self, name: str, path: str, digest: bytes) -> None:
         adapter = self._store.read(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
             if adapter.rank == 0:
                 # no request can name it before it is served, below
                 self._empty.add(name)
-            self._serving[name] = _Served(path, adapter.digest)
+            self._serving[name] = _Served(path, digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
     def _refuse_reload(self, name: str) -> None:
@@ -676,7 +701,7 @@ class LoraAdapterPool(Resource):
 
     # Step lifecycle
 
-    def admit(self, step: LoraStep, ctx: StepContext) -> AdmitOutcome:
+    def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
         """Give each row whose adapter is not resident yet a slot, loading it there.
 
         Nothing to do once every row holds its slot, which is every step after a request's
@@ -759,7 +784,7 @@ class LoraAdapterPool(Resource):
                         self._take(rid, slot)
         return ADMIT_OK
 
-    def rollback_admit(self, step: LoraStep, ctx: StepContext) -> None:
+    def rollback_admit(self, step: ResourceStep, ctx: StepContext) -> None:
         """Give back the slots this step's admit took. An adapter it loaded stays resident
         in its now-unheld slot, as a cache."""
         del step
@@ -780,7 +805,7 @@ class LoraAdapterPool(Resource):
                 if slot:
                     self._release(slot)
 
-    def commit(self, step: LoraStep, ctx: StepContext) -> None:
+    def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         del step
         if ctx.graph_walk == PIECEWISE_WALK and self._enclosing is not None:
             # the region is done; the eager code after it reads the enclosing plan
@@ -883,21 +908,9 @@ class LoraAdapterPool(Resource):
                 return
             adapter = future.result()
             current = self._serving.get(name) or self._retiring.get(name)
-            if current is None or current.path != served.path or (
-                current.digest is not None and current.digest != adapter.digest
-            ):
+            if current is None or current != served:
                 return  # unloaded, or reloaded with other weights, while it was read
-            self._pin_digest(name, current, adapter.digest)
             self._store.put(adapter)
-
-    def _pin_digest(self, name: str, served: _Served, digest: bytes) -> None:
-        """An adapter that arrived with no digest takes its first read's, so a file
-        changed after it is refused rather than served under the name."""
-        if served.digest is not None:
-            return
-        for table in (self._serving, self._retiring):
-            if table.get(name) == served:
-                table[name] = served._replace(digest=digest)
 
     def _pick_slot(self, exclude=()) -> int | None:
         """An empty slot, else the unheld one released longest ago (ties to the lowest
@@ -967,24 +980,25 @@ class LoraAdapterPool(Resource):
         get, empty = self._adapter_of.get, self._empty
         return any((name := get(rid)) is not None and name not in empty for rid in rids)
 
+    def lean_for(self, rids) -> bool:
+        """A step runs base-only when none of its rows names an adapter with something
+        for this pool (``runs_adapters``)."""
+        return not self.runs_adapters(rids)
+
     def _adds_deltas(self, segments, ctx: StepContext) -> bool:
-        """Whether this step's deltas run: under a capture lease, unless its bucket is a
-        base-only one (``LoraBaseOnly``), whose graph records none; eagerly, when a row
-        names an adapter."""
-        lease = ctx.slot_lease
-        if lease is None or lease.bucket is None:
-            return self.runs_adapters(seg.request_id for seg in segments)
-        if not isinstance(lease.bucket.cg_key_info, LoraBaseOnly):
+        """Whether this step's deltas run: unless the step runs this pool lean
+        (``StepContext.lean``), a capture recording none and an eager step skipping them."""
+        if self.resource_key not in ctx.lean:
             return True
         if not ctx.capture and self.runs_adapters(seg.request_id for seg in segments):
             # its rows would lose their deltas silently
             raise RuntimeError(
-                f"LoRA resource {self.spec.resource_key!r}: leased base-only {lease.bucket} "
-                "for a step whose rows name an adapter"
+                f"LoRA resource {self.spec.resource_key!r}: a base-only step "
+                f"({ctx.slot_lease.bucket if ctx.slot_lease is not None else 'eager'}) has rows that name an adapter"
             )
         return False
 
-    def plan(self, step: LoraStep, ctx: StepContext) -> LoraAddressing | None:
+    def plan(self, step: ResourceStep, ctx: StepContext) -> LoraAddressing | None:
         self._plan_thread = threading.get_ident()
         if ctx.graph_walk == PIECEWISE_WALK and not ctx.capture and self._current is not None:
             # before the memoized return below, which a region's repeat plan takes too

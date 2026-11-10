@@ -187,7 +187,9 @@ def test_error_paths(model):
             "transformer_blocks.0.attn.to_q.lora_B.weight": b[:, : RANK - 1],
         })
     with pytest.raises(ValueError, match="unrecognized"):
-        normalize_lora_state_dict({"transformer_blocks.0.attn.to_q.weight": a})
+        normalize_lora_state_dict({
+            "transformer_blocks.0.attn.to_q.lora_A.weight": a, "transformer_blocks.0.attn.to_q.weight": a,
+        })
     adapter = normalize_lora_state_dict({
         "transformer_blocks.0.attn.to_q.lora_A.weight": a,
         "transformer_blocks.0.attn.to_q.lora_B.weight": b,
