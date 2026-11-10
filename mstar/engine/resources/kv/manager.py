@@ -1328,7 +1328,9 @@ class KVManager(AttentionResource):
             first = part.released // group.page_size
             for i in range(start * page_size // group.page_size, stop * page_size // group.page_size):
                 if not first <= i < first + len(part.page_indices):
-                    continue  # the window released it before its first-group page filled
+                    # The window released it before its first-group page filled, so no hit needs it: a hit ends
+                    # past that page, where the window has released it too.
+                    continue
                 key, parent = filed[self._ends_on(g, i) - start]
                 self._index.insert(self._window_key(key, g, i), part.page_indices[i - first], parent)
 
