@@ -361,7 +361,7 @@ def test_a_repeat_whose_allotment_is_spent_leaves_its_image_end_to_the_walk():
     _probe(kv, RID, len(TEXT))
 
     kv.assert_pages_conserved()
-    assert node.stream.lease_len == 3 * PAGE_SIZE, "the repeat copied its image end onto a page \"b\" counts on"
+    assert node.stream.lease.end == 3 * PAGE_SIZE, "the repeat copied its image end onto a page \"b\" counts on"
 
 
 def test_a_grant_past_its_allotment_takes_only_room():

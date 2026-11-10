@@ -261,13 +261,13 @@ class Resource(ResidentHooks, ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, or None."""
+        return the pages, a list for each group of pages the resource keeps, or None."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, pages: list[list[int]], caught_up: bool,
     ) -> bool:
         """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
         raises if it still lacks them once ``caught_up``."""

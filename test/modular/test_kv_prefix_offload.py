@@ -413,7 +413,7 @@ def test_every_page_written_ahead_comes_back_byte_for_byte(layout):
     inputs = ARNodeInputs(input_seq_len=len(prompt) + 2)
     assert kv.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == len(prompt)
 
-    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["b"]["main"].lease], expected), (
+    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["b"]["main"].lease.pages()], expected), (
         "a page written to the host and copied back came back with other bytes"
     )
 

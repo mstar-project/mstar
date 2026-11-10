@@ -185,7 +185,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     first = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    held = list(kv._streams["r1"]["main"].lease)
+    held = kv._streams["r1"]["main"].lease.pages()
     owners = [kv._arena.owners(page) for page in held]
 
     # nothing left for the unmatched tail
@@ -212,7 +212,7 @@ def test_remove_gives_back_a_lease_admit_never_took():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     owners = [kv._arena.owners(page) for page in leased]
 
     kv.remove_request("r1")
@@ -245,7 +245,7 @@ def test_admit_takes_the_lease_over_and_commit_clears_it():
     keys = _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
 
     _grow(kv, "r1", 100 - matched)
 
@@ -270,7 +270,7 @@ def _converted_by_a_refused_admit(kv: KVManager) -> list[int]:
     kv.remove_request("seed")
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     kv.ingest_request("hog", KVReqConfig())
     _grow(kv, "hog", kv._arena.num_free * PAGE_SIZE)
 
@@ -356,7 +356,7 @@ def test_a_lease_taken_after_a_refused_batch_admit_is_still_converted():
     reserved = _refused_then_cached(kv, prompt)
 
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     _grow(kv, "r1", len(prompt) - matched)
 
     stream = kv._streams["r1"]["main"]
@@ -379,7 +379,7 @@ def test_a_leased_stream_an_offload_has_claimed_keeps_its_pages():
     prompt = list(range(100))
     reserved = _refused_then_cached(kv, prompt)
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     # what a claim leaves on a stream while its copy runs with the lock down
     kv._streams["r1"]["main"].offloaded = True
 
@@ -389,7 +389,7 @@ def test_a_leased_stream_an_offload_has_claimed_keeps_its_pages():
     assert stream.page_indices == reserved, (
         "the conversion let go of pages an offload was still copying"
     )
-    assert stream.lease == leased, "the lease was converted under the offload"
+    assert stream.lease.pages() == leased, "the lease was converted under the offload"
 
 
 def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
@@ -440,11 +440,11 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
     )
 
     matched = runner.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
-    leased = list(kv._streams["r1"]["main"].lease)
+    leased = kv._streams["r1"]["main"].lease.pages()
     runner.apply_cached_prefix("r1", NODE, WALK, None, matched)
 
     assert matched.tokens == PAGE_SIZE, "the runner did not take the smallest answer"
-    assert kv._streams["r1"]["main"].lease == leased[:1], (
+    assert kv._streams["r1"]["main"].lease.pages() == leased[:1], (
         "the lease still covers pages the step will now recompute"
     )
     assert all(kv._arena.owners(page) == 1 for page in leased[1:]), (

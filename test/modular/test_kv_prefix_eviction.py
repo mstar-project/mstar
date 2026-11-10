@@ -154,13 +154,13 @@ def test_a_leased_page_is_never_evicted():
     _finished(kv, "a", tokens)
     _ingest(kv, "b", tokens)
     matched = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens)))
-    leased = list(kv._streams["b"]["main"].lease)
+    leased = kv._streams["b"]["main"].lease.pages()
     assert matched, "the second request did not match, so nothing was leased"
 
     # somebody else asks for everything the pool can give
     kv._index.evict(kv.config.max_num_pages)
 
-    assert kv._streams["b"]["main"].lease == leased, (
+    assert kv._streams["b"]["main"].lease.pages() == leased, (
         "the lease lost pages to an eviction it was supposed to hold them from"
     )
     assert all(page not in kv._arena.free_pages() for page in leased), (

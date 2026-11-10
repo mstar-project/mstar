@@ -367,7 +367,7 @@ _DISAGREEING = {
 def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree):
     node = _Node([list(range(1, 33)), IMAGE, TAIL])
     node.walk(TEXT_WALK, 32)
-    lease = list(node.stream.lease)
+    lease = node.stream.lease.pages()
 
     disagree(node)
 
