@@ -244,6 +244,12 @@ class SeqRange(NamedTuple):
     order: torch.Tensor | None = None
 
     @property
+    def start(self) -> int:
+        """Where this rank's share begins among the label's tokens (of each row's), contiguous
+        ranges in rank order; a striped one's are ``index``."""
+        return sum(self.counts[: self.group.rank])
+
+    @property
     def count(self) -> int:
         return self.counts[self.group.rank]
 
@@ -255,14 +261,13 @@ class SeqRange(NamedTuple):
     @property
     def index(self) -> torch.Tensor:
         """Striped: this rank's tokens' indices in the step."""
-        start = sum(self.counts[: self.group.rank])
-        return self.order[start:start + self.count]
+        return self.order[self.start:self.start + self.count]
 
     def local(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
         """This rank's share of ``x`` (the whole label) along ``dim``: a view of a contiguous range,
         which a captured graph reads in place; a copy of a striped one, as a kernel takes it."""
         if self.order is None:
-            return x.narrow(dim, sum(self.counts[: self.group.rank]), self.count)
+            return x.narrow(dim, self.start, self.count)
         return x.index_select(dim, self.index)
 
     def whole(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:

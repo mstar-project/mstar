@@ -1133,8 +1133,7 @@ def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_
     first whatever the keys' order."""
     # one rank of the two, with no group to connect
     monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
+    groups = _sp_groups(NODE)
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS, max_num_pages=8,

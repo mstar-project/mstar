@@ -938,7 +938,7 @@ def test_lora_over_kv_stored_by_position_is_refused_where_the_steps_split(exchan
     if exchange is None:
         assert _validate(model, cfg).worker_graphs
     else:
-        _refused(model, cfg, r"node_groups\[0\]: LoRA resource 'lora' serves node 'llm', which splits tokens "
+        _refused(model, cfg, r"node_groups\[0\]: LoRA resource 'lora@llm' serves node 'llm', which splits tokens "
                              r"over 2 SP ranks")
 
 

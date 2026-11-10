@@ -11,6 +11,7 @@ and into which ranges; and the Wan2.2 DiT over its own resources on two ranks ag
 
 from __future__ import annotations
 
+import dataclasses
 import types
 
 import numpy as np
@@ -443,7 +444,7 @@ def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=
     """The shard's plan of a step of ``segments`` ((request, label, span)), as label -> (counts, rows)
     when it splits, None when copied."""
     rids = rows or sorted({rid for rid, _, _ in segments})
-    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, slot_lease=lease,
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease,
                       force_prefill=force_prefill)
     # declared once on the submodule step, as a model does, which hands it to every resource step
     step = SubmoduleStep(
@@ -998,7 +999,10 @@ def _wan_step(rank, world, grid):
         device=torch.device("cpu"), kv_dtype=torch.float32,
         joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group),
     )
-    res = {key: build_resource(spec, info) for key, spec in specs.items()}
+    res = {
+        key: build_resource(spec, dataclasses.replace(info, dependencies={d: specs[d] for d in spec.depends_on()}))
+        for key, spec in specs.items()
+    }
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
 
