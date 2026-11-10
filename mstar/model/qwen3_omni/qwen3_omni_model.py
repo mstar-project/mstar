@@ -1095,7 +1095,7 @@ class Qwen3OmniModel(Model):
         # So writing the parts out in request order and tokenizing once lets
         # the placement be read back off the ids, with no boundary
         # re-tokenized. The walks re-emit the sentinels themselves
-        # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
+        # (``ThinkerSubmodule._audio_row``, ``_wrap_vision_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
         #
