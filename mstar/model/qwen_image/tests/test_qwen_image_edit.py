@@ -248,6 +248,21 @@ def test_the_vae_nodes_match_the_pipelines_math():
     assert torch.equal(image_out, want_out)
 
 
+def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
+    """The VAE's latents depend on its input's exact values and memory layout (cuDNN picks kernels by it): on an
+    H200 a contiguous input moved the reference latents 1e-3 from the pipeline's."""
+    from diffusers.image_processor import VaeImageProcessor
+    from PIL import Image
+
+    from mstar.model.components.diffusion.image_io import vae_pixels
+
+    image = torch.randint(0, 256, (3, 48, 64), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
+    pil = Image.fromarray(image.permute(1, 2, 0).numpy())
+    ref = VaeImageProcessor(vae_scale_factor=16).preprocess(pil, height=48, width=64).unsqueeze(2)
+    ours = vae_pixels(image)
+    assert torch.equal(ours, ref) and ours.stride() == ref.stride()
+
+
 class _FakeProcessor:
     """The checkpoint processor's outputs, sized from the request: one pad per merged image token."""
 

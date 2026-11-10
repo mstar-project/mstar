@@ -29,12 +29,12 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSu
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.guidance import Guidance, cfg_renorm
 from mstar.model.components.diffusion.image_io import (
-    normalize_pixels,
     pack_latents,
     patchify_latents,
     pixels_to_uint8,
     unpack_latents,
     unpatchify_latents,
+    vae_pixels,
 )
 from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens
 from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, qwen25_tower_inputs
@@ -139,7 +139,8 @@ class QwenImageTextEncoderSubmodule(NodeSubmodule):
 class QwenImageVaeEncoderSubmodule(NodeSubmodule):
     """Reference images, uint8 ``[3, H, W]`` at the VAE's size each -> one packed sequence of normalized latent
     tokens ``[sum(h*w), 64]``, the references in order: the posterior's mode, ``(z - mean) / std`` in the
-    VAE's dtype, as the pipeline encodes. Images differ in size, so each runs alone."""
+    VAE's dtype, as the pipeline encodes, from pixels laid out as its image processor hands them
+    (:func:`vae_pixels`). Images differ in size, so each runs alone."""
 
     disable_torch_compile = True
 
@@ -158,7 +159,7 @@ class QwenImageVaeEncoderSubmodule(NodeSubmodule):
         mean, std = latent_affine(self.vae, dtype, device)[0], latent_std(self.vae, dtype, device)
         tokens = []
         for key in sorted(images, key=lambda name: int(name.split("_")[1])):
-            pixels = normalize_pixels(images[key].to(device))[None, :, None].to(dtype)  # [1, 3, 1, H, W]
+            pixels = vae_pixels(images[key]).to(device=device, dtype=dtype)  # [1, 3, 1, H, W], NHWC-strided
             latent = (self.vae.encode(pixels).latent_dist.mode() - mean) / std
             tokens.append(pack(latent[:, :, 0])[0])
         return {REF_LATENTS: [torch.cat(tokens)]}
