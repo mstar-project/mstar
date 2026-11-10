@@ -558,10 +558,9 @@ jobs:
       # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
       # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
       # re-review with `untestable` set is exempt, since that PR can't be approved. A
-      # `none` that stands runs nothing (verdict `skipped`), and counts as a pass for approval after
-      # that pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
-      # test, so the next run still checks against the last real one. A failed read of the PR's comments
-      # fails this step.
+      # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.
+      # It posts no live-test marker: it isn't a live test, so the next run still checks against the
+      # last real one. A failed read of the PR's comments fails this step.
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
@@ -674,7 +673,6 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.approver.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
-          SINCE: ${{ steps.carry.outputs.since }}
         run: python3 .github/review/gpu_review.py approve
 
       # Model output from untrusted input, posted only from the redacted copies.

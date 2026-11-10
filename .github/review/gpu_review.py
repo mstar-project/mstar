@@ -46,7 +46,7 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pypr
                ".mcp.json", ".claude.json", ".ripgreprc")
 # A submodule's commit in a file's patch, how the compare API shows a gitlink (mode 160000; it gives no mode).
 GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
-# No runtime code: a review's `none` alone approves a change only to these.
+# No runtime code: a re-review's `none` with no live test before it stands only on changes to these (carry).
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # Hardware the bot's GPUs aren't, as a word in a PR can name it (untestable): the backstop for the review's
 # own `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
@@ -201,8 +201,6 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
         out.update(run="full", checks=",".join(CHECKS), asked=run, asked_checks=out["checks"], forced=forced)
     elif run == "none":
         out["verdict"] = "skipped"
-        if passed:
-            out["since"] = last["sha"]
     elif run == "targeted" and passed:
         out["since"] = last["sha"]
         Path("earlier-live-test.md").write_text(last["body"])
@@ -398,8 +396,8 @@ def blocking(review, pages, stacked):
 
 def file_gate(files, repo_root):
     """(blocked, runtime): the files that rule out any approval (the bot's rules, CI, dependencies,
-    toolchains and lockfiles), and those outside docs, tests and benchmarks, which a review's `none`
-    approves only after a passing live test."""
+    toolchains and lockfiles), and those outside docs, tests and benchmarks, on which a re-review's `none`
+    with no live test before it runs in full (carry)."""
     labels = runpy.run_path(str(ROOT / ".github/labels/label_prs.py"))
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
     areas = {f: set(labels["areas_of"](f, aliases)) for f in files}
@@ -423,17 +421,30 @@ def for_approval(review, pages):
     """`review` as the approval reads it: a re-review's `fixed` or `moot` counts as `disputed`, so a person decides,
     where nothing in the code backs it: on a bot thread GitHub doesn't show as outdated (none of its lines changed
     since the bot posted it), and on an earlier finding outside the diff, which has no thread, whose file no commit
-    since the last review is known to have touched (`untouched`, bot.untouched). The summary's status line and the
-    GPU gate keep the review's own judgement."""
+    since the last review is known to have touched (`untouched`, bot.untouched). And a P0 or P1 judged fixed in a PR
+    stacked above (a prior finding's `fixed_above`, an outside-diff item's `fixed_in`) stays open, as `disputed` or
+    with that reason added to its claim: a PR must fix its own P0/P1s. The summary's status line and the GPU gate
+    keep the review's own judgement."""
     unchanged = {**{str(first.get("databaseId", "")): "none of this thread's lines changed: a person decides, or "
                                                        "change one of those lines"
                     for first, _, _, outdated in render_summary.bot_threads(pages) if not outdated},
                  **{location: "no commit since the last review is known to have touched its file: a person decides, "
                               "or change that file" for location in review.get("untouched") or ()}}
-    return {**review, "prior_findings": [
-        {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
-        if f["status"] in render_summary.CLEARS and f["ref"] in unchanged else f
-        for f in review.get("prior_findings") or []]}
+
+    def above(f):
+        """Why a P0/P1 judged fixed above stays open, or None for a P2/P3, which merges with the PR above."""
+        return f"fixed only in #{f.get('fixed_in', '?')} above: a P0/P1 must be fixed in this PR" \
+            if f["priority"] in ("P0", "P1") else None
+
+    def prior(f):
+        if f["status"] in render_summary.CLEARS and f["ref"] in unchanged:
+            return {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
+        return {**f, "status": "disputed", "why": above(f)} if f["status"] == "fixed_above" and above(f) else f
+
+    return {**review,
+            "outside_diff": [{**{k: v for k, v in f.items() if k != "fixed_in"}, "claim": f"{f['claim']} ({above(f)})"}
+                             if f.get("fixed_in") and above(f) else f for f in review.get("outside_diff") or []],
+            "prior_findings": [prior(f) for f in review.get("prior_findings") or []]}
 
 
 def to_fix_first(review, pr, above):
@@ -469,40 +480,32 @@ class ApprovalFacts:
     head_moved: bool
     author_access: str
     head_trusted: bool  # the head repository is this one or owned by someone with write access
-    verdict: str
-    # The review chose `none` and the workflow let it stand (the last live test passed on an ancestor, or
-    # there is none and the review didn't build on an earlier one or the PR changes no runtime code).
-    review_chose_none: bool
-    since: str  # the last passing live test this run built on, or ""
+    verdict: str  # this commit's live test: pass, partial, fail, unavailable, none, or skipped (no run)
     untestable: tuple  # what the live test can't cover here (untestable)
     too_many_files: bool  # the changed-file list is over GitHub's limit, so it couldn't be checked
     findings_changed: tuple  # the bot's inline findings someone has deleted or retagged since it posted them
     blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
-    runtime: bool  # the PR touches runtime code
     risk_level: str
     questions: int
     to_fix_first: tuple  # what the review left open (to_fix_first)
 
 
-def approval_facts(pr, sha, verdict, since, review):
+def approval_facts(pr, sha, verdict, review):
     """The facts of this PR at `sha`, from GitHub and the review; the network reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     # Against the default branch, not the PR's base, so retargeting the PR can't hide a file.
     changes = changed_files(pull["base"]["repo"]["default_branch"], sha)
-    blocked, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), ())
+    blocked = file_gate(file_names(changes), ROOT)[0] if changes is not None else ()
     gitlinks = [f["filename"] for f in changes or [] if GITLINK.search(f.get("patch") or "")]
     return ApprovalFacts(
         head_moved=pull["head"]["sha"] != sha,
         author_access=bot.permission(REPO, pull["user"]["login"]),
         head_trusted=bot.head_trusted(REPO, pull),
         verdict=verdict,
-        review_chose_none=verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none",
-        since=since,
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
         findings_changed=tuple(findings_changed(review, pr)),
         blocked=(*blocked, *gitlinks),
-        runtime=bool(set(runtime) - set(blocked)),  # a gated file already has its own reason
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
         to_fix_first=tuple(to_fix_first(for_approval(review, review_threads(pr)), pr, "stacked-above.json")),
@@ -521,7 +524,7 @@ class Decision:
         return [*self.rule, *self.review]
 
 
-# The two rules that come from the file list approval_facts takes against the default branch.
+# The rule that comes from the file list approval_facts takes against the default branch.
 COUNTED = "files counted against main, including any PR below this one"
 
 
@@ -534,7 +537,10 @@ def decide(f):
         rule.append(f"the author's access is {f.author_access}, not write")
     if not f.head_trusted:
         rule.append("the PR's head repository isn't this one or owned by someone with write access")
-    if not (f.verdict == "pass" or f.review_chose_none):
+    if f.verdict == "skipped":
+        rule.append("no live test ran on this commit (the review chose none): the bot approves only after one "
+                    "passes, so a person approves")
+    elif f.verdict != "pass":
         note = "; judge its 👂 rows" if f.verdict == "partial" else ""
         rule.append(f"the live test's verdict is {f.verdict}{note}")
     rule += f.untestable
@@ -544,9 +550,6 @@ def decide(f):
     if f.blocked:
         rule.append(f"touches the review's rules or dependencies ({COUNTED}): " + ", ".join(f.blocked[:8])
                     + (" and more" if len(f.blocked) > 8 else ""))
-    # A review's `none` counts on runtime code only after a passing live test.
-    if f.verdict == "skipped" and not f.since and f.runtime:
-        rule.append(f"no GPU run on runtime code ({COUNTED})")
     review = []
     if f.risk_level != "low":
         review.append(f"the review rated the design risk {f.risk_level}: a maintainer owns the decisions its "
@@ -586,15 +589,15 @@ def left_for_you(pr, review, decision):
     return render_summary.checklist(for_approval(review, pages), pages, stacked, list(decision.rule))
 
 
-def approve(out, pr, head_sha, runner_temp, verdict, since=""):
+def approve(out, pr, head_sha, runner_temp, verdict):
     """Approve the PR when the rule holds (decide) and REVIEW_APPROVALS is on. What the
     live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
     is posted at all. The review finished cleanly: the live-test job runs only then."""
-    pr, since = int(pr), commit(since) if since else ""
+    pr = int(pr)
     review = json.loads(Path("review.json").read_text())
     refresh_above()
-    outcome = decide(approval_facts(pr, head_sha, verdict, since, review))
+    outcome = decide(approval_facts(pr, head_sha, verdict, review))
     decision = Path(runner_temp, "decision.md")
     if not approvals_on():
         decision.write_text(f"Approvals are off, or their setting can't be read (`REVIEW_APPROVALS`). "
@@ -605,10 +608,9 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
         print("not approved: " + bot.log_value("; ".join(outcome.why)))  # the model's text and file names
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
-    tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
-    body = (f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and {tested}. "
-            "It covers this commit only: a push leaves it visible, but a merge then needs a new `/review` or a "
-            "person's approval.")
+    body = (f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and the live "
+            "test passed on it. It covers this commit only: a push leaves it visible, but a merge then needs a new "
+            "`/review` or a person's approval.")
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
            input=json.dumps({"commit_id": head_sha, "event": "APPROVE", "body": body}))
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")

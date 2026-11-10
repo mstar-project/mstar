@@ -588,8 +588,8 @@ the last review.
   - `targeted`: only the checks the change reaches;
   - `none`: nothing in the change needs a GPU run to settle it (docs, comments, tests, benchmarks,
     or code no served request runs); never a change to what a model or the server does, however
-    small. On a `none` with no passing live test before it, only docs, tests and benchmarks can be
-    approved. The reason says why in one sentence. A change to tests that skip without CUDA gets at
+    small. The bot never approves a `none`: approval needs a live test that passed on the commit.
+    The reason says why in one sentence. A change to tests that skip without CUDA gets at
     least `targeted`: the live test runs CI's tests on the box's GPUs, and GitHub's CPU job never
     does.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
@@ -621,8 +621,7 @@ before it, since no GPU run covered the commits that review built on, and its `n
 PR changes only docs, tests and benchmarks. A re-review with `untestable` set is exempt from both:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
-run" with your reason. It counts as a pass for approval after a passing live test on an ancestor, or
-when the PR changes only docs, tests and benchmarks.
+run" with your reason, and a person approves.
 
 **GPUs are expensive; use as few as settle the question.** Size the box to the largest config the
 plan needs, not the largest the model supports; prefer the smallest model and layout that reaches
