@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import Resource, StepRunner
+from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
+from mstar.testing_utils.resource import StubResource
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the host pool pins its memory"
@@ -418,15 +419,11 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
 # ── the length every resource agreed to ─────────────────────────────────
 
 
-class _Holding(Resource):
+class _Holding(StubResource):
     """A resource that holds a prefix of its own, shorter than the cache's."""
 
     def __init__(self, matched: int):
         self._matched = matched
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return CachedPrefix("main", self._matched, self._matched)
