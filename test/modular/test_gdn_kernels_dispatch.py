@@ -440,6 +440,11 @@ def test_the_sequential_prefill_slot_map():
     expected = torch.full((4, 8), -1, dtype=torch.int32)
     expected[0, 0] = expected[0, 7] = 7
     assert torch.equal(kernel._map, expected)
+    # a row on the sink with a real span (a mixed step's decode run) is skipped too
+    kernel.plan(_prefill_plan((3, 2, 0, 0), [5, 0, 0, 0], [False] * 4))
+    expected = torch.full((4, 8), -1, dtype=torch.int32)
+    expected[0, 0] = expected[0, 2] = 5
+    assert torch.equal(kernel._map, expected)
 
 
 def test_a_bucket_refuses_a_layout_it_cannot_hold():

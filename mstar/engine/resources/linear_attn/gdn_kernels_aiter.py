@@ -365,14 +365,15 @@ class AiterSequentialPrefill(GDNPrefillKernel):
         device = plan.slots.device
         if self._map is None:
             self._allocate(device)
-        # Each row's last token, from the host; -1 for a row the pool sends to
-        # its sink, which then never matches. The slots are already on device.
+        # Each row's last token, from the host; -1 for a row without one, and for
+        # a row the pool sends to its sink even if it has a span (a mixed step's
+        # decode run), which then never matches. The slots are already on device.
         last = [span - 1 if span else -1 for span in plan.real_spans]
         self._last[:rows].copy_(
             torch.tensor(last, dtype=torch.int32, pin_memory=device.type == "cuda"),
             non_blocking=True,
         )
-        ends = self._last[:rows, None]
+        ends = torch.where(plan.slots[:rows] == SINK_SLOT, self._none, self._last[:rows])[:, None]
         cells = (self._cols == ends) | (self._first & (ends >= 0))
         torch.where(
             cells, plan.slots[:rows, None], self._none, out=self._map[:rows],
