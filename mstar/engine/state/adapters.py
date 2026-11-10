@@ -499,6 +499,10 @@ class OpBinding:
         """``value`` in the layout `block` gives its field in the pool."""
         return value
 
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        """``stored``, read from the pool, in the layout the op declares its field in."""
+        return stored
+
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
         """What a handle calls to run the op."""
         return resources[key]
@@ -637,8 +641,11 @@ class GDN(LinearAttnBinding):
         return _block(TensorType((h_v, d_v, d_k), dtype=dtype, shard=shard))
 
     def stored(self, value: torch.Tensor) -> torch.Tensor:
-        """The swap of the last two axes, which is its own inverse."""
+        """The swap of the last two axes, which `from_stored` swaps back."""
         return value.transpose(-1, -2)
+
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        return stored.transpose(-1, -2)
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -817,23 +824,21 @@ class ValueHandle(ArrayHandle):
             for layer in self.array.layers
         }
 
-    def _k_last(self, field: str) -> bool:
-        """Whether ``field`` is the state a declared `GatedDeltaNet` reads, stored K-last as `GDN.block` lays it."""
-        return field == "state" and GatedDeltaNet in self._runners
-
     def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
         """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
         block = self.block(field, layer)
-        expected = (*block.shape[1:-2], block.shape[-1], block.shape[-2]) if self._k_last(field) else block.shape[1:]
+        layout = self._layouts.get(field)
+        expected = block.shape[1:] if layout is None else layout.from_stored(block).shape[1:]
         dtype = self.array.entry.tensors[field].dtype or block.dtype
         if tuple(shape) != tuple(expected) or value.dtype != dtype:
             raise self._refusal(f"{what} of field {field!r} on layer {layer} is {tuple(shape)} of {value.dtype}, and "
                                 f"the field is {tuple(expected)} of {dtype} on this rank")
-        return (value.transpose(-1, -2) if self._k_last(field) else value).to(block.dtype)
+        return (value if layout is None else layout.stored(value)).to(block.dtype)
 
     def _declared(self, field: str, stored: torch.Tensor) -> torch.Tensor:
         """``stored``, read from the pool, in ``field``'s declared layout and dtype."""
-        value = stored.transpose(-1, -2) if self._k_last(field) else stored
+        layout = self._layouts.get(field)
+        value = stored if layout is None else layout.from_stored(stored)
         return value.to(self.array.entry.tensors[field].dtype or value.dtype)
 
     @torch.compiler.disable
