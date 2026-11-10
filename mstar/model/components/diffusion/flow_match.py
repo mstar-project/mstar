@@ -15,6 +15,11 @@ Numerics follow diffusers ``FlowMatchEulerDiscreteScheduler`` to the bit:
 * the shift is applied in float32 numpy arithmetic with a Python-float ``mu``
   (NumPy's NEP-50 promotion keeps float32), so the sigmas equal the reference's
   ``self.sigmas`` exactly;
+* ``shift_terminal``, when set, then stretches the shifted grid so its last
+  sigma is that value (``stretch_shift_to_terminal``), in the same arithmetic;
+* a checkpoint with a fixed sigma list (distilled ones) skips all of the above:
+  ``FlowMatchSchedule.from_sigmas`` uses the list as given, which is what the
+  scheduler does with ``set_timesteps(sigmas=...)`` at shift 1 and no dynamic shift;
 * ``timesteps = sigmas * num_train_timesteps`` and a terminal ``0`` is appended
   to ``sigmas``;
 * the Euler step upcasts the sample to fp32, uses ``dt = sigma_next - sigma``
@@ -52,6 +57,8 @@ class FlowMatchConfig:
     max_shift: float = 1.15
     base_image_seq_len: int = 256
     max_image_seq_len: int = 4096
+    # The last sigma the shifted grid is stretched to end at (None: no stretch).
+    shift_terminal: float | None = None
     # The pipeline's base grid: float64 numpy linspace cast to float32 (FLUX.2) or
     # float32 torch.linspace (Z-Image). Not in the scheduler config; the pipeline picks.
     torch_linspace: bool = False
@@ -67,8 +74,6 @@ class FlowMatchConfig:
         for key in ("use_karras_sigmas", "use_exponential_sigmas", "use_beta_sigmas", "invert_sigmas"):
             if cfg.get(key):
                 raise NotImplementedError(f"scheduler option {key}=True is not supported by FlowMatchSchedule")
-        if cfg.get("shift_terminal"):
-            raise NotImplementedError("scheduler shift_terminal is not supported by FlowMatchSchedule")
         if cfg.get("time_shift_type", "exponential") != "exponential":
             raise NotImplementedError("only the exponential time shift is supported")
         if cfg.get("use_dynamic_shifting", False):
@@ -83,6 +88,7 @@ class FlowMatchConfig:
             max_shift=float(cfg.get("max_shift", 1.15)),
             base_image_seq_len=int(cfg.get("base_image_seq_len", 256)),
             max_image_seq_len=int(cfg.get("max_image_seq_len", 4096)),
+            shift_terminal=float(cfg["shift_terminal"]) if cfg.get("shift_terminal") else None,
         )
 
 
@@ -135,6 +141,9 @@ class FlowMatchSchedule:
     def build(cls, config: FlowMatchConfig, num_steps: int, image_seq_len: int) -> "FlowMatchSchedule":
         if num_steps < 1:
             raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+        if config.shift_terminal is not None and num_steps < 2:
+            # The stretch divides by 1 - sigmas[-1], which is 0 on a one-step grid (the reference yields NaN).
+            raise ValueError(f"num_steps must be >= 2 with shift_terminal, got {num_steps}")
         # The pipelines' explicit grid, then the scheduler's float32 numpy arithmetic.
         if config.torch_linspace:
             sigmas = torch.linspace(1.0, 1 / num_steps, num_steps, dtype=torch.float32).numpy()
@@ -153,8 +162,22 @@ class FlowMatchSchedule:
             sigmas = math.exp(mu) / (math.exp(mu) + (1 / sigmas - 1) ** 1.0)
         elif config.shift_mode is ShiftMode.LINEAR:
             sigmas = config.shift * sigmas / (1 + (config.shift - 1) * sigmas)
+        if config.shift_terminal is not None:
+            one_minus_z = 1 - sigmas
+            sigmas = 1 - one_minus_z / (one_minus_z[-1] / (1 - config.shift_terminal))
+        return cls._from_array(sigmas, config.num_train_timesteps, mu)
+
+    @classmethod
+    def from_sigmas(cls, sigma_values, num_train_timesteps: int = 1000) -> "FlowMatchSchedule":
+        """A fixed sigma list (terminal excluded), used as given."""
+        if len(sigma_values) < 1:
+            raise ValueError("a sigma schedule needs at least one sigma")
+        return cls._from_array(np.array(sigma_values).astype(np.float32), num_train_timesteps, None)
+
+    @classmethod
+    def _from_array(cls, sigmas: np.ndarray, num_train_timesteps: int, mu: float | None) -> "FlowMatchSchedule":
         sigmas_t = torch.from_numpy(np.ascontiguousarray(sigmas)).to(torch.float32)
-        timesteps = sigmas_t * config.num_train_timesteps
+        timesteps = sigmas_t * num_train_timesteps
         sigmas_t = torch.cat([sigmas_t, torch.zeros(1, dtype=torch.float32)])
         return cls(sigmas=sigmas_t, timesteps=timesteps, mu=mu)
 

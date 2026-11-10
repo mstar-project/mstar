@@ -53,7 +53,6 @@ from mstar.model.ltx2_5.submodules import (
     VIDEO_XATTN,
     LTXDenoiseSubmodule,
     LTXShape,
-    distilled_schedule,
     ltx_step,
     pack_audio,
     pack_video,
@@ -372,13 +371,6 @@ def test_declare_step_under_sequence_parallelism(rank, shard):
     for key in (VIDEO_XATTN, AUDIO_XATTN):
         assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
     assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
-
-
-def test_distilled_schedule_matches_the_scheduler_recipe():
-    sched = distilled_schedule()
-    assert sched.num_steps == 8
-    assert sched.sigmas[-1] == 0 and sched.sigmas[:-1].tolist() == pytest.approx(list(DISTILLED_SIGMA_VALUES))
-    assert torch.equal(sched.timesteps, sched.sigmas[:-1] * 1000)
 
 
 def test_step_is_the_reference_round_trip_then_euler():

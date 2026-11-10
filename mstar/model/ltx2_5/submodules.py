@@ -20,7 +20,6 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -97,14 +96,6 @@ def shape_from_metadata(config: LTX25Config, step_metadata: dict) -> LTXShape:
         fps=fps,
         text_len=config.text_max_seq_len,
     )
-
-
-def distilled_schedule(sigma_values=DISTILLED_SIGMA_VALUES) -> FlowMatchSchedule:
-    """An explicit sigma list as ``FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=...)``
-    builds it for this checkpoint (shift 1.0, no dynamic shifting): float32 sigmas used
-    as given, ``timesteps = 1000 * sigmas``, a terminal 0 appended."""
-    sigmas = torch.from_numpy(np.array(sigma_values).astype(np.float32))
-    return FlowMatchSchedule(sigmas=torch.cat([sigmas, torch.zeros(1)]), timesteps=sigmas * 1000, mu=None)
 
 
 def ltx_step(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor, sigma_next: torch.Tensor):
@@ -256,8 +247,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def schedule_for(self, fwd_info, bucket_key: LTXShape) -> FlowMatchSchedule:
         if fwd_info.graph_walk in self.refine_walks:
-            return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES)
-        return distilled_schedule()
+            return FlowMatchSchedule.from_sigmas(STAGE_2_DISTILLED_SIGMA_VALUES)
+        return FlowMatchSchedule.from_sigmas(DISTILLED_SIGMA_VALUES)
 
     def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
         """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,
