@@ -1232,7 +1232,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">submit</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)))</span>
                 <span class="k">try</span><span class="p">:</span>
                     <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="n">index</span><span class="p">],</span> <span class="n">raw_request</span><span class="p">)</span>
-                <span class="k">except</span> <span class="n">HTTPException</span><span class="p">:</span>
+                <span class="k">except</span> <span class="p">(</span><span class="n">HTTPException</span><span class="p">,</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">CancelledError</span><span class="p">):</span>
                     <span class="n">read</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span>
                     <span class="k">raise</span>
                 <span class="n">read</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span>

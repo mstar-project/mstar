@@ -1021,6 +1021,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
@@ -1076,7 +1077,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">request_id</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-            <span class="k">except</span> <span class="n">HTTPException</span><span class="p">:</span>
+            <span class="k">except</span> <span class="p">(</span><span class="n">HTTPException</span><span class="p">,</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">CancelledError</span><span class="p">):</span>
                 <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>  <span class="c1"># collect_results released it before raising</span>
                 <span class="k">raise</span>
             <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>

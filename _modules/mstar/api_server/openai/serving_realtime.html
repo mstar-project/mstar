@@ -1640,9 +1640,6 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
-        <span class="k">except</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">CancelledError</span><span class="p">:</span>
-            <span class="n">api</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
-            <span class="k">raise</span>
         <span class="k">except</span> <span class="n">HTTPException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
             <span class="c1"># a request the engine failed: the status says whose fault it was</span>
             <span class="k">raise</span> <span class="n">StepError</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
