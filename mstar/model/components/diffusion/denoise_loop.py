@@ -62,7 +62,7 @@ Conventions the base fixes:
   them, with the request's scales as step scalars. An unguided step runs branch 0
   alone. A request's rows are its local branches in order. Whether a step is
   guided is the step key's, from the request's per-step fill of scales
-  (:meth:`guidance_scales_at`), as a step schedule's dtype is.
+  (``GUIDANCE.at``), as a step schedule's dtype is.
 """
 
 from __future__ import annotations
@@ -219,9 +219,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         }
         # The step scalars the base slices per step: the scheduler's, and a guided model's scales, each staged
         # under its own name (``_guidance_sources``).
+        scales = guidance.scales if guidance is not None else ()
+        shadowed = set(scales) & set(self.STEP_SCALARS)
+        if shadowed:
+            raise ValueError(
+                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with STEP_SCALARS"
+            )
         self.step_scalars: Mapping[str, StepScalar] = {
-            **self.STEP_SCALARS,
-            **{name: StepScalar(name, broadcast=False) for name in (guidance.scales if guidance is not None else ())},
+            **self.STEP_SCALARS, **{name: StepScalar(name, broadcast=False) for name in scales},
         }
 
     @property
@@ -362,14 +367,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         alone."""
         return euler_step(latents, self.guided_output(engine_inputs, key, latents, timestep, **cond), sigma, sigma_next)
 
-    def guidance_scales_at(self, step_metadata: Mapping, step: int) -> Mapping[str, float]:
-        """The request's guidance scales at denoise step ``step``, by ``GUIDANCE.scales`` name: the fill its step
-        scalars are staged from, and whether the step is guided (``GUIDANCE.active`` of them, in a request that is
-        active at all). Default: the request's knobs at every step. A schedule of scales (guidance on an interval
-        of steps, a truncation) overrides this. It is a host function of the metadata and the step, as a step
-        schedule's dtype is, since the scheduler asks it for a step before that step's inputs are prepared."""
-        return {name: float(step_metadata[name]) for name in self.GUIDANCE.scales}
-
     def build_layout(self, key: StepKey, device: torch.device) -> Any:
         """Derived per-key state (e.g. rotary tables); cached by :meth:`layout` per bucket and branch share."""
         return None
@@ -447,7 +444,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             return self._key(bucket_key, None, False)
         k = self.step_index(fwd_info) if step is None else step
         dtype = None if self.step_dtypes is None else self.step_dtypes.at(k)
-        return self._key(bucket_key, dtype, guided and guidance.active(self.guidance_scales_at(metadata, k)))
+        return self._key(bucket_key, dtype, guided and guidance.active(guidance.at(metadata, k)))
 
     def _key(self, bucket_key: Hashable, dtype: str | None, guided: bool) -> StepKey:
         return StepKey(bucket_key, dtype, guided, self._branch_shares[guided])
@@ -547,14 +544,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _guidance_sources(
         self, fwd_info: CurrentForwardPassInfo, num_steps: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
-        """The request's fill of each guidance scale, one value per step (:meth:`guidance_scales_at`), staged under the
-        scale's name as its step scalar's source."""
-        if self.GUIDANCE is None:
+        """The request's fill of each guidance scale, one value per step (``GUIDANCE.at``), staged under the scale's
+        name as its step scalar's source."""
+        guidance = self.GUIDANCE
+        if guidance is None:
             return {}
-        fill = [self.guidance_scales_at(fwd_info.step_metadata, k) for k in range(num_steps)]
+        fill = [guidance.at(fwd_info.step_metadata, k) for k in range(num_steps)]
         return {
-            name: to_device_nonblocking(torch.tensor([at[name] for at in fill], dtype=torch.float32), device)
-            for name in self.GUIDANCE.scales
+            name: to_device_nonblocking(torch.tensor([float(at[name]) for at in fill], dtype=torch.float32), device)
+            for name in guidance.scales
         }
 
     def _carried_inputs(

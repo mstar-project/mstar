@@ -699,8 +699,9 @@ def test_a_cfg_rank_runs_its_branch_and_matches_one_gpu(rank, scale):
 class IntervalGuidedToy(GuidedToy):
     """Guidance on steps 1 and 2 only: the fill holds 1 (off) at the other steps."""
 
-    def guidance_scales_at(self, step_metadata, step):
-        return {"guidance_scale": float(step_metadata["guidance_scale"]) if step in (1, 2) else 1.0}
+    GUIDANCE = GuidedToy.GUIDANCE._replace(
+        at=lambda step_metadata, step: {"guidance_scale": step_metadata["guidance_scale"] if step in (1, 2) else 1.0},
+    )
 
 
 def test_guidance_turns_on_and_off_per_step_from_the_requests_fill():
@@ -730,6 +731,19 @@ def test_guidance_turns_on_and_off_per_step_from_the_requests_fill():
 def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_construction():
     with pytest.raises(ValueError, match="evenly"):
         GuidedToy(cfg_group=_Group(3))
+
+
+def test_a_guidance_scale_that_shadows_a_step_scalar_is_refused_at_construction():
+    def combine(preds, scales):
+        return cfg(preds, {"guidance_scale": scales["timestep"]})
+
+    combine.scales = ("timestep",)
+
+    class Shadowing(GuidedToy):
+        GUIDANCE = GuidedToy.GUIDANCE._replace(combine=combine)
+
+    with pytest.raises(ValueError, match="timestep"):
+        Shadowing()
 
 
 def test_guided_capture_buckets_stage_the_scale_and_both_keys():

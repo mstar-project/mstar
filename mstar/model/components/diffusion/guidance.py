@@ -3,13 +3,14 @@
 A model declares ``GUIDANCE = Guidance(branches=..., combine=...)`` on its
 :class:`~mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule`, and the base does the rest:
 it runs each branch as a row of the model's forward, splits the branches over the deployment's ``cfg_size``
-ranks, gathers the predictions and combines them, with the request's scales (``scales``, by default its
-``guidance_scale``) as per-row step scalars. A model writes the prediction (``model_output``), never the branches.
+ranks, gathers the predictions and combines them, with the request's scales (the knobs the combine names in its
+``scales``: ``guidance_scale`` for :func:`cfg`) as per-row step scalars. A model writes the prediction
+(``model_output``), never the branches.
 
 Whether guidance is on is decided per step. A request runs its branches at all when one of its scale knobs is
 above 1 (``active``, which intake and the text encoder ask too); a step runs them when, in addition, one of the
-scales its fill holds for that step is (``DenoiseLoopSubmodule.guidance_scales_at``, by default the knobs at every
-step). Its other steps run branch 0 alone, so guidance on an interval of steps is a fill, not a mechanism.
+scales its fill holds for that step is (``Guidance.at``, by default the knobs at every step). Its other steps run
+branch 0 alone, so guidance on an interval of steps is a fill, not a mechanism.
 
 Branch order is part of the contract. Branch ``b`` is ``branches[b]``, and ``combine`` receives the
 predictions in that order (``cfg``: conditional first). Within a step the rows are request-major
@@ -21,7 +22,7 @@ source labels in the order of that tuple.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import torch
@@ -31,7 +32,12 @@ GUIDANCE_SCALE = "guidance_scale"
 
 
 class GuidanceCombine(Protocol):
-    """``(predictions in branch order, {scale name: [B, 1, ...] at the predictions' rank}) -> prediction``."""
+    """``(predictions in branch order, {scale name: [B, 1, ...] at the predictions' rank}) -> prediction``.
+
+    ``scales`` names the request knobs it reads, the one place they are declared: the base stages each per step
+    under its name and hands it here. Two scales (text and image guidance, say) are two names."""
+
+    scales: tuple[str, ...]
 
     def __call__(self, preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor: ...
 
@@ -46,11 +52,23 @@ def cfg(preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> to
     return uncond + (scales[GUIDANCE_SCALE] * (cond - uncond).float()).to(cond.dtype)
 
 
+cfg.scales = (GUIDANCE_SCALE,)
+
+
 def cfg_renorm(preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor:
     """:func:`cfg`, rescaled per token to the conditional prediction's norm over the last dim
     (Qwen-Image's ``comb * |cond| / |comb|``)."""
     comb = cfg(preds, scales)
     return comb * (preds[0].norm(dim=-1, keepdim=True) / comb.norm(dim=-1, keepdim=True))
+
+
+cfg_renorm.scales = cfg.scales
+
+
+def every_step(step_metadata: Mapping, step: int) -> Mapping:
+    """The default fill (``Guidance.at``): the request's knobs at every step."""
+    del step
+    return step_metadata
 
 
 class Guidance(NamedTuple):
@@ -64,9 +82,17 @@ class Guidance(NamedTuple):
     # the input's name here, ``branches[b][argument]``.
     branches: tuple[Mapping[str, str], ...]
     combine: GuidanceCombine
-    # The request knobs ``combine`` reads, by name: each is staged per step from the request's fill and handed to
-    # ``combine`` under its name. Two scales (text and image guidance, say) are two names here.
-    scales: tuple[str, ...] = (GUIDANCE_SCALE,)
+    # The request's fill: ``(step_metadata, step) -> mapping``, holding by name the scales a denoise step runs at. Its
+    # step scalars are staged from it, and the step is guided when ``active`` of it is (in a request that is active
+    # at all). A schedule of scales (guidance on an interval of steps, a truncation) is a fill. It is a host
+    # function of the metadata and the step, as a step schedule's dtype is, since the scheduler asks it for a step
+    # before that step's inputs are prepared.
+    at: Callable[[Mapping, int], Mapping] = every_step
+
+    @property
+    def scales(self) -> tuple[str, ...]:
+        """The request knobs ``combine`` reads (its ``scales``)."""
+        return self.combine.scales
 
     def active(self, scales: Mapping) -> bool:
         """Whether guidance is on at these scales (a request's ``step_metadata``, or one step's fill): one of them
