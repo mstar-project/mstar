@@ -85,8 +85,7 @@ class DeepseekOCRModel(MultimodalDecoderModel):
         self.config = dataclasses.replace(text, extra_stop_token_ids=() if eos is None else (eos,))
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         # one input per view size: an image smaller than a tile has no tiles
-        encoder = MediaEncoder("vision", "vision_encoder", ("global_views", "tiles"), "vision_embeds",
-                               (self.image_token_id,))
+        encoder = MediaEncoder("vision", "vision_encoder", ("global_views", "tiles"), "vision_embeds")
         self.media = (MediaIntake("image", encoder, self.image_token_id, self._image_intake),)
         # the model card decodes greedily; the checkpoint ships no generation_config
         self.sampling_defaults = {"temperature": 0.0, **self.sampling_defaults}
