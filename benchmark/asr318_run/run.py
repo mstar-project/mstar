@@ -426,7 +426,7 @@ class Server:
             cmd = [str(MSTAR_BIN / "mstar"), "serve", m["key"], "--gpus", str(self.gpu), "--port", str(self.port),
                    "--socket-path-prefix", f"/tmp/mstar_{self.name}_{ts}/",
                    "--upload-dir", f"/tmp/mstar_up_{self.name}_{ts}/"] + self.serve_args
-            strict = {**env, "MSTAR_REQUIRE_CUDA_GRAPHS": "1"}
+            strict = {**env, "MSTAR_REQUIRE_ACCELERATOR_GRAPHS": "1"}
             return [("graphs_required", cmd, strict), ("graphs_not_required", cmd, env)]
         if e == "vllm":
             vb = ENVS / "vllm" / "bin"
