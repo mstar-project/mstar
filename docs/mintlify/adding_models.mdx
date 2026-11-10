@@ -131,6 +131,12 @@ The metadata `process_prompt` returns is laid over the request's own `model_kwar
 
 <Note>
 
+The OpenAI chat route reports `usage.prompt_tokens` from `Model.count_prompt_tokens(tensors)`, which by default counts the ids in the `text_inputs` that `process_prompt` returned. A model whose prompt holds tokens outside `text_inputs` (media it does not expand there) overrides it. `usage.completion_tokens` counts the ids of the text chunks the client receives, and `finish_reason` is `length` once they reach the request's `max_output_tokens`.
+
+</Note>
+
+<Note>
+
 A stream that starts with context-only items (a voice clone's reference frames) says so in the metadata as `"stream_lead_items": {edge: n}`: `edge` names a streaming `Connection`, and `n`, at most that edge's policy's left context, leads the first window as context and is never output. Leave the key out when `n` is 0. The data worker drops a client's value, and the consumer partition's workers prime the stream with it (Qwen3-TTS, VoxCPM2).
 
 </Note>

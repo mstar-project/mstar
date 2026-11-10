@@ -60,13 +60,14 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use adapters::{OpenAIAdapter, Part, SubmitArgs};
-use bridge::{Bridge, ResultChunk};
+use bridge::{Bridge, ResultChunk, Usage};
 use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, SpeechRequest,
     VideoGenerationRequest,
 };
 use serving::{
-    collect, now, result_stream, rid, try_result_stream, AppState, Out, OutStream, DUPLICATE_ID_GRACE,
+    collect, now, result_stream, result_stream_with_usage, rid, try_result_stream, AppState, Out, OutStream,
+    UsageSlot, DUPLICATE_ID_GRACE,
 };
 use utf8::Utf8Stream;
 
@@ -659,16 +660,20 @@ async fn chat_completions(
     let request_id = rid("chatcmpl");
 
     if req.stream.unwrap_or(false) {
-        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+        let (stream, usage) = result_stream_with_usage(&st, &args, &request_id, true);
+        let base = match open_stream(stream).await {
             Ok(base) => base,
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
-        return chat_sse(base, request_id, model_name).into_response();
+        return chat_sse(base, request_id, model_name, usage, include_usage(&req)).into_response();
     }
-    match collect(result_stream(&st, &args, &request_id, false)).await {
+    let (stream, usage) = result_stream_with_usage(&st, &args, &request_id, false);
+    match collect(stream).await {
         Ok(chunks) => {
             let rate = st.sample_rate;
-            match blocking(move || build_chat_response(&model_name, &request_id, chunks, rate, audio_format)).await {
+            let usage = usage.get().cloned();
+            let build = move || build_chat_response(&model_name, &request_id, chunks, rate, audio_format, usage.as_ref());
+            match blocking(build).await {
                 Ok(body) => Json(body).into_response(),
                 Err(e) => error(500, &e, "server_error"),
             }
@@ -686,24 +691,50 @@ async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
     }
 }
 
-/// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
-/// rides on the first delta (the finish one when there is none), as in
-/// `serving_chat.py`: clients time the first token from the first chunk.
+/// OpenAI's `stream_options.include_usage`, as `serving_chat._include_usage`
+/// reads it: a stream ends with a chunk that carries `usage` and no choices.
+fn include_usage(req: &ChatCompletionRequest) -> bool {
+    req.extra
+        .get("stream_options")
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get("include_usage"))
+        .is_some_and(adapters::truthy)
+}
+
+/// OpenAI's `usage` object; zeros when the backend reported none.
+fn usage_json(usage: Option<&Usage>) -> Value {
+    let (prompt, completion) = usage.map_or((0, 0), |u| (u.prompt_tokens, u.completion_tokens));
+    json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion})
+}
+
+fn finish_reason(usage: Option<&Usage>) -> &str {
+    usage.map_or("stop", |u| u.finish_reason.as_str())
+}
+
+/// SSE `chat.completion.chunk`s: per-chunk deltas, finish, the usage chunk
+/// when `include_usage`, `[DONE]`. The role rides on the first delta (the
+/// finish one when there is none), as in `serving_chat.py`: clients time the
+/// first token from the first chunk.
 fn chat_sse(
     base: OutStream,
     request_id: String,
     model_name: String,
+    usage: UsageSlot,
+    include_usage: bool,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let payloads = chat_sse_payloads(base, request_id, now(), model_name);
+    let payloads = chat_sse_payloads(base, request_id, now(), model_name, usage, include_usage);
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
 }
 
-/// The `data:` payloads of [`chat_sse`], in order.
+/// The `data:` payloads of [`chat_sse`], in order. `usage` is read once
+/// `base` has ended, when the request's `done` has filled it.
 fn chat_sse_payloads(
     base: OutStream,
     request_id: String,
     created: i64,
     model: String,
+    usage: UsageSlot,
+    include_usage: bool,
 ) -> impl futures::Stream<Item = String> {
     // Set if a terminal error is emitted mid-stream, so the tail below does NOT
     // append a clean `finish_reason:"stop"` + `[DONE]` — a failed request must
@@ -747,7 +778,21 @@ fn chat_sse_payloads(
             if !rest.is_empty() {
                 out.push(chunk_json(&request_id, created, &model, with_role(json!({"content": rest})), None));
             }
-            out.push(chunk_json(&request_id, created, &model, with_role(json!({})), Some("stop")));
+            let usage = usage.get();
+            out.push(chunk_json(&request_id, created, &model, with_role(json!({})), Some(finish_reason(usage))));
+            if include_usage {
+                out.push(
+                    json!({
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": usage_json(usage),
+                    })
+                    .to_string(),
+                );
+            }
             out.push("[DONE]".to_string());
         }
         futures::stream::iter(out)
@@ -829,6 +874,7 @@ fn build_chat_response(
     chunks: Vec<ResultChunk>,
     sample_rate: u32,
     audio_format: &str,
+    usage: Option<&Usage>,
 ) -> Result<Value, String> {
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
@@ -870,8 +916,8 @@ fn build_chat_response(
         "object": "chat.completion",
         "created": now(),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(usage)}],
+        "usage": usage_json(usage),
     }))
 }
 
@@ -2227,8 +2273,9 @@ mod tests {
                 ..SubmitArgs::default()
             };
             let st = state(None);
-            let base = result_stream(&st, &args, "r", true);
-            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone()).into_response()).await;
+            let (base, usage) = result_stream_with_usage(&st, &args, "r", true);
+            let (status, _, data) =
+                body(chat_sse(base, "r".into(), st.model_name.clone(), usage, false).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text
@@ -2494,7 +2541,7 @@ mod tests {
         assert_eq!((compressed("MP3"), compressed("opus")), (Ok("mp3"), Ok("opus")));
         let pcm = vec![1u8, 0, 2, 0];
         let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
-        let resp = build_chat_response("m", "r", chunks, 24000, "pcm").unwrap();
+        let resp = build_chat_response("m", "r", chunks, 24000, "pcm", None).unwrap();
         assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
     }
 
@@ -2549,7 +2596,8 @@ mod tests {
     fn streamed_content(items: Vec<Out>) -> (String, Vec<Value>) {
         let base: serving::OutStream = Box::pin(futures::stream::iter(items));
         let payloads: Vec<String> = futures::executor::block_on(
-            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string()).collect::<Vec<_>>(),
+            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), UsageSlot::default(), false)
+                .collect::<Vec<_>>(),
         );
         let events: Vec<Value> = payloads
             .iter()
@@ -2563,9 +2611,63 @@ mod tests {
         (content, events)
     }
 
+    fn cut_usage() -> Usage {
+        Usage { prompt_tokens: 7, completion_tokens: 2, finish_reason: "length".to_string() }
+    }
+
+    #[test]
+    fn a_chat_reports_the_backend_s_usage_and_finish_reason() {
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav", Some(&cut_usage())).unwrap();
+        assert_eq!(resp["choices"][0]["finish_reason"], "length");
+        assert_eq!(resp["usage"], json!({"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}));
+        // none reported (the mock generator): zeros and a stop, as before
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav", None).unwrap();
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+        assert_eq!(resp["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn a_stream_ends_on_the_backend_s_finish_reason_and_its_usage_when_asked() {
+        for include in [false, true] {
+            let usage = UsageSlot::default();
+            usage.set(cut_usage()).unwrap();
+            let items = split_text_chunks().into_iter().map(Out::Chunk);
+            let base: serving::OutStream = Box::pin(futures::stream::iter(items));
+            let payloads: Vec<String> = futures::executor::block_on(
+                chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), usage, include).collect::<Vec<_>>(),
+            );
+            assert_eq!(payloads.last().unwrap(), "[DONE]");
+            let events: Vec<Value> =
+                payloads[..payloads.len() - 1].iter().map(|p| serde_json::from_str(p).unwrap()).collect();
+            let finish = &events[events.len() - 1 - usize::from(include)];
+            assert_eq!(finish["choices"][0]["finish_reason"], "length");
+            let tail = events.last().unwrap();
+            if include {
+                assert_eq!(tail["choices"], json!([]));
+                assert_eq!(tail["object"], "chat.completion.chunk");
+                assert_eq!(tail["usage"], json!({"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}));
+            } else {
+                assert!(events.iter().all(|e| e.get("usage").is_none()), "{events:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn include_usage_reads_stream_options_as_python_does() {
+        let req = |opts: &str| -> ChatCompletionRequest {
+            serde_json::from_str(&format!(r#"{{"messages": [], "stream": true{opts}}}"#)).unwrap()
+        };
+        assert!(!include_usage(&req("")));
+        assert!(include_usage(&req(r#", "stream_options": {"include_usage": true}"#)));
+        assert!(!include_usage(&req(r#", "stream_options": {"include_usage": false}"#)));
+        assert!(!include_usage(&req(r#", "stream_options": {}"#)));
+        assert!(!include_usage(&req(r#", "stream_options": null"#)));
+        assert!(!include_usage(&req(r#", "stream_options": [true]"#)));
+    }
+
     #[test]
     fn chat_response_joins_text_before_decoding() {
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav").unwrap();
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav", None).unwrap();
         assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
     }
 

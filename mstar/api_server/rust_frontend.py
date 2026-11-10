@@ -17,7 +17,9 @@ protocol are untouched):
                        | {t:"voices", rid, sub}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
-                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
+                       | {t:"err", rid, sub, msg}
+                       | {t:"done", rid, sub, metadata?:{prompt_tokens,
+                          completion_tokens, finish_reason}}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
                        | {t:"checked", rid, sub, error?, status?}
@@ -29,6 +31,10 @@ exports as ``mstar_http_refusals_total``. The reply is what ``GET /metrics``
 serves on the Python frontend: the text rendered from ``APIServer.metrics``
 with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics
 are off (a 404; the counts are then ignored).
+
+A submission's ``done`` carries its ``APIServer.request_usage`` in
+``metadata``: the prompt and completion token counts and the
+``finish_reason`` the OpenAI routes report.
 
 ``chunks`` carries many submissions' chunks as parallel lists, in order:
 the API server's message thread hands the bridge every chunk it drained in
@@ -337,18 +343,27 @@ class RustFrontendBridge:
         key = self._keys[sub] = self.server.submission_key(rid)
         if msg.get("accepts_chunks"):
             self.server.relay_chunks_to(key, self, sub)
+        usage = self.server.request_usage(rid)
         chunks = self.server.iter_result_chunks(rid)
-        asyncio.get_running_loop().create_task(self._relay(rid, sub, chunks))
+        asyncio.get_running_loop().create_task(self._relay(rid, sub, chunks, usage))
 
-    async def _relay(self, rid: str, sub: int | None, chunks) -> None:
-        """Forward this request's ResultChunks; terminal err on failure."""
+    async def _relay(self, rid: str, sub: int | None, chunks, usage=None) -> None:
+        """Forward this request's ResultChunks, then ``done`` with its usage;
+        terminal err on failure."""
         try:
             async for chunk in chunks:
                 self._send({
                     "t": "chunk", "rid": rid, "sub": sub, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
                 })
-            self._send({"t": "done", "rid": rid, "sub": sub})
+            done = {"t": "done", "rid": rid, "sub": sub}
+            if usage is not None:
+                done["metadata"] = {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "finish_reason": usage.finish_reason,
+                }
+            self._send(done)
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
             detail = getattr(e, "detail", None)
             if detail:

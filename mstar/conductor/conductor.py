@@ -371,6 +371,8 @@ class RequestData:
     # resource label -> the config this request's resources were opened with
     resource_configs: dict[str, ResourceReqConfig]
     sharding_config: ShardingConfig | None = None
+    # the data worker's count, passed back on RequestComplete
+    prompt_tokens: int = 0
     # what the replica pick recorded for the request; released in _drop_request
     routing: RoutingHandle | None = None
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
@@ -1468,6 +1470,7 @@ class Conductor:
             worker_graph_to_workers=worker_graph_to_workers,
             all_worker_graph_ids=set(worker_graph_to_workers.keys()),
             max_output_tokens=max_output_tokens,
+            prompt_tokens=body.prompt_tokens,
             random_seed=seed,
             partition_states=partition_states,
             partition_definitions=partition_definitions,
@@ -1837,6 +1840,8 @@ class Conductor:
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
                     conductor_arrival_time=request_data.conductor_arrival_time,
+                    prompt_tokens=request_data.prompt_tokens,
+                    max_output_tokens=request_data.max_output_tokens,
                 )
             )
         )

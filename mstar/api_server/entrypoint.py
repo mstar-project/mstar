@@ -49,6 +49,7 @@ from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
     PreprocessInput,
+    RequestUsage,
     ResultChunk,
 )
 from mstar.api_server.served_models import Selected, ServedModels
@@ -311,6 +312,7 @@ class PendingRequest:
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
     output_totals: dict[str, OutputInfo] = field(default_factory=dict)
+    usage: RequestUsage = field(default_factory=RequestUsage)
     error: Any | None = None
     error_status: int = 500
     # The client streams the client may still append to, and when it last
@@ -1279,6 +1281,8 @@ class APIServer:
                                 # late, not rejected
                                 req.open_streams = frozenset()
                                 req.output_chunk_counts = message.body.output_chunk_counts
+                                req.usage.prompt_tokens = message.body.prompt_tokens
+                                req.usage.max_output_tokens = message.body.max_output_tokens
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
@@ -1365,6 +1369,7 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
+                        req.usage.completion_tokens += result_chunk.num_tokens
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)
                             if info is None:
@@ -1537,6 +1542,14 @@ class APIServer:
         take it right after ``submit_request`` and pass it to
         :meth:`abort_submission`."""
         return self._bind(request_id)[0]
+
+    def request_usage(self, request_id: str) -> RequestUsage | None:
+        """The usage of the newest submission under ``request_id``, which the
+        message thread fills in as it runs. Take it right after
+        ``submit_request``, as :meth:`submission_key`, and read it once the
+        request's results have ended; None for an id with nothing submitted."""
+        req = self._bind(request_id)[1]
+        return None if req is None else req.usage
 
     def iter_result_chunk_batches(self, request_id: str):
         """Yield the :class:`ResultChunk` objects as they arrive, as one list

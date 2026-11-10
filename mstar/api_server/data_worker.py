@@ -998,6 +998,7 @@ class PreprocessWorkerThread:
             stream_items = {name: tensors for name, tensors in
                             self._framed(call, stream_items, call.ended, per_frame=False).items() if tensors}
             self._charge_stream_items(call, stream_items)
+        prompt_tokens = self.model.count_prompt_tokens(tensors) if self.model is not None else 0
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
@@ -1017,6 +1018,7 @@ class PreprocessWorkerThread:
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
+                prompt_tokens=prompt_tokens,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -1648,6 +1650,7 @@ class PreprocessWorkerThread:
             datas = None
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
+        num_tokens = 1 if item.modality == "text" else 0
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1677,7 +1680,7 @@ class PreprocessWorkerThread:
                     sequence,
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
-                        postprocess_s=postprocess_s,
+                        postprocess_s=postprocess_s, num_tokens=num_tokens,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1812,6 +1815,8 @@ class PreprocessWorkerThread:
                 metadata=chunk_metadata,
                 read_time=read_time,
                 postprocess_s=postprocess_s,
+                # a float text tensor (Whisper's word alignment) carries no ids
+                num_tokens=tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0,
             ),
         )
         if self.enable_nvtx:

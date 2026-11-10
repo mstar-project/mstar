@@ -35,6 +35,7 @@ from test_rust_frontend import (
 
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
+from mstar.api_server.request_types import RequestUsage
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 from mstar.api_server.served_models import ServedModels
 
@@ -291,12 +292,16 @@ class _PythonServer:
     open_result_stream = APIServer.open_result_stream
     lora_kwargs = APIServer.lora_kwargs
 
-    def __init__(self, model_name, upload_dir):
+    def __init__(self, model_name, upload_dir, usage=None):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
         self.served_models = ServedModels.of(model_name, None)
+        self.usage = usage
 
     def submit_request(self, **kwargs):
         return kwargs["request_id"]
+
+    def request_usage(self, request_id):
+        return self.usage
 
     async def collect_results(self, request_id, raw_request=None):
         return [_Chunk("text", b"Hello "), _Chunk("text", b"world")]
@@ -354,6 +359,54 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     with _model_stack(model, _StubAPIServer()) as (port, _upload):
         rust = _post(port, "/v1/chat/completions", body, timeout=30)
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+
+
+# ── usage and finish_reason ──────────────────────────────────────────────────
+
+# a reply max_tokens cut short, and one its stop token ended
+USAGE_CASES = {
+    "cut": (RequestUsage(prompt_tokens=7, completion_tokens=2, max_output_tokens=2), "length"),
+    "stopped": (RequestUsage(prompt_tokens=7, completion_tokens=2, max_output_tokens=16), "stop"),
+}
+STREAM_CASES = {
+    "whole": {},
+    "stream": {"stream": True},
+    "stream-usage": {"stream": True, "stream_options": {"include_usage": True}},
+}
+
+
+@pytest.mark.parametrize("stream", sorted(STREAM_CASES))
+@pytest.mark.parametrize("ending", sorted(USAGE_CASES))
+def test_both_frontends_report_a_reply_s_usage_and_why_it_ended_alike(ending, stream, tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    usage, finish = USAGE_CASES[ending]
+    body = {"messages": [{"role": "user", "content": "The capital of France?"}], "max_tokens": 2,
+            **STREAM_CASES[stream]}
+    streamed = bool(body.get("stream"))
+    monkeypatch.setattr(entrypoint, "api_server", _PythonServer("qwen3_5_0.8b", tmp_path, usage))
+    py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    stub = _StubAPIServer()
+    stub.usage = usage
+    with _model_stack("qwen3_5_0.8b", stub) as (port, _upload):
+        rust = _post(port, "/v1/chat/completions", body, timeout=30)
+    status, got = _normalized(*rust, streamed)
+    assert (status, got) == _normalized(py.status_code, py.content, streamed)
+
+    want = {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+    if not streamed:
+        assert got["choices"][0]["finish_reason"] == finish and got["usage"] == want
+        return
+    assert got[-1] == "[DONE]"
+    events = got[:-1]
+    if "stream_options" in body:
+        *events, tail = events
+        assert tail["choices"] == [] and tail["usage"] == want
+    assert events[-1]["choices"][0]["finish_reason"] == finish
+    assert all("usage" not in e for e in events)
 
 
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.request_types import RequestUsage  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 
@@ -62,6 +63,11 @@ class _StubAPI:
         self.raise_after: Exception | None = None
         self.aborted: list = []
         self.released: list = []
+        # what the message thread would have counted for the next request
+        self.usage = RequestUsage()
+
+    def request_usage(self, request_id):
+        return self.usage
 
     def release_request(self, request_id):
         self.released.append(request_id)
@@ -578,6 +584,58 @@ def test_chat_stream(client_and_stub):
     assert lines[0]["choices"][0]["delta"].get("role") == "assistant"
     assert "".join(l["choices"][0]["delta"].get("content", "") for l in lines) == "streaming"
     assert lines[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+# a reply the output budget cut short, and one its stop token ended
+_CUT = RequestUsage(prompt_tokens=7, completion_tokens=2, max_output_tokens=2)
+_STOPPED = RequestUsage(prompt_tokens=7, completion_tokens=3, max_output_tokens=16)
+
+
+@pytest.mark.parametrize("usage,finish", [(_CUT, "length"), (_STOPPED, "stop")], ids=["cut", "stopped"])
+def test_a_chat_reports_its_token_counts_and_why_it_ended(client_and_stub, usage, finish):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"The"), _Chunk("text", b" capital")]
+    stub.usage = usage
+    body = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}).json()
+    assert body["choices"][0]["finish_reason"] == finish
+    total = usage.prompt_tokens + usage.completion_tokens
+    assert body["usage"] == {
+        "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": total,
+    }
+
+
+@pytest.mark.parametrize("include", [None, False, True])
+@pytest.mark.parametrize("usage,finish", [(_CUT, "length"), (_STOPPED, "stop")], ids=["cut", "stopped"])
+def test_a_chat_stream_ends_on_why_it_ended_and_its_usage_when_asked(client_and_stub, usage, finish, include):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"The"), _Chunk("text", b" capital")]
+    stub.usage = usage
+    body = {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+    if include is not None:
+        body["stream_options"] = {"include_usage": include}
+    text = client.post("/v1/chat/completions", json=body).text
+    events = [json.loads(ln[6:]) for ln in text.splitlines() if ln.startswith("data: {")]
+    assert text.rstrip().endswith("data: [DONE]")
+    if include:
+        *events, tail = events
+        assert tail["choices"] == [] and tail["object"] == "chat.completion.chunk"
+        assert tail["usage"]["completion_tokens"] == usage.completion_tokens
+        assert tail["usage"]["total_tokens"] == usage.prompt_tokens + usage.completion_tokens
+    assert all("usage" not in e for e in events)
+    assert events[-1]["choices"][0]["finish_reason"] == finish
+    assert stub.last_submit["model_kwargs"].get("stream_options") is None
+
+
+def test_a_failed_chat_stream_sends_no_usage(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"The"), _Chunk("error", b"boom", {"status": 500})]
+    stub.usage = _CUT
+    text = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": {"include_usage": True},
+    }).text
+    events = [json.loads(ln[6:]) for ln in text.splitlines() if ln.startswith("data: {")]
+    assert "error" in events[-1]
+    assert all("usage" not in e and e.get("choices", [{}])[0].get("finish_reason") is None for e in events)
 
 
 def test_videos_stream_ndjson(client_and_stub):

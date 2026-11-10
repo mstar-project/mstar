@@ -12,14 +12,14 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::stream::Stream;
 use uuid::Uuid;
 
 use crate::adapters::SubmitArgs;
-use crate::bridge::{Bridge, ResultChunk, StreamItem};
+use crate::bridge::{Bridge, ResultChunk, StreamItem, Usage};
 use crate::refusals::{mark_submitted, Refusals};
 use crate::tokenizer::{IncrementalDecoder, Tok};
 
@@ -65,6 +65,10 @@ pub enum Out {
 
 pub type OutStream = Pin<Box<dyn Stream<Item = Out> + Send>>;
 
+/// Where a submission's `done` leaves its usage: set once the stream has
+/// ended cleanly, and never for the mock generator or a failed request.
+pub type UsageSlot = Arc<OnceLock<Usage>>;
+
 /// Aborts the request on drop unless it completed — covers both the client
 /// disconnecting mid-stream (axum drops the body stream, dropping this) and
 /// the timeout path (mstar's `abort_request` releases engine state).
@@ -93,9 +97,22 @@ pub fn result_stream(
     request_id: &str,
     streaming: bool,
 ) -> OutStream {
-    try_result_stream(state, args, request_id, streaming).unwrap_or_else(|(status, message)| {
-        Box::pin(futures::stream::once(async move { Out::Error { status, message } }))
-    })
+    result_stream_with_usage(state, args, request_id, streaming).0
+}
+
+/// [`result_stream`], and the slot its `done` fills with the request's usage.
+pub fn result_stream_with_usage(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+) -> (OutStream, UsageSlot) {
+    let usage = UsageSlot::default();
+    let stream = submit_stream(state, args, request_id, streaming, usage.clone())
+        .unwrap_or_else(|(status, message)| {
+            Box::pin(futures::stream::once(async move { Out::Error { status, message } }))
+        });
+    (stream, usage)
 }
 
 /// How long `/generate` waits for a submission still in flight under a client's
@@ -111,7 +128,17 @@ pub fn try_result_stream(
     request_id: &str,
     streaming: bool,
 ) -> Result<OutStream, (u16, String)> {
-    let base = raw_result_stream(state, args, request_id, streaming)?;
+    submit_stream(state, args, request_id, streaming, UsageSlot::default())
+}
+
+fn submit_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+    usage: UsageSlot,
+) -> Result<OutStream, (u16, String)> {
+    let base = raw_result_stream(state, args, request_id, streaming, usage)?;
     Ok(match (&args.tokens, &state.tok) {
         (Some(_), Some(tok)) => detokenize(base, tok.clone()),
         _ => base,
@@ -178,6 +205,7 @@ fn raw_result_stream(
     args: &SubmitArgs,
     request_id: &str,
     streaming: bool,
+    usage: UsageSlot,
 ) -> Result<OutStream, (u16, String)> {
     let stream: OutStream = match &state.bridge {
         Some(b) => {
@@ -192,26 +220,29 @@ fn raw_result_stream(
             };
             let deadline = Instant::now() + state.request_timeout;
             // finished: a terminal item was yielded — end on the next poll.
-            let st = (rx, guard, deadline, false);
+            let st = (rx, guard, deadline, false, usage);
             Box::pin(futures::stream::unfold(
                 st,
-                |(mut rx, mut guard, deadline, finished)| async move {
+                |(mut rx, mut guard, deadline, finished, usage)| async move {
                     if finished {
                         return None;
                     }
                     let left = deadline.saturating_duration_since(Instant::now());
                     match tokio::time::timeout(left, rx.recv()).await {
                         Ok(Some(StreamItem::Chunk(c))) => {
-                            Some((Out::Chunk(c), (rx, guard, deadline, false)))
+                            Some((Out::Chunk(c), (rx, guard, deadline, false, usage)))
                         }
                         Ok(Some(StreamItem::Error { status, message })) => {
                             guard.done = true; // conductor already cleaned up
                             Some((
                                 Out::Error { status, message },
-                                (rx, guard, deadline, true),
+                                (rx, guard, deadline, true, usage),
                             ))
                         }
-                        Ok(Some(StreamItem::Done)) => {
+                        Ok(Some(StreamItem::Done(done))) => {
+                            if let Some(done) = done {
+                                let _ = usage.set(done);
+                            }
                             guard.done = true;
                             drop(guard); // completed: Drop sees done and skips the abort
                             None
@@ -226,7 +257,7 @@ fn raw_result_stream(
                                     status: 500,
                                     message: "Request timed out".to_string(),
                                 },
-                                (rx, guard, deadline, true),
+                                (rx, guard, deadline, true, usage),
                             ))
                         }
                     }

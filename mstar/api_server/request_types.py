@@ -27,6 +27,8 @@ class ResultChunk:
     # ``postprocess_inline`` call for a value sent inline)
     read_time: float | None = None
     postprocess_s: float = 0.0
+    # how many sampled token ids a text chunk carries; usage.completion_tokens sums them
+    num_tokens: int = 0
 
 
 @dataclass
@@ -71,6 +73,30 @@ class RequestComplete:
     # When the conductor took the request in (queued or admitted), in the same
     # clock as conductor_ingest_time. Only stamped while metrics are on.
     conductor_arrival_time: float | None = None
+    # the prompt's length, as the data worker counted it (NewRequestConductor),
+    # and the output budget the request ran with, after the conductor fit it
+    # to the request's resources
+    prompt_tokens: int = 0
+    max_output_tokens: int | None = None
+
+
+@dataclass(slots=True)
+class RequestUsage:
+    """A request's token counts, as OpenAI's ``usage`` reports them. The API
+    server's message thread fills it in, ``completion_tokens`` as the text
+    chunks arrive and the rest from ``RequestComplete``; read it once the
+    request's results have ended."""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    max_output_tokens: int | None = None
+
+    @property
+    def finish_reason(self) -> str:
+        """``length`` when the reply used its whole output budget, else ``stop``.
+        A reply whose stop token is its last allowed one, and is counted, reads
+        as ``length`` too: the count cannot tell the two apart."""
+        cap = self.max_output_tokens
+        return "length" if cap is not None and self.completion_tokens >= cap else "stop"
 
 
 @dataclass

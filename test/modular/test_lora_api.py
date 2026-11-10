@@ -131,6 +131,9 @@ class _StubAPI:
     async def collect_results(self, request_id, raw_request=None):
         return [SimpleNamespace(modality="text", data=b"ok", metadata={})]
 
+    def request_usage(self, request_id):
+        return None
+
 
 def _client(monkeypatch, config, adapter=None):
     import mstar.api_server

@@ -320,6 +320,9 @@ class NewRequestConductor(MessageBody):
     # A client stream the opening leaves open: a live call, which is refused
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
+    # the prompt's length in tokens (Model.count_prompt_tokens), returned to the
+    # API server on RequestComplete for usage.prompt_tokens
+    prompt_tokens: int = 0
 
 
 @dataclass

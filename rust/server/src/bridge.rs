@@ -22,7 +22,7 @@
 //!                        | {t:"voices", rid, sub}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
-//!                        | {t:"done",  rid, sub}
+//!                        | {t:"done",  rid, sub, metadata?:Usage}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
 //!                        | {t:"checked", rid, sub, error?, status?}
@@ -67,6 +67,16 @@ pub struct ResultChunk {
     pub metadata: Value,
 }
 
+/// A finished request's token counts and why it ended, as the API server
+/// reports them on `done` (`APIServer.request_usage`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// `"length"` when the output budget ended the reply, else `"stop"`.
+    pub finish_reason: String,
+}
+
 /// A result chunk, a backend error, or end-of-stream, delivered to a
 /// request's serving task.
 #[derive(Debug)]
@@ -76,7 +86,9 @@ pub enum StreamItem {
     /// terminal — the route is removed. `status` is the HTTP status the
     /// frontend should return (from the error chunk's `metadata.status`).
     Error { status: u16, message: String },
-    Done,
+    /// The request finished; a submission's `done` carries its usage, a
+    /// probe's reply none.
+    Done(Option<Usage>),
 }
 
 // ---- wire messages ----
@@ -396,7 +408,7 @@ impl Bridge {
     pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
         let start = std::time::Instant::now();
         match self.round_trip("check_ref_audio", None, Some(check), timeout).await {
-            Some(StreamItem::Done) => Ok(()),
+            Some(StreamItem::Done(_)) => Ok(()),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
             // the request's budget ran out, as the Python frontend's request would
             None if start.elapsed() >= timeout => Err((500, "Request timed out".to_string())),
@@ -457,12 +469,12 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(StreamItem::Error { status: 500, message: msg.msg }),
             true,
         ),
-        "done" => (Some(StreamItem::Done), true),
+        "done" => (Some(StreamItem::Done(serde_json::from_value(msg.metadata).ok())), true),
         // Liveness reply: completes the ping's route like a request.
-        "pong" => (Some(StreamItem::Done), true),
+        "pong" => (Some(StreamItem::Done(None)), true),
         "checked" => match msg.error {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
-            None => (Some(StreamItem::Done), true),
+            None => (Some(StreamItem::Done(None)), true),
         },
         "metrics" | "voices" => (
             Some(StreamItem::Chunk(ResultChunk {
@@ -593,6 +605,23 @@ mod tests {
         claim(3).expect("refused after the previous one failed");
         routes.lock().unwrap().remove(3); // Bridge::abort
         claim(4).expect("refused after the previous one was aborted");
+    }
+
+    #[test]
+    fn a_done_carries_its_usage_and_a_probe_reply_none() {
+        let routes: Routes = Mutex::new(Table::default());
+        let (tx, mut rx) = unbounded_channel();
+        routes.lock().unwrap().claim("X", 1, tx).unwrap();
+        let msg = json!({"t": "done", "rid": "X", "sub": 1, "metadata":
+                         {"prompt_tokens": 7, "completion_tokens": 2, "finish_reason": "length"}});
+        deliver(&routes, rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap());
+        let want = Usage { prompt_tokens: 7, completion_tokens: 2, finish_reason: "length".to_string() };
+        assert!(matches!(rx.try_recv(), Ok(StreamItem::Done(Some(u))) if u == want));
+
+        let (tx, mut rx) = unbounded_channel();
+        routes.lock().unwrap().claim("Y", 2, tx).unwrap();
+        deliver(&routes, inbound("done", 2));
+        assert!(matches!(rx.try_recv(), Ok(StreamItem::Done(None))), "a done without usage");
     }
 
     #[test]

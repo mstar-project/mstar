@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.request_types import RequestUsage
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
@@ -46,18 +47,35 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             streaming=bool(req.stream),
             request_id=request_id,
         )
+        usage = api.request_usage(request_id)
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
             return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate),
+                _stream_events(batches, model_name, request_id, sample_rate, usage, _include_usage(req)),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format, usage)
+
+
+def _include_usage(req) -> bool:
+    """OpenAI's ``stream_options.include_usage``: a stream ends with a chunk
+    that carries ``usage`` and no choices."""
+    options = getattr(req, "stream_options", None)
+    return isinstance(options, dict) and bool(options.get("include_usage"))
+
+
+def _usage_json(usage: RequestUsage | None) -> dict:
+    prompt, completion = (usage.prompt_tokens, usage.completion_tokens) if usage is not None else (0, 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _finish_reason(usage: RequestUsage | None) -> str:
+    return "stop" if usage is None else usage.finish_reason
 
 
 def _audio_format(req, sample_rate: int) -> str:
@@ -72,7 +90,7 @@ def _audio_format(req, sample_rate: int) -> str:
     return "pcm" if fmt == "pcm16" else fmt
 
 
-def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", usage=None) -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -109,22 +127,27 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": _finish_reason(usage)}],
+        "usage": _usage_json(usage),
     }
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate):
+async def _stream_events(batches, model_name, request_id, sample_rate, usage=None, include_usage=False):
+    """``usage`` is read after the last batch, when the request has ended."""
     created = now()
 
-    def chunk(delta, finish=None) -> str:
+    def event(choices, **extra) -> str:
         return sse({
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            "choices": choices,
+            **extra,
         })
+
+    def chunk(delta, finish=None) -> str:
+        return event([{"index": 0, "delta": delta, "finish_reason": finish}])
 
     def error(message: str, status: int) -> str:
         return sse({"error": {"message": message, "type": error_type(status), "code": status}})
@@ -180,5 +203,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         yield error(str(exc.detail), exc.status_code)
     if not failed:
         tail = text.flush()
-        yield chunk({**role, "content": tail} if tail else role, finish="stop")
+        yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage))
+        if include_usage:
+            yield event([], usage=_usage_json(usage))
     yield SSE_DONE

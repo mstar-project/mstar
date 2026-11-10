@@ -277,6 +277,7 @@ def test_rust_bridge_passes_extras_to_the_coercing_check():
     bridge.server = types.SimpleNamespace(
         submit_request=lambda **kw: seen.append(normalize_generation_kwargs(kw["model_kwargs"])),
         submission_key=lambda rid: rid,
+        request_usage=lambda rid: None,
         iter_result_chunks=no_chunks,
     )
 

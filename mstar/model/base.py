@@ -1033,6 +1033,13 @@ class Model(ABC):
         """
         pass
 
+    def count_prompt_tokens(self, tensors: NameToTensorList) -> int:
+        """The prompt's length in tokens, as OpenAI's ``usage.prompt_tokens``
+        reports it, from the request's tensors after ``process_prompt``. By
+        default the ids in ``text_inputs``; a model whose prompt holds tokens
+        elsewhere (media it does not expand into ``text_inputs``) overrides it."""
+        return sum(t.numel() for t in tensors.get("text_inputs") or () if not t.is_floating_point())
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before

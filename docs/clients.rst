@@ -487,9 +487,11 @@ Endpoints and model coverage:
        the ``audio`` extra; streamed audio is ``pcm16``. ``n`` or
        ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
        ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
-       other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
-       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
-       sends no usage chunk.
+       other than text are refused. ``usage`` counts the prompt's and the reply's tokens,
+       and ``finish_reason`` is ``length`` when ``max_tokens`` ended the reply, else
+       ``stop``; a stream with ``stream_options.include_usage`` ends with a usage chunk
+       (``choices: []``) before ``[DONE]``. ``parallel_tool_calls``, ``user``, ``store``,
+       ``metadata`` and ``service_tier`` are accepted and have no effect.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise

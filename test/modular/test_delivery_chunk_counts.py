@@ -242,7 +242,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     import threading
 
     from mstar.api_server.entrypoint import APIServer, PendingRequest
-    from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultChunk
+    from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestUsage, ResultChunk
     from mstar.profile.format import RequestProfile
 
     runtime, put, sent = new_runtime(SHAPES["text_image_text"][1], tmp_path)
@@ -251,6 +251,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     complete = APIServerMessage(message_type="request_complete", body=RequestComplete(
         request_id="r1", output_chunk_counts=expected_counts(reports),
         conductor_ingest_time=0.0, conductor_finish_time=0.0,
+        prompt_tokens=9, max_output_tokens=len(chunks),
     ))
 
     worker = PreprocessWorker.__new__(PreprocessWorker)
@@ -266,7 +267,8 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     # a frame's inline values (one InlineTokens per frame) give a chunk per request
     def complete_at_once(item):
         for rid in item.request_ids if isinstance(item, InlineTokens) else [item.request_id]:
-            worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={}))
+            worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={},
+                                                num_tokens=1))
     worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
@@ -295,6 +297,8 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
 
     assert req.event.is_set() and req.error is None
     assert len(req.chunks) == len(chunks)
+    # the tokens of the chunks that came after the completion count too
+    assert req.usage == RequestUsage(prompt_tokens=9, completion_tokens=len(chunks), max_output_tokens=len(chunks))
     # Released by the pass that read the last chunk (the loop prunes at the
     # end of a pass), so the next pass is the first to see it; before the fix
     # it was released right after request_complete.

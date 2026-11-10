@@ -58,6 +58,8 @@ class _StubAPIServer:
         self.texts = {}
         # rid -> (sink, tag), from relay_chunks_to
         self.sinks = {}
+        # APIServer.request_usage's answer for every submission; None reports none
+        self.usage = None
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -88,6 +90,9 @@ class _StubAPIServer:
 
     def relay_chunks_to(self, key, sink, tag):
         self.sinks[key] = (sink, tag)
+
+    def request_usage(self, request_id):
+        return self.usage
 
     def abort_request(self, request_id):
         self.aborted.append(request_id)

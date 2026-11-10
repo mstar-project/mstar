@@ -241,6 +241,16 @@ You must implement these abstract methods:
 
 .. note::
 
+   The OpenAI chat route reports ``usage.prompt_tokens`` from
+   ``Model.count_prompt_tokens(tensors)``, which by default counts the ids in the
+   ``text_inputs`` that ``process_prompt`` returned. A model whose prompt holds
+   tokens outside ``text_inputs`` (media it does not expand there) overrides it.
+   ``usage.completion_tokens`` counts the ids of the text chunks the client
+   receives, and ``finish_reason`` is ``length`` once they reach the request's
+   ``max_output_tokens``.
+
+.. note::
+
    A stream that starts with context-only items (a voice clone's reference frames)
    says so in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a
    streaming ``Connection``, and ``n``, at most that edge's policy's left context,
