@@ -17,6 +17,7 @@ import os
 import pytest
 import torch
 
+from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     HIFT_MEL_CACHE,
     HIFT_TAIL,
@@ -34,10 +35,10 @@ from mstar.model.components.token2wav.model import (
     window_frames,
     window_tokens,
 )
-from mstar.model.components.token2wav.submodule import Token2WavKeys
 from mstar.model.components.token2wav.voice_prompt import VoicePrompt
-from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
 
+T2W_STATE = "t2w_state"
+T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, kv=T2W_KV)
 
 # ---------------------------------------------------------------------------
@@ -728,13 +729,16 @@ def test_resources_declare_one_state_pool_and_a_cache_per_family():
     assert all(s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in kv.values())
 
 
-@pytest.mark.parametrize(("state", "kv", "ok"), [(None, None, True), (17, 16, True), (16, 16, False)])
+@pytest.mark.parametrize(
+    ("state", "kv", "ok"), [(None, None, True), (17, 16, True), (16, 16, False), (17, None, False)],
+)
 def test_slot_check_wants_one_more_state_slot_than_each_cache(state, kv, ok):
     from mstar.model.components.token2wav.resources import check_token2wav_slots
 
     resources = {}
     if state is not None:
         resources[T2W_STATE] = {"max_slots": state}
+    if kv is not None:
         resources.update({key: {"max_slots": kv} for key in T2W_KV.values()})
     if ok:
         check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")

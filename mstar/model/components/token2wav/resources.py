@@ -13,13 +13,13 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
 )
+from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
     DIT_COMPUTE_DTYPE,
     CacheCapacity,
     slot_layout,
 )
-from mstar.model.components.token2wav.submodule import Token2WavKeys
 
 # frames of the s3 tokenizer per second of voice clip
 _TOKENS_PER_SECOND = 25

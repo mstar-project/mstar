@@ -57,6 +57,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel,
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
+from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     DIT_COMPUTE_DTYPE,
     HOP,
@@ -64,7 +65,7 @@ from mstar.model.components.token2wav.model import (
     load_token2wav,
 )
 from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
-from mstar.model.components.token2wav.submodule import Token2WavKeys, Token2WavSubmodule
+from mstar.model.components.token2wav.submodule import Token2WavSubmodule
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig

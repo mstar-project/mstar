@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 
@@ -21,6 +21,7 @@ from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 from mstar.model.components.token2wav.flow import MEL_BINS
+from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
     LAST_WINDOW_TOKENS,
@@ -43,17 +44,6 @@ from mstar.model.submodule_base import (
 from mstar.utils.h2d import to_device_nonblocking
 
 
-class Token2WavKeys(NamedTuple):
-    """The names a model gives token2wav's input signal and resources."""
-
-    # the streamed speech codes this node reads
-    codes: str
-    # the ``RecurrentStateSpec`` holding each request's conv caches and HiFT tails
-    state: str
-    # cache family (``CACHE_FAMILIES``) -> its ``BoundedKVSpec`` resource key
-    kv: Mapping[str, str]
-
-
 class Token2WavSubmodule(NodeSubmodule):
     """Speech codes -> 24 kHz audio, one stream window per step: upstream's
     ``Token2wav.stream``, fed the way its ``streaming_generate`` feeds it (three
@@ -61,8 +51,8 @@ class Token2WavSubmodule(NodeSubmodule):
 
     The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
     the first window gets the silence prepended here. A request's attention caches
-    are on the ``T2W_KV`` bounded KV resources, which start from its voice's
-    prepared caches; its conv caches and HiFT tails are its slot of ``self.keys.state``
+    are on the ``keys.kv`` bounded KV resources, which start from its voice's
+    prepared caches; its conv caches and HiFT tails are its slot of ``keys.state``
     (``RecurrentStatePool``). Its stream position is the chunk's offset in the
     stream (``prepare_inputs``).
 
@@ -188,7 +178,7 @@ class Token2WavSubmodule(NodeSubmodule):
         first = chunk.start_offset == 0
         if first:
             codes = torch.cat([self._lead_silence, codes])
-            state.add("voice", fwd_info.step_metadata.get("voice"))
+            state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
             # HiFT's excitation, window by window from the request's seed
             state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
         # Window k starts 25k codes into the silence-led stream (its look-back
@@ -374,7 +364,7 @@ class Token2WavSubmodule(NodeSubmodule):
                 mel = torch.stack([mels[rid] for rid in chunk])
                 wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last)
                 for i, rid in enumerate(chunk):
-                    out[rid] = {"audio_chunk": [wav[i]]}
+                    out[rid] = {self.keys.audio: [wav[i]]}
         return out
 
     def _chunks(self, runner, group: list, last: bool) -> list[list]:
