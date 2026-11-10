@@ -3422,7 +3422,9 @@ through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = Fa
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
 nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
-renders each), the sentinels a template leaves to its processor, how many
+renders each), the sentinels a template leaves to its processor, the ids its placeholders
+follow when the template writes the sentinels itself (``opens``: MiniCPM-o's ``<image>``,
+``<slice>`` and ``<|audio_start|>``, so a ``<unk>`` the user typed stays a token), how many
 placeholders an attachment fills (``runs(attachment, metadata, request)``, one by default; a Qwen3.5 video fills one
 per temporal group), and ``prepare``, which turns an attachment into the encoder's input
 tensors and each placeholder's tokens (a ``PreparedMedia``). Both see the attachment, its loader

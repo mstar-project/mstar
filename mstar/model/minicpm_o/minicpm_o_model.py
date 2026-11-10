@@ -221,11 +221,19 @@ class MiniCPMOModel(MultimodalDecoderModel):
             tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>", "<|tts_eos|>")
         )
         # Each image slice and each audio clip is one run of `<unk>`, wrapped in
-        # its sentinels by the rendered prompt (`_prompt_ids`).
-        unk = tokenizer.convert_tokens_to_ids("<unk>")
+        # its sentinels by the rendered prompt (`_prompt_ids`). A `<unk>` the
+        # user typed follows none of them and stays a token, as upstream's.
+        tok = tokenizer.convert_tokens_to_ids
+        unk = tok("<unk>")
         self.media = (
-            MediaIntake("image", IMAGE_ENCODER, unk, self._image_intake, runs=self._image_runs),
-            MediaIntake("audio", AUDIO_ENCODER, unk, self._audio_intake, runs=self._audio_runs),
+            MediaIntake(
+                "image", IMAGE_ENCODER, unk, self._image_intake, runs=self._image_runs,
+                opens=frozenset({tok("<image>"), tok("<slice>")}),
+            ),
+            MediaIntake(
+                "audio", AUDIO_ENCODER, unk, self._audio_intake, runs=self._audio_runs,
+                opens=frozenset({tok("<|audio_start|>")}),
+            ),
         )
         self._voices: dict[str, torch.Tensor] = {}
 

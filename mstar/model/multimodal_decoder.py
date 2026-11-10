@@ -50,6 +50,7 @@ from mstar.model.multimodal import (
     media_walk_name,
     media_walks,
     parts_from_modalities,
+    placeholders,
 )
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
@@ -95,7 +96,10 @@ class MediaIntake:
     ``max_slice_nums``). Intakes may share a ``pad`` (and then its sentinels):
     the nth placeholder of a pad goes to the nth attachment of that pad in
     the order of the prompt's parts, which is where `_prompt_ids` renders
-    each attachment.
+    each attachment. ``opens`` are the ids a placeholder follows in the
+    rendered prompt, for a template that writes its own sentinels around a
+    pad users may also type (MiniCPM-o's ``<unk>``): a pad right after none
+    of them stays a token. Intakes sharing a pad declare them all or none.
     """
 
     modality: str
@@ -104,6 +108,7 @@ class MediaIntake:
     prepare: Callable[[torch.Tensor, dict, Mapping], PreparedMedia]
     sentinels: tuple[int, int] | None = None
     runs: Callable[[torch.Tensor, dict, Mapping], int] | None = None
+    opens: frozenset[int] = frozenset()
 
 
 class MediaPrompt(NamedTuple):
@@ -322,6 +327,15 @@ class MultimodalDecoderModel(Model):
             given = loaded.get(f"{m}_inputs") or ()
             return given[i] if i < len(given) else {}
 
+        sentinels: dict[int, tuple[int, int]] = {}
+        opens: dict[int, frozenset[int]] = {}
+        for m in self.media:
+            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
+            if any(bool(o.opens) != bool(m.opens) for o in self.media if o.pad == m.pad):
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} declare opens all or none")
+            if m.opens:
+                opens[m.pad] = opens.get(m.pad, frozenset()) | m.opens
         ids = self._prompt_ids(parts, raw, **kwargs)
         # before any attachment is prepared: user text that spells a placeholder
         # (per pad id, which intakes may share)
@@ -330,18 +344,15 @@ class MultimodalDecoderModel(Model):
             want[intake.pad] = want.get(intake.pad, 0) + sum(
                 1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i), kwargs) for i in range(len(raw[m]))
             )
+        hits = ids[placeholders(ids, want, opens)].tolist()
         for pad, n in want.items():
-            found = int((ids == pad).sum())
+            found = hits.count(pad)
             if found != n:
                 names = " / ".join(m.modality for m in self.media if m.pad == pad)
                 raise ValueError(
                     f"multimodal placement mismatch: the prompt holds {found} {names} "
                     f"placeholders for {n} {names} inputs"
                 )
-        sentinels: dict[int, tuple[int, int]] = {}
-        for m in self.media:
-            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
-                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
         inputs: NameToTensorList = {}
         # per pad id, its runs in prompt order: the nth placeholder of a pad is its nth run
         pad_runs: dict[int, list[MediaRun]] = {m.pad: [] for m in self.media}
@@ -356,7 +367,7 @@ class MultimodalDecoderModel(Model):
             ]
             for name, tensor in prepared.inputs.items():
                 inputs.setdefault(name, []).append(tensor)
-        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels), inputs)
+        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels, opens), inputs)
 
     def max_input_files(self) -> dict[str, int]:
         # an attachment no intake takes, refused before any file is decoded

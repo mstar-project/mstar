@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -106,6 +107,42 @@ def a_model(tmp_path, **kwargs):
     (tmp_path / "assets").mkdir(exist_ok=True)
     sf.write(tmp_path / "assets" / VOICES["default"], a_clip(2.0).numpy(), 16000)
     return MiniCPMOModel(str(tmp_path), **kwargs)
+
+
+class _ChatTokenizer:
+    """MiniCPM-o's special tokens, each its own id (parsed in any text, as the
+    real tokenizer's), every other byte its own id, and a plain chat template:
+    enough to render and place a prompt without the checkpoint."""
+
+    SPECIAL = (
+        "<unk>", "<image>", "</image>", "<slice>", "</slice>", "<image_id>", "</image_id>",
+        "<|audio_start|>", "<|audio_end|>", "<|listen|>", "<|im_start|>", "<|im_end|>",
+        "<|endoftext|>", "<|tts_bos|>", "<|tts_eos|>",
+    )
+
+    def convert_tokens_to_ids(self, token):
+        return 1000 + self.SPECIAL.index(token)
+
+    def encode(self, text):
+        pieces = re.split("(" + "|".join(map(re.escape, self.SPECIAL)) + ")", text)
+        return [i for p in pieces for i in ([self.convert_tokens_to_ids(p)] if p in self.SPECIAL else p.encode())]
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, use_tts_template, enable_thinking):
+        turns = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+        return turns + "<|im_start|>assistant\n" + ("<|tts_bos|>" if use_tts_template else "")
+
+
+@pytest.fixture(params=["stub", pytest.param("ckpt", marks=needs_ckpt)])
+def chat_model(request, tmp_path, monkeypatch):
+    """A MiniCPMOModel that renders and places prompts: ``a_model`` with a stand-in
+    tokenizer of MiniCPM-o's special tokens, and the checkpoint's where it is cached."""
+    if request.param == "ckpt":
+        return request.getfixturevalue("model")
+    from mstar.model.minicpm_o import minicpm_o_model
+
+    stub = SimpleNamespace(from_pretrained=lambda path: _ChatTokenizer())
+    monkeypatch.setattr(minicpm_o_model, "Qwen2Tokenizer", stub)
+    return a_model(tmp_path)
 
 
 def a_bare_model(**attrs):
@@ -579,6 +616,29 @@ def test_an_image_and_a_clip_sharing_unk_take_their_own_encoders_rows(model):
     })
     spliced = splice_media(torch.zeros(len(ids), 1), row.tensor_inputs["media_mask"], row.tensor_inputs["media_embeds"])
     assert torch.equal(spliced[:, 0], fill)
+
+
+@pytest.mark.parametrize("media", [(), ("image", "audio")])
+def test_an_unk_the_user_types_stays_a_token(chat_model, media):
+    """``<unk>`` places the media, and a user may also type it: one that follows
+    none of the media's sentinels is the prompt's own token, as upstream embeds
+    it, and every run stays at its attachment."""
+    from mstar.model.multimodal import PromptPart
+
+    attachments = {"image": an_image, "audio": a_clip}
+    prompt = chat_model.process_prompt(
+        None, [*media, "text"], ["text"],
+        tensors={f"{m}_inputs": [attachments[m]()] for m in media},
+        prompt_parts=[*(PromptPart(m) for m in media), PromptPart("text", "Is <unk> a word? <unk>")],
+    )
+    ids = prompt.new_input_tensors["text_inputs"][0]
+    layout = prompt.metadata[MEDIA_LAYOUT]
+    typed = torch.ones(len(ids), dtype=torch.bool)
+    for offset, tokens in zip(layout["offset"], layout["tokens"], strict=True):
+        typed[offset:offset + tokens] = False
+    unk = chat_model.tokenizer.convert_tokens_to_ids("<unk>")
+    assert int(((ids == unk) & typed).sum()) == 2
+    assert bool((ids[~typed] == unk).all()) and len(set(layout["output"])) == len(media)
 
 
 @needs_ckpt

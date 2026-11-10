@@ -268,32 +268,44 @@ def test_encoders_sharing_a_placeholder_take_their_rows_from_the_layout(tile):
     assert spliced[:, 0].tolist() == [1, 10, 11, 2, 20, 3, 12]
 
 
-def test_two_intakes_may_share_a_placeholder():
-    """Each placeholder goes to the attachment the prompt renders there, and
-    the layout names that attachment's encoder."""
-    from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+U = 0  # a placeholder two intakes share (MiniCPM-o's <unk>)
 
-    unk = 0
+
+@pytest.mark.parametrize("rendered, opens, expanded, offsets", [
+    ([1, U, 2, U, 3], (), [1, U, U, U, 2, U, U, 3], [1, 5]),
+    # each intake's placeholders follow its own openers (1 audio's, 2 the
+    # image's); the pads the user typed follow neither and stay tokens
+    ([U, 1, U, 2, U, 3, U], ({1}, {2}), [U, 1, U, U, U, 2, U, U, 3, U], [2, 6]),
+], ids=["every-pad", "after-openers"])
+def test_two_intakes_may_share_a_placeholder(rendered, opens, expanded, offsets):
+    """Each placeholder goes to the attachment the prompt renders there, and
+    the layout names that attachment's encoder. An intake declaring the ids
+    its placeholders follow leaves its pad elsewhere as text."""
+    from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 
     class Model(MultimodalDecoderModel):
         NAME = "shared"
 
         def _prompt_ids(self, parts, raw, **kwargs):
-            return torch.tensor([1, unk, 2, unk, 3])
+            return torch.tensor(rendered)
 
         def get_node_resources(self):
             return []
 
     model = object.__new__(Model)
     model.media = tuple(
-        MediaIntake(m, encoder, unk, lambda attachment, metadata, request, n=n: PreparedMedia({}, [n]))
-        for m, encoder, n in (("image", VISION, 2), ("audio", AUDIO, 3))
+        MediaIntake(
+            m, encoder, U, lambda attachment, metadata, request, n=n: PreparedMedia({}, [n]),
+            opens=frozenset(after),
+        )
+        for m, encoder, n, after in zip(("audio", "image"), (AUDIO, VISION), (3, 2), opens or ((), ()), strict=True)
     )
     attachments = {"image_inputs": [torch.zeros(1)], "audio_inputs": [torch.zeros(1)]}
     prompt = model.intake(None, ["audio", "image"], attachments)
     layout = model.prompt_layout(prompt)
-    assert prompt.pads.ids.tolist() == [1, unk, unk, unk, 2, unk, unk, 3]
-    assert (layout["offset"], layout["tokens"], layout["output"]) == ([1, 5], [3, 2], ["audio_embeds", "vision_embeds"])
+    assert prompt.pads.ids.tolist() == expanded
+    assert (layout["offset"], layout["tokens"]) == (offsets, [3, 2])
+    assert layout["output"] == ["audio_embeds", "vision_embeds"]
 
 
 def test_every_media_walk_replays_one_capture_that_caps_it():

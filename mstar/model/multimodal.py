@@ -365,15 +365,35 @@ class MediaPads(NamedTuple):
     grid: list[Sequence[int]]
 
 
+def placeholders(
+    ids: torch.Tensor, pads: Iterable[int], opens: Mapping[int, frozenset[int]] | None = None,
+) -> torch.Tensor:
+    """The positions in host ``ids`` of each placeholder: a pad id, and for a
+    pad in ``opens``, one right after one of its openers. Any other pad id
+    there is text the user typed (MiniCPM-o's ``<unk>``)."""
+    pads = list(pads)
+    # a loop over the pad ids, not the tokens: a text-only prompt has none
+    hits = torch.isin(ids, ids.new_tensor(pads)).nonzero().flatten() if pads else ids.new_empty(0)
+    if not opens or not hits.numel():
+        return hits
+    before = ids[(hits - 1).clamp(min=0)].tolist()
+    return hits.new_tensor([
+        i for i, token, prev in zip(hits.tolist(), ids[hits].tolist(), before, strict=True)
+        if token not in opens or (i > 0 and prev in opens[token])
+    ], dtype=hits.dtype)
+
+
 def expand_media_pads(
     ids: torch.Tensor,
     pad_runs: Mapping[int, Sequence[MediaRun]],
     sentinels: Mapping[int, tuple[int, int]] | None = None,
+    opens: Mapping[int, frozenset[int]] | None = None,
 ) -> MediaPads:
-    """Expand the nth occurrence of each pad id in ``ids`` to its run
+    """Expand the nth placeholder of each pad id in ``ids`` to its run
     ``pad_runs[pad][n]``, wrapped in ``sentinels[pad]`` when given (a
     template that writes a bare pad, as the processor's ``replace_*_token``
-    then wraps it).
+    then wraps it). With ``opens[pad]``, a pad is a placeholder only right
+    after one of those ids (`placeholders`), and stays a token elsewhere.
 
     Raises ``ValueError`` when a pad occurs other than once per run: user
     text that spells a placeholder token, or a layout naming an attachment
@@ -381,8 +401,7 @@ def expand_media_pads(
     tokenizer.
     """
     sentinels = sentinels or {}
-    # a loop over the placeholders, not the tokens: a text-only prompt has none
-    hits = torch.isin(ids, ids.new_tensor(list(pad_runs))).nonzero().flatten() if pad_runs else ids.new_empty(0)
+    hits = placeholders(ids, pad_runs, opens)
     seen = dict.fromkeys(pad_runs, 0)
     pieces: list[torch.Tensor] = []
     layout = MediaPads(ids, [], [], [], [])
