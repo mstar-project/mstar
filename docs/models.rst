@@ -75,6 +75,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``meta-models/Muse-Glimmer-30B``
      - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
        NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
+   * - ``ripple_65b`` *(Experimental)*
+     - ``ricursiveAI/Ripple-65B-Preview``
+     - Ricursive's 65B dense text LLM: sliding-window and NoPE global attention layers
+       4:1, with a value residual from the token embeddings. BF16, TP2 or TP4.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -98,6 +102,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        openpi's DROID normalization: raw joint state in, joint velocities out. It also
        serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
        (see :doc:`clients`).
+       ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
+       one entry; the server refuses to start otherwise.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -105,6 +111,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_8_27b``
      - ``Qwen/Qwen3.8-27B``
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
+   * - ``minicpm_o`` *(Beta)*
+     - ``openbmb/MiniCPM-o-4_5``
+     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
+       resampler and a Whisper-medium encoder. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -253,6 +263,19 @@ Notes
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
+- Unset sampling knobs take the checkpoint's ``generation_config.json``, then the
+  model's config. BAGEL and Orpheus are the exception: their files are the
+  backbone's chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
+  ``do_sample: false`` is read and the recipes stay (BAGEL temperature 0.6,
+  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8). MiniCPM-o keeps
+  upstream ``chat``'s recipe over its file (temperature 0.7, top_p 0.8, top_k
+  100, repetition_penalty 1.02).
+- Qwen3-Omni's Talker cap comes from ``talker_max_new_tokens``, 4096 on the
+  released checkpoint (it was 2048). Plain sampling keys target the Thinker, except
+  on ``/v1/audio/speech``, where ``temperature`` and ``top_p`` set the Talker;
+  ``talker_*`` and ``code_predictor_*`` set those stages on every route.
+- Qwen3-TTS: ``talker_<knob>`` wins over a plain ``<knob>`` when a request
+  sends both.
 
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -292,14 +315,20 @@ merge's.
    * - Higgs Audio (``LLM``)
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head`` (the
        checkpoint's ``audio_decoder_proj.text_lm_head``)
-     - No embedding target: text prefill embeds before the step.
+     - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
-     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
-     - Attention only on MoE layers: an adapter on the routed experts or the router is
-       refused. Talker, code predictor and encoders take none. Not validated: this MoE
-       model's bf16 noise is about 10x a dense model's (its router flips experts on
-       near-ties), so even base rows, run in a larger batch than the reference's, miss
-       the check against merged weights.
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``;
+       the routed experts' ``experts_gate_up_proj`` / ``experts_down_proj`` when the YAML's
+       ``targets:`` names them
+     - Expert targets are opt-in: each slot holds every expert's A and B (about 1.7 GB per
+       slot at rank 16, and as much pinned on the host per adapter held there), and with
+       128 experts a pool serves at most 7 slots. Under TP only: an ``ep_config`` with
+       ``parallel: ep`` over several ranks refuses them at startup. Per-expert adapters
+       only (``experts.<N>.<proj>``), not PEFT's fused 3-D form. The router takes none.
+       Talker, code predictor and encoders take none. Not validated: this MoE model's
+       bf16 noise is about 10x a dense model's (its router flips experts on near-ties),
+       so even base rows, run in a larger batch than the reference's, miss the check
+       against merged weights.
    * - Qwen3-TTS (``Talker``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
      - Not the text projection (runs before the step) or the CodePredictor. Not
@@ -327,9 +356,10 @@ VoxCPM2, Wan2.2, Waypoint and Z-Image.
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
-- Zero-shot only: there are no built-in speakers. Pass ``reference_audio`` with its
-  transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
-  ``ref_text`` is required alongside ``reference_audio``.
+- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` (an uploaded
+  ``audio`` input on ``/generate``) with its transcript in ``ref_text`` to clone a voice,
+  or describe one in ``instruct`` (``voice`` on ``/v1/audio/speech``).
+  ``ref_text`` is required alongside the reference clip.
 - ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
   name is resolved to the id the model was trained on before the prompt is
   built, and an unrecognised value warns and falls back to language-agnostic
@@ -371,7 +401,7 @@ Higgs Audio notes
 - The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
   cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
-  embeddings go into the KV cache as one span.
+  embeddings go into the KV cache as three spans.
 - Decode keeps each request's last token in the sampler's slot master and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
@@ -435,6 +465,32 @@ Omnilingual ASR notes
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
 
+Ripple-65B (``ripple_65b``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+    mstar serve ripple_65b --gpus 0,1,2,3
+    mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
+
+- ``configs/ripple_65b_tp4.yaml``, the default, needs four 80 GB GPUs and
+  ``configs/ripple_65b_tp2.yaml`` two 141 GB ones. TP can't pass the model's 8 KV heads. Both
+  serve 131072 tokens a request.
+  For more, raise ``resources.kv_cache.max_seq_len`` and ``max_num_pages`` together: a prompt
+  holds all 80 layers' K/V until its prefill commits, so the shipped pool runs out near 260K
+  tokens and two 128K prompts can't prefill at once.
+- A chat with no ``temperature`` samples at 1.0, as Ricursive's server does, and one with no
+  ``max_tokens`` stops at 2048 tokens, which a long reasoning reply can reach inside
+  ``<think>``. Set ``max_tokens`` for hard problems.
+- Text in, text out, on ``/generate`` and ``/v1/chat/completions``. A reply's reasoning stays
+  inline as ``<think>...</think>``, and a chat that asks for tool calls is refused.
+- Not supported yet: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window
+  doesn't prefix cache) and DP replicas (a window pool can't span instances).
+- The GPU parity scripts live in ``test/ripple/``: ``run_parity.py`` drives a server and gates
+  the result, and ``record_oracle.py`` teacher-forces its replies through the checkpoint's own
+  ``modeling_ricursive.py``, in its own venv, with the attention gate and the value residual
+  each turned off as controls.
+
 FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) notes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -457,7 +513,7 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
     ``target_language`` (a translation to or from English; the OpenAI route also takes
     ``task="translate"``) and ``punctuation`` (default on).
-  - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
+  - ``canary_qwen``: English only. ``instruction``
     replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
 
 - A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
@@ -474,6 +530,28 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
+- Request knobs must have their documented types (a string ``language``, a boolean
+  ``punctuation``, a string ``instruction``), or the request is a 400. Canary-Qwen refuses a
+  ``language`` other than English on every route. Canary and Canary-Qwen decode greedily
+  unless the request sets ``temperature`` above 0 (``top_p`` and ``top_k`` then apply);
+  neither checkpoint declares sampling defaults, so a ``min_p`` or ``repetition_penalty``
+  is refused.
+  ``max_output_tokens`` may be at most 1014 on Canary (the position table less its 10-token
+  prompt) and 1024 on Canary-Qwen; a larger value is refused rather than cut. Parakeet and
+  Nemotron decode greedily and read only ``language``: a sent ``temperature`` is logged
+  as ignored.
+
+Qwen3-ASR (``qwen3_asr``, ``qwen3_asr_realtime``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Greedy, as the checkpoint's ``do_sample: false`` declares. A request reads ``language``
+  (an ISO code or name; it forces the language and drops the model's ``language X`` line),
+  ``initial_prompt`` (or the request text) as system-turn context, and ``assistant_prefix``,
+  a string the model continues from (the realtime route's running hypothesis).
+- ``max_output_tokens`` defaults to 4096; a larger value is served up to the text model's
+  ``max_position_embeddings`` while the KV pool has room, and past it is a 400. The model
+  writes no timestamps: ``/v1/audio/transcriptions`` gives a timed format's segments one
+  per window. ``min_p`` and ``repetition_penalty`` are refused.
 
 BAGEL notes
 ~~~~~~~~~~~
@@ -498,6 +576,21 @@ BAGEL notes
   GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
+
+GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
+--------------------------------------------------
+
+- Sampling defaults come from the checkpoint's ``generation_config.json`` (temperature
+  1.0 and top_p 0.95 for both), read from a local checkpoint or the cached Hub snapshot;
+  the conductor never fetches it, and without it the same values apply. A request may set
+  ``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``,
+  ``penalize_prompt`` and ``ignore_eos``. ``min_p`` above 0 is refused, since neither
+  checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.
+- GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
+  ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
+  ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
+  so ``max_tokens`` above 2048 is a 400 rather than being shortened; under MTP, a
+  ``max_tokens`` past the room the prompt leaves is refused too.
 
 Muse Glimmer (``muse_glimmer``)
 -------------------------------
@@ -642,6 +735,7 @@ and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
 and 9B ship none, so the engine sampler's defaults apply. A request's
 ``min_p`` above 0 is refused (a 400) unless the checkpoint sets a ``min_p``,
 which turns the sampler's min-p filter on; none of these does.
+``max_output_tokens`` may not exceed ``max_position_embeddings``.
 
 With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
@@ -691,9 +785,10 @@ Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:
   2B, 4B) each delta stays on its own side, as PEFT applies them;
 * the vision tower, as unsloth's vision fine-tunes adapt it: each block's
   ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1`` and ``mlp.linear_fc2``, the merger's
-  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. The vision
-  encoder node has its own pool (``vision_lora``), sized by the same ``lora:`` block,
-  and runs the request's adapter too.
+  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. One spec covers
+  both nodes, sized by the one ``lora:`` block; the vision encoder node has a pool of
+  its own (``lora@vision_encoder``, beside the LLM's ``lora@LLM``) and runs the
+  request's adapter too.
 
 Module names may be in any layout PEFT writes for the model: the released checkpoint's
 (``model.language_model.layers.*``, ``model.visual.*``), the text-only causal LM's
@@ -752,8 +847,11 @@ Under TP the LLM's targets split as its linears do (the 27B's single K/V head pe
 at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
 on one GPU in every shipped config.
 
-LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
-block).
+Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
+(``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
+Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
+reads the served adapters once at launch and has neither route, so ``mstar serve``
+refuses ``--rust-frontend`` with ``runtime_updates: true``.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off
@@ -767,8 +865,7 @@ unless the ``lora`` block opts in, and answer 404 otherwise (as vLLM's do withou
         -d '{"lora_name": "sql"}'
 
 ``lora_path`` is a PEFT directory (its ``adapter_model.safetensors`` is read) or a
-safetensors file, readable at the same path by the API server, the conductor (which
-reads the adapter's header to check requests on it) and every worker. A load is checked
+safetensors file, readable at the same path by the API server and every worker. A load is checked
 first (LoRA layers present, rank within ``max_rank``, only the targets above, shapes
 that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM's
 or the vision encoder's); the name is selectable, and listed by ``/v1/models``, once all
@@ -862,7 +959,11 @@ Kokoro notes
   ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
   English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
   ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
-  synthesize a phoneme string directly).
+  synthesize a phoneme string directly). An empty ``voice`` / ``lang_code`` or a
+  ``speed`` outside 0.25-4.0 is a 400. ``seed`` fixes the vocoder's noise (absent, the
+  server derives one from the request id), so a seeded request run at the same batch
+  layout repeats exactly; batched differently, its noise is the same but padding rounding
+  moves the waveform's phase, as it does in the reference.
 - Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
   fallback even when it is installed, ``chunk_target_phonemes`` and
@@ -1013,6 +1114,13 @@ CosyVoice3 notes
 - Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
   prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
   from 1.4% to 13.4%, with words dropped mid-sentence.
+- Request knobs are strictly typed: ``ras_window`` and ``n_cfm_timesteps`` take a whole
+  float but not a string or a boolean; ``top_k`` (1-128) and ``max_new_tokens`` follow
+  the server's integer rule (:ref:`generation-parameters`); an out-of-range value is a
+  400. ``voice``, ``instruct`` and ``ref_text``
+  must be strings. ``max_new_tokens`` above the deployment's speech-token limit is
+  refused, not cut. ``seed`` fixes the LM's sampling; the flow and vocoder noise is
+  fixed, as in the reference. ``speed`` has no effect and is logged as ignored.
 - On ``/v1/audio/speech``, text longer than one piece is synthesized as ordered
   sentence pieces, as the reference frontend does: about 80 tokens (320
   characters) of English, or 80 characters of text with Chinese, each piece
@@ -1114,7 +1222,7 @@ Qwen3-TTS notes
   whole-walk CUDA Graph (up to 128 rows a step), with the 15-step CodePredictor
   loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
-  request state. Residual ``subtalker_*`` sampling is per-request through the
+  request state. Residual ``code_predictor_*`` sampling (``subtalker_*`` is a deprecated alias) is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
@@ -1250,7 +1358,7 @@ Fish Audio S2-Pro notes
   control is part of the text. Clone a voice with ``ref_audio`` (data URL,
   base64, or an http(s) URL when the server allows remote fetch) and its transcript in
   ``ref_text``; with the SDK, ``client.tts(text, reference_audio="ref.wav",
-  ref_text="...")``. ``voice`` and ``speed`` are ignored.
+  ref_text="...")``. ``voice`` and ``speed`` are logged as ignored.
 - Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
   ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
   temperature first and takes top-k and top-p over the tempered probabilities,
@@ -1308,6 +1416,13 @@ VoxCPM2 notes
   mid-text, as it does in the official ``voxcpm`` package (a 983-character
   Russian text stopped about three quarters of the way in on 5 of 10 seeds
   there). Split long text into several requests.
+- ``min_len``, ``max_len`` and ``inference_timesteps`` must be integers (a whole float
+  such as ``16.0`` is accepted; ``2.7`` and ``"20"`` are 400s), ``max_new_tokens`` /
+  ``max_output_tokens`` (160 ms patches) follow the server's integer rule, and
+  ``cfg_value`` is a number in [0, 10].
+  ``inference_timesteps`` is a deployment setting a request may only repeat. A budget past
+  the model's ``max_len`` is refused. ``seed`` fixes the diffusion noise. ``voice`` is
+  dropped (VoxCPM2 has no named voices) and a sent ``speed`` is logged as ignored.
 
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
@@ -1524,19 +1639,21 @@ Chatterbox notes
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
-  the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
-  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  the upper bounds are the reference demo's), ``penalize_prompt`` (whether the
+  penalty counts the prompt's tokens, default true), ``seed``, ``n_cfm_timesteps``
+  (S3Gen Euler steps, 10; Turbo 2), ``max_output_tokens`` (up to the deployment's
   ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
   ``max_concurrent_requests`` set, the server refuses to start unless that
   many requests of that length fit the KV cache, so raise it together with
   ``max_num_pages`` or a lower cap),
-  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  ``ignore_eos`` (T3 decodes all ``max_output_tokens``
   past the stop token, for fixed-length benchmarks; the speech tokens among
   them are vocoded, but T3 keeps emitting stop and control tokens after the
   end of speech and those are dropped, so the audio is shorter than
-  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
-  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
-  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  ``max_output_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo has no
+  ``cfg_weight``, ``exaggeration`` or ``min_p``: a non-zero value is a 400.
+  ``language_id`` on a non-multilingual checkpoint is reported as ignored.
   The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
   a clip uploaded as ``audio`` input is the reference voice.
 - Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
@@ -1656,8 +1773,9 @@ Cosmos3 environment requirements
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
-  when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
-  ``write_video``, which needs the PyAV (``av``) package.
+  when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
+  ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  covers a torchcodec that cannot load FFmpeg.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -1695,7 +1813,9 @@ same transformer instance and KV pool as the generator. ``/v1/chat/completions``
 takes image and video content parts (URLs or data URIs) and streams tokens; the
 chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
 ``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
-``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused unless the checkpoint's
+``generation_config.json`` sets one; ``max_tokens``
+defaults to 2048), and for video attachments ``video_fps`` / ``video_num_frames``
 (frames are sampled at 2 fps by default, each frame a timestamped span).
 
 .. code-block:: bash
@@ -1707,13 +1827,16 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
-compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
-turns it off): the eager step is over a thousand tiny kernels, and the fused
-step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
-(continuous batching over the captured decode graphs, padded to the next batch
-bucket). Requests never see each other's data, but the batch bucket changes the
+The reasoner is a ``SampledTokenDecoder`` on the VLM scaffold: its decode steps
+are captured into CUDA graphs per batch bucket, each compiled first: the eager
+decode step is over a thousand tiny kernels, and the fused step runs at the
+weight-streaming floor (about twice the uncompiled rate at batch size 1 on an
+H100). Text prefills, mixed prefill + decode steps and image or video prefills
+(up to four prompts a step, each prompt one row with its vision tokens spliced
+in) are captured too, and a prompt past the largest bucket prefills eagerly.
+Concurrent chat requests share decode steps (continuous batching over the
+captured decode graphs, padded to the next batch bucket). Requests never see
+each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens'
 logits were equal or one bf16 ulp apart, the first differing token came after
@@ -1847,8 +1970,8 @@ own ``window_decoder`` partition; a request opts in per call:
        new frames are delivered — a new prompt steers the same world.
    * - ``session_timeout_s``
      - 600
-     - Seconds an idle session is kept after its request finishes, capped at the
-       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
+     - Seconds an idle session is kept after its request finishes, at most the
+       deployment's ``session_timeout_max_s`` (3600); more is a 400. An expired session resumes
        like an unknown one: the request is rejected.
    * - ``end_session``
      - ``false``
@@ -1951,7 +2074,8 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
        frames = ``(num_frames - 1) // 4 + 1``.
    * - ``num_inference_steps``
      - 50
-     - Clamped to ``max_denoise_steps`` (100), the denoise loop's ceiling.
+     - An integer in 1-100; the upper bound is the denoise loop's ``max_iters``
+       (``max_denoise_steps``). A 400 outside it.
    * - ``guidance_scale``
      - 5.0
      - Classifier-free guidance; run as a single batched forward.
@@ -2008,7 +2132,9 @@ each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
-resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
+resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
+picks torch's cuDNN SDPA, the kernel ``attention_backend: sdpa`` runs, and the two
+configs give the same videos at the same step time) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
@@ -2238,9 +2364,13 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
+   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
+   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
+   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
+   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
+   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
+   same knob.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -2288,8 +2418,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``async_scheduling``
    The engine's speculative scheduling of the image nodes: the worker assembles a batch's
    next denoise step while the current one runs and merges requests that became ready
-   meanwhile, so requests at different steps share a forward. On by default; a step a
-   request speculates past its schedule is vetoed before any forward, and ``false``
+   meanwhile, so requests at different steps share a forward. On by default; the loop's cap
+   (the request's step count) keeps speculation from running past its schedule, and ``false``
    restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
    to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
    concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

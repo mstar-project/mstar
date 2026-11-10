@@ -223,14 +223,15 @@ model, so they are named for it.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables denoise, prefill and reasoner
-       decode capture. The deployment option
+       captures. The deployment option
        ``model_kwargs.accelerator_graph: false`` also disables all these
        captures and cannot be overridden by this variable.
    * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables only the understanding-tower
-       prefill capture. Denoise and reasoner decode captures remain eligible
-       when ``model_kwargs.accelerator_graph`` is true.
+       prefill captures: the DiT's prompt prefill and the reasoner's text,
+       mixed and vision prefills. Denoise and reasoner decode captures remain
+       eligible when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -313,7 +314,7 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
        ``server_vad`` turn detection, read by
        ``realtime_vad.silero_weights``. Unset, the copy bundled with the
-       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       ``silero-vad`` package (``mstar-ai[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
    * - ``MSTAR_SMART_TURN_PATH``
@@ -375,6 +376,45 @@ Read by the ``mstar-server`` binary and its bridge
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
+   * - ``MSTAR_SERVED_MODELS``
+     - unset
+     - The names a Rust-frontend request's ``model`` may carry, as JSON: the
+       base model's names and the served LoRA adapters
+       (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
+       Unset serves the base model alone. Not for deployments to set:
+       ``launch_rust_server`` sets it from the API server's ``ServedModels``.
+   * - ``MSTAR_TRANSCRIPTION``
+     - unset
+     - What the Rust frontend's ``/v1/audio/transcriptions`` needs from the
+       served model, as JSON: the kwargs it declares, the deployment's
+       ``max_concurrent_requests``, the adapter's language tables, and the
+       pydantic version its error text cites. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``transcription_facts`` for a model
+       with a transcription surface, and drops an inherited value.
+   * - ``MSTAR_OPENPI``
+     - unset
+     - The deployment's openpi policy (its ``openpi:`` block as the API server
+       checked it, the metadata frame packed), as JSON; unset serves no socket
+       at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
+       ``openpi_facts``.
+   * - ``MSTAR_WS_MAX_BYTES``
+     - the body limit
+     - The largest WebSocket message the Rust frontend reads, in bytes: the
+       config's ``ws_max_message_mb``. Not for deployments to set:
+       ``launch_rust_server`` sets it.
+   * - ``MSTAR_CLIENT_STREAMS``
+     - ``[]``
+     - The model's client streams, as JSON: on ``/generate/ws`` a request to a
+       model with any is a live call. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``APIServer.client_streams``.
+   * - ``MSTAR_REALTIME``
+     - unset
+     - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: for a
+       model with an audio client stream, what a conversation needs from it
+       (``conversation_facts``); for realtime transcription, the ONNX Runtime
+       library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
+       load (if it didn't), and the model's tokenizer. Not for deployments to
+       set: ``launch_rust_server`` sets it from ``realtime_facts``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -439,19 +479,10 @@ Read by the ``mstar-server`` binary and its bridge
 Rust frontend limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Rust frontend serves no ``/generate/ws``, so a model's live client input
-(appends to a running request, see :doc:`clients`) needs the Python frontend;
-over ``/generate`` such a model's input ends when the request is submitted.
-
-It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
-surface degrades:
-
-* ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
-  request sets ``generate_sound``, Cosmos3 generates a separate audio track that
-  mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
-  the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
-  the Rust frontend (it spends compute on a track the client won't receive), or
-  run the Python frontend for sound video.
+The Rust frontend serves every route the Python frontend serves but LoRA's
+runtime updates (``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``, see
+:doc:`models`): ``mstar serve`` refuses ``--rust-frontend`` with
+``runtime_updates: true``.
 
 Request media
 -------------
@@ -653,7 +684,9 @@ Worker scheduling
        the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
-       Qwen3.5 alone.
+       Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio
+       and Command A+ pin their own, so it reaches Qwen3.5, Glimmer and the
+       Cosmos3 reasoner (which defaults to ``1,2,4,8,16,24,32,48,64``).
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -737,9 +770,11 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
-       Whisper, which also keeps its timestamp rule state in the sampler's
-       declared loop-back state) and only when the sampler has graph
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Glimmer, Higgs Audio,
+       Qwen3-ASR, the Cosmos3 reasoner, Qwen3-Omni's text-only Thinker and Whisper, which also keeps its timestamp rule state in
+       the sampler's declared loop-back state; the other
+       ``SampledTokenDecoder`` nodes turn it off with
+       ``device_loopback = None``) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
        node that takes its tokens on the host does not pay the eager-step
        master write. ``0`` keeps every node on the per-request tensor path.
@@ -763,9 +798,9 @@ Worker scheduling
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
        one. Only for a node that reads its tokens back on the device
-       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-       rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       (Qwen3.5, Qwen3-ASR, Whisper, the Cosmos3 reasoner) with the device
+       loop-back on, on one rank: above one, where admission doesn't decide,
+       the masters grow and the scatter runs after the replay, as with ``0``.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
@@ -793,7 +828,8 @@ Worker scheduling
        the streams holding the pages, the reservations against the free and evictable
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
-       footprint at removal. Tests and debugging only.
+       footprint at removal. Above one rank, each follower stops if the reservations it
+       admits a step from differ from rank 0's. Tests and debugging only.
 
 Compilation
 -----------

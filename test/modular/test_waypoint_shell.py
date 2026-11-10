@@ -27,6 +27,7 @@ import yaml
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import _walk_io
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import (
     AttentionSpec,
@@ -149,7 +150,6 @@ def _fwd_info(
         random_seed=random_seed,
         max_tokens=0,
         resource_configs={},
-        step_metadata={"is_prefill": graph_walk == PRIME_WALK},
         resource_publish_info={},
     )
 
@@ -835,8 +835,8 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
         assert cfg.compile is False
         # One live world again: the bucket cannot be wider than it.
         assert cfg.capture_batch_sizes == [1]
-        # The v1 engine always dispatches batched; a submodule captured on bare
-        # `forward` is captured on a method that never runs.
+        # A captured forward returns per-row outputs: the engine maps a replay's
+        # entries back by row id.
         assert cfg.capture_forward_method == "forward_batched"
         assert cfg.single_request_inputs.input_seq_len == config.tokens_per_frame
 
@@ -1085,6 +1085,11 @@ def test_the_encoder_emits_the_dit_s_priming_latent(encoder, ae_config):
     # here rather than left for the dit to guess at.
     assert latent.shape == (1, 1, ae_config.channels, *ae_config.latent_shape[1:])
     assert latent.dtype == torch.bfloat16
+    # capture runs the method its config names, keyed by row
+    cfg = encoder.get_accelerator_graph_configs(torch.device("cpu"))[0]
+    captured = getattr(encoder, cfg.capture_forward_method)(PRIME_WALK, _engine_inputs(), image=image)
+    assert set(captured) == {"r0"}
+    assert torch.equal(captured["r0"]["latent"][0], latent)
 
 
 def _seed_hw_info(
@@ -1505,30 +1510,19 @@ def _pointer_info(dims: list[int]) -> TensorPointerInfo:
     )
 
 
-def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
-    """The seed clip is addressed to the vae_encoder; the actions arrive on
-    the client stream, not as a walk input."""
-    seeded = model.get_initial_forward_pass_args(
-        "p", ["image"], ["video_frame"], {"image_inputs": [_pointer_info([720, 1280, 3])]}, {},
-    )
+@pytest.mark.parametrize("dims", [[720, 1280, 3], [4, 720, 1280, 3]], ids=["image", "clip"])
+def test_the_plan_primes_then_rolls_out_with_the_seed_hw_off_the_signal_dims(model, dims):
+    plan = model.walk_plan("p", ["image"], ["video_frame"], {"image_inputs": [_pointer_info(dims)]}, {})
 
-    assert seeded.full_metadata.kwargs["walk_schedule"] == [PRIME_WALK, ROLLOUT_WALK]
-    assert seeded.full_metadata.graph_walk == PRIME_WALK
-    assert seeded.full_metadata.is_prefill is True
-    assert [(e.name, e.next_node) for e in seeded.inputs] == [("image_inputs", VAE_ENCODER_NODE)]
-
+    assert [step.walk for step in plan] == [PRIME_WALK, ROLLOUT_WALK] and not any(step.bind for step in plan)
+    assert all(step.step_metadata == {"seed_hw": (720, 1280)} for step in plan)
+    # the seed clip is addressed to the vae_encoder; the actions arrive on the
+    # client stream, not as a walk input
+    inputs, _, _ = _walk_io(model)
+    assert inputs[PRIME_WALK] == (("image_inputs", VAE_ENCODER_NODE),)
+    assert inputs[ROLLOUT_WALK] == (("clock", DIT_NODE),)
     with pytest.raises(ValueError, match="required seed clip"):
-        model.get_initial_forward_pass_args("p", ["tensor"], ["video_frame"], {}, {})
-    # the seed clip goes with the request
-    assert seeded.unpersist_tensors == []
-
-
-def test_get_initial_forward_pass_args_reads_the_seed_hw_off_the_signal_dims(model):
-    for dims in ([720, 1280, 3], [4, 720, 1280, 3]):
-        fwd_args = model.get_initial_forward_pass_args(
-            "p", ["image"], ["video_frame"], {"image_inputs": [_pointer_info(dims)]}, {},
-        )
-        assert fwd_args.step_metadata["seed_hw"] == (720, 1280)
+        model.walk_plan("p", ["tensor"], ["video_frame"], {}, {})
 
 
 def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):
@@ -1547,3 +1541,8 @@ def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):
         model.postprocess(frames.float(), "video_frame")
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(frames, "image")
+
+
+def test_request_kwargs_are_the_keys_process_prompt_reads(model):
+    # num_steps is read only to refuse it (test above); actions drives the frames
+    assert model.request_kwargs() == {"num_steps", "actions"}

@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,6 @@ import pytest
 import torch
 import yaml
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -24,6 +24,7 @@ from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.model.base import ClientChunk
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.qwen3_tts import qwen3_tts_model
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
@@ -414,7 +415,6 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     # reference transcript or frames. Host values, for the prefill's step metadata.
     assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
     }
 
 
@@ -529,7 +529,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         LANGUAGE_ID_KEY: model.config.talker.codec_language_id["english"],
         REF_CLIP_KEY: clip_digest(clip),
         # All 13 reference frames lead the codec stream as context (fewer than left_context).
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 13,
+        "stream_lead_items": {"codec_tokens": 13},
     }
 
     xvec = model.process_prompt(
@@ -538,7 +538,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     )
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
-    assert xvec.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == 0   # no stream lead
+    assert "stream_lead_items" not in xvec.metadata   # no stream lead
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -581,7 +581,7 @@ def test_qwen3_tts_reference_bounds_are_inclusive():
         )
         assert result.metadata[PROMPT_LAYOUT_KEY][-1] == frames
         # only the last left_context (72) frames lead the codec stream
-        assert result.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == min(frames, 72)
+        assert result.metadata["stream_lead_items"] == {"codec_tokens": min(frames, 72)}
 
 
 def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monkeypatch):
@@ -604,7 +604,7 @@ def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monk
     assert model.load_audio(str(ok), "cpu").data.shape == (2 * 24000,)
 
 
-def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
+def test_qwen3_tts_base_declares_clone_walks_and_plans_them_for_reference_audio():
     model = _variant_model("base")
     walks = model.get_graph_walk_graphs()
     assert "talker_prefill_clone" in walks and "codec_chunk_clone" not in walks
@@ -615,36 +615,15 @@ def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
     # Non-Base variants do not even declare the clone walks (config-driven).
     assert "talker_prefill_clone" not in _variant_model("voice_design").get_graph_walk_graphs()
 
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in (*Qwen3TTSModel.PREFILL_INPUTS, "audio_inputs")
-    }
     prompt = {PROMPT_LAYOUT_KEY: [0, 3, 1, 9, 13], SPEAKER_ID_KEY: -1, LANGUAGE_ID_KEY: -1, REF_CLIP_KEY: "clip"}
-    talker = model.get_initial_forward_pass_args(
-        "Talker", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs=prompt,
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = {(edge.name, edge.next_node) for edge in talker.inputs}
-    assert routes == {("audio_inputs", "RefEncoder"), ("text_inputs", "Talker")}
+    talker = model.walk_plan("Talker", ["audio", "text"], ["audio"], {}, prompt)
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # The layout and the clip's key reach the RefEncoder and the Talker as step metadata.
-    assert {key: talker.step_metadata[key] for key in prompt} == prompt
-    codec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 40},
-    )
-    # The codec runs its one walk; the reference frames leading its stream are
-    # announced so the worker primes the stream with them as context.
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == [] and codec.unpersist_tensors == []
-    assert codec.stream_lead_items == {"codec_tokens": 40}
-    xvec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={},
-    )
-    assert xvec.stream_lead_items == {}
-    rearmed = model.get_partition_forward_pass_args("Codec", codec.full_metadata, persist_signals={})
-    assert rearmed.full_metadata.graph_walk == "codec_chunk" and rearmed.inputs == []
+    assert talker[0].step_metadata == prompt
+    # the decode reads where its text stream ends from the layout
+    assert talker[1].step_metadata == {PROMPT_LAYOUT_KEY: prompt[PROMPT_LAYOUT_KEY]}
+    # The codec runs its one walk
+    assert [step.walk for step in model.walk_plan("Codec", ["audio", "text"], ["audio"], {}, {})] == ["codec_chunk"]
 
     # The Base deployment maps the extra node and walks.
     deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
@@ -723,67 +702,6 @@ def test_qwen3_tts_rejects_unsupported_requests(
         )
 
 
-def test_qwen3_tts_initial_partition_args_route_expected_inputs():
-    model = _make_model()
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in Qwen3TTSModel.PREFILL_INPUTS
-    }
-    assert Qwen3TTSModel.PREFILL_INPUTS == ("text_inputs",)
-
-    prompt = {PROMPT_LAYOUT_KEY: [0, 4, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
-    talker = model.get_initial_forward_pass_args(
-        "Talker",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-        model_kwargs={"subtalker_top_k": 7, **prompt},
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill"
-    assert [edge.name for edge in talker.inputs] == list(pointers)
-    assert talker.step_metadata == {"is_prefill": True, **prompt}
-    # Residual-group sampling rides the code predictor's own per-request
-    # sampler config, not step metadata.
-    assert "subtalker_sampling" not in talker.step_metadata
-    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
-    assert configs[CODE_PRED_SAMPLER].top_k == 7
-
-    codec = model.get_initial_forward_pass_args(
-        "Codec",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-    )
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == []
-    assert codec.request_done is False
-
-
-def test_qwen3_tts_talker_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_prefill",
-        is_prefill=True,
-    )
-    # the prefill's step metadata, as the conductor keeps it
-    metadata.kwargs[PROMPT_LAYOUT_KEY] = [0, 4, 1, 0, 0]
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={"talker_input_embeds": []},
-    )
-
-    assert result.full_metadata.graph_walk == "talker_decode"
-    assert result.full_metadata.is_prefill is False
-    assert result.inputs[0].name == "talker_input_embeds"
-    assert result.request_done is False
-    # the decode reads where its text stream ends from the layout
-    assert result.step_metadata[PROMPT_LAYOUT_KEY] == [0, 4, 1, 0, 0]
-
-
 @pytest.mark.parametrize("kwargs, live", [
     ({}, True),
     ({"non_streaming_mode": True}, False),
@@ -814,36 +732,6 @@ def test_qwen3_tts_live_text_streams_one_item_per_token(kwargs, live):
         request_kwargs=one_shot.metadata,
     )
     assert [t.tolist() for t in model.process_stream_chunk(chunk)["text_in"]] == [[1000], [1001]]
-
-
-def test_qwen3_tts_talker_decode_marks_partition_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
-
-
-def test_qwen3_tts_postprocess_encodes_pcm16():
-    model = _make_model()
-
-    output = model.postprocess(
-        torch.tensor([-1.0, 0.0, 1.0]),
-        modality="audio",
-    )
-
-    expected = torch.tensor([-32767, 0, 32767], dtype=torch.int16)
-    assert output == expected.numpy().tobytes()
 
 
 def _tiny_model_config() -> Qwen3TTSModelConfig:
@@ -1715,7 +1603,7 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     model = _make_model()
     generation = model.config.generation
 
-    default = model.get_request_resource_configs({})[CODE_PRED_SAMPLER]
+    default = model.get_request_resource_configs([], [], {})[CODE_PRED_SAMPLER]
     assert default.temperature == generation.subtalker_temperature
     assert default.top_k == generation.subtalker_top_k
     assert default.top_p == generation.subtalker_top_p
@@ -1723,32 +1611,55 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     assert default.repetition_penalty == 1
 
     overridden = model.get_request_resource_configs(
-        {},
-        {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
+        [], [],
+        {"code_predictor_temperature": 0.5, "code_predictor_top_k": 3, "code_predictor_top_p": 0.25},
     )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
-    # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
+    # Greedy is temperature 0; a client do_sample switch is not read.
     greedy = model.get_request_resource_configs(
-        {}, {"subtalker_dosample": False}
-    )[CODE_PRED_SAMPLER]
-    assert greedy.temperature == 0.0
+        [], [], {"code_predictor_temperature": 0.0, "subtalker_dosample": False, "do_sample": False}
+    )
+    assert greedy[CODE_PRED_SAMPLER].temperature == 0.0
+    assert greedy[TALKER_SAMPLER].temperature == generation.temperature
 
     # Two samplers, one per head; only the Talker's carries a vocab for the
     # repetition penalty (see get_node_resources).
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {TALKER_SAMPLER, CODE_PRED_SAMPLER}
     specs = {
         spec.resource_key: spec for spec in model.get_node_resources()
         if isinstance(spec, SamplerSpec)
     }
     assert specs[TALKER_SAMPLER].vocab_size is not None
-    assert specs[CODE_PRED_SAMPLER].enable_repetion_penalty is False
+    assert specs[CODE_PRED_SAMPLER].enable_repetition_penalty is False
 
     # The conductor seeds each stream; they are seeded independently.
     configs[TALKER_SAMPLER].apply_conductor_config(seed=99)
     assert configs[TALKER_SAMPLER].seed == 99
     assert configs[CODE_PRED_SAMPLER].seed != 99
+
+
+def test_qwen3_tts_checkpoint_min_p_turns_the_capability_on():
+    model = _make_model()
+    model._generation_defaults_cache = {
+        **model._generation_defaults(), "min_p": 0.05, "code_predictor_min_p": 0.1,
+    }
+    specs = {
+        spec.resource_key: spec for spec in model.get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert specs[TALKER_SAMPLER].enable_min_p and specs[CODE_PRED_SAMPLER].enable_min_p
+    # a plain request takes those defaults and is not refused
+    for key, config in model.get_request_resource_configs([], [], {}).items():
+        config.validate(specs[key])
+    # without them the capability stays off
+    plain = {
+        spec.resource_key: spec for spec in _make_model().get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert not plain[TALKER_SAMPLER].enable_min_p and not plain[CODE_PRED_SAMPLER].enable_min_p
+
 
 
 def test_the_reference_audio_encoder_loads_the_flat_mimi_checkpoint(tmp_path):
@@ -2552,10 +2463,7 @@ def _ref_info(rid: str, clip: torch.Tensor, layout: list[int]) -> SimpleNamespac
 
 
 def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2566,7 +2474,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
     prepared = submodule.prepare_inputs(
@@ -2593,10 +2501,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
 
 
 def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2607,7 +2512,7 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
 
@@ -2649,3 +2554,136 @@ def test_qwen3_tts_codec_dtype_option():
     assert codec_dtype(torch.float16) is torch.float16
     with pytest.raises(ValueError, match="codec_dtype"):
         codec_dtype("int8")
+
+
+
+# ── generation-input contract ───────────────────────────────────────────────
+
+CONTRACT_GENERATION_CONFIG = {
+    "do_sample": True, "repetition_penalty": 1.05, "temperature": 0.9, "top_p": 1.0,
+    "top_k": 50, "subtalker_dosample": True, "subtalker_temperature": 0.9,
+    "subtalker_top_p": 1.0, "subtalker_top_k": 50, "max_new_tokens": 8192,
+}
+
+
+def _contract_model(local_dir=None) -> Qwen3TTSModel:
+    model = object.__new__(Qwen3TTSModel)
+    model.config = Qwen3TTSModelConfig()
+    model.local_dir = str(local_dir) if local_dir is not None else None
+    model._submodule_cache = {}
+    return model
+
+
+def _contract_with_generation_config(tmp_path, **overrides) -> Qwen3TTSModel:
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({**CONTRACT_GENERATION_CONFIG, **overrides})
+    )
+    model = _contract_model(tmp_path)
+    # as __init__ does; the other checkpoint files are optional
+    model.config = Qwen3TTSModelConfig.from_pretrained(tmp_path)
+    return model
+
+
+def test_released_defaults():
+    configs = _contract_model().get_request_resource_configs([], [], {})
+    talker, code_pred = configs[TALKER_SAMPLER], configs[CODE_PRED_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.top_p, talker.repetition_penalty) == (
+        0.9, 50, 1.0, 1.05,
+    )
+    assert (code_pred.temperature, code_pred.top_k, code_pred.top_p) == (0.9, 50, 1.0)
+    assert code_pred.repetition_penalty == 1
+
+
+def test_checkpoint_do_sample_false_is_a_temperature_zero_default(tmp_path):
+    model = _contract_with_generation_config(
+        tmp_path, do_sample=False, subtalker_dosample=False, top_k=20, max_new_tokens=100,
+    )
+    configs = model.get_request_resource_configs([], [], {})
+    assert configs[TALKER_SAMPLER].temperature == 0.0
+    assert configs[TALKER_SAMPLER].top_k == 20
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.0
+    assert model.get_max_output_tokens() == 100
+    # a request still samples by naming a temperature
+    configs = model.get_request_resource_configs([], [], {"temperature": 0.5, "code_predictor_temperature": 0.6})
+    assert configs[TALKER_SAMPLER].temperature == 0.5
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.6
+
+
+def test_client_do_sample_switches_are_not_read():
+    model = _contract_model()
+    configs = model.get_request_resource_configs([], [], {"do_sample": False, "subtalker_dosample": False})
+    assert configs[TALKER_SAMPLER].temperature == 0.9
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.9
+    assert "do_sample" not in model.request_kwargs()
+    assert "subtalker_dosample" not in model.request_kwargs()
+
+
+def test_stage_prefixed_key_wins_over_plain():
+    configs = _contract_model().get_request_resource_configs([], [], {
+        "temperature": 0.3, "talker_temperature": 0.4, "top_k": 9, "penalize_prompt": False,
+    })
+    talker = configs[TALKER_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.penalize_prompt) == (0.4, 9, False)
+    # plain keys stay on the Talker
+    assert configs[CODE_PRED_SAMPLER].top_k == 50
+
+
+def test_subtalker_is_a_deprecated_alias(caplog, monkeypatch):
+    monkeypatch.setattr(qwen3_tts_model, "_warned_deprecated", set())
+    model = _contract_model()
+    with caplog.at_level(logging.WARNING, logger=qwen3_tts_model.__name__):
+        old = model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
+        model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
+    assert old[CODE_PRED_SAMPLER].top_k == 7
+    assert sum("deprecated" in r.message for r in caplog.records) == 1
+    both = model.get_request_resource_configs([], [], {"subtalker_top_k": 7, "code_predictor_top_k": 3})
+    assert both[CODE_PRED_SAMPLER].top_k == 3
+
+
+def test_frame_default_and_request_cap():
+    model = _contract_model()
+    assert model.get_max_output_tokens() == 8192
+    assert model.get_max_output_tokens(max_output_tokens=12) == 12
+    # the API folds max_new_tokens into max_output_tokens; the model reads only the latter
+    assert model.get_max_output_tokens(max_new_tokens=12) == 8192
+
+
+@pytest.mark.parametrize("voice", ["", 3])
+@pytest.mark.parametrize("key", ["voice", "speaker"])
+def test_empty_or_non_string_voice_is_a_400(key, voice):
+    with pytest.raises(ValueError, match="voice must be a non-empty name"):
+        _contract_model()._resolve_speaker({key: voice})
+
+
+def test_absent_voice_is_the_default_and_unknown_is_a_400():
+    model = _contract_model()
+    assert model._resolve_speaker({})[0] == model.config.default_speaker
+    with pytest.raises(ValueError, match="Unsupported Qwen3-TTS speaker"):
+        model._resolve_speaker({"voice": "alloy"})
+
+
+@pytest.mark.parametrize("key", ["non_streaming_mode", "x_vector_only_mode"])
+def test_boolean_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._flag({key: "false"}, key, False)
+    assert qwen3_tts_model._flag({key: True}, key, False) is True
+    assert qwen3_tts_model._flag({}, key, False) is False
+
+
+@pytest.mark.parametrize("key", ["language", "instruct", "ref_text"])
+def test_string_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._text({key: 5}, key, "")
+
+
+def test_request_kwargs_spot_checks():
+    declared = _contract_model().request_kwargs()
+    for key in (
+        "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt",
+        "talker_temperature", "code_predictor_temperature", "code_predictor_top_k",
+        "subtalker_top_p", "ignore_eos", "max_output_tokens", "seed", "voice", "speaker",
+        "language", "instruct", "instructions", "non_streaming_mode", "ref_text",
+        "x_vector_only_mode",
+    ):
+        assert key in declared, key
+    assert "max_new_tokens" not in declared

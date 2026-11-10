@@ -55,10 +55,8 @@ from mstar.model.voxcpm2.submodules import (
 )
 from mstar.model.voxcpm2.voxcpm2_model import (
     STREAM_EDGE,
-    STREAM_LEAD_KEY,
     VoxCPM2Model,
     decoder_receptive_field_patches,
-    stream_window_widths,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -310,8 +308,7 @@ def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tu
     edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
     if clip is not None:
         edges = {**edges, "audio_inputs": [clip]}
-    args = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=metadata)
-    return edges, args.step_metadata
+    return edges, dict(model.walk_plan("Talker", modalities, ["audio"], {}, metadata)[0].step_metadata)
 
 
 def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleNamespace:
@@ -351,7 +348,7 @@ def test_process_prompt_builds_each_reference_mode(model):
     # max patches follow the target text only
     digest = hashlib.blake2b(clip.numpy().tobytes(), digest_size=16).hexdigest()
     assert {k: v for k, v in metadata.items() if k != "kv_layout"} == {
-        STREAM_LEAD_KEY: 3,
+        "stream_lead_items": {STREAM_EDGE: 3},
         PATCH_BUDGET_KEY: 16,
         PROMPT_MODE_KEY: MODE_REF_CONTINUATION,
         MIN_LEN_KEY: 2,
@@ -359,7 +356,9 @@ def test_process_prompt_builds_each_reference_mode(model):
     }
     # every key the conductor reads back is one the data worker strips from the client
     for meta in (zero_meta, ref_meta, metadata):
-        assert set(meta) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
+        assert set(meta) - {"kv_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
+    # only a continuation's stream leads with prompt patches
+    assert "stream_lead_items" not in zero_meta and "stream_lead_items" not in ref_meta
 
 
 def test_process_prompt_collapses_whitespace_like_the_reference(model, monkeypatch):
@@ -400,12 +399,9 @@ def test_a_one_patch_request_ends_after_prefill(model, budget, done):
     """Prefill has no loop for the Talker's stop to end, so a request whose
     budget the prefill patch spends goes straight to done instead of a decode
     step that would only veto itself."""
-    args = model.get_initial_forward_pass_args(
-        "Talker", ["text"], ["audio"], {}, model_kwargs={PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
-    )
-    nxt = model.get_partition_forward_pass_args("Talker", args.full_metadata, {"latent_patch": []})
-    assert nxt.request_done is done
-    assert nxt.full_metadata.graph_walk == ("talker_prefill" if done else "talker_decode")
+    kwargs = {PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
+    plan = model.walk_plan("Talker", ["text"], ["audio"], {}, kwargs)
+    assert [step.walk for step in plan] == ["talker_prefill"] + ([] if done else ["talker_decode"])
 
 
 @pytest.mark.parametrize("budget", [2, 5])
@@ -465,11 +461,11 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
         prepared = ref.prepare_inputs(walk, info, {"audio_inputs": [clip]})
         with torch.inference_mode():
             edges.update(ref.forward(walk, None, **prepared.tensor_inputs, **prepared.kwargs))
-    step = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=meta).step_metadata
+    step = dict(model.walk_plan("Talker", modalities, ["audio"], {}, meta)[0].step_metadata)
     prefill = talker.prepare_inputs(walk, _info("r", 0, step), edges)
     assert span.length == prefill.input_seq_len, "the layout and the prefill disagree on its rows"
 
-    configs = model.get_request_resource_configs({}, meta)
+    configs = model.get_request_resource_configs([], [], meta)
     for key in ("base_kv", "res_kv"):
         configs.setdefault(key, KVReqConfig(needed_labels=["main"]))
     refuse_undeclared_labels("VoxCPM2Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
@@ -581,28 +577,19 @@ def test_build_prompt_matches_the_reference_layout():
     assert torch.equal(audio, ref[0])
 
 
-def test_initial_args_route_reference_audio_and_stream_lead(model):
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
+def test_walk_plan_clones_through_the_ref_encoder(model):
     _, metadata = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
     )
-    talker = model.get_initial_forward_pass_args(
-        "Talker", ["text", "audio"], ["audio"], signals, model_kwargs={**metadata, "unrelated": 1}
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = sorted((edge.next_node, edge.name) for edge in talker.inputs)
-    assert routes == [("RefEncoder", "audio_inputs"), ("Talker", "gen_params"), ("Talker", "text_inputs")]
+    talker = model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {**metadata, "unrelated": 1})
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # the prompt facts ride step metadata to the Talker partition's nodes
     keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
-    assert talker.step_metadata == {key: metadata[key] for key in keys}
-    vae = model.get_initial_forward_pass_args(
-        "VAEDecoder", ["text", "audio"], ["audio"], {}, model_kwargs={STREAM_LEAD_KEY: 3}
-    )
-    assert vae.stream_lead_items == {STREAM_EDGE: 3}
+    assert [dict(step.step_metadata) for step in talker] == [{key: metadata[key] for key in keys}, {}]
     _, zero_shot = model.process_prompt("hello", ["text"], ["audio"])
-    plain = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=zero_shot)
-    assert plain.full_metadata.graph_walk == "talker_prefill"
-    assert {edge.next_node for edge in plain.inputs} == {"Talker"}
+    plain = model.walk_plan("Talker", ["text"], ["audio"], {}, zero_shot)
+    assert [step.walk for step in plain] == ["talker_prefill", "talker_decode"]
+    assert [step.walk for step in model.walk_plan("VAEDecoder", ["text"], ["audio"], {}, zero_shot)] == ["vae_chunk"]
 
 
 @pytest.mark.parametrize("ref_text", ["", "world"])
@@ -610,47 +597,22 @@ def test_the_talker_walk_follows_the_prompt_mode_not_input_modalities(model, ref
     """``/generate`` takes ``input_modalities`` from the client: a clip sent with
     ``["text"]`` builds a cloning prompt, so the conductor must run the
     RefEncoder walk for it too, or the Talker has no reference latents."""
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
     _, metadata = model.process_prompt(
         "hello", ["text"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}, ref_text=ref_text
     )
     assert metadata[PROMPT_MODE_KEY] != MODE_ZERO_SHOT
-    talker = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=metadata)
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    assert ("RefEncoder", "audio_inputs") in {(edge.next_node, edge.name) for edge in talker.inputs}
-    assert talker.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
+    prefill = model.walk_plan("Talker", ["text"], ["audio"], {}, metadata)[0]
+    assert prefill.walk == "talker_prefill_clone"
+    assert prefill.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
 
 
 def test_the_talker_walk_needs_the_prompt_mode(model):
     """Only process_prompt sets the mode (INTERNAL_KWARGS drops a client's), so
     a request without one never reached it; refuse it rather than guess."""
     with pytest.raises(ValueError, match=PROMPT_MODE_KEY):
-        model.get_initial_forward_pass_args("Talker", ["text", "audio"], ["audio"], {}, model_kwargs={})
+        model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {})
 
 
-@pytest.mark.parametrize("ref_text, lead", [(None, 0), ("", 0), ("world", 3)])
-def test_a_client_cannot_set_the_stream_lead(model, ref_text, lead):
-    """The data worker lays the prompt metadata over the request's kwargs, so
-    the lead must be the server's in every mode: a client value past the
-    stream's context would raise in the worker's ingest, outside any one
-    request's failure path."""
-    clip = None if ref_text is None else torch.zeros(16000)
-    modalities = ["text"] if clip is None else ["text", "audio"]
-    tensors = None if clip is None else {"audio_inputs": [clip]}
-    client = {STREAM_LEAD_KEY: 999}
-    _, metadata = model.process_prompt(
-        "hello", modalities, ["audio"], tensors=tensors, ref_text=ref_text, **client
-    )
-    vae = model.get_initial_forward_pass_args(
-        "VAEDecoder", modalities, ["audio"], {}, model_kwargs={**client, **metadata}
-    )
-    assert vae.stream_lead_items == ({STREAM_EDGE: lead} if lead else {})
-
-
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == 48000
 
 
 def test_load_audio_resamples_to_16k_and_bounds_duration(model, tmp_path):
@@ -1269,11 +1231,7 @@ def _window_widths(buffer: StreamBuffer) -> list[int]:
 
 
 def test_stream_window_widths_bound_every_window(model):
-    assert stream_window_widths((1, 2, 4), 8, 5) == (1, 3, 7, 13)
-    assert stream_window_widths((1, 2, 4), 8, 22) == (1, 3, 7, 15, 23, 30)
-    assert stream_window_widths((4,), 2, 0) == (2, 4)
-    assert stream_window_widths((), 8, 5) == (8, 13)
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     for lead in (0, 2, model.stream_left_context):
         policy = model.get_partition_topology().connections[0].chunk_policy_factory()
         buffer = StreamBuffer(request_id="r", edge_name=STREAM_EDGE, from_partition="Talker", policy=policy)
@@ -1295,7 +1253,7 @@ def test_vae_windows_replay_at_their_bucket_and_equal_a_whole_decode(model):
     """Every window of a stream goes through the region of the next width up,
     padded at the end; the streamed audio still equals one whole decode."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     vae_node = VAEDecoderSubmodule(_random_vae(config).double(), config, window_buckets=widths)
     regions = vae_node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert list(regions) == [VAE_WINDOW.format(width) for width in widths]
@@ -1317,7 +1275,7 @@ def test_graph_hooks_are_the_names_the_engine_calls(model):
     which captures nothing) and declares its regions when called as the engine
     calls it."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     talker, _, _ = _talker(model)
     vae_node = VAEDecoderSubmodule(_random_vae(config), config, window_buckets=widths)
     for hook in (
@@ -1380,7 +1338,7 @@ def test_captured_regions_replay_the_eager_result_on_cuda(model):
                 else:
                     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
-        widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+        widths = model.stream_window_widths()
         vae_node = VAEDecoderSubmodule(_random_vae(config).to(device), config, window_buckets=widths)
         runners = {
             label: capture(label, region)
@@ -1551,6 +1509,88 @@ def test_adapter_takes_data_urls_and_gated_urls(media_dirs, monkeypatch):
         adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=["x"]), uploads)
 
 
+# -- request contract -----------------------------------------------------------
+
+
+def _loop_conductor(model):
+    """A conductor with only what ``_loop_caps`` reads: the model and its loops' ``max_iters``."""
+    from mstar.conductor.conductor import Conductor
+
+    c = Conductor.__new__(Conductor)
+    c.model = model
+    c._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    return c
+
+
+def test_request_kwargs_are_the_keys_the_model_and_its_adapter_read(model, tmp_path):
+    assert model.request_kwargs() == {
+        "instruct", "instructions", "ref_text", "cfg_value", "min_len", "inference_timesteps",
+        "max_new_tokens", "max_output_tokens", "max_len",
+    }
+    req = SpeechRequest(model="voxcpm2", input="hi", voice="alloy", speed=1.2, seed=7, instructions="calm",
+                        cfg_value=2.5, min_len=2, max_new_tokens=9)
+    sa = adapters.VoxCPM2Adapter().speech_to_request(req, tmp_path)
+    # seed is the conductor's; the adapter drops voice, speech_request forwards a sent speed to be
+    # logged as ignored, and the model reads neither
+    assert set(sa.model_kwargs) - {"seed"} <= model.request_kwargs()
+    assert not {"voice", "speed"} & model.request_kwargs()
+
+
+@pytest.mark.parametrize("key", ["max_new_tokens", "max_output_tokens", "max_len", "min_len", "inference_timesteps"])
+@pytest.mark.parametrize("bad", [2.7, "20", True])
+def test_integer_knobs_are_strict(model, key, bad):
+    """``int()`` used to truncate 2.7 to 2 and read "20" as 20."""
+    with pytest.raises(ValueError, match=f"{key} must be an integer"):
+        model.process_prompt("hello", ["text"], ["audio"], **{key: bad})
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"max_new_tokens": -1}, "max_new_tokens"),
+        ({"min_len": -1}, "min_len"),
+        ({"cfg_value": "2"}, "cfg_value must be a number"),
+        ({"cfg_value": True}, "cfg_value must be a number"),
+        ({"cfg_value": 10**400}, "finite"),
+        ({"max_len": 10**400}, "max_new_tokens <="),
+        ({"instruct": 5}, "instruct must be a string"),
+        ({"instructions": ["calm"]}, "instructions must be a string"),
+        ({"ref_text": 5}, "ref_text must be a string"),
+    ],
+)
+def test_wrong_types_and_ranges_are_value_errors(model, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        model.process_prompt("hello", ["text"], ["audio"], **kwargs)
+
+
+def test_whole_floats_pass_for_integer_knobs(model):
+    _, metadata = model.process_prompt(
+        "hello world", ["text"], ["audio"], max_new_tokens=9.0, min_len=2.0,
+        inference_timesteps=float(model.inference_timesteps), cfg_value=2,
+    )
+    assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, 9) and metadata[MIN_LEN_KEY] == 2
+    assert type(metadata[MIN_LEN_KEY]) is int
+    assert model.get_loop_caps(max_new_tokens=9.0) == {TALKER_LOOP: 8}
+
+
+def test_a_patch_budget_past_the_decode_loop_is_refused_not_clamped(model):
+    """The loop is built from the default request's cap (one under ``max_len``,
+    since the prefill emits the first patch), so one patch past ``max_len`` is
+    refused by the conductor as well as by ``process_prompt``."""
+    limit = model.config.max_len
+    c = _loop_conductor(model)
+    assert c._loop_max_iters == {TALKER_LOOP: limit - 1}
+    assert c._loop_caps({"max_new_tokens": limit}) == {TALKER_LOOP: limit - 1}
+    with pytest.raises(ValueError, match="iterations"):
+        c._loop_caps({"max_new_tokens": limit + 1})
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=limit + 1)
+
+
 def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
     config = model.config
     for compiled, regions in ((True, ["vae.decoder"]), (False, [])):
@@ -1562,3 +1602,125 @@ def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
     assert VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae=False).compile_vae is False
     with pytest.raises(ValueError, match="compile_vae"):
         VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae="no")
+
+
+def test_the_talker_serves_a_ready_prompt_first(model):
+    """Each prefill walk outranks decode, a clone's reference encoding with it:
+    listing a walk covers every node on it, as the worker resolves the entries."""
+    from mstar.worker.services import walk_priorities_of
+
+    priorities = walk_priorities_of(model, model.get_graph_walk_graphs())
+    assert {pair: entry.priority for pair, entry in priorities.items()} == {
+        ("RefEncoder", "talker_prefill_clone"): 1,
+        ("Talker", "talker_prefill"): 1,
+        ("Talker", "talker_prefill_clone"): 1,
+    }
+    assert ("Talker", "talker_decode") not in priorities
+
+
+# -- the local DiT's solve ----------------------------------------------------------------
+
+
+def _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=False):
+    """``solve_cfm`` as the reference writes it: every step re-embeds its time
+    and re-projects the condition through ``estimator.forward``."""
+    rows, x = noise.shape[0], noise
+    t, dt = t_span[0], t_span[0] - t_span[1]
+    zero_init_steps = max(1, int(len(t_span) * 0.04))
+    mu_in, cond_in = torch.cat([mu, torch.zeros_like(mu)]), torch.cat([cond, cond])
+    scale = cfg_value.to(x.dtype).view(rows, 1, 1)
+    for step in range(1, len(t_span)):
+        if step <= zero_init_steps:
+            dphi_dt = torch.zeros_like(x)
+        else:
+            t_in = t.expand(2 * rows)
+            dt_in = dt.expand(2 * rows) if mean_mode else torch.zeros_like(t_in)
+            velocity = estimator(torch.cat([x, x]), mu_in, t_in, cond_in, dt_in)
+            pos, neg = velocity[:rows], velocity[rows:]
+            dot = torch.sum(pos.reshape(rows, -1) * neg.reshape(rows, -1), dim=1, keepdim=True)
+            st_star = (dot / (torch.sum(neg.reshape(rows, -1) ** 2, dim=1, keepdim=True) + 1e-8)).view(rows, 1, 1)
+            dphi_dt = neg * st_star + scale * (pos - neg * st_star)
+        x = x - dt * dphi_dt
+        t = t - dt
+        if step < len(t_span) - 1:
+            dt = t - t_span[step + 1]
+    return x
+
+
+@pytest.mark.parametrize("mean_mode", [False, True])
+def test_the_solve_computes_its_per_solve_tokens_once_and_matches_the_stepwise_solve(mean_mode):
+    from mstar.model.voxcpm2.components.local import cfm_t_span, solve_cfm
+
+    config = VoxCPM2Config.from_dict(TINY)
+    estimator = _random_generator(config).feat_decoder.estimator
+    gen = torch.Generator().manual_seed(1)
+    rows, hidden = 3, config.dit.hidden_size
+    noise = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    mu = torch.randn(rows, 2 * hidden, generator=gen)
+    cond = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    cfg_value = torch.tensor([1.5, 2.0, 3.0])
+    t_span = cfm_t_span(10, "cpu", torch.float32)
+    with torch.no_grad():
+        got = solve_cfm(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+        want = _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel runs on CUDA")
+@pytest.mark.parametrize("seq", [5, 11])
+@pytest.mark.parametrize("rows", [2, 33])
+def test_fused_rope_attention_matches_the_eager_path_at_the_checkpoints_head_size(rows, seq):
+    """The local stacks' shape (16 query and 2 KV heads of 128, rows of the
+    encoder's 5 or the DiT's 11 tokens): rounding apart, the eager result."""
+    from mstar.model.components.rope_attention import rope_attention, rope_attention_reference
+
+    heads, kv_heads, head_dim = 16, 2, 128
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    # any tables: the kernel reads both halves of each, as the eager rotation does
+    cos, sin = (torch.rand(seq, head_dim, device="cuda", generator=gen) * 2 - 1 for _ in range(2))
+    qkv = torch.randn(rows * seq, (heads + 2 * kv_heads) * head_dim, device="cuda", generator=gen).to(torch.bfloat16)
+    got = rope_attention(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    want = rope_attention_reference(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    assert got.shape == want.shape == (rows * seq, heads * head_dim)
+    # a table the kernel can't read with cos's strides takes the eager path
+    wide = torch.rand(seq, 2 * head_dim, device="cuda", generator=gen) * 2 - 1
+    sliced = wide[:, :head_dim]
+    assert torch.equal(rope_attention(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim),
+                       rope_attention_reference(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim))
+    err = (got.float() - want.float()).abs()
+    # the softmax weights round to bfloat16 before the value product, as SDPA's do,
+    # in another order: a few bfloat16 steps at most, far less on average
+    assert err.max() < 0.07 and err.mean() < 0.003
+
+
+def _local_stack(seed=0):
+    """A local stack the fused paths take: head halves of 32, half precision."""
+    from mstar.model.voxcpm2.components.minicpm import MiniCPMLocalTransformer
+    from mstar.model.voxcpm2.config import MiniCPM4Config
+
+    config = MiniCPM4Config(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                            num_key_value_heads=2, head_dim=64, vocab_size=0)
+    torch.manual_seed(seed)
+    stack = MiniCPMLocalTransformer(config, max_len=11)
+    with torch.no_grad():
+        for name, param in stack.named_parameters():
+            param.copy_(1 + 0.1 * torch.randn_like(param) if "norm" in name else 0.05 * torch.randn_like(param))
+    stack.materialize_buffers()
+    return stack.eval()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused paths run on CUDA")
+def test_the_local_stack_compiles_whole_and_its_fused_bf16_path_matches_fp32():
+    """No graph break between layers (attention, add+norm, SiLU are each one op
+    or kernel Dynamo sees whole), and the half-precision fused path within
+    rounding of the float32 portable one on the same weights."""
+    stack = _local_stack()
+    x = torch.randn(6, 11, 256, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        want = stack(x)  # CPU, float32: the reference rotation, SDPA, unfused add+norm and SiLU
+        fused = stack.to("cuda", torch.bfloat16)
+        got = fused(x.to("cuda", torch.bfloat16))
+        compiled = torch.compile(fused, fullgraph=True)(x.to("cuda", torch.bfloat16))
+    err = (got.float().cpu() - want).norm() / want.norm()
+    assert err < 0.02, err
+    torch.testing.assert_close(compiled, got, rtol=0.02, atol=0.02)

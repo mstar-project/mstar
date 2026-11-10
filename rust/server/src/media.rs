@@ -68,14 +68,20 @@ fn modality_from_ext(suffix: &str) -> &'static str {
     }
 }
 
-/// Infer a modality string from a filename's extension (for `/generate`
-/// multipart uploads, matching mstar's `_detect_modality`).
+/// A file's modality by its name, for `/generate` and `/generate/ws`
+/// uploads: `entrypoint._detect_modality`'s table, which differs from the
+/// media paths' (no `.opus`).
 pub fn modality_from_filename(name: &str) -> &'static str {
     let suffix = Path::new(name)
         .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
+        .map(|e| format!(".{}", e.to_string_lossy()).to_lowercase())
         .unwrap_or_default();
-    modality_from_ext(&suffix)
+    match suffix.as_str() {
+        ".png" | ".jpg" | ".jpeg" | ".webp" | ".bmp" | ".tiff" | ".gif" => "image",
+        ".wav" | ".mp3" | ".flac" | ".ogg" | ".m4a" | ".aac" => "audio",
+        ".mp4" | ".avi" | ".mov" | ".mkv" | ".webm" => "video",
+        _ => "unknown",
+    }
 }
 
 /// Map a MIME type to one of the modality strings (image/audio/video).
@@ -96,7 +102,7 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 /// does: whitespace anywhere is dropped (line-wrapped payloads), missing `=`
 /// padding is restored (some OpenAI clients strip it), and anything else
 /// outside the standard alphabet is refused.
-fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub(crate) fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
     use base64::engine::DecodePaddingMode;
     // Python ignores the unused low bits of the last symbol too
@@ -112,6 +118,115 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
         .filter(|c| !c.is_whitespace() && !('\u{1c}'..='\u{1f}').contains(c))
         .collect();
     LENIENT.decode(compact.as_bytes())
+}
+
+/// `subprocess.run(cmd, capture_output=True, timeout=timeout)`: the child's
+/// output, or an `Err` once it has run past `timeout` (it is killed, as
+/// `subprocess.run` kills it).
+fn run_with_timeout(cmd: &mut std::process::Command, timeout: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let name = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{name} failed: {e}"))?;
+    // drained as the child writes, so a full pipe cannot stall it
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("{name} failed: {e}"))? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name} timed out after {} seconds", timeout.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// `mux_mp4_with_pcm16`'s limits on the frame-rate query and the mux.
+const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FFMPEG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `media_io.mux_mp4_with_pcm16`: an H.264 mp4 and raw interleaved 16-bit PCM
+/// into one mp4 with an AAC track, the video stream-copied, by the same
+/// `ffprobe` and `ffmpeg` commands. `video_fps` is the content's true rate: when
+/// it differs from the container's, the video timestamps are rescaled so
+/// playback stays in sync with the audio. Blocking; an `Err` leaves the caller
+/// the video alone, as Python falls back to it.
+pub fn mux_mp4_with_pcm16(
+    video_mp4: &[u8],
+    pcm: &[u8],
+    sample_rate: i64,
+    num_channels: i64,
+    video_fps: Option<f64>,
+) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("mstar_mux_{}", Uuid::new_v4().simple()));
+    // private, as `TemporaryDirectory`'s: the generated clip is the client's
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let (vpath, apath, opath) = (dir.join("v.mp4"), dir.join("a.pcm"), dir.join("out.mp4"));
+        std::fs::write(&vpath, video_mp4).map_err(|e| e.to_string())?;
+        std::fs::write(&apath, pcm).map_err(|e| e.to_string())?;
+        let mut itsscale = None;
+        if let Some(fps) = video_fps {
+            let mut probe = std::process::Command::new("ffprobe");
+            probe
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate",
+                       "-of", "csv=p=0"])
+                .arg(&vpath);
+            // a query that times out fails the mux; one that answers nothing leaves the rate
+            let probe = run_with_timeout(&mut probe, FFPROBE_TIMEOUT)?;
+            let out = String::from_utf8_lossy(&probe.stdout);
+            if let Some((num, den)) = out.trim().split_once('/') {
+                if let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) {
+                    let container = num / den;
+                    if den != 0.0 && container > 0.0 && (container - fps).abs() > 1e-3 {
+                        itsscale = Some(container / fps);
+                    }
+                }
+            }
+        }
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-y", "-v", "error"]);
+        if let Some(scale) = itsscale {
+            cmd.args(["-itsscale".to_string(), format!("{scale:.6}")]);
+        }
+        cmd.arg("-i").arg(&vpath);
+        cmd.args(["-f", "s16le", "-ar", &sample_rate.to_string(), "-ac", &num_channels.to_string(), "-i"]);
+        cmd.arg(&apath);
+        cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
+        cmd.arg(&opath);
+        let out = run_with_timeout(&mut cmd, FFMPEG_TIMEOUT).map_err(|e| format!("ffmpeg mux failed: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("ffmpeg mux failed: {}", stderr.trim().chars().take(500).collect::<String>()));
+        }
+        std::fs::read(&opath).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// `media_io.BARE_REF_AUDIO_REFUSAL`.

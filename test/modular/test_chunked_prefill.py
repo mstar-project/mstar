@@ -369,13 +369,51 @@ def test_a_request_removed_mid_prompt_drops_its_prepared_input():
             pass
 
     engine = _engine_with(_Sub(10))
-    engine._loopback_steps = {}
+    engine._loopback_steps, engine._resident_delta = {}, None
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 
     engine.remove_request(0)
 
     assert not engine._chunking.prepared
+
+
+def test_a_prompts_input_set_aside_leaves_its_key_to_an_earlier_step_and_comes_back_whole():
+    """A request dropped mid-prefill in a later step of its prompt reruns the steps before it first, and each of
+    those prepares its own input under the request's key."""
+    sub = _Prompt(10)
+    engine = _engine_with(sub)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+
+    engine.set_aside_chunk_inputs(0, "LLM")
+    sub.n = 6
+    earlier = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 6, 6, 6))
+    engine.release_chunk_inputs(0, "LLM")
+    engine.restore_chunk_inputs(0, "LLM")
+    resumed = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 10, 10, 6))
+
+    assert earlier.chunk_total == 6, "the earlier step would be cut from the prompt's input"
+    assert resumed.chunk_total == 10 and resumed.input_ids.tolist() == list(range(4, 10)), (
+        "the prompt's next chunk would find no input, or the earlier step's"
+    )
+
+
+def test_a_request_removed_while_its_prompts_input_is_set_aside_drops_it():
+    from types import SimpleNamespace
+
+    class _Sub(_Prompt):
+        def cleanup_request(self, request_id):
+            pass
+
+    engine = _engine_with(_Sub(10))
+    engine._loopback_steps = {}
+    engine._runner = SimpleNamespace(remove_request=lambda rid: None)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    engine.set_aside_chunk_inputs(0, "LLM")
+
+    engine.remove_request(0)
+
+    assert not engine._chunking.aside, "a removed request's prompt input would stay on the device"
 
 
 # ── engine: a chunked row starts past its cached prefix ────────────────
@@ -490,6 +528,24 @@ def test_a_hit_that_lands_after_the_row_was_measured_is_declined_not_dropped():
     assert engine._runner.applied == [(0, 10, 0)]
 
 
+def test_a_rebuild_of_a_prompt_mid_prefill_is_cut_from_the_prompts_input_and_leaves_it():
+    """The prompt ran its first chunk and was dropped. Its rebuild runs that chunk again from the input prepared for
+    it, applying the cached prefix it starts past, and the prompt's next chunk is cut from the same input."""
+    sub = _KeyedPrompt(10)
+    engine = _keyed_engine(sub, matched=0)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    rebuild = _batch()
+
+    rerun = engine._prepare_chunk(rebuild, 0, "prefill", ChunkRange(0, 4, 4, 4))
+    resumed = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 10, 10, 6))
+
+    assert sub.prepares == 1 and not rebuild.first_chunk_rids, "a refused rebuild would release the prompt's input"
+    assert rerun.input_ids.tolist() == [0, 1, 2, 3] and resumed.input_ids.tolist() == list(range(4, 10))
+    assert engine._runner.applied == [(0, 10, 0), (0, 10, 0)], (
+        "the rebuild would write over the pages the drop left cached, unprobed"
+    )
+
+
 def test_a_first_chunk_past_a_prefix_its_inputs_cannot_skip_fails():
     import pytest
 
@@ -598,8 +654,9 @@ def _budgeted_engine(align: int = 1):
 
     from mstar.model.submodule_base import ChunkingPolicy
     from mstar.testing_utils.engine import make_engine, make_mgmt
+    from mstar.testing_utils.resource import make_resource
 
-    state = SimpleNamespace(chunk_alignment=align, force_double_buffer=False, supports_preplan=False)
+    state = make_resource(chunk_alignment=align)
     engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace(), resources={"state": state})})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
@@ -803,7 +860,7 @@ def _captured_buckets(submodule, walk, ladders, engine, bs=1) -> list[int]:
 
 
 def _orpheus_prefill_buckets(ladders) -> list[int]:
-    """Orpheus's ``prefill`` capture, which its ``prefill`` and ``mixed`` steps replay."""
+    """Orpheus's ``prefill`` capture."""
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
     engine = _mixed_engine()
@@ -879,15 +936,11 @@ def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the
     assert buckets(2048) == (2175, [1024, 2048, 2176], [1024, 2048])
 
 
-@pytest.mark.parametrize("walk, match", [
-    # Orpheus's ``mixed`` steps replay its ``prefill`` capture
-    ("mixed", "'prefill'"),
-    # and its ``decode`` capture takes a batch size, one token a row
-    ("decode", "batch size, not tokens"),
-])
-def test_a_walk_with_no_token_ladder_to_set_is_refused(walk, match):
-    with pytest.raises(ValueError, match=match):
-        _orpheus_prefill_buckets({walk: [64]})
+def test_a_walk_with_no_token_ladder_to_set_is_refused():
+    # Orpheus's ``decode`` capture takes a batch size, one token a row (a walk whose steps
+    # replay another's capture is refused in test_cosyvoice3_model)
+    with pytest.raises(ValueError, match="batch size, not tokens"):
+        _orpheus_prefill_buckets({"decode": [64]})
 
 
 def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):

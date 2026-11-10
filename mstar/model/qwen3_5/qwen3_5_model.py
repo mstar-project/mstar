@@ -16,11 +16,11 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import TensorAndMetadata
+from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -37,7 +37,6 @@ from mstar.model.multimodal_decoder import (
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -99,7 +98,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         # prompt order. A text-only checkpoint's tokenizer still has the pad
         # tokens, so the tower decides whether the model takes media.
         pad = self._pad_ids() if self.vision_config is not None else {}
-        tower = vision_encoder(tuple(pad.values())) if pad else None
+        tower = vision_encoder() if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
             # a video fills one pad per temporal group
@@ -131,6 +130,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
         return [
@@ -180,13 +181,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             ),
             self._sampler_spec(self.config.vocab_size),
             *self._vision_resources(),
+            qwen3_5_lora_spec(self.config, self.vision_config),
         ]
-
-    def get_lora_specs(self) -> list[LoraSpec]:
-        """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
-        from mstar.model.qwen3_5.lora import qwen3_5_lora_specs
-
-        return qwen3_5_lora_specs(self.config, self.vision_config)
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""
@@ -224,7 +220,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
         budget = LLMSubmodule.MAX_BATCH_TOKENS
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            ChunkingPolicy(walks=(LLMSubmodule.PREFILL_WALK,), chunkable=True, max_batch_tokens=budget),
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
         )}
@@ -308,7 +304,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         video = sample_video(filepath, self.video_processor)
         return TensorAndMetadata(data=video.frames, metadata=video.metadata)
 
-    def _video_runs(self, metadata: dict) -> int:
+    def _video_runs(self, video: torch.Tensor, metadata: dict) -> int:
         """A video's pad runs: one per temporal group."""
         return len(self._video_timestamps(metadata))
 
@@ -351,6 +347,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     ) -> torch.Tensor:
         """The chat template's prompt, each video's pad written out as one
         ``<t seconds>``-stamped pad per temporal group (`expand_video_pads`)."""
+        enable_thinking = kwargs.get("enable_thinking", True)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
         raw_videos = raw.get(VIDEO, [])
         video_metadata = (kwargs.get("input_metadata") or {}).get("video_inputs", [])
         if len(video_metadata) != len(raw_videos):
@@ -370,7 +369,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 messages_from_parts(parts),
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=kwargs.get("enable_thinking", True),
+                enable_thinking=enable_thinking,
             )
         except TemplateError as exc:
             # a chat the template refuses (a system message after the first turn,
@@ -413,13 +412,12 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
 
-    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+    def media_advance(self, tokens: int, grid: list[int]) -> int:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        advance = length + sum(
-            vision_position_advance(torch.tensor(grid), self._merge()) - tokens
-            for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
-        )
-        return super().kv_layout(layout, length, advance)
+        return image_position_advance(torch.tensor(grid), self._merge())
+
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {"enable_thinking"}
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

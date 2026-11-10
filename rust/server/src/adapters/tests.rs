@@ -75,8 +75,14 @@ fn a_role_a_chat_cannot_render_is_refused() {
 }
 
 /// The surfaces a class serves: chat, speech, images, videos.
-fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 4] {
-    [adapter.supports_chat(), adapter.supports_speech(), adapter.supports_images(), adapter.supports_videos()]
+fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 5] {
+    [
+        adapter.supports_chat(),
+        adapter.supports_speech(),
+        adapter.supports_images(),
+        adapter.supports_videos(),
+        adapter.supports_transcriptions(),
+    ]
 }
 
 #[test]
@@ -88,17 +94,18 @@ fn each_ported_python_adapter_class_is_found_by_its_name_once() {
     for (class, adapter) in ADAPTERS {
         assert_eq!(surfaces(from_python(class).unwrap()), surfaces(*adapter), "{class}");
     }
-    for class in ["", "WhisperAdapter", "qwen3_5_0.8b", "bagel"] {
+    for class in ["", "Pi05Adapter", "qwen3_5_0.8b", "bagel"] {
         assert!(from_python(class).is_none(), "{class:?}");
     }
     // the surfaces of a few classes, as their Python attributes declare them
-    assert_eq!(surfaces(&Bagel), [true, false, true, false]);
-    assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false]);
-    assert_eq!(surfaces(&Qwen3_5), [true, false, false, false]);
-    assert_eq!(surfaces(&Cosmos3), [false, false, true, true]);
-    assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true]);
-    assert_eq!(surfaces(&Qwen3TTS), [false, true, false, false]);
-    assert_eq!(surfaces(&Orpheus), [false, true, false, false]);
+    assert_eq!(surfaces(&Bagel), [true, false, true, false, false]);
+    assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false, false]);
+    assert_eq!(surfaces(&Qwen3_5), [true, false, false, false, false]);
+    assert_eq!(surfaces(&Cosmos3), [false, false, true, true, false]);
+    assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true, false]);
+    assert_eq!(surfaces(&Qwen3TTS), [false, true, false, false, false]);
+    assert_eq!(surfaces(&Orpheus), [false, true, false, false, false]);
+    assert_eq!(surfaces(&Whisper), [false, false, false, false, true]);
 }
 
 fn speech(body: &str) -> SpeechRequest {
@@ -106,7 +113,7 @@ fn speech(body: &str) -> SpeechRequest {
 }
 
 #[test]
-fn a_qwen3_tts_speech_maps_instructions_sampling_and_a_sent_speed() {
+fn a_qwen3_tts_speech_maps_instructions_and_sampling() {
     let args = Qwen3TTS
         .speech_args(&speech(
             r#"{"input":"Hello.","voice":"ryan","language":"English","instructions":"calm",
@@ -118,7 +125,7 @@ fn a_qwen3_tts_speech_maps_instructions_sampling_and_a_sent_speed() {
     assert!(args.file_paths.is_empty());
     assert_eq!(Value::Object(args.model_kwargs), serde_json::json!({
         "voice": "ryan", "language": "English", "instruct": "calm", "temperature": 0.7,
-        "top_p": 0.8, "seed": 4, "speed": 1.25, "top_k": 20,
+        "top_p": 0.8, "seed": 4, "top_k": 20,
     }));
 }
 
@@ -127,19 +134,20 @@ fn a_qwen3_tts_speech_keeps_an_explicit_instruct_and_drops_empty_instructions() 
     let mk = |body: &str| Value::Object(Qwen3TTS.speech_args(&speech(body)).unwrap().model_kwargs);
     assert_eq!(mk(r#"{"input":"x","instructions":"calm","instruct":"bright"}"#), serde_json::json!({"instruct": "bright"}));
     assert_eq!(mk(r#"{"input":"x","instructions":""}"#), serde_json::json!({}));
-    assert_eq!(mk(r#"{"input":"x","speed":null}"#), serde_json::json!({"speed": null}));
     // an empty clip is dropped, as the Python adapter pops it
     let speech = Qwen3TTS.speech_to_request(&speech(r#"{"input":"x","ref_audio":""}"#), Path::new("/unused"), false);
     assert_eq!(Value::Object(speech.unwrap().args.model_kwargs), serde_json::json!({}));
 }
 
 #[test]
-fn every_speech_adapter_forwards_only_a_sent_speed() {
-    for (name, adapter) in [("Qwen3TTS", &Qwen3TTS as &dyn OpenAIAdapter), ("Orpheus", &Orpheus), ("Qwen3Omni", &Qwen3Omni)] {
-        let args = adapter.speech_args(&speech(r#"{"input":"x"}"#)).unwrap();
-        assert!(!args.model_kwargs.contains_key("speed"), "{name}");
-        let args = adapter.speech_args(&speech(r#"{"input":"x","speed":"2"}"#)).unwrap();
-        assert_eq!(args.model_kwargs["speed"], serde_json::json!(2.0), "{name}");
+fn no_speech_adapter_forwards_speed_itself() {
+    // `audio_speech` forwards a sent speed once for every adapter, as Python's speech_request does
+    for (name, adapter) in super::ADAPTERS.iter().filter(|(_, adapter)| adapter.supports_speech()) {
+        for body in [r#"{"input":"x"}"#, r#"{"input":"x","speed":"2"}"#] {
+            // an adapter that needs more than `input` (a voice, a clip) refuses it; nothing to check
+            let Ok(args) = adapter.speech_args(&speech(body)) else { continue };
+            assert!(!args.model_kwargs.contains_key("speed"), "{name}: {body}");
+        }
     }
 }
 
@@ -420,4 +428,11 @@ fn two_images_are_indexed_in_order() {
         [0, 1, 0],
         "the second image does not address the second upload"
     );
+}
+
+#[test]
+fn fish_forwards_a_sent_voice_to_be_logged_as_ignored() {
+    let mk = |body: &str| FishS2Pro.speech_args(&speech(body)).unwrap().model_kwargs;
+    assert_eq!(mk(r#"{"input":"x","voice":"ryan"}"#)["voice"], serde_json::json!("ryan"));
+    assert!(!mk(r#"{"input":"x"}"#).contains_key("voice"));
 }

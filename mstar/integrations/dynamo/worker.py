@@ -116,9 +116,8 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
             CommProtocol(args.tensor_comm_protocol),
             "",     # tcp_transfer_device
         ),
-        kwargs={"lora_adapter_digests": {
-            name: digest.hex() for name, digest in server.lora_adapter_digests.items()
-        }},
+        # the config every process reads (``resolve_lora_spec``)
+        kwargs={"model_config": config},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
@@ -287,7 +286,7 @@ def _serve_until_shutdown(args) -> None:
         # weights, warmed up, and captured CUDA graphs.
         server.finalize_setup()
         # before Dynamo can route here, as the native server runs them before it binds
-        warmups = (server._model_config or {}).get("warmup_requests") or []
+        warmups = (server.model_config or {}).get("warmup_requests") or []
         if warmups:
             _run_warmup_requests(server, warmups, _data_parallel_replicas(server.model, args.config),
                                  cache_dir=args.cache_dir)

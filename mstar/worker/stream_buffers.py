@@ -448,28 +448,3 @@ class StreamBufferManager:
             if all(self._partition.get(e) != partition for e in live):
                 partition_done.add(rid)
         return node_done, partition_done
-
-    def consumption(self, request_id: int) -> dict[str, int]:
-        """Items consumed so far per stream, as the producer is told."""
-        req_info = self._request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return {}
-        return {
-            edge_name: sbuf._consumed
-            for edge_name, sbuf in req_info.stream_buffers.items()
-        }
-
-    def consumption_batch(self, rids: list[int]) -> list[tuple[int, dict[str, int]]]:
-        """``consumption`` for the rids that have stream buffers at all; the
-        rest would report an empty dict."""
-        infos = self._request_state.per_request_info
-        out: list[tuple[int, dict[str, int]]] = []
-        for rid in rids:
-            req_info = infos.get(rid)
-            if req_info is None or not req_info.stream_buffers:
-                continue
-            out.append((rid, {
-                edge_name: sbuf._consumed
-                for edge_name, sbuf in req_info.stream_buffers.items()
-            }))
-        return out

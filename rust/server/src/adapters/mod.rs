@@ -33,18 +33,20 @@ use crate::protocol::{
     ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest, VideoGenerationRequest,
 };
 
+mod asr;
 mod chat;
 mod images;
 mod messages;
 mod speech;
 mod video;
 
+pub use asr::*;
 pub use chat::*;
 pub use images::*;
 pub use messages::flatten_messages;
 use messages::*;
 pub use speech::*;
-pub use video::{Cosmos3, Cosmos3Edge};
+pub use video::{Cosmos3, Cosmos3Edge, MiniMaxH3, Wan22, LTX25};
 
 /// One element of a chat prompt, in request order: mstar's `PromptPart`,
 /// field for field, so the bridge builds one from each as it arrives.
@@ -74,6 +76,24 @@ pub struct SubmitArgs {
     pub model_kwargs: Map<String, Value>,
     /// A chat's parts, in order; empty on every other path.
     pub parts: Vec<Part>,
+    /// End the result stream with a `usage` chunk (set by the chat handler).
+    pub report_usage: bool,
+    /// Decoded inputs that go to the model without a file (`submit_request`'s
+    /// `raw_inputs`): openpi's camera images.
+    pub raw_inputs: BTreeMap<String, Vec<RawArray>>,
+    /// `submit_request`'s `end_input` (true, or the client streams it ends) and
+    /// `file_streams`, for a model with client streams; `None` elsewhere.
+    pub end_input: Option<Value>,
+    pub file_streams: Option<Value>,
+}
+
+/// An array as numpy holds one: its `dtype.str` (`|u1`, `<f4`), shape and bytes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RawArray {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 impl Default for SubmitArgs {
@@ -81,11 +101,15 @@ impl Default for SubmitArgs {
         Self {
             text: None,
             tokens: None,
+            report_usage: false,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
             model_kwargs: Map::new(),
             parts: Vec::new(),
+            raw_inputs: BTreeMap::new(),
+            end_input: None,
+            file_streams: None,
         }
     }
 }
@@ -127,17 +151,8 @@ fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     }
 }
 
-fn json_num(f: f64) -> Value {
+pub(crate) fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
-}
-
-/// A client-sent `speed` into `model_kwargs` for a model with no speed
-/// control, so the server logs it as ignored (`_forward_sent_speed`). An
-/// unsent one stays out; it would warn on every request.
-fn forward_sent_speed(mk: &mut Map<String, Value>, req: &SpeechRequest) {
-    if let Some(speed) = req.speed {
-        set_default(mk, "speed", speed.map_or(Value::Null, json_num));
-    }
 }
 
 /// A speech request's submission, and the reference clip it carries for the API
@@ -190,6 +205,52 @@ pub trait OpenAIAdapter: Send + Sync {
 
     fn supports_videos(&self) -> bool {
         false
+    }
+
+    fn supports_transcriptions(&self) -> bool {
+        false
+    }
+
+    /// `/v1/realtime`: the model can continue a hypothesis it is handed.
+    fn supports_realtime_transcription(&self) -> bool {
+        false
+    }
+
+    /// One realtime step: transcribe `audio_path` (everything heard so far)
+    /// continuing from `prefix`, the stable part of the previous hypothesis.
+    fn realtime_step_request(&self, req: &crate::transcription::TranscriptionRequest, audio_path: &str, prefix: &str) -> Result<SubmitArgs, String> {
+        let _ = (req, audio_path, prefix);
+        Err("realtime transcription is not supported by this model".to_string())
+    }
+
+    /// The class attributes that steer `/v1/audio/transcriptions`.
+    fn transcription_policy(&self) -> crate::transcription::TranscriptionPolicy {
+        crate::transcription::TranscriptionPolicy::DEFAULT
+    }
+
+    fn transcription_to_request(&self, req: &crate::transcription::TranscriptionRequest, audio_path: &str) -> Result<SubmitArgs, String> {
+        let _ = (req, audio_path);
+        Err("audio/transcriptions is not supported by this model".to_string())
+    }
+
+    /// The structured view of a model's raw text stream: plain text unless
+    /// the stream carries control tokens (language, timestamps) to lift.
+    fn parse_transcript(&self, text: &str, req: &crate::transcription::TranscriptionRequest) -> crate::transcription::Transcript {
+        let _ = req;
+        crate::transcription::Transcript::text(py_strip(text))
+    }
+
+    /// The finished transcript's text as the client gets it; not applied to
+    /// partial text, which only grows.
+    fn final_text(&self, text: String) -> String {
+        text
+    }
+
+    /// The client-facing text of the raw stream so far; it must only grow as
+    /// the stream does, so a model with control tokens holds back a tail that
+    /// may still turn out to be one.
+    fn stream_text(&self, raw: &str) -> String {
+        raw.to_string()
     }
 
     /// The adapter's `speech_chunk_*` attributes.
@@ -297,6 +358,16 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("CosyVoice3Adapter", &CosyVoice3),
     ("OmniVoiceAdapter", &OmniVoice),
     ("VoxCPM2Adapter", &VoxCPM2),
+    ("Wan22Adapter", &Wan22),
+    ("LTX25Adapter", &LTX25),
+    ("MiniMaxH3Adapter", &MiniMaxH3),
+    ("WhisperAdapter", &Whisper),
+    ("Qwen3ASRAdapter", &Qwen3ASR),
+    ("CanaryAdapter", &Canary),
+    ("CanaryQwenAdapter", &CanaryQwen),
+    ("TransducerAdapter", &Transducer),
+    ("HiggsAudioAdapter", &HiggsAudio),
+    ("OmnilingualASRAdapter", &OmnilingualASR),
 ];
 
 /// The adapter for a Python class name; `None` for a class with no port here.
@@ -308,6 +379,68 @@ fn set_seed(mk: &mut Map<String, Value>, seed: Option<i64>) {
     if let Some(seed) = seed {
         set_default(mk, "seed", Value::from(seed));
     }
+}
+
+/// Python's `repr` of a JSON value as `json.loads` gives it, for a refusal
+/// that quotes it as the Python frontend's does. An object's keys come in
+/// serde_json's (sorted) order, not the client's.
+pub(crate) fn py_value_repr(v: &Value) -> String {
+    match v {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) if n.is_f64() => py_float_repr(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => crate::media::py_repr(s),
+        Value::Array(items) => format!("[{}]", items.iter().map(py_value_repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter().map(|(k, v)| format!("{}: {}", crate::media::py_repr(k), py_value_repr(v))).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Python's `repr(float)`: the shortest round-trip digits, positional for a
+/// decimal exponent in -4..16 (with at least one fractional digit) and
+/// scientific with a two-digit exponent otherwise.
+pub(crate) fn py_float_repr(x: f64) -> String {
+    if !x.is_finite() {
+        return if x.is_nan() { "nan" } else if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let sci = format!("{x:e}"); // shortest round-trip digits, e.g. "-1.25e-5"
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if !(-4..16).contains(&exp) {
+        let (head, tail) = digits.split_at(1);
+        let frac = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let esign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{frac}e{esign}{:02}", exp.abs());
+    }
+    if exp < 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize));
+    }
+    let point = exp as usize + 1;
+    if digits.len() <= point {
+        format!("{sign}{}{}.0", digits, "0".repeat(point - digits.len()))
+    } else {
+        format!("{sign}{}.{}", &digits[..point], &digits[point..])
+    }
+}
+
+/// Python's `str.isspace()`, which `strip` and `split` use: Unicode whitespace
+/// and the four ASCII separators U+001C..U+001F.
+pub(crate) fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `str.strip()`.
+pub(crate) fn py_strip(s: &str) -> &str {
+    s.trim_matches(py_space)
 }
 
 /// Python's `bool()` of a JSON value.

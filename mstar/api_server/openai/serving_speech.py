@@ -138,7 +138,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
     try:
-        args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+        args = await asyncio.to_thread(adapter.speech_request, req, api.upload_dir)
     except ValueError as exc:
         # the adapter refused the request's fields (a bad data URL, a server path)
         raise HTTPException(status_code=400, detail=str(exc)) from None
@@ -205,7 +205,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                     pending.append(submit(len(pending)))
                 try:
                     results = await api.collect_results(pending[index], raw_request)
-                except HTTPException:
+                except (HTTPException, asyncio.CancelledError):
                     read = index + 1
                     raise
                 read = index + 1

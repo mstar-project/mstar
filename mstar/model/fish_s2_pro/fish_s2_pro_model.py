@@ -37,11 +37,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -57,7 +53,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.fish_s2_pro.config import (
     ALLOWED_TEXT_SPECIAL_TOKENS,
     AR_ATTN,
@@ -114,6 +110,8 @@ LICENSE_NOTICE = (
 
 class FishS2ProModel(Model):
     """Fish Audio S2-Pro model contract (plain TTS and voice cloning)."""
+
+    DECODE_LOOP = "ar_decode_loop"
 
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
@@ -195,7 +193,7 @@ class FishS2ProModel(Model):
                 resource_key=AR_SAMPLER,
                 nodes={"AR"},
                 vocab_size=self.config.semantic_head_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             RecurrentStateSpec(
                 resource_key=CODEC_STATE,
@@ -275,14 +273,10 @@ class FishS2ProModel(Model):
             PartitionDefinition(
                 name="AR",
                 graph_walks={"ar_prefill", "ar_prefill_clone", "ar_decode"},
-                initial_walk="ar_prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="Codec",
                 graph_walks={"codec_chunk"},
-                initial_walk=None,
-                producer_partitions=["AR"],
             ),
         ]
 
@@ -311,31 +305,11 @@ class FishS2ProModel(Model):
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 44.1 kHz mono float32 (the codec rate)."""
-        import soundfile
-        import torchaudio.functional as audio_functional
+        from mstar.model.components.audio_features import load_reference_clip
 
-        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
-        from mstar.model.media_limits import decoding_upload, read_sound_file, sound_file_seconds
-
-        target = self.config.codec.sample_rate
-        # Bound the clip before decoding it: a small compressed file can hold hours of audio.
-        with decoding_upload(filepath, "the reference audio"):
-            info = soundfile.info(filepath)
-            check_resample_rate(info.samplerate, target)
-            seconds = sound_file_seconds(info.frames, info.samplerate)
-            if seconds is not None:
-                self._check_reference_duration(seconds)
-                # the header can understate the length, so the decode stops at the bound too
-                waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
-                audio = torch.from_numpy(waveform)
-            else:
-                # no sample count in the header (a FLAC written to a pipe): count it as it decodes
-                waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
-                self._check_reference_duration(len(waveform) / sample_rate)
-                audio = torch.from_numpy(waveform).mean(dim=1)
-        if sample_rate != target:
-            audio = audio_functional.resample(audio, sample_rate, target)
-        return TensorAndMetadata(data=audio.to(device), metadata={"sample_rate": target, "num_channels": 1})
+        rate = self.config.codec.sample_rate
+        audio = load_reference_clip(filepath, rate, self.config.reference_max_seconds, self._check_reference_duration)
+        return TensorAndMetadata(data=audio.to(device), metadata={"sample_rate": rate, "num_channels": 1})
 
     def _check_reference_duration(self, seconds: float) -> None:
         low, high = self.config.reference_min_seconds, self.config.reference_max_seconds
@@ -429,114 +403,44 @@ class FishS2ProModel(Model):
         return ProcessPromptOutput({"prompt_ids": [torch.tensor(ids, dtype=torch.long)]}, metadata)
 
     # -----------------------------------------------------------------------
-    # Conductor partition state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """AR prefills (a clone through the RefEncoder first), then decodes; the
+        Codec decodes each stream chunk."""
         if partition_name == "AR":
+            max_tokens = self.get_max_output_tokens(**model_kwargs)
+            if "audio" not in output_modalities:
+                return []
             clone = "audio" in input_modalities
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="ar_prefill_clone" if clone else "ar_prefill",
-                is_prefill=True,
-                kwargs={"ar_max_tokens": self.get_max_output_tokens(**model_kwargs)},
-            )
-            routes = [(name, "AR") for name in self.PREFILL_INPUTS]
-            step_metadata = {**self._ar_step_metadata(metadata), PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
+            prompt = {PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
             if clone:
-                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
-                step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
-            inputs = []
-            for name, node in routes:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-                request_done="audio" not in output_modalities,
-                step_metadata=step_metadata,
-            )
+                prompt[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
+            prefill = WalkStep("ar_prefill_clone" if clone else "ar_prefill", step_metadata=prompt)
+            # the prefill samples the first frame, and a stop from it is dropped
+            # (the decode loop isn't in its walk), so one frame ends there
+            return [prefill, WalkStep("ar_decode")] if max_tokens > 1 else [prefill]
         if partition_name == "Codec":
-            return ForwardPassArgs(
-                full_metadata=CurrentForwardConductorMetadata(
-                    input_modalities=input_modalities,
-                    output_modalities=output_modalities,
-                    graph_walk="codec_chunk",
-                    is_prefill=False,
-                ),
-                inputs=[],
-                unpersist_tensors=[],
-                request_done="audio" not in output_modalities,
-            )
+            return [WalkStep("codec_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown Fish S2-Pro partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == "AR":
-            if partition_metadata.graph_walk in ("ar_prefill", "ar_prefill_clone"):
-                if partition_metadata.kwargs["ar_max_tokens"] <= 1:
-                    # the prefill sampled the only frame allowed; a stop from prefill is dropped
-                    return ForwardPassArgs(
-                        full_metadata=partition_metadata,
-                        inputs=[],
-                        unpersist_tensors=list(persist_signals.get("ar_input_embeds", [])),
-                        request_done=True,
-                    )
-                partition_metadata.graph_walk = "ar_decode"
-                partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="AR", name="ar_input_embeds")
-                edge.tensor_info = persist_signals.get("ar_input_embeds", [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._ar_step_metadata(partition_metadata),
-                )
-            if partition_metadata.graph_walk == "ar_decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(f"AR entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
-        if partition_name == "Codec":
-            partition_metadata.graph_walk = "codec_chunk"
-            return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
-        raise ValueError(f"Unknown Fish S2-Pro partition: {partition_name!r}")
-
-    @staticmethod
-    def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding
     # -----------------------------------------------------------------------
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Semantic-code sampling; ``do_sample=False`` is greedy. Residual codebooks are argmax."""
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         temperature = model_kwargs.get("temperature", generation.temperature)
@@ -547,11 +451,18 @@ class FishS2ProModel(Model):
                 temperature=temperature,
                 top_k=model_kwargs.get("top_k", generation.top_k),
                 top_p=model_kwargs.get("top_p", generation.top_p),
+                min_p=model_kwargs.get("min_p", 0.0),
                 repetition_penalty=model_kwargs.get("repetition_penalty", generation.repetition_penalty),
                 penalize_prompt=False,
                 ignore_eos=model_kwargs.get("ignore_eos", False),
             ),
         }
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            "ref_text", "temperature", "top_k", "top_p", "min_p", "repetition_penalty", "ignore_eos", "do_sample",
+            "max_output_tokens",
+        })
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         requested = model_kwargs.get(
@@ -565,10 +476,6 @@ class FishS2ProModel(Model):
             )
         return requested
 
-    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the prefill samples the first frame, so decode runs one iteration fewer than max tokens
-        return {"ar_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {AR_KV: {"main": KVLabel(
             growth=(("ar_decode", "ar_decode_loop"),),
@@ -576,20 +483,6 @@ class FishS2ProModel(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.sample_rate
-
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Encode emitted waveform tensors as raw little-endian PCM16 bytes."""
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported Fish S2-Pro output modality: {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        elif pcm.dtype != torch.int16:
-            pcm = pcm.to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
 
     # -----------------------------------------------------------------------
     # Lazy worker-side submodule and weight loading

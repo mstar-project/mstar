@@ -107,7 +107,7 @@ By default the worker speculates step N+1 through the graph while step N is stil
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
 Some additional information:
-- **Speculation "wastes" the last step of a dynamic loop.** AR decode accepts that cost, because it cannot know its length in advance. Flow and diffusion nodes know their iteration count at request ingestion, so they exit early in `prepare_inputs` for the extra step and pay no extra compute (only some CPU work). A node that can do neither sets `enable_async_scheduling=False`.
+- **Speculation "wastes" the last step of a dynamic loop.** AR decode accepts that cost, because it cannot know its length in advance. Flow and diffusion nodes know their iteration count at request ingestion, so they declare it as the loop's cap (`Model.get_loop_caps`): the loop completes on that iteration and neither runtime speculates past it, so there is no extra step at all. A node that can do neither sets `enable_async_scheduling=False`.
 - **A host sync outside `check_stop` forces synchronous execution.** `check_stop` is fed CPU tensors after a D2H that the worker prematerializes on a side stream, so it is free. Any other `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, `bool()`/`if` on a device tensor, or print of one in the step path collapses the pipeline back to serial and usually costs more than it appears. So does building a device tensor from host data per row in `prepare_inputs` (`torch.tensor(x, device="cuda")`, `.to("cuda")` of a pageable tensor): it is a synchronous copy. Values that are already known on the host (e.g., request settings decided in `process_prompt`) should travel in `step_metadata`, not round-trip through the device.
 - **A new resource doing H2D into fixed buffers must set `force_double_buffer`** (see `Resource.force_double_buffer` in [mstar/engine/resources/base.py](mstar/engine/resources/base.py)). Without it, step N+1 overwrites buffers step N is still reading.
 - **Moving GIL-holding Python to another thread does not parallelize it**; it only adds contention (overlapping `prepare_inputs` with the plan thread measured worse). For a host-bound step, the fix is deleting work, not moving it.
@@ -128,7 +128,7 @@ To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platfo
 
 **Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed. A tuning value a deployment may reasonably want to change (e.g., a per-step token budget) belongs in the serving config, not in an env var added for testing.
 
-The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
+The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help an SLO (throughput, latency, streaming viability, host time during a step, etc.) rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
 
 ### 10. Performance claims come from the repo's own harnesses
 
@@ -208,9 +208,11 @@ pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
+Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
+
 ### Running the CPU suite
 
-It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If it is taking much longer, something is wrong; don't wait it out.
+It takes 4 to 5 minutes on 8 CPUs from a local disk; CI splits it over two 4-CPU runners, about 5 minutes each. If it is taking much longer, something is wrong; don't wait it out.
 
 - **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
 - **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.

@@ -89,6 +89,38 @@ def _text(*parts):
     return [_Chunk("text", p.encode("utf-8")) for p in parts]
 
 
+@pytest.mark.parametrize("started", [False, True], ids=["unstarted", "collecting"])
+def test_cancelled_window_releases_only_windows_not_already_collected(started):
+    stub = _StubAPI()
+    window = serving_transcriptions.Window("window.wav", 0, 1, request_id="current")
+    inflight = {"current", "unread"}
+
+    async def cancel():
+        waiting = asyncio.Event()
+
+        async def collect(request_id, raw_request=None):
+            waiting.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                stub.release_request(request_id)  # collect_results owns this release
+                raise
+
+        stub.collect_results = collect
+        task = asyncio.create_task(serving_transcriptions._collect(stub, window, inflight))
+        if started:
+            await waiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    assert inflight == ({"unread"} if started else {"current", "unread"})
+    serving_transcriptions._release(stub, inflight)
+    assert sorted(stub.released) == ["current", "unread"]
+    assert not inflight
+
+
 def _wav_bytes(seconds: float, sample_rate: int = 16_000) -> bytes:
     import io
     import wave
@@ -153,6 +185,12 @@ def test_timed_formats_ask_for_timestamps():
         assert ad.transcription_to_request(req, "a").model_kwargs["timestamps"] == "segment"
     words = TranscriptionRequest(response_format="verbose_json", timestamp_granularities=["word", "segment"])
     assert ad.transcription_to_request(words, "a").model_kwargs["timestamps"] == "word"
+
+
+def test_qwen3_asr_is_not_sent_the_route_s_timestamps():
+    """Qwen3-ASR writes no timestamps; a timed format's key would only be logged as ignored."""
+    req = TranscriptionRequest(response_format="verbose_json")
+    assert "timestamps" not in adapters.Qwen3ASRAdapter().transcription_to_request(req, "a").model_kwargs
 
 
 def test_extra_fields_pass_through_as_model_kwargs():
@@ -281,6 +319,15 @@ def test_transcription_verbose_json_segments(client_and_stub):
     assert body["words"] == []
     assert body["usage"]["type"] == "duration"
     assert stub.last_submit["model_kwargs"]["timestamps"] == "word"
+
+
+def test_verbose_json_reports_the_temperature_the_request_ran_at(client_and_stub):
+    """A single window runs no retry ladder; its segments report the request's temperature."""
+    client, stub = client_and_stub
+    stub.next_chunks = _text("<|en|>", "<|0.00|>", " Hello", "<|0.80|>")
+    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json", "temperature": "0.3"})
+    assert stub.last_submit["model_kwargs"]["temperature"] == 0.3
+    assert [s["temperature"] for s in r.json()["segments"]] == [0.3]
 
 
 def test_transcription_srt(client_and_stub):

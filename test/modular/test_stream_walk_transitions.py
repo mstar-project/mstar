@@ -12,7 +12,7 @@ import torch
 
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
+    FINAL_PREFILL,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
@@ -345,7 +345,7 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
         conn.consumer_walk = record
     w._graph_runtime.get_output_signals = lambda node, walk: ["thinker_states"]
     fwd = w._request_state.get_fwd_info(0, "Thinker")
-    fwd.step_metadata = {"is_last_prefill": True}
+    fwd.step_metadata = {FINAL_PREFILL: True}
     _pass(w, "Thinker", "thinker_decode", _decode(3))
     _pass(w, "Projector", "thinker_decode", _decode(3))
     _pass(w, "Thinker", "thinker_decode", _decode(4))
@@ -354,7 +354,7 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
         ("thinker_decode", "Projector", _decode(3), fwd),
         ("thinker_decode", "Thinker", _decode(4), fwd),
     ]
-    assert seen[0][3].step_metadata == {"is_last_prefill": True}
+    assert seen[0][3].step_metadata == {FINAL_PREFILL: True}
 
 
 def test_a_pass_allocates_nothing_per_row():
@@ -376,12 +376,7 @@ def test_the_conductor_follows_the_walk_the_worker_ran():
     c._set_partition_worker_graph_ids = (
         lambda rid, partition, walk: setattr(pstate, "current_worker_graph_ids", {7})
     )
-    pstate = PartitionState(
-        partition_name="Talker",
-        metadata=CurrentForwardConductorMetadata(
-            graph_walk="talker_prefill", is_prefill=True,
-        ),
-    )
+    pstate = PartitionState(partition_name="Talker", graph_walk="talker_prefill")
     c.requests = {"r": RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={7: ["w0"]}, all_worker_graph_ids={7},
@@ -395,5 +390,5 @@ def test_the_conductor_follows_the_walk_the_worker_ran():
         request_id="r", worker_graph_ids=[7], is_first_tp_rank=True,
         partition_name="Talker", graph_walk="talker_last_prefill",
     ))
-    assert pstate.metadata.graph_walk == "talker_last_prefill"
+    assert pstate.graph_walk == "talker_last_prefill"
     assert done == ["Talker"]

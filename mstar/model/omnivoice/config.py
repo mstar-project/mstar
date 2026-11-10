@@ -55,7 +55,7 @@ class OmniVoiceGenerationDefaults:
     """Per-request decoding knobs and their defaults.
 
     Every one of these is per-request: they ride ``step_metadata`` and are
-    resolved once in ``OmniVoiceModel.get_initial_forward_pass_args``.  This is
+    resolved once in ``OmniVoiceModel.walk_plan``.  This is
     the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline
     port has to pick one value for the whole server.
     """
@@ -68,8 +68,9 @@ class OmniVoiceGenerationDefaults:
     class_temperature: float = 0.0
     denoise: bool = True
 
-    # Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step
-    # stops the loop early via check_stop; this only bounds the graph.
+    # Ceiling for the unmask Loop's ``max_iters`` and the largest num_step a
+    # request may ask for (above it is a 400). A request's own num_step is the
+    # loop's cap.
     max_num_step: int = 64
 
 

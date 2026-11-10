@@ -142,10 +142,12 @@ def test_request_defaults_and_validation():
         {"num_frames": 1e999},
         {"height": 768.5, "width": 1344},
         {"num_inference_steps": 2.7},
+        {"height": 768, "width": "1344"},
+        {"flow_shift": "3"},
     ):
         with pytest.raises(ValueError):
             model.resolve_request(bad)
-    assert model.resolve_request({"height": 768.0, "width": "1344"})["width"] == 1344
+    assert model.resolve_request({"height": 768.0, "width": 1344})["height"] == 768
     for anchors in (5, [["first"]], [None], {"first": 1}):
         with pytest.raises(ValueError, match="keyframe_anchors"):
             model.keyframe_anchors({"keyframe_anchors": anchors}, 1)
@@ -263,31 +265,23 @@ def test_a_prompt_is_capped_by_the_text_encoder_alone():
     assert encoder.max_positions == H3Config().text_max_positions  # it encodes every prompt admitted
 
 
-def test_walk_transitions_and_step_metadata():
+def test_walk_plan_and_step_metadata():
+    from mstar.conductor.conductor import _walk_io
+
     model = _model()
-    args = model.get_initial_forward_pass_args(
+    plan = model.walk_plan(
         "default", ["text"], ["video", "audio"], {"text_inputs": [_tensor_info([37])]},
         {"height": 256, "width": 448, "num_inference_steps": 6},
     )
-    meta = args.full_metadata
-    assert meta.graph_walk == ENCODE_TEXT_WALK
-    assert meta.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, GENERATE_AV_WALK]
-    layout = layout_from_metadata(args.step_metadata)
+    assert [step.walk for step in plan] == [ENCODE_TEXT_WALK, GENERATE_AV_WALK]
+    layout = layout_from_metadata(plan[0].step_metadata)
     assert layout == H3Layout(text_len=37, latent_frames=37, latent_height=16, latent_width=28, audio_latents=207)
-    nxt = model.get_partition_forward_pass_args("default", meta, {"text_embeds": [_tensor_info([37, 5376])]})
-    assert nxt.full_metadata.graph_walk == GENERATE_AV_WALK and not nxt.request_done
-    assert [e.name for e in nxt.inputs] == ["text_embeds", "latents", "audio_latents"]
-    assert layout_from_metadata(nxt.step_metadata) == layout
-    done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
-    assert done.request_done
-    video_only = model.get_initial_forward_pass_args(
-        "default", ["text"], ["video"], {"text_inputs": [_tensor_info([5])]}, {},
-    )
-    assert video_only.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_VIDEO_WALK
-    audio_only = model.get_initial_forward_pass_args(
-        "default", ["text"], ["audio"], {"text_inputs": [_tensor_info([5])]}, {},
-    )
-    assert audio_only.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_AUDIO_WALK
+    assert layout_from_metadata(plan[1].step_metadata) == layout
+    # what the conductor sends the denoise step: the prompt's embeddings, and empty loop-backs the dit seeds
+    assert {name for name, _ in _walk_io(model)[0][GENERATE_AV_WALK]} == {"text_embeds", "latents", "audio_latents"}
+    for outputs, walk in ((["video"], GENERATE_VIDEO_WALK), (["audio"], GENERATE_AUDIO_WALK)):
+        plan = model.walk_plan("default", ["text"], outputs, {"text_inputs": [_tensor_info([5])]}, {})
+        assert plan[-1].walk == walk
     assert model.get_loop_caps(num_inference_steps=6) == {DENOISE_LOOP: 5}
 
 
@@ -435,28 +429,27 @@ def test_presentation_tags_vision_blocks_as_video():
     assert modality_tags(layout)[:layout.text_len].tolist() == pres.tags
 
 
-def test_keyframe_walk_transitions():
+def test_keyframe_walk_plan():
+    from mstar.conductor.conductor import _walk_io
+
     model = _model()
     model.tokenizer = _Tokenizer()
     signals = {"text_inputs": [_tensor_info([40])], "vision_pixels": [_tensor_info([2 * 4032, 1536])],
                "keyframe_pixels": [_tensor_info([2, 3, 768, 1344])]}
-    args = model.get_initial_forward_pass_args("default", ["image", "text"], ["video", "audio"], signals,
-                                               {"keyframe_anchors": ["last", "first"]})
-    meta = args.full_metadata
-    assert meta.kwargs["walk_schedule"] == [ENCODE_KEYFRAMES_WALK, GENERATE_AV_WALK + KEYFRAMES_SUFFIX]
-    request = meta.kwargs["request"]
+    plan = model.walk_plan("default", ["image", "text"], ["video", "audio"], signals,
+                           {"keyframe_anchors": ["last", "first"]})
+    assert [step.walk for step in plan] == [ENCODE_KEYFRAMES_WALK, GENERATE_AV_WALK + KEYFRAMES_SUFFIX]
+    request = plan[0].step_metadata
     assert request["anchors"] == ["first", "last"] and (request["height"], request["width"]) == (768, 1344)
     assert request["keyframe_grids"] == [[1, 48, 84]] * 2
     assert request["text_video_spans"] == [list(s) for s in vision_spans(model.tokenizer, [1008, 1008])]
-    assert {(e.next_node, e.name) for e in args.inputs} == {
-        ("text_encoder", "text_inputs"), ("text_encoder", "vision_pixels"), ("vae_encoder", "keyframe_pixels")}
-    layout = layout_from_metadata(args.step_metadata)
+    inputs, _, _ = _walk_io(model)
+    assert set(inputs[ENCODE_KEYFRAMES_WALK]) == {
+        ("text_inputs", "text_encoder"), ("vision_pixels", "text_encoder"), ("keyframe_pixels", "vae_encoder")}
+    layout = layout_from_metadata(request)
     assert layout.anchors == ("first", "last") and layout.num_condition_rows == 2 * 24 * 42
-    nxt = model.get_partition_forward_pass_args(
-        "default", meta, {"text_embeds": [_tensor_info([40, 5376])], "cond_latents": [_tensor_info([2016, 96])]},
-    )
-    assert [e.name for e in nxt.inputs] == ["text_embeds", "cond_latents", "latents", "audio_latents"]
-    assert len(nxt.unpersist_tensors) == 2
+    assert {name for name, _ in inputs[GENERATE_AV_WALK + KEYFRAMES_SUFFIX]} == {
+        "text_embeds", "cond_latents", "latents", "audio_latents"}
 
 
 def test_keyframe_noise_is_drawn_first():

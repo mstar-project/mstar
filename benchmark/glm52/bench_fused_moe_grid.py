@@ -83,7 +83,7 @@ def main():
     em_full = sorted_ids.shape[0]
     em_clamp = min(em_full, topk_ids.numel() * bm)
     assert n_valid <= em_clamp, (n_valid, em_clamp)
-    ct = R._tl_compute_type(x.dtype)
+    ct = R.tl_compute_type(x.dtype)
 
     a_q, a_s = R.per_token_group_quant_fp8(x, bk)
     c1 = torch.empty(T * K, 2 * I, device=dev, dtype=x.dtype)

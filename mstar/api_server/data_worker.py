@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 from typing import NamedTuple
 
 import torch
@@ -49,14 +49,13 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
-from mstar.engine.resources.lora.identity import AdapterPrefixRoots
-from mstar.engine.resources.lora.serving import lora_specs
 from mstar.model.base import (
     ClientChunk,
     Model,
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    TensorAndMetadata,
     keyed_labels,
     names_checkpoint,
     serving_resources,
@@ -69,6 +68,7 @@ from mstar.model.media_limits import (
     check_file_counts,
     check_media_limits,
 )
+from mstar.model.utils import TextOutput
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -112,6 +112,18 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     and audio, whose chunks are cheap and carry inline metadata."""
     streamed = loop_indices is not None and bool(loop_indices.loop_name_order)
     return modality in ARTIFACT_MODALITIES and not streamed
+
+
+def text_tokens(modality: str, tensor: torch.Tensor) -> int:
+    """The token ids an output tensor carries to the client, as ``token_ids``
+    lists them. A float text tensor (Whisper's word alignment) carries none."""
+    return tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0
+
+
+def ends_reply(token: int, text: TextOutput | None, request_kwargs: dict | None) -> bool:
+    """Whether a sampled text token ended its reply: one of the model's declared
+    stop ids, unless the request set ``ignore_eos``."""
+    return text is not None and token in text.stop_token_ids and not (request_kwargs or {}).get("ignore_eos")
 
 
 def _sha256(path: str) -> bytes:
@@ -226,26 +238,6 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
-def adapter_prefix_roots(
-    model: Model | None, model_config: dict | None,
-    digests: dict[str, bytes] | None = None,
-) -> AdapterPrefixRoots | None:
-    """The roots the deployment's LoRA adapters key their prompts under.
-
-    None when the deployment keys no label or serves no adapter. Otherwise each adapter
-    is keyed under its digest in ``digests`` (the API server's startup check) or read
-    once, here, so its digest names the weights as they were when it was registered and
-    no request pays for reading it.
-    """
-    if model is None or not model_config or not keyed_labels(model):
-        return None
-    # LoRA first: a deployment without it leaves its `resources:` block to the conductor
-    lora = lora_specs(model, model_config)
-    if not lora or not _kv_page_sizes(model, model_config):
-        return None
-    return AdapterPrefixRoots.read(lora[0], digests)
-
-
 class ResultQueue(queue.Queue):
     """What the data worker hands the API message thread: output chunks, or
     profile updates.
@@ -284,13 +276,11 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
-        adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
     ):
-        """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
-        server's startup check read them. ``upload_dir`` is where the API server saves
-        uploads: a request refused in preprocessing has its files there removed at once."""
+        """``upload_dir`` is where the API server saves uploads: a request refused in
+        preprocessing has its files there removed at once."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -342,9 +332,6 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        # registered adapters' prefix-cache roots; a runtime load or unload updates it
-        self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
-
         self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -366,7 +353,6 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
-                adapter_roots=self.adapter_prefix_roots,
                 conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
                 upload_dir=upload_dir,
@@ -675,6 +661,8 @@ class PreparedInput(NamedTuple):
     tensors: NameToTensorList
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # for the response's usage (``Model.prompt_tokens``)
+    prompt_tokens: int
 
 
 class PreparingInput(NamedTuple):
@@ -703,6 +691,7 @@ class PreprocessWorkerThread:
     # sizes the pool (_size_prepare_pool); 1, inline, for a thread built
     # without __init__, which has no model to size it from.
     _prepare_workers: int | None = 1
+    _decode_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -734,12 +723,10 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
-        adapter_roots: AdapterPrefixRoots | None = None,
         conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
     ):
-        self._adapter_roots = adapter_roots
         self.conductor_outbox = conductor_outbox
         self.upload_dir = upload_dir
         # keying a label needs the deployment's page size as well as the
@@ -844,6 +831,22 @@ class PreprocessWorkerThread:
         self._prepare_workers = workers
         if workers > 1:
             self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
+        model = self.model
+        if getattr(model, "PREPROCESS_PARALLEL_IMAGES", False) and not getattr(model, "PREPROCESS_PARALLEL", False):
+            logger.warning(
+                "%s sets PREPROCESS_PARALLEL_IMAGES without PREPROCESS_PARALLEL, so its images decode in turn",
+                type(model).__name__,
+            )
+        decode_workers = self._num_decode_workers()
+        if decode_workers > 1:
+            self._decode_pool = ThreadPool(max_workers=decode_workers, thread_name_prefix="mstar-decode")
+
+    def _num_decode_workers(self) -> int:
+        """As many as requests prepare at once: a decode has no intra-op work, so
+        these threads don't multiply by the process's intra-op count."""
+        if not getattr(self.model, "PREPROCESS_PARALLEL_IMAGES", False) or self._prepare_workers <= 1:
+            return 1
+        return self._prepare_workers
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -909,17 +912,22 @@ class PreprocessWorkerThread:
             input_metadata[key] = []
             if modality not in ("image", "audio", "video"):
                 continue
-            load = getattr(self.model, f"load_{modality}")
-            for filepath in paths:
-                with budget.file():
-                    if modality == "audio":
-                        check_audio_duration(filepath)
-                    out = load(filepath, self.device)
-                    if modality == "audio":
-                        charge_decoded_audio(out.data, out.metadata["sample_rate"])
+            load_file = partial(self._load_file, budget, modality)
+            # Image decoders release the GIL, so a request's images can overlap.
+            pool = self._decode_pool if modality == "image" and len(paths) > 1 else None
+            for out in (pool.map(load_file, paths) if pool is not None else map(load_file, paths)):
                 tensors[key].append(out.data)
                 input_metadata[key].append(out.metadata)
         return tensors, input_metadata
+
+    def _load_file(self, budget: RequestMediaBudget, modality: str, filepath: str) -> TensorAndMetadata:
+        with budget.file():
+            if modality == "audio":
+                check_audio_duration(filepath)
+            out = getattr(self.model, f"load_{modality}")(filepath, self.device)
+            if modality == "audio":
+                charge_decoded_audio(out.data, out.metadata["sample_rate"])
+        return out
 
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
@@ -959,15 +967,18 @@ class PreprocessWorkerThread:
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
-        # another request's pages and be served that request's KV. Likewise
-        # only process_prompt sets the model's INTERNAL_KWARGS, and only this
-        # worker knows which client streams the opening leaves open.
+        # another request's pages and be served that request's KV, and a stream
+        # lead past the edge's context would raise in the worker's ingest.
+        # Likewise only process_prompt sets the model's INTERNAL_KWARGS, and
+        # only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
-            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", "open_streams", *internal,
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", "stream_lead_items",
+            "open_streams", *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
+        num_prompt_tokens = 0
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -985,6 +996,7 @@ class PreprocessWorkerThread:
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             layouts = model_kwargs.pop("kv_layout", {})
+            num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
                 for key, by_label in layouts.items()
@@ -993,10 +1005,13 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None and not input.prefix_root:
+                # under the base model's empty root its pages would serve base requests
+                model_kwargs["prefix_cache"] = False
             if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
-                    adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
+                    root=input.prefix_root,
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -1004,13 +1019,13 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs)
+        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
 
     def _finish_input(
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs = prepared
+        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1042,6 +1057,8 @@ class PreprocessWorkerThread:
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
+                streaming=input.streaming,
+                prompt_tokens=num_prompt_tokens,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -1374,27 +1391,19 @@ class PreprocessWorkerThread:
     def _prefix_keys(
         self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
-        adapter: str | None = None,
+        root: bytes = b"",
     ) -> dict:
         """Key each page of every label's keyed spans, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
         page, and the output tensor each label's sampled ids arrive in. The keys
         are not rooted in the process (the engine does that). Each keyed span's row
-        in ``rows`` gains its digest and end key. The chains of a request on a LoRA
-        adapter hang from the adapter's root, which is also sent as ``prefix_root``;
-        a base request's hang from the empty root, as before LoRA.
+        in ``rows`` gains its digest and end key. The chains hang from ``root``
+        (``PreprocessInput.prefix_root``: a LoRA adapter's), which is also sent as
+        ``prefix_root``; a base request's hang from the empty root.
         """
         if not self._keyed_labels:
             return {}
-        root = b""
-        if adapter is not None:
-            roots = self._adapter_roots
-            root = roots.root(adapter) if roots is not None else None
-            if root is None:
-                # under the empty root its pages would serve the base model; the
-                # conductor refuses an adapter it does not serve in any case
-                return {"prefix_cache": False}
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
         decode: dict[str, dict[str, str]] = {}
@@ -1681,6 +1690,8 @@ class PreprocessWorkerThread:
             datas = None
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
+        num_tokens = 1 if item.modality == "text" else 0
+        text = self.model.text_output() if num_tokens else None
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1710,7 +1721,8 @@ class PreprocessWorkerThread:
                     sequence,
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
-                        postprocess_s=postprocess_s,
+                        postprocess_s=postprocess_s, num_tokens=num_tokens,
+                        stopped=ends_reply(values[i], text, kwargs.get(request_id)),
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1833,6 +1845,10 @@ class PreprocessWorkerThread:
                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                 )
 
+        num_tokens = text_tokens(modality, tensor)
+        stopped = num_tokens > 0 and ends_reply(
+            int(tensor.reshape(-1)[-1]), self.model.text_output(), self.request_model_kwargs.get(request_id),
+        )
         if self.enable_nvtx:
             profiler.range_push("dataworker.queue_output")
         self._queue_completed_output(
@@ -1845,6 +1861,8 @@ class PreprocessWorkerThread:
                 metadata=chunk_metadata,
                 read_time=read_time,
                 postprocess_s=postprocess_s,
+                num_tokens=num_tokens,
+                stopped=stopped,
             ),
         )
         if self.enable_nvtx:
@@ -2339,3 +2357,5 @@ class PreprocessWorkerThread:
             self._encode_pool.shutdown(wait=False, cancel_futures=True)
         if self._prepare_pool is not None:
             self._prepare_pool.shutdown(wait=False, cancel_futures=True)
+        if self._decode_pool is not None:
+            self._decode_pool.shutdown(wait=False, cancel_futures=True)

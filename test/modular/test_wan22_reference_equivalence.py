@@ -161,7 +161,6 @@ def oracle_meta() -> dict:
 
 def _step_metadata(meta: dict) -> dict:
     return {
-        "is_prefill": False,
         "num_inference_steps": meta["num_inference_steps"],
         "guidance_scale": meta["guidance_scale"],
         "height": meta["height"],
@@ -598,7 +597,7 @@ def test_i2v_first_frame_injection_semantics(oracle_meta, text_embeds, dit_submo
     num_steps, height, width, num_frames = 8, 224, 384, 9
     h_lat, w_lat, t_lat = height // 16, width // 16, (num_frames - 1) // 4 + 1
     meta = {
-        "is_prefill": False, "num_inference_steps": num_steps, "guidance_scale": 5.0,
+        "num_inference_steps": num_steps, "guidance_scale": 5.0,
         "height": height, "width": width, "num_frames": num_frames,
     }
     fwd_info = _fwd_info("video_gen_i2v", meta, seed=7)
@@ -729,9 +728,8 @@ def test_tiled_decode_matches_untiled(oracle_meta):
         # Reference decodes both ways, in floats, matching the submodule's dtype.
         vae = decoder.vae
         z = latent.to(device=DEVICE, dtype=decoder._decode_dtype())
-        z_dim = model.config.vae_z_dim
-        mean = torch.tensor(vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(z.device, z.dtype)
-        std = 1.0 / torch.tensor(vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(z.device, z.dtype)
+        mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(z.device, z.dtype)
+        std = 1.0 / torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(z.device, z.dtype)
         tiled_raw = vae.tiled_decode(z / std + mean, return_dict=False)[0]
         tiled = (tiled_raw / 2 + 0.5).clamp(0, 1).float()
         untiled_raw = vae.decode(z / std + mean, return_dict=False)[0]

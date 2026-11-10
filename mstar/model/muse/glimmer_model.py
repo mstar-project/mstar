@@ -83,7 +83,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             self.config.eot_token_id = eot
         # the vision tower, whose output fills the images' pads in prompt order
         self.media = (MediaIntake(
-            "image", vision_encoder((self._image_pad_id,)), self._image_pad_id, self._image_intake,
+            "image", vision_encoder(), self._image_pad_id, self._image_intake,
             sentinels=(self._image_start_id, self._image_end_id),
         ),)
         if self._image_pad_id != self.config.image_token_id:
@@ -201,8 +201,13 @@ class MuseGlimmerModel(MultimodalDecoderModel):
 
     def render_prompt(self, parts: list[PromptPart], **kwargs) -> str:
         template_kwargs = {}
+        enable_thinking = kwargs.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
+        if kwargs.get("current_date") is not None and not isinstance(kwargs["current_date"], str):
+            raise ValueError(f"current_date must be a string; got {kwargs['current_date']!r}")
         strength = kwargs.get("reasoning_strength") or kwargs.get("reasoning_effort")
-        if strength is None and kwargs.get("enable_thinking") is False:
+        if strength is None and enable_thinking is False:
             # the chat adapters' switch: the template has no off, only "low"
             strength = "low"
         if strength is not None:
