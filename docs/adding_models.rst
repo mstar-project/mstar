@@ -2780,6 +2780,13 @@ that a misspelled setting is never silently ignored:
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
+   * - ``DSASpec``
+     - ``workspace_mb`` (MiB each FlashInfer workspace of its sparse plans starts at; one per
+       walk and capture slot, one for eager steps), ``prefill_score_bytes`` (bytes of fp32
+       scores an eager prefill's selection holds per launch), ``shard_min_rows`` (the rows
+       per rank from which a prefill's selection splits across TP ranks); each a positive
+       integer. The defaults (128 MiB, 256 MiB, 64) are what
+       ``configs/glm5_next_tp8_longctx.yaml`` serves with.
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
