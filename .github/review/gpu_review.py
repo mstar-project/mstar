@@ -8,7 +8,7 @@ Nothing here runs a model or the PR's code: the live-test session runs on the GP
 decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the cheapest open
 listing under the hourly cap, Eras before DigitalOcean (PREFERENCE). A PR whose diff names AMD
-hardware gets a second box, an AMD one, and passes only when both do (VENDORS). The live test's
+hardware gets a second box, an AMD one, and passes only when both do (bot.VENDORS). The live test's
 files are in $RUNNER_TEMP/lt, one directory per vendor's box; `start` and `wait` exit 3, with
 `unavailable` set, when no box could start or none left results (no GPUs free, the bot has
 REVIEW_GPU_MAX_RUNS runs going), after writing each box's unavailable.md.
@@ -52,21 +52,7 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pypr
 GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
 # No runtime code: a re-review's `none` with no live test before it stands only on changes to these (carry).
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
-# Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
-# `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
-# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
-# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
-# PR's live test run on an AMD box too (vendors_of), and those it covers (covered_by_amd) stop counting once it
-# passed there.
-AMD_MODEL = r"mi\d{3}[ax]?"
-AMD = rf"(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"
-UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
-                                 r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
-AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
 AMD_RENTED = gpu_py.SUPPORTED["amd"]  # the AMD GPUs an AMD box can be
-# The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
-# for a PR that names AMD hardware.
-VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # Where a box comes from, by vendor in effect: Eras for NVIDIA while it has GPUs free, DigitalOcean otherwise,
 # and for AMD, which Eras doesn't have. Not by price: Eras is the provider the bot's caches and limits are for.
 PREFERENCE = ("eras", "digitalocean")
@@ -118,8 +104,8 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
            "identity_file": str(ssh / "live_pr"),
            # one box per vendor at once
-           "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": len(VENDORS),
-                      "max_total_usd": usd * hours * len(VENDORS), "max_running": int(max_runs)},
+           "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": len(bot.VENDORS),
+                      "max_total_usd": usd * hours * len(bot.VENDORS), "max_running": int(max_runs)},
            "eras": eras, "digitalocean": {"run_secret_env": "ANTHROPIC_API_KEY", **reachable},
            "runpod": {"enabled": False}, "lambda": {"enabled": False}}
     (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
@@ -173,51 +159,18 @@ def last_live_test(pr):
                               for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"))
 
 
-def changed_files(base, sha):
-    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
-    long to check (300 max)."""
-    files = bot.api(f"repos/{REPO}/compare/{base}...{sha}").get("files")
-    return None if files is None or len(files) >= 300 else files
-
-
-def file_names(files):
-    """The names in changed_files' entries, a rename's old name too."""
-    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
-
-
 def touches_runtime(pr, sha):
     """Whether the PR at SHA changes runtime code, by file_gate; a file list too long to check does."""
-    files = changed_files(bot.api(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
-    return files is None or bool(file_gate(file_names(files), ROOT)[1])
-
-
-def hardware_named(pull, changes):
-    """The words of UNTESTABLE_HARDWARE in the PR's title, file names and changed lines (`changes`, changed_files'
-    entries), lowercased."""
-    text = [pull["title"], *file_names(changes)]
-    for f in changes:
-        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
-    return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
-
-
-def vendors_of(words):
-    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named)."""
-    return [v for v in VENDORS if v == "nvidia" or any(AMD_HARDWARE.fullmatch(w) for w in words)]
-
-
-def vendors_for(pull, sha):
-    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
-    against the default branch, as the approval reads it. carry decides with it, and so does the review's
-    since-live-test diff (bot.since_live_test)."""
-    return vendors_of(hardware_named(pull, changed_files(pull["base"]["repo"]["default_branch"], sha) or []))
+    files = bot.changed_files(REPO, bot.api(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
+    return files is None or bool(file_gate(bot.file_names(files), ROOT)[1])
 
 
 def vendor_list(text):
-    """VENDORS named in `text`, comma-separated, NVIDIA's always among them; anything else raises."""
+    """bot.VENDORS named in `text`, comma-separated, NVIDIA's always among them; anything else raises."""
     vendors = text.split(",")
-    if len(set(vendors)) != len(vendors) or not set(vendors) <= set(VENDORS) or "nvidia" not in vendors:
+    if len(set(vendors)) != len(vendors) or not set(vendors) <= set(bot.VENDORS) or "nvidia" not in vendors:
         raise ValueError(f"unexpected vendors {text!r}")
-    return [v for v in VENDORS if v in vendors]
+    return [v for v in bot.VENDORS if v in vendors]
 
 
 # What is left of a clause of the review's `untestable` text once its AMD hardware words are gone, that says
@@ -226,7 +179,7 @@ FILLER = re.compile(r"\b(?:a|an|the|and|or|no|of|on|for|in|its|kernels?|code|pat
                     r"|support|cloud)\b|\W|_", re.IGNORECASE)
 # A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`),
 # but not a count (`ROCm 8 GPUs`).
-HARDWARE_PHRASE = re.compile(rf"({UNTESTABLE_HARDWARE.pattern})(-(?:specific|only|based))?"
+HARDWARE_PHRASE = re.compile(rf"({bot.UNTESTABLE_HARDWARE.pattern})(-(?:specific|only|based))?"
                              r"(\s+v?\d+(?:\.\d+)*(?![\w.])(?!\s*-?\s*(?:gpus?|nodes?|ranks?|devices?|x\b)))?",
                              re.IGNORECASE)
 
@@ -236,10 +189,11 @@ def covered_by_amd(word):
     `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
     untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
     change can pass on an H200."""
-    if not AMD_HARDWARE.fullmatch(word):
+    if not bot.AMD_HARDWARE.fullmatch(word):
         return False
     series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
-    return not re.fullmatch(AMD_MODEL, word, re.IGNORECASE) or bool(AMD_RENTED.search(word + "x" if series else word))
+    return not re.fullmatch(bot.AMD_MODEL, word, re.IGNORECASE) \
+        or bool(AMD_RENTED.search(word + "x" if series else word))
 
 
 def beyond_vendors(text, vendors):
@@ -281,7 +235,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
         print("::notice::No live test: the review left open items to fix first.")
         out["gated"] = "true"
         return
-    vendors = vendors_for(bot.api(f"repos/{REPO}/pulls/{pr}"), head_sha)
+    vendors = bot.vendors_for(REPO, bot.api(f"repos/{REPO}/pulls/{pr}"), head_sha)
     out["vendors"] = ",".join(vendors)
     last = last_live_test(pr)
     live = review.get("live_test") or {}
@@ -327,9 +281,10 @@ def brief(pr, sha, main_sha, base, run, checks, since="", forced="", asked="", a
                        f"{FORCED[forced]}.")
     gpus = {"nvidia": "NVIDIA's (CUDA)", "amd": "AMD's (ROCm, whose PyTorch calls them `cuda` devices too)"}[vendor]
     if len(vendors) > 1:
-        gpus += (f". The PR names {' and '.join(VENDORS[v] for v in vendors if v != 'nvidia')} hardware, so it gets "
-                 f"a live test on each of {', '.join(VENDORS[v] for v in vendors)}, on a box each: this one is "
-                 f"{VENDORS[vendor]}'s, so test what runs on these GPUs, and name them in the report")
+        others = " and ".join(bot.VENDORS[v] for v in vendors if v != "nvidia")
+        each = ", ".join(bot.VENDORS[v] for v in vendors)
+        gpus += (f". The PR names {others} hardware, so it gets a live test on each of {each}, on a box each: this "
+                 f"one is {bot.VENDORS[vendor]}'s, so test what runs on these GPUs, and name them in the report")
     if vendor == "amd":
         gpus += (". mstar's ROCm install may not build here: when bootstrap.sh stops on it, or torch sees no GPU, "
                  "that is the environment, and the outcome is `unavailable`")
@@ -395,8 +350,8 @@ def unavailable(box, text):
 
 
 def boxes(lt):
-    """The directories of the boxes this run started or tried, one per vendor, in VENDORS' order."""
-    return [lt / v for v in VENDORS if (lt / v).is_dir()]
+    """The directories of the boxes this run started or tried, one per vendor, in bot.VENDORS' order."""
+    return [lt / v for v in bot.VENDORS if (lt / v).is_dir()]
 
 
 def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, vendors="nvidia", since="",
@@ -442,11 +397,11 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         _, listing, tried = found[vendor]
         everything = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", "--all-regions",
                                     check=False).stdout)
-        lines = [f"No {VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
+        lines = [f"No {bot.VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
                  f"${listing['max_usd_per_hour']}/hr."]
         lines += [f"- tried {t}" for t in tried]
         lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
-                  for o in everything["offers"]] or [f"- no listing has that many {VENDORS[vendor]} GPUs"]
+                  for o in everything["offers"]] or [f"- no listing has that many {bot.VENDORS[vendor]} GPUs"]
         lines += [f"- {e}" for e in everything["errors"]]
         unavailable(lt / vendor, "\n".join(lines))
 
@@ -643,7 +598,7 @@ def cleanup(out, pr, tag):
     print(gpu("list", check=False).stdout)
     for key in list(gpu_py.ledger()):
         gpu("terminate", key, check=False)
-    gpu_py.release_by_name(gpu_py.load_config(), [gpu_py.job_name(pr, f"{tag}-{v}") for v in VENDORS])
+    gpu_py.release_by_name(gpu_py.load_config(), [gpu_py.job_name(pr, f"{tag}-{v}") for v in bot.VENDORS])
 
 
 def reap(out, hours="4"):
@@ -731,11 +686,11 @@ def to_fix_first(review, pr, above):
 
 def untestable(pull, changes, review, vendors):
     """What the live test can't cover in this PR, as reasons not to approve (none when it covers it all):
-    what the review's `untestable` field says and what UNTESTABLE_HARDWARE finds in the PR's title, file
+    what the review's `untestable` field says and what bot.UNTESTABLE_HARDWARE finds in the PR's title, file
     names and changed lines, but what the run on `vendors` covers (AMD, when it ran on an AMD box: the rule
     then also needs its verdict, which is a pass only when every box passed). A diff GitHub won't give is a
     reason too."""
-    named = [w for w in hardware_named(pull, changes) if "amd" not in vendors or not covered_by_amd(w)]
+    named = [w for w in bot.hardware_named(pull, changes) if "amd" not in vendors or not covered_by_amd(w)]
     needs = [x for x in (beyond_vendors((review.get("live_test") or {}).get("untestable"), vendors),
                          ", ".join(named)) if x]
     unread = [f["filename"] for f in changes if f.get("changes") and not f.get("patch")]
@@ -765,8 +720,8 @@ def approval_facts(pr, sha, verdict, review, vendors):
     reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     # Against the default branch, not the PR's base, so retargeting the PR can't hide a file.
-    changes = changed_files(pull["base"]["repo"]["default_branch"], sha)
-    blocked = file_gate(file_names(changes), ROOT)[0] if changes is not None else ()
+    changes = bot.changed_files(REPO, pull["base"]["repo"]["default_branch"], sha)
+    blocked = file_gate(bot.file_names(changes), ROOT)[0] if changes is not None else ()
     gitlinks = [f["filename"] for f in changes or [] if GITLINK.search(f.get("patch") or "")]
     pages = review_threads(pr)
     return ApprovalFacts(
@@ -968,7 +923,7 @@ def render_comment(sha, lt, vendors, media_url=""):
         if verdict == "none" and (lt / vendor / "unavailable.md").is_file():  # why it couldn't run, redacted
             verdict, report = "unavailable", render_summary.inert((lt / vendor / "unavailable.md").read_text())
         summary = " ".join(str(result.get("summary", "")).split())  # on one line: it can't open a fence over the report
-        title = f"**Live test of `{sha[:7]}` on {VENDORS[vendor]}: {verdict}.** {render_summary.inert(summary)}"
+        title = f"**Live test of `{sha[:7]}` on {bot.VENDORS[vendor]}: {verdict}.** {render_summary.inert(summary)}"
         room = (60000 - len(head) - len(media) - 100) // len(vendors) - len(title)
         report, cut = (report, "") if len(report) <= room else \
             (report[:room], "\n\n… (cut; the full report is in the run's artifact)\n")
@@ -1075,7 +1030,7 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
     elif any(text(box / "unavailable.md") for box in boxes(lt)):  # no box ran
         body = (f"<!-- claude-live-test sha={head_sha} verdict=unavailable "
                 f"vendors={','.join(box.name for box in boxes(lt))} -->\n" + "\n".join(
-            f"**{VENDORS[box.name]}:** " + render_summary.inert(text(box / "unavailable.md"))
+            f"**{bot.VENDORS[box.name]}:** " + render_summary.inert(text(box / "unavailable.md"))
             for box in boxes(lt) if text(box / "unavailable.md")))
     else:  # the review chose `none` and it stood
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")

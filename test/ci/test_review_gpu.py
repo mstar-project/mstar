@@ -791,7 +791,7 @@ class TestApprove(unittest.TestCase):
                           ("hipster", False), ("test_bare_metal", False), ("bare-metal hosts", False),
                           ("MPS on and off", False)):
             with self.subTest(text):
-                self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
+                self.assertEqual(bool(bot.UNTESTABLE_HARDWARE.search(text)), hit)
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
         finding = {"priority": "P2", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}

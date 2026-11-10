@@ -50,6 +50,20 @@ TYPES = render_summary.TYPES
 # The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads: the commit,
 # the verdict and the GPU vendors it ran on (a comment from before vendors were written ran on NVIDIA alone).
 LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+)(?: vendors=([a-z,]+))? -->")
+# Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
+# `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
+# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
+# PR's live test run on an AMD box too (vendors_of), and those it covers (gpu_review.covered_by_amd) stop
+# counting once it passed there.
+AMD_MODEL = r"mi\d{3}[ax]?"
+AMD = rf"(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"
+UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
+                                 r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
+AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+# The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
+# for a PR that names AMD hardware.
+VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -653,16 +667,48 @@ def passed_on_ancestor(repo, live, head_sha):
     return status in ("ahead", "identical")
 
 
+def changed_files(repo, base, sha):
+    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
+    long to check (300 max)."""
+    files = api(f"repos/{repo}/compare/{base}...{sha}").get("files")
+    return None if files is None or len(files) >= 300 else files
+
+
+def file_names(files):
+    """The names in changed_files' entries, a rename's old name too."""
+    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
+
+
+def hardware_named(pull, changes):
+    """The words of UNTESTABLE_HARDWARE in the PR's title, file names and changed lines (`changes`, changed_files'
+    entries), lowercased."""
+    text = [pull["title"], *file_names(changes)]
+    for f in changes:
+        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
+    return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
+
+
+def vendors_of(words):
+    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named)."""
+    return [v for v in VENDORS if v == "nvidia" or any(AMD_HARDWARE.fullmatch(w) for w in words)]
+
+
+def vendors_for(repo, pull, sha):
+    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
+    against the default branch, as the approval reads it. The live test decides with it (gpu_review.carry), and so
+    does the review's since-live-test diff (since_live_test)."""
+    return vendors_of(hardware_named(pull, changed_files(repo, pull["base"]["repo"]["default_branch"], sha) or []))
+
+
 def since_live_test(repo, pull, head_sha, conversation):
     """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
     last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
-    vendor this PR's live test needs (gpu_review.vendors_for, as the live-test job decides), for the review's
+    vendor this PR's live test needs (vendors_for, as the live-test job decides), for the review's
     live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either) the review
     judges the whole PR."""
-    import gpu_review  # here, not at the top: it imports this module
     live = last_live_test(conversation)
     if not passed_on_ancestor(repo, live, head_sha) \
-            or not set(gpu_review.vendors_for(pull, head_sha)) <= set(live["vendors"]):
+            or not set(vendors_for(repo, pull, head_sha)) <= set(live["vendors"]):
         return
     tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:
