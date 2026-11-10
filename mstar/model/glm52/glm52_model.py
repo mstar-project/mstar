@@ -54,6 +54,7 @@ from mstar.model.utils import (
     TextOutput,
     capture_ladder,
     load_snapshot_tokenizer,
+    long_context_kwargs,
     read_fp8_block_quant_config,
     resolve_checkpoint,
 )
@@ -110,20 +111,7 @@ class Glm52Model(Model):
         if "num_hidden_layers" in kwargs:
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
-        long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
-                           if k in kwargs)
-        if long_only and not kwargs.get("dsa_long_context", False):
-            # they size and split the long-context path only; without it they would be dropped
-            raise ValueError(f"{long_only} apply only with dsa_long_context")
-        for key in ("dsa_long_context", "dsa_shard_prefill"):
-            # bool("false") is True
-            if key in kwargs and not isinstance(kwargs[key], bool):
-                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
-        for key in ("max_seq_len", "prefill_window_tokens"):
-            # int() would take True as 1 and 2.5 as 2
-            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
-                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
-        if kwargs.get("dsa_long_context", False):
+        if long_context_kwargs(kwargs):
             # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
