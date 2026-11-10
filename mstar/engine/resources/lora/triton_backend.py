@@ -8,9 +8,9 @@ Programs are laid out over compact row tiles: tile ``i`` belongs to the slot who
 cover it, counting ``cdiv(rows, BLOCK_M)`` tiles for each slot that has rows and a nonzero
 rank, slot after slot (``_locate``). So base-model rows (the zero adapter) and slots with
 nothing for this target launch no work beyond reading the slot table. The grid depends
-only on the token count, the slot count and the shapes, never on the batch's contents
-(there are never more tiles than ``min(tokens, cdiv(tokens, BLOCK_M) + slots - 1)``), so a
-captured replay launches the same grid every step.
+only on the token count, the slot count, the shapes, the dtype and the device, never on the
+batch's contents (there are never more tiles than ``min(tokens, cdiv(tokens, BLOCK_M) +
+slots - 1)``), so a captured replay launches the same grid every step.
 
 At decode width a shrink has a few row tiles and a long contraction, so ``lora_apply_``
 splits the contraction over programs into fp32 partials. The rank is held in tiles of at
@@ -20,15 +20,19 @@ per column block, one rank tile at a time and only the tiles under the slot's ow
 so a small kernel first sums the partials into one ``h`` (``_lora_reduce_kernel``):
 summed inside that loop they would be reloaded for every column block.
 
-Tile sizes depend only on the token count and the max rank (``_tiles``): small row tiles
-at decode width, where the work is streaming the adapter weights, and larger ones at
-prefill width, where it is the GEMMs.
+The launch config (``_choose``) depends only on the token count, the max rank, the element
+size and the device: small row tiles at decode width, where the work is streaming the
+adapter weights, larger ones at prefill width, where it is the GEMMs, each falling back to
+fewer pipeline stages or smaller tiles when the device's shared memory is too small.
 
 The shrink writes zeros from a slot's rank up to the max rank, so ``lora_apply_``'s expand
-contracts over whole rank tiles with no mask on the slot's rank, which would stop the
-compiler from vectorizing loads along ``h``'s contiguous axis. Weight columns past a
-slot's rank meet those zeros, so they must be finite (the pool zero-pads them), as the
-reference also requires.
+masks ``h`` and ``b`` by the max rank, the same for every slot, rather than by the slot's
+rank. The max rank is a runtime argument, but Triton specializes integer arguments on
+divisibility by 16, so for a max rank that is a multiple of 16 the mask is constant over
+runs of contiguous elements and the loads compile to 16-byte ``cp.async`` copies; masked
+by a rank loaded from memory (or a max rank off the multiple), they are scalar loads.
+``tl.multiple_of`` on the shrink's k bounds does the same for ``x`` and ``a``. So
+``b[slot, :, rank:]`` is read, against zeros, and must be finite (``ops.py``).
 
 These are the CUDA kernels of the ``mstar::lora_shrink`` / ``mstar::lora_expand_`` /
 ``mstar::lora_apply_`` custom ops (``ops.py``), so ``torch.compile`` treats each as one
@@ -68,22 +72,64 @@ _SHRINK_WAVES = 2
 
 
 class _Tiles(NamedTuple):
-    shrink_m: int
-    shrink_k: int
-    expand_m: int
-    expand_n: int
+    """One kernel's launch config: rows per tile, its other tiled extent (the shrink's
+    contraction, the expand's output columns) and its software-pipeline stages."""
+    m: int
+    n: int
+    stages: int
 
 
-_DECODE_TILES = _Tiles(shrink_m=16, shrink_k=128, expand_m=16, expand_n=64)
-_PREFILL_TILES = _Tiles(shrink_m=64, shrink_k=128, expand_m=64, expand_n=128)
+class _Config(NamedTuple):
+    shrink: _Tiles
+    expand: _Tiles
+
+
+# preferred first: a launch takes the first whose shared memory fits the device's, so an
+# fp32 pool or a smaller GPU gets fewer stages, then smaller tiles
+_DECODE_SHRINK = (_Tiles(16, 128, 3), _Tiles(16, 128, 2), _Tiles(16, 64, 2), _Tiles(16, 64, 1))
+_DECODE_EXPAND = (_Tiles(16, 64, 3), _Tiles(16, 64, 2), _Tiles(16, 64, 1))
+_PREFILL_SHRINK = (_Tiles(64, 128, 3), _Tiles(64, 128, 2), _Tiles(64, 64, 2), _Tiles(32, 64, 2), _Tiles(16, 64, 1))
+_PREFILL_EXPAND = (_Tiles(64, 128, 3), _Tiles(64, 128, 2), _Tiles(64, 64, 2), _Tiles(32, 64, 2), _Tiles(16, 64, 1))
 # from these many tokens, or these many over a tiled rank, the prefill tiles are faster
 _PREFILL_TOKENS = 256
 _PREFILL_TOKENS_TILED_RANK = 64
 
 
-def _tiles(tokens: int, max_rank: int) -> _Tiles:
+def _shrink_smem(t: _Tiles, block_r: int, elsize: int) -> int:
+    """An upper bound on the shrink's shared memory: ``stages`` buffers of its two operand
+    tiles and one of its output tile (``test_lora_triton_high_rank`` checks it against the
+    compiled kernels)."""
+    return (t.stages * (t.m * t.n + t.n * block_r) + t.m * block_r) * elsize
+
+
+def _expand_smem(t: _Tiles, block_r: int, elsize: int) -> int:
+    """As ``_shrink_smem``, plus the ``h`` tile a one-tile rank holds across the loop."""
+    return (t.stages * (t.m * block_r + block_r * t.n) + t.m * block_r + t.m * t.n) * elsize
+
+
+@functools.cache
+def _smem_limit(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+
+
+@functools.cache
+def _choose(tokens: int, max_rank: int, elsize: int, smem: int) -> _Config:
+    """The launch config: a function of the token count, the max rank, the element size and
+    the device, so a capture bucket launches the same grid every replay."""
+    block_r = _rank_tiles(max_rank)[0]
     tiled = max_rank > _MAX_BLOCK_R
-    return _PREFILL_TILES if tokens >= (_PREFILL_TOKENS_TILED_RANK if tiled else _PREFILL_TOKENS) else _DECODE_TILES
+    prefill = tokens >= (_PREFILL_TOKENS_TILED_RANK if tiled else _PREFILL_TOKENS)
+    shrink = _PREFILL_SHRINK if prefill else _DECODE_SHRINK
+    expand = _PREFILL_EXPAND if prefill else _DECODE_EXPAND
+    # the last candidate when none fits, which then fails to launch as any would
+    return _Config(
+        next((t for t in shrink if _shrink_smem(t, block_r, elsize) <= smem), shrink[-1]),
+        next((t for t in expand if _expand_smem(t, block_r, elsize) <= smem), expand[-1]),
+    )
+
+
+def _tiles(tokens: int, max_rank: int, dtype: torch.dtype, device: torch.device) -> _Config:
+    return _choose(tokens, max_rank, dtype.itemsize, _smem_limit(device.index))
 
 
 @triton.jit
@@ -291,15 +337,15 @@ def _align(*values: int) -> int:
 def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles):
     slots, width, _ = a.shape
     block_r, r_tiles = _rank_tiles(width // num_slices)
-    _lora_shrink_kernel[(_row_tiles(x.shape[0], slots, tiles.shrink_m), num_slices * r_tiles, splits)](
+    return _lora_shrink_kernel[(_row_tiles(x.shape[0], slots, tiles.m), num_slices * r_tiles, splits)](
         x, a, h, token_order, slot_indptr, ranks,
         x.shape[1], width // num_slices, k_per_split,
         x.stride(0), x.stride(1),
         a.stride(0), a.stride(1), a.stride(2),
         h.stride(0), h.stride(1), h.stride(2),
         NUM_SLOTS=slots, SLOTS_P2=triton.next_power_of_2(slots),
-        BLOCK_M=tiles.shrink_m, BLOCK_R=block_r, R_TILES=r_tiles, BLOCK_K=tiles.shrink_k,
-        K_ALIGN=_align(x.shape[1], k_per_split),
+        BLOCK_M=tiles.m, BLOCK_R=block_r, R_TILES=r_tiles, BLOCK_K=tiles.n,
+        K_ALIGN=_align(x.shape[1], k_per_split), num_stages=tiles.stages,
     )
 
 
@@ -324,22 +370,22 @@ def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices,
     for width in out_slices:
         bounds.append(bounds[-1] + width)
     bounds += [bounds[-1]] * (_MAX_SLICES + 1 - len(bounds))
-    row_tiles = _row_tiles(y.shape[0], slots, tiles.expand_m)
+    row_tiles = _row_tiles(y.shape[0], slots, tiles.m)
     block_r, r_tiles = _rank_tiles(max_rank)
     # enough strips to fill the device a few times over when the row tiles do not
     strips = max(1, min(
-        triton.cdiv(max(out_slices), tiles.expand_n),
+        triton.cdiv(max(out_slices), tiles.n),
         4 * _num_sms(y.device.index) // (row_tiles * len(out_slices)),
     ))
-    _lora_expand_kernel[(row_tiles, strips, len(out_slices))](
+    return _lora_expand_kernel[(row_tiles, strips, len(out_slices))](
         h, b, y, token_order, slot_indptr, ranks, scalings,
         max_rank, *bounds,
         h.stride(0), h.stride(1), h.stride(2),
         b.stride(0), b.stride(1), b.stride(2),
         y.stride(0), y.stride(1),
         NUM_SLOTS=slots, SLOTS_P2=triton.next_power_of_2(slots), SPLITS=h.shape[0],
-        BLOCK_M=tiles.expand_m, BLOCK_N=tiles.expand_n, BLOCK_R=block_r, R_TILES=r_tiles,
-        ZEROS_PAST_RANK=zeros_past_rank,
+        BLOCK_M=tiles.m, BLOCK_N=tiles.n, BLOCK_R=block_r, R_TILES=r_tiles,
+        ZEROS_PAST_RANK=zeros_past_rank, num_stages=tiles.stages,
     )
 
 
@@ -349,7 +395,7 @@ def _shrink_cuda(x, a, token_order, slot_indptr, token_slot, ranks, num_slices):
     if tokens == 0:
         return h
     _shrink_into(h.unsqueeze(0), x, a, token_order, slot_indptr, ranks, num_slices, 1, in_features,
-                 _tiles(tokens, a.shape[1] // num_slices))
+                 _tiles(tokens, a.shape[1] // num_slices, x.dtype, x.device).shrink)
     return h
 
 
@@ -357,7 +403,7 @@ def _expand_cuda(y, h, b, token_order, slot_indptr, token_slot, ranks, scalings,
     if y.shape[0] == 0:
         return
     _expand_from(y, h.unsqueeze(0), b, token_order, slot_indptr, ranks, scalings, out_slices,
-                 _tiles(y.shape[0], b.shape[2]), zeros_past_rank=False)
+                 _tiles(y.shape[0], b.shape[2], b.dtype, b.device).expand, zeros_past_rank=False)
 
 
 def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
@@ -366,20 +412,21 @@ def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scaling
         return
     slots, width, _ = a.shape
     num_slices = len(out_slices)
-    tiles = _tiles(tokens, width // num_slices)
+    tiles = _tiles(tokens, width // num_slices, x.dtype, x.device)
     r_tiles = _rank_tiles(width // num_slices)[1]
-    programs = _row_tiles(tokens, slots, tiles.shrink_m) * num_slices * r_tiles
+    programs = _row_tiles(tokens, slots, tiles.shrink.m) * num_slices * r_tiles
     splits = max(1, min(_MAX_SPLITS, triton.cdiv(in_features, _SPLIT_K_CHUNK),
                         triton.cdiv(_SHRINK_WAVES * _num_sms(x.device.index), programs)))
-    k_per_split = triton.cdiv(triton.cdiv(in_features, splits), tiles.shrink_k) * tiles.shrink_k
+    k_per_split = triton.cdiv(triton.cdiv(in_features, splits), tiles.shrink.n) * tiles.shrink.n
     splits = triton.cdiv(in_features, k_per_split)
     # partials, written only for rows the expand reads, so never cleared; one split is
     # written in the weights' dtype, as the expand would round it
     h = torch.empty(splits, tokens, width, dtype=torch.float32 if splits > 1 else x.dtype, device=x.device)
-    _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles)
+    _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles.shrink)
     if splits > 1 and r_tiles > 1:
         h = _reduce(h, x.dtype)
-    _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles, zeros_past_rank=True)
+    _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles.expand,
+                 zeros_past_rank=True)
 
 
 lora_shrink.register_kernel("cuda")(_shrink_cuda)
