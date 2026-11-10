@@ -308,8 +308,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   the plan written (with its estimated time), bootstrap done, each check started and finished with its
   outcome, writing the report. The workflow's log shows them while you run.
 - Test what this change needs and nothing more: its claims and the risks its diff creates. For a perf
-  claim, measure the cells the PR claims, adding boots or rounds only when a delta sits within the
-  noise, and a main-arm perf baseline only when the claim is relative to main (the skill's same-code
+  claim, measure the cells the PR claims and those its change could put at risk (a likely regression:
+  another concurrency, model or path the diff reaches), adding boots or rounds only when a delta sits
+  within the noise, and a main-arm perf baseline only when the claim is relative to main (the skill's same-code
   control for an output-diff conclusion stays). Test the PR's head against its base: this
   overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
   on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
@@ -317,8 +318,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   what CI can't run, and always the test files the PR adds or changes that skip without CUDA.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
-  change needs; about two hours once compile caches are warm (compiling doesn't count) is the most a
-  plan should take, not a goal to fill. This ceiling overrides the skill's "Close your own Not
+  change needs, ideally much less than two hours; about two hours once compile caches are warm
+  (compiling doesn't count) is the most a plan should take, for the PRs that truly need it, not a goal
+  to fill. This ceiling overrides the skill's "Close your own Not
   tested list": close only Not-tested lines the change reaches, and if the plan won't fit, cut from
   the bottom of the test matrix's priority order, as the skill's step 3 does, and list what you cut
   as not tested instead of running it.
