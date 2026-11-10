@@ -40,7 +40,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
+from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs, walk_partition
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -88,7 +88,7 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
     inputs, persists, repeating = {}, {}, set()
     for walk, graph in model.get_graph_walk_graphs().items():
         io = graph.get_inputs_outputs()
-        streamed = streamed_inputs(model, walk, graph).keys()
+        streamed = streamed_inputs(model, walk, graph)
         loops = graph.get_loops()
         # a loop-back whose first iteration a node outside its Loop feeds
         # (V-JEPA 2's encoder ahead of its rollout) is the walk's own to seed
@@ -607,6 +607,9 @@ class Conductor:
         )
         if topology:
             topology.check_walk_driving_connections()
+            topology.check_walk_scoped_continuation(
+                {walk: walk_partition(model, walk) for walk in model.get_graph_walk_graphs()}
+            )
 
         for group in self.default_sharding_config.groups:
             group_graph_walks = group.graph_walks or graph_walks

@@ -176,6 +176,22 @@ class PartitionTopology:
                     f"{type(policy).__name__}"
                 )
 
+    def check_walk_scoped_continuation(self, walk_partitions: Mapping[str, str]) -> None:
+        """A stream that continues past its end in some walks only (given each
+        walk's partition) must drive its consumer's walk: a buffer learns the
+        walk only from a driving connection, and otherwise asks with None."""
+        drivers = self.walk_drivers()
+        for conn in self.connections:
+            if conn.to_partition in drivers:
+                continue
+            policy = conn.chunk_policy_factory()
+            for walk, partition in walk_partitions.items():
+                if partition == conn.to_partition and policy.continues_in(walk) != policy.continues_in(None):
+                    raise ValueError(
+                        f"{conn.edge_name}: its chunk policy continues past its end in some walks only, "
+                        f"but it does not drive {partition!r}'s walk (consumer_walk)"
+                    )
+
 
 def client_stream_limits(
     topology: PartitionTopology, model_config: Mapping | None,

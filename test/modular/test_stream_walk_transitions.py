@@ -19,7 +19,6 @@ from mstar.conductor.request_info import (
 )
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.model.base import Model
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
@@ -163,12 +162,8 @@ def test_a_stream_continuing_in_some_walks_must_drive_its_consumers_walk():
         "thinker_states", walk=None,
         policy=lambda: FixedChunkPolicy(1, continue_after_done=frozenset({"talker_decode"})),
     )])
-    model = SimpleNamespace(
-        get_partitions=lambda: [SimpleNamespace(name="Talker", graph_walks=["talker_decode"])],
-        get_partition_topology=lambda: topology,
-    )
     with pytest.raises(ValueError, match="thinker_states"):
-        Model._get_worker_graphs_for_graph_walk(model, "talker_decode", None, [])
+        topology.check_walk_scoped_continuation({"talker_decode": "Talker"})
 
 
 # --- idle --------------------------------------------------------------------

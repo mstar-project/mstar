@@ -546,36 +546,33 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> dict[tuple[str, str], bool]:
-    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
-    edge of a connection into the walk's partition (the client's included),
-    at each node of the walk that takes it, each with whether its stream
-    continues past its end in this walk (``ChunkPolicy.continues_in``). The
-    worker graphs and the conductor's walk plans both read this, so they agree
-    on what is streamed."""
-    partition = next(
+def walk_partition(model: "Model", graph_walk: str) -> str:
+    """The partition ``graph_walk`` runs in."""
+    return next(
         (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
     )
-    topology = model.get_partition_topology()
-    driven = partition in topology.walk_drivers()
-    continues: dict[str, bool] = {}
-    for conn in topology.connections:
-        if conn.to_partition != partition:
-            continue
-        # structural (``ChunkPolicy.continues_in``), so one policy answers
-        policy = conn.chunk_policy_factory()
-        continues[conn.edge_name] = policy.continues_in(graph_walk)
-        # a buffer learns its consumer's walk only from a connection that
-        # drives it, and asks with None otherwise
-        if not driven and continues[conn.edge_name] != policy.continues_in(None):
-            raise ValueError(
-                f"{conn.edge_name}: its chunk policy continues past its end in some walks only, "
-                f"but it does not drive {partition!r}'s walk (consumer_walk)"
-            )
+
+
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = walk_partition(model, graph_walk)
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
     return {
-        (name, node.name): continues[name]
-        for node in graph.get_nodes().values() for name in continues.keys() & set(node.input_names)
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
     }
+
+
+def continuing_streams(model: "Model", graph_walk: str) -> frozenset[str]:
+    """The streams into ``graph_walk``'s partition that continue past their end
+    in this walk (``ChunkPolicy.continues_in``; structural)."""
+    partition = walk_partition(model, graph_walk)
+    return frozenset(
+        conn.edge_name for conn in model.get_partition_topology().connections
+        if conn.to_partition == partition and conn.chunk_policy_factory().continues_in(graph_walk)
+    )
 
 
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
@@ -708,12 +705,15 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
+        continuing = continuing_streams(self, graph_walk)
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams={name: cont for (name, _), cont in streamed_inputs(self, graph_walk, graph).items()},
+            input_streams={
+                name: name in continuing for name, _ in streamed_inputs(self, graph_walk, graph)
+            },
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
