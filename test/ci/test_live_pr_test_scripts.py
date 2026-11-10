@@ -115,7 +115,7 @@ class TestGpu(unittest.TestCase):
         self.g.update(runpod=runpod, runpod_list=lambda path, field, params=None: listed,
                       find_offer=lambda cfg, oid: OFFER,
                       runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-        args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+        args = argparse.Namespace(boxes=1, offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
                                   allow_over_budget=False, dry_run=False)
         exited = False
         with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
@@ -193,7 +193,7 @@ class TestGpu(unittest.TestCase):
                 return [{"id": "p1", "name": state["name"]}]
             self.g.update(runpod=runpod, runpod_list=runpod_list, find_offer=lambda cfg, oid: OFFER,
                           runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
-            args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
+            args = argparse.Namespace(boxes=1, offer=OFFER["id"], pr=7, hours=1, tag=None, run=None, input=[],
                                   allow_over_budget=False, dry_run=False)
             with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):

@@ -398,8 +398,9 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
     description (pr-body.md) as data, and the box's own Anthropic key. Every vendor's box or none: when one has no
-    GPUs free, or the boxes would go past REVIEW_GPU_MAX_RUNS, none starts. A box that then fails to start (its
-    offer taken meanwhile) gets an unavailable.md; exits 3, with `unavailable` set, when no box started."""
+    GPUs free, none starts, and the first launch asks budget.max_running for room for them all. A box that then
+    fails to start (its offer taken meanwhile) gets an unavailable.md; exits 3, with `unavailable` set, when no box
+    started."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks, vendors = branch(base), check_kinds(checks), vendor_list(vendors)
     since = commit(since) if since else ""
@@ -457,35 +458,26 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
             none_free(vendor)
     if any((lt / v / "unavailable.md").exists() for v in vendors):
         stop("Not started: another vendor's box can't start, and the PR passes only when every box does.")
-    cap = cfg.get("budget", {}).get("max_running")
-    if cap is not None:  # every box this run needs, against budget.max_running, before any starts
-        try:
-            gpu_py.reap(cfg)
-            up = len(gpu_py.running(cfg))
-        except gpu_py.ApiError:
-            up = 0  # gpu.py launch counts again, and refuses
-        if up + len(vendors) > cap:
-            stop(f"The bot has {up} GPU boxes going and this run needs {len(vendors)}, past {cap} "
-                 "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
     secret = os.environ.get(cfg.get("digitalocean", {}).get("run_secret_env") or "", "")
-    for vendor in vendors:
+    for i, vendor in enumerate(vendors):
         box = lt / vendor
         free, _, tried = found[vendor]
 
-        def launch(o, vendor=vendor, box=box, tried=tried):
+        # The first launch checks budget.max_running has room for every box this run needs.
+        def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(vendors) if i == 0 else 1):
             data = fit_user_data(lt, box, len(secret)) if o["provider"] == "digitalocean" \
                 else [lt / "findings.json", lt / "pr-body.md"]
             inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON) for x in ("--input", str(f))]
             r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", f"{tag}-{vendor}",
-                    "--run", str(BOX), *inputs, check=False)
+                    "--run", str(BOX), *inputs, "--boxes", str(boxes), check=False)
             if r.returncode:
                 tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
             return r
 
         o, r = launch_first(free, launch)
-        if r and r.returncode == 4:  # budget.max_running, reached since the check above
-            unavailable(box, f"The bot already has {cfg['budget']['max_running']} GPU boxes going "
-                             "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
+        if r and r.returncode == 4:  # budget.max_running
+            unavailable(box, f"The bot's GPU boxes would go past {cfg['budget']['max_running']} with this run's "
+                             f"{len(vendors)} (REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
         elif o:
             (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (box / "offer.json").write_text(json.dumps(o))

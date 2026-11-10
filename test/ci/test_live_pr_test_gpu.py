@@ -32,7 +32,7 @@ def keys(*names):
 
 class TestEras(unittest.TestCase):
     def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False, run=None,
-                    inputs=(), gone=()):
+                    inputs=(), gone=(), boxes=1):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
         between, and those `gone` no longer exist; the calls it made."""
@@ -75,8 +75,8 @@ class TestEras(unittest.TestCase):
                 "storage": True})
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1", "v2"]},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
-        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=run, input=list(inputs), cache="ro",
-                                  cache_write=write, allow_over_budget=False, dry_run=dry_run)
+        args = argparse.Namespace(boxes=boxes, offer="eras:l1", pr=0, hours=1, tag="c", run=run, input=list(inputs),
+                                  cache="ro", cache_write=write, allow_over_budget=False, dry_run=dry_run)
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -241,7 +241,7 @@ class TestEras(unittest.TestCase):
                                                   "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True}
         key = Path(tempfile.mkdtemp()) / "key.pub"
         key.write_text("ssh-ed25519 AAAA test")
-        args = argparse.Namespace(offer="runpod:H100:dc:1", pr=0, hours=1, tag="t", run="box.sh", input=[],
+        args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=0, hours=1, tag="t", run="box.sh", input=[],
                                   allow_over_budget=False, dry_run=True)
         with self.assertRaises(SystemExit, msg="a pod would hold GPUs with nothing running on them"), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -276,6 +276,8 @@ class TestEras(unittest.TestCase):
                          "a refused launch would leave an ssh key in the organization")
         self.assertIn(("POST", "/instances"), [c[:2] for c in self.eras_launch(max_running=1, held=())],
                       "a launch under budget.max_running would be refused")
+        self.assertIn(("exit", 4), [c[:2] for c in self.eras_launch(max_running=1, held=(), boxes=2)],
+                      "the first of a run's two boxes would start with room for one, and the second be refused")
 
 
 def do_size(slug, model, count, vram, price, regions=("nyc2", "tor1"), available=True):
@@ -380,7 +382,7 @@ class TestDigitalOcean(unittest.TestCase):
         key.write_text("ssh-ed25519 AAAA test")
         GPU["find_offer"] = lambda cfg, oid: {"id": offer, "provider": "digitalocean", "gpu": gpu, "count": count,
                                               "usd_per_hour": 1.99, "region": "any", "storage": True}
-        args = argparse.Namespace(offer=offer, pr=7, hours=1, tag="1-1-amd", run=run, input=list(inputs),
+        args = argparse.Namespace(boxes=1, offer=offer, pr=7, hours=1, tag="1-1-amd", run=run, input=list(inputs),
                                   allow_over_budget=False, dry_run=dry_run)
         cfg = {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4},
                **(cfg or {})}

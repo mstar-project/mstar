@@ -5,7 +5,7 @@ or DigitalOcean.
 usage:
   gpu.py check                                   keys, persistent storage, budget
   gpu.py offers --gpus N [--vendor nvidia|amd] [--min-vram GB] [--all-regions] [--allow-arm] [--json]
-  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
+  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]] [--boxes N]
                [--cache ro|none | --cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
@@ -852,9 +852,10 @@ def cmd_launch(args, cfg):
                     up = running(cfg)
                 except ApiError as err:
                     die(f"can't count this tool's instances for budget.max_running: {err}")
-                if len(up) >= max_running:
-                    die(f"{len(up)} of this tool's instances are up, from every session; budget.max_running is "
-                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
+                if len(up) + args.boxes > max_running:
+                    die(f"{len(up)} of this tool's instances are up, from every session, and this launch needs room "
+                        f"for {args.boxes}; budget.max_running is {max_running}. Wait for one to end, or ask before "
+                        "passing --allow-over-budget", code=4)
             check_total(cfg, sum(committed_usd(e) for e in live.values()) + o["usd_per_hour"] * hours,
                         args.allow_over_budget)
         body, create = p.plan(o, name, pubkey, hours, args)
@@ -1307,6 +1308,9 @@ def main():
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
     cache.add_argument("--cache-write", metavar="ID",
                        help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if held")
+    p.add_argument("--boxes", type=int, default=1,
+                   help="budget.max_running must leave room for this many, this one and those launched after it "
+                        "for the same job")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")
