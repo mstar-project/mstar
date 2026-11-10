@@ -852,7 +852,7 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     def set_inline_streams(self, keys: "frozenset[tuple[str, str]]") -> None:
         """The (node, signal) pairs whose streamed items go as values when the
-        route carries the signal inline (``EngineManager.inline_stream_keys``).
+        route carries the signal inline (``EngineManager.inline_streams.keys``).
         A runtime without inline emit sends every item as a tensor."""
         del keys
 
