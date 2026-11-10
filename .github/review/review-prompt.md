@@ -57,7 +57,7 @@ The skill's bar (§2), description pass (§4.3), questions and output (§8): rep
 
 The skill's modes table: every mode runs every pass, and the modes differ in what they report. **light** runs on `/review light`, **nogpu** on `/review nogpu`, and **full** on `/review`: it reviews as nogpu and then decides what the live test runs.
 
-**A big diff, in any mode,** is reviewed as a stack of slices with subagents, as the skill's "Working efficiently" says, when your turn cap is in the hundreds or more. With a small cap (a contributor's own review), review the files most likely to hold a defect and list the rest in `skipped`; with a large one, never skip a file. Subagents read and report; only you return findings, and only ones you have verified.
+**A big diff (over about 4,000 changed lines), in any mode,** is reviewed as a stack of slices with subagents, as the skill's "Working efficiently" says, when your turn cap is in the hundreds or more. With a small cap (a contributor's own review), review the files most likely to hold a defect and list the rest in `skipped`; with a large one, never skip a file. Subagents read and report; only you return findings, and only ones you have verified.
 
 Don't return again a finding that already has an inline comment, whether its thread is open or resolved, unless the code has since changed so that it applies again; report it in `prior_findings` instead. Don't return a point the author answered again: return it in `prior_findings`, as `moot` for a P3 whose reason holds and `disputed` for a P0–P2.
 
