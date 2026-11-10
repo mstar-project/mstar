@@ -239,6 +239,9 @@ class CacheFamily(NamedTuple):
     # the voice's cache in stream order, ``[layers, rows, H, L, 2d]``
     source: Callable[[Token2WavVoice], torch.Tensor]
     reverse_step_order: bool = False
+    # whether its attention has relative positions (the conformer's): a step's retained
+    # keys then have to fit the position table (``flow.band_fits``)
+    positional: bool = False
 
     def position(self, voice_tokens: int, written_tokens: int) -> tuple[int, int]:
         """``(source_len, written)`` once a request's windows have added ``written_tokens``
@@ -262,8 +265,8 @@ def _whole_stream(written: int) -> Callable[[int], SinkWindow]:
 
 def _families(enc1: Callable[[int], SinkWindow], enc2: Callable[[int], SinkWindow]) -> dict[str, CacheFamily]:
     return {
-        "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, enc1, _enc1_source),
-        "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, enc2, _enc2_source),
+        "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, enc1, _enc1_source, positional=True),
+        "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, enc2, _enc2_source, positional=True),
         "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
                            _dit_source, reverse_step_order=True),
     }
