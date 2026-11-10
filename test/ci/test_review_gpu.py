@@ -381,11 +381,20 @@ class TestComment(unittest.TestCase):
             results = Path(temp, "lt/results")
             results.mkdir(parents=True)
             endless = b"x " * gpu_review.LINE_CAP * 4
-            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key plaintoken123\n")
-            gpu_review.redact({}, temp, s3="plaintoken123")
+            key = "ant/key+secret=="  # held only by the job, not in its environment; cut where it starts
+            split = b"y" * (gpu_review.LINE_CAP - 9) + b" " + key.encode() * 300
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key plaintoken123\n"
+                                                   + split + b"\n")
+            (results / "progress.log.redacted").mkdir()  # the box's, in the way of a fixed temporary name
+            gpu_review.redact({}, temp, s2=key, s3="plaintoken123")
             self.assertEqual((results / "progress.log").read_text(),
-                             "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n",
-                             "a stray byte would fail the step; a line of any length is read whole into memory")
+                             "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n"
+                             + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
+                             "a stray byte would fail the step; a line of any length is read whole into memory; "
+                             "a cut would show the start of a key")
+            with unittest.mock.patch.object(gpu_review.bot, "redact", side_effect=RuntimeError):
+                self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
+            self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
@@ -869,7 +878,7 @@ class TestEras(unittest.TestCase):
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
     def test_a_progress_read_survives_a_shrunk_log_a_bad_count_and_an_endless_line(self):
-        def show(log, seen, count=None, caps=True):
+        def show(log, seen, count=None, caps=True, exact=()):
             """show_progress on a box whose progress.log is `log` (its line count `count`, default wc's), with
             `head`'s caps kept or not; what it printed and the count it returned."""
             def ssh(argv, stdin):
@@ -879,7 +888,7 @@ class TestEras(unittest.TestCase):
                 return f"{log.count(chr(10)) if count is None else count} progress.log\n" + body
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
-                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen)),
+                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen, exact)),
                               {"gpu.py ssh": ssh})
             return printed.getvalue().splitlines(), out["n"]
 
@@ -894,12 +903,12 @@ class TestEras(unittest.TestCase):
         many = "".join(f"09:00 line {i}\n" for i in range(5000))
         self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
 
-        def rest(log, seen):
+        def rest(log, seen, exact=()):
             path = Path(tempfile.mkdtemp(), "progress.log")
             path.write_bytes(log if isinstance(log, bytes) else log.encode())
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
-                gpu_review.show_rest(path, seen)
+                gpu_review.show_rest(path, seen, exact)
             return printed.getvalue().splitlines()
         self.assertEqual(len(rest(many[:10000] + long, 0)), many[:10000].count("\n") + 1,
                          "once the box ends, what the polls didn't print would be lost, the last line too")
@@ -909,8 +918,8 @@ class TestEras(unittest.TestCase):
                          "a progress bar's \\r would split a line, and lines already printed would be printed again")
         self.assertEqual(rest("09:00 a\n", 5), ['"09:00 a"'], "a log rewritten shorter would print nothing")
         hf_token = "hf_" + "Q1w2E3r4T5y6U7i8O9p0" * 3
-        for cap, show_cut in ((gpu_review.LINE_CAP, lambda text: rest(text, 0)),
-                              (gpu_review.PROGRESS_CAP, lambda text: show(text, 0)[0])):
+        for cap, show_cut in ((gpu_review.LINE_CAP, lambda text, exact=(): rest(text, 0, exact)),
+                              (gpu_review.PROGRESS_CAP, lambda text, exact=(): show(text, 0, exact=exact)[0])):
             with self.subTest(cap=cap):  # a line cut at a cap, a token straddling the cut
                 cut = show_cut("sk-ant-" + "A" * (cap - 26) + " " + hf_token + "\n09:02 c\n")
                 self.assertNotIn("hf_", "".join(cut), "the start of a token the cut split would reach the log")
@@ -918,8 +927,7 @@ class TestEras(unittest.TestCase):
                     self.assertEqual(cut[-1], '"09:02 c"', "one long line would swallow the next")
                 exact = show_cut("x" * cap + "\n09:02 c\n")[0]
                 self.assertEqual(exact, '"' + "x" * 300 + '"', "a line exactly the cap long would be cut or lost")
-                with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y+secret=="}):
-                    cut = show_cut("sk-ant-" + "A" * (cap - 17) + " eras/k3y+secret==\n09:02 c\n")
+                cut = show_cut("sk-ant-" + "A" * (cap - 17) + " eras/k3y+secret==\n09:02 c\n", ["eras/k3y+secret=="])
                 self.assertNotIn("eras/", "".join(cut), "the start of an exact key the cut split would reach the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
