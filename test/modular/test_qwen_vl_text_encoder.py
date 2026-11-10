@@ -5,7 +5,9 @@ the encoder's own loader (the family's config reader, the key remap and the skip
 which must leave the vision tower and the unused layers on disk); the tapped hidden state
 must equal transformers' ``hidden_states[k]`` for a text-only prompt and for a prompt with
 two images: the family's vision tower (Qwen3-VL's with deepstack, Qwen2.5-VL's windowed one),
-whose tokens the encoder splices in and positions with the family's 3-D MRoPE layout.
+whose tokens the encoder splices in and positions with the family's 3-D MRoPE layout. The last
+layer's tap is the normed last hidden state, or with ``tie_last_hidden_states`` off the output
+before the final norm.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ if not hasattr(transformers, "Qwen3VLForConditionalGeneration"):
     pytest.skip("this transformers has no Qwen3-VL", allow_module_level=True)
 
 from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig, QwenHiddenStateEncoder  # noqa: E402
-from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens  # noqa: E402
+from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens, qwen3_vl_tokens  # noqa: E402
 from mstar.model.components.diffusion.qwen.weight_loading import (  # noqa: E402
     qkv_rules,
     remap_text_encoder_key,
@@ -31,11 +33,6 @@ from mstar.model.components.diffusion.weight_loading import (  # noqa: E402
     iter_transformers_component,
     load_native,
     materialize,
-)
-from mstar.model.components.qwen3_vit import (  # noqa: E402
-    vision_interpolation,
-    vision_position_ids,
-    vision_seq_lengths,
 )
 from mstar.model.components.qwen_vision import (  # noqa: E402
     VISION_ATTN,
@@ -60,6 +57,7 @@ class Family(NamedTuple):
     tower: callable          # (reference, checkpoint path, grids) -> (pixels -> VisionTokens)
     patch: int
     tap: int
+    tie: bool = True         # whether the last layer's tap is normed (HF's tie_last_hidden_states)
 
 
 def _save(model, path):
@@ -94,15 +92,10 @@ def _qwen2_5_vl(path):
 def _qwen3_tower(reference, path, grids):
     vision = QwenVisionModel(QwenVisionConfig.from_hf(path)).eval()
     vision.load_state_dict(reference.model.visual.state_dict())
+    frames = FrameSDPA()
     for block in vision.blocks:
-        block.attn.bind_resources({VISION_ATTN: FrameSDPA(vision_seq_lengths(grids))})
-
-    def encode(pixels):
-        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, 2)
-        merged, deepstack = vision(pixels, indices, weights, vision_position_ids(grids, 2))
-        return VisionTokens(grids, 2, merged, deepstack)
-
-    return encode
+        block.attn.bind_resources({VISION_ATTN: frames})
+    return lambda pixels: qwen3_vl_tokens(vision, frames, pixels, grids)
 
 
 def _qwen25_tower(reference, path, grids):
@@ -132,12 +125,15 @@ FAMILIES = {
     "qwen3_vl": Family(_qwen3_vl, QwenEncoderConfig.from_qwen3_vl, _qwen3_tower, patch=16, tap=3),
     # Qwen-Image's tap: the normed last hidden state
     "qwen2_5_vl": Family(_qwen2_5_vl, QwenEncoderConfig.from_qwen2_5_vl, _qwen25_tower, patch=4, tap=4),
+    # Qwen-Image-2.1's: the last layer's output before the final norm
+    "qwen3_vl_untied": Family(_qwen3_vl, QwenEncoderConfig.from_qwen3_vl, _qwen3_tower, patch=16, tap=4, tie=False),
 }
 
 
 def _encoder(path, family, fused_qkv):
     config = family.config(
         json.loads((path / "config.json").read_text()), hidden_state_layers=(family.tap,), fused_qkv=fused_qkv,
+        tie_last_hidden_states=family.tie,
     )
     assert config.num_hidden_layers == 4 and config.image_token_id == IMAGE
     with torch.device("meta"):
@@ -151,15 +147,21 @@ def _encoder(path, family, fused_qkv):
     return encoder
 
 
-def _reference_hidden(reference, tap, ids, **media):
+def _reference_hidden(reference, family, ids, **media):
     # transformers 5 positions the images in 3-D only when told which tokens are image tokens
     kwargs = dict(input_ids=ids[None], attention_mask=torch.ones_like(ids[None]), use_cache=False,
                   output_hidden_states=True, mm_token_type_ids=(ids == IMAGE).long()[None], **media)
+    # untied, as Qwen-Image-2.1's pipeline reads it: a hook returning the final norm's input
+    norm = reference.model.language_model.norm
+    handle = None if family.tie else norm.register_forward_hook(lambda module, args, output: args[0])
     try:
-        return reference.model(**kwargs).hidden_states[tap]
+        return reference.model(**kwargs).hidden_states[family.tap]
     except TypeError:  # a transformers without token types
         kwargs.pop("mm_token_type_ids", None)
-        return reference.model(**kwargs).hidden_states[tap]
+        return reference.model(**kwargs).hidden_states[family.tap]
+    finally:
+        if handle is not None:
+            handle.remove()
 
 
 @pytest.mark.parametrize("name", FAMILIES)
@@ -171,7 +173,7 @@ def test_tapped_hidden_state_matches_transformers(tmp_path, name, fused_qkv):
     ids = torch.randint(0, 240, (11,), generator=torch.Generator().manual_seed(1))
     with torch.no_grad():
         ours = encoder(ids[None], torch.ones_like(ids[None]))
-        theirs = _reference_hidden(reference, family.tap, ids)
+        theirs = _reference_hidden(reference, family, ids)
     torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-5)
 
 
@@ -193,7 +195,7 @@ def test_image_prompt_matches_transformers(tmp_path, name):
     ])
     pixels = torch.randn(sum(t * h * w for t, h, w in grids), 3 * 2 * family.patch**2, generator=g)
     with torch.no_grad():
-        theirs = _reference_hidden(reference, family.tap, ids, pixel_values=pixels, image_grid_thw=torch.tensor(grids))
+        theirs = _reference_hidden(reference, family, ids, pixel_values=pixels, image_grid_thw=torch.tensor(grids))
         ours = encoder(ids[None], torch.ones_like(ids[None]), images=tower(pixels))
     torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-5)
 
