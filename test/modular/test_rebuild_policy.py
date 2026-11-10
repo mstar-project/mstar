@@ -868,12 +868,13 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
 def test_the_vlm_scaffold_keeps_a_request_that_samples_a_pad_id_droppable():
     """The scaffold places a prompt's encoder rows by its layout, not by pad id, so a pad sampled into a rebuild
     row's tail takes no encoder row (`test_qwen3_5_video`), and no sample needs to make the request undroppable."""
+    from mstar.model.multimodal_decoder import MediaIntake
+
     model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
-    vars(model).update(
-        config=SimpleNamespace(max_position_embeddings=4096, hidden_size=2),
-        media=(SimpleNamespace(encoder=vision_encoder()),),
-    )
-    assert not model.rebuild_policies()[NODE].pad_ids
+    model.config = SimpleNamespace(max_position_embeddings=4096, hidden_size=2)
+    model.media = (MediaIntake("image", vision_encoder(), 0, None),)
+    policy = model.rebuild_policies()[NODE]
+    assert policy.walks == {"prefill_text", "prefill_vision"} and not policy.pad_ids
 
 
 @pytest.mark.parametrize("last, forgotten", [(VISION, True), (PREFILL, False)])
