@@ -383,6 +383,14 @@ Read by the ``mstar-server`` binary and its bridge
        (``api_server/served_models.py``, ``rust/server/src/served_models.rs``).
        Unset serves the base model alone. Not for deployments to set:
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
+   * - ``MSTAR_TRANSCRIPTION``
+     - unset
+     - What the Rust frontend's ``/v1/audio/transcriptions`` needs from the
+       served model, as JSON: the kwargs it declares, the deployment's
+       ``max_concurrent_requests``, the adapter's language tables, and the
+       pydantic version its error text cites. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``transcription_facts`` for a model
+       with a transcription surface, and drops an inherited value.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
