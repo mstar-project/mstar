@@ -32,6 +32,7 @@ from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.model.components.cached_prefix import CACHED, EagerPastCachedPrefix
 from mstar.model.glm5_next.components.attention import HOLE_KPE
 from mstar.model.glm5_next.config import (
     ATTN,
@@ -100,7 +101,7 @@ def _upload(stager: PinnedStager, values: list, device: torch.device) -> torch.T
     stager.copy_(out, values)
     return out
 
-class Glm5NextLLMSubmodule(ARNodeSubmodule):
+class Glm5NextLLMSubmodule(EagerPastCachedPrefix, ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
 
@@ -315,30 +316,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)
             # set by `split_inputs` when this prepare's probe finds a cached prefix
-            state.remove("cached")
+            state.remove(CACHED)
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
         return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
-
-    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
-        if start > 0:
-            # the prompt's first ``start`` tokens came from the prefix cache
-            self.request_state(fwd_info.rid_handle).add("cached", start)
-        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
-
-    def cg_key_info(self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None,
-                    **kwargs) -> str | None:
-        return self._cg_key(graph_walk, per_request_info)
-
-    def _cg_key(self, graph_walk: str, rids) -> str | None:
-        """Every capture's key (None), or for a dsa_long_context prefill with a request past a
-        cached prefix one no capture has: its rows see more keys than a bucket's capture holds
-        (DSA scores a captured prefill's rows within its bucket). Dense attention reads the
-        cached pages from a capture."""
-        if self.config.dsa_long_context and graph_walk == "prefill" and any(
-                rid in self.request_states and self.request_states[rid].get("cached") for rid in rids):
-            return "eager"
-        return None
 
     def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
         """MTP verifies by argmax: refuse what it would silently ignore."""
@@ -424,7 +405,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         keep, start = [1.0] * num_tokens, 0
         for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True):
             state = self.request_states.get(rid)
-            fresh = state is None or (state.get("context", 0) == 0 and not state.get("cached"))
+            fresh = state is None or (state.get("context", 0) == 0 and not state.get(CACHED))
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
@@ -854,8 +835,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # The step ran, so its tokens are the request's context now, a cached prefix's too.
         if inputs is not None:
             state = self.request_state(request_id)
-            state.add("context", state.get("context", 0) + state.get("cached", 0) + inputs.input_seq_len)
-            state.remove("cached")
+            state.add("context", state.get("context", 0) + state.get(CACHED, 0) + inputs.input_seq_len)
+            state.remove(CACHED)
         # the decode loop's text_inputs edge carries the emitted token; an MTP verify step set
         # it already, to the token after the accepted drafts
         if "new_token" not in outputs:

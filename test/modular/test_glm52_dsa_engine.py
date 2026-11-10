@@ -70,7 +70,6 @@ def test_cleanup_request_drops_per_request_state():
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
-    sub._prefix_hits = {"r0"}
     sub._mtp_emitted = {"r0": 7}
     sub._mtp_checked = {"r0": 7}
     sub._mtp_max_tokens = {"r0": 32}
@@ -80,7 +79,6 @@ def test_cleanup_request_drops_per_request_state():
 
     sub.request_state("r0").add("token_budget", 20)
     sub.cleanup_request("r0")
-    assert sub._prefix_hits == set()
     assert sub.request_states == {}
     assert sub._mtp_emitted == {}
     assert sub._mtp_max_tokens == {}
@@ -128,7 +126,6 @@ def _fake_step(starts, seq_len, tables):
 def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._prefix_hits = set()
     return sub
 
 

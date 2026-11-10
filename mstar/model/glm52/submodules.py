@@ -31,6 +31,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.dsa.paged import DSAContext
+from mstar.model.components.cached_prefix import EagerPastCachedPrefix
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -75,7 +76,7 @@ class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
                 and (self.max_step_tokens is None or step <= self.max_step_tokens)]
 
 
-class Glm52LLMSubmodule(ARNodeSubmodule):
+class Glm52LLMSubmodule(EagerPastCachedPrefix, ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
@@ -84,9 +85,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # dsa_long_context: handles whose prefill starts past a cached prefix; their step runs
-        # eager (_cg_key), since a bucket's capture scores only its own rows
-        self._prefix_hits: set[int] = set()
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -123,7 +121,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
 
     def cleanup_request(self, request_id: str):
-        self._prefix_hits.discard(request_id)
         self._mtp_emitted.pop(request_id, None)
         self._mtp_checked.pop(request_id, None)
         self._mtp_max_tokens.pop(request_id, None)
@@ -229,23 +226,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             steps=steps,
             cg_key_info=self._cg_key(graph_walk, request_ids),
         )
-
-    def cg_key_info(self, graph_walk: str, per_request_info: dict,
-                    per_request_input_metadata=None, **kwargs) -> str | None:
-        return self._cg_key(graph_walk, per_request_info)
-
-    def _cg_key(self, graph_walk: str, rids) -> str | None:
-        """Every capture's key (None), or for a prefill with a request past a cached prefix
-        one no capture has: its rows see more keys than its bucket's capture scores."""
-        if (self.config.dsa_long_context and graph_walk == "prefill"
-                and not self._prefix_hits.isdisjoint(rids)):
-            return "eager"
-        return None
-
-    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
-        if self.config.dsa_long_context and graph_walk == "prefill" and start > 0:
-            self._prefix_hits.add(fwd_info.rid_handle)
-        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
 
     # ── capture configs ──
 
@@ -441,8 +421,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         seq_lens = [inp.input_seq_len for inp in inputs]
         device = self.get_device()
         long_context = self.config.dsa_long_context
-        if long_context and graph_walk == "prefill":
-            self._prefix_hits.difference_update(request_ids)  # its step has been leased
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
         # engine path is on, where the cap is the serving window. The KV pool
