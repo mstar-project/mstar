@@ -152,6 +152,8 @@ class TestCarry(unittest.TestCase):
          [live_test("fail"), live_test("unavailable")], "ahead", full("targeted", "failed")),
         ("fail, then no verdict", True, "targeted", ["correctness"], [live_test("fail"), live_test("none")], "ahead",
          full("targeted", "failed")),
+        ("pass, then no valid verdict", True, "targeted", ["correctness"], [live_test("pass"), live_test("none")],
+         "ahead", full("targeted", "failed")),
         ("fail, then a verdict it doesn't know", True, "targeted", ["correctness"],
          [live_test("fail"), live_test("skipped")], "ahead", full("targeted", "failed")),
         ("pass on an ancestor, then unavailable", True, "targeted", ["correctness"],
@@ -176,8 +178,7 @@ class TestCarry(unittest.TestCase):
         fetch fails. files: the PR's changed files. review: more of the review's fields; threads: the PR's review
         threads."""
         routes = {"POST graphql": threads_page(*threads),
-                  f"GET repos/{R}/pulls/7": {"title": "T", "base": {"sha": "b" * 40, "repo": BASE_REPO}},
-                  f"GET repos/{R}/compare/{'b' * 40}...*": {"files": [{"filename": f} for f in files]},
+                  f"GET repos/{R}/pulls/7": {"title": "T", "base": {"repo": BASE_REPO}},
                   f"GET repos/{R}/compare/main...*": {"files": [{"filename": f} for f in files]},
                   f"GET repos/{R}/compare/*": {"status": status},
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
@@ -452,7 +453,8 @@ class TestStart(unittest.TestCase):
                       brief(7, "0123456789", "abcdef", "main", "targeted", kinds("performance,correctness")))
         forced = {"forced": "failed", "asked_checks": kinds("correctness")}
         self.assertIn("The review asked for `targeted` with correctness checks only; the workflow made it full, with "
-                      "both kinds of check, because the PR's last live test failed or was partial.",
+                      "both kinds of check, because the PR's last live test failed, was partial or left no valid "
+                      "verdict.",
                       brief(7, "0123456789", "abcdef", "main", "full", kinds("correctness,performance"),
                             asked="targeted", **forced),
                       "the session would plan a narrower run than the workflow chose")
@@ -487,6 +489,15 @@ class TestComment(unittest.TestCase):
             gpu_review.write_gallery(7, "0123456789", out, ["nvidia"], out / "site")
             gpu_review.render_comment("0123456789", out, ["nvidia"], media_url=media_url)
         return out, (out / "comment.md").read_text()
+
+    def test_a_box_file_that_isnt_utf8_is_still_redacted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp, "lt/nvidia/results")
+            results.mkdir(parents=True)
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n09:01 key plaintoken123\n")
+            gpu_review.redact({}, temp, s3="plaintoken123")
+            self.assertEqual((results / "progress.log").read_text(), "09:00 caf\ufffd\n09:01 key [REDACTED]\n",
+                             "one stray byte from the box would fail the step and lose the finished run")
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
@@ -1082,6 +1093,8 @@ class TestEras(unittest.TestCase):
         self.assertEqual(len(show(long, 0, final=True)[0]), 1, "the last line would be lost when the box ends")
         many = "".join(f"09:00 line {i}\n" for i in range(5000))
         self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
+        self.assertEqual(show(many[:3000] + "09:59 end", 0, final=True)[1], many[:3000].count("\n") + 1,
+                         "the final read would stop at 50 lines and lose the rest of the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",

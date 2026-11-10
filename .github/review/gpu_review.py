@@ -59,7 +59,7 @@ BOX_OUT = "/workspace/live-pr/out"
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
           "performance": "performance (throughput and latency A/Bs)"}
 # Why carry made a run full that the review asked to narrow, as the brief says it.
-FORCED = {"failed": "the PR's last live test failed or was partial",
+FORCED = {"failed": "the PR's last live test failed, was partial or left no valid verdict",
           "vendors": "the PR's last passing live test didn't run on every GPU vendor this one needs"}
 MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MODEL, CLAUDE = "claude-opus-5-5", "stable"  # the box's session: its model, and Claude Code's release
@@ -214,7 +214,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     the brief), and on which vendors' GPUs (`vendors`, bot.vendors_for). Nothing runs while the review left
     something to fix first (to_fix_first): `gated`, with the reasons in $RUNNER_TEMP/gate.txt, never in the
     outputs, since they hold model text. Otherwise the call stands unless the PR's last conclusive live test
-    (bot.last_live_test: an unavailable run, or one with no verdict, says nothing) failed or was partial, or
+    (bot.last_live_test: an unavailable run says nothing) failed, was partial or left no valid verdict, or
     passed on fewer GPU vendors than this run needs; then the run is full, with every kind of check, whatever
     the review asked for, so a failure is never hidden behind a narrower run. With no conclusive earlier live
     test, the call stands. A re-review (`rereview`) naming something `untestable` is left alone (but for what an
@@ -238,7 +238,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     passed = bot.passed_on_ancestor(REPO, last, head_sha)
     covered = passed and set(vendors) <= set(last["vendors"])  # that pass ran on every vendor this run needs
     forced = None if rereview and beyond_vendors(live.get("untestable"), vendors) \
-        else "failed" if last and last["verdict"] in ("fail", "partial") else "vendors" if passed and not covered \
+        else "failed" if last and last["verdict"] != "pass" else "vendors" if passed and not covered \
         else None
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
@@ -309,11 +309,12 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   outcome, writing the report. The workflow's log shows them while you run.
 - Test what this change needs and nothing more: its claims and the risks its diff creates. For a perf
   claim, measure the cells the PR claims, adding boots or rounds only when a delta sits within the
-  noise, and a control arm only when a claim needs one. Test the PR's head against its base: this
+  noise, and a main-arm perf baseline only when the claim is relative to main (the skill's same-code
+  control for an output-diff conclusion stays). Test the PR's head against its base: this
   overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
   on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
   Never run what CI already runs (its CPU tests, lint, type checks): run only what needs a GPU or
-  what CI can't run.
+  what CI can't run, and always the test files the PR adds or changes that skip without CUDA.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
   change needs; about two hours once compile caches are warm (compiling doesn't count) is the most a
@@ -569,12 +570,13 @@ PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
 def show_progress(box, seen, label, final=False):
-    """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the job's
-    log; the new count. Whole lines, at most 50 a poll, and on the `final` read the last line too; a line longer
-    than the read's cap counts as one, cut, once wc counts it. Each is redacted with the exact secrets the
-    redact step uses, then cut and quoted, since the session wrote them. A file that got shorter is read once
-    more, from its start. The box caps the read (a FIFO or a huge line can't hold it), and what is printed is
-    capped again here; a read that fails, times out or gives no line count changes nothing."""
+    """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the
+    job's log; the new count. Whole lines, at most 50 a read; the `final` read reads on until nothing new comes
+    (20 reads at most), the last line too. A line longer than the read's cap counts as one, cut, once wc counts
+    it. Each is redacted with the exact secrets the redact step uses and the credential patterns, then cut and
+    quoted, since the session wrote them. A file that got shorter is read once more, from its start. The box caps
+    the read (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails,
+    times out or gives no line count changes nothing."""
     key = (box / "instance").read_text().strip()
     log = f"{BOX_OUT}/progress.log"
 
@@ -587,25 +589,31 @@ def show_progress(box, seen, label, final=False):
             return None
         return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
 
-    got = read(seen)
-    if got and got[0] < seen:  # rewritten shorter
-        seen, got = 0, read(0)
-    if got is None:
-        return seen
-    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
-    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
-    # ssh call captured, which isn't streamed: the PR's author is trusted.
-    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
-    # The last piece is a line still being written, or nothing. It is shown on the final read, and when it is one
-    # line past the cap that wc already counts (so a line still being written isn't shown at every poll).
-    whole = len(lines) == 1 and len(raw) >= PROGRESS_CAP and total > seen
-    if not lines[-1] or not (final or whole):
-        lines = lines[:-1]
-    lines = lines[:50]
+    # The review's own key, which a DigitalOcean box holds, and the cloud keys.
     exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
-    for line in lines:
-        print(label + bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
-    return seen + len(lines)
+    for _ in range(20 if final else 1):
+        got = read(seen)
+        if got and got[0] < seen:  # rewritten shorter
+            seen, got = 0, read(0)
+        if got is None:
+            return seen
+        total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+        # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+        # ssh call captured, which isn't streamed: the PR's author is trusted.
+        lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+        # The last piece is a line still being written, or nothing. It is shown on the final read (it ends the
+        # file, so nothing follows it), and when it is one line past the cap that wc already counts (so a line
+        # still being written isn't shown at every poll).
+        tail = lines.pop()
+        whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
+        unended = bool(tail) and final and not whole and len(lines) < 50
+        lines = [*lines, *([tail] if tail and (whole or unended) else [])][:50]
+        for line in lines:
+            print(label + bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
+        seen += len(lines)
+        if not lines or unended:
+            break
+    return seen
 
 
 def wait(out, runner_temp):
@@ -1031,8 +1039,8 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
     exact = (s2, s3, s4)
     for box in boxes(Path(runner_temp, "lt")):
         for f in (box / "results/report.md", box / "results/progress.log", box / "unavailable.md"):
-            if f.is_file():
-                f.write_text(bot.redact(f.read_text(), exact=exact))
+            if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
+                f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
         result, fields = box / "results/result.json", {}
         if result.is_file():  # the box wrote this: unreadable counts as no verdict
             try:
