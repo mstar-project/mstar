@@ -29,6 +29,7 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Block,
     Causal,
     CausalConv,
     Entry,
@@ -42,7 +43,7 @@ from mstar.engine.state import (
 )
 from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, StateSetup, build_specs, node_resources
 from mstar.engine.state.contract import Mask, Op
-from mstar.model.base import Model, enabled_resources
+from mstar.model.base import Model, enabled_resources, serving_resources
 from mstar.validation import DeploymentError
 
 _SPLIT = CombinedSplit("mixed", prefill_walks=("prefill",))
@@ -533,6 +534,55 @@ def test_validate_deployment_reports_a_refusal_at_construction_with_the_rest(tmp
 def test_validate_deployment_reports_no_layout_yet_with_the_rest(tmp_path):
     problems = _validation_problems(_Declaring(_kv(reads={"attn": _read(op=None)})), tmp_path)
     assert len(problems) == 1 and "Array 'kv': no layout yet" in problems[0], problems
+
+
+def _tokens(packed: bool) -> Array:
+    return Array("tokens", nodes={"llm"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=0,
+                 reads={"tokens_attn": Read(mask=Block(), op=Attend(q_heads=2), packed=packed)})
+
+
+_ON_SDPA = {"tokens_attn": {"backend": "sdpa"}}
+
+
+def test_validate_deployment_refuses_sdpa_on_a_read_of_packed_queries(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources=_ON_SDPA)
+    (problem,) = problems
+    assert "reads['tokens_attn'] runs SDPA, which can't tell one segment" in problem, "a worker would bind it and fail"
+
+
+def test_validate_deployment_takes_sdpa_on_a_read_of_rows(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, resources=_ON_SDPA)
+    assert problems == [], "the block chose a binding, which builds no spec for it to name"
+
+
+def test_validate_deployment_reports_a_refused_sdpa_block_with_the_rest_of_the_block_checks(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources={**_ON_SDPA, "nope": {}})
+    assert len(problems) == 2 and "runs SDPA, which can't tell" in problems[0] and "['nope']" in problems[1], (
+        "a refused binding would hide the deployment's other problems"
+    )
+
+
+def test_a_worker_builds_no_spec_for_a_resource_on_sdpa():
+    assert serving_resources(_Declaring(_tokens(False)), {"resources": _ON_SDPA}) == [], (
+        "the overrides would name a resource SDPA doesn't build"
+    )
+
+
+def test_validate_deployment_refuses_attention_backend_on_a_node_group_naming_the_new_key(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups)
+    assert problems == [
+        "node_groups[0].attention_backend: the backend is a resource's setting, as "
+        "`resources: {<the read's resource key>: {backend: sdpa}}`",
+    ], "a config that asks for SDPA there would run the ragged kernel"
+
+
+def test_a_config_half_moved_to_the_new_key_gets_one_problem(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups, resources=_ON_SDPA)
+    assert len(problems) == 1 and problems[0].startswith("node_groups[0].attention_backend"), (
+        "the backend block it already moved would be refused too"
+    )
 
 
 def test_validate_deployment_labels_a_declaration_it_cannot_read(tmp_path):

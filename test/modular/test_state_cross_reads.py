@@ -16,12 +16,14 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
 )
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
 from mstar.engine.state.adapters import (
@@ -39,6 +41,9 @@ from mstar.engine.state.analysis import deployment_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
 from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.testing_utils.model import StubModel
+from mstar.worker import engine_manager
+from mstar.worker.engine_manager import EngineManager
 
 HEADS, DIM = 4, 8
 
@@ -209,6 +214,22 @@ def test_a_seq_sharded_value_is_refused_by_name():
                     seq_sharded=True)
     with pytest.raises(ValueError, match="Array 'v': no layout yet"):
         build_specs([sharded])
+
+
+def test_each_side_resolves_the_arrays_sharing_a_resource_once(monkeypatch):
+    read, reads = adapters._within_step_read, []
+
+    def counted(array, *rest):
+        reads.append(array.name)
+        return read(array, *rest)
+
+    monkeypatch.setattr(adapters, "_within_step_read", counted)
+    arrays = _av()
+    resources = {spec.resource_key: _StubRagged() for spec in build_specs(arrays)}
+    assert sorted(reads) == sorted(array.name for array in arrays), "the specs resolved an array once per array"
+    reads.clear()
+    node_handles(_Model(*arrays), "dit", resources)
+    assert sorted(reads) == sorted(array.name for array in arrays), "the handles resolved the arrays again per array"
 
 
 # The steps, per rank
@@ -400,7 +421,41 @@ def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
     assert callables[0] is callables[1], "Dynamo would retrace ulysses_attention's frame once per layer"
 
 
+def test_a_step_none_of_whose_builders_has_anything_to_do_is_skipped():
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
+    for group, skipped in ((None, True), (_StubGroup(), False)):
+        handles = _handles([_array("a", sharded=True)], group=group, setup=_on_sdpa("a_read"))
+        builder = WITHIN_STEP.step_builder()
+        builder.add(handles["a"], step.state["a"], step)
+        assert builder.steps() == {}, "a read on SDPA plans nothing"
+        assert (state_steps(step, handles) is None) is skipped, "only a Ulysses exchange needs the step's segments"
+
+
+def test_a_read_declared_packed_false_refuses_packed_queries():
+    h = _within(_array("a", label="main"), _StubRagged())
+    _opened(h, [Segment(1, "main", 4)])
+    h.add(0, k=_q()[0], v=_q()[0])
+    with pytest.raises(ValueError, match="Array 'a': packed queries on a read declared packed=False"):
+        h.read(0, _q()[0])
+
+
 # backend: sdpa
+
+
+def test_a_worker_gives_its_specs_and_its_engine_one_choice_object(monkeypatch):
+    seen = []
+    serving = engine_manager.serving_resources
+    monkeypatch.setattr(engine_manager, "serving_resources",
+                        lambda model, config, setup: seen.append(setup) or serving(model, config, setup))
+    manager = EngineManager.build(
+        node_names=set(), device=torch.device("cpu"), model_config={"node_groups": []},
+        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        transfer_engine_info=TransferEngineInfo(my_entity_id="test", my_session_id="test", transfer_engine=None),
+        model=StubModel(), graph_runtime=SimpleNamespace(),
+    )
+    assert seen == [manager.engine._state_setup] and seen[0] is manager.engine._state_setup, (
+        "the specs and the handles would bind by two choices, and the engine would open requests in another store"
+    )
 
 
 def test_a_resource_on_sdpa_builds_no_spec():

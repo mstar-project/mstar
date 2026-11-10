@@ -19,12 +19,14 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
 from mstar.engine.state.adapters import (
+    HOST_VALUE,
     StateSetup,
     build_handle,
     build_specs,
     kv_layouts,
     node_handles,
     state_steps,
+    storage_of,
 )
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.host_fields import HostFields, is_host_value
@@ -67,6 +69,14 @@ def test_a_value_of_host_fields_builds_no_spec_and_no_step():
     assert build_specs([_flags()]) == []
     step = _step(_handle(), host={(RID, "main", 0): {"sent": True}})
     assert step.steps == {}, "no resource holds a host field"
+
+
+def test_a_value_of_host_fields_only_has_its_own_storage_whose_handle_refuses_a_read_by_name():
+    assert storage_of(_flags()) is HOST_VALUE, "a Value with no tensor has no pool to hold"
+    step = _step(_handle())
+    assert step.steps == {} and len(step.state_handles) == 1, "the step runs, to commit the writes, with no resource"
+    with pytest.raises(ValueError, match="Array 'flags': no layout yet: read on a HostValueHandle"):
+        step.state_handles[0].read(0, torch.zeros(1))
 
 
 def test_a_value_of_host_fields_has_no_layout():
