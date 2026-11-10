@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 # ``after``, the text that opens the constrained part (a reasoning model's think-end tag).
 STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
+# a grammar compiles while its request waits for admission, so its size is bounded
+MAX_GRAMMAR_CHARS = 1 << 17
 
 
 def _xgr():
@@ -126,6 +128,8 @@ def grammar_request(value: Any) -> GrammarRequest | None:
         raw = json.dumps(raw)
     elif not isinstance(raw, str):
         raise ValueError(f"structured_outputs {kind} must be a string")
+    if len(raw) > MAX_GRAMMAR_CHARS:
+        raise ValueError(f"structured_outputs {kind} is {len(raw)} characters; at most {MAX_GRAMMAR_CHARS} are served")
     after = value.get("after")
     if after is not None and (not isinstance(after, str) or not after):
         raise ValueError("structured_outputs after must be a non-empty string")
@@ -155,12 +159,13 @@ def response_format_request(response_format: Any) -> dict | None:
 
 
 class _Row:
-    """One request's matcher, compiled in the background, and ``error``: why
-    the row can no longer be served, which fails its request at its next admit."""
-    __slots__ = ("_compiled", "_matcher", "error")
+    """One request's matcher, compiled in the background while admission holds
+    the request back, and ``error``: why the row can no longer be served, which
+    fails its request at its next admit."""
+    __slots__ = ("compiled", "_matcher", "error")
 
     def __init__(self, compiled: Future):
-        self._compiled = compiled
+        self.compiled = compiled
         self._matcher = None
         self.error: str | None = None
 
@@ -168,11 +173,11 @@ class _Row:
     def matcher(self):
         """None once the row failed; the first use waits for the compile."""
         if self._matcher is None and self.error is None:
-            failed = self._compiled.exception()
+            failed = self.compiled.exception()
             if failed is not None:
                 self.error = f"structured_outputs grammar failed to compile: {failed}"
             else:
-                self._matcher = _xgr().GrammarMatcher(self._compiled.result())
+                self._matcher = _xgr().GrammarMatcher(self.compiled.result())
         return None if self.error is not None else self._matcher
 
     @property
@@ -230,6 +235,11 @@ class GrammarRows:
 
     def remove(self, rid) -> None:
         self._rows.pop(rid, None)
+
+    def compiling(self, rid) -> Future | None:
+        """``rid``'s compile, while it runs."""
+        row = self._rows.get(rid)
+        return None if row is None or row.compiled.done() else row.compiled
 
     def failures(self, rids) -> dict:
         """Why each of ``rids`` that can no longer be served can't, by rid."""

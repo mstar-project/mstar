@@ -743,7 +743,8 @@ reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar``
 (EBNF), as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds
 that text, so a reasoning model thinks freely first. An unsupported schema is a 400, and
-so is a request on a deployment without ``enable_grammar``. The captured sampler then applies
+so is a request on a deployment without ``enable_grammar`` or a grammar over 131072
+characters. The grammar compiles in the background while admission holds its request back. The captured sampler then applies
 a bitmask every step, and a step holding a constrained row waits for its rows' last draws to
 reach the host before it launches. A grammar that fails to compile, or refuses a drawn token,
 fails its request with an error rather than letting the reply go unconstrained. Not served with

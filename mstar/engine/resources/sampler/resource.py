@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import asdict
 
 import torch
@@ -415,25 +416,37 @@ class SamplerResource(Resource):
     # captured graphs index, of which there are `sampler_slots`. A request takes
     # it before its first step and holds it until it is removed, which waits for
     # the steps still running it, so a row is never handed on while one of them
-    # can still write it.
+    # can still write it. A constrained request also waits for its grammar to
+    # compile: its first draw needs the mask, and a step waiting for the compile
+    # would hold every row on the worker. Above one rank no rank asks, and the
+    # first step waits for the compile instead.
 
     def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
         bufs = self._cg_buffers
+        row = bufs is not None and bufs.ingraph_scatter and not bufs.has_slot(rid)
+        compiling = self._decides and self._grammar is not None and self._grammar.compiling(rid) is not None
+        return ASKS if row or compiling else None
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | Future | None:
+        compiling = None if self._grammar is None else self._grammar.compiling(rid)
+        if compiling is not None:
+            return compiling
+        bufs = self._cg_buffers
         if bufs is None or not bufs.ingraph_scatter or bufs.has_slot(rid):
             return None
-        return ASKS
-
-    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
-        room = self._cg_buffers.free_rows
+        room = bufs.free_rows
         if room <= 0:
             return room
-        self._cg_buffers.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
+        bufs.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
         return None
 
     def unreserve(self, rid: str) -> None:
-        self._cg_buffers.unregister_request(rid)
+        if self._cg_buffers is not None and self._cg_buffers.ingraph_scatter:
+            self._cg_buffers.unregister_request(rid)
 
-    def grew_since(self, mark: int) -> bool:
+    def grew_since(self, mark: int | Future) -> bool:
+        if isinstance(mark, Future):
+            return mark.done()
         return self._cg_buffers.free_rows > mark
 
     def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:

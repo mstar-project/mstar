@@ -4,6 +4,7 @@ is untouched, ``after`` starts the grammar at a text, and the request field is
 checked where the conductor builds the sampler config."""
 
 import json
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +14,10 @@ pytest.importorskip("xgrammar")
 
 from mstar.api_server.openai.adapters import _constrain_after_thinking, _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.engine.resources.admission import Admission  # noqa: E402
 from mstar.engine.resources.sampler import utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
-from mstar.engine.resources.sampler.grammar import GrammarRequest, grammar_request  # noqa: E402
+from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.engine.resources.step import SlotLease, StepContext  # noqa: E402
 
@@ -132,6 +134,22 @@ def test_a_replay_commits_the_draw_of_the_graph_it_replays():
     assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
 
 
+def test_a_constrained_request_starts_once_its_grammar_compiled():
+    """Admission holds it back meanwhile: a first step waiting for the compile
+    would hold every row on the worker."""
+    res = _resource(graph=False)
+    compiled = Future()
+    res._grammar._compile_pool = SimpleNamespace(submit=lambda fn, *args: compiled)
+    request = grammar_request({"choice": ["ab"]})
+    res.ingest_request(0, SamplingReqConfig(grammar=request))
+    admission = Admission({"sampler": res}, ["sampler"])
+
+    assert admission.admit(0, "LLM", "decode", None, ["sampler"]).queued
+    assert admission.admit_waiting(lambda rid, node: None) == []
+    compiled.set_result(request.compile(res._grammar._compiler))
+    assert admission.admit_waiting(lambda rid, node: None) == [("LLM", 0)]
+
+
 @pytest.mark.parametrize("failure", ["compile", "refused draw"])
 def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     """A grammar that fails to compile, or a draw it refuses, is the request's
@@ -179,6 +197,7 @@ def test_after_starts_the_grammar_once_the_reply_holds_its_text():
     ({"choice": []}, "non-empty list"),
     ({"grammar": "root ::= nothing_defined"}, "structured_outputs grammar"),
     ({"json_object": True, "after": ""}, "after must be"),
+    ({"regex": "a" * (MAX_GRAMMAR_CHARS + 1)}, "at most"),
 ])
 def test_a_bad_grammar_is_refused(value, error):
     with pytest.raises(ValueError, match=error):
