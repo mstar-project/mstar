@@ -117,6 +117,11 @@ class LLMSubmodule(ARNodeSubmodule):
             walk=frozenset({DECODE, DECODE_SPOKEN}), signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
 
+    def resident_walks(self) -> frozenset[str]:
+        # the decode preprocess reads only the token (RoPE comes off the position
+        # resource inside each layer), so the captured step can run off resident tables
+        return frozenset({DECODE, DECODE_SPOKEN})
+
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
         if graph_walk == DECODE_SPOKEN:
             return {SPEECH_IDS: self.device_loopback.buffer, self.device_loopback.signal: self.device_loopback.buffer}

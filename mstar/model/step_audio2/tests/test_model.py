@@ -713,3 +713,7 @@ def test_the_clients_text_leaves_out_speech_ids_and_special_tokens(tmp_path, tok
     assert detok.to_bytes(reply) == b"The Great Wall"
     assert b"".join(detok.token_bytes(t) for t in reply) == b"The Great Wall"
     assert set(model.text_output().stop_token_ids) == {EOT, TTS_END, ENDOFTEXT}
+
+
+def test_both_decodes_run_off_the_resident_tables():
+    assert an_llm().resident_walks() == {DECODE, DECODE_SPOKEN}
