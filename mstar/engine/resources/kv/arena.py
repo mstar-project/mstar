@@ -154,7 +154,7 @@ class _ListStreamPages(list):
 
     def assign(self, pages: Iterable[int]) -> None:
         self._arena.changes += 1
-        self[:] = pages
+        list.__setitem__(self, slice(None), pages)
 
     def clear(self) -> None:
         self._arena.changes += 1
@@ -167,6 +167,12 @@ class _ListStreamPages(list):
     def free(self) -> None:
         self.clear()
         self._arena._streams.pop(self.sid, None)
+
+    def _refused(self, *args, **kwargs):
+        raise TypeError("a stream's pages change only by extend, assign, clear and del, as a Rust stream's do")
+
+    # each would move the pages without moving the arena's change count
+    append = insert = pop = remove = sort = reverse = __setitem__ = __iadd__ = __imul__ = _refused
 
 
 class PythonPageArena:

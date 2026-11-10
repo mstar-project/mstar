@@ -216,3 +216,22 @@ def test_the_change_count_moves_with_every_owner_count_and_page_list_change(back
         before = arena.changes
         change()
         assert arena.changes > before, f"change {at} left the count where it was"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_stream_refuses_list_changes_the_change_count_doesnt_see(backend):
+    """Only extend, assign, clear and del move the arena's change count, and a Rust stream has nothing else, so the
+    Python one refuses the other list methods rather than change its pages unseen."""
+    arena = new_page_arena(8, backend)
+    stream = arena.new_stream()
+    stream.extend(arena.acquire(2))
+    changes = [
+        ("append", 0), ("insert", 0, 0), ("pop",), ("remove", stream[0]), ("sort",), ("reverse",),
+        ("__setitem__", 0, 0),
+    ]
+    for name, *args in changes:
+        with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+            getattr(stream, name)(*args)
+        assert stream.n == 2, f"{name} moved the pages"
+    with pytest.raises(TypeError):
+        stream += [0]
