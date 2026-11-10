@@ -33,7 +33,7 @@ import triton.language as tl
 
 from mstar.kernels import Impl, KernelOp, TableEntry, Target, Tolerance, register
 from mstar.kernels.registry import on_reset
-from mstar.utils.quant_fp8 import FP8_DTYPE
+from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
 from mstar.utils.situ import SiTU
 
 # ---------------------------------------------------------------------------
@@ -580,7 +580,8 @@ def act_and_mul_quant_fp8_kernel(
     if HAS_SWIGLU_CLAMP:
         gate = tl.minimum(gate, SWIGLU_LIMIT)
         up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-    activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
+    # SwiGLU / GeGLU only (no beta): act_and_mul_quant_fp8 launches a SiTU as the two kernels this one fuses
+    activated = _apply_activation(gate, ACTIVATION_TYPE, 1.0).to(in_dtype)
     y = (activated * up).to(in_dtype).to(tl.float32)
     y_s = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
     y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max).to(q_ptr.dtype.element_ty)
@@ -596,11 +597,16 @@ def act_and_mul_quant_fp8(
     eps: float = 1e-10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`act_and_mul_triton` then ``per_token_group_quant_fp8(_, group_size)`` in one
-    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``."""
+    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``. A SiTU
+    (its ``spec`` string) runs as those two launches."""
     assert gateup_output.is_contiguous() and gateup_output.dim() == 2
     M, two_inter = gateup_output.shape
     inter = two_inter // 2
     assert inter % group_size == 0, f"inter {inter} must be a multiple of group_size {group_size}"
+    if SiTU.parse(activation) is not None:
+        act = torch.empty((M, inter), dtype=gateup_output.dtype, device=gateup_output.device)
+        act_and_mul_triton(gateup_output, act, activation=activation, swiglu_limit=swiglu_limit)
+        return per_token_group_quant_fp8(act, group_size, eps)
     finfo = torch.finfo(FP8_DTYPE)
     q = torch.empty((M, inter), dtype=FP8_DTYPE, device=gateup_output.device)
     s = torch.empty((M, inter // group_size), dtype=torch.float32, device=gateup_output.device)
