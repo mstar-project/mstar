@@ -4,6 +4,7 @@ A call that touches state runs behind a graph break, so it is plain Python in ea
 on a replay, and its checks live in it.
 """
 
+from abc import abstractmethod
 from collections.abc import Mapping
 from typing import Any
 
@@ -11,21 +12,20 @@ import torch
 
 from mstar.engine.resources.step import StepHandle
 from mstar.engine.state.contract import (
-    EMPTY,
     FUSED_DRAW_MAX_VOCAB,
     Array,
     ArrayStep,
+    CausalConv,
     FusedDrawArgs,
     GatedDeltaNet,
-    Reached,
+    Op,
     Sampler,
-    is_value,
 )
-from mstar.engine.state.host import HostFields, is_host_value
 
 
 class ArrayHandle(StepHandle):
-    """A node's calls on one declared array that keeps entries, or on a Value.
+    """A node's calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
+    this class refuses the rest as having no layout yet.
 
     ``layer`` is always the model's layer id as declared: the int, or a 0-d int64 CPU tensor holding it. A compiled
     caller passes the tensor, so that its frame doesn't guard on the layer and one frame serves every layer. Each row's
@@ -33,45 +33,26 @@ class ArrayHandle(StepHandle):
     resources hold the step's plan.
     """
 
-    def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None,
-        host_fields: HostFields | None = None,
-    ):
+    # whether a step that lists the array has anything to do for it
+    needs_step = True
+
+    def __init__(self, array: Array, resources: Mapping[str, Any], positions_key: str | None):
         self.array = array
-        self.host_fields = host_fields
         # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
         self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
         self.label = "main"
-        self.reads = {key: resources[key] for key in array.reads}
-        self.first_read = next(iter(self.reads.values()), None)
         self.positions_key = positions_key
         self.positions = None if positions_key is None else resources[positions_key]
         rope = None if array.positions is None else array.positions.rope
         self.rope_dtype = None if rope is None else rope.dtype
 
         self._pool_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
-        self._attn = {
-            layer: self.reads[key]
-            for key, read in array.reads.items() for layer in read.layers or array.layers
-        }
-        self._kv = None if is_value(array) or not array.max_len else resources[array.name]
-        self._views = {} if self._kv is None else {
-            layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()
-        }
-        self._pool = resources[array.name] if is_value(array) and array.entry.tensors else None
-        self._linear = next(
-            (resources[key] for key, update in array.updates.items() if isinstance(update, GatedDeltaNet)), None,
-        )
-        self._blocks = {} if self._pool is None else {
-            field: {layer: self._pool.block(field, i) for layer, i in self._pool_layer.items()}
-            for field in array.entry.tensors
-        }
 
         # This step's calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
-        # `_updated` the update calls run, and `_written` the fields each layer's write set.
+        # and `_updated` the update calls run.
         self._open = False
         self._keep = True
         self._capturing = False
@@ -81,16 +62,15 @@ class ArrayHandle(StepHandle):
         self._scratch: set[int] = set()
         self._read: set[int] = set()
         self._updated: set[tuple[str, int]] = set()
-        self._written: dict[int, set[str]] = {}
-        # each layer's start state from `set_start`, in the pool's layout, fixed from the handle's first step on
-        self._start: dict[int, dict[str, torch.Tensor]] = {}
-        self._stepped = False
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Array {self.name!r}: {cause}")
 
     def _no_layout(self, missing: str) -> ValueError:
         return self._refusal(f"no layout yet: {missing}")
+
+    def _unsupported(self, call: str) -> ValueError:
+        return self._no_layout(f"{call} on a {type(self).__name__}")
 
     def _layer_id(self, layer: int | torch.Tensor) -> int:
         if not isinstance(layer, torch.Tensor):
@@ -105,7 +85,6 @@ class ArrayHandle(StepHandle):
         if self._open:
             raise self._refusal("a step began while another is open")
         self._open = True
-        self._stepped = True
         declared: ArrayStep = step.state[self.name]
         segments = declared.segments or step.segments
         if segments:
@@ -113,7 +92,7 @@ class ArrayHandle(StepHandle):
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
         self._capturing = step.ctx.capture
-        for calls in (self._kept, self._scratch, self._read, self._updated, self._written):
+        for calls in (self._kept, self._scratch, self._read, self._updated):
             calls.clear()
         # before the replay's return, since a captured step's writes reach this on a replay
         if declared.host:
@@ -132,47 +111,16 @@ class ArrayHandle(StepHandle):
         if self._kept and self._kept != self.array.layers:
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
-        if self._pool is not None and not self.array.updates:
-            self._check_written(step.state[self.name].segments or step.segments or ())
-
-    def _check_written(self, segments) -> None:
-        rows = [segment.request_id for segment in segments if segment.span >= 1]
-        if not rows:
-            return
-        for layer in sorted(self.array.layers):
-            unwritten = sorted(self.array.entry.tensors.keys() - self._written.get(layer, set()))
-            if unwritten:
-                raise self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, "
-                                    "and a Value with no update is written whole by the step's own write")
 
     def commit_step(self, step) -> None:
-        if self.host_fields is not None:
-            self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
+        """Nothing: the resources hold what a step keeps of the array."""
 
     def end_step(self, step) -> None:
         self._open = False
         self._held = self._held_layer = None
 
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
-        if self.host_fields is None:
-            raise self._refusal("a host write, and the array declares no host fields")
-        if not declared.keep:
-            raise self._refusal("a host write on a step that keeps nothing, which has no commit to apply it at")
-        for (row, label, layer), written in declared.host.items():
-            where = f"a host write on row {row}, label {label!r}, layer {layer}"
-            if not ctx.is_real_row(row):
-                raise self._refusal(f"{where}, and that row isn't one of the step's requests")
-            if label not in self.array.labels or layer not in self.array.layers:
-                raise self._refusal(f"{where}, and the array declares labels {sorted(self.array.labels)} and layers "
-                                    f"{sorted(self.array.layers)}")
-            if not self.host_fields.is_open(row):
-                raise self._refusal(f"{where}, and that request has no open fields")
-            for field, value in written.items():
-                kind = self.array.entry.host.get(field)
-                if kind is None:
-                    raise self._refusal(f"{where}: field {field!r} isn't declared, of {sorted(self.array.entry.host)}")
-                if not is_host_value(value, kind):
-                    raise self._refusal(f"{where}: field {field!r} takes {kind}, and got {value!r}")
+        raise self._refusal("a host write, and the array declares no host fields")
 
     def _check_step(self, declared: ArrayStep, segments, ctx) -> None:
         declared_labels = self.array.labels
@@ -186,24 +134,15 @@ class ArrayHandle(StepHandle):
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
-        if not declared.keep and self._pool is not None:
-            raise self._refusal("keep=False on a Value with tensor fields, whose entry has no saved copy to return to, "
-                                "until saved copies exist")
         if self.positions is None and (declared.advance is not None or declared.position_ids is not None):
             raise self._refusal("a step sets advance or position_ids, and the array declares no positions")
-        if self._kv is None and (declared.placeholders or declared.eager_add):
+        self._check_storage(declared, segments, ctx)
+
+    @abstractmethod
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        """Refuse what ``declared`` asks of this array's storage that it can't do."""
+        if declared.placeholders or declared.eager_add:
             raise self._refusal("a step sets placeholders or eager_add, and the array has no paged entries to add to")
-        if declared.forks and not self.array.max_len:
-            raise self._refusal("a step forks an array with max_len 0, which keeps nothing to fork")
-        # A capture's dummy rows open only the default label.
-        if self._kv is None or ctx.capture:
-            return
-        for segment in segments:
-            if (segment.request_id, segment.label) not in declared.placeholders and not self._kv.opens_label(
-                segment.request_id, segment.label,
-            ):
-                raise self._refusal(f"a step touches label {segment.label!r} of request {segment.request_id}, "
-                                    "which it didn't open")
 
     def _check_open(self, call: str) -> None:
         if not self._open:
@@ -217,8 +156,6 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"an add on layer {layer} after a read in the same layer")
         if layer in self._kept:
             raise self._refusal(f"an add on layer {layer} after its kept add")
-        if not self.array.max_len:
-            return
         if keep and not self._keep:
             raise self._refusal(f"keep=True on layer {layer} in a step with keep=False, whose commit keeps no add")
         (self._kept if self._keep and keep is not False else self._scratch).add(layer)
@@ -232,22 +169,12 @@ class ArrayHandle(StepHandle):
         self._read.add(layer)
 
     def _record_update(self, field: str, layer: int) -> None:
-        self._check_open(f"the update of {field}")
+        # not `_check_open`, whose message would be formatted on every update of every layer
+        if not self._open:
+            raise self._refusal(f"the update of {field} in a step that doesn't list the array")
         if (field, layer) in self._updated:
             raise self._refusal(f"a second update of {field} on layer {layer} in one step")
         self._updated.add((field, layer))
-
-    def block(self, field: str, layer: int) -> torch.Tensor:
-        """``layer``'s view of the entry field ``field``, for an update's op."""
-        blocks = self._blocks.get(field)
-        if blocks is None or layer not in blocks:
-            raise self._refusal(f"no field {field!r} on layer {layer}, of layers {sorted(self._pool_layer)}")
-        return blocks[layer]
-
-    def _holds(self, layer: int) -> bool:
-        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages."""
-        attn = self._attn.get(layer)
-        return attn is not None and not attn.requires_kv_write
 
     def _take_hold(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         held = self._held
@@ -256,117 +183,48 @@ class ArrayHandle(StepHandle):
         self._held = None
         return held
 
-    @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         """Append each row's span at its next log positions. A kept add happens once per layer per step, as the
         layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the next add or the end of the step.
         None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a step that keeps needs
         each layer to end on a kept add, and a step with ``keep`` False refuses ``keep=True``."""
-        layer = self._layer_id(layer)
-        self._record_add(layer, keep)
-        if self._holds(layer):
-            self._held, self._held_layer = (fields["k"], fields["v"]), layer
-            return
-        self._kv.write_kv(fields["k"], fields["v"], layer_idx=self._pool_layer[layer], label=self.label)
+        raise self._unsupported("add")
 
-    @torch.compiler.disable
-    def read(
-        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
-    ) -> torch.Tensor | Reached:
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
-        latest add, at the positions its mask reaches.
+        latest add, at the positions its mask reaches."""
+        raise self._unsupported("read")
 
-        A Value takes no ``q`` and returns its fields as `Reached`. A row with nothing written yet, with span 0 or that
-        pads the step reads the start `set_start` gave, zeros for a field it doesn't name.
-        """
-        if is_value(self.array):
-            return self._read_value(self._layer_id(layer), q, mask_args)
-        if q is None:
-            raise self._no_layout("a read with no op")
-        if mask_args:
-            raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
-        layer = self._layer_id(layer)
-        self._record_read(layer)
-        k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
-        return self._attn[layer].run(
-            q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
-        )
-
-    def _read_value(self, layer: int, q: torch.Tensor | None, mask_args: Mapping) -> Reached:
-        if self._pool is None:
-            raise self._refusal("read on a Value with no tensor fields; host() reads its host fields")
-        if q is not None or mask_args:
-            given = sorted({*mask_args, *(("q",) if q is not None else ())})
-            raise self._refusal(f"a Value's read takes no q and no keyword, and got {given}")
-        self._record_read(layer)
-        if layer in self._written or any(updated == layer for _, updated in self._updated):
-            raise self._refusal(f"a read of layer {layer} after its write or update in this step")
-        start = self._start.get(layer, EMPTY)
-        fields = {}
-        for field in self.array.entry.tensors:
-            read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
-            fields[field] = self._declared(field, read)
-        rows = next(iter(fields.values()))
-        return Reached(fields, row_offsets=torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device))
+    def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
+        """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
+        for a Value."""
+        if not self.array.rewritable:
+            raise self._refusal("write on an append-only array")
+        raise self._unsupported("write")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
         for each field it names, of one entry's shape on this rank, and zeros for the rest. The tensors are made at load
         and never written, since a captured read keeps their address."""
-        if self._pool is None:
-            raise self._refusal("set_start on an array that isn't a Value with tensor fields")
-        if self._stepped:
-            raise self._refusal("set_start after the handle's first step, whose captured reads keep the start "
-                                "they read")
-        undeclared = start.keys() - self.array.entry.tensors.keys()
-        if undeclared:
-            raise self._refusal(f"start names fields {sorted(undeclared)}, of {sorted(self.array.entry.tensors)}")
-        self._start = {
-            layer: {field: self._stored(field, layer, value, value.shape, "start") for field, value in start.items()}
-            for layer in self.array.layers
-        }
+        raise self._unsupported("set_start")
 
-    def _k_last(self, field: str) -> bool:
-        """Whether ``field`` is the state a declared `GatedDeltaNet` reads, stored K-last as `_state_block` lays it."""
-        return field == "state" and self._linear is not None
+    def block(self, field: str, layer: int) -> torch.Tensor:
+        """``layer``'s view of the entry field ``field``, for an update's op."""
+        raise self._unsupported("block")
 
-    def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
-        """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
-        block = self.block(field, layer)
-        expected = (*block.shape[1:-2], block.shape[-1], block.shape[-2]) if self._k_last(field) else block.shape[1:]
-        dtype = self.array.entry.tensors[field].dtype or block.dtype
-        if tuple(shape) != tuple(expected) or value.dtype != dtype:
-            raise self._refusal(f"{what} of field {field!r} on layer {layer} is {tuple(shape)} of {value.dtype}, and "
-                                f"the field is {tuple(expected)} of {dtype} on this rank")
-        return (value.transpose(-1, -2) if self._k_last(field) else value).to(block.dtype)
+    def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
+        raise self._unsupported("at_last_token")
 
-    def _declared(self, field: str, stored: torch.Tensor) -> torch.Tensor:
-        """``stored``, read from the pool, in ``field``'s declared layout and dtype."""
-        value = stored.transpose(-1, -2) if self._k_last(field) else stored
-        return value.to(self.array.entry.tensors[field].dtype or value.dtype)
+    def _kernel_setting(self, read: str, field: str) -> Any:
+        raise self._unsupported(f"kernel_setting of {read!r}")
 
-    @torch.compiler.disable
-    def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
-        """Set the step's rows' entries on a Value for later steps, at the step's commit.
+    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
+        """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the
+        field's view."""
+        raise self._unsupported(f"an update of type {kind.__name__}")
 
-        The rule is per row: with no update, each row at span 1 or more gets every field from the step's own write,
-        and a row at span 0 or that pads the step writes nowhere.
-        """
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
-        if at is not None:
-            raise self._no_layout("write at positions, on anything but a Value")
-        layer = self._layer_id(layer)
-        self._check_open("write")
-        written = self._written.setdefault(layer, set())
-        for field, value in fields.items():
-            if field in written:
-                raise self._refusal(f"a second write of field {field!r} on layer {layer} in one step")
-            if value.ndim == 0:
-                raise self._refusal(f"field {field!r} written with no row axis")
-            written.add(field)
-            stored = self._stored(field, layer, value, value.shape[1:], "write")
-            self._pool.scatter_(field, stored, self._pool_layer[layer], label=self.label)
+    def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
+        raise self._unsupported("host")
 
 
 class SamplerHandle(StepHandle):
@@ -415,10 +273,8 @@ def causal_conv(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    layer = h._layer_id(layer)
-    conv = h.block("conv", layer)
-    h._record_update("conv", layer)
-    return h._linear.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
+    run, conv = h._update(CausalConv, "conv", h._layer_id(layer))
+    return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
 @torch.compiler.disable
@@ -427,19 +283,13 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    layer = h._layer_id(layer)
-    state = h.block("state", layer)
-    h._record_update("state", layer)
-    return h._linear.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+    run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
+    return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
 
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:
     """One entry's host fields on the host, as the last committed step left them."""
-    layer = h._layer_id(layer)
-    fields = None if h.host_fields is None else h.host_fields.fields(request, h.name, label, layer)
-    if fields is None:
-        raise h._refusal(f"no host fields for request {request}, label {label!r}, layer {layer}")
-    return fields
+    return h._host(request, label, h._layer_id(layer))
 
 
 def position(h: ArrayHandle, rid_handle: int, label: str) -> int:
@@ -500,8 +350,7 @@ def drew(s: SamplerHandle, n: int) -> None:
 @torch.compiler.disable
 def at_last_token(h: ArrayHandle, x: torch.Tensor) -> torch.Tensor:
     """``x`` at each row's last token in this step, in row order."""
-    h._check_open("at_last_token")
-    return h.first_read.select_last_hidden(x, label=h.label)
+    return h.at_last_token(x)
 
 
 def last_sampled(s: SamplerHandle) -> torch.Tensor:
@@ -513,7 +362,4 @@ def last_sampled(s: SamplerHandle) -> torch.Tensor:
 
 def kernel_setting(h: ArrayHandle, read: str, field: str) -> Any:
     """The value of a `kernel_settings` field in effect, YAML included, until the engine picks kernels itself."""
-    resource = h.reads[read]
-    if resource is None:
-        raise h._refusal(f"no {field} for read {read!r}, which runs SDPA and has no kernel")
-    return getattr(resource, field)
+    return h._kernel_setting(read, field)

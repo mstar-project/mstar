@@ -104,8 +104,11 @@ def _state_op(fused, adds, writes, reads, mutates, formats, reference) -> StateO
 
 def bind_state_ops(handles: Mapping[str, Any]) -> None:
     """Cache on each array handle which ops run their fused kernel on its format, so a call reads a constant."""
+    # imported here, since the layer imports the model's components, and they import this package
+    from mstar.engine.state.adapters import PagedArrayHandle
+
     for handle in handles.values():
-        if isinstance(handle, ArrayHandle) and handle._kv is not None:
+        if isinstance(handle, PagedArrayHandle):
             handle.fused_ops = frozenset(name for name, op in STATE_OPS.items() if _addresses(op, handle))
 
 

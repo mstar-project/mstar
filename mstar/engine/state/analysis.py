@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
@@ -42,20 +42,6 @@ def state_declaration_problems(model: "Model") -> list[str]:
     for sampler in samplers:
         problems += _sampler_problems(sampler, nodes)
     return problems
-
-
-def sdpa_nodes(node_groups: Sequence[Mapping[str, object]]) -> frozenset[str]:
-    """The nodes whose node groups set ``attention_backend: sdpa``. A node listed by several groups, one per graph walk,
-    must get the same answer from each."""
-    asked: dict[str, str] = {}
-    for group in node_groups:
-        backend = group.get("attention_backend", "flashinfer")
-        if backend not in ("flashinfer", "sdpa"):
-            raise ValueError(f"attention_backend takes flashinfer or sdpa, not {backend!r}")
-        for node in group["node_names"]:
-            if asked.setdefault(node, backend) != backend:
-                raise ValueError(f"node {node!r} gets different attention_backend settings from two node_groups")
-    return frozenset(node for node, backend in asked.items() if backend == "sdpa")
 
 
 def position_key(array: Array) -> str:
@@ -101,9 +87,6 @@ def _array_problems(array: Array) -> list[str]:
         if None in llama31 and any(factor is not None for factor in llama31):
             problems.append(f"{where}.positions.rope: low_freq_factor, high_freq_factor and old_context_len are "
                             f"all set or all None, and they are {llama31}")
-    kinds = [type(update) for update in array.updates.values()]
-    for kind in sorted({kind for kind in kinds if kinds.count(kind) > 1}, key=lambda kind: kind.__name__):
-        problems.append(f"{where}.updates: it carries {kinds.count(kind)} updates of type {kind.__name__}")
     return problems
 
 
@@ -205,11 +188,10 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 
 def deployment_problems(
-    model: "Model", resources: Mapping[str, Mapping[str, object]], *, sdpa: Collection[str] = frozenset(),
-    head_shards: Mapping[str, int] = EMPTY,
+    model: "Model", resources: Mapping[str, Mapping[str, object]], *, head_shards: Mapping[str, int] = EMPTY,
 ) -> list[str]:
-    """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, ``sdpa``
-    of the nodes it names, and ``head_shards``, TP times SP per node above SP1, of a read sharded on both sides."""
+    """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, and
+    ``head_shards``, TP times SP per node above SP1, of a read sharded on both sides."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = [
@@ -219,17 +201,11 @@ def deployment_problems(
         if isinstance(declared, Sampler) and declared.draws > 1
         and resources.get(declared.name, {}).get("enable_logprobs")
     ]
-    reading = {node for array in arrays.values() if array.reads for node in array.nodes}
-    problems += [f"node {node!r}: attention_backend sdpa, and it holds no array with a read for SDPA to run"
-                 for node in sorted(set(sdpa) - reading)]
     for array in arrays.values():
         gated = any(isinstance(update, GatedDeltaNet) for update in array.updates.values())
         if is_value(array) and not gated and "state_dtype" in resources.get(array.name, {}):
             problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and only a Value with a "
                             "GatedDeltaNet picks a stored dtype")
-        if array.max_len and array.nodes & sdpa:
-            problems.append(f"Array {array.name!r}: attention_backend sdpa on nodes {sorted(array.nodes & sdpa)}, and "
-                            "its entries are kept between steps, so SDPA has no read of them")
         for key, read in array.reads.items():
             shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
             if array.seq_sharded and arrays.get(read.queries, array).seq_sharded and read.op.q_heads % shards:

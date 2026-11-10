@@ -147,8 +147,7 @@ class CodecDriver:
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.engine.resources.runner import StepRunner
         from mstar.engine.state import Entry, TensorType, Value
-        from mstar.engine.state.adapters import build_specs
-        from mstar.engine.state.calls import ArrayHandle
+        from mstar.engine.state.adapters import build_handle, build_specs
         from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_entry
 
         self.node = submodule
@@ -160,7 +159,7 @@ class CodecDriver:
         (spec,) = build_specs([array], kernel_settings={CODEC_STATE: {"max_slots": max_slots}})
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
-        self.handle = ArrayHandle(array, {CODEC_STATE: self.pool}, None)
+        self.handle = build_handle(array, {CODEC_STATE: self.pool})
         self.node.bind_node_state({CODEC_STATE: self.handle})
         self.added: set[str] = set()
 

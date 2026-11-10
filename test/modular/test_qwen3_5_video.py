@@ -508,7 +508,9 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
 
 def _encoder(max_segments: int):
     """A vision encoder bound to a ragged attention resource with this ceiling."""
-    from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+    from mstar.engine.state import Array, Attend, Block, KVEntry, Read
+    from mstar.engine.state.adapters import build_handle
+    from mstar.model.qwen3_5.config import VISION_ATTN, VISION_TOKENS, Qwen3_5VisionConfig
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     config = Qwen3_5VisionConfig(
@@ -517,7 +519,10 @@ def _encoder(max_segments: int):
         num_position_embeddings=16, out_hidden_size=64,
     )
     encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, "vision_embeds", (torch.zeros(1), torch.ones(1)))
-    encoder.vision = SimpleNamespace(reads={VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)})
+    array = Array(VISION_TOKENS, nodes={"vision_encoder"}, layers={0}, entry=KVEntry(heads=2, head_dim=16), max_len=0,
+                  reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=2))})
+    ragged = SimpleNamespace(max_segments_per_step=max_segments, run=lambda *args, **kwargs: None)
+    encoder.vision = build_handle(array, {VISION_ATTN: ragged})
     return encoder
 
 

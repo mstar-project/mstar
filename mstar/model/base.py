@@ -137,6 +137,7 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
     from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state.adapters import StateSetup
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -531,19 +532,19 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
     (``mstar.engine.resources.lora.serving``). Raises the first problem with the declaration,
     for callers that skip ``validate_deployment``, which reports them all."""
     from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
     from mstar.engine.state.adapters import node_resources
-    from mstar.engine.state.analysis import sdpa_nodes, state_declaration_problems
+    from mstar.engine.state.analysis import state_declaration_problems
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
-    specs = node_resources(model, sdpa_nodes=sdpa_nodes(model_config.get("node_groups") or ()))
+    specs = node_resources(model, setup=setup)
     lora = declared_lora_specs(model, model_config)
     size_lora_specs(lora, model_config)
     return specs + lora
@@ -568,7 +569,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``enabled_resources``, the YAML's
     ``resources:`` overrides applied, as ``built_resources``.
 
@@ -577,9 +591,10 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     steps, reporting every problem rather than the first.
     """
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return built_resources(specs)
 
 

@@ -26,9 +26,9 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import host
-from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs, state_steps
+from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, sampling_configs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.host_fields import HostFields
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.norm import RMSNorm
@@ -185,7 +185,7 @@ class _StubResource:
 
 def _handles(model, node, fields=None):
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
-    return node_handles(model, node, resources, host_fields=fields or HostFields())
+    return node_handles(model, node, resources, setup=StateSetup(host_fields=fields or HostFields()))
 
 
 def _thinker(model=None) -> ThinkerSubmodule:
@@ -327,7 +327,7 @@ def test_the_vision_capture_check_reads_the_ceiling_in_effect():
     sub = VisionEncoderSubmodule(None, model.config)
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
     resources[VISION_ATTN].max_segments_per_step = 2
-    sub.bind_node_state(node_handles(model, "vision_encoder", resources, host_fields=HostFields()))
+    sub.bind_node_state(node_handles(model, "vision_encoder", resources))
     frames = [SimpleNamespace(input_seq_len=4 * n, resource_step_info={"main": (4,) * n}) for n in (2, 3)]
     assert sub._fits_capture(frames[:1]) and not sub._fits_capture(frames[1:]), "a YAML override must still hold"
 

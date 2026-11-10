@@ -37,9 +37,8 @@ from mstar.engine.state import (
     TensorType,
     Value,
 )
-from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.adapters import build_handle, state_steps
 from mstar.engine.state.calls import ArrayHandle
-from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components import Attention
 from mstar.model.components.decoder_layer import DecoderLayer, eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed.attention import ParallelAttention
@@ -100,7 +99,7 @@ def _kv_handle(positions=None) -> ArrayHandle:
         positions=positions,
     )
     resources = {"kv": _StubKV(), "attn": _StubAttn(), "rope": _StubPositions()}
-    return ArrayHandle(array, resources, None if positions is None else "rope")
+    return build_handle(array, resources)
 
 
 def _attention(pos_key="rope", cls=Attention, **kwargs):
@@ -192,7 +191,7 @@ def _gdn_handle() -> ArrayHandle:
     })
     array = Value("gdn", nodes={"LLM"}, layers={1, 2}, entry=entry,
                   updates={"conv": CausalConv(), "linear": GatedDeltaNet()})
-    return ArrayHandle(array, {"gdn": _StubPool(), "conv": None, "linear": _StubLinear()}, None)
+    return build_handle(array, {"gdn": _StubPool(), "conv": None, "linear": _StubLinear()})
 
 
 def test_a_delta_net_with_a_handle_runs_both_updates_under_its_own_id():
@@ -201,7 +200,7 @@ def test_a_delta_net_with_a_handle_runs_both_updates_under_its_own_id():
     layer.bind_state({"gdn": h})
     _begin(h)
     out = layer(torch.randn(TOKENS, HIDDEN))
-    assert h._linear.calls == ["conv", "delta"] and out.shape == (TOKENS, HIDDEN)
+    assert h._runners[GatedDeltaNet].calls == ["conv", "delta"] and out.shape == (TOKENS, HIDDEN)
     assert h._updated == {("conv", 2), ("state", 2)}
 
 
@@ -228,7 +227,7 @@ class _StubRagged:
 def _vision_handle() -> ArrayHandle:
     array = Array("tokens", nodes={"vit"}, layers={0, 1}, entry=KVEntry(heads=2, head_dim=8), max_len=0,
                   reads={"vision": Read(mask=Block(), op=Attend(q_heads=2))})
-    return WithinStepHandle(array, {"vision": _StubRagged()}, None)
+    return build_handle(array, {"vision": _StubRagged()})
 
 
 def _vision_inputs():

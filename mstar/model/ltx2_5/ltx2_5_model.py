@@ -208,7 +208,7 @@ class LTX25Model(Model):
             return Array(
                 name, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=dit_entry(heads, head_dim),
                 labels={label}, max_len=0, seq_sharded=sharded,
-                reads={read: Read(mask=Block(), op=Attend(q_heads=heads), queries=queries)},
+                reads={read: Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=False)},
             )
 
         video = (t.num_attention_heads, t.attention_head_dim)

@@ -1791,8 +1791,7 @@ class _CodecDriver:
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.engine.resources.runner import StepRunner
         from mstar.engine.state import Value
-        from mstar.engine.state.adapters import build_specs
-        from mstar.engine.state.calls import ArrayHandle
+        from mstar.engine.state.adapters import build_handle, build_specs
         from mstar.model.qwen3_tts.components.incremental_codec import codec_state_entry
 
         self.node = submodule
@@ -1801,7 +1800,7 @@ class _CodecDriver:
         (spec,) = build_specs([array], kernel_settings={CODEC_STATE: {"max_slots": max_slots}})
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
-        self.node.bind_node_state({CODEC_STATE: ArrayHandle(array, {CODEC_STATE: self.pool}, None)})
+        self.node.bind_node_state({CODEC_STATE: build_handle(array, {CODEC_STATE: self.pool})})
         self.streams: set[str] = set()
 
     def remove(self, rid: str) -> None:

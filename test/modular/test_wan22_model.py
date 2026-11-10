@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
@@ -116,7 +116,8 @@ def test_wan22_declares_only_dit_attention_resources():
     specs = node_resources(model)
     assert [spec.resource_key for spec in specs] == [SELF_ATTN]
     assert all(spec.nodes == {"dit"} for spec in specs)
-    assert node_resources(model, sdpa_nodes={"dit"}) == []
+    setup, _ = state_setup({"resources": {SELF_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    assert node_resources(model, setup=setup) == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
 
 

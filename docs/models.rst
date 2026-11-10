@@ -1702,7 +1702,7 @@ resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
-(``attention_backend: sdpa`` on the ``dit`` node group restores the reference kernel; the
+(``backend: sdpa`` on the ``dit_self_attn`` resource restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
@@ -1812,7 +1812,7 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 (multipart ``image`` + ``prompt``; up to four reference images are concatenated as
 conditioning tokens, in order).
 
-``attention_backend: sdpa`` on the ``dit`` node group, as the shipped configs set it, runs the
+``backend: sdpa`` on the ``dit_attn`` resource, as the shipped configs set it, runs the
 reference kernel, cuDNN on an H100. Without it the DiT's joint attention runs on the engine's
 ragged FlashInfer resource. Both are CUDA-graph replayable.
 
@@ -1913,7 +1913,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the same GPU the 4B's denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
    and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
    concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
-   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``backend: sdpa``).
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one

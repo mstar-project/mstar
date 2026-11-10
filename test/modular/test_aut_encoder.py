@@ -142,8 +142,6 @@ def test_encode_attends_through_a_bound_handle():
     calls = []
 
     class _Recorder:
-        runs_sdpa = False
-
         def add(self, layer, k, v):
             self.held = k, v
 
@@ -188,13 +186,3 @@ def test_a_float16_layer_keeps_its_residual_stream_finite():
     assert torch.isfinite(out).all()
     assert out.max() == torch.finfo(torch.float16).max - 1000
 
-
-def test_a_bound_encoder_refuses_sdpa_at_bind():
-    """Its packed windows have no SDPA layout, so asking for it fails at load and not at the first capture."""
-    from types import SimpleNamespace
-
-    from mstar.model.components.aut_encoder import AuTAttention
-
-    attention = AuTAttention(d_model=8, num_heads=2, array="tokens", layer=0)
-    with pytest.raises(ValueError, match="Array 'tokens': attention_backend sdpa, and packed windows"):
-        attention.bind_state({"tokens": SimpleNamespace(runs_sdpa=True)})

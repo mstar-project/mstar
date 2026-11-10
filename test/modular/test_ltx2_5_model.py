@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import RaggedCrossAttentionSpec
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.ltx2_5.components.transformer import (
@@ -184,8 +184,10 @@ def test_resources_follow_the_attention_backend():
     assert all(s.nodes == {"dit"} for s in specs.values())
     assert (specs[VIDEO_SELF].config.num_qo_heads, specs[VIDEO_SELF].config.head_dim) == (32, 128)
     assert (specs[AUDIO_SELF].config.num_qo_heads, specs[AUDIO_SELF].config.head_dim) == (32, 64)
-    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    model = _make_model()
+    setup, _ = state_setup({"resources": {key: {"backend": "sdpa"} for key in specs}}, model.declare_state())
+    assert node_resources(model, setup=setup) == []
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         _make_model(attention_backend="sdpa")
 
 

@@ -242,13 +242,6 @@ def test_a_good_rope_has_no_problem(positions):
     assert state_declaration_problems(_StubModel(_array(positions=positions))) == []
 
 
-def test_an_array_may_not_carry_two_updates_of_one_type():
-    value = Value("gdn", nodes={"LLM"}, layers={0}, entry=_gdn_entry(),
-                  updates={"a": CausalConv(), "b": CausalConv(activation=None)})
-    problem = _one_problem(value)
-    assert problem.startswith("Array 'gdn'.updates") and "2 updates of type CausalConv" in problem
-
-
 def test_kv_labels_may_name_only_declared_labels():
     problem = _one_problem(_array(), kv_labels={"kv": {"main": None, "cfg": None}})
     assert problem.startswith("kv_labels()['kv']['cfg']") and "Array 'kv'.labels" in problem

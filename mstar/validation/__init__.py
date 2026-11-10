@@ -14,8 +14,8 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-from mstar.engine.state.adapters import node_resources
-from mstar.engine.state.analysis import deployment_problems, sdpa_nodes, state_declaration_problems
+from mstar.engine.state.adapters import StateSetup, node_resources, spec_overrides, state_setup
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
@@ -122,17 +122,18 @@ def validate_deployment(
         if declaration_problems:
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
-            sdpa = frozenset() if malformed else sdpa_nodes(config["node_groups"])
-            specs = node_resources(model, sdpa_nodes=sdpa)
+            setup = StateSetup()
+            if not malformed and resources_readable:
+                setup, setup_problems = state_setup(config, model.declare_state())
+                problems += setup_problems
+            specs = node_resources(model, setup=setup)
             if resources_readable:
                 # a worker graph's `tp_size` is the instance's, TP times SP
                 head_shards = {} if deployment is None else {
                     node: graph.tp_size for graph in deployment.worker_graphs if graph.sp_size > 1
                     for node in graph.section.get_nodes()
                 }
-                problems += deployment_problems(
-                    model, config.get("resources") or {}, sdpa=sdpa, head_shards=head_shards,
-                )
+                problems += deployment_problems(model, config.get("resources") or {}, head_shards=head_shards)
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -140,7 +141,7 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("declaring the node resources", e))
-    checked_config = config
+    checked_config = spec_overrides(config) if resources_readable else config
     # a `resources:` block check_resources refuses turns no LoRA on
     if specs is not None and resources_readable and lora_enabled(config):
         lora = None
@@ -153,7 +154,8 @@ def validate_deployment(
         if lora is None:
             # reported above, not again as an unknown resource
             checked_config = {
-                **config, "resources": {k: v for k, v in config["resources"].items() if k != LORA_RESOURCE_KEY},
+                **checked_config,
+                "resources": {k: v for k, v in checked_config["resources"].items() if k != LORA_RESOURCE_KEY},
             }
         else:
             # the override step refuses the same block on the `lora` spec, with the rest

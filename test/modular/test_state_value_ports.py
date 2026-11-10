@@ -8,6 +8,7 @@ by agreeing with itself. Canary-Qwen's ``page_size`` is the one named difference
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -49,6 +50,7 @@ from mstar.model.fish_s2_pro.submodules import CodecSubmodule as FishCodecSubmod
 from mstar.model.parakeet.config import ParakeetModelConfig
 from mstar.model.parakeet.parakeet_model import ParakeetModel
 from mstar.model.parakeet.submodules import TransducerSubmodule
+from mstar.model.qwen3_asr.config import AUT_ATTN
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule
 from mstar.model.qwen3_tts.components.incremental_codec import _DILATIONS, _KERNEL, _PRE_CONV_KERNEL
@@ -57,6 +59,7 @@ from mstar.model.qwen3_tts.submodules import DEPTH_LOOP_REGION, TalkerSubmodule
 from mstar.model.qwen3_tts.submodules import CodecSubmodule as TTSCodecSubmodule
 from mstar.model.registry import MODEL_REGISTRY
 from mstar.model.submodule_base import ARNodeInputs, NodeInputs, NodeSubmodule, engine_step
+from mstar.validation import DeploymentError, validate_deployment
 
 
 def _canary(tmp_path=None, monkeypatch=None) -> CanaryQwenModel:
@@ -339,6 +342,19 @@ def test_canary_qwen_differs_only_in_a_page_size_that_means_the_same_pages():
     assert declared.page_size is None and hand_written.page_size == 128
     assert (declared.tokens_per_page, declared.num_units) == (hand_written.tokens_per_page, hand_written.num_units)
     assert declared.groups == hand_written.groups, "the arena's layout follows from the groups"
+
+
+def test_sdpa_on_the_aut_read_is_refused_before_any_worker_boots():
+    """The AuT packs its windows, and SDPA can't tell one window's queries from the next. The bindings refuse it where
+    they resolve, so the deployment fails validation with its other problems, and not at each worker's bind."""
+    path = Path(__file__).parents[2] / "configs" / "qwen3_asr.yaml"
+    deployment = {**yaml.safe_load(path.read_text()), "resources": {AUT_ATTN: {"backend": "sdpa"}}}
+    with pytest.raises(DeploymentError) as refused:
+        validate_deployment(_asr(), deployment, str(path))
+    (problem,) = refused.value.problems
+    assert f"reads[{AUT_ATTN!r}] runs SDPA, which can't tell one segment of packed queries" in problem, (
+        "validation would pass, and each worker would fail on its first packed window"
+    )
 
 
 def test_the_codec_values_allocate_in_each_codec_dtype():

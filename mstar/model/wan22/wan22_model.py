@@ -144,7 +144,7 @@ class Wan22Model(Model):
         return [Array(
             DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0,
             entry=dit_entry(c.num_attention_heads, c.attention_head_dim),
-            reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads))},
+            reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads), packed=False)},
         )]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:

@@ -146,7 +146,7 @@ class ZImageModel(Model):
             return Array(
                 name, nodes={"dit"}, layers=frozenset(layers), labels={label}, max_len=0,
                 entry=dit_entry(t.n_heads, t.head_dim),
-                reads={read: Read(mask=Block(), op=Attend(q_heads=t.n_heads))},
+                reads={read: Read(mask=Block(), op=Attend(q_heads=t.n_heads), packed=False)},
             )
 
         return [

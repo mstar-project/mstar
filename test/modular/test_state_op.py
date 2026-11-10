@@ -19,7 +19,21 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import engine as engine_module
 from mstar.engine.resources.kv.config import KVLayout
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Causal, KVEntry, PagedNHD, PagedNHDTarget, Read, state_op
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    Entry,
+    KVEntry,
+    PagedNHD,
+    PagedNHDTarget,
+    Read,
+    TensorType,
+    Value,
+    state_op,
+)
+from mstar.engine.state.adapters import build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import make_model
@@ -95,7 +109,7 @@ def _kv_array(**fields) -> Array:
 def _handle(kv=None, attn=None, array=None) -> ArrayHandle:
     kv = kv or _StubKV()
     array = array or _kv_array()
-    return ArrayHandle(array, {array.name: kv, "attn": attn or _StubAttn()}, None)
+    return build_handle(array, {array.name: kv, "attn": attn or _StubAttn()})
 
 
 def _open(handle) -> SubmoduleStep:
@@ -251,7 +265,8 @@ def test_a_call_in_a_step_that_doesnt_list_the_array_is_refused():
 
 
 def test_a_state_op_that_adds_to_a_rewritable_array_is_refused():
-    h = _handle(array=_kv_array(rewritable=True))
+    value = Value("kv", nodes={"llm"}, layers={0, 1}, entry=Entry({"x": TensorType((2,), dtype=None)}))
+    h = build_handle(value, {"kv": SimpleNamespace(block=lambda field, layer: None)})
     _open(h)
     with pytest.raises(ValueError, match="Array 'kv': state op 'write_q' adds to kv, and the array is rewritable"):
         _fused_op()(h, 0, *_tensors())
