@@ -1,8 +1,9 @@
-"""``no_cudnn_sdpa`` turns off cuDNN attention and leaves every other SDPA backend as it was."""
+"""``no_cudnn_sdpa`` turns off cuDNN attention and leaves every other SDPA backend as the process had it."""
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.profiler import ProfilerActivity, profile
 
 from mstar.model.components.sdpa_backends import no_cudnn_sdpa
@@ -26,6 +27,15 @@ def test_only_cudnn_is_turned_off():
         assert torch.backends.cuda.math_sdp_enabled()
 
 
+def test_a_backend_the_process_turned_off_stays_off():
+    with sdpa_kernel([SDPBackend.MATH, SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION]):
+        with no_cudnn_sdpa():
+            assert not torch.backends.cuda.mem_efficient_sdp_enabled()
+            assert not torch.backends.cuda.cudnn_sdp_enabled()
+            assert torch.backends.cuda.math_sdp_enabled()
+        assert torch.backends.cuda.cudnn_sdp_enabled()
+
+
 def test_cpu_keeps_its_flash_kernel():
     q, k, v = (torch.randn(2, 4, 50, 8) for _ in range(3))
     bias = torch.randn(2, 4, 50, 50)
@@ -45,7 +55,16 @@ def test_dense_bias_matches_unpinned_off_cudnn(dtype, t):
     # a FastConformer padding mask: the last keys of row 0 masked out
     bias[0, :, :, t - 20:] = torch.finfo(dtype).min
 
-    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+    if dtype == torch.float32:
+        # cuDNN takes half precision only: compare against math in float64
+        with sdpa_kernel([SDPBackend.MATH]):
+            ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), attn_mask=bias.double())
+        ref = ref.float()
+    else:
+        with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+            ref = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+            ref_ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(q, k, v, attn_mask=bias))
+        assert any("cudnn" in op for op in ref_ops), ref_ops
     with no_cudnn_sdpa():
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(q, k, v, attn_mask=bias))
