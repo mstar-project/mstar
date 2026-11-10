@@ -1,6 +1,5 @@
 import logging
 from collections.abc import Mapping
-from concurrent.futures import Future
 from dataclasses import asdict
 
 import torch
@@ -61,9 +60,6 @@ class SamplerResource(Resource):
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         greedy_capture: bool | None = None,
-        enable_grammar: bool = False,
-        text_output=None,
-        grammar_cache_mb: int = 512,
     ):
         self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
@@ -177,19 +173,15 @@ class SamplerResource(Resource):
         # its sampler rows on the device; None on a host-planned step
         self._step_rows: tuple | None = None
         self._step_index: torch.Tensor | None = None
-        # Grammar-constrained rows (`sampler/grammar.py`), when the spec enables them.
+        # Grammar-constrained rows (`sampler/grammar.py`), on a `GrammarSamplerResource`.
         # The mask this step applies (None: none), the static mask buffer of each cg
         # slot the captures apply, the slots holding a constrained row's mask, and an
         # eager step's drawn tokens (a captured step's are its slot's last-token row).
         self._grammar: GrammarRows | None = None
-        if enable_grammar:
-            if text_output is None:
-                raise ValueError("enable_grammar needs a model that declares text_output()")
-            self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20)
         self._grammar_mask: torch.Tensor | None = None
         self._grammar_masks: dict[int, torch.Tensor] = {}
         self._grammar_dirty: set[int] = set()
-        self._grammar_stager = PinnedStager(torch.int32) if enable_grammar else None
+        self._grammar_stager: PinnedStager | None = None
         self._eager_draw: torch.Tensor | None = None
 
     @property
@@ -208,7 +200,12 @@ class SamplerResource(Resource):
 
     @classmethod
     def build(cls, spec: SamplerSpec, info: EngineResourceInfo):
-        return cls(
+        resource_class, grammar = cls, {}
+        if spec.enable_grammar:
+            resource_class = GrammarSamplerResource
+            text_output = info.text_output() if info.text_output is not None else None
+            grammar = dict(text_output=text_output, grammar_cache_mb=spec.grammar_cache_mb)
+        return resource_class(
             vocab_size=spec.vocab_size,
             enable_repetition_penalty=spec.enable_repetition_penalty,
             device=info.device,
@@ -221,9 +218,7 @@ class SamplerResource(Resource):
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
-            enable_grammar=spec.enable_grammar,
-            text_output=info.text_output() if spec.enable_grammar and info.text_output is not None else None,
-            grammar_cache_mb=spec.grammar_cache_mb,
+            **grammar,
         )
 
     def build_accelerator_graph_buffers(
@@ -418,37 +413,25 @@ class SamplerResource(Resource):
     # captured graphs index, of which there are `sampler_slots`. A request takes
     # it before its first step and holds it until it is removed, which waits for
     # the steps still running it, so a row is never handed on while one of them
-    # can still write it. A constrained request also waits for its grammar to
-    # compile: its first draw needs the mask, and a step waiting for the compile
-    # would hold every row on the worker. Above one rank no rank asks, and the
-    # first step waits for the compile instead.
+    # can still write it.
 
     def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
         bufs = self._cg_buffers
-        row = bufs is not None and bufs.ingraph_scatter and not bufs.has_slot(rid)
-        compiling = self._decides and self._grammar is not None and self._grammar.compiling(rid) is not None
-        return ASKS if row or compiling else None
-
-    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | Future | None:
-        compiling = None if self._grammar is None else self._grammar.compiling(rid)
-        if compiling is not None:
-            return compiling
-        bufs = self._cg_buffers
         if bufs is None or not bufs.ingraph_scatter or bufs.has_slot(rid):
             return None
-        room = bufs.free_rows
+        return ASKS
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        room = self._cg_buffers.free_rows
         if room <= 0:
             return room
-        bufs.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
+        self._cg_buffers.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
         return None
 
     def unreserve(self, rid: str) -> None:
-        if self._cg_buffers is not None and self._cg_buffers.ingraph_scatter:
-            self._cg_buffers.unregister_request(rid)
+        self._cg_buffers.unregister_request(rid)
 
-    def grew_since(self, mark: int | Future) -> bool:
-        if isinstance(mark, Future):
-            return mark.done()
+    def grew_since(self, mark: int) -> bool:
         return self._cg_buffers.free_rows > mark
 
     def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
@@ -980,3 +963,26 @@ class SamplerResource(Resource):
         self._row_stager.copy_(index, rows)
         for dst, src in updates:
             dst.index_copy_(0, index, src.to(dst.dtype))
+
+
+class GrammarSamplerResource(SamplerResource):
+    """The sampler of a spec with ``enable_grammar``: it serves ``structured_outputs``.
+    A class of its own because the runner sweeps ``admit_retrieve`` by class, for
+    every ready row on every scan, and a sampler without grammar stays out of it."""
+
+    def __init__(self, vocab_size: int | None, enable_repetition_penalty: bool, device: torch.device, *,
+                 text_output, grammar_cache_mb: int = 512, **kwargs):
+        if text_output is None:
+            raise ValueError("enable_grammar needs a model that declares text_output()")
+        super().__init__(vocab_size, enable_repetition_penalty, device, **kwargs)
+        self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20)
+        self._grammar_stager = PinnedStager(torch.int32)
+
+    def admit_retrieve(self, rid: str, node_name: str, graph_walk: str, published: None) -> AdmitOutcome:
+        """Not ready while ``rid``'s grammar compiles: its first draw needs the
+        mask, and a step that waited for the compile would stall every row on
+        the worker. Readiness, not capacity, so the requests behind it start
+        meanwhile. Each rank compiles from the same request: the leader holds
+        the request back, and a follower handed its step waits only for what is
+        left of its own compile."""
+        return AdmitOutcome(ok=True, ready=False) if self._grammar.compiling(rid) else ADMIT_OK

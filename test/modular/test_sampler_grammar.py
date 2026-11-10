@@ -14,12 +14,13 @@ pytest.importorskip("xgrammar")
 
 from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
-from mstar.engine.resources.admission import Admission  # noqa: E402
+from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
-from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
-from mstar.engine.resources.step import SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
+from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 
 VOCAB = [b"{", b"}", b'"', b":", b",", b"a", b"b", b"1", b"2", b" ", b"true", b"x", b"<think>", b"</think>", b""]
 EOS = len(VOCAB) - 1
@@ -34,14 +35,14 @@ def _argmax_draw(monkeypatch):
     monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
 
 
-def _resource(graph: bool) -> SamplerResource:
+def _resource(graph: bool, comm_group=None) -> GrammarSamplerResource:
     text_output = SimpleNamespace(
         detokenizer=SimpleNamespace(token_bytes=lambda i: VOCAB[i] if i < len(VOCAB) else b""),
         stop_token_ids=frozenset({EOS}),
     )
-    res = SamplerResource(
+    res = GrammarSamplerResource(
         vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
-        enable_grammar=True, text_output=text_output,
+        text_output=text_output, comm_group=comm_group,
     )
     if graph:
         res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=4, max_seq_len=1)
@@ -134,20 +135,39 @@ def test_a_replay_commits_the_draw_of_the_graph_it_replays():
     assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
 
 
-def test_a_constrained_request_starts_once_its_grammar_compiled():
-    """Admission holds it back meanwhile: a first step waiting for the compile
-    would hold every row on the worker."""
-    res = _resource(graph=False)
+class _Pool(StubResource):
+    """A KV pool with room for every request, which each new request asks."""
+
+    def __init__(self):
+        self.held = set()
+
+    def ask(self, rid, node_name, graph_walk):
+        return None if rid in self.held else ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published):
+        self.held.add(rid)
+
+    def unreserve(self, rid):
+        self.held.discard(rid)
+
+
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
+    """A compile is readiness, not capacity: the requests behind it start
+    meanwhile, and it waits out of every step on any number of ranks (the one
+    step that waited for it would stall every row on the worker)."""
+    res = _resource(graph=False, comm_group=SimpleNamespace(world_size=ranks))
     compiled = Future()
     res._grammar._compile_pool = SimpleNamespace(submit=lambda fn, *args: compiled)
     request = grammar_request({"choice": ["ab"]})
-    res.ingest_request(0, SamplingReqConfig(grammar=request))
-    admission = Admission({"sampler": res}, ["sampler"])
+    res.ingest_request("a", SamplingReqConfig(grammar=request))
+    res.ingest_request("b", SamplingReqConfig())
+    runner = StepRunner({"kv": _Pool(), "sampler": res}, node_resources={"LLM": ["kv", "sampler"]})
 
-    assert admission.admit(0, "LLM", "decode", None, ["sampler"]).queued
-    assert admission.admit_waiting(lambda rid, node: None) == []
+    assert not runner.admit_retrieve("a", "LLM", "w").ready
+    assert runner.admit_retrieve("b", "LLM", "w").ready, "a request waited behind another's compile"
     compiled.set_result(request.compile(res._grammar._compiler))
-    assert admission.admit_waiting(lambda rid, node: None) == [("LLM", 0)]
+    assert runner.admit_retrieve("a", "LLM", "w").ready
 
 
 @pytest.mark.parametrize("failure", ["compile", "refused draw"])
@@ -238,7 +258,7 @@ def test_enable_grammar_on_a_sampler_narrower_than_the_text_vocabulary_is_refuse
     """A non-text sampler (an audio codec's, say) draws ids no grammar describes."""
     text_output = SimpleNamespace(detokenizer=SimpleNamespace(tokenizer=[b""] * (V + 1)), stop_token_ids=())
     with pytest.raises(ValueError, match="belongs on the text sampler"):
-        SamplerResource(
+        GrammarSamplerResource(
             vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
-            enable_grammar=True, text_output=text_output,
+            text_output=text_output,
         )

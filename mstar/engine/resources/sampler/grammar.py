@@ -157,9 +157,9 @@ def response_format_request(response_format: Any) -> dict | None:
 
 
 class _Row:
-    """One request's matcher, compiled in the background while admission holds
-    the request back, and ``error``: why the row can no longer be served, which
-    fails its request at its next admit."""
+    """One request's matcher, compiled in the background while its request is
+    not ready (`GrammarSamplerResource.admit_retrieve`), and ``error``: why the
+    row can no longer be served, which fails its request at its next admit."""
     __slots__ = ("compiled", "_matcher", "error")
 
     def __init__(self, compiled: Future):
@@ -243,10 +243,9 @@ class GrammarRows:
     def remove(self, rid) -> None:
         self._rows.pop(rid, None)
 
-    def compiling(self, rid) -> Future | None:
-        """``rid``'s compile, while it runs."""
+    def compiling(self, rid) -> bool:
         row = self._rows.get(rid)
-        return None if row is None or row.compiled.done() else row.compiled
+        return row is not None and not row.compiled.done()
 
     def failures(self, rids) -> dict:
         """Why each of ``rids`` that can no longer be served can't, by rid."""

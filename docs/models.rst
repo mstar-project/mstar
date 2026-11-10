@@ -746,9 +746,9 @@ that text, so a reasoning model thinks freely first; a model that declares where
 ends (Qwen3.5's ``</think>``, Muse Glimmer's ``<|eom|>``) sets it on any turn whose prompt leaves
 the reasoning open. An unsupported schema is a 400, and so is a request on a deployment
 without ``enable_grammar`` or a grammar over 131072 characters. The grammar compiles in the
-background while admission holds its request back. The captured sampler then applies a bitmask
-on every step but a greedy one without a constrained row (the lean twin), and a step holding a
-constrained row waits for its rows' last draws to reach the host before it launches. A grammar
+background, on every rank, while its request waits and the requests behind it start. The
+captured sampler then applies a bitmask on every step but a greedy one without a constrained
+row (the lean twin), and a step holding a constrained row waits for its rows' last draws to reach the host before it launches. A grammar
 that fails to compile, or refuses a drawn token, fails its request with an error rather than
 letting the reply go unconstrained. Not served with it yet: speculative decoding (no model that
 declares ``text_output()`` drafts outside its sampler), resident planning, and a text sampler
