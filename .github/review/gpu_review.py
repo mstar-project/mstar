@@ -1122,12 +1122,14 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
                 cut = f.seek(0, os.SEEK_END) > ERR_READ
                 f.seek(-ERR_READ if cut else 0, os.SEEK_END if cut else os.SEEK_SET)
                 window = f.read()
-            if cut:  # from its first whitespace, so a secret the seek split can't leave its end
-                space = re.search(rb"\s", window)
-                window = window[space.start():] if space else b""
-            text = bot.redact(window.decode("utf-8", "replace"), exact=exact)  # whole, so no secret is cut in two
+            text = window.decode("utf-8", "replace")
+            if cut:  # without its partial first line and any end of an exact key it starts with (cut_short's
+                text = text.partition("\n")[2]  # mirror), so a secret the seek split can't leave its end
+                for value in filter(None, exact):
+                    text = text[next((k for k in range(len(value) - 1, 0, -1) if text.startswith(value[-k:])), 0):]
+            text = bot.redact(text, exact=exact)  # whole, so no secret is cut in two
             start = max(len(text) - ERR_TAIL, 0)  # marked where it starts mid-line
-            whole = text[start - 1] == "\n" if start else not cut or text.startswith("\n")
+            whole = text[start - 1] == "\n" if start else True
             (box / "results/claude.err.tail").write_text(("" if whole else "…") + text[start:])
 
 

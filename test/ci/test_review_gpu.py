@@ -532,15 +532,28 @@ class TestComment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:  # a stderr of any size: only its end is read
             results = Path(temp, "lt/amd/results")
             results.mkdir(parents=True)
-            (results / "claude.err").write_bytes(b"x " * (4 << 20) + b"API Error: 401\n")
+            (results / "claude.err").write_bytes(b"x\n" * (4 << 20) + b"API Error: 401\n")
             tracemalloc.start()
             try:
                 gpu_review.redact({}, temp)
                 peak = tracemalloc.get_traced_memory()[1]
             finally:
                 tracemalloc.stop()
-            self.assertTrue((results / "claude.err.tail").read_text().endswith("x API Error: 401\n"))
+            self.assertTrue((results / "claude.err.tail").read_text().endswith("x\nAPI Error: 401\n"))
             self.assertLess(peak, 2 << 20, "an 8 MB stderr would be read whole into the job's memory")
+        key, filler = "k3y+secret\nline2==", "S" * 4000  # an exact key the read's seek splits
+        body = (filler + "\n") * 16 + "API Error: 401\n"
+        for at in (3, 13):  # in its first line, then in its second
+            with self.subTest(at=at), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp, "lt/amd/results")
+                results.mkdir(parents=True)
+                pad = "p" * (gpu_review.ERR_READ - len(key[at:] + "\n" + body) - 1) + "\n"
+                (results / "claude.err").write_bytes(("a\n" + key + "\n" + pad + body).encode())
+                gpu_review.redact({}, temp, s3=filler, s4=key)
+                tail = (results / "claude.err.tail").read_text()
+                self.assertTrue(tail.endswith("API Error: 401\n"))
+                self.assertNotIn("line2", tail, "the end of a key the seek split would reach the artifact")
+                self.assertNotIn("secret", tail, "the end of a key the seek split would reach the artifact")
 
     def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
         box_key = "sk-ant-api03-" + "Ab1_-" * 8
