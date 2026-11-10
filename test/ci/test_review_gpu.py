@@ -285,12 +285,13 @@ class TestStart(unittest.TestCase):
 
         routes = {"gpu.py launch": launch, "gpu.py offers": listing,
                   "git rev-parse": "abcdef\n",
-                  f"GET repos/{R}/pulls/7": {"title": "Faster decode", "body": self.INJECTED},
+                  f"GET repos/{R}/pulls/7": {"title": "Faster decode", "body": getattr(self, "body", self.INJECTED)},
                   f"GET repos/{R}/issues[?]*": []}
         lt = Path(tempfile.mkdtemp())
         config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
                                        tail_lines=gpu_review.gpu_py.tail_lines, reap=lambda cfg: [],
-                                       running=lambda cfg: ["box"] * up)
+                                       running=lambda cfg: ["box"] * up, cloud_config=gpu_review.gpu_py.cloud_config,
+                                       USER_DATA_MAX=gpu_review.gpu_py.USER_DATA_MAX)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"live_test": {
@@ -368,6 +369,25 @@ class TestStart(unittest.TestCase):
         self.assertIn("No AMD GPUs", (out / "amd/unavailable.md").read_text())
         with self.assertRaises(ValueError, msg="a vendor set the workflow never makes would reach the box"):
             self.start({}, vendors="amd")
+
+    def test_a_digitalocean_box_gets_the_description_and_earlier_report_cut_to_fit(self):
+        mi300x = {"id": "digitalocean:gpu-mi300x1-192gb", "provider": "digitalocean", "gpu": "AMD MI300X",
+                  "count": 1, "usd_per_hour": 2.0, "availability": "available", "vendor": "amd"}
+        self.body = os.urandom(100_000).hex()  # no compression saves it
+        earlier = os.urandom(50_000).hex()
+        out, launched = self.start({"eras": {"run_secret_id": "s"}}, offers={"nvidia": self.ERAS, "amd": [mi300x]},
+                                   vendors="nvidia,amd", run="targeted", since="f" * 40, earlier=earlier)
+        nvidia, amd = (x[x.index("--run") + 2:][1::2] for x in launched)
+        self.assertEqual(nvidia[1:3], [str(out / "findings.json"), str(out / "pr-body.md")],
+                         "an Eras box, which has no such limit, would get the cut copies")
+        self.assertEqual(amd[1:3], [str(out / "amd/findings.json"), str(out / "amd/pr-body.md")])
+        body, report = (out / "amd/pr-body.md").read_text(), json.loads((out / "amd/findings.json").read_text())
+        self.assertTrue(body.endswith("(cut to fit)\n") and report["earlier_report"].endswith("(cut to fit)\n"),
+                        "the session wouldn't know what it reads was cut")
+        self.assertIn(self.body, (out / "pr-body.md").read_text())
+        user_data = gpu_review.gpu_py.cloud_config(str(gpu_review.BOX), amd, None)
+        self.assertLessEqual(len(user_data.encode()), gpu_review.gpu_py.USER_DATA_MAX,
+                             "DigitalOcean would refuse every AMD box of a PR with a long description")
 
     def test_no_box_starts_unless_every_vendors_box_can(self):
         mi300x = {"id": "digitalocean:gpu-mi300x1-192gb", "provider": "digitalocean", "gpu": "AMD MI300X",

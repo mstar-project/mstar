@@ -633,6 +633,9 @@ class DigitalOcean(Provider):
                 die(f"digitalocean.run_secret_env names {secret}, which is not set; the box would have no key")
             body["user_data"] = cloud_config(args.run, args.input, secret and (
                 "<the value of $" + secret + ">" if args.dry_run else os.environ[secret]))
+            if len(body["user_data"].encode()) > USER_DATA_MAX:
+                die(f"the --run script and inputs take {len(body['user_data'].encode())} bytes of user_data, over "
+                    f"DigitalOcean's {USER_DATA_MAX}; send smaller inputs")
         return body, lambda: str(digitalocean("POST", "/droplets", body, retry=False)["droplet"]["id"])
 
     def hf_home(self):
@@ -672,12 +675,8 @@ def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
     files = [entry(f"/run/live-pr/{Path(f).name}", Path(f).read_bytes()) for f in [run, *inputs]]
     if secret:
         files.append(entry("/run/live-pr-key/value", secret.encode()))
-    text = "#cloud-config\n" + json.dumps({"write_files": files, "runcmd": [
+    return "#cloud-config\n" + json.dumps({"write_files": files, "runcmd": [
         ["systemd-run", "--unit", "live-pr", "bash", f"/run/live-pr/{Path(run).name}"]]})
-    if len(text.encode()) > USER_DATA_MAX:
-        die(f"the --run script and inputs take {len(text.encode())} bytes of user_data, over DigitalOcean's "
-            f"{USER_DATA_MAX}; send smaller inputs")
-    return text
 
 
 def digitalocean_ssh_key(pubkey: str, name: str) -> str:

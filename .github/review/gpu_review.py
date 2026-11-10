@@ -453,13 +453,15 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
         if up + len(vendors) > cap:
             stop(f"The bot has {up} GPU boxes going and this run needs {len(vendors)}, past {cap} "
                  "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
+    secret = os.environ.get(cfg.get("digitalocean", {}).get("run_secret_env") or "", "")
     for vendor in vendors:
         box = lt / vendor
         free, _, tried = found[vendor]
-        inputs = [x for f in (box / "brief.md", *(lt / f for f in ("findings.json", "pr-body.md", "run.json")),
-                              BOX_COMMON) for x in ("--input", str(f))]
 
-        def launch(o, vendor=vendor, inputs=inputs, tried=tried):
+        def launch(o, vendor=vendor, box=box, tried=tried):
+            data = fit_user_data(lt, box, len(secret)) if o["provider"] == "digitalocean" \
+                else [lt / "findings.json", lt / "pr-body.md"]
+            inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON) for x in ("--input", str(f))]
             r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", f"{tag}-{vendor}",
                     "--run", str(BOX), *inputs, check=False)
             if r.returncode:
@@ -479,6 +481,39 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     if not any((box / "instance").exists() for box in boxes(lt)):
         out["unavailable"] = "true"
         sys.exit(3)
+
+
+CUT = "\n\n(cut to fit)\n"
+
+
+def fit_user_data(lt, box, secret_length):
+    """Copies in `box` of lt/findings.json and lt/pr-body.md, cut to fit with the box's other files in a
+    DigitalOcean droplet's user_data (64 KiB, which gpu.py checks again): the PR's description first, then the
+    earlier live test's report, each with a note where it was cut. Their paths."""
+    body = (lt / "pr-body.md").read_text()
+    findings = json.loads((lt / "findings.json").read_text())
+    report = findings.get("earlier_report", "")
+    paths = [box / "findings.json", box / "pr-body.md"]
+
+    def cut(text, n):
+        return text if n >= len(text) else text[:n] + CUT
+
+    def fits(b, r):
+        paths[0].write_text(json.dumps({**findings, **({"earlier_report": r} if report else {})}, indent=1))
+        paths[1].write_text(b)
+        files = [str(f) for f in (box / "brief.md", *paths, lt / "run.json", BOX_COMMON)]
+        text = gpu_py.cloud_config(str(BOX), files, "k" * secret_length or None)
+        return len(text.encode()) <= gpu_py.USER_DATA_MAX
+
+    nb, nr = len(body), len(report)
+    while not fits(cut(body, nb), cut(report, nr)):
+        if nb > 1000:
+            nb = nb * 3 // 4
+        elif nr > 1000:
+            nr = nr * 3 // 4
+        else:
+            break  # what is left is too big anyway: gpu.py refuses the launch and says so
+    return paths
 
 
 def refresh(out, runner_temp, tag, volume, gpus, hours, models, skip, weights, max_usd, github_repository):
