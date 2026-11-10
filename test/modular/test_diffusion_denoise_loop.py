@@ -753,6 +753,8 @@ def test_guided_capture_buckets_stage_the_scale_and_both_keys():
         StepKey((8, 3)), StepKey((8, 3), guided=True, branches=(0, 1)),
     ]
     assert torch.equal(configs[1].single_request_inputs.tensor_inputs["guidance_scale"], torch.tensor([1.0]))
+    # a row's input_seq_len is one branch's tokens; the guided bucket holds both branches' rows
+    assert [c.get_total_tokens(4) for c in configs] == [[44], [88]]
     assert sub.split_batches_by_capture_key(WALK)
 
 

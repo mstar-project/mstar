@@ -700,6 +700,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     # the model compiles its own transformer region; the graph records those kernels
                     compile=False,
                     capture_batch_sizes=list(self.capture_batch_sizes),
+                    # a row's input_seq_len is one branch's tokens; the step plans every local branch's
+                    total_tokens_multiplier=len(step_key.branches),
                     # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
                     caps_eager_batch_size=False,
                     # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
