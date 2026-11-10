@@ -571,14 +571,21 @@ def finished(box, cfg):
 PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
-def show_progress(box, seen, label, final=False):
-    """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the
-    job's log; the new count. Whole lines, at most 50 a read; the `final` read reads on until nothing new comes
-    (20 reads at most), the last line too. A line longer than the read's cap counts as one, cut, once wc counts
-    it. Each is redacted with the exact secrets the redact step uses and the credential patterns, then cut and
-    quoted, since the session wrote them. A file that got shorter is read once more, from its start. The box caps
-    the read (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails,
-    times out or gives no line count changes nothing."""
+def print_progress(lines, label):
+    """Print a box session's progress lines to the job's log, after `label` (its vendor, when there are two boxes),
+    each redacted (the review's own key, which a DigitalOcean box holds, the cloud keys and the credential
+    patterns), then cut and quoted, since the session wrote them."""
+    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
+    for line in lines:
+        print(label + bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
+
+
+def show_progress(box, seen, label):
+    """Print the lines the box's session added to progress.log since the `seen` lines already printed
+    (print_progress); the new count. Whole lines, at most 50 a poll; a line longer than the read's cap counts as
+    one, cut, once wc counts it. A file that got shorter is read once more, from its start. The box caps the read
+    (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails, times out
+    or gives no line count changes nothing. What is left when the box is done, show_rest prints."""
     key = (box / "instance").read_text().strip()
     log = f"{BOX_OUT}/progress.log"
 
@@ -591,46 +598,53 @@ def show_progress(box, seen, label, final=False):
             return None
         return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
 
-    # The review's own key, which a DigitalOcean box holds, and the cloud keys.
-    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
-    for _ in range(20 if final else 1):
-        got = read(seen)
-        if got and got[0] < seen:  # rewritten shorter
-            seen, got = 0, read(0)
-        if got is None:
-            return seen
-        total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
-        # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
-        # ssh call captured, which isn't streamed: the PR's author is trusted.
-        lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
-        # The last piece is a line still being written, or nothing. It is shown on the final read (it ends the
-        # file, so nothing follows it), and when it is one line past the cap that wc already counts (so a line
-        # still being written isn't shown at every poll).
-        tail = lines.pop()
-        whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
-        unended = bool(tail) and final and not whole and len(lines) < 50
-        lines = [*lines, *([tail] if tail and (whole or unended) else [])][:50]
-        for line in lines:
-            print(label + bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
-        seen += len(lines)
-        if not lines or unended:
-            break
-    return seen
+    got = read(seen)
+    if got and got[0] < seen:  # rewritten shorter
+        seen, got = 0, read(0)
+    if got is None:
+        return seen
+    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+    # ssh call captured, which isn't streamed: the PR's author is trusted.
+    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+    # The last piece is a line still being written, or nothing: shown only when it is one line past the cap that
+    # wc already counts (so a line still being written isn't shown at every poll).
+    tail = lines.pop()
+    whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
+    lines = [*lines, *([tail] if tail and whole else [])][:50]
+    print_progress(lines, label)
+    return seen + len(lines)
+
+
+PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+
+
+def show_rest(path, seen, label):
+    """Once a box's results are back: the lines of its progress.log (`path`) the polls didn't print, the last one
+    too, at most PROGRESS_REST (print_progress); from its start if it got shorter than `seen`."""
+    if not path.is_file():
+        return
+    lines = path.read_text(errors="replace").split("\n")
+    if not lines[-1]:
+        lines.pop()
+    print_progress(lines[seen if seen <= len(lines) else 0:][:PROGRESS_REST], label)
 
 
 def wait(out, runner_temp):
     """Until every box's session finishes; then copy each one's results back and let it go, as it finishes.
-    Meanwhile each poll prints the box's new progress lines (show_progress). A box that left no results (Eras
+    Meanwhile each poll prints the box's new progress lines (show_progress), and once its results are back, the
+    ones left (show_rest). A box that left no results (Eras
     refused the Pod, say) gets an unavailable.md with its status, which carries the platform's failure code and
     message; exits 3, with `unavailable` set, when no box left any."""
     lt = Path(runner_temp, "lt")
     cfg = gpu_py.load_config()
     pending = [box for box in boxes(lt) if (box / "instance").exists()]
     seen = dict.fromkeys(pending, 0)
+    label = {box: f"{box.name}: " if len(pending) > 1 else "" for box in pending}
     while pending:
         for box in list(pending):
             st = finished(box, cfg)
-            seen[box] = show_progress(box, seen[box], f"{box.name}: " if len(seen) > 1 else "", final=st is not None)
+            seen[box] = show_progress(box, seen[box], label[box])
             if st is None:
                 continue
             pending.remove(box)
@@ -638,6 +652,7 @@ def wait(out, runner_temp):
             results = box / "results"
             results.mkdir(exist_ok=True)
             gpu("pull", key, f"{BOX_OUT}/.", str(results), check=False, timeout=1800)
+            show_rest(results / "progress.log", seen[box], label[box])
             gpu("ssh", key, f"touch {BOX_OUT}/collected", check=False, timeout=120)
             gpu("terminate", key, check=False)
             print(f"{box.name} collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))

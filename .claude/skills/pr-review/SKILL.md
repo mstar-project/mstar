@@ -621,9 +621,9 @@ The bot overrides the review's call in two cases: when the PR's last live test f
 or left no valid verdict, the live test runs in full, with both kinds of check, whatever the review
 asked for, so a failure is never hidden behind a narrower run; and so does any call when the last
 pass didn't run on every GPU vendor this run needs (NVIDIA only, on a PR that names AMD hardware). An
-earlier live test that was unavailable leaves your call as it is unless one before it failed; so does
-none at all. A re-review with `untestable` set
-(beyond what an AMD box covers) is exempt from both:
+earlier live test that was unavailable (no GPUs, a box that left no results, or a session that
+couldn't run the test) leaves your call as it is unless one before it didn't pass; so does none at
+all. A re-review with `untestable` set (beyond what an AMD box covers) is exempt from both:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
 run" with your reason, and a person approves.
