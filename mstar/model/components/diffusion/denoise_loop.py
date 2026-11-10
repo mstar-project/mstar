@@ -66,7 +66,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, Segment, SeqShardStep, SlotLease, SubmoduleStep
 from mstar.model.components.diffusion.attention import RaggedAttentionFn
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import (
@@ -153,6 +153,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         loop_name: str,
         max_batch_size: int = 8,
         attn_resource_key: str | None = None,
+        shard_resource_key: str | None = None,
         capture_buckets: Sequence[tuple[str, Hashable]] = (),
         capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
         replay_walks: Mapping[str, Sequence[str]] | None = None,
@@ -163,6 +164,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self.loop_name = loop_name
         self._max_batch_size = int(max_batch_size)
         self.attn_resource_key = attn_resource_key
+        # the node's sequence shard (``SeqShardSpec``), declared beside the attention on every
+        # step; the model brackets its layer stack with its scatter / gather
+        self.shard_resource_key = shard_resource_key
         # (graph_walk, bucket_key) pairs to capture; the same key on another walk
         # replays only if ``replay_walks`` says so.
         self.capture_buckets = list(capture_buckets)
@@ -566,9 +570,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             for rid, inp in zip(request_ids, inputs, strict=True)
             for label, span in self.attention_segments(self._bucket_of(inp.resource_step_info))
         ]
+        steps = {self.attn_resource_key: self.attention_step()}
+        if self.shard_resource_key is not None:
+            steps = {self.shard_resource_key: SeqShardStep(), **steps}
         return SubmoduleStep(
             segments=segments,
-            steps={self.attn_resource_key: self.attention_step()},
+            steps=steps,
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 

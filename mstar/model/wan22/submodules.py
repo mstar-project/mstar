@@ -28,13 +28,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import CommGroup, my_rows
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
-from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import Wan22Config
 
@@ -316,6 +315,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     # The ragged self-attention resource (Wan22Model.get_node_resources).
     SELF_ATTN = "dit_self_attn"
+    # On SP ranks, splits each row's tokens over them (Wan22Model.get_node_resources).
+    SEQ_SHARD = "dit_seq_shard"
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
 
@@ -323,6 +324,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
+            shard_resource_key=self.SEQ_SHARD if config.attention_backend == "flashinfer" else None,
         )
         self.transformer = transformer
         self.config = config
@@ -508,6 +510,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
             self_attn_fn=self._ragged(),
+            shard=self.node_resources.get(self.SEQ_SHARD),
         )
         if not do_cfg:
             return out
