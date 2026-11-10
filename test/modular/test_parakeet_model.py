@@ -191,7 +191,7 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
 def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     """A whole clip runs its one walk, and a live call the two stream walks,
     each in its own partition; the partitions a request doesn't use are done
-    from the start, so a clip's graph is the same as before."""
+    from the start."""
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
     assert {p.name for p in model.get_partitions()} == {"default", "Encoder", "Decoder"}
     client = model.get_partition_topology().client_connections()

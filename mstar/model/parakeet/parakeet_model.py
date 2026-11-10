@@ -26,8 +26,10 @@ each, for a live call:
                     of the client's audio
     decode_stream — transducer_stream, one step per chunk of frames, its tokens
                     to the client; both end with the client's stream
-A whole clip runs ``transcribe`` and a live call the other two: the partition a
-request doesn't use is done from the start, so whole clips pay nothing for it.
+A whole clip runs ``transcribe`` and a live call the other two: the partitions a
+request doesn't use are done from the start. Without ``live_lookahead`` the graph is
+exactly the whole-clip one; with it, whole clips measured 3-8% slower on an H200
+(cause not traced).
 """
 
 import json
@@ -99,9 +101,8 @@ class ParakeetModel(Model):
     ):
         """``lookahead`` is the clips' (the checkpoint's widest by default);
         ``live_lookahead``, one the checkpoint supports, also serves live calls
-        at it (configs/nemotron_asr_live.yaml). Without it the graph is the
-        whole-clip one alone: a live path costs every clip's request its extra
-        partitions and the deployment its stream state."""
+        at it (configs/nemotron_asr_live.yaml), at the cost of the stream state
+        and captures. Without it the graph is the whole-clip one alone."""
         self.model_path_hf = model_path_hf
         self.compile_step = compile_step
         self.local_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=CHECKPOINT_FILES)
