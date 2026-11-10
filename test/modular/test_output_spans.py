@@ -418,3 +418,12 @@ def test_gpu_thread_stages_spans_to_the_host_behind_the_step():
     assert host.device.type == "cpu" and host.is_pinned()
     assert host.tolist() == [[3, 9], [0, 5]]
     assert outputs.host_rows is None
+
+
+def test_a_submodule_that_overrides_the_old_inline_hook_is_refused():
+    """``inline_client_signals`` was renamed ``inline_signals``; an override of the old
+    name would never be called, so defining the class fails instead."""
+    with pytest.raises(TypeError, match="inline_client_signals is now inline_signals"):
+        class _Old(NodeSubmodule):
+            def inline_client_signals(self, graph_walk):
+                return {}

@@ -834,6 +834,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     """Base class for a model's compute units: defines the prepare_inputs →
     preprocess → forward(_batched) contract the engines drive."""
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # nothing calls the old name, so an override of it would be skipped silently
+        if "inline_client_signals" in vars(cls):
+            raise TypeError(f"{cls.__name__}.inline_client_signals is now inline_signals")
+
     # Set True on a submodule whose forward does not benefit from (or is broken
     # by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot
     # forward where the trace cost dwarfs the win. The KV-cache / stateless
