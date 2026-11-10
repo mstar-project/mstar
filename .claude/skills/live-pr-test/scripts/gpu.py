@@ -610,9 +610,10 @@ class DigitalOcean(Provider):
             g = s.get("gpu_info") or {}
             gpu = str(g.get("model") or "").replace("_", " ").upper()  # nvidia_h100 -> NVIDIA H100
             vram = (g.get("vram") or {}).get("amount") or 0
-            # Contracted sizes are sold under a contract, never created self-serve.
+            # Contracted sizes are sold under a contract, never created self-serve; a spot size can be taken
+            # back mid-run, which would lose the test.
             if vendor_of(gpu) not in self.vendors or (g.get("count") or 0) < gpus or vram < min_vram \
-                    or s["slug"].endswith("-contracted") or not (s.get("available") or all_regions):
+                    or s["slug"].endswith(("-contracted", "-spot")) or not (s.get("available") or all_regions):
                 continue
             offers.append({
                 "id": f"digitalocean:{s['slug']}", "provider": "digitalocean", "gpu": gpu, "count": g["count"],

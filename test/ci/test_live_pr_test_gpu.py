@@ -300,12 +300,14 @@ DO_SIZES = [  # two pages, as the API pages them
                do_size("gpu-h200x1-141gb", "nvidia_h200", 1, 141, 3.44, available=False),
                do_size("gpu-l40sx1-48gb", "nvidia_l40s", 1, 48, 1.57)],
      "links": {"pages": {"last": "https://api.digitalocean.com/v2/sizes?page=2",
-                         "next": "https://api.digitalocean.com/v2/sizes?page=2"}}, "meta": {"total": 8}},
+                         "next": "https://api.digitalocean.com/v2/sizes?page=2"}}, "meta": {"total": 10}},
     {"sizes": [do_size("gpu-mi300x1-192gb", "amd_mi300x", 1, 192, 1.99, regions=()),  # sold, but no region listed
                do_size("gpu-h200x8-1128gb-contracted", "nvidia_h200", 8, 141, 27.52),
+               do_size("gpu-h100x1-80gb-spot", "nvidia_h100", 1, 80, 1.99),
+               do_size("gpu-b300x1-288gb-lc-spot", "nvidia_b300", 1, 288, 6.17),
                do_size("gpu-mi300x8-1536gb", "amd_mi300x", 8, 192, 15.92)],
      "links": {"pages": {"first": "https://api.digitalocean.com/v2/sizes?page=1",
-                         "prev": "https://api.digitalocean.com/v2/sizes?page=1"}}, "meta": {"total": 8}},
+                         "prev": "https://api.digitalocean.com/v2/sizes?page=1"}}, "meta": {"total": 10}},
 ]
 
 
@@ -369,7 +371,7 @@ class TestDigitalOcean(unittest.TestCase):
         self.assertEqual(self.offers("nvidia"), {
             "digitalocean:gpu-h100x1-80gb": ("nvidia", "NVIDIA H100", 1, 3.39, "available"),
             "digitalocean:gpu-h100x8-640gb": ("nvidia", "NVIDIA H100", 8, 23.92, "available")},
-            "a size under 80 GB, sold only under contract or not available would be offered")
+            "a size under 80 GB, sold only under contract or as spot, or not available would be offered")
         self.assertEqual(self.offers("amd"), {
             "digitalocean:gpu-mi300x1-192gb": ("amd", "AMD MI300X", 1, 1.99, "available"),
             "digitalocean:gpu-mi300x8-1536gb": ("amd", "AMD MI300X", 8, 15.92, "available")},
