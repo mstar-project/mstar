@@ -362,12 +362,12 @@ def decode_append(payload: str, carry: bytes = b"", codec: str = "audio/pcm") ->
     return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
 
 
-def _append_failed(exc: Exception, session_id: str) -> dict:
-    """The error event for an append that failed inside the server: an error
-    id, under which the log has the error."""
+def _failed_in_server(what: str, exc: Exception, session_id: str) -> dict:
+    """The error event for an ``append`` or ``commit`` that failed inside the
+    server: an error id, under which the log has the error."""
     error_id = uuid.uuid4().hex[:12]
-    logger.error("realtime append failed (error id %s, session %s)", error_id, session_id, exc_info=exc)
-    return error_event(f"the append failed (error id {error_id})", kind="server_error")
+    logger.error("realtime %s failed (error id %s, session %s)", what, error_id, session_id, exc_info=exc)
+    return error_event(f"the {what} failed (error id {error_id})", kind="server_error")
 
 
 def _append_error(audio: np.ndarray, rate: int) -> dict | None:
@@ -1107,7 +1107,7 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             self.api.reject_input(self.key, f"append rejected: {exc}", 400)
             return
         except Exception as exc:  # noqa: BLE001 — an error event, and the session goes on, as a conversation's
-            await self.send(_append_failed(exc, s.session_id))
+            await self.send(_failed_in_server("append", exc, s.session_id))
             return
         s.streamed_samples += int(chunk.size)
         s.chunk_id += 1
@@ -1120,7 +1120,16 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             await self.step(tail, final=True)
         key, task = self.key, self.relay_task
         self.key = self.relay_task = None
-        ended = key is None or self.api.stream_input(key, end_input=True)
+        try:
+            ended = key is None or self.api.stream_input(key, end_input=True)
+        except Exception as exc:  # noqa: BLE001 — the item fails, and the session goes on
+            # whether the call's input ended is unknown, so its output may never
+            # end: the call is aborted rather than waited out
+            if task is not None:
+                task.cancel()
+            self.api.abort_submission(key)
+            await self._fail(_failed_in_server("commit", exc, s.session_id))
+            ended, task = True, None
         if task is not None:
             await task
         if not ended:
@@ -1438,7 +1447,7 @@ class RealtimeConversation:
                 self.api.reject_input(self.key, f"append rejected: {exc}", 400)
                 return False
             except Exception as exc:  # noqa: BLE001 — the client gets an error event, not a bare close
-                await self.send(_append_failed(exc, self.session_id))
+                await self.send(_failed_in_server("append", exc, self.session_id))
                 return False
 
     async def _clock(self) -> None:

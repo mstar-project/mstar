@@ -198,16 +198,28 @@ impl Realtime {
             self.live_step(tail).await;
         }
         let call = self.call();
-        let (sub, output) = (call.sub.take(), call.output.take());
+        let (sub, mut output) = (call.sub.take(), call.output.take());
         let ended = match (sub, self.st.bridge.clone()) {
             (None, _) => true,
-            (Some(sub), Some(bridge)) => {
+            (Some(sub), bridge) => {
                 let mut op = Map::new();
                 op.insert("end_input".into(), Value::Bool(true));
-                let reply = bridge.live(sub, "append", op, crate::BRIDGE_PROBE_TIMEOUT * 5).await;
-                reply.as_ref().and_then(|m| m.get("accepted")).and_then(Value::as_bool) == Some(true)
+                let reply = match bridge {
+                    Some(bridge) => bridge.live(sub, "append", op, crate::BRIDGE_PROBE_TIMEOUT * 5).await,
+                    None => None,
+                };
+                let meta = reply.as_ref().and_then(Value::as_object);
+                match meta.filter(|m| m.get("error").is_none()).and_then(|m| m.get("accepted")).and_then(Value::as_bool) {
+                    Some(accepted) => accepted,
+                    None => {
+                        // whether the call's input ended is unknown, so its output
+                        // may never end: dropping it aborts the call
+                        output = None;
+                        self.fail(super::failed_in_server("commit", meta, &self.s.id)).await;
+                        true
+                    }
+                }
             }
-            (Some(_), None) => false,
         };
         if let Some(mut output) = output {
             while let Some(item) = output.next().await {

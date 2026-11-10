@@ -74,8 +74,9 @@ class _Duplex:
     call's output once the call has heard audio, then ends it (``end``) or
     waits until the call is aborted, rejected or its input ended; an error
     chunk ends it too. ``refuse`` opens are refused at capacity first; past
-    ``BUDGET`` an append is refused as the call's input cap refuses it, and
-    an append of one sample of 0.5 fails inside the server."""
+    ``BUDGET`` an append is refused as the call's input cap refuses it, an
+    append of one sample of 0.5 fails inside the server, and so does ending
+    the input of a call that took one sample of -0.5."""
 
     def __init__(self, upload_dir: Path, name="duplex_test", **model):
         self.model_name = name
@@ -112,7 +113,7 @@ class _Duplex:
             raise HTTPException(503, "at capacity")
         self.submits.append({**{k: kw.get(k) for k in ("text", "input_modalities", "output_modalities", "end_input")},
                              "model_kwargs": kw.get("model_kwargs") or None})
-        self.call = {"rid": request_id, "bytes": 0, "error": None, "over": False, "heard": False}
+        self.call = {"rid": request_id, "bytes": 0, "error": None, "over": False, "heard": False, "end_fails": False}
         return request_id
 
     def submission_key(self, request_id):
@@ -131,6 +132,8 @@ class _Duplex:
             # a live transcription's commit: the call's input ends, and its output with it
             if not self.taking_input(key):
                 return False
+            if self.call["end_fails"]:
+                raise RuntimeError("the stream's buffer is gone")
             self.ended += 1
             self.call["over"] = True
             return True
@@ -145,6 +148,7 @@ class _Duplex:
             raise ValueError(f"call input is past {BUDGET} bytes")
         self.call["bytes"] += audio.nbytes
         self.call["heard"] = True
+        self.call["end_fails"] |= audio.size == 1 and audio[0] == -0.5
         self.appends.append(audio.copy())
         return True
 
@@ -291,7 +295,8 @@ def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, u
         server.reset(script, end, refuse)
         evs, code = run()
         out.append((_normalized(evs), code, {"submits": server.submits, "appends": list(server.appends),
-                                              "rejected": server.rejected, "ended": server.ended}))
+                                              "rejected": server.rejected, "ended": server.ended,
+                                              "aborted": len(server.aborted)}))
     return out
 
 
@@ -321,13 +326,17 @@ def _is_end(e: dict) -> bool:
     return e.get("type") == "error" and e["error"]["message"] == "unknown event 'mstar.end'"
 
 
-def _assert_same(py, rust, *, audio=True):
+def _assert_same(py, rust, *, audio=True, aborted=False):
+    """``aborted``: the calls aborted too, for a case whose last call has
+    ended (a call open at the close is aborted after it on mstar-server)."""
     (py_events, py_code, py_call), (rust_events, rust_code, rust_call) = py, rust
     assert rust_events == py_events
     assert rust_code == py_code
     assert rust_call["submits"] == py_call["submits"]
     assert rust_call["rejected"] == py_call["rejected"]
     assert rust_call["ended"] == py_call["ended"]
+    if aborted:
+        assert rust_call["aborted"] == py_call["aborted"]
     if audio:
         assert len(rust_call["appends"]) == len(py_call["appends"])
         for r, p in zip(rust_call["appends"], py_call["appends"], strict=True):
@@ -539,6 +548,11 @@ LIVE = {
     # an append that fails inside the server is an error event; the item's call goes on
     "append-fails": ([_text(0, b" hello")], [
         _append(np.array([16384], "<i2").tobytes()), _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
+    # a commit whose end fails inside the server aborts the item's call rather than waiting it out;
+    # the item fails and the next one goes on
+    "end-fails": ([_text(0, b" hello")], [
+        _append(_tone(16000, 0.2).tobytes()), _append(np.array([-16384], "<i2").tobytes()), 0.3, COMMIT,
+        _append(_tone(16000, 0.1).tobytes()), COMMIT, END]),
 }
 
 
@@ -550,7 +564,7 @@ def test_live_transcription_reads_as_pythons(stacks, monkeypatch, name):
     script, events = LIVE[name]
     py, rust = _both(stacks, monkeypatch, "live", events, script=script, end=False,
                      until=lambda evs: _is_end(evs[-1]))
-    _assert_same(py, rust)
+    _assert_same(py, rust, aborted=True)
     kinds = _kinds(py[0])
     if name == "completed":
         assert [e["error"]["message"].split(":")[0] for e in py[0] if e["type"] == "error"][:3] == [
@@ -564,6 +578,11 @@ def test_live_transcription_reads_as_pythons(stacks, monkeypatch, name):
         assert [e["error"]["message"] for e in py[0] if e["type"] == "error"][0] == "the append failed (error id X)"
         assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello"]
         assert len(py[2]["appends"]) == 1 and py[2]["ended"] == 1
+    elif name == "end-fails":
+        assert [e["error"]["message"] for e in py[0] if e["type"] == "error"][0] == "the commit failed (error id X)"
+        assert kinds.count("conversation.item.input_audio_transcription.failed") == 1
+        assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello"]
+        assert len(py[2]["submits"]) == 2 and py[2]["aborted"] == 1 and py[2]["ended"] == 1
     else:
         assert kinds.count("conversation.item.input_audio_transcription.failed") == 2
         assert len(py[2]["appends"]) == 2 and py[2]["ended"] == 0

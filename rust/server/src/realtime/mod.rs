@@ -306,19 +306,20 @@ async fn stream_audio(st: &AppState, sub: u64, stream: &str, audio: &[f32], sess
             bridge.live(sub, "reject", op, timeout).await;
             Ok(false)
         }
-        meta => {
-            let error_id = meta
-                .and_then(|m| m.get("error_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-                    eprintln!("realtime append failed (error id {id}, session {session_id}): the API server did not answer");
-                    id
-                });
-            Err(error_event(&format!("the append failed (error id {error_id})"), "server_error", None))
-        }
+        meta => Err(failed_in_server("append", meta, session_id)),
     }
+}
+
+/// `_failed_in_server`: the `error` event for an `append` or `commit` whose
+/// bridge reply `meta` was an error (logged on the API server under its
+/// error id) or never came.
+fn failed_in_server(what: &str, meta: Option<&Map<String, Value>>, session_id: &str) -> Value {
+    let error_id = meta.and_then(|m| m.get("error_id")).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        eprintln!("realtime {what} failed (error id {id}, session {session_id}): the API server did not answer");
+        id
+    });
+    error_event(&format!("the {what} failed (error id {error_id})"), "server_error", None)
 }
 
 // ── settings ─────────────────────────────────────────────────────────────────
