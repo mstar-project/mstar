@@ -6,9 +6,10 @@ name: Review bot approval current
 # approval is on the PR's current head (bot.py, approval_current). Any read error fails it. It reads the head when the
 # PR enters the queue: GitHub takes a PR out of the queue on a push, so a push after that can't ride on this check.
 #
-# A PR that edits this file runs its own copy in the merge queue. That is accepted: the bot approves only PRs whose
-# authors have write access, and those are trusted not to defeat this check. It guards against a bot approval carrying
-# an unreviewed later push, not against such an author.
+# A PR that edits this file runs its own copy in the merge queue. That is accepted: the bot approves only a PR whose
+# author and requester have write access and whose branch is on this repository or on a write-access owner's fork, and
+# everyone who can push to that branch (write-access members, or people that fork's owner lets push) is trusted not to
+# defeat this check. It guards against a bot approval carrying an unreviewed later push, not against them.
 
 on:
   pull_request:
