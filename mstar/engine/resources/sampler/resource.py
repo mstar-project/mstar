@@ -5,7 +5,7 @@ from dataclasses import asdict
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
@@ -40,7 +40,7 @@ class SamplerResource(Resource):
     # a rebuild row's draw never commits, so a drop has nothing here to discard
     supports_drop = True
 
-    def can_capture(self) -> bool:
+    def can_capture(self, spec: CGSlotSpec) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,

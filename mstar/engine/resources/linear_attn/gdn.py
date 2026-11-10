@@ -360,13 +360,11 @@ class GDNManager(LinearAttnManager):
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
-    def capture_refusal(self, spec: CGSlotSpec) -> str | None:
+    def can_capture(self, spec: CGSlotSpec) -> bool:
         # one-token rows take the decode kernel, which every backend captures;
         # a longer row takes the prefill kernel the backend can capture, whose
         # cost may grow with that row
-        if spec.max_row_tokens <= 1:
-            return None
-        return self._kernels.uncapturable_prefill(spec.max_row_tokens)
+        return spec.max_row_tokens <= 1 or self._kernels.uncapturable_prefill(spec.max_row_tokens) is None
 
     def cleanup(self):
         self._cg_wrappers.clear()

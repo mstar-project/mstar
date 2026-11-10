@@ -277,16 +277,16 @@ def test_flydsl_decode_needs_flydsl_and_its_architectures(on_platform, monkeypat
 # --- captured prefill bound ------------------------------------------------------
 
 
-def test_aiter_refuses_prefill_buckets_past_its_bound(on_platform, aiter_installed):
+def test_aiter_blocks_capture_of_prefill_buckets_past_its_bound(on_platform, aiter_installed):
     on_platform(_Mi300x())
     manager = build(device=torch.device("cuda"))
     bound = DEFAULT_MAX_CAPTURED_PREFILL_TOKENS
-    assert manager.capture_refusal(packed(16, bound)) is None
-    assert "max_captured_prefill_tokens" in manager.capture_refusal(packed(1, 2 * bound))
+    assert manager.can_capture(packed(16, bound))
+    assert not manager.can_capture(packed(1, 2 * bound))
     # a batched bucket's row holds only its share of the tokens
-    assert manager.capture_refusal(batched(16, tokens_per_row=bound // 16)) is None
-    # decode is never refused, however wide its bucket
-    assert manager.capture_refusal(batched(4 * bound)) is None
+    assert manager.can_capture(batched(16, tokens_per_row=bound // 16))
+    # decode is never blocked, however wide its bucket
+    assert manager.can_capture(batched(4 * bound))
 
 
 def test_a_bound_of_zero_leaves_decode_captured(on_platform, aiter_installed):
@@ -294,8 +294,8 @@ def test_a_bound_of_zero_leaves_decode_captured(on_platform, aiter_installed):
     one-token rows take the decode kernel and stay captured."""
     on_platform(_Mi300x())
     manager = build(device=torch.device("cuda"), max_captured_prefill_tokens=0)
-    assert manager.capture_refusal(packed(1, 32)) is not None
-    assert manager.capture_refusal(batched(128)) is None
+    assert not manager.can_capture(packed(1, 32))
+    assert manager.can_capture(batched(128))
 
 
 def test_the_bound_is_a_deployment_setting(on_platform, aiter_installed):
@@ -322,7 +322,7 @@ def test_the_bound_is_a_deployment_setting(on_platform, aiter_installed):
 def test_flashinfer_captures_every_prefill_bucket(on_platform):
     on_platform(CudaPlatform())
     manager = build()
-    assert manager.capture_refusal(packed(1, 1 << 20)) is None
+    assert manager.can_capture(packed(1, 1 << 20))
 
 
 def test_yaml_rejects_an_unknown_backend():

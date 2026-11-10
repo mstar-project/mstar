@@ -28,16 +28,17 @@ def test_resource_owns_kernel_capture_support(device_type):
     from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
     from mstar.engine.resources.sampler.resource import SamplerResource
 
+    one_token = SimpleNamespace(max_row_tokens=1)
     if device_type == "cuda":
         for cls in (FlashInferManager, FlashInferRaggedManager,
                     FlashInferCrossManager, GDNManager, Mamba2Manager):
             resource = object.__new__(cls)
             resource._device = torch.device(device_type)
-            assert resource.can_capture()
+            assert resource.can_capture(one_token)
     sampler = object.__new__(SamplerResource)
     sampler._device = torch.device(device_type)
-    assert sampler.can_capture() is (device_type != "cpu")
-    assert not object.__new__(DenseAttentionManager).can_capture()
+    assert sampler.can_capture(one_token) is (device_type != "cpu")
+    assert not object.__new__(DenseAttentionManager).can_capture(one_token)
 
 
 @pytest.mark.parametrize("piecewise", [False, True])
@@ -45,7 +46,7 @@ def test_resource_owns_kernel_capture_support(device_type):
 def test_resource_capability_filters_recipes_and_preserves_strict_mode(
     monkeypatch, caplog, piecewise, can_capture,
 ):
-    resource = make_resource(can_capture=lambda: can_capture)
+    resource = make_resource(can_capture=lambda spec: can_capture)
     step = SimpleNamespace(steps={"attention": object()})
     declare = Mock(return_value=step)
     step_runner = Mock()
@@ -75,18 +76,14 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
         )
 
     specs = runner.prepare_for_capture()
-    assert bool(specs) is can_capture
+    assert specs, "a blocked bucket is still warmed, so the floor counts its peak"
     assert runner.prepare_for_capture() is specs
+    step_runner.build_accelerator_graph_buffers.assert_called_once()
+    missing = runner.dropped_shapes if piecewise else runner.dropped_buckets
     if can_capture:
-        step_runner.build_accelerator_graph_buffers.assert_called_once()
-        missing = runner.dropped_shapes if piecewise else runner.dropped_buckets
         assert not missing
     else:
-        step_runner.build_accelerator_graph_buffers.assert_not_called()
-        step_runner.ingest_capture_row.assert_not_called()
-        assert declare.call_count == 1, "capability is checked once per recipe"
-        assert "resources cannot capture: ['attention']" in caplog.text
-        missing = runner.dropped_shapes if piecewise else runner.dropped_buckets
+        assert "resources cannot capture" in caplog.text or "['attention'] cannot capture" in caplog.text
         assert len(missing) == 2
         monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
         with pytest.raises(RuntimeError, match="accelerator graphs are required"):

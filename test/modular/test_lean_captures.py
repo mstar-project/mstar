@@ -216,7 +216,7 @@ def _capture_runner(resources, steps=None, blocked=()):
         return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
 
     for key in blocked:
-        resources[key].can_capture = lambda: False
+        resources[key].can_capture = lambda spec: False
     configs = _configs()
     submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
                                 compiled_entries_per_shape=1)
@@ -254,11 +254,12 @@ def test_a_twin_is_kept_only_where_the_configs_step_drives_its_resources():
     assert leans == sorted(leans) and [s.bs for s in specs if not s.bucket.lean] == [4, 4, 1, 1, 1, 1]
 
 
-def test_a_blocked_config_reports_its_plain_buckets_alone():
+def test_a_blocked_bucket_reports_its_plain_buckets_alone():
     runner = _capture_runner({"a": _Lean(), "x": _Plain()}, steps={WALK: ["a", "x"], "prefill": ["a"]},
                              blocked=["x"])
     specs = runner.prepare_for_capture()
-    assert _listed(specs) == {("prefill", 1, frozenset()), ("prefill", 1, frozenset("a"))}
+    # blocked buckets are still warmed, so they stay listed; only the plain ones are reported
+    assert {(b.graph_walk, b.bs) for b in runner._blocked_buckets} == {(WALK, 1), (WALK, 4)}
     assert {(b.graph_walk, b.bs, b.lean) for b in runner.dropped_buckets} == {
         (WALK, 1, frozenset()), (WALK, 4, frozenset()),
     }

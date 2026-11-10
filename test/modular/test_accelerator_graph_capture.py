@@ -94,7 +94,6 @@ class _FakeRunner:
     _register_slot = AcceleratorGraphRunner._register_slot
     _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
     _report_dropped = AcceleratorGraphRunner._report_dropped
-    _refused_buckets = AcceleratorGraphRunner._refused_buckets
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
@@ -114,12 +113,10 @@ class _FakeRunner:
         self._fail = fail
         # every bucket alike, so capture keeps the specs' order
         self._capture_costs = {spec.bucket: CaptureCost(0, 0, 0, num_slots) for spec in specs}
-        # walks a resource cannot run inside a graph
-        self._refuse = refuse
         self.attempted: list = []
         self._buckets = {}
         self._memory_pool = None
-        self._blocked_buckets = []
+        self._blocked_buckets = {spec.bucket for spec in specs if spec.bucket.graph_walk in refuse}
         self._executables = {}
         self.barrier = _Group(peer_flags, drop_scopes)
         self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier, instance=self.barrier)
@@ -134,9 +131,6 @@ class _FakeRunner:
 
     def warmup_and_capture(self):
         AcceleratorGraphRunner.warmup_and_capture(self, {spec.bucket for spec in self._specs})
-
-    def _capture_refusal(self, spec):
-        return "no capturable kernel" if spec.bucket.graph_walk in self._refuse else None
 
     def _capture_one(self, spec, forwards):
         self.attempted.append((spec.bucket.graph_walk, spec.slot))
@@ -461,12 +455,11 @@ def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):
     assert clean.dropped_buckets == []
 
 
-def test_a_bucket_a_resource_refuses_is_never_captured_and_runs_eagerly(caplog):
-    """A resource that cannot run a bucket in a graph says so before capture
-    starts: no capture is attempted, the bucket runs eagerly with one warning
-    saying why, and it stays listed, so a deployment that requires every graph
-    still fails. Every rank skips it, scope and all, as it skips an unplanned
-    bucket."""
+def test_a_bucket_a_resource_blocks_is_never_captured_and_runs_eagerly(caplog):
+    """A resource that cannot run a bucket in a graph (`can_capture`): no capture
+    is attempted, the bucket runs eagerly, and it stays listed, so a deployment
+    that requires every graph still fails. Every rank skips it, scope and all, as
+    it skips an unplanned bucket."""
     specs = _specs(walks=("decode", "prefill"))
     runner = _FakeRunner(specs, refuse=frozenset({"prefill"}))
 
@@ -477,43 +470,7 @@ def test_a_bucket_a_resource_refuses_is_never_captured_and_runs_eagerly(caplog):
     assert {walk for walk, _ in runner.attempted} == {"decode"}
     assert [key.graph_walk for key in runner.dropped_buckets] == ["prefill"]
     assert runner.barrier.scopes == len([spec for spec in specs if spec.bucket.graph_walk == "decode"])
-    refusals = [r for r in caplog.records if "runs eagerly: no capturable kernel" in r.message]
-    assert len(refusals) == 1 and refusals[0].levelname == "WARNING"
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
-
-
-class _Refusing:
-    """A resource that refuses buckets above a token count."""
-
-    def __init__(self, limit):
-        self.limit = limit
-
-    def capture_refusal(self, spec):
-        return f"over {self.limit}" if spec.max_row_tokens > self.limit else None
-
-
-def test_the_step_runner_asks_only_the_nodes_own_resources():
-    from mstar.engine.resources.base import Resource
-    from mstar.engine.resources.runner import StepRunner
-
-    class Plain(Resource):
-        @classmethod
-        def build(cls, spec, info):
-            return cls()
-
-    class Refusing(Plain):
-        capture_refusal = _Refusing(64).capture_refusal
-
-    runner = StepRunner(
-        {"plain": Plain(), "gdn": Refusing()},
-        node_resources={"llm": ["plain", "gdn"], "vision": ["plain"]},
-    )
-    big = CGSlotSpec(
-        bucket=BucketKey(graph_walk="prefill", bs=1, num_tokens=128), slot=0,
-        config=SimpleNamespace(get_config_type=lambda: None),
-    )
-    assert runner.capture_refusal(big, node_name="llm") == "gdn: over 64"
-    assert runner.capture_refusal(big, node_name="vision") is None
 
 
 def test_the_longest_row_a_bucket_can_hold():
