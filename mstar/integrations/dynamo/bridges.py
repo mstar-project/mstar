@@ -42,7 +42,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mstar.api_server.openai._util import check_inline_result
+from mstar.api_server.openai._util import check_inline_result, error_type
 from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -112,7 +112,7 @@ def _inline_result(response_format, n=1) -> None:
     try:
         check_inline_result(response_format, n)
     except ValueError as exc:
-        raise _BadRequestError(str(exc)) from exc
+        raise _StatusError(str(exc)) from exc
 
 
 def _image_body(request: dict) -> dict:
@@ -163,19 +163,27 @@ def _speech_body(request: dict) -> dict:
     return body
 
 
-class _BadRequestError(ValueError):
-    """A 400 whose message reaches the client as written.
+class _StatusError(ValueError):
+    """A failure with an HTTP status (400 unless given) for Dynamo to send.
 
     Dynamo's worker reads ``code`` and ``message`` off any exception the
-    handler raises; a bare ``ValueError`` is a 400 too, but reaches the client
-    as ``ValueError: <message>``.
+    handler raises, before it looks at the type, and sanitizes a 5xx body
+    itself; a bare ``ValueError`` is a 400 too, but reaches the client as
+    ``ValueError: <message>``. It stays a ``ValueError`` so a request-parse
+    failure is still one; read ``code``, never the type, for the status.
     """
 
-    code = 400
-
-    def __init__(self, message: str):
+    def __init__(self, message: str, code: int = 400):
         super().__init__(message)
+        self.code = code
         self.message = message
+
+
+def _chunk_error(chunk) -> Exception:
+    """An engine error chunk as the exception to raise, with the chunk's
+    status (a 4xx refusal, a 503 from a failed worker), else 500."""
+    message = chunk.data.decode("utf-8", "replace")
+    return _StatusError(message, int((chunk.metadata or {}).get("status") or 500))
 
 
 class RequestBridge:
@@ -227,7 +235,7 @@ class RequestBridge:
         try:
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
-            raise _BadRequestError(str(exc)) from exc
+            raise _StatusError(str(exc)) from exc
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 
@@ -250,7 +258,7 @@ class RequestBridge:
                     if content := text.feed(chunk.data):
                         yield envelope({"role": "assistant", "content": content})
                 elif chunk.modality == "error":
-                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                    raise _chunk_error(chunk)
                 else:
                     dropped.add(chunk.modality)
             cancelled = _client_gone(context)
@@ -297,7 +305,7 @@ class RequestBridge:
             try:
                 n = image_count(req)
             except ValueError as exc:
-                raise _BadRequestError(str(exc)) from exc
+                raise _StatusError(str(exc)) from exc
             submits = [args]
             seed = args.model_kwargs.get("seed")
             for i in range(1, n):
@@ -314,7 +322,7 @@ class RequestBridge:
                     if chunk.modality == "image":
                         images.append(chunk.data)
                     elif chunk.modality == "error":
-                        raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                        raise _chunk_error(chunk)
                 if _client_gone(context):
                     break
         finally:
@@ -355,7 +363,7 @@ class RequestBridge:
                 if chunk.modality == "audio":
                     pcm.extend(chunk.data)
                 elif chunk.modality == "error":
-                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                    raise _chunk_error(chunk)
         finally:
             self.server.abort_request(rid)
 
@@ -401,7 +409,7 @@ class RequestBridge:
                 elif chunk.modality == "audio":
                     audios.append(chunk)
                 elif chunk.modality == "error":
-                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                    raise _chunk_error(chunk)
         finally:
             self.server.abort_request(rid)
 
@@ -673,7 +681,7 @@ class RealtimeBridge:
                             "response.output_audio.delta", turn.response_id, turn.item_id,
                             delta=base64.b64encode(chunk.data).decode("ascii")))
                     elif chunk.modality == "error":
-                        raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                        raise _chunk_error(chunk)
                 stopped = _client_gone(context)
             finally:
                 self.server.abort_request(rid)
@@ -693,14 +701,18 @@ class RealtimeBridge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
-            logger.exception("realtime turn %s failed", turn.response_id)
-            await events.put(error_event(str(exc), kind="server_error", code="generation_error"))
+            status = exc.code if isinstance(exc, _StatusError) else 500
+            # a refusal is the client's, sent as main's realtime route sends it
+            code = "generation_error" if status >= 500 else None
+            if code:
+                logger.exception("realtime turn %s failed", turn.response_id)
+            else:
+                logger.info("realtime turn %s refused (%d): %s", turn.response_id, status, exc)
+            error = error_event(str(exc), kind=error_type(status), code=code)
+            await events.put(error)
             await events.put(server_event("response.done", response=response_object(
                 turn.response_id, "failed", modalities,
-                status_details={
-                    "type": "failed",
-                    "error": {"code": "generation_error", "type": "server_error"},
-                })))
+                status_details={"type": "failed", "error": error["error"]})))
         finally:
             await events.put(None)
 
@@ -1130,7 +1142,7 @@ class TensorBridge:
         try:
             async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "error":
-                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                    raise _chunk_error(chunk)
                 tensors = self.spec.output_tensors(chunk)
                 if not tensors:
                     continue
