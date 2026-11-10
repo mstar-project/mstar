@@ -4712,6 +4712,9 @@ class KVManager(AttentionResource):
 
     def _grew_since(self, mark: RoomMark | PassMark) -> bool:
         if isinstance(mark, PassMark):
+            # a mark at the pool's size is a holder's, which no room ever reaches
+            if mark.room >= self.config.request_pages:
+                return False
             # pages kept for a waiting request are no room for a passer
             room = self._class_room(mark.guaranteed, passing=True)
         elif mark.rid not in self._asks:
@@ -4720,25 +4723,26 @@ class KVManager(AttentionResource):
             room = self._room_for(mark.rid)
         return room > mark.room or (mark.filed is not None and (mark.filed, mark.taken) != self._index_counts())
 
-    def _room_for(self, rid: str, passing: bool = False) -> int:
+    def _room_for(self, rid: str, passing: bool = False, reclaim: bool = True) -> int:
         """The room ``rid`` may take past what its allotment holds back from borrowers. A guaranteed request that holds
         an allotment takes back what it lends, and past it only the room. Any other request takes the room of its
-        class. ``passing``, or ``rid`` returning past the first request, leaves out `_kept`."""
+        class, with what moves could free only when ``reclaim``. ``passing``, or ``rid`` returning past the first
+        request, leaves out `_kept`."""
         passing = passing or rid in self._passers
         allotment = self._allotments.get(rid)
         if rid not in self._guaranteed or allotment is None:
-            return self._class_room(rid in self._guaranteed, passing)
+            return self._class_room(rid in self._guaranteed, passing, reclaim)
         room = self._room()
         return min(room + self._borrowable, allotment.lends + max(0, room)) - (self._kept if passing else 0)
 
-    def _class_room(self, guaranteed: bool, passing: bool) -> int:
+    def _class_room(self, guaranteed: bool, passing: bool, reclaim: bool = True) -> int:
         """`_room_for` a request that holds no guaranteed allotment. A preemptible request also borrows what
         guaranteed requests lend, unless one of them waits to take pages back. Where moves happen, a guaranteed
         request that asks to be admitted counts what moving every preemptible request would free, since it can take
         that back."""
         if not guaranteed:
             room = self._room() + (0 if self._taking_back() else self._borrowable)
-        elif self._moves:
+        elif self._moves and reclaim:
             # Under the lock even from `grew_since`, since the GPU thread opens a label in `_streams` during an admit.
             # The room is read under it too, so a page freed between the two reads isn't counted in both.
             with self._lock:
@@ -5265,12 +5269,10 @@ class KVManager(AttentionResource):
 
     def _hit_allowance(self, rid: str) -> int:
         """The pages ``rid``'s cache hits on evictable pages may take: `_allowance`, or for a guaranteed request
-        `_room_for` alone, and only the room once it holds no allotment, since what moves could free isn't room yet.
-        Its allotment keeps every page the request's walks write until the request adopts its lease, since a cut
-        leaves the walk to write the cut pages again."""
-        if rid not in self._guaranteed:
-            return self._allowance(rid)
-        return self._room_for(rid) if rid in self._allotments else max(0, self._room())
+        `_room_for` alone, without what moves could free, which isn't room yet. Its allotment keeps every page the
+        request's walks write until the request adopts its lease, since a cut leaves the walk to write the cut pages
+        again."""
+        return self._allowance(rid) if rid not in self._guaranteed else self._room_for(rid, reclaim=False)
 
     def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.

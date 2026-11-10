@@ -1211,6 +1211,21 @@ def test_a_guaranteed_request_with_no_allotment_hits_only_pages_the_room_has():
     assert kv._hit_allowance("g") == 2, "g's hits could take what moving p would free"
 
 
+def test_a_guaranteed_request_returning_past_the_first_with_no_allotment_hits_none_of_the_pages_kept_for_it():
+    """g returns past the first request in the queue holding no allotment, as a moved passer does, and one page is
+    kept for that first request. g's room leaves the kept page out, and so must what its hits may take."""
+    kv = _pool()
+    _running(kv, "x", 4, arrival=0, guaranteed=True, decodes=PAGE_SIZE)
+    _running(kv, "p", 3, arrival=1)
+    _request(kv, "g", 2, arrival=2, guaranteed=True)
+    _request(kv, "h", 9, arrival=3)
+    assert not _ready(kv, "g") and kv._room() == 2 and "g" not in kv._allotments
+    kv._passers.add("g")
+    kv._keeper, kv._kept = "h", 1
+
+    assert kv._hit_allowance("g") == 1, "g's hits could take the page kept for h"
+
+
 class _StubRanks:
     """Two ranks, the other of which agrees on each value but whether the pool moves requests, which it does."""
 
