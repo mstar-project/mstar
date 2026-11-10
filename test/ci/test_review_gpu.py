@@ -1,6 +1,7 @@
 """Check the approval rule in .github/review/gpu_review.py, which decides whether the review bot approves."""
 
 import contextlib
+import functools
 import io
 import json
 import os
@@ -361,8 +362,12 @@ class TestStart(unittest.TestCase):
         self.assertIn("ERAS_RUN_SECRET_ID", (out / "nvidia/unavailable.md").read_text())
         out, launched = self.start({"eras": {"run_secret_id": "s"}})
         self.assertEqual([x[1] for x in launched], ["eras:l1"])
-        self.assertLess(json.loads((out / "run.json").read_text())["end_by"], time.time() + 4 * 3600 - 10 * 60,
+        end_by = json.loads((out / "run.json").read_text())["end_by"]
+        self.assertLess(end_by, time.time() + 4 * 3600 - 10 * 60,
                         "the session would run into the box's deadline and its results go with the box")
+        self.assertGreater(end_by, time.time() + 4 * 3600 - 30 * 60, "the session would lose time it could test in")
+        self.assertIn(time.strftime("stops this session at %Y-%m-%d %H:%M UTC", time.gmtime(end_by)),
+                      (out / "nvidia/brief.md").read_text(), "the session wouldn't know to finish its report in time")
         self.assertNotIn(self.INJECTED, (out / "nvidia/brief.md").read_text(),
                          "model text from an untrusted PR would be instructions to a root shell")
         self.assertEqual(json.loads((out / "findings.json").read_text())["focus"],
@@ -445,11 +450,11 @@ class TestStart(unittest.TestCase):
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",
-                                                                ["correctness"]),
+                                                                ["correctness"], end_by=0),
                       "the PR's arm would be compared with main")
 
     def test_the_brief_says_which_kinds_of_check_to_run_and_only_those_words_get_in(self):
-        kinds, brief = gpu_review.check_kinds, gpu_review.brief
+        kinds, brief = gpu_review.check_kinds, functools.partial(gpu_review.brief, end_by=0)
         self.assertIn("- Checks: correctness (served output, parity, regressions) only. Skip performance",
                       brief(7, "0123456789", "abcdef", "main", "targeted", kinds("correctness")),
                       "a change that can't move speed would still get throughput A/Bs")
