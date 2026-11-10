@@ -1121,17 +1121,18 @@ class RealtimeLiveTranscription(RealtimeTranscription):
         if tail is not None and tail.size:
             await self.step(tail, final=True)
         key, task = self.key, self.relay_task
-        self.key = self.relay_task = None
         try:
             ended = key is None or self.api.stream_input(key, end_input=True)
         except Exception as exc:  # noqa: BLE001 — the item fails, and the session goes on
             # whether the call's input ended is unknown, so its output may never
             # end: the call is aborted rather than waited out
-            if task is not None:
-                task.cancel()
-            self.api.abort_submission(key)
+            self._abort()
             await self._fail(_failed_in_server("commit", exc, s.session_id))
             ended, task = True, None
+        else:
+            # cleared with no await since stream_input, so the relay sees the
+            # commit's end of input, not an early end
+            self.key = self.relay_task = None
         if task is not None:
             await task
         if not ended:
