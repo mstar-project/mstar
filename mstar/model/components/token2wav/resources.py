@@ -15,9 +15,8 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
-    CACHE_FAMILIES,
     DIT_COMPUTE_DTYPE,
-    CacheCapacity,
+    Token2WavStreaming,
     slot_layout,
 )
 
@@ -27,12 +26,15 @@ _TOKENS_PER_SECOND = 25
 
 def token2wav_resources(
     keys: Token2WavKeys, node: str, voice_seconds: tuple[float, float], max_slots: int,
+    streaming: Token2WavStreaming | None = None,
 ) -> list[NodeResourceSpec]:
     """The state pool and the bounded KV caches of ``node``, sized for voices of
-    ``voice_seconds`` (shortest, longest). The state pool has ``max_slots``; each cache
-    one fewer, since the state pool also keeps its sink slot."""
+    ``voice_seconds`` (shortest, longest) and retained as ``streaming`` (the model's
+    ``Token2Wav.streaming``; MiniCPM-o's by default) says. The state pool has
+    ``max_slots``; each cache one fewer, since the state pool also keeps its sink slot."""
+    streaming = streaming or Token2WavStreaming()
     # one token of slack for rounding, each way
-    capacity = CacheCapacity(int(voice_seconds[1] * _TOKENS_PER_SECOND) + 1)
+    capacity = streaming.capacity(int(voice_seconds[1] * _TOKENS_PER_SECOND) + 1)
     min_tokens = max(0, int(voice_seconds[0] * _TOKENS_PER_SECOND) - 1)
     state = RecurrentStateSpec(
         resource_key=keys.state, nodes={node},
@@ -61,7 +63,7 @@ def token2wav_resources(
                 dtype=DIT_COMPUTE_DTYPE if name == "dit" else torch.float32,
             ),
         )
-        for name, family in CACHE_FAMILIES.items()
+        for name, family in streaming.cache_families().items()
     ]
     return [state, *caches]
 

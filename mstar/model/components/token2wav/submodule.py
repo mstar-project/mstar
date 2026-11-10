@@ -25,7 +25,6 @@ from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
     LAST_WINDOW_TOKENS,
-    LEAD_SILENCE,
     SILENCE_CODE,
     WINDOW,
     AttentionCache,
@@ -46,11 +45,13 @@ from mstar.utils.h2d import to_device_nonblocking
 
 class Token2WavSubmodule(NodeSubmodule):
     """Speech codes -> 24 kHz audio, one stream window per step: upstream's
-    ``Token2wav.stream``, fed the way its ``streaming_generate`` feeds it (three
-    silence codes first, 28-code windows advancing by 25, a last flush).
+    ``Token2wav.stream``, fed the way the model's reference feeds it: 28-code windows
+    advancing by 25, a last flush, and for MiniCPM-o (``streaming_generate``) three
+    silence codes first. The model's ``Token2WavStreaming`` (``model.streaming``) says
+    which, and which caches its reference cuts.
 
-    The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
-    the first window gets the silence prepended here. A request's attention caches
+    For MiniCPM-o the windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the
+    TTS; the first window gets the silence prepended here. A request's attention caches
     are on the ``keys.kv`` bounded KV resources, which start from its voice's
     prepared caches; its conv caches and HiFT tails are its slot of ``keys.state``
     (``RecurrentStatePool``). Its stream position is the chunk's offset in the
@@ -73,6 +74,9 @@ class Token2WavSubmodule(NodeSubmodule):
 
     disable_torch_compile = True
     disable_autocast = True
+    # the caches as the model's reference retains them (``Token2WavStreaming``); MiniCPM-o's
+    # until ``__init__`` reads the model's
+    families = CACHE_FAMILIES
 
     def __init__(self, model, keys: Token2WavKeys, voices: dict, eos_code: int, dit_dtype: torch.dtype):
         """``keys``: the node's input signal and resource keys. ``voices``: the model's
@@ -83,7 +87,9 @@ class Token2WavSubmodule(NodeSubmodule):
         self.keys = keys
         self.eos_code = eos_code
         self.bank = VoiceBank.build(voices, dit_dtype=dit_dtype)
-        self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
+        # the model's reference's streaming knobs (``Token2WavStreaming``)
+        self.families = model.streaming.cache_families()
+        self._lead_silence = torch.full((model.streaming.lead_silence,), SILENCE_CODE, dtype=torch.int32)
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         # HiFT up to its spectrum, compiled once with dynamic shapes (every region's
@@ -94,7 +100,7 @@ class Token2WavSubmodule(NodeSubmodule):
     def _caches(self, resources: Mapping) -> WindowCaches:
         """The step's ``WindowCaches``."""
         return WindowCaches(**{
-            name: AttentionCache(resources[self.keys.kv[name]], self.bank.sources[name]) for name in CACHE_FAMILIES
+            name: AttentionCache(resources[self.keys.kv[name]], self.bank.sources[name]) for name in self.families
         })
 
     def _voice_of(self, rid: str) -> tuple[int, int]:
@@ -121,7 +127,7 @@ class Token2WavSubmodule(NodeSubmodule):
                 voice, tokens = self._voice_of(rid)
                 positions.append((tokens, req.get("written", 0), voice))
         steps = {}
-        for name, family in CACHE_FAMILIES.items():
+        for name, family in self.families.items():
             steps[self.keys.kv[name]] = BoundedKVStep(
                 segments=[
                     Segment(request_id=rid, label="main", span=family.span(n, last))
@@ -181,9 +187,9 @@ class Token2WavSubmodule(NodeSubmodule):
             state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
             # HiFT's excitation, window by window from the request's seed
             state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
-        # Window k starts 25k codes into the silence-led stream (its look-back
-        # included), which is what its caches hold before it (``_cache_steps``).
-        state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
+        # Window k starts 25k codes into the (silence-led, for MiniCPM-o) stream, its
+        # look-back included, which is what its caches hold before it (``_cache_steps``).
+        state.add("written", 0 if first else chunk.start_offset + self._lead_silence.numel())
         return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first})
 
     def declare_step(
