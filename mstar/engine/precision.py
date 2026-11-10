@@ -50,6 +50,12 @@ class NodePrecision:
             return self.autocast
         return self.param_dtype if self.autocast else None
 
+    @property
+    def compute_dtype(self) -> torch.dtype | None:
+        """The dtype the node computes in: its autocast dtype, else its param
+        dtype; None for a node that keeps its build dtypes without autocast."""
+        return self.autocast_dtype or self.param_dtype
+
 
 def fp32_names(module: torch.nn.Module, globs: tuple[str, ...]) -> set[str]:
     """Names of the modules, params and buffers ``globs`` match. A glob that

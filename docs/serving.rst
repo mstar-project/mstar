@@ -553,9 +553,10 @@ cast. A paged KV cache in float32 is a load error too: the attention backends th
 paged caches take float16 and bfloat16 only. Paged and ring KV caches,
 attention, cross-attention and ragged attention accept it. Without it, a resource takes
 the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
-attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
-keep their build dtype, or have different param dtypes, and that declares no dtype fails
-at load. The full resolution order is in :doc:`adding_models`.
+attention resource takes its KV cache's dtype before its nodes'. Without autocast, a node's
+dtype is its param dtype; under autocast, the autocast dtype. A resource whose nodes keep
+their build dtypes without autocast, or compute in different dtypes, and that declares no
+dtype fails at load. The full resolution order is in :doc:`adding_models`.
 
 **Node precision.** Each node runs under the precision policy its model declares: the
 dtype its params are cast to, the modules kept fp32, and whether its forward runs under

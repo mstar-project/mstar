@@ -39,7 +39,10 @@ class _Model(StubModel):
         self._kv_dtype = kv_dtype
 
     def get_node_precision(self, node_name):
-        # "inherit" runs in the model's dtype, "fp16" in its own, "opted_out" in none
+        # "inherit" runs in the model's dtype, "fp16" in its own, "opted_out" in none;
+        # "autocast_only" keeps its build dtypes but autocasts in bf16, as GLM-5.2 does
+        if node_name == "autocast_only":
+            return NodePrecision(None, autocast=torch.bfloat16)
         dtype = {"inherit": self._dtype, "fp16": torch.float16, "opted_out": None}[node_name]
         return NodePrecision(dtype)
 
@@ -107,7 +110,7 @@ def test_yaml_sets_the_kv_dtype_per_resource_key():
 
 
 def test_nodes_without_a_dtype_must_declare_one():
-    with pytest.raises(ValueError, match=r"'kv' declares no dtype .* keep the dtype they were built in"):
+    with pytest.raises(ValueError, match=r"'kv' declares no dtype .* keep their build dtypes without autocast"):
         _build(_Model(torch.bfloat16, {"opted_out"}))
     # the model-wide None is no fallback either
     with pytest.raises(ValueError, match=r"'kv' declares no dtype"):
@@ -115,6 +118,10 @@ def test_nodes_without_a_dtype_must_declare_one():
     assert _dtypes(_Model(None, {"inherit"}, kv_dtype=torch.bfloat16)) == (
         torch.bfloat16, torch.bfloat16,
     )
+
+
+def test_a_node_that_only_autocasts_gives_its_resources_the_autocast_dtype():
+    assert _dtypes(_Model(None, {"autocast_only"})) == (torch.bfloat16, torch.bfloat16)
 
 
 def test_shared_resource_with_mismatched_node_dtypes_errors():

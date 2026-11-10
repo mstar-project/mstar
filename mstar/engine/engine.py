@@ -177,8 +177,8 @@ def _row_inputs(
 
 
 def _common_dtype(dtypes: Iterable[torch.dtype | None]) -> torch.dtype | None:
-    """The one param dtype a resource's nodes were cast to, or None if they differ or
-    one keeps the dtype it was built in (``NodePrecision.param_dtype`` None)."""
+    """The one dtype a resource's nodes compute in (``NodePrecision.compute_dtype``),
+    or None if they differ or one has none."""
     distinct = set(dtypes)
     return distinct.pop() if len(distinct) == 1 else None
 
@@ -790,7 +790,7 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
-            local_dtypes = {node: precisions[node].param_dtype for node in relevant_nodes}
+            local_dtypes = {node: precisions[node].compute_dtype for node in relevant_nodes}
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -896,8 +896,8 @@ class Engine:
                 )
 
     def node_dtype(self, node_name: str) -> torch.dtype | None:
-        """The dtype ``node_name`` was cast to and runs in, or None if it keeps its build dtypes."""
-        return self._submodules[node_name].precision.param_dtype
+        """The dtype ``node_name`` computes in (``NodePrecision.compute_dtype``), or None."""
+        return self._submodules[node_name].precision.compute_dtype
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
         """Put ``node_name`` on resident tables if it can and the deployment
@@ -1250,12 +1250,12 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        param_dtype = submodule_mgmt.precision.param_dtype
+        compute_dtype = submodule_mgmt.precision.compute_dtype
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region's activations run in; a node that keeps its
-            # build dtype declares none, and gets float32
-            param_dtype or torch.float32,
+            # build dtypes without autocast declares none, and gets float32
+            compute_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
         apply_region_ladders(

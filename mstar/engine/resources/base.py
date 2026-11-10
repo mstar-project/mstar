@@ -65,8 +65,8 @@ class EngineResourceInfo:
     device: torch.device
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
-    # the param dtype this resource's local nodes were cast to; None when they
-    # disagree or one keeps the dtype it was built in (``NodePrecision``)
+    # the dtype this resource's local nodes compute in (``NodePrecision.compute_dtype``:
+    # autocast's, else the params'); None when they disagree or one has none
     compute_dtype: torch.dtype | None = None
     # each local node's resolved dtype, to name them when there is no common one
     node_dtypes: "Mapping[str, torch.dtype | None]" = field(default_factory=dict)
@@ -112,7 +112,7 @@ class EngineResourceInfo:
         if len(set(self.node_dtypes.values())) > 1:
             reason = f"its nodes run in different dtypes {dtypes}"
         else:
-            reason = f"its nodes {dtypes} keep the dtype they were built in (no param_dtype)"
+            reason = f"its nodes {dtypes} keep their build dtypes without autocast"
         raise ValueError(
             f"resource {resource_key!r} declares no dtype and {reason}; set "
             "`dtype` on its config, or `resources.<key>.dtype` in YAML"

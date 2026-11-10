@@ -992,12 +992,15 @@ kernel is planned in. The engine resolves each resource's dtype once, at load:
 1. the spec's own ``dtype``, if set;
 2. for ``AttentionSpec`` and ``CrossAttentionSpec`` only, the ``dtype`` of the KV cache
    they read, because the kernel is planned against those pages;
-3. otherwise, the dtype that every local node of the resource resolved to.
+3. otherwise, the dtype that every local node of the resource computes in: its autocast
+   dtype if it runs under autocast, else its ``param_dtype``.
 
-If none of these gives a dtype, loading fails. This happens when the resource's nodes keep
-their build dtype (``param_dtype=None``), or when they have different param dtypes. The
-engine never silently allocates fp32. Declare the dtype on the spec in those cases. A
-node's ``param_dtype`` applies whether or not it runs under autocast.
+If none of these gives a dtype, loading fails. This happens when one of the resource's
+nodes keeps its build dtypes without autocast (``param_dtype=None``, ``autocast=False``),
+or when the nodes compute in different dtypes. The engine never silently allocates fp32.
+Declare the dtype on the spec in those cases. A node that keeps its build dtypes but runs
+under autocast, as GLM-5.2 does (``NodePrecision(None, autocast=torch.bfloat16)``), gives
+its resources the autocast dtype.
 
 A resource can also store in a different dtype from the one its nodes compute in. A node
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
