@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.scheduling_policy import RoundRobin
 from mstar.worker.speculation import SpeculationTarget
 
 
@@ -18,11 +20,14 @@ def _speculator(target, other_ready=True, speculation=None, mid_prefill_walks=fr
         peek=peek,
         max_consecutive_spec=8,
         scheduler=SimpleNamespace(
-            has_ready_excluding=lambda key: peeked.append(key) or other_ready,
+            has_ready_excluding=lambda key, among=None: peeked.append(key) or other_ready,
             next_batch=lambda exclude_target: excluded.append(exclude_target),  # noqa: PLW0108
             chunks=lambda node_name, graph_walk: budgeted,
+            policy=RoundRobin(),
         ),
     ).speculator
+    scheduler = speculator.scheduler
+    scheduler.chain_yields = MicroScheduler.chain_yields.__get__(scheduler)
     speculator.can_speculate = lambda batch: True
     speculator._choose_spec_target = lambda batch: target
     speculator._try_speculate_next = lambda pending, target: speculation

@@ -704,7 +704,7 @@ def _higgs(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.multimodal_decoder import MediaIntake
     config = HiggsAudioModelConfig()
     pad = config.audio_in_token_idx
-    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
@@ -761,7 +761,7 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     )
     return _bare(
         Qwen3_5DenseModel, config=config, vision_config=None,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -798,7 +798,7 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
     config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
     return _bare(
         MuseGlimmerModel, config=config, vision_config=vision_config,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -850,7 +850,7 @@ def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
     config = Qwen3ASRModelConfig()
     pad = config.audio_token_id
-    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
@@ -868,7 +868,7 @@ def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _canary(name, model_kwargs, tmp_path, monkeypatch):

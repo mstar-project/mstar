@@ -310,8 +310,9 @@ engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
-  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  ``repetition_penalty``, ``min_p``, ``penalize_prompt`` and ``ignore_eos``. The
+  conductor fills in the per-request seed, derived per resource key so each sampler of a
+  request draws its own stream. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
   Further knobs, each needing a ``SamplerSpec`` capability (CUDA only):
@@ -362,7 +363,8 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 .. code-block:: python
 
    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-       keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+       keys = ("temperature", "top_p", "top_k", "min_p",
+               "repetition_penalty", "penalize_prompt", "ignore_eos")
        return {
            SAMPLER: SamplingReqConfig(
                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
@@ -372,6 +374,25 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 BAGEL (``bagel_model.py``) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.
+
+Sampling knobs mean the same thing on every model (:ref:`generation-parameters`), and
+the server range-checks them before your model sees them. A model's part of that
+contract:
+
+- Default each knob the request leaves unset from the checkpoint's own
+  ``generation_config.json`` (``mstar.model.utils.load_generation_defaults``),
+  falling back to your config only when the checkpoint ships none.
+- Raise ``ValueError`` (a 400) for an input you cannot serve; never clamp, coerce, or
+  fall back silently. A ``SamplerSpec`` without ``enable_repetition_penalty`` or
+  ``enable_min_p`` refuses those knobs at admission, so do not default a penalty onto it.
+- Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
+  client sends is logged as ignored by the server. ``test_model_contracts.py`` fails for a
+  registered model that does not override it.
+- Bound a request's length, or a denoise loop's step count, through ``get_loop_caps``: the
+  conductor refuses a cap past the loop's ``max_iters`` instead of cutting the request short,
+  so do not clamp it, or check it against a typed-in limit, yourself.
+- Draw any model-local randomness from the request's seed (``random_seed`` on the
+  forward-pass info), never the global RNG.
 
 A spec can also build its own request's config from ``model_kwargs``
 (``NodeResourceSpec.request_config``), which the conductor adds beside the model's. That
@@ -849,9 +870,9 @@ The spec types are:
        RoPE on CUDA only and refuses other configs. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
-   * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
+   * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
-       seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
+       seen-token mask. ``enable_repetition_penalty`` declares a capability, not an
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
@@ -946,7 +967,7 @@ appears in no spec, so it receives no resources:
            SamplerSpec(
                resource_key=SAMPLER, nodes={"LLM"},
                vocab_size=self.config.vocab_size,
-               enable_repetion_penalty=True,
+               enable_repetition_penalty=True,
            ),
            PositionSpec(
                resource_key=ROPE, nodes={"LLM"},
@@ -1005,10 +1026,10 @@ to N-1, using its own vocabulary size and no repetition penalty:
 
    SamplerSpec(resource_key=TALKER_SAMPLER, nodes={"Talker"},
                vocab_size=self.config.talker_text.vocab_size,
-               enable_repetion_penalty=True),
+               enable_repetition_penalty=True),
    SamplerSpec(resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                vocab_size=self.config.code_predictor.vocab_size,
-               enable_repetion_penalty=False),
+               enable_repetition_penalty=False),
 
 The forward looks up each sampler by key and calls ``.sample()`` on it::
 
@@ -2040,7 +2061,7 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's.
-``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
+``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. A decode step whose token also streams to
 another node keeps only the loop-back on the device: give the loop-back its own signal
@@ -2181,6 +2202,27 @@ into one GPU call. A submodule controls this behavior with these methods:
   applies to the rows a speculation chain continues, the backlog and the queued rows alike; when
   every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
   last in that same line.
+
+**Walk priorities.** Which (node, walk) a worker's next step goes to is a
+``SchedulingPolicy`` (``mstar/worker/scheduling_policy.py``). By default it is round robin:
+the least recently scheduled key first, and a speculation chain keeps its first step before
+it gives way to other ready work. A model that returns ``WalkPriority`` entries from
+``Model.get_walk_priorities`` gets ``Priority`` instead. An entry names a node (all its
+walks), a walk (all its nodes) or one (node, walk), and where entries overlap the most
+specific decides: a pair over a walk over a node. Keys with ready rows go in priority order,
+round robin among equals, and a chain gives way at once when a key above its own has a row
+the engine would take. That trades the other keys' steps for the listed one's latency, so it
+suits a walk whose steps are short, such as a TTS model's prefill, whose first audio waits on
+it while decode streams have time to spare: list the walk, and every node on it is covered.
+A key that stays ready holds lower ones back for as long as it does, unless they have a
+``max_wait``: a ready key that has gone that many of the worker's chain steps (every step on
+its main chain, side-lane steps not counted) since it last ran goes
+first, longest waiting first, and a chain gives it its next step. A priority on one walk of a
+combined walk lifts the whole combined key in that order, its other walks' rows included, and
+a backlogged key, split over several steps, still finishes first whatever its priority. A
+deployment replaces the entries, sets a default ``max_wait`` or turns priorities off with the
+serving config's ``scheduling`` (see :doc:`serving`). An entry naming nothing the model runs,
+a negative priority, or two entries for the same target refuse the worker's start.
 
 .. _combined-walks:
 
@@ -3216,7 +3258,7 @@ own KV cache and attention, a second KV cache for the encoder context, a
 ``CrossAttentionSpec`` over that second cache, a ``PositionSpec``, and a ``SamplerSpec``.
 The ``PositionSpec`` exists only for the position counter. Whisper uses learned position
 embeddings, so the planned ids index an ``embed_positions`` table instead of driving RoPE.
-The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcription
+The ``SamplerSpec`` sets ``enable_repetition_penalty=False``, because ASR transcription
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the
@@ -3381,14 +3423,17 @@ or the engine refuses to start; Muse Glimmer and Ripple-65B return ``{}`` until 
 through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = False``) has no
 ``prefill_text`` walk, so the scaffold returns ``{}`` for it. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
-its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
-temporal group), and ``prepare``, which turns an attachment into the encoder's input
+its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
+nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
+renders each), the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+per temporal group), and ``prepare``, which turns an attachment into the encoder's input
 tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
-to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
+to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
+with its grid), and ``process_prompt`` returns the pads' layout as ``MEDIA_LAYOUT``
+metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
 schedule's walk and the KV layout's alike. ``kv_layout``'s ``advance``, how far the prompt
 moves the position counter, defaults to the prompt's length; under Qwen-style MRoPE it is
@@ -3406,13 +3451,15 @@ The ``LLM`` node subclasses ``SampledTokenDecoder``
 (decode, packed text prefill, mixed, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
-(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+(``where(mask, media[cumsum(mask) - 1], embed(ids))``, the media in prompt order and the mask
+of their tokens laid out from ``MEDIA_LAYOUT``, not found by pad id, so media may share a
+placeholder token), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
 loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
 a one-token budget, ends the partition before decode runs. The loop's cap,
-``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
-ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+``max(1, max_output_tokens - 1)``, is the only budget. Each encoder's rows match the tokens of
+its runs in the layout, checked in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
 
@@ -3437,8 +3484,8 @@ sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's p
 rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
-calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's
-``reasoner_prefill_vision``). A graph that names its other walks otherwise sets
+calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
+``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text

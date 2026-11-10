@@ -612,7 +612,7 @@ def _higgs():
         model = model_object(HiggsAudioModel, c)
         llm = model.build_llm(group).to(DTYPE)
         llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
-        encoders = (audio_encoder(c.audio_in_token_idx),)
+        encoders = (audio_encoder(),)
         return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
 
     def inputs(c, n, seed):

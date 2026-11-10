@@ -13,21 +13,26 @@ and its attention key, and an MRoPE model adds its own positions.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
 one pad per token at intake (`expand_media_pads`). Its encoders' outputs
-ride as tensors named by `MediaEncoder.output`, and the forward splices them
-in at their pads: ``where(pad, media[cumsum(pad) - 1], embed(ids))``. The
+ride as tensors named by `MediaEncoder.output`. `prepare_inputs` reads the
+row's ``MEDIA_LAYOUT`` on the host and lays them out as one prompt-ordered
+``MEDIA_EMBEDS`` and a ``MEDIA_MASK`` of the row's tokens, True on each
+run's; the forward splices ``where(mask, media[cumsum(mask) - 1],
+embed(ids))``. The layout places the rows, not the pad ids, so encoders may
+share a placeholder token and a sampled id never takes a media row. The
 contract that makes this capture-safe:
 
-- a row's media tensor holds exactly the pads in its ids, in prompt order
-  (`prepare_inputs` checks the row count against the intake's layout), so
-  the packed step's media, concatenated in row order, line up with the
-  cumulative pad count;
-- real tokens precede a replay's padding tail, so the tail's stale ids
-  cannot shift a real row's index; and a captured media buffer has at least
-  the bucket's tokens rows, so a tail index stays in bounds and
-  `splice_media`'s clamp to the last row never binds.
+- a row's media tensor holds exactly the tokens of its runs, in prompt
+  order (`prepare_inputs` checks each encoder's row count against the
+  layout), so the packed step's media, concatenated in row order, line up
+  with the cumulative mask count;
+- every step of the media capture's walks brings the mask, and real tokens
+  precede a replay's padding tail, so the tail's stale mask cannot shift a
+  real row's index; and the captured media buffer has at least the bucket's
+  tokens rows, so a tail index stays in bounds and `splice_media`'s clamp to
+  the last row never binds.
 
-A step that splits a media row (chunked prefill) must slice its media by
-the host pad counts of each piece.
+A step that splits a media row (chunked prefill) must slice its mask with
+its ids, and its media by the mask's count in each piece.
 
 The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
@@ -65,7 +70,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -75,7 +80,13 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
+
+# A media row's encoder rows in prompt order, and its tokens' mask of where
+# they go (`SampledTokenDecoder._media_inputs`)
+MEDIA_EMBEDS = "media_embeds"
+MEDIA_MASK = "media_mask"
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
@@ -206,8 +217,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             )
 
         def media(n: int) -> ARNodeInputs:
-            # every encoder's buffer, `n` rows: a step without that medium
-            # leaves it stale, and no pad reads it. A row advances the position
+            # the prompt-ordered media of every encoder and its mask, `n` rows
+            # each; the mask on the host, as `_media_inputs` builds it, since a
+            # replay pads real rows with these. A row advances the position
             # counter by its own length, so a replay's padding row (n = 0)
             # moves nothing beside real rows that place their own positions.
             return ARNodeInputs(
@@ -215,10 +227,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 resource_step_info=n,
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
                 tensor_inputs={
-                    e.output: torch.zeros(
+                    MEDIA_EMBEDS: torch.zeros(
                         (n, self.config.hidden_size), device=device, dtype=self.model.embed_dtype,
-                    )
-                    for e in self._encoders
+                    ),
+                    MEDIA_MASK: torch.zeros(n, dtype=torch.bool),
                 },
             )
 
@@ -259,8 +271,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 make_node_input=media,
                 capture_batch_sizes=self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(walks[0]),
-                # a media buffer is [tokens, hidden], and hidden can equal a bucket
-                input_seq_dims={e.output: 0 for e in self._encoders},
+                # the media buffer is [tokens, hidden], and hidden can equal a bucket
+                input_seq_dims={MEDIA_EMBEDS: 0, MEDIA_MASK: 0},
             ))
         return configs
 
@@ -283,11 +295,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def _media_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
     ) -> ARNodeInputs:
-        """A whole multimodal prompt as one row: its ids, and each encoder's
-        output for the forward to splice in.
+        """A whole multimodal prompt as one row: its ids, and its encoders'
+        rows in prompt order (``MEDIA_EMBEDS``) with the mask of the tokens
+        they replace (``MEDIA_MASK``), both laid out from the row's
+        ``MEDIA_LAYOUT``: slices of the encoders' outputs at host offsets, so
+        no device sync.
 
         Each medium's row count, none when its output is missing, is checked
-        against the pads the intake laid out, on host values only; a mismatch
+        against the tokens its runs take, on host values only; a mismatch
         fails this request (a captured replay would otherwise splice in the
         previous step's rows). A model placing its own positions
         (`prompt_positions`) hands them over as ``custom_pos_ids``, and its
@@ -297,18 +312,34 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """
         ids = inputs["text_inputs"][0]
         layout = fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}
-        media: dict[str, torch.Tensor] = {}
+        mask, runs = media_rows(layout, ids.shape[0])
+        unknown = {r.output for r in runs} - {e.output for e in self._encoders}
+        if unknown:
+            raise ValueError(f"the prompt's media layout names {sorted(unknown)}, which no encoder of this node sends")
+        outputs: dict[str, torch.Tensor] = {}
         for e in self._encoders:
-            pads = sum(
-                n for n, out in zip(layout.get("tokens", ()), layout.get("output", ()), strict=True)
-                if out == e.output
-            )
+            pads = sum(r.tokens for r in runs if r.output == e.output)
             rows = inputs[e.output][0] if inputs.get(e.output) else None
             found = 0 if rows is None else rows.shape[0]
             if found != pads:
                 raise ValueError(f"{e.output} has {found} rows for the prompt's {pads} pads")
-            if rows is not None:
-                media[e.output] = rows
+            if found:
+                outputs[e.output] = rows
+        if len(outputs) == 1:
+            # one encoder's runs read its output whole, in order
+            (embeds,) = outputs.values()
+        else:
+            # each run takes the next rows of its encoder's output, in prompt
+            # order; a run of no tokens takes none (its encoder may send none)
+            cursor = dict.fromkeys(outputs, 0)
+            pieces = []
+            for r in runs:
+                if r.tokens:
+                    at = cursor[r.output]
+                    pieces.append(outputs[r.output][at:at + r.tokens])
+                    cursor[r.output] += r.tokens
+            embeds = torch.cat(pieces) if pieces else None
+        media = {} if embeds is None else {MEDIA_EMBEDS: embeds, MEDIA_MASK: mask}
         # the stream's counter is keyed by the worker's handle (AGENTS.md invariant 14)
         start = self.node_resources[self.POS_KEY].position(rid=fwd_info.rid_handle, label="main")
         pos_ids, advance = self.prompt_positions(start, layout, ids.shape[0])
@@ -411,11 +442,18 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
             return {"input_ids": ids}
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
-        for e in self._encoders:
-            # in row order, as the forward's cumulative pad count reads them
-            rows = [inp.tensor_inputs[e.output] for inp in inputs if e.output in inp.tensor_inputs]
-            if rows:
-                out[e.output] = torch.cat(rows, dim=0)
+        if not self._encoders:
+            return out
+        # in row order, as the forward's cumulative mask count reads them
+        rows = [inp.tensor_inputs[MEDIA_EMBEDS] for inp in inputs if MEDIA_EMBEDS in inp.tensor_inputs]
+        if rows:
+            out[MEDIA_EMBEDS] = torch.cat(rows, dim=0)
+            # one host mask for the step, one copy: a row without media masks nothing
+            masks = []
+            for inp in inputs:
+                mask = inp.tensor_inputs.get(MEDIA_MASK)
+                masks.append(torch.zeros(inp.input_seq_len, dtype=torch.bool) if mask is None else mask)
+            out[MEDIA_MASK] = to_device_nonblocking(torch.cat(masks), out["input_ids"].device)
         return out
 
     def declare_step(
@@ -473,14 +511,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        media = {e.output: tensors.pop(e.output) for e in self._encoders if e.output in tensors}
+        media, mask = tensors.pop(MEDIA_EMBEDS, None), tensors.pop(MEDIA_MASK, None)
         decoder_kwargs = self.decoder_kwargs(graph_walk, engine_inputs, input_ids.shape[0], **tensors)
         embeds = self.model.embed(input_ids)
-        for e in self._encoders:
-            rows = media.get(e.output)
-            # a host shape: an eager step without this medium skips it
-            if rows is not None and rows.shape[0]:
-                embeds = splice_media(embeds, e.pads(input_ids), rows)
+        # a host shape: an eager step without media skips it
+        if media is not None and media.shape[0]:
+            embeds = splice_media(embeds, mask, media)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head

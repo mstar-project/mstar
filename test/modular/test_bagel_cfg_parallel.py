@@ -55,7 +55,13 @@ def _bare_model() -> BagelModel:
         repetition_penalty=1.0,
         ignore_eos=False,
         vocab_size=32,
+        # the image geometry check_request_kwargs bounds width / height by
+        latent_downsample=16, max_latent_size=64,
     )
+    model.sampling_defaults = {
+        "temperature": 1.0, "top_k": 0, "top_p": 1.0,
+        "repetition_penalty": 1.0, "ignore_eos": False,
+    }
     model._has_cfg_parallel = True
     model._has_llm_disaggregation = False
     model._image_gen_remote_handoff = False
@@ -189,6 +195,36 @@ def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(inputs, targ
     outputs = {"new_token": [torch.tensor([4])]}
     LLMSubmodule.postprocess(llm, "r", info, outputs)
     assert LLMSubmodule.check_stop(llm, "r", info, outputs) == stop
+
+
+@pytest.mark.parametrize(("inputs", "target", "think"), [
+    (["image", "text"], "text", False),
+    (["text"], "image", True),
+], ids=["text", "think-then-image"])
+def test_a_one_token_budget_ends_at_the_prefills_token(inputs, target, think):
+    """The last prefill samples the only token asked for, so no decode step
+    follows it: a text reply ends there, and a think-then-image request goes
+    straight to its image."""
+    from mstar.model.bagel.bagel_model import DECODE, FINAL_PREFILL
+
+    model = _bare_model()
+    model._has_cfg_parallel = False
+    signals = {name: [SimpleNamespace(dims=[3, 8, 8])]
+               for name in ("text_inputs.0", "text_inputs.1", *(("image_inputs.0",) if "image" in inputs else ()))}
+    kwargs = {"think_mode": think, ROLE_TURNS: target == "text"}
+    if target == "image":
+        kwargs = _image_kwargs(model, kwargs)
+    full = model.walk_plan("default", inputs, [target], signals, kwargs)
+    one = model.walk_plan("default", inputs, [target], signals, {**kwargs, "max_output_tokens": 1})
+    assert DECODE in [step.walk for step in full]
+    assert DECODE not in [step.walk for step in one]
+    last_prefill = max(k for k, step in enumerate(one) if step.step_metadata.get(FINAL_PREFILL) is not None)
+    assert one[last_prefill].step_metadata[FINAL_PREFILL] is True
+    if target == "text":
+        assert len(one) == last_prefill + 1
+    else:
+        assert [step.walk for step in one[last_prefill + 1:]] == [step.walk for step in full if step.walk != DECODE][
+            last_prefill + 1:]
 
 
 def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():

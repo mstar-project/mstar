@@ -48,6 +48,7 @@ def _bagel():
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
     model.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
     model._has_cfg_parallel = model._has_llm_disaggregation = False
+    model.sampling_defaults = {"temperature": 0.0, "top_k": 0, "top_p": 1.0}
     return model
 
 
@@ -435,7 +436,7 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
     pad = cfg.audio_in_token_idx
-    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    model.media = (MediaIntake("audio", audio_encoder(), pad, model._audio_intake),)
     # two whole chunks of 50 rows and a 1.5 s one of 19
     clip = torch.zeros(int(9.5 * cfg.sampling_rate))
 
@@ -610,14 +611,15 @@ def test_vjepa2_s_plan_is_the_routed_walk_and_needs_the_video(kind):
         m.walk_plan("default", ["video"], ["video"], {}, {})
 
 
-@pytest.mark.parametrize("horizon", [2, 5, 10_000])
+@pytest.mark.parametrize("horizon", [2, 5, 16])
 def test_vjepa2_s_cap_alone_ends_the_rollout_at_its_horizon(horizon):
-    """No stop check ends the rollout, so its cap is every frame a request gets. Each
-    iteration reads the next action, so a trajectory shorter than the cap is refused
-    before the loop could read past it."""
+    """No stop check ends the rollout, so its cap is every frame a request gets
+    (past the loop's max_iters the conductor refuses it). Each iteration reads the
+    next action, so a trajectory shorter than the cap is refused before the loop
+    could read past it."""
     model = _vjepa2()
     cap = model.get_loop_caps(rollout_horizon=horizon)[model.ROLLOUT_LOOP_NAME]
-    assert cap == min(horizon, model.config.max_rollout_horizon)
+    assert cap == horizon
     trajectory = torch.zeros(cap, 7)
     model.process_prompt(None, [], ["video"], {}, rollout_horizon=horizon, actions=trajectory, states=trajectory)
     with pytest.raises(ValueError, match="trajectory length"):
@@ -701,8 +703,7 @@ def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
     """The prefill samples the first token and the decode loop's cap runs the
     rest: the stop check counts no budget of its own, so the cap alone must
     leave max_tokens tokens (a budget of 1 ends at the prefill)."""
-    loop = "reasoner_decode_loop" if name == "cosmos3" else "decode_loop"
-    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max_tokens
 
 
 def _whisper():
@@ -712,6 +713,7 @@ def _whisper():
 
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig(lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360})
+    model.sampling_defaults = {}
     model.log_mel = LogMelSpectrogram(
         num_mel_bins=model.config.num_mel_bins, sampling_rate=model.config.sampling_rate,
         n_fft=model.config.n_fft, hop_length=model.config.hop_length, chunk_length=model.config.chunk_length,

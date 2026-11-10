@@ -39,6 +39,7 @@ from mstar.model.multimodal import (
     VIDEO,
     MediaEncoder,
     MediaPads,
+    MediaRun,
     PromptPart,
     check_attachments,
     expand_media_pads,
@@ -84,11 +85,15 @@ class PreparedMedia(NamedTuple):
 class MediaIntake:
     """How a prompt's attachments of one ``modality`` reach their encoder.
 
-    Each attachment fills ``runs(metadata)`` placeholders ``pad`` in the
-    rendered prompt (one when ``runs`` is None); ``prepare(attachment,
-    metadata)`` gives its `PreparedMedia`, and each placeholder is expanded
-    to its run's tokens, between ``sentinels`` when given. ``metadata`` is
-    the attachment's loader metadata, ``{}`` when it came with none.
+    Each attachment fills ``runs(attachment, metadata)`` placeholders
+    ``pad`` in the rendered prompt (one when ``runs`` is None);
+    ``prepare(attachment, metadata)`` gives its `PreparedMedia`, and each
+    placeholder is expanded to its run's tokens, between ``sentinels`` when
+    given. ``metadata`` is the attachment's loader metadata, ``{}`` when it
+    came with none. Intakes may share a ``pad`` (and then its sentinels):
+    the nth placeholder of a pad goes to the nth attachment of that pad in
+    the order of the prompt's parts, which is where `_prompt_ids` renders
+    each attachment.
     """
 
     modality: str
@@ -96,16 +101,16 @@ class MediaIntake:
     pad: int
     prepare: Callable[[torch.Tensor, dict], PreparedMedia]
     sentinels: tuple[int, int] | None = None
-    runs: Callable[[dict], int] | None = None
+    runs: Callable[[torch.Tensor, dict], int] | None = None
 
 
 class MediaPrompt(NamedTuple):
-    """A prompt after intake: its ids with each placeholder expanded, every
-    encoder's inputs in prompt order, and the runs' grids by pad."""
+    """A prompt after intake: its ids with each placeholder expanded to its
+    run (each run's encoder output and grid), and every encoder's inputs in
+    prompt order."""
 
     pads: MediaPads
     inputs: NameToTensorList
-    grids: dict[int, list[Sequence[int]]]
 
 
 class MultimodalDecoderModel(Model):
@@ -235,8 +240,10 @@ class MultimodalDecoderModel(Model):
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
     ) -> torch.Tensor:
         """The rendered prompt's host ids, each attachment's placeholders in
-        place. ``raw`` is each modality's attachments; ``kwargs`` are
-        `process_prompt`'s."""
+        place, the attachments rendered in the order of ``parts``: intake
+        gives the nth placeholder of a pad to the nth attachment of that pad
+        in part order (`MediaIntake`). ``raw`` is each modality's
+        attachments; ``kwargs`` are `process_prompt`'s."""
         raise NotImplementedError
 
     def process_prompt(
@@ -308,31 +315,39 @@ class MultimodalDecoderModel(Model):
 
         ids = self._prompt_ids(parts, raw, **kwargs)
         # before any attachment is prepared: user text that spells a placeholder
+        # (per pad id, which intakes may share)
+        want: dict[int, int] = {}
         for m, intake in media.items():
-            found = int((ids == intake.pad).sum())
-            want = sum(
-                1 if intake.runs is None else intake.runs(metadata(m, i)) for i in range(len(raw[m]))
+            want[intake.pad] = want.get(intake.pad, 0) + sum(
+                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i)) for i in range(len(raw[m]))
             )
-            if found != want:
+        for pad, n in want.items():
+            found = int((ids == pad).sum())
+            if found != n:
+                names = " / ".join(m.modality for m in self.media if m.pad == pad)
                 raise ValueError(
-                    f"multimodal placement mismatch: the prompt holds {found} {m} "
-                    f"placeholders for {want} {m} inputs"
+                    f"multimodal placement mismatch: the prompt holds {found} {names} "
+                    f"placeholders for {n} {names} inputs"
                 )
+        sentinels: dict[int, tuple[int, int]] = {}
+        for m in self.media:
+            if m.sentinels is not None and sentinels.setdefault(m.pad, m.sentinels) != m.sentinels:
+                raise ValueError(f"{self.NAME}: intakes sharing placeholder {m.pad} wrap it in different sentinels")
         inputs: NameToTensorList = {}
-        counts: dict[int, list[int]] = {m.pad: [] for m in self.media}
-        grids: dict[int, list[Sequence[int]]] = {}
+        # per pad id, its runs in prompt order: the nth placeholder of a pad is its nth run
+        pad_runs: dict[int, list[MediaRun]] = {m.pad: [] for m in self.media}
         for part in parts:
             intake = media.get(part.modality)
             if intake is None:
                 continue
             prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index))
-            counts[intake.pad] += prepared.tokens
-            if prepared.grids is not None:
-                grids.setdefault(intake.pad, []).extend(prepared.grids)
+            grids = [()] * len(prepared.tokens) if prepared.grids is None else prepared.grids
+            pad_runs[intake.pad] += [
+                MediaRun(n, intake.encoder.output, grid) for n, grid in zip(prepared.tokens, grids, strict=True)
+            ]
             for name, tensor in prepared.inputs.items():
                 inputs.setdefault(name, []).append(tensor)
-        sentinels = {m.pad: m.sentinels for m in self.media if m.sentinels is not None}
-        return MediaPrompt(expand_media_pads(ids, counts, sentinels), inputs, grids)
+        return MediaPrompt(expand_media_pads(ids, pad_runs, sentinels), inputs)
 
     def max_input_files(self) -> dict[str, int]:
         # an attachment no intake takes, refused before any file is decoded
@@ -342,9 +357,7 @@ class MultimodalDecoderModel(Model):
     def prompt_layout(self, prompt_in: MediaPrompt) -> dict[str, list]:
         """The prompt's ``MEDIA_LAYOUT``. Always set, so a layout the client
         sent never reaches the LLM."""
-        return media_layout(
-            prompt_in.pads, {m.pad: m.encoder.output for m in self.media}, prompt_in.grids,
-        )
+        return media_layout(prompt_in.pads)
 
     # -----------------------------------------------------------------------
     # Output
@@ -370,13 +383,9 @@ class MultimodalDecoderModel(Model):
         admission (a 400), not dropped."""
         return SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
             enable_min_p=bool(self.sampling_defaults.get("min_p")),
         )
-
-    def request_kwargs(self) -> frozenset[str]:
-        # enable_thinking: what each subclass's chat template reads
-        return frozenset(SAMPLING_KEYS) | {"enable_thinking"}
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
@@ -387,6 +396,10 @@ class MultimodalDecoderModel(Model):
             if model_kwargs.get(k) is not None:
                 sampling[k] = model_kwargs[k]
         return {SAMPLER: SamplingReqConfig(**sampling)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # enable_thinking: what each subclass's chat template reads
+        return frozenset({"max_output_tokens", "enable_thinking", *SAMPLING_KEYS})
 
     # -----------------------------------------------------------------------
     # Walk plan

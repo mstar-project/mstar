@@ -22,7 +22,7 @@ Graph walks:
 import json
 import logging
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 
 import torch
 
@@ -38,7 +38,6 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -60,9 +59,24 @@ from mstar.model.canary_qwen.config import (
     CanaryQwenModelConfig,
 )
 from mstar.model.components.audio_features import HOP_LENGTH, clip_samples
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, expand_media_pads, media_layout, media_walk_name
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
+from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
+    MediaEncoder,
+    MediaRun,
+    expand_media_pads,
+    media_layout,
+    media_walk_name,
+)
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextOutput, check_kv_pools_fit, kv_pages
+from mstar.model.utils import TextOutput, base_language, check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -94,14 +108,14 @@ def merge_lora(
         raise KeyError(f"incomplete LoRA weights for {sorted(pending)[:3]}")
 
 
-def audio_encoder(pad_id: int) -> MediaEncoder:
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
     audio placeholder out, on the ``prefill`` walk (configs and metrics read walk names)."""
-    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,), walk="prefill")
+    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", walk="prefill")
 
 
 # the media walk the LLM node knows its prompts by, named from the encoder
-PREFILL_WALK = media_walk_name([audio_encoder(0)])
+PREFILL_WALK = media_walk_name([audio_encoder()])
 
 
 class CanaryQwenModel(Model):
@@ -124,6 +138,9 @@ class CanaryQwenModel(Model):
     # the chat template and instruction: with 512 audio tokens and a full
     # transcript, a request stays inside MAX_SEQ_LEN
     MAX_TEXT_TOKENS = 512
+    # greedy, as NeMo decodes, under the checkpoint's own generation_config.json
+    # (not the backbone LLM's chat preset); set by __init__
+    sampling_defaults: Mapping[str, object] = GREEDY_SAMPLING
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs):
         from transformers import AutoTokenizer
@@ -135,6 +152,7 @@ class CanaryQwenModel(Model):
         llm_repo = json.loads((self.local_dir / "config.json").read_text())["pretrained_llm"]
         self.llm_dir = resolve_snapshot_dir(llm_repo, cache_dir, allow_patterns=["*.json", "*.txt"])
         self.config = CanaryQwenModelConfig.from_pretrained(self.local_dir, self.llm_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(self.llm_dir)
         # NeMo registers the placeholder as a special token at load, as here
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.config.audio_locator_tag]})
@@ -147,7 +165,7 @@ class CanaryQwenModel(Model):
         self.config.stop_token_ids = frozenset(
             self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")
         )
-        self.audio_encoder = audio_encoder(self.audio_token_id)
+        self.audio_encoder = audio_encoder()
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -178,7 +196,10 @@ class CanaryQwenModel(Model):
                 resource_key=ROPE, nodes={"llm"},
                 config=PositionConfig(kv_cache=KV_CACHE, rope_theta=llm.rope_theta),
             ),
-            SamplerSpec(resource_key=SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size, enable_repetion_penalty=False),
+            SamplerSpec(
+                resource_key=SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size,
+                **sampler_capabilities(self.sampling_defaults),
+            ),
         ]
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -188,23 +209,19 @@ class CanaryQwenModel(Model):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
-        model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # NeMo decodes greedily
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
-        }
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"instruction", "language", "max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # graph walks
     # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        requested = model_kwargs.get("max_output_tokens")
-        return self.MAX_OUTPUT_TOKENS if requested is None else min(requested, self.MAX_OUTPUT_TOKENS)
+        # MAX_SEQ_LEN is sized for it; a larger request is refused by the
+        # conductor against the decode loop, not clamped
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", self.MAX_OUTPUT_TOKENS)
 
     def get_max_output_tokens_limit(self) -> int:
         return self.MAX_OUTPUT_TOKENS
@@ -234,7 +251,8 @@ class CanaryQwenModel(Model):
                     GraphEdge(next_node="llm", name="text_inputs"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # the default request's iterations, which MAX_SEQ_LEN is sized for
+            max_iters=self.get_loop_caps()[DECODE_LOOP],
             outputs=[],
         )
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
@@ -284,14 +302,18 @@ class CanaryQwenModel(Model):
         """The clip's samples and the chat prompt. The text ``prompt`` is
         unused: the ASR harnesses send a generic one, which would replace the
         trained instruction. ``instruction`` replaces it on purpose (default
-        "Transcribe the following:")."""
+        "Transcribe the following:"). ``language``, if set, must be English."""
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "Canary-Qwen")
-        instruction = kwargs.get("instruction") or DEFAULT_INSTRUCTION
+        kw = checked_request_kwargs(kwargs)
+        instruction = kw.get("instruction", DEFAULT_INSTRUCTION)
         if not isinstance(instruction, str):
             raise ValueError(f"instruction must be a string; got {instruction!r}")
+        if base_language(kw.get("language") or "en") != "en":
+            raise ValueError(f"Canary-Qwen transcribes English only; got language {kw['language']!r}")
         frames = self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH)
         pads = expand_media_pads(
-            self.prompt_ids(instruction.strip() or DEFAULT_INSTRUCTION), {self.audio_token_id: [frames]},
+            self.prompt_ids(instruction.strip() or DEFAULT_INSTRUCTION),
+            {self.audio_token_id: [MediaRun(frames, self.audio_encoder.output)]},
         )
         length = int(pads.ids.numel())
         # rows, not ids: the audio placeholders are the same for every clip of a length
@@ -299,7 +321,7 @@ class CanaryQwenModel(Model):
             spans=(Span("rows", PREFILL_WALK, length, length, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )}}
-        layout = media_layout(pads, {self.audio_token_id: self.audio_encoder.output})
+        layout = media_layout(pads)
         return ProcessPromptOutput(
             {"audio": [samples], "text_inputs": [pads.ids]}, {MEDIA_LAYOUT: layout, "kv_layout": kv_layout},
         )

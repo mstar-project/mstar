@@ -24,6 +24,7 @@ boundaries (fixed 4 s chunks only) and the client-side n-gram loop fix
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 
 import torch
@@ -38,10 +39,9 @@ from mstar.engine.resources import (
     PositionSpec,
 )
 from mstar.engine.resources.lora import LoraSpec
-from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.model.components.request_kwargs import GREEDY_SAMPLING, sampler_capabilities, sampling_defaults
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
-from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, ROPE
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
 from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
@@ -49,12 +49,17 @@ from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
 logger = logging.getLogger(__name__)
 
+# the reference eval decodes greedily; the checkpoint's generation_config.json overrides
+DEFAULT_SAMPLING = GREEDY_SAMPLING
+# reference transcribe.py generates up to 1024 new tokens
+MAX_OUTPUT_TOKENS = 1024
 
-def audio_encoder(pad_id: int) -> MediaEncoder:
+
+def audio_encoder() -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's mel chunks in, one LLM-space
     row per audio pad out. Each chunk's mel frame count rides the walk's
     ``MEDIA_LAYOUT`` as the clip's grid, so the node reads it on the host."""
-    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds", (pad_id,))
+    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds")
 
 
 class HiggsAudioModel(MultimodalDecoderModel):
@@ -63,6 +68,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
     NAME = "Higgs-Audio"
     # every process fetches the whole snapshot, as before the scaffold
     METADATA_FILES = ("*",)
+    # the checkpoint's sampling defaults, set by __init__; a model built without it has the built-in ones
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
     # The reference pipeline extracts mel features with the
     # whisper-large-v3 processor (not from the higgs checkpoint).
     WHISPER_PROCESSOR_ID = "openai/whisper-large-v3"
@@ -79,6 +86,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         # ``model_kwargs: {encoder_graphs: false}`` runs the audio tower eagerly
         self.encoder_graphs = bool(kwargs.get("encoder_graphs", True))
         self.config = HiggsAudioModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
 
@@ -88,7 +96,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         )
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         pad = self.config.audio_in_token_idx
-        self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
+        self.media = (MediaIntake("audio", audio_encoder(), pad, self._audio_intake),)
 
     # -------------------------------------------------------------------
     # Resources
@@ -138,15 +146,16 @@ class HiggsAudioModel(MultimodalDecoderModel):
                     rope_theta=self.config.rope_theta,
                 ),
             ),
-            # ASR transcription: the reference decodes greedily and exposes
-            # no penalty knob, so no seen-token buffers.
-            replace(self._sampler_spec(self.config.vocab_size), enable_repetion_penalty=False),
+            # ASR transcription: the reference decodes greedily and exposes no
+            # penalty knob, so no seen-token buffers unless the checkpoint
+            # defaults one; without the capability a request penalty or min_p
+            # is refused.
+            replace(self._sampler_spec(self.config.vocab_size), **sampler_capabilities(self.sampling_defaults)),
             self._lora_spec(),
         ]
 
     def get_max_output_tokens(self, **model_kwargs):
-        # Reference transcribe.py generates up to 1024 new tokens.
-        return model_kwargs.get("max_output_tokens", 1024)
+        return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -------------------------------------------------------------------
     # Intake
@@ -164,20 +173,10 @@ class HiggsAudioModel(MultimodalDecoderModel):
             None if prompt_parts is None else [p for p in prompt_parts if p.modality in keep], **kwargs,
         )
 
-    def request_kwargs(self) -> frozenset[str]:
-        return frozenset({"temperature", "top_p", "ignore_eos", "enable_thinking"})
-
-    def get_request_resource_configs(
-        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
-        # the request knobs higgs has always read; the rest are ignored, as before
-        model_kwargs = model_kwargs or {}
-        return {SAMPLER: SamplingReqConfig(
-            # Reference eval decodes greedily (do_sample=False).
-            temperature=model_kwargs.get("temperature", 0.0),
-            top_p=model_kwargs.get("top_p", 1.0),
-            ignore_eos=model_kwargs.get("ignore_eos", False),
-        )}
+    # the sampling keys, max_output_tokens and enable_thinking, and their
+    # configs, are MultimodalDecoderModel's: the checkpoint's defaults over
+    # greedy decoding (``sampling_defaults``). ``language`` and ``timestamps``
+    # from the transcription adapter are not read.
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
@@ -189,6 +188,9 @@ class HiggsAudioModel(MultimodalDecoderModel):
         intake expands to its tokens. ``enable_thinking=False`` (default)
         appends the empty think block so the transcript starts immediately.
         """
+        enable_thinking = kwargs.get("enable_thinking", False)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
         clips = len(raw["audio"])
         if clips != 1:
             raise ValueError(f"{self.NAME} expects exactly one audio input per request; got {clips}.")
