@@ -200,7 +200,7 @@ def test_every_shipped_config_matches_reference(monkeypatch):
         pytest.skip(f"no tuned table for {torch.cuda.get_device_name()}")
     for dims, m, cfg in entries:
         x, w1, w2, weights, ids = _inputs(dims, m)
-        monkeypatch.setattr(runner, "get_config", lambda **_: cfg)
+        monkeypatch.setattr(runner, "get_config", lambda *, cfg=cfg, **_: cfg)
         out = runner.fused_experts(x, w1, w2, weights, ids)
         try:
             _assert_matches(out, _reference(x, w1, w2, weights, ids))

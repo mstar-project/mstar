@@ -434,7 +434,8 @@ def _sync_routing(
 
 def prepare_moe_weights(module: nn.Module) -> None:
     """Convert each MoE block's expert weights to its backend's layout.
-    Run after every load of the weights (``load_weights_into`` does). No-op for backends that use the checkpoint layout."""
+    Run after every load of the weights (``load_weights_into`` does).
+    No-op for backends that use the checkpoint layout."""
     for m in module.modules():
         backend = getattr(m, "experts_backend", None)
         if backend is not None:
