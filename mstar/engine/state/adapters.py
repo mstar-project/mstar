@@ -810,8 +810,7 @@ class ValueHandle(ArrayHandle):
         for field in self.array.entry.tensors:
             read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
             fields[field] = self._declared(field, read)
-        rows = next(iter(fields.values()))
-        return Reached(fields, row_offsets=torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device))
+        return _OneEntryPerRow(fields)
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         if self._stepped:
@@ -870,6 +869,19 @@ class ValueHandle(ArrayHandle):
         view = self.block(field, layer)
         self._record_update(field, layer)
         return runner, view
+
+
+class _OneEntryPerRow(Reached):
+    """A Value read's `Reached`. Its ``row_offsets`` is built only when asked for, so a read that doesn't ask launches
+    no kernel for it, and a captured read records none."""
+
+    def __init__(self, fields: Mapping[str, torch.Tensor]):
+        object.__setattr__(self, "fields", fields)
+
+    @functools.cached_property
+    def row_offsets(self) -> torch.Tensor:
+        rows = next(iter(self.fields.values()))
+        return torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device)
 
 
 class HostValueHandle(ArrayHandle):
