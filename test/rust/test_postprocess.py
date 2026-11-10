@@ -313,11 +313,14 @@ def _counted(frames) -> dict:
     return counts
 
 
-def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path):
+@pytest.mark.parametrize("early", [False, True], ids=["at_postprocess", "while_running"])
+def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, early):
     """A step that ran several iterations hands the client a token per
     iteration: a row's tokens up to its stop, in order, each with its own
     iteration's loop index and counted by the completion report, and nothing
-    the device ran past the stop. The reference runs the same tokens one
+    the device ran past the stop. The same when some go out while the step
+    runs (``emit_prefix``, up to the iteration the host learned had landed)
+    and its postprocess sends the rest. The reference runs the same tokens one
     iteration a step."""
     sent = {}
     for k in ("one_a_step", "repeated"):
@@ -342,10 +345,18 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path):
             # landed as a repeated step lands them: [iterations, rows], viewed
             # as a column per iteration
             wide = torch.tensor(RUN, dtype=torch.int64).t().contiguous().t()
+            start = 0
+            if early:
+                # the host looks after the first iteration landed, then the third
+                for landed in (1, 3):
+                    start, stopped = rt.emit_prefix(
+                        PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide, start), landed,
+                    )
+                    assert (start, stopped) == (landed, False)
             trace = _drive(rt, PostprocessRequest(
                 partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
                 wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
-                tokens=wide, row_rids=rids, inline=InlineColumn(SIG, wide),
+                tokens=wide, row_rids=rids, inline=InlineColumn(SIG, wide, start),
                 loop_strides=[MAX_ITERS] * 2, token_width=MAX_ITERS,
             ), {}, model_stops={})
             # row 0 runs to the Loop's cap, which ends it without a stop

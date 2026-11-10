@@ -60,6 +60,10 @@ impl TokenColumn {
         self
     }
 
+    pub(super) fn width(&self) -> usize {
+        self.width
+    }
+
     /// Row `row`'s value of iteration `at < self.width`.
     fn read_at(&self, row: usize, iter: usize) -> i64 {
         debug_assert!(row < self.rows && iter < self.width);
@@ -258,6 +262,14 @@ impl Postprocess {
     }
 }
 
+/// `emit_prefix`'s values: (rid, signal, modality, value, iteration), the
+/// rows' loop context, and whether every row has stopped.
+pub(super) struct Prefix {
+    pub items: Vec<(u32, String, String, i64, u32)>,
+    pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    pub all_stopped: bool,
+}
+
 /// `_merged_stops`: the loops each rid stops, in first-seen order.
 fn merged_stops(parts: [&[(u32, Vec<String>)]; 2]) -> Vec<(u32, Vec<String>)> {
     let mut out: Vec<(u32, Vec<String>)> = Vec::new();
@@ -438,6 +450,48 @@ impl GraphRuntime {
             stopped_rids.push(rid);
         }
         Ok((stopped_rids, frames))
+    }
+
+    /// The values the route would emit inline for `inline`'s iterations from
+    /// its start, each row cut where `stops_over` stops it, as of now: a
+    /// row's loop context and stop limits are what its step's postprocess
+    /// will see, since nothing moves them while the step is in flight. None
+    /// when the check can't decide every row, which leaves it all to
+    /// postprocess.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefix_items(
+        &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32], row_rids: &[u32],
+        tokens: &TokenColumn, signal: &str, inline: &TokenColumn,
+    ) -> Option<Prefix> {
+        let found = self.stops_over(partition, node_name, graph_walk, rids, Some(tokens), row_rids).ok()?;
+        if !found.missing.is_empty() {
+            return None;
+        }
+        let kept: FxHashMap<u32, u32> = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
+        let wg = self.owner_of(node_name, graph_walk)?;
+        let node = self.nid(wg, node_name)?;
+        let sig = self.interner.get(signal)?;
+        let edge = self.g(wg).node(node).outputs.iter()
+            .find(|e| e.name == sig && matches!(e.dest, Dest::EmitToClient) && !e.persist)?;
+        let modality = self.interner.name(edge.modality).to_string();
+        let runs = inline.runs_for(rids, row_rids, &kept)?;
+        let width = inline.width() as u32;
+        let mut out = Prefix {
+            items: Vec::new(), nested: FxHashMap::default(),
+            all_stopped: rids.iter().all(|r| kept.get(r).is_some_and(|&k| k <= width)),
+        };
+        for (&rid, run) in rids.iter().zip(runs) {
+            if run.values.is_empty() {
+                continue;
+            }
+            // a row with no state here is one the route skips
+            let Some(idx) = self.nested_idxs_interned(wg, rid, node) else { continue };
+            out.nested.insert(rid, idx);
+            for (j, value) in run.values.into_iter().enumerate() {
+                out.items.push((rid, signal.to_string(), modality.clone(), value, run.first + j as u32));
+            }
+        }
+        Some(out)
     }
 
     /// The loop name of each of (node, walk)'s stop rules, by index.

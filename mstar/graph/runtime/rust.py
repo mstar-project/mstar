@@ -20,7 +20,7 @@ Build: ``maturin develop --release -m rust/Cargo.toml`` (see
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from typing import TYPE_CHECKING, get_args
 
@@ -39,6 +39,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
+    InlineColumn,
     ParallelList,
     PopRidsOutput,
     PostprocessNeed,
@@ -759,6 +760,19 @@ class RustGraphRuntime(GraphRuntime):
             token_iter_stride=step, inline_iter_stride=istep, inline_start=0 if inline is None else inline.start,
         )
         return self._postprocess_step(out)
+
+    def emit_prefix(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int], row_rids: Sequence[int],
+        tokens: torch.Tensor, inline: InlineColumn, end: int,
+    ) -> tuple[int, bool]:
+        ptr, rows, stride, step, dtype = _column(tokens)
+        iptr, irows, istride, istep, idtype = _column(inline.column)
+        return self._rust.emit_prefix(
+            partition, node_name, graph_walk, rids, list(row_rids),
+            ptr, rows, stride, step, dtype,
+            inline.signal, iptr, irows, istride, istep, idtype,
+            inline.start, end,
+        )
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),

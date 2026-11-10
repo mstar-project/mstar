@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, NamedTuple
@@ -1354,6 +1354,22 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def emit_prefix(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int], row_rids: Sequence[int],
+        tokens: "torch.Tensor", inline: InlineColumn, end: int,
+    ) -> tuple[int, bool]:
+        """While a repeated step runs, send the client its inline values of
+        iterations ``inline.start`` up to ``end``, which have landed, each row
+        cut at its stop by the check its postprocess runs, so nothing past a
+        stop goes out. ``tokens`` is the stop's column, ``rids`` the rows the
+        step routes. Decides nothing: the postprocess, its ``inline.start``
+        set to what this returns, sends the rest.
+
+        Returns how far it sent (``inline.start`` when the check can't decide
+        every row), and whether every row has stopped by then."""
         pass
 
     @abstractmethod

@@ -1200,7 +1200,8 @@ pub struct SendPlan {
     /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, signal, modality, value, iteration): emitted inline, one frame
-    /// per step; `iteration` is the value's within its step, from 0.
+    /// per send (the step's, and each `emit_prefix` while it ran);
+    /// `iteration` is the value's within its step, from 0.
     pub emit_inline: Vec<(u32, String, String, i64, u32)>,
     /// rid -> the log-prob its emits carry, inline or tensor.
     pub logprobs: FxHashMap<u32, f64>,
@@ -3440,6 +3441,49 @@ impl GraphRuntime {
         self.pp_run(py, pp)
     }
 
+    /// Send the client the values a repeated step has landed so far, while
+    /// it runs: iterations `start..end` of its inline column, each row cut at
+    /// its stop by the same check its postprocess runs (`stops_over`), so
+    /// nothing past a stop goes out and postprocess, given `start` = what this
+    /// returns, sends the rest. Decides nothing: no stop, count or route.
+    ///
+    /// The caller knows `end` has landed (a device run: from `wait_count`, on
+    /// this thread, which orders these reads after it). Returns the end it
+    /// sent up to, `start` when the check can't decide every row, and whether
+    /// every row has stopped by then, after which nothing more of the step
+    /// goes out. The columns are as `begin_postprocess` takes them; `rids`
+    /// are the step's routed rows, in the step's one walk.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_prefix(
+        &mut self, py: Python<'_>,
+        partition: String, node_name: String, graph_walk: String, rids: Vec<u32>, row_rids: Vec<u32>,
+        token_ptr: usize, token_rows: usize, token_stride: usize, token_iter_stride: usize, token_dtype: &str,
+        inline_signal: String, inline_ptr: usize, inline_rows: usize, inline_stride: usize,
+        inline_iter_stride: usize, inline_dtype: &str,
+        start: u32, end: u32,
+    ) -> PyResult<(u32, bool)> {
+        if end <= start {
+            return Ok((start, false));
+        }
+        let Some(tokens) = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype) else {
+            return Ok((start, false));
+        };
+        let Some(inline) = postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
+        else {
+            return Ok((start, false));
+        };
+        let tokens = tokens.wide(end as usize, token_iter_stride);
+        let inline = inline.wide(end as usize, inline_iter_stride).from(start as usize);
+        let Some(prefix) = self.prefix_items(
+            &partition, &node_name, &graph_walk, &rids, &row_rids, &tokens, &inline_signal, &inline,
+        ) else {
+            return Ok((start, false));
+        };
+        let frames = self.inline_frames(prefix.items, &prefix.nested, &FxHashMap::default())?;
+        self.send_frames(py, frames)?;
+        Ok((end, prefix.all_stopped))
+    }
+
     /// Resume a step parked for its stops (STOPS): the loops each rid stops,
     /// and the rows to drop (their stop check failed).
     fn resume_postprocess_stops(
@@ -4161,7 +4205,7 @@ impl GraphRuntime {
             }
 
             // Inline emits: one RESULT_TOKENS frame per (signal, modality)
-            // per step, with the same per-request bookkeeping as a tensor
+            // per send, with the same per-request bookkeeping as a tensor
             // emit so the completion report counts the chunk.
             let emit_inline = std::mem::take(&mut plan.emit_inline);
             frames.extend(self.inline_frames(emit_inline, &nested, &plan.logprobs)?);
