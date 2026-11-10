@@ -24,6 +24,7 @@ from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E40
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AUT_ENCODE  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS  # noqa: E402
 from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
 from mstar.model.multimodal_decoder import MediaIntake  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
@@ -121,7 +122,7 @@ def _make_model(config: Qwen3ASRModelConfig | None = None) -> Qwen3ASRModel:
     model._detokenizer = ByteLevelDetokenizer(model.tokenizer)
     model._submodule_cache = {}
     pad = model.config.audio_token_id
-    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    model.media = (MediaIntake("audio", audio_encoder(), pad, model._audio_intake),)
     return model
 
 
@@ -422,7 +423,7 @@ def test_encoder_packs_a_step_only_up_to_its_largest_capture():
 
 def _llm_submodule(cfg):
     return Qwen3ASRLLMSubmodule(
-        SimpleNamespace(embed_dtype=torch.float32), cfg, (audio_encoder(cfg.audio_token_id),), text_prompts=False,
+        SimpleNamespace(embed_dtype=torch.float32), cfg, (audio_encoder(),), text_prompts=False,
     )
 
 
@@ -436,7 +437,7 @@ def test_llm_captures_decode_and_the_whole_prompt_only():
     assert {walk for c in configs for walk in c.replay_graph_walks} == {DECODE_WALK, PREFILL_WALK}
     assert set(_make_model().get_graph_walk_graphs()) == {DECODE_WALK, PREFILL_WALK}
     (prefill,) = [c for c in configs if PREFILL_WALK in c.replay_graph_walks]
-    assert prefill.make_node_input(7).tensor_inputs["audio_embeds"].shape == (7, cfg.text.hidden_size)
+    assert prefill.make_node_input(7).tensor_inputs[MEDIA_EMBEDS].shape == (7, cfg.text.hidden_size)
     assert prefill.caps_eager_batch_size and sub.max_batch_size(PREFILL_WALK) is None
 
 

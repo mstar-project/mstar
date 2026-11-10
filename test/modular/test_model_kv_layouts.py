@@ -436,7 +436,7 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
     pad = cfg.audio_in_token_idx
-    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    model.media = (MediaIntake("audio", audio_encoder(), pad, model._audio_intake),)
     # two whole chunks of 50 rows and a 1.5 s one of 19
     clip = torch.zeros(int(9.5 * cfg.sampling_rate))
 

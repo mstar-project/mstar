@@ -569,11 +569,7 @@ class Cosmos3Model(Model):
         """The reasoner's one medium: the vision encoder's tokens fill the
         prompt's image and video pads, in prompt order, on the scaffold's
         ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
-        r = self.config.reasoner
-        return MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
-            (r.image_token_id, r.video_token_id),
-        )
+        return MediaEncoder("vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds")
 
     def _reasoner_enabled(self) -> bool:
         """Whether the reasoner walks (and the vision_encoder + reasoner

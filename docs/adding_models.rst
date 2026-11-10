@@ -3409,14 +3409,17 @@ or the engine refuses to start; Muse Glimmer and Ripple-65B return ``{}`` until 
 through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = False``) has no
 ``prefill_text`` walk, so the scaffold returns ``{}`` for it. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
-its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
-temporal group), and ``prepare``, which turns an attachment into the encoder's input
+its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
+nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
+renders each), the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+per temporal group), and ``prepare``, which turns an attachment into the encoder's input
 tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
-to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
+to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
+with its grid), and ``process_prompt`` returns the pads' layout as ``MEDIA_LAYOUT``
+metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
 schedule's walk and the KV layout's alike. ``kv_layout``'s ``advance``, how far the prompt
 moves the position counter, defaults to the prompt's length; under Qwen-style MRoPE it is
@@ -3434,13 +3437,15 @@ The ``LLM`` node subclasses ``SampledTokenDecoder``
 (decode, packed text prefill, mixed, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
-(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+(``where(mask, media[cumsum(mask) - 1], embed(ids))``, the media in prompt order and the mask
+of their tokens laid out from ``MEDIA_LAYOUT``, not found by pad id, so media may share a
+placeholder token), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
 loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
 a one-token budget, ends the partition before decode runs. The loop's cap,
-``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
-ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+``max(1, max_output_tokens - 1)``, is the only budget. Each encoder's rows match the tokens of
+its runs in the layout, checked in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
 

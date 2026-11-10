@@ -479,7 +479,7 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
                                  image_token_id=pad, mrope_section=[2, 1, 1])
     base = H.hf_text_weights()
     lora_pool = H.pool(H.lora_spec({"e": path}))
-    encoder = vision_encoder((pad,))
+    encoder = vision_encoder()
     llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config(), (encoder,))
     llm.bind_node_resources({LORA_RESOURCE_KEY: lora_pool})
     llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64))

@@ -17,7 +17,7 @@ from mstar.model.submodule_base import END_PARTITION, HostRows
 def _submodule(slot_masters=True):
     config = HiggsAudioModelConfig()
     # as the model builds it: the audio walk, no text-only prompt
-    encoders = (audio_encoder(config.audio_in_token_idx),)
+    encoders = (audio_encoder(),)
     sub = HiggsAudioLLMSubmodule(torch.nn.Linear(1, 1), config, encoders, text_prompts=False)
     sub.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=slot_masters)}
     return sub
