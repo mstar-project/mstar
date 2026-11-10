@@ -1308,14 +1308,12 @@ async fn images_generations(
             collect(result_stream(&st, &args, &request_id, false)).await
         }
     });
-    let mut all: Vec<ResultChunk> = Vec::new();
-    for r in futures::future::join_all(futs).await {
-        match r {
-            Ok(chunks) => all.extend(chunks),
-            Err((status, msg)) => return error(status, &msg, error_type(status)),
-        }
+    // The first failure ends the request; dropping the other images' streams
+    // aborts the ones still running. Results stay in submit order.
+    match futures::future::try_join_all(futs).await {
+        Ok(images) => Json(images_response(images.into_iter().flatten().collect())).into_response(),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
-    Json(images_response(all)).into_response()
 }
 
 /// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
