@@ -234,7 +234,7 @@ async def realtime(websocket: WebSocket):
     audio = api.client_audio if api is not None else []
     # a model that hears audio as it comes and writes a transcript, with no turns: transcription
     # is the intent it serves, so an omitted one means it too
-    stream = api.model.live_transcription_stream if api is not None else None
+    stream = api.model.live_transcription_stream if api is not None and api.model is not None else None
     if stream is not None and intent in (None, "transcription") \
             and (adapter := get_adapter(api.model_name)) is not None:
         await serving_realtime.RealtimeLiveTranscription(api, api.model_name, adapter, websocket, stream).run()

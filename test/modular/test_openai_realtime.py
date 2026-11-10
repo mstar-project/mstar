@@ -671,6 +671,15 @@ def test_realtime_is_gated_on_the_adapter(client_and_stub):
             ws.receive_text()
 
 
+def test_realtime_serves_a_server_built_without_a_model(client_and_stub):
+    """An API server built with no model has no live stream to look up: its
+    adapter's re-decoding session opens."""
+    client, stub = client_and_stub
+    stub.model = None
+    with client.websocket_connect("/v1/realtime") as ws:
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.created"
+
+
 @pytest.mark.parametrize("transcription", [
     {"language": ["en"]},
     {"language": True},
