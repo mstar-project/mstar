@@ -1592,9 +1592,9 @@ class Engine:
             if walk not in keyed:
                 continue
             chunk = chunks.get(rid) if chunks else None
-            if chunk is not None and chunk.stride != chunk.end:
-                # a later chunk (`runs_first_chunk`): the first applied or declined the row's lease,
-                # and one taken again before that chunk commits would restore over what it wrote
+            if chunk is not None and not chunk.is_first:
+                # the first chunk applied or declined the row's lease, and one taken again before
+                # that chunk commits would restore over what it wrote
                 continue
             leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
             if leases:
