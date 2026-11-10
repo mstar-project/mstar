@@ -15,7 +15,7 @@ periodic status message, and the API server records them here; no
 multiprocess directory, which would only aggregate one host. Families whose
 values come from another process are defined in :mod:`.catalog`.
 
-``prometheus_client`` is optional (``pip install 'mstar[metrics]'``) and only
+``prometheus_client`` is optional (``pip install 'mstar-ai[metrics]'``) and only
 needed when metrics are on.
 """
 
@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-INSTALL_HINT = "--enable-metrics needs prometheus_client: pip install 'mstar[metrics]'"
+INSTALL_HINT = "--enable-metrics needs prometheus_client: pip install 'mstar-ai[metrics]'"
 
 #: ``success``: the result went to the HTTP layer. ``error``: the request
 #: failed (engine, preprocessing, result delivery, conductor gone).
