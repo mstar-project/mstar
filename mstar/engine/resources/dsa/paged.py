@@ -27,6 +27,7 @@ import torch
 
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig
+from mstar.utils.h2d import PinnedStager
 
 
 class DSASpan(NamedTuple):
@@ -77,6 +78,8 @@ class DSAContext:
     eager: sparse_mla.EagerSparsePlans | None = None
     # planned under a capture lease (its rows are the slot's buffers)
     captured: bool = False
+    # the resource's pinned int32 stager, which an eager step's row indices go through
+    stager: PinnedStager | None = None
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -103,6 +106,15 @@ class DSAContext:
                 torch.zeros_like(self.row_req))
         return meta[3:]
 
+    def device_rows(self, rows: list[int]) -> torch.Tensor:
+        """``rows`` as an int32 device index, copied from pinned memory: a pageable
+        ``torch.tensor(rows, device=...)`` waits for the stream to drain."""
+        if self.stager is None:
+            return torch.tensor(rows, dtype=torch.int32, device=self.pos.device)
+        out = torch.empty(len(rows), dtype=torch.int32, device=self.pos.device)
+        self.stager.copy_(out, rows)
+        return out
+
     def rows(self, c0: int, c1: int) -> DSAContext:
         """This eager step's rows ``[c0, c1)`` alone, for a pass over them after the rows
         before them have written the cache (under the KV resource's ``token_window(c0,
@@ -119,8 +131,7 @@ class DSAContext:
         resource's ``token_rows``)."""
         starts = [r0 for r0, _, _ in self.spans]
         req = [self.spans[bisect.bisect_right(starts, r) - 1][2] for r in rows]
-        idx = torch.tensor(rows, device=self.pos.device)
-        return self._subset(idx, [self.host_pos[r] for r in rows],
+        return self._subset(self.device_rows(rows), [self.host_pos[r] for r in rows],
                             [DSASpan(i, 1, q) for i, q in enumerate(req)])
 
     def _subset(self, idx, host_pos: list[int], spans: list[DSASpan]) -> DSAContext:
@@ -207,7 +218,7 @@ def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
     out = torch.empty(q.shape[0], ctx.width, dtype=torch.int32, device=q.device)
     single = [r0 for r0, n, _ in ctx.spans if n == 1]
     if single:  # a mixed step's decode rows, in one launch
-        idx = torch.tensor(single, device=q.device)
+        idx = ctx.device_rows(single)
         pools = max(1, *((ctx.host_pos[r] + 1) // ctx.kpool for r in single))
         scores = _decode_scores(q[idx], w[idx], view, ctx, ctx.pos[idx], ctx.row_req[idx], pools)
         out[idx] = _slots(scores, ctx, idx)

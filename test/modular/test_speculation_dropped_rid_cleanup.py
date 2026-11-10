@@ -60,7 +60,7 @@ def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     committed: list[tuple] = []
     speculator = make_worker(
-        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name))),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name)), consumer_node={}),
         # The staged ingests are settled per rid before the chunks go back, so
         # the chunk leaves the node's slot first; see Speculator.settle.
         graph_runtime=SimpleNamespace(
@@ -112,7 +112,7 @@ def test_failed_settle_after_success_returns_nothing():
     """
     returned: list[tuple[str, str]] = []
     speculator = make_worker(
-        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name))),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name)), consumer_node={}),
         graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
         engine_manager=SimpleNamespace(
             get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),

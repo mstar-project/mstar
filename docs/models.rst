@@ -113,8 +113,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
    * - ``minicpm_o`` *(Beta)*
      - ``openbmb/MiniCPM-o-4_5``
-     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
-       resampler and a Whisper-medium encoder. Half-duplex only.
+     - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
+       SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
+       flow-matching vocoder for speech. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -586,6 +587,16 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
   ``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``,
   ``penalize_prompt`` and ``ignore_eos``. ``min_p`` above 0 is refused, since neither
   checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.
+- Chat renders each message in its role (``system``, ``developer`` as ``system``, ``user``,
+  ``assistant`` with its ``tool_calls``, ``tool``; another role is a 400) through the
+  checkpoint's chat template, and splits the reply into ``reasoning_content``, ``content``
+  and ``tool_calls`` (``finish_reason: "tool_calls"``). A request may set ``tools``
+  (function tools) and ``tool_choice``: ``auto`` (the default) or ``none``, which leaves
+  the tools out of the prompt; ``required`` or a named function needs constrained decoding
+  and is a 400. A call to a function the request did not offer stays text.
+  ``enable_thinking``, ``reasoning_effort`` and ``clear_thinking`` reach the template, flat
+  in the body or under ``chat_template_kwargs``, which drops any other key. GLM-5.3-Flash
+  always reasons, so ``enable_thinking: false`` is a 400 there.
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
@@ -899,6 +910,37 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends, and a request that sends one is logged as ignoring it.
+
+MiniCPM-o 4.5 (``minicpm_o``)
+------------------------------
+
+Text, image and audio in; text, or text and 24 kHz speech, out, as upstream's half-duplex
+``chat()``: the LLM (Qwen3-8B) writes the reply, a TTS reads it into speech codes, and a
+streaming flow-matching vocoder (Step-Audio2's token2wav) turns them into audio. Ask for
+speech with ``output_modalities`` including ``"audio"``; the bundled ``default`` voice is the
+only one. A spoken reply's system message is upstream's voice-clip prompt, so a spoken
+request with a system prompt of its own is refused (400) unless it sets ``voice_prompt:
+false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
+``streaming_generate``, video input and full duplex are not supported.
+
+``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
+it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
+reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
+``max_slots`` cap the replies being voiced at once. ``t2w_state`` has one more than each of the
+three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
+back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
+so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
+that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
+pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``): a full
+pool moves a request to the host until those fill. At the cap of 32, with 2048 tokens
+out on an H200 (one run per size), a burst of prompts around 3.7k tokens or longer still
+waits, 2.5k does not (follow-up: reserve a request's whole layout).
+
+The vocoder's DiT runs its GEMMs, convolutions and attention, and keeps its caches, in
+float16; its residual stream, its norms' arithmetic, the Euler solver, the token encoder
+and HiFT stay float32. Its mel is within about 0.1% of a float32 DiT's, and the served
+speech's Whisper WER is unchanged. HiFT up to its spectrum is compiled (``compile_regions``),
+and the TTS's decode capture runs cuBLAS GEMMs (``compile_mode="default"``).
 
 Command A+ (``command_a_plus``)
 -------------------------------
