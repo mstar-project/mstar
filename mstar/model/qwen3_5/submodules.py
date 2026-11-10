@@ -306,8 +306,11 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.vision = handles[VISION_TOKENS]
 
-    def _declare(self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]]) -> SubmoduleStep:
-        return SubmoduleStep(segments=super()._declare(rows).segments, state={VISION_TOKENS: ArrayStep()})
+    def _declare(
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
+    ) -> SubmoduleStep:
+        state = {VISION_TOKENS: ArrayStep()} if attention else {}
+        return SubmoduleStep(segments=super()._declare(rows).segments, state=state)
 
     def max_segments_per_step(self) -> int:
         return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
