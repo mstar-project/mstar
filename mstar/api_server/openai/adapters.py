@@ -89,6 +89,8 @@ def _content_part(part) -> tuple[str, str | dict]:
     else the part's object (``{"url"}``, or ``input_audio``'s ``{"data", "format"}``).
     A part that is empty, malformed or of a type no model here reads is refused."""
     ptype = part.get("type") if isinstance(part, dict) else None
+    if ptype is not None and not isinstance(ptype, str):
+        raise ValueError("a content part's 'type' must be a string")
     if ptype == "text":
         if not isinstance(part.get("text"), str) or not part["text"]:
             raise ValueError("a text content part needs a non-empty 'text' string")

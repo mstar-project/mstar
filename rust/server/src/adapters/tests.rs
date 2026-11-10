@@ -84,6 +84,7 @@ fn an_empty_unknown_or_misplaced_chat_part_is_refused() {
         ("user", r#"{"type":"input_audio","input_audio":{"data":""}}"#, "an input_audio content part needs non-empty base64 'data' and a 'format' string"),
         ("user", r#"{"type":"text","text":""}"#, "a text content part needs a non-empty 'text' string"),
         ("user", r#"{"type":"file","file":{"file_id":"f"}}"#, "unsupported content part type 'file'; parts are text, image_url, video_url, audio_url or input_audio"),
+        ("user", r#"{"type":true}"#, "a content part's 'type' must be a string"),
         ("system", image, "a system message takes text parts only, not 'image_url'"),
         ("developer", image, "a system message takes text parts only, not 'image_url'"),
     ] {

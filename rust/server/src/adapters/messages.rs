@@ -112,7 +112,7 @@ fn content_part(part: &Value) -> Result<ContentPart<'_>, String> {
             let shown = match ptype {
                 None | Some(Value::Null) => "None".to_string(),
                 Some(Value::String(s)) => media::py_repr(s),
-                Some(v) => v.to_string(),
+                Some(_) => return Err("a content part's 'type' must be a string".to_string()),
             };
             Err(format!(
                 "unsupported content part type {shown}; parts are text, image_url, video_url, audio_url or input_audio"

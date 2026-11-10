@@ -390,21 +390,23 @@ def test_text_chat_passes_those_fields_off(tmp_path):
 _IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
 
 
-@pytest.mark.parametrize("role, part", [
+@pytest.mark.parametrize("role, part, error", [
     # empty or unknown parts were dropped, and the model answered without them (200)
-    ("user", {"type": "image_url", "image_url": {"url": ""}}),
-    ("user", {"type": "image_url", "image_url": "data:image/png;base64,iVBORw0KGgo="}),
-    ("user", {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}),
-    ("user", {"type": "text", "text": ""}),
-    ("user", {"type": "file", "file": {"file_id": "f"}}),
-    ("user", {"text": "no type"}),
+    ("user", {"type": "image_url", "image_url": {"url": ""}}, "the image_url content part needs"),
+    ("user", {"type": "image_url", "image_url": "data:image/png;base64,iVBORw0KGgo="}, "the image_url content part"),
+    ("user", {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}, "an input_audio content part"),
+    ("user", {"type": "text", "text": ""}, "a text content part needs"),
+    ("user", {"type": "file", "file": {"file_id": "f"}}, "unsupported content part type 'file'"),
+    ("user", {"text": "no type"}, "unsupported content part type None"),
+    # worded as the Rust frontend words it
+    ("user", {"type": True}, "a content part's 'type' must be a string"),
     # a system image reached the model as a user's attachment, which it then refused for another reason
-    ("system", _IMAGE),
-    ("developer", _IMAGE),
+    ("system", _IMAGE, "a system message takes text parts only"),
+    ("developer", _IMAGE, "a system message takes text parts only"),
 ])
-def test_an_empty_unknown_or_misplaced_chat_part_is_refused(tmp_path, role, part):
+def test_an_empty_unknown_or_misplaced_chat_part_is_refused(tmp_path, role, part, error):
     # the valid image after it is never saved either
     messages = [{"role": role, "content": [part]}, {"role": "user", "content": [_IMAGE]}]
-    with pytest.raises(ValueError, match="content part|system message"):
+    with pytest.raises(ValueError, match=error):
         adapters.flatten_messages(messages, tmp_path)
     assert not list(tmp_path.iterdir())
