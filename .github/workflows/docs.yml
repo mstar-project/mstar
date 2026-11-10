@@ -34,14 +34,28 @@ jobs:
           # deliberately does not mock torch (PEP 604 annotations break under mocks).
           pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu
-          # Base install only; GPU-only model extras (flashinfer, transformers, ...)
-          # are not needed for the narrative docs. Modules that import them at module
-          # scope yield autosummary stub pages, which is acceptable for the first site.
+          # The engine imports Triton at module scope, and CPU torch wheels don't
+          # bring it; 3.6.0 is the version torch 2.10.0 pins, as in ci.yml.
+          pip install triton==3.6.0
           pip install -e .
+          # The rest of what the documented modules import at module scope; none
+          # of it needs a GPU. diffusers is pinned as in ci.yml.
+          pip install einops safetensors transformers diffusers==0.39.0
           pip install -r docs/requirements.txt
 
       - name: Build HTML
-        run: sphinx-build -b html docs docs/_build/html
+        run: |
+          set -o pipefail
+          sphinx-build -b html docs docs/_build/html 2>&1 | tee sphinx-build.log
+
+      # Sphinx only warns when it cannot import a module, and publishes the
+      # reference without it. Install what the module imports in the step above.
+      - name: Fail on modules the API reference could not import
+        run: |
+          if grep -A4 "failed to import" sphinx-build.log; then
+            echo "::error::The API reference could not import the modules above."
+            exit 1
+          fi
 
       - name: Publish to gh-pages
         if: github.ref == 'refs/heads/main'

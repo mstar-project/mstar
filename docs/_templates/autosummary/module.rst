@@ -47,6 +47,8 @@
    {% endblock %}
 
 {% block modules %}
+{# Test packages are not API, and a module-level pytest skip in one reads as a failed import. #}
+{% set modules = modules | reject("in", ["tests", fullname ~ ".tests"]) | list %}
 {% if modules %}
 .. rubric:: Modules
 
