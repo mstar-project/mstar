@@ -28,6 +28,9 @@ class DSAConfig:
     sm_scale: float | None = None
     # kpool > 1: the indexer's key width; an INDEX_PLANES row is three of them wide
     index_head_dim: int | None = None
+    # MiB each FlashInfer workspace of its sparse plans starts at (one per walk and capture
+    # slot, one for eager steps); a plan that needs more grows it until captures are sealed
+    workspace_mb: int = 128
 
 
 @dataclass

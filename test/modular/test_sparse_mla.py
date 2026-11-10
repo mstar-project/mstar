@@ -1,9 +1,16 @@
 """sparse_mla on CPU: the torch reference against a masked dense softmax, a sharded row
-selection against the unsharded one, and the plan's packed layout."""
+selection against the unsharded one, the plan's packed layout and its workspace."""
 import pytest
 import torch
 
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.dsa import sparse_mla
+
+CPU = torch.device("cpu")
+
+
+def _workspace(size_mb=1):
+    return WorkspacePool(CPU, size_mb=size_mb, owner="dsa").get("eager")
 
 
 def test_reference_is_masked_dense_softmax():
@@ -88,11 +95,13 @@ def test_the_plan_runs_on_one_intra_op_thread():
     before = torch.get_num_threads()
     torch.set_num_threads(2)  # so CI's OMP_NUM_THREADS=1 can't pass it without the narrowing
     try:
-        sparse_mla._plan(Wrapper(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512, 64, 0.1)
+        sparse_mla._plan(_workspace(), Wrapper(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512,
+                         64, 0.1)
         assert seen == [1]
         assert torch.get_num_threads() == 2
         with pytest.raises(RuntimeError, match="plan failed"):
-            sparse_mla._plan(Fails(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512, 64, 0.1)
+            sparse_mla._plan(_workspace(), Fails(), torch.zeros(4, dtype=torch.int32), [2, 1], 4,
+                             512, 64, 0.1)
         assert torch.get_num_threads() == 2
     finally:
         torch.set_num_threads(before)
@@ -107,9 +116,38 @@ def test_pack_lays_the_slots_out_as_the_plan_describes():
         def plan(self, qo, kv, indices, lens, *args):
             seen.update(kv=kv, lens=lens)
 
-    sparse_mla._plan(Wrapper(), torch.zeros(10, dtype=torch.int32), [2, 3, 1], 4, 512, 64, 0.1)
+    sparse_mla._plan(_workspace(), Wrapper(), torch.zeros(10, dtype=torch.int32), [2, 3, 1], 4,
+                     512, 64, 0.1)
     slots = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32)
     dst = torch.full((3 * 3 + 1,), -7, dtype=torch.int32)
     sparse_mla._pack(dst, slots, seen["kv"], seen["lens"])
     # what a row leaves unused lands on the spare last entry
     assert dst[:9].tolist() == [10, 11, 20, 21, 22, 30, -7, -7, -7]
+
+
+def test_a_plan_short_of_workspace_grows_it_until_the_pool_is_sealed():
+    """FlashInfer reports a short float workspace when it plans. The plan's workspace grows
+    and it plans again; once the pool is sealed a captured graph may hold the address, so the
+    plan is refused and names the setting."""
+    pool = WorkspacePool(CPU, size_mb=1, owner="dsa")
+    workspace = pool.get("decode", 0)
+    need = 3 << 20
+
+    class Wrapper:
+        def plan(self, *args):
+            have = workspace.tensor.numel()
+            if have < need:
+                raise RuntimeError(f"Buffer overflow when allocating memory for tmp_v with size "
+                                   f"{need} and alignment 16, but only {have} bytes available")
+
+    def plan():
+        sparse_mla._plan(workspace, Wrapper(), torch.zeros(4, dtype=torch.int32), [2, 1], 4, 512,
+                         64, 0.1)
+
+    plan()
+    assert workspace.tensor.numel() == need
+    need = 8 << 20
+    pool.seal()
+    with pytest.raises(RuntimeError, match="workspace_mb dsa declares"):
+        plan()
+    assert workspace.tensor.numel() == 3 << 20
