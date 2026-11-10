@@ -471,7 +471,8 @@ class TestComment(unittest.TestCase):
 
     def test_a_box_with_no_verdict_keeps_the_redacted_tail_of_its_sessions_stderr(self):
         for verdict, kept, err in (("unavailable", True, "x" * 9000 + "\n"), ("pass", False, ""),
-                                   ("unavailable", True, "x" * 9000)):  # one long last line
+                                   ("unavailable", True, "x" * 9000),  # one long last line
+                                   ("unavailable", True, "x\n" + "E" * 5000 + "\n")):  # a long line, then a short
             with self.subTest(verdict), tempfile.TemporaryDirectory() as temp:
                 results = Path(temp, "lt/amd/results")
                 results.mkdir(parents=True)
@@ -482,7 +483,9 @@ class TestComment(unittest.TestCase):
                 self.assertEqual(tail.exists(), kept, "a session that died at once would leave no reason")
                 if kept:
                     self.assertTrue(tail.read_text().endswith("API Error: 401 for key [REDACTED]\n"))
-                    self.assertLessEqual(len(tail.read_text()), gpu_review.ERR_TAIL)
+                    self.assertLessEqual(len(tail.read_text()), gpu_review.ERR_TAIL + 1)
+                    self.assertGreater(len(tail.read_text()), gpu_review.ERR_TAIL - 100,
+                                       "the tail would drop the long line the error is on")
 
     def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
         box_key = "sk-ant-api03-" + "Ab1_-" * 8
