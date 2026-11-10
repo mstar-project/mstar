@@ -780,13 +780,12 @@ class TestApprove(unittest.TestCase):
                            ("AMD-only code path", ""), ("the ROCm 7 path", ""), ("no ROCm support", ""),
                            ("MI300X 2 nodes", "2 nodes"), ("MI300 kernels", ""), ("MI300A kernels", "MI300A"),
                            ("ROCm 8 GPUs", "8 GPUs"), ("ROCm 2 nodes", "2 nodes"), ("ROCm 8-GPU", "8-GPU"),
-                           ("ROCm 7 GPU kernels", ""), ("ROCm 6.2 GPUs", ""), ("ROCm v7 GPUs", ""),
-                           ("ROCm 7 node kernels", "node kernels"),
+                           ("ROCm 8 GPU", "8 GPU"), ("ROCm 7 GPU kernels", "7 GPU kernels"), ("ROCm 6.2 GPUs", ""),
+                           ("ROCm v7 GPUs", ""), ("ROCm 7 node kernels", "7 node kernels"),
                            ("cloud backends", "cloud backends")):
             with self.subTest(text):
                 left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
                 self.assertIn(kept, left, "what the AMD box can't run either would stop counting")
-                self.assertNotRegex(left, r"^v?\d+(\.\d+)? (GPU|node)( |$)", "a ROCm version would read as a count")
                 self.assertEqual(left == "", kept == "", "AMD hardware alone would still stop an AMD PR's approval")
 
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
