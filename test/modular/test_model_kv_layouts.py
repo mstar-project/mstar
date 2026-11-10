@@ -430,7 +430,7 @@ def _higgs():
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
     pad = model.config.audio_in_token_idx
-    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    model.media = (MediaIntake("audio", audio_encoder(), pad, model._audio_intake),)
     return model
 
 
