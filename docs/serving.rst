@@ -244,8 +244,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
        ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
        true`` runs the group's node beside the worker's main chain of steps (see
-       below). ``attention_backend: sdpa`` runs each attention the group's DiT node
-       declares on torch's SDPA in place of the default ``flashinfer``.
+       below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -440,6 +439,10 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``backend: sdpa`` on the resource of a declared read within a step runs each read on it
+through torch's SDPA, as a DiT's reference pipeline does, and builds no resource, so its block
+takes no other key. A read whose queries come packed can't run on SDPA, and loading refuses it.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's

@@ -199,7 +199,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     Every attention in the DiT reads a declared array (``LTX25Model.declare_state``):
     three spans per request, ``video``, ``audio`` and ``text``; two self-attentions
     and four cross-attentions between them, on four resources (self / cross x the
-    two head geometries). With ``attention_backend: sdpa`` every attention runs SDPA,
+    two head geometries). With ``backend: sdpa`` on all four every attention runs SDPA,
     which is what the reference pipeline runs.
     """
 

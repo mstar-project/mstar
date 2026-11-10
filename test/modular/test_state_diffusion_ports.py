@@ -88,6 +88,11 @@ def _ltx(**kwargs) -> LTX25Model:
     return model
 
 
+def _on_sdpa(model) -> frozenset[str]:
+    """Every resource ``model`` declares, which on a DiT is each attention's."""
+    return frozenset(spec.resource_key for spec in node_resources(model))
+
+
 def _wan_reference() -> RaggedAttentionSpec:
     c = Wan22Config()
     return RaggedAttentionSpec(
@@ -142,7 +147,8 @@ def test_specs_equal_the_hand_written_one_after_yaml_overrides(name):
 
 @pytest.mark.parametrize("name", MODELS)
 def test_sdpa_builds_no_spec_as_the_hand_written_model_did(name):
-    assert node_resources(MODELS[name][0](), sdpa_nodes={"dit"}) == []
+    model = MODELS[name][0]()
+    assert node_resources(model, sdpa=_on_sdpa(model)) == []
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -162,12 +168,12 @@ def test_declarations_have_no_problems(name):
 
 @pytest.mark.parametrize("build", [_klein, _z])
 def test_the_old_knob_is_refused(build):
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         build(attention_backend="sdpa")
 
 
 def test_the_old_knob_is_refused_on_wan22():
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         Wan22Model("test/wan22", attention_backend="sdpa")
 
 
@@ -247,7 +253,7 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
 def test_a_step_on_sdpa_is_none_as_the_hand_written_model_returned():
     model = _klein()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
-    handles = node_handles(model, "dit", {}, sdpa=True)
+    handles = node_handles(model, "dit", {}, sdpa=_on_sdpa(model))
     assert state_steps(sub.declare_step("gen", [0], [_inputs(_klein_key())]), handles) is None
 
 
@@ -372,7 +378,7 @@ def test_ltx_specs_equal_the_hand_written_four_after_yaml_overrides():
 
 
 def test_ltx_on_sdpa_builds_no_spec_and_its_declarations_have_no_problems():
-    assert node_resources(_ltx(), sdpa_nodes={"dit"}) == []
+    assert node_resources(_ltx(), sdpa=_on_sdpa(_ltx())) == []
     assert state_declaration_problems(_ltx()) == []
 
 
@@ -442,5 +448,5 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
     model = _ltx()
     sub = LTXDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP)
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    handles = node_handles(model, "dit", {}, sdpa=True)
+    handles = node_handles(model, "dit", {}, sdpa=_on_sdpa(model))
     assert state_steps(sub.declare_step("generate_av", [0], [_inputs(shape)]), handles) is None

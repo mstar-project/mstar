@@ -70,7 +70,7 @@ def test_graph_structure():
 
 def test_resources_and_dummy_mode():
     assert [s.resource_key for s in node_resources(_make_model())] == [DIT_ATTN]
-    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
+    assert node_resources(_make_model(), sdpa={DIT_ATTN}) == []
     model = _make_model()
     assert all(model.get_submodule(n) is None for n in model.nodes)
     assert model.get_autocast_dtype() is None

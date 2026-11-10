@@ -30,9 +30,10 @@ from mstar.engine.state.adapters import (
     _bindings,
     build_specs,
     node_handles,
+    sdpa_resources,
     state_steps,
 )
-from mstar.engine.state.analysis import deployment_problems, sdpa_nodes
+from mstar.engine.state.analysis import deployment_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
 from mstar.model.components.diffusion.attention import sdpa_attention
@@ -96,7 +97,7 @@ def _within(array, ragged, **within) -> WithinStepHandle:
     return WithinStepHandle(array, {next(iter(array.reads)): ragged}, None, _bindings(WITHIN_STEP, array), **within)
 
 
-def _handles(arrays, *, group=None, sdpa=False) -> dict[str, WithinStepHandle]:
+def _handles(arrays, *, group=None, sdpa=frozenset()) -> dict[str, WithinStepHandle]:
     specs = build_specs(arrays)
     return node_handles(
         _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, sdpa=sdpa,
@@ -389,70 +390,70 @@ def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
     assert callables[0] is callables[1], "Dynamo would retrace ulysses_attention's frame once per layer"
 
 
-# attention_backend: sdpa
+# backend: sdpa
 
 
-def test_a_node_on_sdpa_builds_no_spec():
-    assert build_specs([_array("a")], sdpa_nodes={"dit"}) == []
+def test_a_resource_on_sdpa_builds_no_spec():
+    assert build_specs([_array("a")], sdpa={"a_read"}) == []
 
 
-def test_kernel_settings_on_a_node_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
-    assert build_specs([_array("a")], sdpa_nodes={"dit"}, kernel_settings={"a_read": {"workspace_mb": 1}}) == []
+def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
+    assert build_specs([_array("a")], sdpa={"a_read"}, kernel_settings={"a_read": {"workspace_mb": 1}}) == []
     with pytest.raises(ValueError, match="it may set only"):
-        build_specs([_array("a")], sdpa_nodes={"dit"}, kernel_settings={"a_read": {"backend": "dense"}})
+        build_specs([_array("a")], sdpa={"a_read"}, kernel_settings={"a_read": {"backend": "dense"}})
 
 
-def test_a_node_on_sdpa_needs_an_array_with_a_read():
-    assert deployment_problems(_Model(_array("a")), {}, sdpa={"dit"}) == []
-    (problem,) = deployment_problems(_Model(_array("a")), {}, sdpa={"dit", "vae"})
-    assert problem.startswith("node 'vae': attention_backend sdpa, and it holds no array")
+def test_sdpa_on_a_resource_no_read_runs_on_is_refused():
+    with pytest.raises(ValueError, match=r"resources \['vae'\]: backend sdpa, and no read runs on them"):
+        build_specs([_array("a")], sdpa={"a_read", "vae"})
 
 
 def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
-    handle = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
+    handle = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})["a"]
     with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
                                          "SdpaAttend takes no kernel settings"):
         kernel_setting(handle, "a_read", "max_segments_per_request")
 
 
 def test_a_step_of_reads_on_sdpa_is_no_step_at_all():
-    handles = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)
+    handles = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})
     step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
-    assert state_steps(step, handles) is None, "a node on sdpa declares no step, and its forward still runs"
+    assert state_steps(step, handles) is None, "a step on sdpa declares no step, and its forward still runs"
 
 
 def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
     q, k, v = (torch.randn(2, 4, HEADS, DIM) for _ in range(3))
-    h = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
+    h = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})["a"]
     h.add(0, k=k, v=v)
     assert torch.equal(h.read(0, q), sdpa_attention(q, k, v))
 
 
 def test_a_read_on_sdpa_refuses_packed_tokens():
     with pytest.raises(ValueError, match="Array 'a': no layout yet: reads\\['a_read'\\] runs SDPA, which can't tell"):
-        node_handles(_Model(_array("a", packed=True)), "dit", {}, sdpa=True)
+        node_handles(_Model(_array("a", packed=True)), "dit", {}, sdpa={"a_read"})
 
 
-def test_the_setting_is_read_per_node_from_its_groups():
-    assert sdpa_nodes([{"node_names": ["dit", "vae"], "attention_backend": "sdpa"}, {"node_names": ["te"]}]) == {
-        "dit", "vae",
-    }
+def test_the_setting_is_read_per_resource_from_its_block():
+    config = {"resources": {"a_read": {"backend": "sdpa"}, "b_read": {"backend": "dense"}, "kv": {"page_size": 8}}}
+    assert sdpa_resources(config) == {"a_read"}
 
 
-@pytest.mark.parametrize("groups, cause", [
-    ([{"node_names": ["dit"], "attention_backend": "dense"}], "takes flashinfer or sdpa, not 'dense'"),
-    ([{"node_names": ["dit"], "attention_backend": "sdpa"}, {"node_names": ["dit"]}], "node 'dit' gets different"),
+@pytest.mark.parametrize("config, cause", [
+    ({"node_groups": [{"node_names": ["dit"], "attention_backend": "sdpa"}]},
+     "node_groups\\[0\\].attention_backend: the backend is a resource's setting"),
+    ({"resources": {"a_read": {"backend": "sdpa", "max_segments_per_step": 2}}},
+     "resources.a_read: backend sdpa builds no resource, so it takes no other setting"),
 ])
-def test_a_bad_setting_is_refused_naming_the_cause(groups, cause):
+def test_a_bad_setting_is_refused_naming_the_cause(config, cause):
     with pytest.raises(ValueError, match=cause):
-        sdpa_nodes(groups)
+        sdpa_resources(config)
 
 
-def test_sdpa_on_a_node_that_keeps_entries_is_refused_at_load():
+def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     array = Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
                   reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
-    (problem,) = deployment_problems(_Model(array), {}, sdpa={"llm"})
-    assert problem.startswith("Array 'kv': attention_backend sdpa on nodes ['llm']")
+    with pytest.raises(ValueError, match="Array 'kv': no layout yet: reads\\['r'\\].mask must be Block, the only mask"):
+        build_specs([array], sdpa={"r"})
 
 
 def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():

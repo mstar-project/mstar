@@ -70,26 +70,26 @@ if TYPE_CHECKING:
     from mstar.model.base import LabelLayout, Model
 
 
-def node_resources(model: "Model", *, sdpa_nodes: Collection[str] = frozenset()) -> list[NodeResourceSpec]:
+def node_resources(model: "Model", *, sdpa: Collection[str] = frozenset()) -> list[NodeResourceSpec]:
     """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
-    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings(), sdpa_nodes=sdpa_nodes)
+    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings(), sdpa=sdpa)
     return specs + list(model.get_node_resources() or [])
 
 
 def build_specs(
     declarations: Sequence[Array | Sampler], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
-    sdpa_nodes: Collection[str] = frozenset(),
+    sdpa: Collection[str] = frozenset(),
 ) -> list[NodeResourceSpec]:
     """Each array's specs, from its storage and its ops' bindings, under the names the declarations give, then a
-    `PositionSpec` for each array that declares positions and a `SamplerSpec` per sampler. A node in ``sdpa_nodes``
-    builds no ragged spec, since its reads run SDPA.
+    `PositionSpec` for each array that declares positions and a `SamplerSpec` per sampler. The reads of a resource in
+    ``sdpa`` run SDPA, which builds no spec.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack. That includes a second update of
     one type on an array, a temporary limit: an update call finds its op by type, which today's resources need and the
     contract doesn't.
     """
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    resolved = _resolve(arrays, sdpa_nodes)
+    resolved = _resolve(arrays, sdpa)
     specs: list[NodeResourceSpec] = []
     for array in arrays:
         specs += resolved.specs[array.name]
@@ -100,18 +100,54 @@ def build_specs(
     return specs
 
 
-def _resolve(arrays: Sequence[Array], sdpa_nodes: Collection[str] = frozenset()) -> "Resolved":
-    """``arrays`` resolved by their storages, each storage's at once."""
+def _resolve(arrays: Sequence[Array], sdpa: Collection[str] = frozenset()) -> "Resolved":
+    """``arrays`` resolved by their storages, each storage's at once. Refuses a resource in ``sdpa`` that no read runs
+    on."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
         by_storage.setdefault(storage_of(array), []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
     resource_of: dict[str, str] = {}
     for storage, held in by_storage.items():
-        each = storage.resolve(held, arrays, sdpa_nodes)
+        each = storage.resolve(held, arrays, sdpa)
         specs |= each.specs
         resource_of |= each.resource_of
+    unknown = sorted(set(sdpa) - set(resource_of.values()))
+    if unknown:
+        raise ValueError(f"resources {unknown}: backend sdpa, and no read runs on them, of "
+                         f"{sorted(set(resource_of.values()))}")
     return Resolved(specs, resource_of)
+
+
+def sdpa_resources(config: Mapping[str, Any]) -> frozenset[str]:
+    """The resources whose ``resources:`` block in ``config`` sets ``backend: sdpa``. A ``node_groups`` entry that
+    still sets ``attention_backend`` is refused, since a config that asks for SDPA there would run the ragged kernel."""
+    for i, group in enumerate(config.get("node_groups") or ()):
+        if "attention_backend" in group:
+            raise ValueError(f"node_groups[{i}].attention_backend: the backend is a resource's setting, as "
+                             "`resources: {<the read's resource key>: {backend: sdpa}}`")
+    blocks = config.get("resources") or {}
+    sdpa = frozenset(
+        key for key, block in blocks.items() if isinstance(block, Mapping) and block.get("backend") == "sdpa"
+    )
+    for key in sorted(sdpa):
+        others = sorted(blocks[key].keys() - {"backend"})
+        if others:
+            raise ValueError(f"resources.{key}: backend sdpa builds no resource, so it takes no other setting, and it "
+                             f"sets {others}")
+    return sdpa
+
+
+def spec_overrides(config: Mapping[str, Any], sdpa: Collection[str]) -> Mapping[str, Any]:
+    """``config`` without the ``resources:`` blocks of the resources in ``sdpa``, which have no spec to take them."""
+    if not sdpa:
+        return config
+    return {**config, "resources": {key: block for key, block in config["resources"].items() if key not in sdpa}}
+
+
+def _chosen(array: Array, sdpa: Collection[str], resource_of: Mapping[str, str]) -> dict[str, "OpBinding"]:
+    """The reads of ``array`` whose resource runs SDPA, with that binding."""
+    return {key: SDPA[WITHIN_STEP, Attend] for key in array.reads if resource_of.get(key, key) in sdpa}
 
 
 def _no_layout(array: Array, missing: str) -> ValueError:
@@ -126,10 +162,8 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     return k.shape
 
 
-def _within_step_read(
-    array: Array, chosen: Mapping[str, "OpBinding"],
-) -> tuple["BoundOp", int, int, torch.dtype | None]:
-    """``array``'s one read, bound as `_bindings` binds it, its heads and head dim, and its dtype, None for the compute
+def _within_step_read(array: Array) -> tuple["BoundOp", int, int, torch.dtype | None]:
+    """``array``'s one read, bound as `BINDINGS` binds it, its heads and head dim, and its dtype, None for the compute
     dtype."""
     k = array.entry.tensors.get("k")
     if k is None or len(k.shape) != 2 or k.shard != 0 or array.entry != Entry({"k": k, "v": k}):
@@ -140,7 +174,7 @@ def _within_step_read(
     if len(array.labels) != 1:
         raise _no_layout(array, f"max_len 0 takes one label, since a plan holds one per call, and it has "
                                 f"{sorted(array.labels)}")
-    (bound,) = _bindings(WITHIN_STEP, array, chosen)
+    (bound,) = _bindings(WITHIN_STEP, array)
     return bound, k.shape[0], k.shape[1], k.dtype
 
 
@@ -199,14 +233,14 @@ def _apply_kernel_settings(
 
 
 def node_handles(
-    model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None, sdpa: bool = False,
-    host_fields: HostFields | None = None,
+    model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None,
+    sdpa: Collection[str] = frozenset(), host_fields: HostFields | None = None,
 ) -> dict[str, ArrayHandle | SamplerHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``. With ``sdpa``, its reads of arrays with
-    ``max_len`` 0 have no resource and run SDPA. ``host_fields`` holds the fields of the Values that declare them."""
+    """``node``'s handles, by declared name, over its built ``resources``. The reads of a resource in ``sdpa`` run SDPA.
+    ``host_fields`` holds the fields of the Values that declare them."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
-    resource_of = _resolve(list(arrays.values())).resource_of
+    resource_of = _resolve(list(arrays.values()), sdpa).resource_of
     handles: dict[str, ArrayHandle | SamplerHandle] = {}
     for declared in declarations:
         if node not in declared.nodes:
@@ -216,9 +250,8 @@ def node_handles(
             handles[declared.name] = ValueHandle(declared, resources, None, (), host_fields)
         elif isinstance(declared, Array) and storage_of(declared) is WITHIN_STEP:
             ((read_key, read),) = declared.reads.items()
-            chosen = {read_key: SDPA[WITHIN_STEP, Attend]} if sdpa else EMPTY
             handles[declared.name] = WithinStepHandle(
-                declared, resources, None, _bindings(WITHIN_STEP, declared, chosen),
+                declared, resources, None, _bindings(WITHIN_STEP, declared, _chosen(declared, sdpa, resource_of)),
                 resource_key=resource_of[read_key], queried=arrays.get(read.queries), sp_group=sp_group,
             )
         else:
@@ -849,9 +882,9 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
 
     @abstractmethod
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
-        """``arrays``, all of the declared ones this storage holds, at once, where ``declared`` are all of them. A read
-        of an array on ``sdpa_nodes`` runs SDPA."""
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa: Collection[str]) -> Resolved:
+        """``arrays``, all of the declared ones this storage holds, at once, where ``declared`` are all of them. The
+        reads of a resource in ``sdpa`` run SDPA."""
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
@@ -873,19 +906,20 @@ class PagedStorage(Storage):
 
     handle_class = PagedArrayHandle
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa: Collection[str]) -> Resolved:
         return Resolved(
-            {array.name: self._specs(array) for array in arrays}, {key: key for array in arrays for key in array.reads},
+            {array.name: self._specs(array, sdpa) for array in arrays},
+            {key: key for array in arrays for key in array.reads},
         )
 
-    def _specs(self, array: Array) -> list[NodeResourceSpec]:
+    def _specs(self, array: Array, sdpa: Collection[str]) -> list[NodeResourceSpec]:
         heads, head_dim = _kv_shape(array)
         if array.seq_sharded or any(read.queries is not None for read in array.reads.values()):
             raise _no_layout(array, "seq_sharded and queries take max_len 0, and today's paged reads attend their own "
                                     "pool")
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
-        bound = _bindings(self, array)
+        bound = _bindings(self, array, _chosen(array, sdpa, EMPTY))
         q_heads = {read.op.q_heads for read in array.reads.values()}
         if len(q_heads) > 1:
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
@@ -921,7 +955,7 @@ class ValueStorage(Storage):
 
     handle_class = ValueHandle
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa: Collection[str]) -> Resolved:
         return Resolved({array.name: self._specs(array, declared) for array in arrays}, {})
 
     def _specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
@@ -972,7 +1006,7 @@ class WithinStepStorage(Storage):
     def step_builder(self) -> StepBuilder:
         return WithinStepSteps()
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa: Collection[str]) -> Resolved:
         """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
         node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
         resource rather than a resource of its own."""
@@ -982,8 +1016,7 @@ class WithinStepStorage(Storage):
         resource_of: dict[str, str] = {}
         shared: dict[tuple, NodeResourceSpec] = {}
         for array in arrays:
-            chosen = dict.fromkeys(array.reads, SDPA[WITHIN_STEP, Attend]) if array.nodes <= sdpa_nodes else EMPTY
-            bound, heads, head_dim, dtype = _within_step_read(array, chosen)
+            bound, heads, head_dim, dtype = _within_step_read(array)
             key, read = bound.key, bound.declared
             queried = by_name.get(read.queries, array)
             config = RaggedAttentionConfig(
@@ -995,6 +1028,7 @@ class WithinStepStorage(Storage):
             spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
             spec = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
             resource_of[key] = spec.resource_key
+            (bound,) = _bindings(self, array, _chosen(array, sdpa, resource_of))
             specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return Resolved(specs, resource_of)
 

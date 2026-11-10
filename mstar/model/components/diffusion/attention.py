@@ -10,8 +10,8 @@ no KV cache to page. Two backends serve the same ``[B, S, H, D]`` contract:
   FA2/FA3) — one segment per request, planned by the runner outside the captured
   graph, so a per-step CUDA graph can replay it.
 
-Layers call :func:`attend`, and the array's read picks the backend at bind from the
-node's ``attention_backend``.
+Layers call :func:`attend`, and the array's read picks the backend at bind from its
+resource's ``backend``.
 """
 
 from __future__ import annotations
@@ -43,7 +43,8 @@ def dit_entry(heads: int, head_dim: int) -> Entry:
 def refuse_attention_backend_kwarg(kwargs: Mapping[str, Any]) -> None:
     """A constructor's ``**kwargs`` would swallow the old knob, and a config that asks for SDPA would run FlashInfer."""
     if "attention_backend" in kwargs:
-        raise ValueError("attention_backend is a node group's setting: move it from model_kwargs to the DiT's group")
+        raise ValueError("attention_backend is a resource's setting: move it from model_kwargs to "
+                         "`resources: {<the read's resource key>: {backend: sdpa}}`")
 
 
 def attend(state: Any, layer: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

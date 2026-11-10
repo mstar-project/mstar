@@ -563,7 +563,7 @@ class Engine:
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
         side_stream_nodes: Collection[str] = (),
-        sdpa_nodes: Collection[str] = (),
+        sdpa: Collection[str] = (),
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
@@ -572,8 +572,8 @@ class Engine:
         self._device_capability = device_capability
         # nodes whose steps run beside the worker's chain (``EngineManager.build``)
         self._side_stream_nodes = frozenset(side_stream_nodes)
-        # nodes whose reads of arrays with max_len 0 run SDPA (``attention_backend``)
-        self._sdpa_nodes = frozenset(sdpa_nodes)
+        # resources whose reads run SDPA (``resources: {<key>: {backend: sdpa}}``)
+        self._sdpa = frozenset(sdpa)
         self._host_fields = HostFields()
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
@@ -711,7 +711,7 @@ class Engine:
             submodule.bind_node_resources(resources)
             handles = {} if model is None else node_handles(
                 model, node_name, resources, sp_group=parallel_groups.get_sp_config_for_node(node_name),
-                sdpa=node_name in self._sdpa_nodes, host_fields=self._host_fields,
+                sdpa=self._sdpa, host_fields=self._host_fields,
             )
             if handles:
                 bind_state_ops(handles)

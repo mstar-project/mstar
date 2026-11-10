@@ -39,7 +39,7 @@ A recipe such as LTX-2.5's two-stage distilled one (half-resolution denoise → 
 
 ## Attention
 
-Every attention in the DiT should go through the read of an array with `max_len=0`, so the model gets the engine's kernels and `attention_backend: sdpa` on its node group can swap them. A layer holds its id as a 0-d CPU tensor and calls `attend(self.state, self.layer, q, k, v)`: an int on the module recompiles the frame per layer when the read breaks the graph.
+Every attention in the DiT should go through the read of an array with `max_len=0`, so the model gets the engine's kernels and `backend: sdpa` on the read's resource can swap them. A layer holds its id as a 0-d CPU tensor and calls `attend(self.state, self.layer, q, k, v)`: an int on the module recompiles the frame per layer when the read breaks the graph.
 
 - `attention_segments(bucket_key)` declares, per array, every span a request's layers attend over, as `(label, length)`. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) binds its own array with its own label.
 - Reads of one kernel configuration on one node fold into one resource, so a model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) gets one resource per geometry.

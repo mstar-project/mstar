@@ -537,13 +537,13 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     (``mstar.engine.resources.lora.serving``). Raises the first problem with the declaration,
     for callers that skip ``validate_deployment``, which reports them all."""
     from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-    from mstar.engine.state.adapters import node_resources
-    from mstar.engine.state.analysis import sdpa_nodes, state_declaration_problems
+    from mstar.engine.state.adapters import node_resources, sdpa_resources
+    from mstar.engine.state.analysis import state_declaration_problems
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
-    specs = node_resources(model, sdpa_nodes=sdpa_nodes(model_config.get("node_groups") or ()))
+    specs = node_resources(model, sdpa=sdpa_resources(model_config))
     lora = declared_lora_specs(model, model_config)
     size_lora_specs(lora, model_config)
     return specs + lora
@@ -577,9 +577,10 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     steps, reporting every problem rather than the first.
     """
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import sdpa_resources, spec_overrides
 
     specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    apply_yaml_overrides(specs, spec_overrides(model_config, sdpa_resources(model_config)))
     return built_resources(specs)
 
 

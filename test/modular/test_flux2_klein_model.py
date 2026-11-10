@@ -104,11 +104,11 @@ def test_resources_follow_the_attention_backend():
     assert len(flashinfer) == 1 and flashinfer[0].resource_key == DIT_ATTN and flashinfer[0].nodes == {"dit"}
     cfg = flashinfer[0].config
     assert cfg.num_qo_heads == 24 and cfg.head_dim == 128 and cfg.max_segments_per_request == 1
-    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
+    assert node_resources(_make_model(), sdpa={DIT_ATTN}) == []
 
 
 def test_the_old_attention_backend_kwarg_is_refused():
-    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+    with pytest.raises(ValueError, match="attention_backend is a resource's setting"):
         _make_model(attention_backend="sdpa")
 
 
