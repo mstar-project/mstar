@@ -261,8 +261,9 @@ def _vaes():
 def test_the_vae_nodes_match_the_pipelines_math():
     """Encode: the image processor's pixels, to the bit and memory layout (on an H200 a contiguous input moved the
     latents 1e-3, cuDNN picking kernels by layout), then the posterior's mode, (z - mean) / std, packed; decode:
-    unpacked, z / (1 / std) + mean, rounded as the pipeline's image processor does. The Wan class holds the
-    QwenImage checkpoint."""
+    unpacked, z / (1 / std) + mean, rounded as the pipeline's image processor does. The nodes skip the VAE's
+    one-frame feature cache (written, never read): a diffusers change that reads it would break this. The Wan
+    class holds the QwenImage checkpoint."""
     from diffusers.image_processor import VaeImageProcessor
     from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline as P
     from PIL import Image
@@ -271,8 +272,8 @@ def test_the_vae_nodes_match_the_pipelines_math():
     image = torch.randint(0, 256, (3, 32, 48), dtype=torch.uint8)
     pil = Image.fromarray(image.permute(1, 2, 0).numpy())
     pixels = VaeImageProcessor(vae_scale_factor=16).preprocess(pil, height=32, width=48).unsqueeze(2)
-    seen, encode = [], wan.encode
-    wan.encode = lambda x: seen.append(x) or encode(x)
+    seen = []
+    wan.encoder.register_forward_pre_hook(lambda module, args: seen.append(args[0]))
     encoder = QwenImageVaeEncoderSubmodule(wan)
     encoder.get_device = lambda: torch.device("cpu")
     with torch.no_grad():

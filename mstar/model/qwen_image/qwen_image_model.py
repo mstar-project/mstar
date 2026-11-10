@@ -95,7 +95,8 @@ class QwenImageModel(Model):
         # Dummy mode: get_submodule returns None for every node (CPU tests, no weights).
         self.skip_weight_loading = skip_weight_loading
         self.attention_backend = attention_backend
-        # torch.compile per transformer block, static but for the text axis
+        # torch.compile per transformer block (static but for the text axis) and the VAE's encoder and decoder
+        # (dynamic): not bit-exact, gated against the fp32 pipeline
         self.compile = bool(compile)
         # the largest output a request may ask for: the attention is quadratic in it
         self.max_image_area = int(max_image_area)
@@ -348,8 +349,8 @@ class QwenImageModel(Model):
             if self._vae is None:
                 self._vae = weight_loader.build_vae(snapshot, device)
             if node_name == "vae_encoder":
-                return QwenImageVaeEncoderSubmodule(self._vae)
-            return QwenImageVaeDecoderSubmodule(self._vae, config)
+                return QwenImageVaeEncoderSubmodule(self._vae, compile=self.compile)
+            return QwenImageVaeDecoderSubmodule(self._vae, config, compile=self.compile)
         if node_name == "dit":
             return QwenImageDenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group), config,

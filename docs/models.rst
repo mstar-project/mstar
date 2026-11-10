@@ -2346,7 +2346,7 @@ turns guidance off and skips the negative prompt), ``negative_prompt`` (``" "``)
 
 Deployment knobs (``configs/qwen_image_edit.yaml``): ``attention_backend`` (``flashinfer`` or
 ``sdpa``, the reference kernel) and ``compile`` (each transformer block, static but for the text
-length). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
+length, and the VAE's encoder and decoder, dynamic). ``qwen_image_edit_tp2.yaml`` splits the DiT over two GPUs, and
 ``qwen_image_edit_cfg2.yaml`` the guidance branches. Not done: CUDA-graph capture (a step is
 GPU-bound), sequence parallelism, the text-to-image and layered Qwen-Image pipelines.
 
