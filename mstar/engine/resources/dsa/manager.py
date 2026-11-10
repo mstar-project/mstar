@@ -12,6 +12,7 @@ from contextlib import contextmanager
 
 import torch
 
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.dsa import paged, sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec, DSAStep
@@ -63,9 +64,9 @@ class DSAManager(Resource):
                                  "top_k_page_table_transform takes a page_size")
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
-        return cls(spec.config, kv_config, info.device)
+        return cls(spec.config, kv_config, info.device, spec.resource_key)
 
-    def __init__(self, config: DSAConfig, kv_config, device: torch.device):
+    def __init__(self, config: DSAConfig, kv_config, device: torch.device, name: str = "dsa"):
         self.config = config
         self.page_size = kv_config.tokens_per_page
         self.kv_rows = kv_config.max_seq_len  # cache rows a request may hold
@@ -81,12 +82,15 @@ class DSAManager(Resource):
         self._int_stager = PinnedStager(torch.int32)
         # (bucket, slot) -> the int32 rows a captured graph reads: pos, row_req, page_start, pages
         self._cg_rows: dict[tuple[BucketKey, int], torch.Tensor] = {}
-        # under CUDA graphs one sparse-attention plan per (walk, capture slot, rows), and per
-        # (walk, capture slot) the workspace and index buffer its plans share
+        # FlashInfer's workspaces: one per (walk, capture slot), one for eager steps
+        self._workspaces = WorkspacePool(device, config.workspace_mb, owner=name)
+        # (walk, capture slot, rows) -> its sparse-attention plan under CUDA graphs
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
-        self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        # an eager step's sparse plans, reused (one workspace)
-        self._eager = sparse_mla.EagerSparsePlans(device) if device.type == "cuda" else None
+        # (walk, capture slot) -> the index buffer its plans share
+        self._sparse_indices: dict[tuple[str, int], torch.Tensor] = {}
+        # an eager step's sparse plans, reused
+        self._eager = (sparse_mla.EagerSparsePlans(self._workspaces)
+                       if device.type == "cuda" else None)
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
@@ -133,6 +137,10 @@ class DSAManager(Resource):
                              f"{sparse_mla.MAX_ROWS} rows; cap the node's prefill ladder there")
         for spec in slots:
             self._cg_buffer(spec.bucket, spec.slot)
+
+    def seal_capture_buffers(self) -> None:
+        # a workspace a plan outgrew would move, and a captured graph holds its address
+        self._workspaces.seal()
 
     # -- the step ----------------------------------------------------------------------------
 
@@ -219,16 +227,14 @@ class DSAManager(Resource):
         key = (walk, slot, rows)
         sparse_plan = self._sparse_plans.get(key)
         if sparse_plan is None:
-            buffers = self._sparse_buffers.get(key[:2])
-            if buffers is None or buffers[1].numel() < rows * width + 1:
+            indices = self._sparse_indices.get(key[:2])
+            if indices is None or indices.numel() < rows * width + 1:
                 # captures run largest first, so the first is the slot's size; +1: the
                 # plan's spare index entry
-                buffers = self._sparse_buffers[key[:2]] = (
-                    torch.empty(sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8,
-                                device=self._device),
-                    torch.zeros(rows * width + 1, dtype=torch.int32, device=self._device))
+                indices = self._sparse_indices[key[:2]] = torch.zeros(
+                    rows * width + 1, dtype=torch.int32, device=self._device)
             sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
-                rows, width, buffers[0], buffers[1])
+                rows, width, self._workspaces.get(walk, slot), indices)
         sparse_plan.plan(lens, self.num_heads, self.kv_lora_rank, self.kpe, self.config.sm_scale)
         return sparse_plan
 

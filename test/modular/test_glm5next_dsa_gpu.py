@@ -10,6 +10,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.dsa import paged as dsa
 from mstar.engine.resources.dsa import sparse_mla
 
@@ -176,8 +177,9 @@ def test_captured_decode_matches_eager():
     window = 1 << 20
     ctx = _ctx(tables, list(range(rows)), [0] * rows, DEV, max_pools=window // KP, graph=True)
     ctx.pages = torch.cat([ctx.pages, ctx.pages.new_zeros(rows * window // PAGE)])
-    plan = sparse_mla.SparseGraphPlan(
-        rows, ctx.width, torch.empty(sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8, device=DEV))
+    workspaces = WorkspacePool(torch.device(DEV), size_mb=128, owner="dsa")
+    plan = sparse_mla.SparseGraphPlan(rows, ctx.width, workspaces.get("decode", 0))
+    eager = sparse_mla.EagerSparsePlans(workspaces)
     ctx.sparse_plan = plan
     q = torch.zeros(rows, NH, D, device=DEV).bfloat16()
     w = torch.zeros(rows, NH, device=DEV)
@@ -191,6 +193,7 @@ def test_captured_decode_matches_eager():
     plan.plan([1] * rows, HEADS, W, 0, 0.0625)
     step()  # warm up the kernels before capture
     torch.cuda.synchronize()
+    workspaces.seal()  # as the engine does: the graph holds the workspace's address
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = step()
@@ -205,5 +208,6 @@ def test_captured_decode_matches_eager():
         graph.replay()
         eager_ctx = _ctx(tables, list(range(rows)), positions, DEV)
         slots = dsa.select(q, w, view, eager_ctx)
+        eager_ctx.eager = eager
         want = dsa.sparse_attend(q_nope, q_pe, latent, slots, eager_ctx, 0.0625)
         assert torch.allclose(out.float(), want.float(), atol=1e-2, rtol=1e-2), trial

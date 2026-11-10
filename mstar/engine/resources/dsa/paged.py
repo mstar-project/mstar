@@ -318,14 +318,13 @@ def expand_slots(pool_first: torch.Tensor, ctx: DSAContext, rows=slice(None)) ->
 def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,
                   slots: torch.Tensor, ctx: DSAContext, sm_scale: float) -> torch.Tensor:
     """Absorbed MLA of each row over its slots: ``[rows, heads, kv_lora_rank]``. ``latent`` is
-    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``."""
+    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``. An eager step on the
+    kernel plans through ``ctx.eager``, the resource's reused plans."""
     if not sparse_mla.uses_kernel(q_nope, latent):
         lens = ctx.attn_lens() if ctx.host_pos is not None else attn_lens(
             ctx.pos.tolist(), ctx.topk, ctx.kpool)
         return sparse_mla.reference(q_nope, q_pe, latent, slots, lens, sm_scale)
     if ctx.sparse_plan is None:  # eager: every layer of the forward shares one plan
-        args = (ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
-                sm_scale)
-        ctx.sparse_plan = (ctx.eager.plan(*args) if ctx.eager is not None
-                           else sparse_mla.EagerSparsePlan(*args, q_nope.device))
+        ctx.sparse_plan = ctx.eager.plan(ctx.attn_lens(), ctx.width, q_nope.shape[1],
+                                         q_nope.shape[-1], q_pe.shape[-1], sm_scale)
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)
