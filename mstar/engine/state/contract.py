@@ -148,6 +148,9 @@ class GatedDeltaNet(Op):
 
 @dataclass(frozen=True, kw_only=True)
 class Read:
+    """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
+    can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
+
     mask: Mask
     op: Op | None = None
     layers: frozenset[int] | None = None    # None: all of the array's layers
@@ -172,6 +175,8 @@ class Array:
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
+    ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
+    so prefix caching and undo save a copy before one runs.
     """
 
     name: str
