@@ -48,7 +48,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate, audio_format, parser)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
 
 
 def _usage(usage: reply.Usage) -> dict:
@@ -98,7 +98,8 @@ def _audio_format(req, sample_rate: int) -> str:
     return "pcm" if fmt == "pcm16" else fmt
 
 
-def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", parser=None) -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
+    """A whole reply with no output parser and no stop strings: text, audio and images."""
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -115,8 +116,6 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
-    if parser is not None:
-        message = parser.message(text)
 
     if audio_pcm:
         audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
@@ -139,7 +138,7 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": reply.finish_reason(parser, usage)}],
+        "choices": [{"index": 0, "message": message, "finish_reason": reply.finish_reason(None, usage)}],
         "usage": _usage(usage),
     }
 
