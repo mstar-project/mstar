@@ -14,7 +14,8 @@ from triton.backends.compiler import GPUTarget  # noqa: E402
 from triton.compiler import ASTSource  # noqa: E402
 from triton.runtime.jit import mangle_type  # noqa: E402
 
-from mstar.utils import quant_fp8  # noqa: E402
+from mstar.utils import dense_fp8, quant_fp8  # noqa: E402
+from mstar.utils.fp8_block import FP8_DTYPE  # noqa: E402
 from mstar.utils.fused_moe import kernels, runner  # noqa: E402
 from mstar.utils.situ import SiTU  # noqa: E402
 
@@ -103,3 +104,20 @@ def test_the_gated_activation_launches_compile(monkeypatch, activation):
     situ = SiTU.parse(activation) is not None
     _compile(quant if situ else act_quant)
     assert not (act_quant if situ else quant).calls
+
+
+@pytest.mark.parametrize("glu", [False, True], ids=["linear", "glu"])
+@pytest.mark.parametrize("tokens", [2, 16], ids=["fma", "dot"])
+def test_the_dense_fp8_w8a16_launch_compiles(monkeypatch, tokens, glu):
+    """A served layer hands ``fp8_block`` its weight as e4m3 (what the stored bytes stand for): the w8a16
+    kernel, which loads bytes, compiles for it on its FMA and dot tiles."""
+    cpu = torch.device("cpu")
+    monkeypatch.setitem(dense_fp8._COUNTERS, cpu, torch.zeros(dense_fp8._MAX_TILES, dtype=torch.int32))
+    w8a16 = _record(monkeypatch, dense_fp8, "_w8a16_kernel")
+    n, k = 256, 2048
+    weight = torch.zeros(2 * n if glu else n, k, dtype=FP8_DTYPE)
+    scale = torch.ones(weight.shape[0] // BLOCK[0], k // BLOCK[1])
+    dense_fp8._linear(torch.zeros(tokens, k, dtype=torch.bfloat16), weight, scale, BLOCK, glu)
+    (launch,) = w8a16.calls
+    assert launch[1]["DOT"] is (tokens > 2) and launch[1]["SPLIT"] > 1
+    _compile(w8a16)
