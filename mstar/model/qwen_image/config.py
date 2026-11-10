@@ -20,10 +20,6 @@ from mstar.model.components.qwen_vision import Qwen25VisionConfig
 from mstar.model.qwen_image.components.transformer import QwenImageTransformerConfig
 
 QWEN_IMAGE_EDIT_2511 = "Qwen/Qwen-Image-Edit-2511"
-# What a download takes: the safetensors and configs of the served components, and the processor's files.
-SNAPSHOT_PATTERNS = [
-    "model_index.json", "*/*.json", "*/*.safetensors", "processor/*", "tokenizer/*",
-]
 
 # Resource key of the dit's ragged joint attention, and the loop its graph and cap agree on.
 DIT_ATTN = "dit_attn"

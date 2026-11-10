@@ -42,7 +42,6 @@ from mstar.model.qwen_image.config import (
     DIT_ATTN,
     PICTURE_PREFIX,
     QWEN_IMAGE_EDIT_2511,
-    SNAPSHOT_PATTERNS,
     TOKEN_PIXELS,
     QwenImageConfig,
     calculate_dimensions,
@@ -63,7 +62,7 @@ from mstar.model.qwen_image.submodules import (
     QwenImageVaeEncoderSubmodule,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.hf_snapshot import resolve_snapshot_dir
+from mstar.utils.hf_snapshot import OTHER_WEIGHT_FORMATS, resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +108,8 @@ class QwenImageModel(Model):
     @property
     def snapshot(self):
         if self._snapshot is None:
-            self._snapshot = resolve_snapshot_dir(self.model_path_hf, self.cache_dir, allow_patterns=SNAPSHOT_PATTERNS)
+            self._snapshot = resolve_snapshot_dir(
+                self.model_path_hf, self.cache_dir, ignore_patterns=OTHER_WEIGHT_FORMATS)
         return self._snapshot
 
     @property
