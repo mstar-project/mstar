@@ -174,8 +174,10 @@ class InputIngest:
     def _add_new_request(self, body: NewRequest) -> None:
         wire_rid = body.request_id
         lifecycle = self._lifecycle
-        if not lifecycle.takes_input(wire_rid):
-            return
+        # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. After
+        # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
+        # request wait until it holds the request.
+        unread = not lifecycle.takes_input(wire_rid)
         logger.debug("Worker %s received request %s", self._worker_id, wire_rid)
         laps = PhaseLaps("worker.msg.new_request.")
         runtime = self._runtime
@@ -215,25 +217,33 @@ class InputIngest:
                 laps.lap("skip_publish")
             body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-            self._streams.add_request(rid, body.request_info)
-            laps.lap("stream_buffers")
+            if not unread:
+                self._streams.add_request(rid, body.request_info)
+                laps.lap("stream_buffers")
 
-            # Start RDMA reads for tensors that have tensor_info
-            self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-            ))
-            laps.lap("start_reads")
+                # Start RDMA reads for tensors that have tensor_info
+                self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                    rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+                ))
+                laps.lap("start_reads")
 
-            # Signal-only edges (tensor_info is None) can be processed immediately
-            signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
-            if signal_only:
-                runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
-            laps.lap("ingest_signals")
+                # Signal-only edges (tensor_info is None) can be processed immediately
+                signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
+                if signal_only:
+                    runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
+                laps.lap("ingest_signals")
         except Exception as err:
             # a failed engine ingest rolled itself back; the conductor's REMOVE
             # tears down what else the request has here
             self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
-        self._dispatch(lifecycle.take_parked(wire_rid))
+        parked = lifecycle.take_parked(wire_rid)
+        if unread:
+            # its parked inputs are never read, so they are ACKed unread as for a removed request
+            for message in parked:
+                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                    self.drop_for_removed(message)
+            parked = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+        self._dispatch(parked)
 
     def _remove_request(self, body: RemoveRequest) -> None:
         rid = self._runtime.get_rid_handle(body.request_id)

@@ -88,9 +88,12 @@ def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
 
-def _rebuilds(pool_bytes: int = 1 << 10, device: torch.device = torch.device("cpu")) -> Rebuilds:
-    """`Rebuilds` with ``R``, ``A`` and ``B`` taken in as requests a drop on ``NODE`` can free."""
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(pool_bytes, device))
+def _rebuilds(
+    pool_bytes: int = 1 << 10, device: torch.device = torch.device("cpu"), followed: frozenset = frozenset(),
+) -> Rebuilds:
+    """`Rebuilds` with ``R``, ``A`` and ``B`` taken in as requests a drop on ``NODE`` can free, on a rank that follows
+    ``followed``."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(pool_bytes, device), followed)
     writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))}}
     layouts = {"kv": [StreamLayout(spans=(PrefixSpan(3, 3, PREFILL),), growth=(("decode_loop", 1),))]}
     for rid in (R, A, B):
@@ -158,6 +161,85 @@ def test_removing_a_request_gives_its_slice_back():
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
 
     assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
+
+
+def _prompts() -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Steps that read the prompts of r and a, each of which fills a 32-byte pool."""
+    return tuple(_ran(PREFILL, {rid: {"text_inputs": [torch.arange(4)]}}) for rid in (R, A))
+
+
+def _ranks() -> tuple[Rebuilds, Rebuilds]:
+    """Rank 0 and a follower of ``NODE``, each with a 32-byte pool."""
+    return _rebuilds(32), _rebuilds(32, followed=frozenset({NODE}))
+
+
+def test_a_follower_keeps_the_ids_of_a_request_rank_0_keeps_when_its_own_pool_is_full():
+    """Each rank gives a slice back at its own teardown. Rank 0 tears r down before it keeps a's prompt and the
+    follower after, so only rank 0's pool has room for a's prompt. Rank 0 can then drop a, and a follower that kept
+    no ids for a stopped. The follower keeps a's prompt outside its pool."""
+    (leader, follower), (r, a) = _ranks(), _prompts()
+    for rebuilds in (leader, follower):
+        rebuilds.keep_prompts(r)
+    leader.remove_request(R)
+
+    assert leader.keep_prompts(a) == [] and follower.keep_prompts(a) == []
+    follower.remove_request(R)
+
+    kept = follower.kept(A, NODE)
+    assert leader.kept(A, NODE) is not None
+    assert kept is not None, "rank 0 can drop a request the follower keeps no ids for"
+    assert kept.prompt.view.tolist() == [0, 1, 2, 3] and follower.pool.nbytes_used() == 0, (
+        "the follower kept other ids, or a's copy takes room in its pool"
+    )
+
+
+def test_a_follower_gives_back_the_ids_of_a_request_rank_0_kept_none_for():
+    """Rank 0's pool has no room for a's prompt, so a keeps no ids and rank 0 never drops it. The follower kept a's
+    prompt outside its pool until rank 0's journal said so, and kept it again from a later step."""
+    (leader, follower), (r, a) = _ranks(), _prompts()
+    for rebuilds in (leader, follower):
+        rebuilds.keep_prompts(r)
+    assert leader.keep_prompts(a) == [A]
+    follower.keep_prompts(a)
+
+    follower.forget(A, NODE)
+    follower.keep_prompts(a)
+
+    assert follower.kept(A, NODE) is None, "the follower holds ids outside its pool that rank 0 never drops with"
+
+
+def test_a_prompt_chunk_the_pool_cant_hold_leaves_its_request_to_keep_the_prompt_at_a_later_chunk():
+    """Each chunk of a prompt mid-prefill reads the whole prompt. A chunk that found the pool full kept a from keeping
+    ids at a later chunk that found room, so a stayed undroppable. Rank 0 of a lockstep node keeps as one rank does,
+    and journals nothing for a chunk mid-prefill, since a follower keeps the prompt from a's first chunk."""
+    leader, (r, a) = _rebuilds(32), _prompts()
+    leader.keep_prompts(r)
+    assert leader.keep_prompts(a, mid_prefill={A}) == [], "rank 0 journaled that a mid-prefill keeps no ids"
+    leader.remove_request(R)
+
+    assert leader.keep_prompts(a) == [] and leader.kept(A, NODE) is not None, "a later chunk kept nothing"
+
+
+def test_a_request_whose_last_prompt_chunk_the_pool_couldnt_hold_keeps_no_ids_from_a_later_step():
+    """A step of the policy's walk after a's prompt reads a decode id, which kept as a's prompt would never cover a's
+    KV. Rank 0 of a lockstep node also journals the refusal, which a follower replays, so a later keep would leave
+    rank 0 alone holding ids."""
+    leader, (r, a) = _rebuilds(32), _prompts()
+    leader.keep_prompts(r)
+    assert leader.keep_prompts(a) == [A]
+    leader.remove_request(R)
+
+    assert leader.keep_prompts(a) == [] and leader.kept(A, NODE) is None
+
+
+def test_a_prompt_refused_at_its_first_chunk_keeps_no_ids_at_a_speculated_last_chunk():
+    """A speculated chunk has no inputs. Rank 0 refused a's prompt at its first chunk and skipped its last chunk, so
+    it never journaled that a keeps no ids, and a follower kept its copy of a's prompt until a's teardown."""
+    leader, (r, a) = _rebuilds(32), _prompts()
+    leader.keep_prompts(r)
+    assert leader.keep_prompts(a, mid_prefill={A}) == []
+
+    assert leader.keep_prompts(_ran(PREFILL, {A: {}})) == [A], "rank 0 never journaled that a keeps no ids"
 
 
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])

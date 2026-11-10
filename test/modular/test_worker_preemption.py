@@ -54,6 +54,7 @@ from mstar.testing_utils.worker import make_scheduler, make_worker, preempting
 from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE = "LLM"
@@ -719,6 +720,49 @@ def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "a guaranteed request was dropped for an older page"
     )
+
+
+def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_step_still_sends_the_drop():
+    """Rank 0 drops a TP node's victim in the call that chose it, as at one rank, and journals the drop. A pass
+    that builds no step for the node still sends one with no rows, so the followers replay the drop."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w.lockstep._led = frozenset({NODE})
+    owed = []
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: bool(owed)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
+    assert kv.residency("v") is Residency.DROPPED, "rank 0 left the victim for a later step"
+
+    sent = []
+    w.lockstep.broadcast, w.lockstep._streams = sent.append, StreamBufferManager(w.request_state, None, [])
+    w.lockstep._followers = {NODE: ["rank1"]}
+    owed.append(NODE)
+    w.lockstep.flush_moves()
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], (
+        "the drop waits for a step that never comes"
+    )
+
+
+def test_rank_0_sends_its_journal_unless_a_step_of_the_instance_waits_for_its_decision():
+    """At the top of a pass, the step in flight may be the instance's own, whose speculation decision hasn't gone
+    out: a follower would read a step with no rows sent first as no speculation. A step of a node outside the
+    instance waits for no decision, so the journal goes out at once, and the removals held for it don't wait out
+    that node's chain."""
+    w = _worker(_pool())
+    w.lockstep._led, w.lockstep._followers = frozenset({NODE}), {NODE: ["rank1"]}
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: True
+    sent = []
+    w.lockstep.broadcast, w.lockstep._streams = sent.append, StreamBufferManager(w.request_state, None, [])
+
+    w.lockstep.flush_moves(SimpleNamespace(node_name=NODE))
+    assert not sent, "a step of moves alone went out ahead of the instance's speculation decision"
+    w.lockstep.flush_moves(SimpleNamespace(node_name="SNAC"))
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], "the journal waits out SNAC's chain"
 
 
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():

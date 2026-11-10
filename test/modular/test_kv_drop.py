@@ -123,7 +123,7 @@ def test_a_refused_drop_changes_nothing(refusal):
     kv._overrides["r"].rebuildable = refusal != "not rebuildable"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
-    kv._world_size = 2 if refusal == "ranks" else kv._world_size
+    kv._world_size, kv._counts = (2, False) if refusal == "ranks" else (kv._world_size, kv._counts)
     kv._cpu_pool = SimpleNamespace(is_offloaded=lambda rid: refusal == "host")
     pages = list(kv._streams["r"]["main"].page_indices)
 

@@ -93,9 +93,11 @@ class Admission:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            rebuild = self._rebuilds.start(rid, node_name, self.prefilling(node_name, rid, fwd_info.graph_walk))
-            if rebuild is not None:
-                engine.prepare_rebuild(node_name, rid, rebuild)
+            # A follower starts a rebuild only at its first row in rank 0's step, in `Lockstep._start_follow_rebuilds`.
+            # The request stays dropped here from the rebuild's last chunk until this rank replays the rebuild landing
+            # on rank 0, and starting a rebuild then would run it a second time on this rank alone.
+            if node_name not in self._follows:
+                self.start_rebuild(node_name, rid, fwd_info.graph_walk)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
@@ -107,6 +109,11 @@ class Admission:
             })
             return False
         return outcome.ok and outcome.ready
+
+    def start_rebuild(self, node_name: str, rid: int, graph_walk: str) -> None:
+        rebuild = self._rebuilds.start(rid, node_name, self.prefilling(node_name, rid, graph_walk))
+        if rebuild is not None:
+            self._engine_manager.get_engine(node_name).prepare_rebuild(node_name, rid, rebuild)
 
     def prefilling(self, node_name: str, rid: int, graph_walk: str) -> Prefilling | None:
         """Where ``rid``'s prompt stands while it is mid-prefill in ``graph_walk`` on ``node_name``, read off its

@@ -176,6 +176,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     )
     a, b = t.handle("req-a"), t.handle("req-b")
     w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": {a, b}}
+    w._rebuilds._refused = {"n": {a: 32}}
     w._rebuilds._cursors[("n", a)] = None
     w.preemption._preempted[a] = Preempted()
     w.streams._rids.add(a)
@@ -192,6 +193,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert a not in w.scheduler.admission.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
     assert w._rebuilds._keeps_ids == {"n": {b}}, "the next request would keep ids it can't be dropped with"
+    assert w._rebuilds._refused == {"n": {}}, "the next request would keep no ids from its last prompt chunk"
     assert not (w._rebuilds._cursors or w.preemption._preempted), (
         "the next request would run this one's rebuild, or be counted as preempted"
     )
