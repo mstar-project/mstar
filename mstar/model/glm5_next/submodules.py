@@ -14,11 +14,11 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -29,7 +29,6 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.convenience import KDACallable
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
@@ -64,9 +63,10 @@ logger = logging.getLogger(__name__)
 # How long a read waits for a verify step's verdict before the process exits
 _VERDICT_DEADLINE_S = 300.0
 
-# Captured prefill shapes when the config names none. They start above the MoE decode path's
-# 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
-# request's 2048, then 256 apart to 4096 for steps of several prompts.
+# Captured prefill shapes, which a deployment's serving config `prefill_token_buckets` replaces.
+# They start above the MoE decode path's 64 tokens, since the fused runner routes padding rows
+# safely; 64 apart from 1024 to one request's 2048, then 256 apart to 4096 for steps of several
+# prompts.
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
 PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
@@ -153,12 +153,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
                 raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
                                  f"{cache.dtype}: set the node's dtype to bfloat16")
-        buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
-        if self.config.dsa_long_context and self.config.prefill_graphs and (
-                max(buckets) > sparse_mla.MAX_ROWS):
-            # a captured prefill plans its whole bucket at once; the eager plan takes chunks
-            raise ValueError(f"dsa_long_context captures prefill buckets up to "
-                             f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
@@ -258,8 +252,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # runs eager rather than being split.
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
-                capture_token_lengths=list(
-                    self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS),
+                capture_token_lengths=list(PREFILL_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,

@@ -304,7 +304,7 @@ def test_a_model_without_the_api_is_an_anthropic_404(client_and_stub):
 @pytest.mark.parametrize("stream", [False, True])
 def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream):
     client, stub = client_and_stub
-    stub.served_models = ServedModels(base=["glm52"], adapters=["sql"])
+    stub.served_models = ServedModels(base=["glm52"], digests={"sql": b"\x01" * 32})
     stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
     r = client.post("/v1/messages", json=_body(model="sql", stream=stream))
     assert stub.last_submit["model_kwargs"]["lora_adapter"] == "sql"

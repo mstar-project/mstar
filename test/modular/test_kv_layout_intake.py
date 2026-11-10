@@ -14,28 +14,31 @@ import torch
 import yaml
 from test_kv_prefix_request_keys import _StubTensorManager
 
+import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.conductor.request_info import WalkStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, SpanKind, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 
 PS = 16
 PROMPT = 100
 LAYOUT = {"kv": {
     "main": LabelLayout(
-        spans=(Span("ids", "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
+        spans=(Span(SpanKind.IDS, "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
     ),
     "uncond": LabelLayout(
-        spans=(Span("rows", "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
+        spans=(Span(SpanKind.ROWS, "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
     ),
 }}
 
@@ -47,7 +50,8 @@ class _Comm:
         self.batches = deque()
 
     def send(self, entity_id, msg):
-        self.sent.append(msg)
+        # through the wire codec, as the data worker's and the conductor's messages travel
+        self.sent.append(wire.decode(wire.encode(msg)))
 
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
@@ -60,8 +64,7 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _Model(Model):
-
+class _Model(StubModel):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
@@ -98,31 +101,16 @@ class _Model(Model):
     def get_loop_caps(self, **model_kwargs):
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         return {"kv": KVReqConfig(needed_labels=["main", "uncond"])}
 
-    def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,
-                                      input_signals, model_kwargs=None):
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(graph_walk="prefill", is_prefill=True),
-            inputs=[], unpersist_tensors=[],
-        )
-
-    def get_partition_forward_pass_args(self, *args, **kwargs):
-        raise AssertionError("the request never leaves its first walk")
-
-    def max_input_files(self):
-        return {}
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        # no worker reports in these tests, so the request never leaves prefill
+        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
 
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.arange(PROMPT)]}
         return tensors if self._layout is None else ProcessPromptOutput(tensors, {"kv_layout": self._layout})
-
-    def postprocess(self, *args, **kwargs):
-        return b""
-
-    def get_submodule(self, *args, **kwargs):
-        return None
 
 
 def _preprocess(model: _Model, model_kwargs: dict, kv_key: str = "kv", **config) -> dict:
@@ -216,10 +204,14 @@ def test_a_prompt_is_keyed_only_where_its_cache_opens(model, config, model_kwarg
     assert ("prefix_keys" in kwargs) == keyed
 
 
-def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cap", [51, 0])
+def test_a_cap_past_its_loop_or_below_one_is_refused(tmp_path, monkeypatch, cap):
+    """Past its loop's max_iters the loop would end short; a loop ends on its
+    count only at a cap of 1 or more, so a cap of 0 would never end by count."""
     model = _Model()
+    monkeypatch.setattr(model, "get_loop_caps", lambda **kwargs: {"decode_loop": cap})
 
-    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 51}), tmp_path, monkeypatch).sent
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 10}), tmp_path, monkeypatch).sent
 
     failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
     assert [body.status for body in failed] == [400], "a request the loop would end short was served"
@@ -279,6 +271,23 @@ def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
     sent, kept = new_request.request_info.resource_configs["kv"], comm.conductor.requests["r"].resource_configs["kv"]
     assert sent.kv_layout and sent.loop_caps, "the worker's KV manager would ingest no layout"
     assert kept.kv_layout is None and kept.loop_caps is None, "the conductor's later messages would carry the layout"
+
+
+@pytest.mark.parametrize("lead", [None, {"codes": 3}])
+def test_a_stream_lead_reaches_the_new_request_and_a_clients_is_dropped(tmp_path, monkeypatch, lead):
+    """process_prompt's stream lead primes the consumer's stream; a client's
+    value past the stream's context would raise in the worker's ingest."""
+
+    class _Leading(_Model):
+        def process_prompt(self, *args, **kwargs):
+            out = super().process_prompt(*args, **kwargs)
+            if lead:
+                out.metadata["stream_lead_items"] = lead
+            return out
+
+    model = _Leading()
+    kwargs = _preprocess(model, {"max_output_tokens": 30, "stream_lead_items": {"codes": 999}})
+    assert _ingest(model, kwargs, tmp_path, monkeypatch).request_info.stream_lead_items == (lead or {})
 
 
 def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):

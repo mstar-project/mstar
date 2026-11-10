@@ -15,7 +15,7 @@ node_groups:
     ranks: [0]
 
   # Talker LLM on 2 GPUs, TP=2.
-  # ParallelAttention + ParallelSparseMoeBlockWithSharedExpert. The
+  # ParallelAttention + ParallelSparseMoeBlock with a shared expert. The
   # internal CodePredictor stays TP=1 (replicated weights, deterministic
   # sampler with broadcast) — sharding its 5-layer x 15-iter unrolled
   # loop would cost more in NCCL than the compute it saves.

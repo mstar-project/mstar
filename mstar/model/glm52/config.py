@@ -126,10 +126,6 @@ class Glm52ModelConfig:
     # None: a request that names no max_tokens may run to the end of the window,
     # as in vLLM; the submodule caps each request at what its prompt leaves.
     max_output_tokens: int | None = None
-    temperature: float = 1.0
-    top_p: float = 0.95
-    repetition_penalty: float = 1.0
-    ignore_eos: bool = False
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
@@ -151,10 +147,6 @@ class Glm52ModelConfig:
     # would otherwise fail every capture and serve eager.
     graph_compile: bool = True
 
-    prefill_token_buckets: list[int] | None = None
-    # Token buckets for the prefill batch sizes above 1; None captures them at
-    # prefill_token_buckets too.
-    prefill_batched_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent
@@ -312,7 +304,6 @@ class Glm52ModelConfig:
             max_seq_len=512,
             eos_token_ids=(250, 251, 252),
             pad_token_id=250,
-            prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
 

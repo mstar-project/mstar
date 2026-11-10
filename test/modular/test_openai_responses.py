@@ -225,7 +225,7 @@ def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream
     from mstar.api_server.served_models import ServedModels
 
     client, stub = client_and_stub
-    stub.served_models = ServedModels(base=["glm5_next"], adapters=["sql"])
+    stub.served_models = ServedModels(base=["glm5_next"], digests={"sql": b"\x01" * 32})
     stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
     r = client.post("/v1/responses", json=_codex(model="sql", stream=stream))
     assert stub.last_submit["model_kwargs"]["lora_adapter"] == "sql"
