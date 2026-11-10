@@ -62,6 +62,19 @@ MAX_SEQ_LEN = 512
 # a request whose prompt reaches past 16 positions rotates with the long half
 LONGROPE = LongRoPE((1.0,) * 4, (2.0,) * 4, original_max_position_embeddings=16, max_position_embeddings=1024)
 
+# Every test here also runs on LongRoPE (`_all_on_longrope`), where each ingest of a
+# handle flips its table, so a recycled or displaced row changes halves.
+_ON_LONGROPE = {"on": False}
+_INGESTS: dict[tuple[int, int], int] = {}
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["rope", "longrope"])
+def _all_on_longrope(request):
+    _ON_LONGROPE["on"] = request.param
+    _INGESTS.clear()
+    yield
+    _ON_LONGROPE["on"] = False
+
 
 class _StubTransfer:
     def __init__(self, transfer_engine_info, kv_cache, **kwargs):
@@ -82,7 +95,11 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, longrope: bool = False):
+def _resources(
+    cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, longrope: bool | None = None,
+):
+    if longrope is None:
+        longrope = _ON_LONGROPE["on"]
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=MAX_SEQ_LEN,
@@ -106,6 +123,11 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: 
 
 
 def _ingest(res: dict[str, Resource], rid: int, max_position: int | None = None) -> None:
+    if max_position is None and isinstance(res["rope"], LongRopeManager):
+        # a handle's tables alternate from one ingest to the next, from its id on
+        n = _INGESTS.get((id(res["rope"]), rid), 0)
+        _INGESTS[(id(res["rope"]), rid)] = n + 1
+        max_position = 20 if (rid + n) % 2 else 3
     res["kv"].ingest_request(rid, KVReqConfig())
     res["pool"].ingest_request(rid, None)
     res["rope"].ingest_request(rid, None if max_position is None else PositionReqConfig(max_position=max_position))
@@ -206,10 +228,11 @@ def _replay(res, planner, s, promote=True):
 
 def _setup(
     prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
-    longrope: bool = False,
+    longrope: bool | None = None,
 ):
     """The same requests prefilled on resident resources and on a host-planned
-    reference. With ``longrope``, each request's prompt length picks its table."""
+    reference. With ``longrope``, each request's prompt length picks its table;
+    left None, the module's LongRoPE pass alternates each handle's table."""
     live = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
     ref = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
     planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
@@ -780,6 +803,9 @@ def _assert_step_read_its_streams(live, s, rids) -> None:
         assert s.offsets[i] == wrote % PAGE
         assert s.positions[i] == live["rope"].position(rid, "main") - 1
         assert s.pool_slots[i] == live["pool"]._slots[rid]["main"].index
+        rope = live["rope"]
+        if isinstance(rope, LongRopeManager):
+            assert s.table_ids[i] == s.positions[i] + (MAX_SEQ_LEN if rid in rope._long_rids else 0)
 
 
 def _assert_held_rows(planner, live) -> None:
