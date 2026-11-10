@@ -27,7 +27,7 @@ from mstar.engine.resources import (  # noqa: E402
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
-from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.testing_utils.resource import StubResource  # noqa: E402
@@ -389,6 +389,92 @@ def test_a_by_value_stream_goes_by_value_only_where_its_signal_rides_inline():
     ):
         streams = _inline_streams(submodules, model(by_value), groups)
         assert streams.keys == keys and streams.tensor_streams == {(NODE, WALK): {"token"}}
+
+
+def _spoken(outputs, loop_outputs=(), by_value=True):
+    """A node of ``WALK`` streaming ``speech`` by value (when ``by_value``),
+    inside a loop collecting ``loop_outputs``."""
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import Connection, PartitionTopology
+
+    class _Streams(_Graph):
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["a", "b"], connections=[
+                Connection("a", "b", "speech", lambda: FixedChunkPolicy(chunk_size=1), by_value=by_value),
+            ])
+
+    node = GraphNode(name=NODE, input_names=["token"], outputs=list(outputs))
+    collected = [GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in loop_outputs]
+    return _Streams(Loop(name="loop", section=node, max_iters=4, outputs=collected))
+
+
+def test_signals_sharing_the_columns_buffer_ride_it_and_need_no_tensor():
+    """Every inline signal reading the first one's buffer rides the step's
+    column: its by-value stream keeps no tensor, and a signal whose every edge
+    rides (a by-value stream, a client emit, an empty destination) is carried.
+    The loop-back token is not (its edge to the node needs it routed or kept on
+    the device), nor is one read off another buffer, persisted, or collected by
+    its loop."""
+    from mstar.streaming.topology import StreamingGraphEdge
+
+    speech = StreamingGraphEdge(next_node="Vocoder", name="speech")
+    edges = [
+        GraphEdge(next_node=NODE, name="token"), GraphEdge(next_node=EMIT_TO_CLIENT, name="token"),
+        speech, GraphEdge(next_node=EMIT_TO_CLIENT, name="text"), GraphEdge(next_node=EMPTY_DESTINATION, name="text"),
+    ]
+    one = {"token": "new_token", "speech": "new_token", "text": "new_token"}
+    talker = {NODE: SimpleNamespace(inline_signals=lambda walk: one)}
+    streams = _inline_streams(talker, _spoken(edges))
+    assert streams.keys == {(NODE, "speech")} and streams.tensor_streams == {}
+    assert streams.carried == {(NODE, WALK): {"speech", "text"}}
+
+    # read off another buffer: one column a step, so the stream keeps its tensors
+    two = {NODE: SimpleNamespace(inline_signals=lambda walk: {**one, "speech": "speech_token"})}
+    streams = _inline_streams(two, _spoken(edges))
+    assert streams.tensor_streams == {(NODE, WALK): {"speech"}} and streams.carried == {(NODE, WALK): {"text"}}
+    # not carried when an edge needs the tensor, or the loop collects the signal
+    for graph in (
+        _spoken([*edges, GraphEdge(next_node=EMPTY_DESTINATION, name="text", persist=True)]),
+        _spoken(edges, loop_outputs=("text",)),
+    ):
+        assert _inline_streams(talker, graph).carried == {(NODE, WALK): {"speech"}}
+    # a stream without ``by_value``, or a lockstep node's, keeps its tensors
+    lockstep = SimpleNamespace(get_instance_world_size_for_node=lambda node: 2)
+    for graph, groups in ((_spoken(edges, by_value=False), None), (_spoken(edges), lockstep)):
+        streams = _inline_streams(talker, graph, groups)
+        assert streams.tensor_streams == {(NODE, WALK): {"speech"}}
+        assert streams.carried == {(NODE, WALK): {"text"}}
+
+
+def test_a_loop_back_over_several_walks_loops_back_on_each():
+    """``DeviceLoopback.walk`` may name several walks: each keeps its token on
+    the device, names it inline, and refuses to withhold it."""
+    from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, TokenStop
+    from mstar.streaming.topology import StreamingGraphEdge
+
+    loopback = DeviceLoopback(walk=frozenset({WALK, "spoken"}), signal="token", sampler="s", buffer="new_token")
+    assert loopback.covers(WALK) and loopback.covers("spoken") and not loopback.covers("prefill")
+    assert DeviceLoopback(walk=WALK, signal="token", sampler="s", buffer="t").covers(WALK)
+
+    class _Talker(ARNodeSubmodule):
+        forward = prepare_inputs = preprocess = None
+
+    sub = _Talker.__new__(_Talker)
+    torch.nn.Module.__init__(sub)
+    sub.device_loopback = loopback
+    sub.node_resources = {"s": SimpleNamespace(has_slot_masters=True)}
+    for walk in (WALK, "spoken"):
+        assert sub.device_loopback_signals(walk) == {"token"}
+        assert sub.inline_signals(walk) == {"token": "new_token"}
+    assert sub.device_loopback_signals("prefill") == frozenset() and sub.inline_signals("prefill") == {}
+
+    stop = TokenStop(loop="loop", buffer="new_token", stop_ids=frozenset({0}), sampler="s", withhold=("token",))
+    talker = {NODE: SimpleNamespace(token_stop=stop, device_loopback=loopback)}
+    graph = _Graph(Loop(name="loop", section=GraphNode(
+        name=NODE, input_names=["x"], outputs=[StreamingGraphEdge(next_node="Codec", name="token")],
+    ), max_iters=4, outputs=[]))
+    with pytest.raises(ValueError, match="withholds"):
+        _refuse_unroutable_withholds(talker, graph)
 
 
 @pytest.mark.parametrize("conn", [

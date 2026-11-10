@@ -2034,9 +2034,9 @@ methods are:
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
    row whose token is a stop id (the Qwen3-TTS Talker).
-   Only an output that leaves by a streaming edge can be withheld (any other consumer
-   would wait for an item that never comes), and not one that a node this worker
-   speculates into reads, nor the loop-back signal. Startup refuses a
+   Only an output that leaves by a streaming edge, as a tensor or by value, can be withheld
+   (any other consumer would wait for an item that never comes), and not one that a node
+   this worker speculates into reads, nor the loop-back signal. Startup refuses a
    ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
    checked.
 
@@ -2478,19 +2478,24 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
+Its ``walk`` may be a ``frozenset`` of walks when several decode walks read the token back; a
+combined step's rows each follow their own walk.
 
 A token that also streams to another node can go down the stream by value, when the
 stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
-stream as one CPU int64 tensor of its items' values. A step whose node names the signal
-in ``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame
-instead of a tensor, with nothing to stage, read or acknowledge. A step carries one
-inline signal, the first of those it outputs, so a client token and a different stream
-token cannot both ride inline. The step keeps its rows on the device only if every
-output is one of ``device_loopback_signals``, so the streamed signal must also be the
-loop-back signal: MiniCPM-o's TTS decode loops its code back on the device and streams
-the same code to the vocoder by value. A lockstep node's streams keep their tensors,
-and a ``by_value`` connection cannot join its items, drive its consumer's walk or come
-from the client.
+stream as one CPU int64 tensor of its items' values. A step whose node names the signal in
+``inline_signals(walk)`` sends each row's value in the step's ``EDGE_ITEMS`` frame instead
+of a tensor, with nothing to stage, read or acknowledge. A step carries one inline column:
+the first of those signals it outputs, and every other it outputs that reads the same stop
+buffer, so a client token and a stream of the same token both ride inline; a signal read
+off another buffer keeps its tensors. A row whose stop check withheld one of them
+(``StopCheck.withheld``) sends nothing for it, and its stream counts no item. The step
+keeps its rows on the device when every output is one of ``device_loopback_signals`` or
+rides the column on every edge (a client emit or a ``by_value`` stream, neither persisted,
+and not collected by an enclosing loop): MiniCPM-o's TTS decode loops its code back on the
+device and streams the same code to the vocoder by value. A lockstep node's streams keep
+their tensors, and a ``by_value`` connection cannot join its items, drive its consumer's
+walk or come from the client.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
