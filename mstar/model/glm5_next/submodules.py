@@ -331,10 +331,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         return self._cg_key(graph_walk, per_request_info)
 
     def _cg_key(self, graph_walk: str, rids) -> str | None:
-        """Every capture's key (None), or for a prefill with a request past a cached prefix one no
-        capture has: its rows see more keys than a bucket's capture holds (DSA scores a captured
-        prefill's rows within its bucket)."""
-        if graph_walk == "prefill" and any(
+        """Every capture's key (None), or for a dsa_long_context prefill with a request past a
+        cached prefix one no capture has: its rows see more keys than a bucket's capture holds
+        (DSA scores a captured prefill's rows within its bucket). Dense attention reads the
+        cached pages from a capture."""
+        if self.config.dsa_long_context and graph_walk == "prefill" and any(
                 rid in self.request_states and self.request_states[rid].get("cached") for rid in rids):
             return "eager"
         return None

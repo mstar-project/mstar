@@ -31,6 +31,7 @@ from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
+from mstar.model.submodule_base import ARNodeInputs
 from mstar.utils.device import DeviceCapability
 from mstar.worker.host_copies import HostCopies
 
@@ -210,3 +211,21 @@ def test_the_next_turn_starts_past_the_reply_s_pages():
     ref = _generate(cold, {"b": _request(cold_model, cold, "b", "x" * len(turn), ids=turn)})
     assert ref.prefilled == {"b": len(turn)}
     assert got.tokens == ref.tokens, "a hit on the reply's pages changed the greedy output"
+
+
+@pytest.mark.parametrize("variant, key", [("reduced_long_context", "eager"), ("reduced", None)],
+                         ids=["dsa", "dense"])
+def test_only_a_dsa_prefill_past_a_cached_prefix_leaves_its_captures(variant, key):
+    """DSA scores a captured prefill's rows within its bucket, so a prefill with a request past
+    a cached prefix takes a capture key no bucket has; dense attention reads the cached pages
+    from a capture, and keeps every capture's key."""
+    model = Glm5NextModel("x", config_variant=variant, tokenizer_mode="byte",
+                          dsa_long_context=variant == "reduced_long_context")
+    sub = Glm5NextLLMSubmodule(Glm5NextForCausalLM(model.config), model.config)
+    whole = ARNodeInputs(input_ids=torch.arange(10), input_seq_len=10)
+    assert sub.cg_key_info("prefill", {"b": _info("b", "prefill", 0)}) is None
+    cut = sub.split_inputs("prefill", _info("b", "prefill", 0), whole, 6, 10)
+    # the engine's lookup of the bucket, and the step the submodule declares, agree
+    assert sub.cg_key_info("prefill", {"a": _info("a", "prefill", 0), "b": _info("b", "prefill", 0)}) == key
+    assert sub.declare_step("prefill", ["b"], [cut]).cg_key_info == key
+    assert sub.cg_key_info("decode", {"b": _info("b", "decode", 0)}) is None
