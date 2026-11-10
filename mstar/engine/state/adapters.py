@@ -3,7 +3,7 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 
 import functools
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, astuple, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -89,11 +89,10 @@ def build_specs(
     contract doesn't.
     """
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    resolved = _resolve(arrays)
+    resolved = _resolve(arrays, sdpa_nodes)
     specs: list[NodeResourceSpec] = []
     for array in arrays:
-        if storage_of(array) is not WITHIN_STEP or not array.nodes <= sdpa_nodes:
-            specs += resolved.specs[array.name]
+        specs += resolved.specs[array.name]
         if array.positions is not None:
             specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
@@ -101,7 +100,7 @@ def build_specs(
     return specs
 
 
-def _resolve(arrays: Sequence[Array]) -> "Resolved":
+def _resolve(arrays: Sequence[Array], sdpa_nodes: Collection[str] = frozenset()) -> "Resolved":
     """``arrays`` resolved by their storages, each storage's at once."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
@@ -109,7 +108,7 @@ def _resolve(arrays: Sequence[Array]) -> "Resolved":
     specs: dict[str, list[NodeResourceSpec]] = {}
     resource_of: dict[str, str] = {}
     for storage, held in by_storage.items():
-        each = storage.resolve(held, arrays)
+        each = storage.resolve(held, arrays, sdpa_nodes)
         specs |= each.specs
         resource_of |= each.resource_of
     return Resolved(specs, resource_of)
@@ -127,9 +126,11 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     return k.shape
 
 
-def _within_step_read(array: Array) -> tuple[tuple[str, Read], int, int, torch.dtype | None]:
-    """``array``'s one read, once its binding has checked it, its heads and head dim, and its dtype, None for the
-    compute dtype."""
+def _within_step_read(
+    array: Array, chosen: Mapping[str, "OpBinding"],
+) -> tuple["BoundOp", int, int, torch.dtype | None]:
+    """``array``'s one read, bound as `_bindings` binds it, its heads and head dim, and its dtype, None for the compute
+    dtype."""
     k = array.entry.tensors.get("k")
     if k is None or len(k.shape) != 2 or k.shard != 0 or array.entry != Entry({"k": k, "v": k}):
         raise _no_layout(array, "entry must be a KVEntry, which may declare one dtype, all RaggedAttentionConfig holds")
@@ -139,8 +140,8 @@ def _within_step_read(array: Array) -> tuple[tuple[str, Read], int, int, torch.d
     if len(array.labels) != 1:
         raise _no_layout(array, f"max_len 0 takes one label, since a plan holds one per call, and it has "
                                 f"{sorted(array.labels)}")
-    (bound,) = _bindings(WITHIN_STEP, array)
-    return (bound.key, bound.declared), k.shape[0], k.shape[1], k.dtype
+    (bound,) = _bindings(WITHIN_STEP, array, chosen)
+    return bound, k.shape[0], k.shape[1], k.dtype
 
 
 def _block(tensor: TensorType) -> RecurrentBlockConfig:
@@ -190,7 +191,7 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(binding.kernel_settings)}")
-        # an update's settings go on its own spec, and a read on a node in ``sdpa_nodes`` has no spec to set
+        # an update's settings go on its own spec, and a read on SDPA has no spec to set
         spec = by_key.get(resource_of.get(key, key))
         for field, value in settings.items():
             if spec is not None:
@@ -215,11 +216,10 @@ def node_handles(
             handles[declared.name] = ValueHandle(declared, resources, None, (), host_fields)
         elif isinstance(declared, Array) and storage_of(declared) is WITHIN_STEP:
             ((read_key, read),) = declared.reads.items()
-            resource_key = resource_of[read_key]
+            chosen = {read_key: SDPA[WITHIN_STEP, Attend]} if sdpa else EMPTY
             handles[declared.name] = WithinStepHandle(
-                declared, {read_key: None if sdpa else resources[resource_key]}, None,
-                _bindings(WITHIN_STEP, declared), resource_key=resource_key, queried=arrays.get(read.queries),
-                sp_group=sp_group,
+                declared, resources, None, _bindings(WITHIN_STEP, declared, chosen),
+                resource_key=resource_of[read_key], queried=arrays.get(read.queries), sp_group=sp_group,
             )
         else:
             handles[declared.name] = build_handle(declared, resources)
@@ -333,7 +333,7 @@ class WithinStepSteps(StepBuilder):
     def add(self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep) -> None:
         """Plan ``handle``'s read over the segments its kernel sees. A Ulysses read runs over whole segments after the
         exchange, and any other over this rank's share of a sharded side."""
-        if handle.runs_sdpa:
+        if not handle._plans:
             return
         key, name, segments = handle.resource_key, handle.name, declared.segments or step.segments
         if handle.queried is None:
@@ -485,16 +485,49 @@ class PagedAttend(OpBinding):
         steps[key] = AttentionStep(segments=segments, causal=True)
 
 
-class RaggedAttend(OpBinding):
-    """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
+class WithinStepAttend(OpBinding, ABC):
+    """`Attend` within a step, over the step's own adds."""
 
-    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
+    # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
+    plans: ClassVar[bool]
 
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Block):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Block, the mask RaggedAttentionConfig has")
+            raise _no_layout(array, f"reads[{key!r}].mask must be Block, the only mask a read within a step takes")
         if read.walks is not None:
-            raise _no_layout(array, f"reads[{key!r}].walks must be None, since RaggedAttentionConfig has no walk")
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
+
+    @abstractmethod
+    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+        """The attention over rows of one length that the read's exchange runs, where ``run`` is what `bind` gave."""
+
+
+class RaggedAttend(WithinStepAttend):
+    """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
+
+    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
+    plans = True
+
+    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+        return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
+
+
+class SdpaAttend(WithinStepAttend):
+    """`Attend` within a step through SDPA, the reference pipelines' kernel: no spec, no step and no kernel setting."""
+
+    plans = False
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        super().check(array, key, read)
+        if read.packed:
+            raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
+                                    "the next, and a read of rows of one length declares packed=False")
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> Any:
+        return sdpa_attention
+
+    def attend(self, run: Any, label: str) -> Callable[..., torch.Tensor]:
+        return run
 
 
 class LinearAttnBinding(OpBinding):
@@ -694,7 +727,7 @@ class WithinStepHandle(ArrayHandle):
 
     ``queried`` is the array whose segments lay out the queries of a cross read. Under sequence parallelism the two
     flags pick the exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
-    ranks' partial attentions when only the keys are. A read with no resource runs SDPA.
+    ranks' partial attentions when only the keys are. The read's binding supplies the attention each exchange runs.
     """
 
     def __init__(
@@ -703,26 +736,26 @@ class WithinStepHandle(ArrayHandle):
     ):
         super().__init__(array, resources, positions_key)
         self._bindings = bindings
-        self.reads = {bound.key: bound.binding.bind(array, bound.key, resources) for bound in bindings}
-        self.first_read = next(iter(self.reads.values()))
-        self.resource_key = resource_key or next(iter(array.reads), None)
+        ((key, read, self._binding),) = bindings
+        self.resource_key = resource_key or key
+        self.reads = {key: self._binding.bind(array, self.resource_key, resources)}
+        self.first_read = self.reads[key]
         self.queried = queried
-        self._packed = bindings[0].declared.packed
-        self.runs_sdpa = self.first_read is None
+        self._packed = read.packed
+        # a plain attribute, which a compiled caller's trace reads as a constant
+        self._plans = self._binding.plans
         self._sp = sp_group
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
         self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
         # A read on SDPA plans nothing, so a step needs to run for it only to learn a Ulysses exchange's rank sizes.
-        self.needs_step = not self.runs_sdpa or (self._keys_sharded and self._queries_sharded)
+        self.needs_step = self._plans or (self._keys_sharded and self._queries_sharded)
         self._seq_sizes: list[int] | None = None
         # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
         self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
         # One callable per array, not per layer: Dynamo specializes `ulysses_attention` on the identity of the callable
         # it runs, so a callable per layer would retrace that frame per layer.
-        self._attend = sdpa_attention if self.runs_sdpa else functools.partial(
-            joint_attention, ragged=functools.partial(self.first_read.run, label=self._plan_label),
-        )
+        self._attend = self._binding.attend(self.first_read, self._plan_label)
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
@@ -765,7 +798,7 @@ class WithinStepHandle(ArrayHandle):
         """Hold k and v for this layer's read. Every add here is scratch."""
         if keep:
             raise self._refusal("keep=True, and max_len 0 keeps nothing between steps")
-        if not (self.runs_sdpa or torch.compiler.is_compiling()):
+        if self._plans and not torch.compiler.is_compiling():
             self._held_layer = self._layer_id(layer)
             self._record_add(self._held_layer, False)
         self._held = fields["k"], fields["v"]
@@ -777,7 +810,7 @@ class WithinStepHandle(ArrayHandle):
             raise self._no_layout("a read with no op")
         if mask_args:
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
-        if not (self.runs_sdpa or torch.compiler.is_compiling()):
+        if self._plans and not torch.compiler.is_compiling():
             self._record_read(self._layer_id(layer))
         # Dropped here, not at the step's end: a compiled frame would otherwise return k and v from its graph, which
         # keeps the whole projection they are views of alive through the next layer.
@@ -785,8 +818,6 @@ class WithinStepHandle(ArrayHandle):
         if q.ndim == 3:
             if not self._packed:
                 raise self._refusal("packed queries on a read declared packed=False")
-            if self.runs_sdpa:
-                raise self._no_layout("SDPA over packed tokens, which can't tell one segment from the next")
             return self.first_read.run(q, k, v, label=self._plan_label)
         if self._keys_sharded and self._queries_sharded:
             return ulysses_attention(self._sp, q, k, v, self._attend, self._seq_sizes, seq_dim=1, head_dim=2)
@@ -795,8 +826,9 @@ class WithinStepHandle(ArrayHandle):
         return self._attend(q, k, v)
 
     def _kernel_setting(self, read: str, field: str) -> Any:
-        if self.runs_sdpa:
-            raise self._refusal(f"no {field} for read {read!r}, which runs SDPA and has no kernel")
+        if not self._binding.kernel_settings:
+            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(self._binding).__name__} takes no "
+                                "kernel settings")
         return getattr(self.reads[read], field)
 
 
@@ -817,8 +849,9 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
 
     @abstractmethod
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
-        """``arrays``, all of the declared ones this storage holds, at once, where ``declared`` are all of them."""
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
+        """``arrays``, all of the declared ones this storage holds, at once, where ``declared`` are all of them. A read
+        of an array on ``sdpa_nodes`` runs SDPA."""
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
@@ -840,7 +873,7 @@ class PagedStorage(Storage):
 
     handle_class = PagedArrayHandle
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
         return Resolved(
             {array.name: self._specs(array) for array in arrays}, {key: key for array in arrays for key in array.reads},
         )
@@ -888,7 +921,7 @@ class ValueStorage(Storage):
 
     handle_class = ValueHandle
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
         return Resolved({array.name: self._specs(array, declared) for array in arrays}, {})
 
     def _specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
@@ -939,7 +972,7 @@ class WithinStepStorage(Storage):
     def step_builder(self) -> StepBuilder:
         return WithinStepSteps()
 
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], sdpa_nodes: Collection[str]) -> Resolved:
         """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
         node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
         resource rather than a resource of its own."""
@@ -949,7 +982,9 @@ class WithinStepStorage(Storage):
         resource_of: dict[str, str] = {}
         shared: dict[tuple, NodeResourceSpec] = {}
         for array in arrays:
-            (key, read), heads, head_dim, dtype = _within_step_read(array)
+            chosen = dict.fromkeys(array.reads, SDPA[WITHIN_STEP, Attend]) if array.nodes <= sdpa_nodes else EMPTY
+            bound, heads, head_dim, dtype = _within_step_read(array, chosen)
+            key, read = bound.key, bound.declared
             queried = by_name.get(read.queries, array)
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
@@ -960,7 +995,7 @@ class WithinStepStorage(Storage):
             spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
             spec = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
             resource_of[key] = spec.resource_key
-            specs[array.name] = [spec] if spec.resource_key == key else []
+            specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return Resolved(specs, resource_of)
 
 
@@ -986,17 +1021,22 @@ BINDINGS: dict[tuple[Storage, type[Op]], OpBinding] = {
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
 }
+# What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
+SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
 
 
-def _bindings(storage: Storage, array: Array) -> tuple[BoundOp, ...]:
-    """``array``'s reads, then its updates, each with the binding that runs it on ``storage``, once the binding has
-    checked it. Refuses a pair `BINDINGS` has no entry for, and a second update of one type."""
+def _bindings(
+    storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
+) -> tuple[BoundOp, ...]:
+    """``array``'s reads, then its updates, each with the binding that runs it on ``storage``: ``chosen``'s for a read
+    it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair `BINDINGS` has no entry for, and
+    a second update of one type."""
     bound = []
     for key, read in array.reads.items():
         binding = BINDINGS.get((storage, type(read.op)))
         if binding is None:
             raise _no_binding(storage, array, f"reads[{key!r}].op")
-        bound.append(BoundOp(key, read, binding))
+        bound.append(BoundOp(key, read, chosen.get(key, binding)))
     unbound = sorted(key for key, op in array.updates.items() if (storage, type(op)) not in BINDINGS)
     if unbound:
         raise _no_binding(storage, array, f"updates {unbound}")

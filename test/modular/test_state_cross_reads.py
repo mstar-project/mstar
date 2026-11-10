@@ -46,12 +46,12 @@ def _entry(heads=HEADS, dtype=None) -> Entry:
 
 
 def _array(
-    name, read=None, *, queries=None, sharded=False, label=None, heads=HEADS, nodes=("dit",), dtype=None,
+    name, read=None, *, queries=None, sharded=False, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
 ) -> Array:
     return Array(
         name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0, seq_sharded=sharded,
         labels={label or name},
-        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries)},
+        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
     )
 
 
@@ -323,7 +323,7 @@ def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
 
 def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
     ragged = _StubRagged()
-    h = _within(_array("a", label="main"), ragged)
+    h = _within(_array("a", label="main", packed=True), ragged)
     _opened(h, [Segment(1, "main", 4)])
     h.add(0, k=_q()[0], v=_q()[0])
     assert h.read(0, _q()[0]).shape == (4, HEADS, DIM)
@@ -410,7 +410,8 @@ def test_a_node_on_sdpa_needs_an_array_with_a_read():
 
 def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
     handle = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
-    with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', which runs SDPA"):
+    with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
+                                         "SdpaAttend takes no kernel settings"):
         kernel_setting(handle, "a_read", "max_segments_per_request")
 
 
@@ -428,10 +429,8 @@ def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
 
 
 def test_a_read_on_sdpa_refuses_packed_tokens():
-    h = node_handles(_Model(_array("a")), "dit", {}, sdpa=True)["a"]
-    h.add(0, k=_q()[0], v=_q()[0])
-    with pytest.raises(ValueError, match="Array 'a': no layout yet: SDPA over packed tokens"):
-        h.read(0, _q()[0])
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: reads\\['a_read'\\] runs SDPA, which can't tell"):
+        node_handles(_Model(_array("a", packed=True)), "dit", {}, sdpa=True)
 
 
 def test_the_setting_is_read_per_node_from_its_groups():
