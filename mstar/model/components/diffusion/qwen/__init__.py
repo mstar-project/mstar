@@ -1,9 +1,9 @@
-"""The Qwen3 prompt encoder the scaffold's DiTs condition on.
+"""The Qwen-family prompt encoder the scaffold's DiTs condition on.
 
-FLUX.2 [klein] and Z-Image feed their DiTs intermediate hidden states of a Qwen3
-LM rather than its logits, so this is a Qwen3 LM truncated at the deepest tapped
-layer: ``encoder`` is the module and its config, ``weight_loading`` the
-checkpoint rules that fill it, ``submodule`` the ``text_encoder`` node both
-models serve it from. Distinct from ``components.qwen3_lm``, which
-serves Qwen3 as a language model.
+FLUX.2 [klein] and Z-Image feed their DiTs intermediate hidden states of a Qwen3 LM, MiniMax-H3
+a Qwen3-VL LM's, and Qwen-Image a Qwen2.5-VL LM's normed last hidden state, rather than logits:
+``encoder`` is that LM truncated at the deepest tapped layer, and its config; ``vl_prompt`` the
+vision tower's output it takes for a prompt with images; ``weight_loading`` the checkpoint rules
+that fill it; ``submodule`` the padded-prompt ``text_encoder`` node klein and Z-Image serve it
+from. Distinct from ``components.qwen3_lm``, which serves Qwen3 as a language model.
 """

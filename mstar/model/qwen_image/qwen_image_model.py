@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Hashable
 
 import numpy as np
 import torch
@@ -70,8 +69,6 @@ logger = logging.getLogger(__name__)
 ENCODE_EDIT_WALK = "encode_edit"
 ENCODE_REFS_WALK = "encode_refs"
 IMAGE_EDIT_WALK = "image_edit"
-# What process_prompt settles for walk_plan: the condition images' patch grids (only process_prompt sets it).
-VL_GRIDS_KWARG = "qwen_image_vl_grids"
 
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
@@ -79,7 +76,7 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 class QwenImageModel(Model):
     """Qwen-Image-Edit-Plus checkpoints (Edit-2511 by default, Edit-2509 by ``model_path_hf``)."""
 
-    INTERNAL_KWARGS = (VL_GRIDS_KWARG,)
+    INTERNAL_KWARGS = (VL_GRIDS,)
 
     def __init__(
         self,
@@ -284,7 +281,7 @@ class QwenImageModel(Model):
         if QwenImageDenoiseSubmodule.GUIDANCE.active(knobs):
             prompts.append(encode(knobs["negative_prompt"])["input_ids"][0])
         tensors_out = {TEXT_INPUTS: prompts, VL_PIXELS: [positive["pixel_values"]], IMAGE_INPUTS: vae_images}
-        return ProcessPromptOutput(tensors_out, {VL_GRIDS_KWARG: positive["image_grid_thw"].tolist()})
+        return ProcessPromptOutput(tensors_out, {VL_GRIDS: positive["image_grid_thw"].tolist()})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the loop ends on the request's own step count, and is never speculated past it
@@ -305,7 +302,7 @@ class QwenImageModel(Model):
             "num_inference_steps": knobs["num_inference_steps"],
             GUIDANCE_SCALE: knobs[GUIDANCE_SCALE],
             "ref_grids": [list(self.config.latent_grid(h, w)) for h, w in refs],
-            VL_GRIDS: model_kwargs[VL_GRIDS_KWARG],
+            VL_GRIDS: model_kwargs[VL_GRIDS],
             PROMPT_LENGTHS: [int(info.dims[0]) for info in input_signals[TEXT_INPUTS]],
         }
         logger.info(
@@ -323,9 +320,6 @@ class QwenImageModel(Model):
     def get_autocast_dtype(self):
         # the checkpoint dtypes (bf16) throughout, as the reference pipeline runs
         return None
-
-    def capture_buckets(self) -> list[tuple[str, Hashable]]:
-        return []
 
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None,

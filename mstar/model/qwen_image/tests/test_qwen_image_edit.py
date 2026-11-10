@@ -25,7 +25,6 @@ from mstar.model.qwen_image.qwen_image_model import (  # noqa: E402
     ENCODE_EDIT_WALK,
     ENCODE_REFS_WALK,
     IMAGE_EDIT_WALK,
-    VL_GRIDS_KWARG,
     QwenImageModel,
 )
 from mstar.model.qwen_image.submodules import (  # noqa: E402
@@ -254,7 +253,7 @@ def test_intake_plans_the_edit_and_refuses_what_it_cannot_serve():
     model = _model()
     images = [torch.zeros(3, 300, 400, dtype=torch.uint8), torch.zeros(3, 600, 300, dtype=torch.uint8)]
     out = model.process_prompt("make it blue", ["image", "text"], ["image"], tensors={IMAGE_INPUTS: images})
-    tensors, grids = out.new_input_tensors, out.metadata[VL_GRIDS_KWARG]
+    tensors, grids = out.new_input_tensors, out.metadata[VL_GRIDS]
     assert len(tensors[TEXT_INPUTS]) == 2 and len(grids) == 2  # guided by default: both prompts
     # each reference at ~1024^2 in its own aspect, the default output the last one's
     assert [tuple(t.shape) for t in tensors[IMAGE_INPUTS]] == [(3, 896, 1184), (3, 1440, 736)]
@@ -314,7 +313,7 @@ def test_prompts_match_the_pipelines_processor_call():
     tensors = out.new_input_tensors
     assert [ids.tolist() for ids in tensors[TEXT_INPUTS]] == [w["input_ids"][0].tolist() for w in want]
     assert torch.equal(tensors[VL_PIXELS][0], want[0]["pixel_values"])
-    assert out.metadata[VL_GRIDS_KWARG] == want[0]["image_grid_thw"].tolist()
+    assert out.metadata[VL_GRIDS] == want[0]["image_grid_thw"].tolist()
     for tensor, pil in zip(tensors[IMAGE_INPUTS], pils, strict=True):
         w, h = calculate_dimensions(1024 * 1024, pil.width / pil.height)
         expect = (resizer.preprocess(pil, h, w)[0] + 1.0) / 2.0 * 255.0

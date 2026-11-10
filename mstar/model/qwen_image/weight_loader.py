@@ -15,12 +15,9 @@ from mstar.model.components.diffusion.weight_loading import (
     load_native,
     materialize,
 )
-from mstar.model.components.qwen_vision import Qwen25VisionModel, qwen25_vision_key
+from mstar.model.components.qwen_vision import QWEN25_VISION_PREFIXES, Qwen25VisionModel, qwen25_vision_key
 from mstar.model.qwen_image.components.transformer import QwenImageTransformer
 from mstar.model.qwen_image.config import QwenImageConfig
-
-# The vision tower's keys in a Qwen2.5-VL checkpoint, as published and as transformers 5 saves it.
-_VISION_PREFIXES = ("visual.", "model.visual.")
 
 
 def build_transformer(
@@ -47,13 +44,6 @@ def build_text_encoder(config: QwenImageConfig, snapshot: Path, device, dtype=to
     )
 
 
-def vision_key(name: str) -> str:
-    for prefix in _VISION_PREFIXES:
-        if name.startswith(prefix):
-            return qwen25_vision_key(name[len(prefix):])
-    return name
-
-
 def build_vision_tower(config: QwenImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Qwen25VisionModel:
     """The text encoder checkpoint's vision tower."""
     with torch.device("meta"):
@@ -61,10 +51,10 @@ def build_vision_tower(config: QwenImageConfig, snapshot: Path, device, dtype=to
     materialize(tower, dtype, device)
 
     def skip(name: str) -> bool:
-        return not name.startswith(_VISION_PREFIXES)
+        return not name.startswith(QWEN25_VISION_PREFIXES)
 
     return load_native(
-        tower, iter_transformers_component(Path(snapshot) / "text_encoder", device, skip=skip), vision_key,
+        tower, iter_transformers_component(Path(snapshot) / "text_encoder", device, skip=skip), qwen25_vision_key,
         "Qwen2.5-VL vision tower", skip=skip,
     )
 

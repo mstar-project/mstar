@@ -53,8 +53,9 @@ IMAGE_INPUTS = "image_inputs"
 TEXT_EMBEDS_POS, TEXT_EMBEDS_NEG = "text_embeds_pos", "text_embeds_neg"
 REF_LATENTS = "ref_latents"
 IMAGE_OUTPUT = "image_output"
-# Step metadata: the condition images' patch grids, and each prompt's token count.
-VL_GRIDS, PROMPT_LENGTHS = "vl_grids", "prompt_lengths"
+# The condition images' patch grids, which only process_prompt sets (an internal model kwarg) and the walks carry as
+# step metadata, and each prompt's token count.
+VL_GRIDS, PROMPT_LENGTHS = "qwen_image_vl_grids", "prompt_lengths"
 
 
 def pack(latents: torch.Tensor) -> torch.Tensor:
@@ -234,15 +235,11 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
         return FlowMatchSchedule.build(self.config.scheduler, steps, bucket_key.image_tokens)
 
     def seed_latents(self, fwd_info, bucket_key: QwenEditKey, generator: torch.Generator) -> torch.Tensor:
-        # randn_tensor parity: (1, 1, C, H, W) in bf16 on the CPU generator, then packed
+        # randn_tensor parity: (1, 1, C, H, W) in the transformer's dtype on the CPU generator, then packed; C is
+        # the VAE's latent channels, which the transformer outputs
         h, w = bucket_key.grid
-        shape = (1, 1, self.config.vae.z_dim, 2 * h, 2 * w)
-        noise = torch.randn(shape, generator=generator, dtype=self.transformer_dtype)
-        return pack(noise[:, 0])[0]
-
-    @property
-    def transformer_dtype(self) -> torch.dtype:
-        return self.transformer.dtype if self.transformer is not None else torch.bfloat16
+        shape = (1, 1, self.config.transformer.out_channels, 2 * h, 2 * w)
+        return pack(torch.randn(shape, generator=generator, dtype=self.transformer.dtype)[:, 0])[0]
 
     def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         rows = text_rows(key)

@@ -29,9 +29,7 @@ SNAPSHOT_PATTERNS = [
 DIT_ATTN = "dit_attn"
 DENOISE_LOOP = "denoise_loop"
 
-# The VAE downsamples 8x and the transformer patches 2x2 latents: a token is 16 pixels a side, and the
-# pipelines size images in multiples of 32.
-VAE_SCALE = 8
+# The VAE downsamples 8x and the transformer patches 2x2 latents: a token is 16 pixels a side.
 TOKEN_PIXELS = 16
 
 # What the edit template's first rows hold before the user turn: the system prompt the pipeline drops.
@@ -82,17 +80,6 @@ def calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
 
 
 @dataclass(frozen=True)
-class QwenImageVaeConfig:
-    """``vae/config.json`` of ``AutoencoderKLQwenImage``: its state dict is ``AutoencoderKLWan``'s."""
-
-    config: dict = field(default_factory=dict)
-
-    @property
-    def z_dim(self) -> int:
-        return int(self.config.get("z_dim", 16))
-
-
-@dataclass(frozen=True)
 class QwenImageConfig:
     recipe: QwenImageRecipe = RECIPES["QwenImageEditPlusPipeline"]
     transformer: QwenImageTransformerConfig = field(default_factory=QwenImageTransformerConfig)
@@ -107,7 +94,6 @@ class QwenImageConfig:
         temporal_patch_size=2, spatial_merge_size=2, out_hidden_size=3584, window_size=112,
         fullatt_block_indexes=(7, 15, 23, 31),
     ))
-    vae: QwenImageVaeConfig = field(default_factory=QwenImageVaeConfig)
     scheduler: FlowMatchConfig = field(default_factory=lambda: FlowMatchConfig.from_scheduler_config({
         "base_image_seq_len": 256, "base_shift": 0.5, "max_image_seq_len": 8192, "max_shift": 0.9,
         "num_train_timesteps": 1000, "shift": 1.0, "shift_terminal": 0.02, "time_shift_type": "exponential",
@@ -143,6 +129,5 @@ class QwenImageConfig:
                 max_sequence_length=int(text.get("max_position_embeddings", 128_000)), fused_qkv=False,
             ),
             vision=Qwen25VisionConfig.from_dict(text["vision_config"]),
-            vae=QwenImageVaeConfig(read("vae", "config.json")),
             scheduler=FlowMatchConfig.from_scheduler_config(read("scheduler", "scheduler_config.json")),
         )

@@ -248,8 +248,17 @@ _QWEN25_MERGER = {
 }
 
 
+# the tower's prefixes in a Qwen2.5-VL checkpoint, as published and as transformers 5 saves it
+QWEN25_VISION_PREFIXES = ("visual.", "model.visual.")
+
+
 def qwen25_vision_key(name: str) -> str:
-    """A ``Qwen2_5_VisionTransformerPretrainedModel`` parameter's name in ``Qwen25VisionModel``."""
+    """A ``Qwen2_5_VisionTransformerPretrainedModel`` parameter's name (or a checkpoint key under its prefix) in
+    ``Qwen25VisionModel``."""
+    for prefix in QWEN25_VISION_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
     for theirs, ours in _QWEN25_MERGER.items():
         if name.startswith(theirs):
             return ours + name[len(theirs):]
