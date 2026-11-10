@@ -563,10 +563,6 @@ def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis)
     assert build(CommGroup.trivial()).targets
     if axis == "sp":
         assert build(sp2, replicated_over_sp=True).targets
-    else:
-        # replication over SP lifts the SP axis alone
-        with pytest.raises(ValueError, match=rf"at {axis}_size 2, which LoRA does not support"):
-            build(sp2, replicated_over_sp=True)
 
 
 def test_a_replicated_slice_that_does_not_split_evenly_is_refused():

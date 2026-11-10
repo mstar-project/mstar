@@ -774,9 +774,10 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             first_node = min(relevant_nodes)
-            # one resource is sized by one head-shard count (validate_deployment checks this
-            # first); conservative for a resource that never reads it
-            if len({shards[node] for node in relevant_nodes}) > 1:
+            # one resource is sized by one head-shard count over one parallel group, so its nodes
+            # all run replicated over SP or none do (validate_deployment checks this first);
+            # conservative for a resource that never reads it
+            if len({over_sp[node] for node in relevant_nodes}) > 1:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
