@@ -497,6 +497,21 @@ def test_a_side_walk_hands_over_rows_on_each_loop_back_walk():
     assert not _stops_on_a_token(sub, "prefill")
 
 
+def test_a_token_stop_on_several_walks_stops_on_each():
+    """A ``TokenStop.walk`` may be a frozenset of walks (MiniCPM-o's decode walks)."""
+    import dataclasses
+
+    from mstar.model.submodule_base import TokenStop
+    from mstar.worker.engine_manager import _stops_on_a_token
+
+    stop = TokenStop(loop="loop", buffer="t", stop_ids=frozenset({0}), sampler="s", walk=frozenset({WALK, "spoken"}))
+    sub = SimpleNamespace(token_stop=stop, device_loopback=None)
+    assert _stops_on_a_token(sub, WALK) and _stops_on_a_token(sub, "spoken")
+    assert not _stops_on_a_token(sub, "prefill")
+    every = SimpleNamespace(token_stop=dataclasses.replace(stop, walk=None), device_loopback=None)
+    assert _stops_on_a_token(every, "prefill")
+
+
 def test_a_loop_back_over_several_walks_loops_back_on_each():
     """``DeviceLoopback.walk`` may name several walks: each keeps its token on
     the device, names it inline, and refuses to withhold it."""
