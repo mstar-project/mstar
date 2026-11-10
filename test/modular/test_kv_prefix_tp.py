@@ -214,6 +214,31 @@ def test_ranks_cut_a_window_lease_alike_when_one_index_has_dropped_a_page():
     assert leader._streams["b"]["main"].lease == follower._streams["b"]["main"].lease
 
 
+def test_ranks_keep_the_walks_a_window_lease_served_when_a_later_walk_drops_it():
+    """A window lease holds the window's pages at its end. A later walk that writes unprobed cuts it back to the
+    walks it served, and above one rank only the lease's own pages count, so it holds the window there too."""
+    ranks = leader, follower = _manager(0, window=24, max_num_pages=64), _manager(1, window=24, max_num_pages=64)
+    parts = [_tokens(3 * PAGE_SIZE, seed=1), 3 * PAGE_SIZE, _tokens(52, seed=2)]
+    for kv in ranks:
+        _ingest(kv, "a", *parts)
+        _run(kv, "a", *parts)
+        kv.remove_request("a")
+        _ingest(kv, "b", *parts)
+    assert _follow(follower, _send(leader, "b"))
+    for kv in ranks:
+        for walk, length in _walks(parts)[:2]:
+            assert _step(kv, "b", length, walk) is None, "the cache didn't serve the first two walks whole"
+
+        kv.apply_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=52), None)
+
+        stream = kv._streams["b"]["main"]
+        assert (stream.stored_len, stream.later[0].stored_len) == (6 * PAGE_SIZE, 24), "the served walks' KV went"
+        kv.assert_pages_conserved()
+    assert [part.page_indices for part in leader._streams["b"]["main"].groups] == [
+        part.page_indices for part in follower._streams["b"]["main"].groups
+    ]
+
+
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
     ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
     x, y, z = (_tokens(2 * PAGE_SIZE + 1, seed=s) for s in (6, 7, 8))

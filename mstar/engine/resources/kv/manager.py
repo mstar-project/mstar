@@ -217,14 +217,16 @@ class Lease:
     them: in each group of its pool, the first group's first, the pages a stream holds once it has written
     ``end`` tokens (`KVManager._kept`), whole pages only. In a pool of one group, a hit past a cached image end
     ends at that image, inside a page, and ``image_end`` holds the cached partial page and the page it is
-    copied onto. After `admit` a lease holds only the cached partial page, until `plan` copies it."""
+    copied onto. After `admit` a lease holds only the cached partial page, until `plan` copies it. Above one
+    rank, ``starts`` holds the window pages kept at each later walk's start under ``end`` (`_start_pages`)."""
     end: int
     groups: list[list[int]]
     image_end: list[int] = field(default_factory=list)
+    starts: list[int] = field(default_factory=list)
 
     def pages(self) -> list[int]:
-        """Every page it holds, group by group, then its image end."""
-        return [*(page for group in self.groups for page in group), *self.image_end]
+        """Every page it holds, group by group, then its image end and its walk starts' window pages."""
+        return [*(page for group in self.groups for page in group), *self.image_end, *self.starts]
 
 
 @dataclass(slots=True)
@@ -911,7 +913,9 @@ class KVManager(AttentionResource):
                     queried, hit = self.prefix_tokens.get(node_name, (0, 0))
                     self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if held:
-                    stream.lease = Lease(held, matched, copied)
+                    starts = self._start_pages(chain, held, matched) if self._world_size > 1 else []
+                    self._arena.retain(starts)
+                    stream.lease = Lease(held, matched, copied, starts)
                     self._recount(rid)
             return True
 
@@ -991,6 +995,21 @@ class KVManager(AttentionResource):
             end = lower
         return 0, [[] for _ in self._groups]
 
+    def _start_pages(self, chain: PrefixChain, end: int, groups: list[list[int]]) -> list[int]:
+        """The window pages past ``groups`` that the index keeps at each walk start under ``end``. Above one rank a
+        lease holds them too: a cut there re-matches among the lease's own pages only (`_recut`), and a later
+        walk the lease doesn't serve (`_drop_layout`, a declined hit) cuts it to the walks it did."""
+        if not self._windows:
+            return []
+        pages, leased, at = [], {page for group in groups for page in group}, 0
+        for span in chain.spans:
+            if span.opens_step and 0 < at < end:
+                found, kept = self._match(chain.rooted, at // self.config.tokens_per_page)
+                if found == at:
+                    pages += [page for group in kept[1:] for page in group if page not in leased and page not in pages]
+            at += span.length
+        return pages
+
     def _retain_window_match(
         self, rid: str, stream: CacheStream, rooted: list[bytes], end: int, groups: list[list[int]],
     ) -> tuple[int, list[list[int]]]:
@@ -1022,7 +1041,9 @@ class KVManager(AttentionResource):
         """Cut the stream's lease to the longest boundary at or under ``held`` the cache serves, matched again
         there, and return it. A window keeps other pages at a shorter boundary than at the lease's end, which
         the index may still hold. Above one rank only the lease's own pages count: every rank holds the same
-        lease, but this rank's index may be ahead of rank 0's. Raises if that boundary is under ``least``."""
+        lease, but this rank's index may be ahead of rank 0's. There the lease also holds the window at each
+        walk start under its end (`_start_pages`), so a cut falls at worst to the walk start below it. Raises if
+        that boundary is under ``least``."""
         lease = stream.lease
         among = None if self._world_size == 1 else set(lease.pages())
         end, groups = self._match(stream.chain.rooted, held // self.config.tokens_per_page, among)
@@ -1039,7 +1060,9 @@ class KVManager(AttentionResource):
         self._arena.retain(taken)
         if self._world_size == 1:
             self._index.touch(taken)
-        stream.lease = Lease(end, groups) if end else None
+        starts = [page for page in lease.starts if page not in kept] if end else []
+        stream.lease = Lease(end, groups, starts=starts) if end else None
+        kept.update(starts)
         others = self._hand_over(stream, [page for group in lease.groups[1:] for page in group if page not in kept])
         self._release(rid, stream, [page for page in lease.pages() if page not in kept])
         self._recount(rid, *others)
@@ -1068,7 +1091,8 @@ class KVManager(AttentionResource):
             return self._answer(prefix.label, cursor, step, end)
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
-        """Returns the same lease's pages, group by group, with every step until `admit` converts it."""
+        """Returns the same lease's pages, group by group and then its walk starts' window pages, with every step
+        until `admit` converts it."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -1076,7 +1100,7 @@ class KVManager(AttentionResource):
             stream = self._ensure_label(rid, label)
             chain, cursor = stream.chain, stream.span_cursor
             if stream.lease is not None:
-                return stream.lease.groups
+                return [*stream.lease.groups, stream.lease.starts]
             if (
                 chain is None or cursor.done == len(chain.spans)
                 or chain.spans[cursor.done].walk != graph_walk
@@ -1086,7 +1110,7 @@ class KVManager(AttentionResource):
         if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
-            return None if stream.lease is None else stream.lease.groups
+            return None if stream.lease is None else [*stream.lease.groups, stream.lease.starts]
 
     def adopt_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, pages: list[list[int]], caught_up: bool,
@@ -1115,14 +1139,17 @@ class KVManager(AttentionResource):
             # above one rank a lease has no cached image end, so it ends on its first group's last page
             end = len(pages[0]) * self.config.tokens_per_page
             found, matched = self._match(chain.rooted, len(pages[0]))
-            if found < end and not caught_up:
+            # rank 0's walk starts, which this rank's index may hold more of
+            *groups, starts = pages
+            held = set(self._start_pages(chain, end, matched))
+            if (found < end or not held.issuperset(starts)) and not caught_up:
                 return False
-            if matched != pages:
+            if matched != groups or not held.issuperset(starts):
                 raise RuntimeError(
                     f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
                     f"pages {matched[0][:4]}... here ({len(matched[0])}), {pages[0][:4]}... there ({len(pages[0])})"
                 )
-            stream.lease = Lease(end, matched)
+            stream.lease = Lease(end, matched, starts=starts)
             self._arena.retain(stream.lease.pages())
             return True
 
@@ -1192,6 +1219,7 @@ class KVManager(AttentionResource):
             if lease is None:
                 lease = Lease(0, [[] for _ in self._groups])
             self._adopt(rid, stream, lease.groups, lease.end)
+            self._release(rid, stream, lease.starts)
         else:
             self._release_lease(rid, stream)
         stream.chain = None
@@ -2158,6 +2186,7 @@ class KVManager(AttentionResource):
                     )
                     if stream.lease is not None:
                         self._image_ends.append((segment.request_id, stream))
+                    self._release(segment.request_id, stream, lease.starts)
                     stream.converted = True
                     self._recount(segment.request_id)
                 if report:

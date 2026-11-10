@@ -263,7 +263,7 @@ class Resource(ResidentHooks, ABC):
 
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, a list for each group of pages the resource keeps, or None."""
+        return the pages, as lists of them `adopt_cached_prefix` takes back, or None."""
         return None
 
     def adopt_cached_prefix(
