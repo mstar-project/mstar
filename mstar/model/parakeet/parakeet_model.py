@@ -29,7 +29,9 @@ each, for a live call:
 A whole clip runs ``transcribe`` and a live call the other two: the partitions a
 request doesn't use are done from the start. Without ``live_lookahead`` the graph is
 exactly the whole-clip one; with it, whole clips measured 3-8% slower on an H200
-(cause not traced).
+(cause not traced), before the data worker's parallel prepare. A model with a client
+stream prepares one request at a time, so on a live deployment whole clips also
+prepare serially.
 """
 
 import json
