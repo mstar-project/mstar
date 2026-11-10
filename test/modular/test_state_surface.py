@@ -106,6 +106,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", 'None'],
         ["walks", "KEYWORD_ONLY", 'None'],
         ["queries", "KEYWORD_ONLY", 'None'],
+        ["packed", "KEYWORD_ONLY", 'True'],
     ],
     "Rope": [
         ["theta", "KEYWORD_ONLY", '10000.0'],

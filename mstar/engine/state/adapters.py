@@ -707,6 +707,7 @@ class WithinStepHandle(ArrayHandle):
         self.first_read = next(iter(self.reads.values()))
         self.resource_key = resource_key or next(iter(array.reads), None)
         self.queried = queried
+        self._packed = bindings[0].declared.packed
         self.runs_sdpa = self.first_read is None
         self._sp = sp_group
         sharded = sp_group is not None and sp_group.world_size > 1
@@ -782,6 +783,8 @@ class WithinStepHandle(ArrayHandle):
         # keeps the whole projection they are views of alive through the next layer.
         k, v = self._take_hold(layer)
         if q.ndim == 3:
+            if not self._packed:
+                raise self._refusal("packed queries on a read declared packed=False")
             if self.runs_sdpa:
                 raise self._no_layout("SDPA over packed tokens, which can't tell one segment from the next")
             return self.first_read.run(q, k, v, label=self._plan_label)
