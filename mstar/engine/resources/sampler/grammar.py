@@ -248,7 +248,7 @@ class GrammarRows:
         # (rows, host tokens, event) per committed step not yet accepted, oldest first.
         # Rows, not handles: a request removed meanwhile leaves its row here, and its
         # last draw never reaches the next request given its handle.
-        self._pending: list[tuple[list[_Row], torch.Tensor, Any]] = []
+        self._pending: list[tuple[list[_Row], list[int], torch.Tensor, Any]] = []
         self._shifts = torch.arange(32, dtype=torch.int32, device=device)
 
     def __contains__(self, rid) -> bool:
@@ -279,22 +279,25 @@ class GrammarRows:
         if not index:
             return
         rows = [self._rows[rids[i]] for i in index]
-        picked = tokens.reshape(-1)[torch.tensor(index, device=tokens.device)]
-        if picked.device.type == "cpu":
-            self._pending.append((rows, picked.clone(), None))
+        drawn = tokens.reshape(-1)[:len(rids)]
+        if drawn.device.type == "cpu":
+            self._pending.append((rows, index, drawn.clone(), None))
             return
-        host = torch.empty(picked.shape, dtype=picked.dtype, pin_memory=True)
-        host.copy_(picked, non_blocking=True)
-        event = torch.Event(picked.device)
+        # the whole row of draws, picked on the host: a device index built from a host
+        # list is a pageable copy, which waits for the step just launched to finish
+        host = torch.empty(drawn.shape, dtype=drawn.dtype, pin_memory=True)
+        host.copy_(drawn, non_blocking=True)
+        event = torch.Event(drawn.device)
         event.record()
-        self._pending.append((rows, host, event))
+        self._pending.append((rows, index, host, event))
 
     def _accept_pending(self) -> None:
-        for rows, host, event in self._pending:
+        for rows, index, host, event in self._pending:
             if event is not None:
                 event.synchronize()
-            for row, token in zip(rows, host.tolist(), strict=True):
-                row.accept(token)
+            drawn = host.tolist()
+            for row, i in zip(rows, index, strict=True):
+                row.accept(drawn[i])
         self._pending.clear()
 
     def fill(self, rids) -> torch.Tensor:
