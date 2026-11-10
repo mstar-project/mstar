@@ -4363,7 +4363,7 @@ class KVManager(AttentionResource):
         assert pool._unmoved == unmoved, f"the host counts {pool._unmoved} pages set aside, but requests hold {unmoved}"
 
     def post_warmup_validate(self):
-        """Assert ``num_free_pages`` is identical across every rank of the
+        """Assert ``num_free_pages``, and whether the worker moves requests, are identical across every rank of the
         instance
 
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
@@ -4374,8 +4374,14 @@ class KVManager(AttentionResource):
         """
         if self._comm_group.world_size == 1:
             return
-        free = self._arena.num_free
-        lo, neg_hi = self._comm_group.agree([free, -free])
+        free, moves = self._arena.num_free, int(self._moves)
+        lo, neg_hi, moves_lo, neg_moves_hi = self._comm_group.agree([free, -free, moves, -moves])
+        if moves_lo != -neg_moves_hi:
+            raise RuntimeError(
+                f"KV cache {self.name!r} lends what guaranteed requests haven't written on some ranks of its instance "
+                "and not on others, so the ranks count different room. Whether the worker moves requests follows the "
+                "node's rebuild policy and the pool's host pages, which every rank must share."
+            )
         if lo != -neg_hi:
             raise RuntimeError(
                 f"KV cache {self.name!r} has asymmetric num_free_pages "
