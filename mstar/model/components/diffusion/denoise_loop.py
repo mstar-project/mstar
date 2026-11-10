@@ -126,7 +126,7 @@ class StepKey:
 
     bucket: Hashable
     dtype: str | None = None             # the linears' dtype under a step schedule
-    guided: bool = False                 # whether the request runs its guidance branches
+    guided: bool = False                 # whether the step runs its guidance branches
     branches: tuple[int, ...] = (0,)     # the branches this rank runs, in row order
 
 
