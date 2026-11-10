@@ -656,8 +656,9 @@ class RustFrontendBridge:
 
     def _live(self, msg: dict) -> None:
         """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
-        conversation, whose ops name its ``ClientAudio`` stream ``stream`` and
-        whose appends carry ``audio``, float32 samples for it; its commit is an
+        session (a conversation or a live transcription), whose ops name its
+        ``ClientAudio`` stream ``stream`` and whose appends carry ``audio``,
+        float32 samples for it; a live transcription's commit is an
         ``end_input`` append with none), answered as the Python route would
         act on it. The call is the submission its ``call`` names; one that has
         ended has no key and takes nothing."""
