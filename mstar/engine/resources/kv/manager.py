@@ -711,6 +711,8 @@ class KVManager(AttentionResource):
         #   decided at their first `ask`, or later when the host has no room to set aside for their move.
         # `_borrowable` counts the pages of `_unused` that guaranteed requests lend, which preemptible requests may
         #   borrow.
+        # `_changes` moves whenever an allotment's counts or a request's class change, and `_reclaim` holds the last
+        #   `_reclaimable` with the arena's, the pool's and the index's counts it was walked at.
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they
         #   restore it.
         # `_footprints` holds each request's `_footprint` as it was at intake.
@@ -729,6 +731,8 @@ class KVManager(AttentionResource):
         self._unused = 0
         self._guaranteed: set[str] = set()
         self._borrowable = 0
+        self._changes = 0
+        self._reclaim: tuple[tuple, int] | None = None
         self._snapshots: list["RecurrentStatePool"] = []
         self._footprints: dict[str, int] = {}
         self._kept = 0
@@ -4173,7 +4177,7 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
-            self._guaranteed.discard(rid)
+            self._classify(rid, guaranteed=False)
             self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)
             self._rebuilt.pop(rid, None)
@@ -4422,7 +4426,7 @@ class KVManager(AttentionResource):
         # A request that no drop here can free, and that no host can take, would wait holding its pages once
         # it ran short, so it reserves what it grows into.
         if overrides.unpausable or not (overrides.rebuildable or self._cpu_pool is not None):
-            self._guaranteed.add(rid)
+            self._classify(rid, guaranteed=True)
         pages = self._footprint(rid) if rid in self._guaranteed else prompt
         capacity = self.config.request_pages
         if pages > capacity:
@@ -4616,11 +4620,18 @@ class KVManager(AttentionResource):
 
     def _guarantee(self, rid: str) -> None:
         """Make ``rid`` guaranteed, since no host has room to set aside for its move."""
-        self._guaranteed.add(rid)
+        self._classify(rid, guaranteed=True)
         if self._cpu_pool is not None:
             self._cpu_pool.unreserve(rid)
             if self._decides:
                 self._cpu_pool.count_guaranteed(rid)
+
+    def _classify(self, rid: str, guaranteed: bool) -> None:
+        if guaranteed:
+            self._guaranteed.add(rid)
+        else:
+            self._guaranteed.discard(rid)
+        self._changes += 1
 
     def _flip(self, rid: str, pages: int) -> None:
         """Guarantee ``rid``, which waits for room, so that it asks for its footprint of ``pages``."""
@@ -4704,18 +4715,33 @@ class KVManager(AttentionResource):
         guaranteed requests lend, unless one of them waits to take pages back. Where moves happen, a guaranteed
         request that asks to be admitted counts what moving every preemptible request would free, since it can take
         that back."""
-        room = self._room()
         if not guaranteed:
-            room += 0 if self._taking_back() else self._borrowable
+            room = self._room() + (0 if self._taking_back() else self._borrowable)
         elif self.moves:
-            room += self._reclaimable()
+            # Under the lock even from `grew_since`, since the GPU thread opens a label in `_streams` during an admit.
+            # The room is read under it too, so a page freed between the two reads isn't counted in both.
+            with self._lock:
+                room = self._room() + self._reclaimable()
+        else:
+            room = self._room()
         return room - (self._kept if passing else 0)
 
     def _reclaimable(self) -> int:
-        """What moving every preemptible request would free. Under the lock even from `grew_since`, since the GPU
-        thread opens a label in `_streams` during an admit."""
-        with self._lock:
+        """What moving every preemptible request would free, walked again only once a page, an allotment or a
+        request's class has changed since the last walk. Caller holds the lock."""
+        def walk() -> int:
             return self._frees([rid for rid in self._streams if rid not in self._guaranteed])
+
+        counts = (self._arena.changes, self._changes, self._index_counts())
+        if self._reclaim is None or self._reclaim[0] != counts:
+            self._reclaim = (counts, walk())
+        elif _DEBUG_ASSERTS:
+            fresh = walk()
+            assert fresh == self._reclaim[1], (
+                f"moving the preemptible requests frees {fresh} pages, but the pool kept {self._reclaim[1]} from "
+                "counts nothing has moved since"
+            )
+        return self._reclaim[1]
 
     def _spare(self) -> int:
         """The free and evictable pages no allotment holds back from borrowers."""
@@ -5278,6 +5304,7 @@ class KVManager(AttentionResource):
         """Set ``allotment``'s ``remaining`` and ``taken_back``, and what it lends, `_unused` and `_borrowable` with
         them."""
         lends = remaining - taken_back if rid in self._guaranteed and self.moves else 0
+        self._changes += 1
         self._unused += remaining - allotment.remaining
         self._borrowable += lends - allotment.lends
         allotment.remaining, allotment.taken_back, allotment.lends = remaining, taken_back, lends

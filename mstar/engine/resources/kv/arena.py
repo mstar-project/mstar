@@ -89,6 +89,10 @@ class PageArena(Protocol):
     trail: tuple[int, int] | None
 
     @property
+    def changes(self) -> int:
+        """Moves whenever an owner count or a stream's page list changes."""
+
+    @property
     def max_num_pages(self) -> int: ...
     @property
     def num_free(self) -> int: ...
@@ -144,8 +148,21 @@ class _ListStreamPages(list):
     def tolist(self) -> list[int]:
         return list(self)
 
+    def extend(self, pages: Iterable[int]) -> None:
+        self._arena.changes += 1
+        super().extend(pages)
+
     def assign(self, pages: Iterable[int]) -> None:
+        self._arena.changes += 1
         self[:] = pages
+
+    def clear(self) -> None:
+        self._arena.changes += 1
+        super().clear()
+
+    def __delitem__(self, i) -> None:
+        self._arena.changes += 1
+        super().__delitem__(i)
 
     def free(self) -> None:
         self.clear()
@@ -166,6 +183,7 @@ class PythonPageArena:
         # queues each page a release leaves to the index alone, for a copy to the host
         self.writes = None
         self.trail: tuple[int, int] | None = None
+        self.changes = 0
         # held weakly: a stream nothing holds is gone, as a Rust one is
         self._streams: weakref.WeakValueDictionary[int, _ListStreamPages] = weakref.WeakValueDictionary()
         self._next_sid = 0
@@ -185,6 +203,7 @@ class PythonPageArena:
     def acquire(self, n: int) -> list[int] | None:
         pages = self.allocator.try_allocate(n)
         if pages is not None:
+            self.changes += 1
             for page in pages:
                 self.num_owners[page] = 1
             if self.trail is not None:
@@ -192,12 +211,14 @@ class PythonPageArena:
         return pages
 
     def retain(self, pages: Iterable[int]) -> None:
+        self.changes += 1
         for page in pages:
             self.num_owners[page] += 1
             if self.num_owners[page] == 2 and self.index is not None:
                 self.index.set_shared(page, True)
 
     def release(self, pages: Iterable[int]) -> None:
+        self.changes += 1
         freed = []
         for page in pages:
             assert self.num_owners[page] > 0, f"page {page} released with no owner"
@@ -214,6 +235,7 @@ class PythonPageArena:
     def give_back(self, pages: list[int]) -> None:
         for page in pages:
             assert self.num_owners[page] == 1, f"page {page} given back with {self.num_owners[page]} owners"
+        self.changes += 1
         for page in pages:
             self.num_owners[page] = 0
             self.sealed[page] = False

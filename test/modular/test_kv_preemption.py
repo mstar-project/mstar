@@ -1397,10 +1397,67 @@ def test_a_guaranteed_request_waiting_for_admission_counts_what_moves_free_under
     assert not _ready(kv, "g")
     locked, frees = [], KVManager._frees
     monkeypatch.setattr(KVManager, "_frees", lambda kv, rids: locked.append(kv._lock._is_owned()) or frees(kv, rids))
+    assert _step(kv, "p", 1).ok
 
     _runner(kv).admit_waiting(lambda rid, node: None)
 
     assert locked and all(locked), "the walk over the preemptible requests' streams ran without the lock"
+
+
+def test_a_passer_that_holds_an_allotment_is_refused_without_a_walk_by_a_mark_that_never_grows(monkeypatch):
+    """A request that holds an allotment is refused while passing whatever the room. Its mark still measured the
+    room of its class, which for g walks every preemptible request's pages, and grew whenever that room did."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    assert _step(kv, "o", 3 * PAGE_SIZE).ok
+    kv._streams["o"]["main"].step_in_flight = True
+    assert _preempt(kv, "g", _step(kv, "g", 4 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True).waits
+    walks, frees = [], KVManager._frees
+    monkeypatch.setattr(KVManager, "_frees", lambda kv, rids: walks.append(rids) or frees(kv, rids))
+
+    mark = kv.reserve_past("g", NODE, WALK, None)
+    _remove(kv, "o")
+
+    assert not walks and not kv.grew_since(mark), "g's refusal walked the pool, or its mark grew"
+
+
+@pytest.mark.usefixtures("backend")
+def test_an_admission_pass_that_changed_nothing_walks_no_preemptible_request(monkeypatch):
+    """g's room walks the streams of every preemptible request, and each pass walked them again for g and for each
+    guaranteed passer: 67 us at 256 pages and 984 us at 4,096 per mark, under the lock the GPU thread allocates in."""
+    kv = _pool()
+    _running(kv, "x", 4, arrival=0, guaranteed=True, decodes=PAGE_SIZE)
+    _running(kv, "p", 3, arrival=1)
+    for rid, arrival in (("g", 2), ("g2", 3)):
+        _request(kv, rid, 2, arrival=arrival, guaranteed=True)
+        assert not _ready(kv, rid)
+    walks, frees = [], KVManager._frees
+    monkeypatch.setattr(KVManager, "_frees", lambda kv, rids: walks.append(rids) or frees(kv, rids))
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not walks, f"a pass that changed nothing walked the preemptible requests {len(walks)} times"
+
+
+def test_a_guaranteed_request_waiting_for_admission_reads_the_room_and_the_walk_under_one_lock(monkeypatch):
+    """`grew_since` read the room without the lock and then walked the preemptible requests under it, so a page freed
+    on the GPU thread between the two was counted in both."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    kv = _pool()
+    _running(kv, "x", 4, arrival=0, guaranteed=True, decodes=PAGE_SIZE)
+    _running(kv, "p", 3, arrival=1)
+    _request(kv, "g", 2, arrival=2, guaranteed=True)
+    assert not _ready(kv, "g")
+    (refusal,) = _runner(kv).refusals()
+    locked, room = [], KVManager._room
+    monkeypatch.setattr(KVManager, "_room", lambda kv: locked.append(kv._lock._is_owned()) or room(kv))
+
+    kv.grew_since(refusal.mark)
+
+    assert locked and all(locked), "the room was read outside the lock the walk takes"
 
 
 def test_a_passer_borrows_what_a_guaranteed_request_lends_but_none_of_the_pages_kept_for_the_head():
