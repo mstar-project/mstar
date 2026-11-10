@@ -349,6 +349,25 @@ def test_a_failed_construction_anywhere_is_a_failure_everywhere(fake_aiter, monk
     assert ca.closed
 
 
+@pytest.mark.parametrize("vote", [0, 1, 2])
+def test_a_vote_that_meets_a_peers_aiter_collective_falls_back(fake_aiter, monkeypatch, vote):
+    """A peer failed partway through AITER's own collectives, so this rank's
+    vote meets one of them and gloo raises. Like FlashInfer's, this stays
+    unfused instead of failing the load."""
+    peers = _Peers()
+
+    def agree(group, values):
+        if len(peers.seen) == vote:
+            raise RuntimeError("gloo: ranks lost sync")
+        return peers(group, values)
+
+    monkeypatch.setattr(ar_fusion, "_agree", agree)
+    monkeypatch.setattr(AiterARFusion, "_check_kernel", staticmethod(lambda *a: None))
+    group = types.SimpleNamespace(rank=0, world_size=2, cpu_group="gloo-group")
+    assert AiterARFusion.create(group, 2048, 4096, BF16) is None
+    assert all(ca.closed for ca in _FakeCA.built) and len(_FakeCA.built) == min(vote, 1)
+
+
 def test_a_disabled_custom_all_reduce_builds_nothing(fake_aiter, monkeypatch):
     real_init = _FakeCA.__init__
 

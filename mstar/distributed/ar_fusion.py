@@ -387,66 +387,76 @@ class AiterARFusion(ARFusion):
                         world_size, hidden, dtype)
             return None
 
-        # Building the workspace runs collectives, so every rank has to agree
-        # to go ahead before any of them starts.
-        pool_cls = None
-        try:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce,
-                IPCBufferPool,
-            )
-            pool_cls = IPCBufferPool
-            reason = cls._unsupported(CustomAllreduce, IPCBufferPool)
-        except Exception as e:  # noqa: BLE001
-            reason = f"cannot import AITER's custom all-reduce: {type(e).__name__}: {e}"
-        # AITER names its store keys after a per-process pool counter. Line it
-        # up across the group so all members use the same keys.
-        seq = pool_cls._pool_seq if reason is None else 0
-        refused, seq = _agree(group, [int(reason is not None), seq])
-        if refused:
-            logger.warning("AITER fused all-reduce + RMSNorm unavailable (%s), "
-                           "using RCCL + separate norm",
-                           reason or "refused on another rank")
-            return None
-        pool_cls._pool_seq = seq
-
-        elt = torch.empty((), dtype=dtype).element_size()
-        # AITER's meta buffer is meta_size() + 2 * max_size. Below 2 MiB it
-        # only exports over IPC at whole 4 KiB pages, so stay above that.
-        max_size = max(1 << 20, _round_up(bound * hidden * elt, 1 << 20))
-        device = torch.device("cuda", torch.cuda.current_device())
         ca = None
         try:
-            with _raw_input_pool():
-                ca = CustomAllreduce(cpu_group, device, max_size=max_size)
-            built = not ca.disabled
-        except Exception:
-            logger.exception("AITER CustomAllreduce construction failed")
-            built = False
-        if _agree(group, [int(not built)])[0]:
-            logger.warning("AITER custom all-reduce failed to build on some rank, "
-                           "using RCCL + separate norm")
+            # Building the workspace runs collectives, so every rank has to agree
+            # to go ahead before any of them starts.
+            pool_cls = None
+            try:
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce,
+                    IPCBufferPool,
+                )
+                pool_cls = IPCBufferPool
+                reason = cls._unsupported(CustomAllreduce, IPCBufferPool)
+            except Exception as e:  # noqa: BLE001
+                reason = f"cannot import AITER's custom all-reduce: {type(e).__name__}: {e}"
+            # AITER names its store keys after a per-process pool counter. Line it
+            # up across the group so all members use the same keys.
+            seq = pool_cls._pool_seq if reason is None else 0
+            refused, seq = _agree(group, [int(reason is not None), seq])
+            if refused:
+                logger.warning("AITER fused all-reduce + RMSNorm unavailable (%s), "
+                               "using RCCL + separate norm",
+                               reason or "refused on another rank")
+                return None
+            pool_cls._pool_seq = seq
+
+            elt = torch.empty((), dtype=dtype).element_size()
+            # AITER's meta buffer is meta_size() + 2 * max_size. Below 2 MiB it
+            # only exports over IPC at whole 4 KiB pages, so stay above that.
+            max_size = max(1 << 20, _round_up(bound * hidden * elt, 1 << 20))
+            device = torch.device("cuda", torch.cuda.current_device())
+            try:
+                with _raw_input_pool():
+                    ca = CustomAllreduce(cpu_group, device, max_size=max_size)
+                built = not ca.disabled
+            except Exception:
+                logger.exception("AITER CustomAllreduce construction failed")
+                built = False
+            if _agree(group, [int(not built)])[0]:
+                logger.warning("AITER custom all-reduce failed to build on some rank, "
+                               "using RCCL + separate norm")
+                if ca is not None:
+                    ca.close()
+                return None
+
+            bad = cls._check_kernel(ca, rank, world_size, hidden, dtype, bound, device)
+            # AITER turns off registering captured inputs under expandable segments
+            register = bool(getattr(ca, "enable_register_for_capturing", False)
+                            and hasattr(ca, "_ops_get_graph_buffer_count"))
+            failed, no_register = _agree(group, [int(bad is not None), int(not register)])
+            if failed:
+                logger.error("AITER fused all-reduce + RMSNorm failed its startup check "
+                             "(tp=%d hidden=%d %s, %s), using RCCL + separate norm",
+                             world_size, hidden, dtype, bad or "on another rank")
+                ca.close()
+                return None
+
+            logger.info("all-reduce fusion workspace: AITER CustomAllreduce, up to "
+                        "%d tokens x %d, max_size %d MiB, captured inputs %s",
+                        bound, hidden, max_size >> 20,
+                        "copied into the pool" if no_register else "registered")
+            return cls(ca, group, hidden, dtype, bound, not no_register)
+        except RuntimeError:
+            # A rank failed between AITER's own collectives, so a vote met a
+            # different one; the gloo timeout closes the group on every member,
+            # and every rank falls back here.
+            logger.exception("TP ranks lost sync building AITER's custom all-reduce; "
+                             "using RCCL + separate norm")
             if ca is not None:
                 ca.close()
             return None
-
-        bad = cls._check_kernel(ca, rank, world_size, hidden, dtype, bound, device)
-        # AITER turns off registering captured inputs under expandable segments
-        register = bool(getattr(ca, "enable_register_for_capturing", False)
-                        and hasattr(ca, "_ops_get_graph_buffer_count"))
-        failed, no_register = _agree(group, [int(bad is not None), int(not register)])
-        if failed:
-            logger.error("AITER fused all-reduce + RMSNorm failed its startup check "
-                         "(tp=%d hidden=%d %s, %s), using RCCL + separate norm",
-                         world_size, hidden, dtype, bad or "on another rank")
-            ca.close()
-            return None
-
-        logger.info("all-reduce fusion workspace: AITER CustomAllreduce, up to "
-                    "%d tokens x %d, max_size %d MiB, captured inputs %s",
-                    bound, hidden, max_size >> 20,
-                    "copied into the pool" if no_register else "registered")
-        return cls(ca, group, hidden, dtype, bound, not no_register)
 
     @classmethod
     def _unsupported(cls, custom_allreduce, pool_cls) -> str | None:
