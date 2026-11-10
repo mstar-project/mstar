@@ -899,12 +899,28 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner)
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
+UPLOADED = ("report.md", "result.json", "progress.log")  # what the workflow's "Keep the report" uploads from results
+
+
+def remove(path):
+    """Remove whatever is at `path`: a directory with all it holds, or anything else."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def redact(out, runner_temp, s2="", s3=""):
     """What the box and the providers wrote, redacted in place before anything reads it, so the comment,
     the kept report and the artifact all get the redacted copy: the exact values of the secrets this job
-    holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key."""
+    holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key.
+    First, anything but a regular file at a path the artifact uploads (UPLOADED) goes: redact would skip it,
+    and the upload would take a directory's files unredacted."""
     lt = Path(runner_temp, "lt")
     exact = (s2, s3)
+    for path in (lt / "results" / name for name in UPLOADED):
+        if path.is_symlink() or not path.is_file():
+            remove(path)
     for f in (lt / "results/report.md", lt / "unavailable.md"):
         if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
             f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))

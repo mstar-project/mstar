@@ -693,6 +693,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py post
 
+      # These paths are gpu_review.py's UPLOADED: the redact step leaves only regular files there.
       - name: Keep the report
         if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         continue-on-error: true
