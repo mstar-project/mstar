@@ -317,7 +317,9 @@ class DSAManager(Resource):
                label: str | None = None) -> torch.Tensor:
         """``[rows, width]`` cache slots each row attends, scored over ``plane``'s keys."""
         return paged.select(q, w, self._need_kv().aux_view(INDEX_PLANES, plane),
-                            self.current(label), group)
+                            self.current(label), group,
+                            score_bytes=self.config.prefill_score_bytes,
+                            shard_min_rows=self.config.shard_min_rows)
 
     def attend(self, plane: int, q_nope: torch.Tensor, q_pe: torch.Tensor, slots: torch.Tensor,
                *, label: str | None = None) -> torch.Tensor:

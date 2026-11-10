@@ -75,7 +75,7 @@ def test_a_sharded_selection_comes_back_as_each_ranks_own_slots(world, r0, r1):
         group.rank = rank
         got = sparse_mla.select_rows(
             lambda a, b: slots_on(group.rank, picks[a:b]), r0, r1, 4,
-            torch.device("cpu"), group, sparse_mla.RequestPages(pages[rank], page))
+            torch.device("cpu"), group, sparse_mla.RequestPages(pages[rank], page), min_rows=64)
     assert torch.equal(got, slots_on(world - 1, picks[r0:r1]))
 
 

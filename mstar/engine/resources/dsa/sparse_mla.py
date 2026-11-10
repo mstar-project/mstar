@@ -18,8 +18,6 @@ from mstar.utils.h2d import PinnedStager
 # FlashInfer's kernel over one-token pages faults past ~16k rows, so an eager plan attends in
 # chunks of this many rows.
 MAX_ROWS = 8192
-# A prefill's selection shards across TP ranks from this many rows per rank.
-SHARD_MIN_ROWS = 64
 
 
 def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
@@ -246,13 +244,14 @@ class RequestPages(NamedTuple):
 
 def select_rows(select: Callable[[int, int], torch.Tensor], r0: int, r1: int, width: int,
                 device: torch.device, group=None,
-                request: RequestPages | None = None) -> torch.Tensor:
+                request: RequestPages | None = None, *, min_rows: int) -> torch.Tensor:
     """``select(a, b)`` (``[b - a, width]`` int32 cache slots) over rows ``[r0, r1)`` of one
-    request's prefill. With a TP ``group`` each rank selects a contiguous block and the blocks
-    are all-gathered as token positions in ``request`` (``RequestPages``)."""
+    request's prefill. With a TP ``group`` and at least ``min_rows`` rows per rank, each rank
+    selects a contiguous block and the blocks are all-gathered as token positions in
+    ``request`` (``RequestPages``)."""
     n = r1 - r0
     world = group.world_size if group is not None else 1
-    if world == 1 or n < world * SHARD_MIN_ROWS:
+    if world == 1 or n < world * min_rows:
         return select(r0, r1)
     if request is None:
         raise ValueError("a selection sharded across ranks needs the request's pages")
