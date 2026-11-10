@@ -556,9 +556,12 @@ RESULTS = ("result.json", "report.md", "refresh.log")  # any of which says the b
 
 def finished(box, cfg):
     """The box's status once its session finished or the box is gone, else None. A flaky ssh or API call is not
-    an outcome."""
+    an outcome. A box gpu.py no longer knows is gone: terminating it drops its ledger entry, which its watchdog
+    does at the deadline."""
     key = (box / "instance").read_text().strip()
-    e = gpu_py.entry(key)
+    e = gpu_py.ledger().get(key)
+    if e is None:
+        return "released at its deadline (or by hand) before its session finished"
     try:
         st, host, port = gpu_py.status(e, cfg)
     except Exception as err:

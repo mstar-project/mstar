@@ -1126,7 +1126,7 @@ class TestEras(unittest.TestCase):
         def ledger_txn():
             yield led
 
-        g = types.SimpleNamespace(entry=lambda key: dict(led[key]), load_config=dict, ledger_txn=ledger_txn,
+        g = types.SimpleNamespace(ledger=lambda: led, load_config=dict, ledger_txn=ledger_txn,
                                   status=lambda e, cfg: ("active", "box.example", 2222))
         (temp / "lt/nvidia/results").mkdir()
         (temp / "lt/nvidia/results/claude.json").write_text('{"total_cost_usd": 2}')
@@ -1241,7 +1241,7 @@ class TestEras(unittest.TestCase):
                 (temp / "lt/nvidia/instance").write_text("eras:i-1\n")
                 for f in files:
                     (temp / "lt/nvidia/results" / f).write_text("x")
-                patches = {"entry": lambda key: dict(e), "load_config": dict, "eras": lambda *a: instance}
+                patches = {"ledger": lambda: {"eras:i-1": dict(e)}, "load_config": dict, "eras": lambda *a: instance}
                 with unittest.mock.patch.multiple(gpu_review.gpu_py, **patches), \
                         contextlib.redirect_stdout(io.StringIO()):
                     out, _ = step(gpu_review.wait, {"gpu.py *": ""}, runner_temp=str(temp))
@@ -1258,30 +1258,36 @@ class TestEras(unittest.TestCase):
                     self.assertNotIn("zzkey", comment, "a secret made inert first would slip past the redaction")
 
     def test_wait_collects_every_box_and_one_without_results_doesnt_sink_the_other(self):
-        temp = Path(tempfile.mkdtemp())
-        for vendor, key in (("nvidia", "eras:i-1"), ("amd", "digitalocean:9")):
-            (temp / "lt" / vendor).mkdir(parents=True)
-            (temp / "lt" / vendor / "instance").write_text(key + "\n")
-        led = {"eras:i-1": {"provider": "eras", "instance_id": "i-1"},
-               "digitalocean:9": {"provider": "digitalocean", "instance_id": "9"}}
+        # the AMD droplet is gone: deleted (its ledger entry kept), or released by its watchdog at the deadline,
+        # which drops the entry too
+        for gone, reason in (("deleted", "ended with no results: ended"), ("reaped", "released at its deadline")):
+            with self.subTest(gone):
+                temp = Path(tempfile.mkdtemp())
+                for vendor, key in (("nvidia", "eras:i-1"), ("amd", "digitalocean:9")):
+                    (temp / "lt" / vendor).mkdir(parents=True)
+                    (temp / "lt" / vendor / "instance").write_text(key + "\n")
+                led = {"eras:i-1": {"provider": "eras", "instance_id": "i-1"},
+                       **({"digitalocean:9": {"provider": "digitalocean", "instance_id": "9"}}
+                          if gone == "deleted" else {})}
 
-        @contextlib.contextmanager
-        def ledger_txn():
-            yield led
+                @contextlib.contextmanager
+                def ledger_txn(led=led):
+                    yield led
 
-        def pull(argv, stdin):  # the NVIDIA box left a report; the AMD droplet is gone
-            if argv[3] == "eras:i-1":
-                Path(argv[-1], "report.md").write_text("r")
-            return ""
-        g = types.SimpleNamespace(entry=lambda key: dict(led[key]), load_config=dict, ledger_txn=ledger_txn,
-                                  status=lambda e, cfg: ("active", "h", 22) if e["provider"] == "eras"
-                                  else ("ended", None, 22))
-        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(io.StringIO()):
-            out, fake = step(gpu_review.wait, {"gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
-        self.assertEqual(out, {}, "a run with one box's results would read as no live test at all")
-        self.assertIn("ended with no results: ended", (temp / "lt/amd/unavailable.md").read_text())
-        self.assertEqual(sorted(a[3] for a, _ in fake.calls if a[2] == "terminate"), ["digitalocean:9", "eras:i-1"],
-                         "a box would bill on after its run")
+                def pull(argv, stdin):  # the NVIDIA box left a report
+                    if argv[3] == "eras:i-1":
+                        Path(argv[-1], "report.md").write_text("r")
+                    return ""
+                g = types.SimpleNamespace(ledger=lambda led=led: led, load_config=dict, ledger_txn=ledger_txn,
+                                          status=lambda e, cfg: ("active", "h", 22) if e["provider"] == "eras"
+                                          else ("ended", None, 22))
+                with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(io.StringIO()):
+                    out, fake = step(gpu_review.wait, {"gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
+                self.assertEqual(out, {}, "a run with one box's results would read as no live test at all")
+                self.assertEqual((temp / "lt/nvidia/results/report.md").read_text(), "r")
+                self.assertIn(reason, (temp / "lt/amd/unavailable.md").read_text())
+                self.assertEqual(sorted(a[3] for a, _ in fake.calls if a[2] == "terminate"),
+                                 ["digitalocean:9", "eras:i-1"], "a box would bill on after its run")
 
     def test_cleanup_releases_every_vendors_box_by_name(self):
         released = []
