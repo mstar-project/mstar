@@ -1465,6 +1465,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">kv_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"StreamLayout"</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">loop_caps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># `unpausable`: the request streams an output that can't pause, set by the conductor.</span>
+    <span class="c1"># `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.</span>
+    <span class="c1"># A pool that decides admission reads both at the request's first `KVManager.ask` and at its admission. A request</span>
+    <span class="c1"># no drop can free can still turn guaranteed later, at the first page the host pool has no room for.</span>
+    <span class="n">unpausable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">rebuildable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
 <div class="viewcode-block" id="KVReqConfig.apply_conductor_config">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.apply_conductor_config">[docs]</a>
@@ -1499,8 +1505,10 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">scratch</span><span class="o">=</span><span class="n">scratch</span><span class="p">,</span>
                     <span class="n">retention</span><span class="o">=</span><span class="kc">None</span> <span class="k">if</span> <span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">RetentionPolicy</span><span class="p">(</span><span class="o">*</span><span class="n">retention</span><span class="p">),</span>
                     <span class="n">keyed_spans</span><span class="o">=</span><span class="n">keyed_spans</span><span class="p">,</span>
+                    <span class="n">max_growth</span><span class="o">=</span><span class="n">max_growth</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">max_growth</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="p">)</span>
-                <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="p">(</span><span class="n">spans</span><span class="p">,</span> <span class="n">growth</span><span class="p">,</span> <span class="n">scratch</span><span class="p">,</span> <span class="n">retention</span><span class="p">,</span> <span class="n">keyed_spans</span><span class="p">)</span> <span class="ow">in</span> <span class="n">kv_layout</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                <span class="c1"># a row may leave out the growth bound, as a span row may leave out its later fields</span>
+                <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="p">(</span><span class="n">spans</span><span class="p">,</span> <span class="n">growth</span><span class="p">,</span> <span class="n">scratch</span><span class="p">,</span> <span class="n">retention</span><span class="p">,</span> <span class="n">keyed_spans</span><span class="p">,</span> <span class="o">*</span><span class="n">max_growth</span><span class="p">)</span> <span class="ow">in</span> <span class="n">kv_layout</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">opened</span>
             <span class="p">}</span>
         <span class="k">if</span> <span class="n">loop_caps</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1545,8 +1553,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        the one model that declares one, computes its positions in each forward.</span>
 
 <span class="sd">        Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool</span>
-<span class="sd">        has for requests. The pool admits on the prompt alone, so such a request would be admitted</span>
-<span class="sd">        and then could not finish even alone in an empty pool."""</span>
+<span class="sd">        has for requests. The pool admits a preemptible request on its prompt alone, so a request this</span>
+<span class="sd">        large would be admitted and then could not finish even alone in an empty pool."""</span>
         <span class="k">if</span> <span class="n">spec</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">):</span>
             <span class="k">return</span>
         <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -1641,6 +1649,29 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model</span><span class="si">}</span><span class="s2"> returned a kv_layout for </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">/</span><span class="si">{</span><span class="n">extra</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, which it does not declare"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">missing</span> <span class="o">:=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">configs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">()</span> <span class="o">-</span> <span class="n">laid_out</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model</span><span class="si">}</span><span class="s2"> returned no kv_layout for </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">/</span><span class="si">{</span><span class="n">missing</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, which the request opens"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="rebuild_refusal">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.rebuild_refusal">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">rebuild_refusal</span><span class="p">(</span><span class="n">layouts</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="s2">"StreamLayout"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""</span>
+    <span class="n">laid_out</span> <span class="o">=</span> <span class="p">[</span><span class="n">layout</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">layouts</span> <span class="k">if</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">]</span>
+    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">kind</span> <span class="o">!=</span> <span class="n">SpanKind</span><span class="o">.</span><span class="n">IDS</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">"it holds KV that can't be recomputed from token ids"</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">laid_out</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">"it writes more than one label, span or growth loop, which one rebuild row can't lay out again"</span>
+    <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="mark_unpausable">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.mark_unpausable">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">mark_unpausable</span><span class="p">(</span><span class="n">configs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">],</span> <span class="n">unpausable</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Mark every KV config in ``configs``, since a pause in any pool is heard."""</span>
+    <span class="k">for</span> <span class="n">config</span> <span class="ow">in</span> <span class="n">configs</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">):</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">unpausable</span> <span class="o">=</span> <span class="n">unpausable</span></div>
 
 
 
@@ -1861,22 +1892,23 @@ window.runMermaid = runMermaid;</script>
     <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">retention</span><span class="p">:</span> <span class="n">RetentionPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">keyed_spans</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">max_growth</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="StreamLayout.slots">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.slots">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">slots</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span>
-            <span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span>
-        <span class="p">)</span></div>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_grown</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="StreamLayout.positions">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.positions">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">positions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">advance</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span>
-            <span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span>
-        <span class="p">)</span></div>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">advance</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_grown</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_grown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">grown</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">grown</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_growth</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">min</span><span class="p">(</span><span class="n">grown</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_growth</span><span class="p">)</span>
 
 <div class="viewcode-block" id="StreamLayout.pages">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.pages">[docs]</a>

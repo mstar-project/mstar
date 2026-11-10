@@ -104,12 +104,12 @@ class Preemption:
         self._walked = None
         for refusal in refusals:
             kv = self._caches.get(refusal.key)
-            if kv is None or not self._moves(kv, refusal.mark.node_name):
+            if kv is None or not self._moves(kv, refusal.node_name):
                 continue
             newer = engine.newer_than(refusal.rid)
             victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
             if victims is not None:
-                self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+                self._move(kv, self.counts[refusal.node_name], victims, refusal.rid)
                 return
         self._walked = walked
 

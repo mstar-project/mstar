@@ -1198,23 +1198,28 @@ prefix reuse</strong> below.</p></li>
 <code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code> can name on any node and walk, <code class="docutils literal notranslate"><span class="pre">main</span></code> when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:</p>
+A layout has six fields:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">spans</span></code>: the committed writes known at intake, in walk order. A
 <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.Span</span></code> has a <code class="docutils literal notranslate"><span class="pre">kind</span></code>: <code class="docutils literal notranslate"><span class="pre">&quot;ids&quot;</span></code> for token ids from the tensor
 <code class="docutils literal notranslate"><span class="pre">source</span></code> names, <code class="docutils literal notranslate"><span class="pre">&quot;digest&quot;</span></code> for KV made from an uploaded file (<code class="docutils literal notranslate"><span class="pre">source</span></code> is
 <code class="docutils literal notranslate"><span class="pre">(modality,</span> <span class="pre">index)</span></code>), and <code class="docutils literal notranslate"><span class="pre">&quot;rows&quot;</span></code> for KV made from anything else, such as another
-node’s outputs. <code class="docutils literal notranslate"><span class="pre">length</span></code> is the slots the write fills, <code class="docutils literal notranslate"><span class="pre">advance</span></code> how far it moves
+node’s outputs. A request with a <code class="docutils literal notranslate"><span class="pre">&quot;digest&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;rows&quot;</span></code> span can’t be rebuilt from
+its token ids, so in a pool that decides admission it can only move to the host, into room
+the host sets aside for the pages it holds, and reserves its whole footprint when the host can’t.
+<code class="docutils literal notranslate"><span class="pre">length</span></code> is the slots the write fills, <code class="docutils literal notranslate"><span class="pre">advance</span></code> how far it moves
 the position counter. A span’s <code class="docutils literal notranslate"><span class="pre">scratch</span></code> is the most one non-committing step writes
 before the span commits into those slots, as a window’s denoise steps do.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">growth</span></code>: <code class="docutils literal notranslate"><span class="pre">(loop,</span> <span class="pre">slots)</span></code> pairs, <code class="docutils literal notranslate"><span class="pre">slots</span></code> per iteration of <code class="docutils literal notranslate"><span class="pre">loop</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_growth</span></code>: the most slots <code class="docutils literal notranslate"><span class="pre">growth</span></code> writes in all, for loops that end before their
+caps, as Nemotron’s do.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">scratch</span></code>: the most KV slots one non-committing step writes past the committed length.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">retention</span></code>: the <code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code> the label’s committing steps declare.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">keyed_spans</span></code>: how many leading spans the label’s keys cover, by default every span
 before the first <code class="docutils literal notranslate"><span class="pre">rows</span></code> span.</p></li>
 </ul>
-<p>The footprint adds the spans, the growth at each loop’s iterations and the scratch, and
-rounds up to whole pages per label. A span’s own scratch counts only with the spans before
+<p>The footprint adds the spans, the growth at each loop’s iterations up to <code class="docutils literal notranslate"><span class="pre">max_growth</span></code> and the
+scratch, and rounds up to whole pages per label. A span’s own scratch counts only with the spans before
 it, so a window’s denoise steps and its commit count once. Under a <code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code> it
 takes the window’s peak instead. <code class="docutils literal notranslate"><span class="pre">KVReqConfig.validate</span></code> refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and <code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_room</span></code> cuts the default

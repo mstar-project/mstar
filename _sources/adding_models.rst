@@ -437,23 +437,28 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
-  node's outputs. ``length`` is the slots the write fills, ``advance`` how far it moves
+  node's outputs. A request with a ``"digest"`` or ``"rows"`` span can't be rebuilt from
+  its token ids, so in a pool that decides admission it can only move to the host, into room
+  the host sets aside for the pages it holds, and reserves its whole footprint when the host can't.
+  ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
 - ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
+- ``max_growth``: the most slots ``growth`` writes in all, for loops that end before their
+  caps, as Nemotron's do.
 - ``scratch``: the most KV slots one non-committing step writes past the committed length.
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
+The footprint adds the spans, the growth at each loop's iterations up to ``max_growth`` and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default

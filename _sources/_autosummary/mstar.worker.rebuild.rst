@@ -13,6 +13,7 @@ mstar.worker.rebuild
 
    .. autosummary::
    
+      node_writes
       policies_run_here
    
    
@@ -24,6 +25,7 @@ mstar.worker.rebuild
    .. autosummary::
    
       KeptIds
+      NodeWrites
       Prefilling
       RebuildCursor
       Rebuilds

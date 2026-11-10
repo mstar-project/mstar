@@ -764,8 +764,8 @@
 <p>Earlier PR (#400) proposed admission control that reserves each request’s worst case — its prompt plus <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>. It removes the stall completely, but induces severe HoL blocking (e.g. chats queue behind image requests): their TTFT p50 rose from 0.45 s to 17.7 s. Whether this fragments the pool was never measured, but it is nonetheless based on a banker check which felt too strict.</p>
 <p>This design adds slim version of admission control by default (A1). A request reserves only its prompt’s pages and waits in a queue until they fit. On top of it, the requests are classified as either:</p>
 <ol class="arabic simple">
-<li><p><strong>Guaranteed.</strong> A request that streams audio, or whose KV can’t be rebuilt from token ids, also reserves pages for the most it can generate, and is never preempted.</p></li>
-<li><p><strong>Preemptible.</strong> When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids.</p></li>
+<li><p><strong>Guaranteed.</strong> A request that streams an output that can’t pause, such as audio, or whose pages nothing could take back, also reserves pages for the most it can generate, and is never preempted once it starts.</p></li>
+<li><p><strong>Preemptible.</strong> When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids. A request that can’t be rebuilt moves only to the host, into room the host set aside for it.</p></li>
 </ol>
 <p>A host tier for the prefix cache, which was on the roadmap regardless, is built alongside, and aims to cut that recompute by copying pages between host and device asynchronously, hiding the offload and reload cost.</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -805,18 +805,19 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
     <span class="o">...</span>
-    <span class="n">guaranteed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># reserves its whole footprint and is never dropped</span>
+    <span class="n">unpausable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># streams an output that can't pause, set by the conductor</span>
+    <span class="n">rebuildable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>   <span class="c1"># a drop on this worker can free its pages, set by the worker</span>
 </pre></div>
 </div>
-<p>A dropped request keeps only its token ids, so a request can be preempted only if its node can rebuild all of its KV from them.</p>
-<p>A request that can’t be rebuilt must never run short. It reserves its whole footprint up front, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.</p>
+<p>A dropped request keeps only its token ids, so a request can be dropped only if its node can rebuild all of its KV from them. One that can’t be dropped can still move to the host.</p>
+<p>A request that nothing can take pages back from must never run short. From the moment it is guaranteed, it reserves its whole footprint, its prompt plus its growth bound, and is never preempted once it starts. That is what guaranteed means.</p>
 <p>The model declares the footprint as KV spans (#832). A span’s kind says what its KV is made from:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">ids</span></code>: token ids</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">digest</span></code>: an encoder’s output</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">rows</span></code>: another node’s outputs</p></li>
 </ul>
-<p>The conductor sets the class once, at ingest, and the same class holds in every pool.</p>
+<p>Each pool decides the class from two facts. The conductor marks a request that streams an output that can’t pause, and that mark holds in every pool. The worker marks whether a drop there can free the request’s pages: every node of the pool that writes the request’s KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible while the host pool sets aside room for its move: its prompt when it is admitted, and each page it takes after that before it takes it. When the host pool has no room for that, at admission or at any page after, it becomes guaranteed, and the host pool logs and counts it.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>#</p></th>
@@ -827,23 +828,23 @@
 </thead>
 <tbody>
 <tr class="row-even"><td><p>1</p></td>
-<td><p>Audio it streams out</p></td>
+<td><p>An output it streams that can’t pause, audio unless the model or the deployment says otherwise</p></td>
 <td><p>guaranteed</p></td>
 <td><p>a pause is a gap in playback</p></td>
 </tr>
 <tr class="row-odd"><td><p>2</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">rows</span></code> span</p></td>
-<td><p>guaranteed</p></td>
+<td><p>moves only to the host there, or guaranteed</p></td>
 <td><p>its KV comes from another node’s outputs, such as the Thinker’s hidden states the Qwen3-Omni Talker reads</p></td>
 </tr>
 <tr class="row-even"><td><p>3</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">digest</span></code> span</p></td>
-<td><p>guaranteed</p></td>
+<td><p>moves only to the host there, or guaranteed</p></td>
 <td><p>its KV comes from an encoder’s output, freed after prefill</p></td>
 </tr>
 <tr class="row-odd"><td><p>4</p></td>
-<td><p>No rebuild policy on its node</p></td>
-<td><p>guaranteed there</p></td>
+<td><p>No rebuild policy on the node that writes its KV</p></td>
+<td><p>moves only to the host there, or guaranteed</p></td>
 <td><p>the model declares no way to rebuild the node’s KV, as when its decode reads embeddings</p></td>
 </tr>
 <tr class="row-even"><td><p>5</p></td>
@@ -859,8 +860,10 @@
 <p>Why this shape:</p>
 <ul class="simple">
 <li><p><strong>The class comes from the request.</strong> A priority or a per-request flag would be one more input to tune, when the footprint and the output can be used to make the decision.</p></li>
-<li><p><strong>The conductor sets it.</strong> It is the one place that sees every resource’s layout. A Qwen3-Omni request with audio out has <code class="docutils literal notranslate"><span class="pre">rows</span></code> only on the Talker’s worker, so a class each worker set from its own pools would let the Thinker’s worker drop a request whose Talker is speaking.</p></li>
-<li><p><strong>Only streamed audio.</strong> A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.</p></li>
+<li><p><strong>An output that can’t pause holds in every pool.</strong> A Qwen3-Omni request with streamed audio out must not be dropped by the Thinker’s worker while its Talker is speaking, so the conductor marks it. A span no rebuild can write again holds only in its node’s pools: for an unstreamed reply, a Thinker rebuild only delays the Talker’s rows.</p></li>
+<li><p><strong>Only streamed outputs that can’t pause.</strong> The model declares them (<code class="docutils literal notranslate"><span class="pre">Model.UNPAUSABLE_OUTPUTS</span></code>, audio by default), and a deployment overrides them with <code class="docutils literal notranslate"><span class="pre">unpausable_outputs</span></code>, as an Orpheus deployment may to keep a fast first chunk. A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.</p></li>
+<li><p><strong>Room on the host is set aside, not assumed.</strong> A request that can only move to the host must be able to move when an older request needs its pages (§5.5). Room counted at that moment is whatever other moves left, so a full host pool would leave it holding its pages, and a pool of such requests stalls as in #307. The room set aside always covers the pages it holds, so its move fits. Past <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>, the rest are guaranteed.</p></li>
+<li><p><strong>The room grows with what it holds.</strong> Setting its whole footprint aside at its first ask held host room for pages it might never write, and for requests still waiting in the queue, so few requests got room and the host prefix tier was left little. Turning guaranteed at the page the host can’t cover needs the rest of its footprint free on the device, and until it is, the request is short of those pages as a decode step is short of one (§3).</p></li>
 <li><p><strong>Not the worst case for every request.</strong> With 32 Bagel text chats beside 16 image chats on 64 pages, chat TTFT p50 was 559 ms with every request guaranteed and 69.7 ms with two classes.</p></li>
 <li><p><strong>Seeded requests stay preemptible.</strong> Guaranteeing them would charge the worst case to every request that sets a seed. A rebuilt seeded request may not repeat its output (§5.4).</p></li>
 </ul>
@@ -901,10 +904,10 @@
 </thead>
 <tbody>
 <tr class="row-even"><td><p>a page only the index holds</p></td>
-<td><p>a fresh page</p></td>
+<td><p>a fresh page, out of the room alone for a guaranteed request until it adopts its lease</p></td>
 </tr>
 <tr class="row-odd"><td><p>a page another request holds</p></td>
-<td><p>nothing, lent to a preemptible request</p></td>
+<td><p>nothing, lent</p></td>
 </tr>
 <tr class="row-even"><td><p>a cached prefix copied from the host at readiness</p></td>
 <td><p>a grant within the request’s reservation</p></td>
@@ -918,6 +921,7 @@
 <li><p><strong>Only the head of a queue is admitted.</strong> No newer prompt passes the oldest one, so it can’t wait forever behind a stream of small ones.</p></li>
 <li><p><strong>A request that asks again waits outside the queues, and holds newer prompts back only while it is the oldest in its pool.</strong> Waiting at its arrival for its whole history and a page, it held every newer prompt back: 32 Bagel requests over four shared prefixes on 96 pages, with 512 host pages, ran about 3 at once and took about 58 s, against 41 to 54 s today. Today an offloaded request reloads outside admission once its pages fit, and trying returns first in the same way took that run to 40.8 to 47.9 s on R4. Waiting outside the queues with no such rule, a request on the host or dropped could be passed by a steady stream of newer prompts until it timed out, even once it was the oldest. Every older request in its pool finishes (§5.5), so it becomes the oldest there, and no newer prompt passes it then.</p></li>
 <li><p><strong>Evictable hits are charged as fresh.</strong> Eviction could hand such a page to another request before the probe leases it.</p></li>
+<li><p><strong>A guaranteed request is charged for no hit until it adopts its lease.</strong> A cut lease leaves the walk to write the cut pages, and a cut page another request still holds frees no room, so its reservation keeps every page until then.</p></li>
 </ul>
 </section>
 <hr class="docutils" />
@@ -940,7 +944,7 @@
 <h3>3.2 Choosing the victims<a class="headerlink" href="#choosing-the-victims" title="Link to this heading">#</a></h3>
 <p>Say request R’s grant is short by <code class="docutils literal notranslate"><span class="pre">pages_short</span></code> pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.</p>
 <ul class="simple">
-<li><p><strong>Candidates.</strong> The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn’t landed, since the rebuild runs on its reservation, and a request holding a lease, until its walk’s admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn’t refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and asks again, whatever the host pool. The host’s room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.</p></li>
+<li><p><strong>Candidates.</strong> The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn’t landed, since the rebuild runs on its reservation, and a request holding a lease, until its walk’s admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn’t refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and the room the host set aside for it, and asks again, whatever the host pool. The host’s room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.</p></li>
 <li><p><strong>Victims.</strong> The fewest leading candidates that together free at least <code class="docutils literal notranslate"><span class="pre">pages_short</span></code>, minus any whose move wouldn’t change what the set frees.</p></li>
 </ul>
 <p>Then:</p>
@@ -971,7 +975,7 @@
 </div>
 <p>The room R’s grant counted joins R’s reservation at once. As each victim’s move lands, what it frees joins too, up to what the grant needed past the reservation, so R’s next grant can’t fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R’s next step, and R would fail again, as it does today.</p>
 <p>Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.</p>
-<p>When a waiting request W chooses victims, the earmark is W’s. W takes the room as its victims’ moves land, once that covers all W asks for, so a victim, which asks again at once, can’t take it back first.</p>
+<p>When a waiting request W chooses victims, the earmark is W’s. W takes the room as its victims’ moves land, once that covers all W asks for, so a victim, which asks again at once, can’t take it back first. If the host then has no room to set aside for W’s move (§1), W turns guaranteed and waits for its whole footprint instead.</p>
 <p>Lifecycle:</p>
 <ol class="arabic simple">
 <li><p>Created with its victims when the worker handles R’s failed grant.</p></li>
@@ -1094,6 +1098,7 @@
 <ul class="simple">
 <li><p><strong>A whole history and a page, not the prompt alone.</strong> A victim readmitted once its prompt fit would take back its own pages, and R would fail again. A victim dropped partway through its prompt still writes the rest of it, so it returns with the whole prompt at least.</p></li>
 <li><p><strong>Capped at the footprint.</strong> The ingest 400 bounds the footprint, not the history plus a page.</p></li>
+<li><p><strong>Not its whole footprint.</strong> A footprint far larger than what the request held kept it at the head of the queue while pages were free, and every prompt behind it waited too. When it runs short again it waits for its shortage instead (§3.2).</p></li>
 <li><p><strong>Outside <code class="docutils literal notranslate"><span class="pre">check_ready</span></code>.</strong> After a partial cache hit, <code class="docutils literal notranslate"><span class="pre">admit_retrieve</span></code> would move the position counter past what the rebuild restores, so no <code class="docutils literal notranslate"><span class="pre">admit_retrieve</span></code> runs on a request between its drop and the end of its rebuild.</p></li>
 </ul>
 </section>
@@ -1132,15 +1137,15 @@
 </section>
 <section id="why-every-request-finishes">
 <h3>5.5 Why every request finishes<a class="headerlink" href="#why-every-request-finishes" title="Link to this heading">#</a></h3>
-<p>A guaranteed request reserves its whole footprint and is never preempted, so it finishes.</p>
-<p>Take the oldest preemptible request O, once every older request has finished:</p>
+<p>A guaranteed request reserves its whole footprint and is never preempted once it starts, so it then finishes.</p>
+<p>Take the oldest request O, once every older request has finished:</p>
 <ol class="arabic simple">
 <li><p>No request chooses O as a victim, since a victim is newer than the request it is chosen for.</p></li>
 <li><p>When O runs short, newer requests move to the host or are dropped first. When their moves can’t cover the shortage, O moves to the host if the host holds it whole, and otherwise waits.</p></li>
-<li><p>While O waits, on the host or holding its pages, every other request that holds pages is newer, and no newer prompt starts in O’s pools except one already allotted its room, which takes nothing more. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, moves to the host or waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. O’s footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.</p></li>
+<li><p>While O waits, on the host or holding its pages, every other request that holds pages is newer, and no newer prompt starts in O’s pools except one already allotted its room, which takes nothing more. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, moves to the host or waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. A guaranteed request never runs short, so one among them waits only because the moves it chose admitted it before it could start, and with no page written its move only undoes that admission. One no drop can free moves into the room the host set aside for it (§1). O’s footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.</p></li>
 <li><p>So O runs again each time it waits, and each time it has grown by at least a page. From the host it returns with every page its grant needed, so that grant can’t fail again. Its footprint fits the pool, so it finishes.</p></li>
 </ol>
-<p>The next oldest request then takes its place in the argument. Two requests that hold pages and wait can’t wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page, and once it is the oldest no newer prompt passes it.</p>
+<p>The next oldest request then takes its place in the argument. Two requests that hold pages and wait can’t wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page, and once it is the oldest no newer prompt passes it. Until every older request has finished, newer prompts, guaranteed ones included, can start in O’s pools. After that none does, so the argument holds while new requests keep arriving. <code class="docutils literal notranslate"><span class="pre">admit_waiting</span></code> tries every return that fits, oldest first, so it can admit returns newer than O ahead of O, and the argument survives that because each newer return grows by a page each time it is preempted, up to its footprint.</p>
 <p>For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.</p>
 </section>
 </section>
@@ -1174,7 +1179,7 @@
 <h2>7. Checks<a class="headerlink" href="#checks" title="Link to this heading">#</a></h2>
 <p>Always on:</p>
 <ul class="simple">
-<li><p>A victim is preemptible, can move to the host or be dropped, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.</p></li>
+<li><p>A victim is preemptible, or guaranteed and not yet started, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.</p></li>
 <li><p>A grant that a reservation covers and that can’t take its pages raises.</p></li>
 <li><p>Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.</p></li>
 </ul>
@@ -1188,7 +1193,7 @@
 <section id="trade-offs">
 <h2>8. Trade-offs<a class="headerlink" href="#trade-offs" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><strong>Drops cost a rebuild.</strong> A victim the host pool can’t hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307’s workload one request was dropped four times, although that was a contrived test.</p></li>
+<li><p><strong>Drops cost a rebuild.</strong> A victim the host pool can’t hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again each time an older request runs short.</p></li>
 <li><p><strong>A lone rebuild isn’t speculated.</strong> Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.</p></li>
 <li><p><strong>Kept ids.</strong> A node with a rebuild policy copies each request’s prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can’t hold is never dropped on that node, though with a host pool it can still move to the host.</p></li>
 <li><p><strong>Shared prefixes with host offload.</strong> A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.</p></li>

@@ -1210,6 +1210,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefix_root</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span>
     <span class="c1"># the client streams the opening ends; the others stay open for appends</span>
     <span class="n">ends</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Inputs the API server already holds decoded, by modality and in order,</span>
     <span class="c1"># in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):</span>
     <span class="c1"># each goes to ``Model.load_decoded_&lt;modality&gt;``, with no file between.</span>

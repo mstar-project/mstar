@@ -740,6 +740,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal"><code class="docutils literal notranslate"><span class="pre">Refusal</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.key"><code class="docutils literal notranslate"><span class="pre">Refusal.key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.mark"><code class="docutils literal notranslate"><span class="pre">Refusal.mark</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.node_name"><code class="docutils literal notranslate"><span class="pre">Refusal.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.rid"><code class="docutils literal notranslate"><span class="pre">Refusal.rid</span></code></a></li>
 </ul>
 </li>
@@ -763,8 +764,8 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.admission.Admission" title="mstar.engine.resources.admission.Admission"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Admission</span></code></a>(resources, ask_order)</p></td>
 <td><p>The queues of the resources that ask, and the nodes each request was admitted on.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.admission.Refusal" title="mstar.engine.resources.admission.Refusal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Refusal</span></code></a>(rid, key, mark)</p></td>
-<td><p>A waiting request that didn't fit, the resource that refused it, and the mark that resource returned.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.admission.Refusal" title="mstar.engine.resources.admission.Refusal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Refusal</span></code></a>(rid, key, node_name, mark)</p></td>
+<td><p>A waiting request that didn't fit, the resource that refused it, the node it asked that resource for, and the mark that resource returned.</p></td>
 </tr>
 </tbody>
 </table>
@@ -924,14 +925,16 @@ ingests it once for each, with the same number.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.admission.Refusal">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.admission.</span></span><span class="sig-name descname"><span class="pre">Refusal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mark</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/admission.html#Refusal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.admission.Refusal" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.admission.</span></span><span class="sig-name descname"><span class="pre">Refusal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mark</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/admission.html#Refusal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.admission.Refusal" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
-<p>A waiting request that didn’t fit, the resource that refused it, and the mark that resource returned.</p>
+<p>A waiting request that didn’t fit, the resource that refused it, the node it asked that resource for, and the
+mark that resource returned.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>mark</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a>)</p></li>
 </ul>
 </dd>
@@ -945,6 +948,12 @@ ingests it once for each, with the same number.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.admission.Refusal.mark">
 <span class="sig-name descname"><span class="pre">mark</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><span class="pre">object</span></a></span><a class="headerlink" href="#mstar.engine.resources.admission.Refusal.mark" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.admission.Refusal.node_name">
+<span class="sig-name descname"><span class="pre">node_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.admission.Refusal.node_name" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 2</p>
 </dd></dl>
 
@@ -1019,6 +1028,7 @@ ingests it once for each, with the same number.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal"><code class="docutils literal notranslate"><span class="pre">Refusal</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.key"><code class="docutils literal notranslate"><span class="pre">Refusal.key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.mark"><code class="docutils literal notranslate"><span class="pre">Refusal.mark</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.node_name"><code class="docutils literal notranslate"><span class="pre">Refusal.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Refusal.rid"><code class="docutils literal notranslate"><span class="pre">Refusal.rid</span></code></a></li>
 </ul>
 </li>

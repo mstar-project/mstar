@@ -1058,7 +1058,14 @@ below).</p></td>
 conductor’s queue, except a live call (open client input), which is refused with
 a 503.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">routing_weights</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unpausable_outputs</span></code></p></td>
+<td><p><em>(optional)</em> The output modalities a pause would break, such as <code class="docutils literal notranslate"><span class="pre">[audio]</span></code>. A request
+that streams one of them reserves its whole KV footprint and is never preempted once it
+starts (see below). Defaults to the model’s <code class="docutils literal notranslate"><span class="pre">UNPAUSABLE_OUTPUTS</span></code>, which is <code class="docutils literal notranslate"><span class="pre">[audio]</span></code>
+unless the model declares otherwise. <code class="docutils literal notranslate"><span class="pre">[]</span></code> gives a voice deployment a fast first chunk
+under KV pressure, at the cost of a pause when its requests are preempted.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">routing_weights</span></code></p></td>
 <td><p><em>(optional)</em> The weights of the data-parallel replica pick (see below), one per
 term: <code class="docutils literal notranslate"><span class="pre">load</span></code> for the live requests on a replica, and <code class="docutils literal notranslate"><span class="pre">prefix</span></code> for the share of
 the prompt predicted in its KV prefix cache. Each is a number from 0 to 1e6; <code class="docutils literal notranslate"><span class="pre">load</span></code>
@@ -1069,13 +1076,13 @@ parallelism, warmup copies run with <code class="docutils literal notranslate"><
 they still spread but do not warm the prefill that starts from cached pages; a
 warmup spec that sets <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> keeps its own value.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code></p></td>
 <td><p><em>(optional)</em> The share of its GPU each worker may hold once CUDA-graph capture is
 done, for workers that share a GPU (see below). Unset, capture plans against
 whatever is free. A node that sets <code class="docutils literal notranslate"><span class="pre">capture_cudnn_benchmark</span></code> is held to the
 share while its captures are sized, so its eager step must fit in it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
 <td><p><em>(optional)</em> <code class="docutils literal notranslate"><span class="pre">true</span></code> runs the workers as clients of a CUDA MPS control daemon the
 conductor starts in a private directory, so workers that share a GPU overlap their
 kernels instead of time-slicing (the ASR <code class="docutils literal notranslate"><span class="pre">*_split</span></code> configs, and the speech ones:
@@ -1084,7 +1091,7 @@ needs <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-m
 shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
 <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
 <td><p><em>(optional, default 512)</em> For a model that takes live client input: how many MiB
 of files (and append text) one call may send over its whole life, its opening
 message’s included, and of decoded audio samples a route appends
@@ -1095,7 +1102,7 @@ it ends the call with a 400; a one-shot request is not counted. It caps a call�
 decoded input is larger than its files, and how much of it waits in buffers
 depends on how fast the model consumes it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
 <td><p><em>(optional)</em> For a model that takes live client input: per client stream (by
 its edge name, e.g. <code class="docutils literal notranslate"><span class="pre">audio_in</span></code>), overrides of the limits the model declares on
 it (<code class="docutils literal notranslate"><span class="pre">ClientStreamLimits</span></code>, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). <code class="docutils literal notranslate"><span class="pre">max_items</span></code>: what the
@@ -1107,10 +1114,10 @@ model sizes its buffers from its own settings (for <code class="docutils literal
 <code class="docutils literal notranslate"><span class="pre">max_session_s</span></code> instead). An unknown stream, key or value fails loading. Unlike
 <code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code> it counts what the model was handed, not bytes uploaded.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openpi</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openpi</span></code></p></td>
 <td><p><em>(optional)</em> For a robot policy, a model that declares <code class="docutils literal notranslate"><span class="pre">Model.robot_io</span></code> and
 <code class="docutils literal notranslate"><span class="pre">Model.load_decoded_image</span></code> (pi0.5 today). Serves openpi’s policy WebSocket at <code class="docutils literal notranslate"><span class="pre">/</span></code> (see
 <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>), mapping an openpi observation onto the request, as openpi’s
@@ -1121,7 +1128,7 @@ into the robot state. <code class="docutils literal notranslate"><span class="pr
 the model can’t serve (more cameras than <code class="docutils literal notranslate"><span class="pre">num_cameras</span></code>, an unknown key) stops
 the server at startup.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
 <td><p><em>(optional, default true)</em> Whether the server offers per-message deflate on its
 WebSocket routes; it applies to every route.
 Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
@@ -1130,14 +1137,14 @@ costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
 event loop, not the network, is the bottleneck.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code></p></td>
 <td><p><em>(optional)</em> The largest WebSocket message the server reads, in MiB, on every
 WebSocket route; by default the HTTP body limit, <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>. A larger one
 closes its socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> before any handler sees it, so the client gets no
 error frame. Raise it for clients that send big uncompressed frames, such as several
 raw camera images in one openpi observation.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scheduling</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scheduling</span></code></p></td>
 <td><p><em>(optional)</em> Which (node, walk) a worker’s next step goes to (see “Walk priorities” in
 <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). <code class="docutils literal notranslate"><span class="pre">policy</span></code>: <code class="docutils literal notranslate"><span class="pre">priority</span></code> (the default) or <code class="docutils literal notranslate"><span class="pre">round_robin</span></code>, which
 turns the model’s priorities off. <code class="docutils literal notranslate"><span class="pre">max_wait</span></code>: the most of a worker’s chain steps (side-lane steps not counted) a ready key
@@ -1149,7 +1156,7 @@ pair decides. An entry naming nothing the model runs, a negative priority, a
 loading. For example <code class="docutils literal notranslate"><span class="pre">scheduling:</span> <span class="pre">{walk_priorities:</span> <span class="pre">[{walk:</span> <span class="pre">talker_prefill,</span> <span class="pre">priority:</span>
 <span class="pre">1},</span> <span class="pre">{node:</span> <span class="pre">Talker,</span> <span class="pre">walk:</span> <span class="pre">talker_decode,</span> <span class="pre">max_wait:</span> <span class="pre">4}]}</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk of the node’s combined
 walks, or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On for a walk, a speculation
 chain on it merges ready rows of the other walks of its combined walk, so
@@ -1160,12 +1167,12 @@ has a token budget (<code class="docutils literal notranslate"><span class="pre"
 merged prompt then runs whole. Naming a node with no combined walk, or a
 walk outside its combined walks, fails loading.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code></p></td>
 <td><p><em>(optional)</em> Per node, one token budget for every walk the model budgets, or a
 mapping of walk -&gt; budget; null turns a walk’s chunking off. Overrides the
 model’s defaults. See <em>Chunked prefill budgets</em> below.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code></p></td>
 <td><p><em>(optional)</em> Per node, a mapping of name -&gt; ladder: the token counts a packed
 graph capture is taken at, in place of the model’s. A name is a walk the
 node runs, for its packed captures on that walk (the model’s
@@ -1216,11 +1223,11 @@ key replaces <code class="docutils literal notranslate"><span class="pre">model_
 <code class="docutils literal notranslate"><span class="pre">prefill_batched_token_buckets</span></code> (GLM-5.2), <code class="docutils literal notranslate"><span class="pre">backbone_token_buckets</span></code>
 (OmniVoice) and <code class="docutils literal notranslate"><span class="pre">lm_prefill_token_buckets</span></code> (CosyVoice3), which fail loading.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code></p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code> to let a walk inside a combined walk take a budget
 of its own under the step’s. See <em>Chunked prefill budgets</em> below.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculate_mid_prefill</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculate_mid_prefill</span></code></p></td>
 <td><p><em>(optional, default true)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk it chunks,
 or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On, a prompt mid-prefill takes its
 next chunk in the step speculated during the current one, so a lone long prompt
@@ -1228,7 +1235,7 @@ pays no scheduling gap between chunks; other ready work still goes first after
 every prompt step. Off, the next chunk waits for the current one to land. Naming
 a node or walk the model does not chunk fails loading.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">batch_builder</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">batch_builder</span></code></p></td>
 <td><p><em>(optional, default</em> <code class="docutils literal notranslate"><span class="pre">fifo</span></code> <em>)</em> How the worker composes a step under a token
 budget (<code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>). <code class="docutils literal notranslate"><span class="pre">fifo</span></code> serves prompts in the order they started:
 a prompt mid-prefill takes the budget before a newer one, so it finishes first,
@@ -1236,13 +1243,13 @@ and prompts short enough for an equal share still go in whole. <code class="docu
 splits the budget max-min fair over every waiting prompt, so each advances every
 step and all finish late together.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code></p></td>
 <td><p><em>(optional, default 128)</em> The fewest tokens a prompt cut by chunked prefill runs
 in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
 chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
 up to a page. See <em>Chunked prefill budgets</em> below.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rebuild_host_mb</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rebuild_host_mb</span></code></p></td>
 <td><p><em>(optional, default 64)</em> MiB of pinned host memory a worker serving a node whose model
 declares a rebuild policy sets aside at startup for its requests’ prompt ids, 8 B a token (int64),
 which a request dropped from the KV cache is rebuilt from. A request the pool can’t hold
@@ -1250,7 +1257,7 @@ keeps no ids, so it is never dropped on that node, though it can still move to t
 with <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>. A TP, SP or CFG node never drops a request, so it
 keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
 <td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
 binds, so no client pays a shape’s first-request cost (torch.compile of a step,
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
@@ -1271,13 +1278,13 @@ replicated VAE, the entry first runs once alone, so that graph also warms its
 one-request shape before the copies reach it together. A malformed or failing warmup
 is logged and skipped.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
 <td><p><em>(optional)</em> Timeout in seconds for the NCCL world group and its parallel
 subgroups during weight load and warmup; serving keeps PyTorch’s default.
 Unset keeps PyTorch’s default throughout. Raise it only where weight load,
 JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP, SP and CFG group:
 <code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
 any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
@@ -1292,24 +1299,24 @@ differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
 to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
 <td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
 <td><p><em>(optional)</em> Async scheduling for the parallel nodes: <code class="docutils literal notranslate"><span class="pre">true</span></code>
 (default), <code class="docutils literal notranslate"><span class="pre">false</span></code> or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">preprocess_workers</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">preprocess_workers</span></code></p></td>
 <td><p><em>(optional)</em> Requests the data worker prepares at once, for a model that
 declares <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span></code>. Default: as many as fit the CPUs left
 beside the API server’s intra-op threads (<code class="docutils literal notranslate"><span class="pre">preprocess_torch_threads</span></code>),
 at most 8; <code class="docutils literal notranslate"><span class="pre">1</span></code> prepares inline. It must be a positive integer, for any
 model: the server refuses to start on another value. See <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
@@ -1368,41 +1375,50 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (<code class="docutils literal notranslate"><span class="pre">AttentionConfig.sliding_window</span></code>) has no prefix cache yet: its
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> goes off (logged at info), and a serving config that sets
 <code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">true</span></code> on it is refused.</p>
-<p>On a single rank, a request waits at the head of its pool’s queue until its prompt fits beside
-the prompts already admitted, and no request behind it starts first. A cache hit on a page only
-the prefix index holds counts as a page the request takes. A request that can’t fit in its pool
-at its full output length gets a 400 if it asked for that length, and otherwise has the model’s
-default length cut until it fits. The pool reserves only prompts, so a decode step can find no
-page outside the admitted prompts. The worker then takes pages from the newest requests, those
-that arrived after the request that ran short, until they cover its shortage. Each moves to the
-host when the host pool (<code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>) can hold all of its pages, and is otherwise
-dropped if it can be rebuilt from its token ids. The request that ran short gets the pages
-freed, up to its shortage. When the newer requests can’t cover it, it moves to the host if the
-host pool can hold all of its pages, and otherwise waits holding its pages. A request on the host,
-a dropped one and one waiting for pages wait outside the queue, so a new prompt that fits still
-starts, unless one of them is the oldest request in its pool, which no newer prompt passes unless
-its room is already allotted.
-They are tried oldest first, before the queue. The oldest refused request that moves can let in
-moves newer requests that wait holding pages, to the host or by a drop as above. A request on the host
-returns once its pages and one more page fit, or every page its grant needed when it moved
+<p>On a single rank, a request waits at the head of its pool’s queue until its reservation fits beside
+the reservations already admitted, and no request behind it starts first. A cache hit on a page only
+the prefix index holds counts as a page the request takes. A request that can’t fit in its pool at
+its full output length gets a 400 if it asked for that length, and otherwise has the model’s default
+length cut until it fits. A request that can be rebuilt reserves only its prompt, so a decode step
+can find no page outside the reservations. The worker then takes pages from the newest requests,
+those that arrived after the request that ran short, until they cover its shortage. Each moves to
+the host when the host pool (<code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>) can hold all of its pages, and is otherwise
+dropped if it can be rebuilt from its token ids. The request that ran short gets the pages freed, up
+to its shortage. When the newer requests can’t cover it, it moves to the host if the host pool can
+hold all of its pages, and otherwise waits holding its pages. A request on the host, a dropped one
+and one waiting for pages wait outside the queue, so a new prompt that fits still starts, unless one
+of them is the oldest request in its pool, which no newer prompt passes unless its room is already
+allotted. They are tried oldest first, before the queue. The oldest refused request that moves can
+let in moves newer requests that wait holding pages, to the host or by a drop as above. A request on
+the host returns once its pages and one more page fit, or every page its grant needed when it moved
 itself, and its pages are then copied back. A dropped request returns once its prompt, or its
-history and one more page if that is larger, fits, counting no prompt page another request
-holds, then recomputes its KV in prefill chunks cut by its walk’s chunk budget.</p>
-<p>Above one rank, on a worker that runs only some of a node’s walks, on a node with a second
-paged KV cache, such as Whisper’s decoder, and on a node with no rebuild policy and no host
-pool, such as Qwen3-TTS’s Talker without <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>, a decode step that finds no
-page and nothing to offload holds its requests until they time out. Elsewhere at one rank, a
-request that runs short, when moving or dropping the newer requests wouldn’t cover it and the host
-pool can’t hold it, waits holding its pages until its shortage fits. Several such requests can
-wait on each other. <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> prevents both. It caps how many
+history and one more page if that is larger, fits, counting no prompt page another request holds,
+then recomputes its KV in prefill chunks cut by its walk’s chunk budget. A request that streams an
+output in <code class="docutils literal notranslate"><span class="pre">unpausable_outputs</span></code> reserves its whole footprint in every pool, with every cache hit
+counted, and is never dropped or moved to the host. Voice requests then queue when the pool is short
+and are never preempted mid-stream. A request no drop can free, because it holds KV made from media
+or another node’s outputs or a node that keeps no token ids writes its KV, moves only to the host:
+when it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt.
+The room grows with each page the request takes after that, so its move always fits. When the host
+pool has no room for it at admission, or later once the device has room for the rest of its
+footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
+host pool logs it. While the device has no room for that either, nothing is logged: newer requests
+move for it as for any request that runs short, and otherwise it moves to the host, into the room
+set aside for it, and returns once its whole footprint fits. So <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> also sets how
+many pages such requests can hold with only their prompt reserved.</p>
+<p>Above one rank, and on a node with a second paged KV cache, such as Whisper’s decoder, a decode
+step that finds no page and nothing to offload holds its requests until they time out. Elsewhere at
+one rank, a request that runs short, when moving or dropping the newer requests wouldn’t cover it
+and the host pool can’t hold it, waits holding its pages until its shortage fits. Several such
+requests can wait on each other. <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> prevents both. It caps how many
 requests run at once, and the pool’s pages divided by the pages one request needs, prompt and
-output together, is a safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> lets a full pool move a request to the
-host instead of dropping it. An offload frees only the device pages no other running request
-reads, though, so a request that shares most of its prompt frees little. Offload helps a pool
-that runs short now and then. It doesn’t replace the cap. With a host pool and the prefix cache
-on, a cached page is copied to the host once no request holds it, and a later request whose
-prefix the device evicted copies it back from there. So the host pool should hold more pages
-than the device’s prefix cache.</p>
+output together, is a safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> lets a full pool move a request to the host
+instead of dropping it. An offload frees only the device pages no other running request reads,
+though, so a request that shares most of its prompt frees little. Offload helps a pool that runs
+short now and then. It doesn’t replace the cap. With a host pool and the prefix cache on, a cached
+page is copied to the host once no request holds it, and a later request whose prefix the device
+evicted copies it back from there. So the host pool should hold more pages than the device’s prefix
+cache.</p>
 <p><strong>Chunked prefill budgets.</strong> A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
 budgets:</p>
