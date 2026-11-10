@@ -48,6 +48,7 @@ SNAPSHOT = {
         ["forks", "KEYWORD_ONLY", '()'],
         ["placeholders", "KEYWORD_ONLY", 'frozenset()'],
         ["eager_add", "KEYWORD_ONLY", 'False'],
+        ["fixed_layout", "KEYWORD_ONLY", 'False'],
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],

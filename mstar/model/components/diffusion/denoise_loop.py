@@ -536,7 +536,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 name: ArrayStep(segments=tuple(
                     Segment(request_id=rid, label=label, span=span)
                     for rid, arrays in rows for label, span in arrays[name]
-                ))
+                ), fixed_layout=True)
                 for name in rows[0][1]
             },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),

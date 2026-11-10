@@ -210,6 +210,7 @@ def _assert_plans_equal(step: SubmoduleStep, reference: SubmoduleStep, key: str)
     assert step.steps.keys() == reference.steps.keys() and step.cg_key_info == reference.cg_key_info
     assert step.segments == reference.segments, "a LoRA pool's rows are the step's segments"
     assert isinstance(step.steps[key], AttentionStep) and step.steps[key].causal is False
+    assert step.steps[key].fixed_layout == reference.steps[key].fixed_layout, "a captured bucket replays its layout"
     assert _by_label(step.steps[key]) == _by_label(reference.steps[key])
 
 
@@ -224,7 +225,9 @@ def test_klein_steps_equal_the_hand_written_one(rids):
     key = _klein_key()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     segments = [Segment(request_id=rid, label="main", span=key.total_tokens) for rid in rids]
-    reference = SubmoduleStep(segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={KLEIN_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, KLEIN_ATTN)
 
 
@@ -237,7 +240,9 @@ def test_z_image_steps_equal_the_hand_written_one(rids):
         Segment(request_id=rid, label=label, span=span) for rid in rids
         for label, span in (("image", key.image_tokens_padded), ("caption", 32), ("main", key.total_tokens))
     ]
-    reference = SubmoduleStep(segments=segments, steps={Z_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={Z_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key] * len(rids), rids), reference, Z_ATTN)
 
 
@@ -248,7 +253,9 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     sub = Wan22DitSubmodule(None, model.config)
     tokens = sub.num_tokens(key)
     segments = [Segment(request_id=0, label="main", span=tokens)] * branches
-    reference = SubmoduleStep(segments=segments, steps={SELF_ATTN: AttentionStep(causal=False)}, cg_key_info=key)
+    reference = SubmoduleStep(
+        segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+    )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
 
@@ -391,8 +398,8 @@ def _ltx_reference_step(rids, shape: LTXShape, shard: int) -> dict:
     audio = tuple(Segment(rid, "audio", shape.audio_frames) for rid in rids)
     text = tuple(Segment(rid, "text", shape.text_len) for rid in rids)
     return {
-        "dit_attn_video": AttentionStep(segments=video, causal=False),
-        "dit_attn_audio": AttentionStep(segments=audio, causal=False),
+        "dit_attn_video": AttentionStep(segments=video, causal=False, fixed_layout=True),
+        "dit_attn_audio": AttentionStep(segments=audio, causal=False, fixed_layout=True),
         "dit_xattn_video": RaggedCrossAttentionStep(segments=video_shard + text, pairs=(("video", "text"),)),
         "dit_xattn_audio": RaggedCrossAttentionStep(
             segments=video_shard + audio + text, pairs=(("audio", "text"), ("video", "audio"), ("audio", "video")),
@@ -420,7 +427,7 @@ def test_ltx_steps_equal_the_hand_written_ones_per_rank(rids, world_size, rank, 
         if isinstance(expected, RaggedCrossAttentionStep):
             assert step.steps[key].pairs == expected.pairs, "plans run in the order of the hand-written pairs"
         else:
-            assert step.steps[key].causal is False
+            assert step.steps[key].causal is False and step.steps[key].fixed_layout, key
 
 
 @pytest.mark.parametrize("array, keys, queries, label", [

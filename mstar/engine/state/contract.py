@@ -369,6 +369,7 @@ class ArrayStep:
     forks: tuple[Fork, ...] = ()
     placeholders: frozenset[tuple[int, str]] = frozenset()    # (row, label): holds a place, reads and keeps nothing
     eager_add: bool = False                        # this step's adds run outside the captured graph
+    fixed_layout: bool = False                     # replays of its capture bucket plan the capture's layout
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
