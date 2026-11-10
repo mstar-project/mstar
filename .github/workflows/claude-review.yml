@@ -539,6 +539,7 @@ jobs:
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
           MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+          ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
         run: python3 .github/review/gpu_review.py configure
 
       # The review's fields as files for the steps below, whether the PR's author has write access

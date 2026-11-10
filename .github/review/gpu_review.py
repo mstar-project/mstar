@@ -31,6 +31,8 @@ import render_summary
 ROOT = Path(__file__).resolve().parents[2]
 GPU = ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"
 BOX = Path(__file__).with_name("gpu_review_box.sh")
+BOX_COMMON = Path(__file__).with_name("box_common.sh")  # passed to both box scripts with --input
+REFRESH_BOX = Path(__file__).with_name("refresh_cache_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 # gpu.py's ledger, for this run only.
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
@@ -75,10 +77,12 @@ def gpu(*args, check=True, timeout=900):
 
 # ---------------------------------------------------------------- GPUs
 
-def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2", eras_secret=""):
+def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2", eras_secret="",
+              eras_cache_volumes=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the runner's ssh key
     (`ssh_key`, REVIEW_SSH_KEY, stored in the environment; it stays on the runner and never reaches the
-    box). Eras only with that key and ERAS_API_KEY (gpu.py checks)."""
+    box). Eras only with that key and ERAS_API_KEY (gpu.py checks). ERAS_CACHE_VOLUMES: the Eras cache
+    volumes' ids, space-separated."""
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
@@ -90,7 +94,7 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
     else:
         print("::warning::REVIEW_SSH_KEY is not set, so the live test has no GPUs to reach.")
     usd, hours = float(max_usd), float(hours)
-    eras = {} if ssh_key else {"enabled": False}
+    eras = {"cache_volume_ids": eras_cache_volumes.split(), **({} if ssh_key else {"enabled": False})}
     if eras_secret:
         eras["run_secret_id"] = eras_secret
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
@@ -257,6 +261,25 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 """
 
 
+def free_offers(gpus, max_usd_per_hour=None):
+    """(the offers that can start now, the listing they came from): `gpu.py offers`, keeping those under
+    `max_usd_per_hour` (default gpu.py's cap). check=False: offers exits 1 with its JSON when something
+    errored and nothing has an offer, which is "no GPUs" here too, with the errors listed."""
+    listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
+    cap = listing["max_usd_per_hour"] if max_usd_per_hour is None else max_usd_per_hour
+    return [o for o in listing["offers"] if o["usd_per_hour"] <= cap and o["availability"] != "none"], listing
+
+
+def launch_first(offers, launch):
+    """`launch(o)` (the run of gpu.py's launch) on each offer in turn until one starts, since another run can
+    take a listing first; (the offer that started and its run's output) or (None, None)."""
+    for o in offers:
+        r = launch(o)
+        if r.returncode == 0:
+            return o, r
+    return None, None
+
+
 def unavailable(out, lt, text):
     """Say why the live test can't run, in lt/unavailable.md, and stop the step, exit 3 with `unavailable`
     set."""
@@ -292,29 +315,31 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
     cfg = gpu_py.load_config()
-    # check=False: offers exits 1 with its JSON when something errored and nothing has an offer. That
-    # is "no GPUs" here too, with the errors listed.
-    listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
+    free, listing = free_offers(gpus)
     cap = listing["max_usd_per_hour"]
-    free = [o for o in listing["offers"] if o["usd_per_hour"] <= cap and o["availability"] != "none"]
     tried = []
     # The box's Anthropic key is a saved Eras secret: without it a box would be paid for and do nothing.
     if free and not cfg.get("eras", {}).get("run_secret_id"):
         tried, free = ["eras: ERAS_RUN_SECRET_ID is not set"], []
     inputs = [x for f in ("brief.md", "findings.json", "pr-body.md", "run.json") for x in ("--input", str(lt / f))]
-    for o in free:
+    inputs += ["--input", str(BOX_COMMON)]
+
+    def launch(o):
         r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", tag,
                 "--run", str(BOX), *inputs, check=False)
         if r.returncode == 4:  # budget.max_running
-            msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
-                   "comment `/review` again when one finishes.")
-            unavailable(out, lt, msg)
-        if r.returncode == 0:
-            (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
-            (lt / "offer.json").write_text(json.dumps(o))
-            print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
-            return
-        tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
+            unavailable(out, lt, f"The bot already has {cfg['budget']['max_running']} GPU runs going "
+                                 "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
+        if r.returncode:
+            tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
+        return r
+
+    o, r = launch_first(free, launch)
+    if o:
+        (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
+        (lt / "offer.json").write_text(json.dumps(o))
+        print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
+        return
     everything = json.loads(gpu("offers", "--gpus", str(gpus), "--json", "--all-regions", check=False).stdout)
     lines = [f"No GPUs for the live test: it needs {gpus} Hopper-class GPU(s), at most ${cap}/hr."]
     lines += [f"- tried {t}" for t in tried]
@@ -322,6 +347,43 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
               for o in everything["offers"]] or ["- no listing has that many Hopper-class GPUs"]
     lines += [f"- {e}" for e in everything["errors"]]
     unavailable(out, lt, "\n".join(lines))
+
+
+def refresh(out, runner_temp, tag, volume, gpus, hours, models, skip, weights, max_usd, github_repository):
+    """review-cache.yml: fill the Eras cache volume `volume` from main on a box of its own (`--cache-write`
+    takes only that volume). The price cap is twice the live test's: a refresh runs for hours, once."""
+    if not re.fullmatch(r"[0-9]+", gpus) or not 1 <= int(gpus) <= 8 or not re.fullmatch(r"[0-9]+", hours) \
+            or not 1 <= int(hours) <= 11:  # the wait step allows 700 min; --allow-over-budget lifts the hours cap
+        print("::error::gpus must be 1 to 8, and hours a whole number from 1 to 11 (the wait step allows 700 min).")
+        sys.exit(1)
+    if not os.environ.get("ERAS_API_KEY"):
+        print("::error::Set ERAS_API_KEY.")
+        sys.exit(1)
+    lt = Path(runner_temp, "lt")
+    lt.mkdir(parents=True, exist_ok=True)
+    main_sha = bot.run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    (lt / "run.json").write_text(json.dumps({"repo": github_repository, "main_sha": main_sha, "models": models,
+                                             "skip": skip, "weights": weights}))
+    free, listing = free_offers(gpus, float(max_usd) * 2)  # configure turned every provider but Eras off
+    if not free:
+        print(f"::error::No Eras listing with {gpus} GPUs free now: {json.dumps(listing['errors'])}")
+        sys.exit(1)
+
+    tried = []
+
+    def launch(o):
+        r = gpu("launch", o["id"], "--pr", "0", "--hours", hours, "--tag", tag, "--cache-write", volume,
+                "--allow-over-budget", "--run", str(REFRESH_BOX), "--input", str(lt / "run.json"),
+                "--input", str(BOX_COMMON), check=False)
+        if r.returncode:
+            tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
+        return r
+
+    o, r = launch_first(free, launch)
+    if not o:
+        print(f"::error::No Eras listing with {gpus} GPUs launched: " + "; ".join(tried).replace("\n", " "))
+        sys.exit(1)
+    (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])  # where `wait` finds the box
 
 
 def instance(lt):
@@ -793,7 +855,7 @@ def incomplete(out, pr, run_url):
 
 STEPS = {"configure": configure, "inputs": inputs, "carry": carry, "start": start, "wait": wait, "redact": redact,
          "comment": comment, "publish": publish, "approve": approve, "post": post, "cleanup": cleanup,
-         "incomplete": incomplete}
+         "incomplete": incomplete, "refresh": refresh}
 
 if __name__ == "__main__":
     bot.main(STEPS)
