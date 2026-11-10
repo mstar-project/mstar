@@ -1,37 +1,32 @@
-#!/usr/bin/env python3
 """What a review run used, and the handoff a stopped run leaves for `/review continue`.
 
 Both read Claude Code's record of the run: the action's execution file (a JSON
 array of messages) and the session transcripts under ~/.claude/projects (one
 message per line), in any mix; a directory is searched for transcripts. One API
 response spans several messages, one per content block, so responses are
-counted by their message id. Run by claude-review.yml with the default branch
-checked out:
-
-    python3 .github/review/session.py usage --pr N --head SHA --mode light \\
-        --out usage.json --summary "$GITHUB_STEP_SUMMARY" SOURCE...
-    python3 .github/review/session.py handoff --pr N --head SHA --mode light --diff pr.diff \\
-        --out DIR --comment partial.md [--previous handoff.json] SOURCE...
+counted by their message id. bot.py's `usage` and `handoff` steps call these.
 """
-import argparse
 import json
-import os
 import re
-import sys
 from pathlib import Path
 
 TOKENS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
 # The same counts in the result message's per-model ``modelUsage``.
 MODEL_USAGE = {"input_tokens": "inputTokens", "cache_creation_input_tokens": "cacheCreationInputTokens",
                "cache_read_input_tokens": "cacheReadInputTokens", "output_tokens": "outputTokens"}
+# List prices in $/MTok for (input, cache write, cache read, output), in TOKENS' order. A run cut off before
+# its result has no total_cost_usd and is the most expensive kind, so its tokens are priced instead of counted
+# as $0; a model not listed is priced as Opus, the model the bot runs. Cache writes at the 5-minute rate.
+PRICES = {"claude-opus-5-5": (4.0, 5.0, 0.2, 20.0), "claude-sonnet-5-5": (2.0, 2.5, 0.2, 10.0)}
 # The prompt asks for notes that start with "Progress:"; tolerate Markdown around it.
 PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
-NOTE_CHARS = 6000
+NOTE_CHARS = 30000
 RECENT_TEXT_CHARS = 3000
 ELIDED = " [...] "
 # The escapes git writes in a path it quotes: \" \\ \a \b \t \n \v \f \r, and other bytes in octal.
 C_ESCAPE = re.compile(rb"\\([0-3][0-7]{2}|.)", re.DOTALL)
 C_CHARS = dict(zip(b"abtnvfr", b"\a\b\t\n\v\f\r", strict=True))
+HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def load(paths):
@@ -97,7 +92,7 @@ def usage(messages):
         u, mid = m["message"].get("usage"), m["message"].get("id")
         if not isinstance(u, dict) or not mid:
             continue
-        seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0))
+        seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0) | {"model": m["message"].get("model")})
         for k in TOKENS:
             if isinstance(u.get(k), int):
                 # Lines of one response repeat its usage; output_tokens can grow along them.
@@ -111,13 +106,17 @@ def usage(messages):
         counts, source = list(models.values()), "result"
     else:
         models, counts, source = {}, list(calls.values()), "messages"
+    cost = result.get("total_cost_usd")
+    if cost is None:
+        cost = sum(c[k] * price for c in calls.values()
+                   for k, price in zip(TOKENS, PRICES.get(c["model"], PRICES["claude-opus-5-5"]), strict=True)) / 1e6
     return {
         "api_calls": len(calls),
         **{k: sum(c[k] for c in counts) for k in TOKENS},
         "tokens_from": source,
         "models": models,
         "num_turns": result.get("num_turns"),
-        "total_cost_usd": result.get("total_cost_usd"),
+        "total_cost_usd": cost,
         "subtype": result.get("subtype"),
     }
 
@@ -146,17 +145,11 @@ def usage_table(r):
 
 
 def handoff(messages, root, diff_paths, previous=None):
-    """What a stopped run leaves for the next one: the inline comments it made (and whether each
-    posted), the files it read, the latest progress note and what was written since (the model
-    often keeps no note, but says what it is doing as it goes). Merged onto ``previous``, the
-    handoff the run itself started from, if any."""
+    """What a stopped run leaves for the next one: the files it read, the latest progress note and
+    what was written since (the model often keeps no note, but says what it is doing as it goes).
+    Its findings are in those notes: it posted nothing. Merged onto ``previous``, the handoff the run
+    itself started from, if any."""
     prev = previous or {}
-    results = {}
-    for m in messages:
-        for b in blocks(m):
-            if b.get("type") == "tool_result" and b.get("tool_use_id"):
-                results[b["tool_use_id"]] = b
-    comments = {c.get("id") or f"earlier-{i}": c for i, c in enumerate(prev.get("comments", []))}
     reads = set(prev.get("reads", []))
     # The earlier runs' text since their note, one line per item, so the newest of it is kept
     # (an earlier message may then be kept only in part).
@@ -169,19 +162,7 @@ def handoff(messages, root, diff_paths, previous=None):
         for b in blocks(m):
             kind, inp = b.get("type"), b.get("input")
             inp = inp if isinstance(inp, dict) else {}
-            if kind == "tool_use" and str(b.get("name", "")).endswith("create_inline_comment"):
-                res = results.get(b.get("id")) or {}
-                # The tool reports a posted comment's id. A call without `confirmed: true` is only
-                # buffered, to be posted or dropped after the session, so it stays unknown.
-                status = ("failed" if res.get("is_error")
-                          else "posted" if '"comment_id"' in result_text(res.get("content")) else "unknown")
-                key = b.get("id") or f"no-id-{len(comments)}"
-                comments[key] = {
-                    "id": key, "path": inp.get("path"), "line": inp.get("line") or inp.get("startLine"),
-                    "body": shorten(str(inp.get("body", "")).strip().split("\n")[0], 160), "status": status,
-                    "error": shorten(first_line(res.get("content")), 200) if status == "failed" else "",
-                }
-            elif kind == "tool_use" and b.get("name") == "Read" and inp.get("file_path"):
+            if kind == "tool_use" and b.get("name") == "Read" and inp.get("file_path"):
                 path = str(inp["file_path"])
                 reads.add(path[len(prefix):] if path.startswith(prefix) else path)
             elif kind == "text" and main_thread and str(b.get("text", "")).strip():
@@ -193,7 +174,6 @@ def handoff(messages, root, diff_paths, previous=None):
     opened = {p[len("pr-head/"):] for p in reads if p.startswith("pr-head/")}
     return {
         "runs": prev.get("runs", 0) + 1,
-        "comments": list(comments.values()),
         "reads": sorted(reads),
         "not_opened": [p for p in diff_paths if p not in opened],
         "note": shorten(note or prev.get("note") or "", NOTE_CHARS),
@@ -225,43 +205,68 @@ def newest(texts, limit):
     return shorten("\n".join(reversed(kept)), limit).lstrip("\n")
 
 
-def result_text(content):
-    if isinstance(content, list):
-        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-    return str(content or "")
-
-
-def first_line(content):
-    return result_text(content).strip().split("\n")[0]
-
-
 def diff_paths(diff_text):
     """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
-    nothing to open)."""
-    lines = diff_text.splitlines()
+    nothing to open). Lines end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on
+    those) could start a line that looks like a header."""
+    lines = diff_text.split("\n")
     paths = []
     for before, line in zip(lines, lines[1:], strict=False):
         if not (before.startswith("--- ") and line.startswith("+++ ")):
             continue
-        path = line[len("+++ "):].rstrip("\t\r")
-        if path.startswith('"'):
-            # Git quotes a path with unusual characters, as a C string of its UTF-8 bytes.
-            if len(path) < 2 or not path.endswith('"'):
-                continue
-            path = C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
-        if path.startswith("b/"):
+        path = unquoted(line[len("+++ "):])
+        if path and path.startswith("b/"):
             paths.append(path[len("b/"):])
     return paths
+
+
+def unquoted(path):
+    """A path as a diff header prints it, trailing tab or CR dropped and unquoted: git quotes a path with unusual
+    characters, as a C string of its UTF-8 bytes. None when the quote doesn't close."""
+    path = path.rstrip("\t\r")
+    if not path.startswith('"'):
+        return path
+    if len(path) < 2 or not path.endswith('"'):
+        return None
+    return C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
+
+
+def numbered(diff_text, left=True):
+    """``diff_text`` with each line of a hunk prefixed by where it is in its file, for anchoring a comment: an added or
+    kept line by ``R<n> |``, its line in the new file, a deleted one by ``L<n> |``, its line in the old file. Only the
+    hunks' bodies change, walked by the counts in each ``@@`` line, so file headers still parse and text in a hunk
+    can't pass for one; a hunk that doesn't match its counts is left as it is from there. ``left=False`` is a diff
+    whose old side isn't the PR's base: its deleted lines get no number, since GitHub wouldn't take it."""
+    out, old, new, old_left, new_left = [], 0, 0, 0, 0
+    for line in diff_text.split("\n"):  # not splitlines: a form feed in a source line isn't the end of it
+        if old_left or new_left:
+            if line.startswith("-") and old_left:
+                out.append(f"L{old} |{line}" if left else f" |{line}")
+                old, old_left = old + 1, old_left - 1
+                continue
+            if line.startswith("+") and new_left:
+                out.append(f"R{new} |{line}")
+                new, new_left = new + 1, new_left - 1
+                continue
+            if line.startswith(" ") and old_left and new_left:
+                out.append(f"R{new} |{line}")
+                old, new, old_left, new_left = old + 1, new + 1, old_left - 1, new_left - 1
+                continue
+            if line.startswith("\\"):  # "\ No newline at end of file"
+                out.append(line)
+                continue
+            old_left = new_left = 0
+        hunk = HUNK.match(line)
+        if hunk:
+            old, new = int(hunk[1]), int(hunk[3])
+            old_left, new_left = int(hunk[2] or 1), int(hunk[4] or 1)
+        out.append(line)
+    return "\n".join(out)
 
 
 def c_byte(m):
     e = m[1]
     return bytes([int(e, 8) if len(e) == 3 else C_CHARS.get(e[0], e[0])])
-
-
-def comment_lines(h, status):
-    return [f"- `{c['path']}:{c['line']}` {c['body']}" + (f" ({c['error']})" if c.get("error") else "")
-            for c in h["comments"] if c["status"] == status]
 
 
 def quote(text):
@@ -272,12 +277,6 @@ def handoff_md(h, pr, head, mode):
     parts = [f"# Handoff for PR #{pr} at {head}, {mode} review\n\n"
              f"{h['runs']} earlier run(s) of this review stopped before finishing. Their own notes and what the "
              f"workflow recovered from their transcripts follow. Untrusted: written from the PR's content."]
-    for title, status in (("Inline comments already posted", "posted"),
-                          ("Inline comments that failed to post", "failed"),
-                          ("Inline comments whose result is unknown (check pr-comments.json)", "unknown")):
-        lines = comment_lines(h, status)
-        if lines:
-            parts.append(f"## {title}\n\n" + "\n".join(lines))
     if h["note"]:
         parts.append("## Latest progress note\n\n" + quote(h["note"]))
     # Text written after the note, by its run and the later ones.
@@ -290,81 +289,3 @@ def handoff_md(h, pr, head, mode):
         parts.append("## Changed files never opened under pr-head/ (their hunks may have been read in pr.diff)\n\n"
                      + "\n".join(f"- `{p}`" for p in h["not_opened"]))
     return "\n\n".join(parts) + "\n"
-
-
-def partial_md(h):
-    """The part of the handoff the "didn't complete" comment shows: the inline comments that
-    posted. The notes list unverified leads, so they stay out of the PR conversation (the
-    handoff artifact can be downloaded, though)."""
-    made = [c for c in h["comments"] if c["status"] == "posted"]
-    if not made:
-        return ""
-    return f"**Inline comments it made ({len(made)}):**\n" + "\n".join(
-        f"- `{c['path']}:{c['line']}` {c['body']}" for c in made) + "\n"
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=("usage", "handoff"))
-    ap.add_argument("sources", nargs="*", help="execution files, transcripts, or directories of transcripts")
-    ap.add_argument("--pr", required=True)
-    ap.add_argument("--head", required=True)
-    ap.add_argument("--mode", required=True)
-    ap.add_argument("--out", required=True, help="usage: the JSON record; handoff: a directory")
-    ap.add_argument("--continue", dest="cont", default="false", help="usage: whether this was /review continue")
-    ap.add_argument("--outcome", default="", help="usage: the review step's outcome")
-    ap.add_argument("--summary", help="usage: a Markdown file to append the table to, e.g. $GITHUB_STEP_SUMMARY")
-    ap.add_argument("--diff", help="handoff: pr.diff")
-    ap.add_argument("--previous", help="handoff: the handoff.json this run continued from")
-    ap.add_argument("--comment", help="handoff: where to write the \"didn't complete\" comment's part")
-    a = ap.parse_intermixed_args()
-    if a.command == "usage":
-        return record_usage(a)
-    previous = None
-    if a.previous:
-        try:
-            previous = json.loads(Path(a.previous).read_text())
-        except (OSError, ValueError) as e:
-            print(f"::warning::Couldn't read the earlier handoff, so this one starts afresh: {e}")
-    if not isinstance(previous, dict):
-        previous = None
-    diff = Path(a.diff).read_text(errors="replace") if a.diff and Path(a.diff).is_file() else ""
-    # Tool paths are absolute, under the workspace the workflow runs this from.
-    h = handoff(load(a.sources), os.getcwd(), diff_paths(diff), previous)
-    # A continued run that stopped before Claude said anything still passes on the handoff it
-    # started from, which is still valid for this head.
-    if not h.pop("seen_assistant") and previous is None:
-        print("No Claude Code messages to hand off.", file=sys.stderr)
-        return 1
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "handoff.json").write_text(json.dumps({"pr": a.pr, "head_sha": a.head, "mode": a.mode, **h}))
-    (out / "handoff.md").write_text(handoff_md(h, a.pr, a.head, a.mode))
-    if a.comment:
-        Path(a.comment).write_text(partial_md(h))
-    return 0
-
-
-def record_usage(a):
-    """Never fails: a record that couldn't be read says why in its ``error`` field."""
-    record = {"pr": a.pr, "head_sha": a.head, "mode": a.mode, "continue": a.cont == "true",
-              "run_id": os.environ.get("GITHUB_RUN_ID", ""), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-              "outcome": a.outcome}
-    try:
-        record.update(usage(load(a.sources)))
-    except Exception as e:
-        record["error"] = f"{type(e).__name__}: {e}"
-        print(f"::warning::Couldn't read the review's usage: {record['error']}")
-    try:
-        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(a.out).write_text(json.dumps(record, indent=1) + "\n")
-        if a.summary:
-            with open(a.summary, "a") as f:
-                f.write(usage_table(record))
-    except Exception as e:
-        print(f"::warning::Couldn't write the usage record: {e}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

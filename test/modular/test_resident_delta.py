@@ -31,6 +31,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
     MessageSource,
@@ -129,11 +130,8 @@ def test_an_empty_delta_is_falsy():
 # --- the engine's journal and replay ----------------------------------------
 
 
-class _Resource:
+class _Resource(StubResource):
     supports_eviction = True
-    supports_preplan = False
-    force_double_buffer = False
-    lean_capture = False
 
     def __init__(self):
         self.offloaded: set[str] = set()
@@ -211,7 +209,10 @@ class _Engine(Engine):
         self.resource = _Resource()
         self._resources = {"kv": self.resource}
         self._submodules["node"] = make_mgmt(resources={"kv": self.resource})
-        self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
+        self._runner = SimpleNamespace(
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
+            readmit=lambda *args: None,
+        )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )

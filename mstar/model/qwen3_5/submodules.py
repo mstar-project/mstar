@@ -162,9 +162,8 @@ class LLMSubmodule(SampledTokenDecoder):
         ``t * h' * w'`` tokens, so the cursor advances by the real amount and
         the position resource is handed the total.
         """
-        # built on the host, copied once
-        pos_ids, advance = layout_position_ids(layout, self._merge_size, num_tokens, start)
-        return to_device_nonblocking(pos_ids, self.get_device()), advance
+        # built on the host: the scaffold moves them, and a chunk's cut rebuilds them
+        return layout_position_ids(layout, self._merge_size, num_tokens, start)
 
     def resident_walks(self) -> frozenset[str]:
         # a captured decode step builds its rope inside the graph on every config
