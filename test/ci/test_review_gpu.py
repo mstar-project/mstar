@@ -151,6 +151,8 @@ class TestCarry(unittest.TestCase):
          [live_test("fail"), live_test("unavailable")], "ahead", full("targeted", "failed")),
         ("fail, then no verdict", True, "targeted", ["correctness"], [live_test("fail"), live_test("none")], "ahead",
          full("targeted", "failed")),
+        ("pass, then no valid verdict", True, "targeted", ["correctness"], [live_test("pass"), live_test("none")],
+         "ahead", full("targeted", "failed")),
         ("fail, then a verdict it doesn't know", True, "targeted", ["correctness"],
          [live_test("fail"), live_test("skipped")], "ahead", full("targeted", "failed")),
         ("pass on an ancestor, then unavailable", True, "targeted", ["correctness"],
@@ -169,13 +171,10 @@ class TestCarry(unittest.TestCase):
          {"run": "full", "checks": BOTH}),
     ]
 
-    def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",), review=None,
-              threads=(), untestable=""):
-        """carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
-        PR's changed files. review: more of the review's fields; threads: the PR's review threads."""
-        routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/pulls/7": {"base": {"sha": "b" * 40}},
-                  f"GET repos/{R}/compare/{'b' * 40}...*": {"files": [{"filename": f} for f in files]},
-                  f"GET repos/{R}/compare/*": {"status": status},
+    def carry(self, rereview, run, checks, comments, status, review=None, threads=(), untestable=""):
+        """carry's outputs and the earlier report it kept; comments None: the fetch fails. review: more of the
+        review's fields; threads: the PR's review threads."""
+        routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/compare/*": {"status": status},
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws, contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"outside_diff": [], "inline": {}, **(review or {}),
@@ -341,7 +340,8 @@ class TestStart(unittest.TestCase):
                       brief(7, "0123456789", "abcdef", "main", "targeted", kinds("performance,correctness")))
         forced = {"forced": "failed", "asked_checks": kinds("correctness")}
         self.assertIn("The review asked for `targeted` with correctness checks only; the workflow made it full, with "
-                      "both kinds of check, because the PR's last live test failed or was partial.",
+                      "both kinds of check, because the PR's last live test failed, was partial or left no valid "
+                      "verdict.",
                       brief(7, "0123456789", "abcdef", "main", "full", kinds("correctness,performance"),
                             asked="targeted", **forced),
                       "the session would plan a narrower run than the workflow chose")
