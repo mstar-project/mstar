@@ -472,15 +472,16 @@ class AiterARFusion(ARFusion):
 
         Every rank runs every case even after one fails: each call is a
         collective, and a rank that stops early leaves its peers spinning in
-        the kernel."""
+        the kernel. That holds for a case that raises here too (say an OOM on
+        this GPU): it counts as a failure and the next case still runs."""
         gen = torch.Generator().manual_seed(1234)
         bad = None
-        try:
-            for tokens in sorted({1, max_tokens}):
-                xs = torch.randn(world_size, tokens, hidden, generator=gen).to(dtype)
-                res = torch.randn(tokens, hidden, generator=gen).to(dtype)
-                w = (torch.randn(hidden, generator=gen) * 0.1).to(dtype)
-                for gemma in (False, True):
+        for tokens in sorted({1, max_tokens}):
+            xs = torch.randn(world_size, tokens, hidden, generator=gen).to(dtype)
+            res = torch.randn(tokens, hidden, generator=gen).to(dtype)
+            w = (torch.randn(hidden, generator=gen) * 0.1).to(dtype)
+            for gemma in (False, True):
+                try:
                     out = torch.full(
                         (tokens, hidden), float("nan"), dtype=dtype, device=device,
                     )
@@ -492,8 +493,9 @@ class AiterARFusion(ARFusion):
                     )
                     if bad is None:
                         bad = _compare(xs, res, w, gemma, out, r, tokens)
-        except Exception as e:  # noqa: BLE001
-            return f"{type(e).__name__}: {e}"
+                except Exception as e:  # noqa: BLE001
+                    if bad is None:
+                        bad = f"tokens={tokens} gemma={gemma}: {type(e).__name__}: {e}"
         if bad is not None:
             logger.warning("AITER fused all-reduce + RMSNorm startup check failed on "
                            "this rank (rank %d): %s", rank, bad)

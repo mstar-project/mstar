@@ -467,13 +467,20 @@ def test_the_kernel_check_catches_a_kernel_that_ignores_gemma():
 
 
 def test_the_kernel_check_reports_a_raising_kernel():
+    """A raise on this rank alone (say an OOM) still leaves its peers waiting in
+    the later cases' collectives, so it keeps making those calls."""
     ca = _FakeCA(None, "cpu")
+    real = ca.fused_ar_rms
 
-    def boom(*a, **kw):
-        raise RuntimeError("no kernel for this size")
+    def boom_once(inp, res, **kw):
+        if not ca.calls:
+            ca.calls.append(kw)
+            raise RuntimeError("no kernel for this size")
+        return real(inp, res, **kw)
 
-    ca.fused_ar_rms = boom
+    ca.fused_ar_rms = boom_once
     assert "no kernel" in AiterARFusion._check_kernel(ca, 0, 1, 64, BF16, 8, torch.device("cpu"))
+    assert len(ca.calls) == 4, "1 and 8 rows, gemma on and off"
 
 
 # --- running and capturing ----------------------------------------------------
