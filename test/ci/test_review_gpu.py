@@ -504,8 +504,12 @@ class TestComment(unittest.TestCase):
             (results / "progress.log.redacted").mkdir()  # the box's, in the way of a fixed temporary name
             (results / "report.md").mkdir()  # the box's: a directory the artifact would upload unredacted
             (results / "report.md/notes").write_text(lined)
+            (results / "elsewhere").write_text("{}")
+            (results / "result.json").symlink_to(results / "elsewhere")  # the box's: a link the upload would follow
             gpu_review.redact({}, temp, s2=key, s3=lined)
-            self.assertFalse((results / "report.md").exists(), "a directory's files would be uploaded unredacted")
+            for name in ("report.md", "result.json"):
+                self.assertFalse((results / name).exists() or (results / name).is_symlink(),
+                                 "a directory's files, or a link's target, would be uploaded unredacted")
             self.assertEqual((results / "progress.log").read_text(),
                              "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n"
                              "[REDACTED]\n" + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
@@ -1129,8 +1133,9 @@ class TestEras(unittest.TestCase):
         with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed), \
                 unittest.mock.patch.object(gpu_review.time, "sleep"), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y\n+tail=="}):
-            def pull(argv, stdin):  # the box's log as it ended
+            def pull(argv, stdin):  # the box's log as it ended, and a file it named after a key
                 Path(argv[-1], "progress.log").write_text(logs[-1])
+                Path(argv[-1], "+tail==").write_text("")
                 return ""
             step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
         shown = [line for line in printed.getvalue().splitlines() if line.startswith('"09:')]
@@ -1139,6 +1144,7 @@ class TestEras(unittest.TestCase):
                          "the job's log would show nothing for hours, a line twice or half-written, the box's key, "
                          "or the job's Eras key, whose lines it shows one by one")
         self.assertIn("$2.0000", printed.getvalue(), "the job's log wouldn't show what the box's session cost")
+        self.assertNotIn("+tail==", printed.getvalue(), "a file the box named after a key would show it")
         self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
                          "gpu.py ssh and pull would die with 'run gpu.py wait first'")
         ssh = gpu_review.gpu_py.ssh_base({**e, "host": "box.example", "port": 2222},
