@@ -79,10 +79,8 @@ class _Node:
             max_num_pages=128, page_size=PAGE_SIZE,
         )
         if window is not None:
-            # Layer 1 keeps the last ``window`` tokens. The cache's pages then hold one group's layers each,
-            # which `_write` doesn't address, so nothing is written: a window test checks pages, not bytes.
+            # layer 1 keeps the last ``window`` tokens
             cfg.keep_window(window, (1,))
-            self._write = lambda view, positions: None
         self.kv = KVManager(
             cfg=cfg,
             name=KV, joint_comm_group=None, transfer_engine_info=None,
@@ -130,34 +128,36 @@ class _Node:
         assert self.runner.admit(step).outcome.ok
         results = self.runner.plan(step)
         positions = results[ROPE]["main"].tolist()
-        view = results[KV]["main"].views[0]
-        self._write(view, positions)
+        self._write(rid, positions)
         self.runner.commit(step)
         return positions
 
-    def _write(self, view, positions: list[int]) -> None:
+    def _slots(self, rid: str):
+        """Each layer's view and the stream's pages and slot count in that layer's group."""
+        stream = self.kv._streams[rid]["main"]
+        for part, group in zip(stream.groups, self.kv._groups, strict=True):
+            for layer in group.layers:
+                yield self.kv.kv_cache.layer_view(layer), part, group.page_size
+
+    def _write(self, rid: str, positions: list[int]) -> None:
         """Stand in for the forward: a slot's contents depend on its position.
 
         The point of the test is that a cached page and a freshly computed one
         are indistinguishable, so what is written has to be a function of the
         position alone — which is exactly what a correct prefix reuse claims.
+        Before commit, so the new slots follow each group's stored ones.
         """
-        resident = view.length - view.to_compute
-        for offset, position in enumerate(positions):
-            slot = resident + offset
-            page = view.page_idxs[slot // PAGE_SIZE]
-            self.kv.kv_cache.tensor[:, page, :, slot % PAGE_SIZE] = (
-                float(position) + 0.5
-            )
+        for view, part, page_size in self._slots(rid):
+            for offset, position in enumerate(positions):
+                slot = part.stored_len + offset
+                view[part.page_indices[slot // page_size], :, slot % page_size] = float(position) + 0.5
 
     def attended(self, rid: str) -> torch.Tensor:
-        """Every slot this request would attend over, in order."""
-        stream = self.kv._streams[rid]["main"]
+        """Every slot this request would attend over, in order, layer by layer."""
         return torch.stack([
-            self.kv.kv_cache.tensor[
-                :, stream.page_indices[at // PAGE_SIZE], :, at % PAGE_SIZE
-            ].clone()
-            for at in range(stream.stored_len)
+            view[part.page_indices[at // page_size], :, at % page_size].clone()
+            for view, part, page_size in self._slots(rid)
+            for at in range(part.stored_len)
         ])
 
 
@@ -189,15 +189,17 @@ def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int
 # ── the claim ───────────────────────────────────────────────────────────
 
 
-def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed():
-    warm = _Node()
+@pytest.mark.parametrize("window", [None, 40], ids=["full", "window"])
+def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed(window):
+    warm = _Node(window=window)
     _schedule_a(warm, "seed", PROMPT)
     warm.kv.remove_request("seed")
 
     matched, cached = _schedule_b(warm, "b", PROMPT + SUFFIX)
-    fresh_node = _Node(cached=False)
+    fresh_node = _Node(cached=False, window=window)
     skipped, fresh = _schedule_b(fresh_node, "b", PROMPT + SUFFIX)
 
+    assert matched == 192, "the run found nothing in the cache"
     assert skipped == 0, "the fresh run found a cache it was supposed to be without"
     assert cached == fresh[matched:], (
         "the run that skipped a prefix carried on at the wrong positions"
