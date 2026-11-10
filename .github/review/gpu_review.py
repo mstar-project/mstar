@@ -569,7 +569,8 @@ def finished(box, cfg):
         return None
     if host and (e.get("host"), e.get("port")) != (host, port):  # where gpu.py ssh and pull connect
         with gpu_py.ledger_txn() as d:
-            d[key].update(host=host, port=port)
+            if key in d:  # its watchdog may have dropped it since the read
+                d[key].update(host=host, port=port)
     if st.lower().startswith("run ") or st.lower() in ("ended", "releasing"):
         return st  # the box is gone, and its results with it
     if host and gpu("ssh", key, f"test -f {BOX_OUT}/done", check=False, timeout=120).returncode == 0:
