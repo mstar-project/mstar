@@ -479,9 +479,12 @@ class SamplerResource(Resource):
                 self._assert_penalty_inert(ctx)
 
     def lean_for(self, rids) -> bool:
-        """Whether every one of ``rids`` samples greedily (``samples_greedy``),
-        so a step over them may take each row's argmax. From the configs set at
-        ingest, which are the same on every rank of a lockstep instance."""
+        """Whether every one of ``rids`` samples greedily (``samples_greedy``)
+        and none has a grammar, so a step over them may take each row's argmax
+        and apply no mask. From the configs set at ingest, which are the same on
+        every rank of a lockstep instance."""
+        if self._grammar is not None and self._grammar.any_of(rids):
+            return False
         return not self._sampled_rids or self._sampled_rids.isdisjoint(rids)
 
     def lean_captures(self, config_type) -> bool:
@@ -710,11 +713,16 @@ class SamplerResource(Resource):
 
     def _stage_grammar(self, ctx: StepContext) -> None:
         """This step's grammar masks, from every token its rows drew so far: into
-        the leased slot's static buffer, which the capture applies whatever it
+        the leased slot's static buffer, which a full capture applies whatever it
         holds (all ones when no row is constrained), or into a fresh tensor for an
-        eager step with a constrained row."""
+        eager step with a constrained row. A lean step (greedy, unconstrained)
+        applies none."""
         grammar = self._grammar
         lease = ctx.slot_lease
+        if self._greedy_this_step:
+            # a lean step holds no grammar row, and its capture applies no mask
+            self._grammar_mask = None
+            return
         constrained = grammar.any_of(ctx.request_ids)
         buf = self._grammar_masks.get(lease.slot) if lease is not None else None
         if buf is None:

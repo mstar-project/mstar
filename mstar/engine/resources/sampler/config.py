@@ -112,8 +112,9 @@ class SamplerSpec(NodeResourceSpec):
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
     # Allows ``structured_outputs`` (grammar-constrained sampling, ``sampler/grammar.py``)
-    # on this node. The captured sampler then applies a bitmask every step, asked or
-    # not, so a deployment turns it on in its ``resources:`` block, on its text sampler.
+    # on this node. The captured sampler then applies a bitmask on every step but a lean
+    # one (greedy, no constrained row), asked or not, so a deployment turns it on in its
+    # ``resources:`` block, on its text sampler.
     enable_grammar: bool = False
 
     def apply_yaml_overrides(
