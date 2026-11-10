@@ -201,7 +201,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
     ):
         super().__init__(model_path_hf, cache_dir)
         # not the checkpoint's generation_config.json: upstream's `chat` sets its own
-        self.sampling_defaults = SAMPLING_DEFAULTS
+        self.sampling_defaults = dict(SAMPLING_DEFAULTS)  # a plain dict: the model is pickled
         self.config = MiniCPMOConfig.from_hf(self.local_dir)
         limit = self.config.llm.max_position_embeddings
         self.max_seq_len = limit if max_seq_len is None else max_seq_len
