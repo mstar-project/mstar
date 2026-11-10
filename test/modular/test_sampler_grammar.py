@@ -12,7 +12,7 @@ import torch
 
 pytest.importorskip("xgrammar")
 
-from mstar.api_server.openai.adapters import _constrain_after_thinking, _refuse_unserved_chat  # noqa: E402
+from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.engine.resources.admission import Admission  # noqa: E402
 from mstar.engine.resources.sampler import utils  # noqa: E402
@@ -213,16 +213,6 @@ def test_a_chat_response_format_becomes_structured_outputs(response_format, want
     mk = {"response_format": response_format}
     _refuse_unserved_chat(SimpleNamespace(n=None, stop=None), mk)
     assert mk.get("structured_outputs") == want and "response_format" not in mk
-
-
-@pytest.mark.parametrize("mk, after", [
-    ({"structured_outputs": {"json_object": True}}, "</think>"),
-    ({"structured_outputs": {"json_object": True}, "enable_thinking": False}, None),
-    ({"structured_outputs": {"json_object": True, "after": "<answer>"}}, "<answer>"),
-])
-def test_a_qwen_thinking_turn_starts_its_grammar_after_the_think_block(mk, after):
-    _constrain_after_thinking(mk)
-    assert mk["structured_outputs"].get("after") == after
 
 
 def _conductor(enable_grammar: bool):

@@ -10,21 +10,7 @@ impl OpenAIAdapter for Qwen3_5 {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        let mut args = template_kwargs_chat(req, upload_dir, allow_remote)?;
-        constrain_after_thinking(&mut args.model_kwargs);
-        Ok(args)
-    }
-}
-
-/// `_constrain_after_thinking`: a thinking turn (unless `enable_thinking` is
-/// false) starts its `structured_outputs` grammar at `</think>`; a client's
-/// own `after` wins.
-fn constrain_after_thinking(mk: &mut Map<String, Value>) {
-    if mk.get("enable_thinking") == Some(&Value::Bool(false)) {
-        return;
-    }
-    if let Some(Value::Object(structured)) = mk.get_mut("structured_outputs") {
-        structured.entry("after").or_insert_with(|| Value::String("</think>".to_string()));
+        template_kwargs_chat(req, upload_dir, allow_remote)
     }
 }
 

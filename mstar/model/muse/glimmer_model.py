@@ -63,6 +63,8 @@ _IMAGE_PROCESSOR = {
 
 class MuseGlimmerModel(MultimodalDecoderModel):
     NAME = "Muse Glimmer"
+    # closes the reasoning channel, which every turn opens (enable_thinking false is "low")
+    REASONING_END = "<|eom|>"
     METADATA_FILES = (
         "config.json", "processor_config.json",
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",

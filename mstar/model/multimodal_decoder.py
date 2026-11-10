@@ -29,6 +29,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
@@ -133,6 +134,10 @@ class MultimodalDecoderModel(Model):
     # ``text_prompts``, captures neither. The walk plan refuses a text-only
     # request.
     TEXT_PROMPTS = True
+    # the text that ends the model's reasoning, None for a model that does not
+    # reason: a reply's ``structured_outputs`` grammar starts after it on a turn
+    # whose prompt leaves the reasoning open (`process_prompt`)
+    REASONING_END: str | None = None
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
@@ -257,9 +262,16 @@ class MultimodalDecoderModel(Model):
         spent = {
             f"{m.modality}_inputs": [] for m in self.media if (tensors or {}).get(f"{m.modality}_inputs")
         }
+        metadata = {MEDIA_LAYOUT: layout, "kv_layout": self.kv_layout(layout, int(prompt_in.pads.ids.numel()))}
+        structured = kwargs.get(STRUCTURED_OUTPUTS_KWARG)
+        if self.REASONING_END is not None and isinstance(structured, dict) and "after" not in structured:
+            # a thinking turn's prompt ends inside the reasoning; one that turned it
+            # off ends past the reasoning's end, and the grammar holds from the start
+            tail = self.tokenizer.decode(prompt_in.pads.ids[-8:].tolist())
+            if not tail.rstrip().endswith(self.REASONING_END):
+                metadata[STRUCTURED_OUTPUTS_KWARG] = {**structured, "after": self.REASONING_END}
         return ProcessPromptOutput(
-            {"text_inputs": [prompt_in.pads.ids], **spent, **prompt_in.inputs},
-            {MEDIA_LAYOUT: layout, "kv_layout": self.kv_layout(layout, int(prompt_in.pads.ids.numel()))},
+            {"text_inputs": [prompt_in.pads.ids], **spent, **prompt_in.inputs}, metadata,
         )
 
     def intake(
