@@ -155,7 +155,7 @@ def test_an_eager_slot_runs_cudnn_then_flashinfer_then_cudnn():
     heads = 24
     spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
         num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE, backend=RaggedAttnBackend.CUDNN))
-    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
     for lens, kind in (([4608, 4608], CudnnRaggedPrefillWrapper), ([4608, 1024], FlashInferRaggedPrefillWrapper),
                        ([1024, 1024], CudnnRaggedPrefillWrapper)):
         step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=n)
@@ -175,7 +175,7 @@ def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
     """At the image DiTs' sizes and LTX-2.5's (8160 video tokens, 32 heads)."""
     spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
         num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
-    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, compute_dtype=DTYPE))
     step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=seq) for i in range(2)),
                          causal=False, fixed_layout=True)
     lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="image_gen", bs=2, num_tokens=2 * seq)) if captured else None

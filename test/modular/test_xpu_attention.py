@@ -83,6 +83,7 @@ def _xpu_spec_and_info(device: str = "xpu"):
     )
     info = EngineResourceInfo(
         device=torch.device(device),
+        compute_dtype=torch.bfloat16,
         dependencies={
             "kv": KVSpec(
                 resource_key="kv",

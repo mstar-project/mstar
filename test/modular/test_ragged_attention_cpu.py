@@ -148,7 +148,7 @@ def test_cfg_ranks_keep_every_head(tp, sp, shard_over_sp, heads):
         config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64, shard_over_sp=shard_over_sp),
     )
     mgr = build_resource(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
+        device=torch.device("cpu"), compute_dtype=torch.bfloat16, joint_comm_group=joint,
     ))
     assert mgr._kwargs["num_qo_heads"] == heads
 

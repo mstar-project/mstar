@@ -13,6 +13,7 @@ each block's queries, and the pages of its prefix.
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.flashinfer import CGSlotKey, EagerSlotKey, FlashInferManager
 from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
@@ -194,7 +195,7 @@ class BlockCausalAttentionManager:
             block_size=spec.block_size,
             kv_cache=spec.config.kv_cache,
             device=info.device,
-            dtype=info.kv_dtype,
+            dtype=AttentionManager._planned_dtype(spec, info, kv_config),
             kv_config=kv_config,
             backend=spec.config.flashinfer_backend,
             sm_scale=spec.config.sm_scale,

@@ -328,7 +328,7 @@ class _Rig:
             if spec.resource_key == FLOW_KV:
                 spec.config.max_num_pages = 512
             info = EngineResourceInfo(
-                device=self.device, kv_dtype=torch.bfloat16,
+                device=self.device, compute_dtype=torch.bfloat16,
                 dependencies={key: by_key[key] for key in spec.depends_on()},
             )
             self.resources[spec.resource_key] = build_resource(spec, info)

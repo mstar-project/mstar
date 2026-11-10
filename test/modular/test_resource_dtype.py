@@ -12,6 +12,7 @@ from mstar.engine.resources.attn.config import AttnBackend
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import StubModel
 from mstar.worker.engine_manager import EngineManager
 
 
@@ -39,7 +40,7 @@ class _OptedOut(_Node):
 _NODES = {"inherit": _Node, "fp16": _Fp16, "opted_out": _OptedOut}
 
 
-class _Model:
+class _Model(StubModel):
     """What ``EngineManager.build`` reads off a model: one KV cache and its
     attention over ``nodes``."""
 
@@ -66,24 +67,6 @@ class _Model:
                 config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER),
             ),
         ]
-
-    def kv_labels(self):
-        return {}
-
-    def get_graph_walk_graphs(self):
-        return {}
-
-    def combined_walk_of(self):
-        return {}
-
-    def chunking_policy_of(self):
-        return {}
-
-    def checkpoint_path(self):
-        return None
-
-    def preprocess_fingerprint(self):
-        return ""
 
 
 def _build(model, model_config=None) -> EngineManager:

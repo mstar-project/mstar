@@ -754,7 +754,9 @@ def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(model_dir, monk
         BatchPrefillWithPagedKVCacheWrapper=wrapper, BatchDecodeWithPagedKVCacheWrapper=wrapper,
     ))
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    info = EngineResourceInfo(device=torch.device("cpu"), dependencies={KV_CACHE: specs[KV_CACHE]})
+    info = EngineResourceInfo(
+        device=torch.device("cpu"), compute_dtype=torch.bfloat16, dependencies={KV_CACHE: specs[KV_CACHE]},
+    )
     attn = {key: AttentionManager.build(specs[key], info) for key in (ATTN_SLIDING, ATTN_FULL)}
     lm = MuseGlimmerForCausalLM(model.config)
     # the LLM node's resources, handed to every module that binds them as bind_node_resources does

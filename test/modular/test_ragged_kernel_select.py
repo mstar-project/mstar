@@ -72,7 +72,7 @@ def spec(heads=24, head_dim=128, cls=RaggedAttentionSpec, block_size=None, **con
 
 
 def build(s, device=GPU):
-    return build_resource(s, EngineResourceInfo(device=device, kv_dtype=torch.bfloat16))
+    return build_resource(s, EngineResourceInfo(device=device, compute_dtype=torch.bfloat16))
 
 
 def cu(*lens) -> torch.Tensor:
@@ -125,7 +125,9 @@ def test_the_table_is_read_for_the_ranks_heads(gpu):
     gpu(B300)
     s = spec(heads=48)
     two_ranks = SimpleNamespace(tp_group=SimpleNamespace(world_size=2), sp_group=SimpleNamespace(world_size=1))
-    manager = build_resource(s, EngineResourceInfo(device=GPU, kv_dtype=torch.bfloat16, joint_comm_group=two_ranks))
+    manager = build_resource(
+        s, EngineResourceInfo(device=GPU, compute_dtype=torch.bfloat16, joint_comm_group=two_ranks),
+    )
     assert manager._config.num_qo_heads == 24
     assert [c.impl for _, c in manager._kernel_rows] == ["cudnn"]
 
