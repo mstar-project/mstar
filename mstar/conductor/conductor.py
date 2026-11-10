@@ -40,7 +40,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs, walk_partition
+from mstar.model.base import Model, WorkerGraph, continuing_streams, serving_resources, streamed_inputs, walk_partition
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -102,6 +102,12 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
         edges += [edge for loop in loops.values() for edge in loop.outputs + loop.accumulated_outputs]
         persists[walk] = frozenset(edge.name for edge in edges if edge.persist)
         if streamed and set(loops) <= {chunk_loop_name(node, walk) for node in graph.get_nodes()}:
+            if continuing := continuing_streams(model, walk) & {name for name, _ in streamed}:
+                # a continuing stream's final chunk ends nothing, so the re-sent step would wait on it forever
+                raise ValueError(
+                    f"graph walk {walk!r} runs once per chunk (no Loop) but its stream "
+                    f"{sorted(continuing)[0]!r} continues past its end; give the walk a Loop"
+                )
             repeating.add(walk)
     return inputs, persists, frozenset(repeating)
 

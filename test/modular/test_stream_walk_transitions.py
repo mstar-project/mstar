@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.conductor.conductor import Conductor, RequestData
+from mstar.conductor.conductor import Conductor, RequestData, _walk_io
 from mstar.conductor.request_info import (
     FINAL_PREFILL,
     CurrentForwardPassInfo,
@@ -164,6 +164,26 @@ def test_a_stream_continuing_in_some_walks_must_drive_its_consumers_walk():
     )])
     with pytest.raises(ValueError, match="thinker_states"):
         topology.check_walk_scoped_continuation({"talker_decode": "Talker"})
+
+
+def test_a_walk_run_once_per_chunk_cannot_take_a_continuing_stream():
+    """Its final chunk ends nothing, and the walk's graph resets after each
+    pass, so the re-sent step would wait on the closed buffer forever."""
+    topology = PartitionTopology(partitions=["Thinker", "Talker"], connections=[_conn(
+        "thinker_states", policy=lambda: FixedChunkPolicy(1, continue_after_done=True),
+    )])
+    graph = SimpleNamespace(
+        get_nodes=lambda: {"Talker": SimpleNamespace(name="Talker", input_names={"thinker_states"}, outputs=[])},
+        get_loops=dict,
+        get_inputs_outputs=lambda: SimpleNamespace(ext_inputs=set(), loop_back=set()),
+    )
+    model = SimpleNamespace(
+        get_graph_walk_graphs=lambda: {"talker_decode": graph},
+        get_partitions=lambda: [SimpleNamespace(name="Talker", graph_walks=["talker_decode"])],
+        get_partition_topology=lambda: topology,
+    )
+    with pytest.raises(ValueError, match="talker_decode.*thinker_states"):
+        _walk_io(model)
 
 
 # --- idle --------------------------------------------------------------------
