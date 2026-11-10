@@ -55,6 +55,8 @@ from mstar.engine.state import (
     sample,
 )
 from mstar.engine.state.adapters import (
+    PagedArrayHandle,
+    WithinStepHandle,
     build_specs,
     kv_layouts,
     node_handles,
@@ -62,8 +64,7 @@ from mstar.engine.state.adapters import (
     state_steps,
 )
 from mstar.engine.state.analysis import deployment_problems
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle
-from mstar.engine.state.within_step import WithinStepHandle
+from mstar.engine.state.calls import SamplerHandle
 from mstar.model.base import LabelLayout, Model
 from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, NodeInputs, NodeSubmodule, engine_step
 from mstar.testing_utils.model import make_model
@@ -263,7 +264,7 @@ def test_a_name_the_node_does_not_declare_is_refused():
 
 def test_an_array_needs_an_array_step_and_a_sampler_a_sample_step():
     handles = _handles(_kv(), Sampler("sampler", nodes={"LLM"}, vocab_size=8))
-    with pytest.raises(ValueError, match=r"state\['kv'\] is a SampleStep, and on this node 'kv' is ArrayHandle"):
+    with pytest.raises(ValueError, match=r"state\['kv'\] is a SampleStep, and on this node 'kv' is PagedArrayHandle"):
         state_steps(SubmoduleStep(segments=SEGMENTS, state={"kv": SampleStep()}), handles)
     with pytest.raises(ValueError, match=r"state\['sampler'\] is a ArrayStep"):
         state_steps(SubmoduleStep(segments=SEGMENTS, state={"sampler": ArrayStep()}), handles)
@@ -723,7 +724,7 @@ def test_a_node_gets_only_its_own_handles():
 
 
 def test_an_array_that_keeps_nothing_gets_the_handle_that_stays_in_its_graph():
-    assert type(_handles(_kv())["kv"]) is ArrayHandle
+    assert type(_handles(_kv())["kv"]) is PagedArrayHandle
     assert type(_handles(_within(), node="vit")["vision"]) is WithinStepHandle
 
 

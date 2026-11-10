@@ -17,8 +17,8 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Entry, Fork, KVEntry, Value, host
-from mstar.engine.state.adapters import build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
+from mstar.engine.state.adapters import build_handle, build_specs, kv_layouts, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.host import HostFields, is_host_value
 
@@ -199,8 +199,9 @@ def test_a_write_for_a_request_with_no_open_fields_is_refused():
 
 
 def test_a_write_on_an_array_that_holds_no_host_fields_is_refused():
-    array = Array("kv", nodes={"talker"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=8)
-    h = ArrayHandle(array, {"kv": SimpleNamespace(layer_view=lambda i: None)}, None)
+    array = Array("kv", nodes={"talker"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=8,
+                  reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))})
+    h = build_handle(array, {"kv": SimpleNamespace(layer_view=lambda i: None), "attn": SimpleNamespace()})
     declared = ArrayStep(host={(RID, "main", 0): {"sent": True}})
     step = SubmoduleStep(segments=(Segment(RID, "main", 1),), state={"kv": declared})
     step.set_ctx(StepContext(request_ids=[RID], graph_walk="decode", slot=0, capture=False))

@@ -28,9 +28,8 @@ from mstar.engine.resources.lora.config import LoraStep
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
-from mstar.engine.state.adapters import node_handles, node_resources, state_steps
+from mstar.engine.state.adapters import build_handle, node_handles, node_resources, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components.diffusion.attention import dit_entry
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
@@ -318,7 +317,7 @@ def test_a_read_that_breaks_the_graph_recompiles_no_frame_per_layer(attention):
         entry=dit_entry(2, 4), labels={"main"}, max_len=0,
         reads={"attn": Read(mask=Block(), op=Attend(q_heads=2))},
     )
-    handle = WithinStepHandle(array, {"attn": _BreakingRead()}, None)
+    handle = build_handle(array, {"attn": _BreakingRead()})
     built = [attention(layer) for layer in (0, 1)]
     for module, _ in built:
         module.bind_state({array.name: handle})

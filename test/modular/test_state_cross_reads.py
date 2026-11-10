@@ -23,12 +23,18 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
 )
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value
-from mstar.engine.state.adapters import build_specs, node_handles, state_steps
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
+from mstar.engine.state.adapters import (
+    WITHIN_STEP,
+    WithinStepHandle,
+    _bindings,
+    build_specs,
+    node_handles,
+    state_steps,
+)
 from mstar.engine.state.analysis import deployment_problems, sdpa_nodes
 from mstar.engine.state.calls import kernel_setting
 from mstar.engine.state.contract import Entry
-from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components.diffusion.attention import sdpa_attention
 
 HEADS, DIM = 4, 8
@@ -84,6 +90,10 @@ class _StubGroup:
 
     def __init__(self, world_size=2, rank=0):
         self.world_size, self.rank = world_size, rank
+
+
+def _within(array, ragged, **within) -> WithinStepHandle:
+    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, None, _bindings(WITHIN_STEP, array), **within)
 
 
 def _handles(arrays, *, group=None, sdpa=False) -> dict[str, WithinStepHandle]:
@@ -304,7 +314,7 @@ def _opened(handle, segments):
 def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
     ragged = _StubRagged()
     array = _array("a", label="main")
-    h = WithinStepHandle(array, {"a_read": ragged}, None)
+    h = _within(array, ragged)
     _opened(h, [Segment(1, "main", 4)])
     h.add(0, k=_q(), v=_q())
     assert h.read(0, _q()).shape == (1, 4, HEADS, DIM)
@@ -313,7 +323,7 @@ def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
 
 def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
     ragged = _StubRagged()
-    h = WithinStepHandle(_array("a", label="main"), {"a_read": ragged}, None)
+    h = _within(_array("a", label="main"), ragged)
     _opened(h, [Segment(1, "main", 4)])
     h.add(0, k=_q()[0], v=_q()[0])
     assert h.read(0, _q()[0]).shape == (4, HEADS, DIM)
@@ -322,7 +332,7 @@ def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
 def test_a_cross_read_runs_under_the_label_of_both_sides():
     ragged = _StubRagged()
     array = _array("b", queries="a", label="text")
-    h = WithinStepHandle(array, {"b_read": ragged}, None, queried=_array("a", label="video"))
+    h = _within(array, ragged, queried=_array("a", label="video"))
     step = SubmoduleStep(state={
         "a": ArrayStep(segments=(Segment(1, "video", 4),)), "b": ArrayStep(segments=(Segment(1, "text", 2),)),
     })
@@ -337,14 +347,12 @@ def test_a_cross_read_runs_under_the_label_of_both_sides():
     (True, True, "ulysses"), (True, False, "merge"), (False, True, "plain"), (False, False, "plain"),
 ])
 def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, exchange):
-    from mstar.engine.state import within_step
-
     calls = []
-    monkeypatch.setattr(within_step, "ulysses_attention", lambda *a, **k: calls.append(("ulysses", a[1], k)))
-    monkeypatch.setattr(within_step, "attention_over_sharded_keys", lambda *a, **k: calls.append(("merge", a[1], k)))
+    monkeypatch.setattr(adapters, "ulysses_attention", lambda *a, **k: calls.append(("ulysses", a[1], k)))
+    monkeypatch.setattr(adapters, "attention_over_sharded_keys", lambda *a, **k: calls.append(("merge", a[1], k)))
     queried = _array("a", sharded=queried_sharded)
     array = _array("b", queries="a", sharded=sharded)
-    h = WithinStepHandle(array, {"b_read": _StubRagged()}, None, queried=queried, sp_group=_StubGroup())
+    h = _within(array, _StubRagged(), queried=queried, sp_group=_StubGroup())
     step = SubmoduleStep(state={
         "a": ArrayStep(segments=(Segment(1, "a", 9),)), "b": ArrayStep(segments=(Segment(1, "b", 9),)),
     })
@@ -359,25 +367,21 @@ def test_the_two_flags_pick_the_exchange(monkeypatch, sharded, queried_sharded, 
 
 
 def test_no_flag_exchanges_at_sp1(monkeypatch):
-    from mstar.engine.state import within_step
-
     def fail(*args, **kwargs):
         raise AssertionError("attention_over_sharded_keys breaks the graph, so it must not run at SP1")
 
-    monkeypatch.setattr(within_step, "ulysses_attention", fail)
-    monkeypatch.setattr(within_step, "attention_over_sharded_keys", fail)
-    h = WithinStepHandle(_array("a", sharded=True), {"a_read": _StubRagged()}, None, sp_group=_StubGroup(world_size=1))
+    monkeypatch.setattr(adapters, "ulysses_attention", fail)
+    monkeypatch.setattr(adapters, "attention_over_sharded_keys", fail)
+    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup(world_size=1))
     _opened(h, [Segment(1, "a", 4)])
     h.add(0, k=_q(), v=_q())
     h.read(0, _q())
 
 
 def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
-    from mstar.engine.state import within_step
-
     callables = []
-    monkeypatch.setattr(within_step, "ulysses_attention", lambda group, q, k, v, run, *a, **kw: callables.append(run))
-    h = WithinStepHandle(_array("a", sharded=True), {"a_read": _StubRagged()}, None, sp_group=_StubGroup())
+    monkeypatch.setattr(adapters, "ulysses_attention", lambda group, q, k, v, run, *a, **kw: callables.append(run))
+    h = _within(_array("a", sharded=True), _StubRagged(), sp_group=_StubGroup())
     _opened(h, [Segment(1, "a", 8)])
     for layer in (0, 1):
         h.add(layer, k=_q(), v=_q())
