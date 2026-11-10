@@ -23,6 +23,7 @@ mstar.model.multimodal
       media_grids
       media_layout
       media_prefill_step
+      media_rows_between
       media_walk_name
       media_walk_names
       media_walks

@@ -1597,6 +1597,28 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="media_rows_between">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_rows_between">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_rows_between</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""The rows ``[a, b)`` of each encoder output that the pads among tokens</span>
+<span class="sd">    ``[start, end)`` of a ``MEDIA_LAYOUT``'s prompt read, by output; an</span>
+<span class="sd">    output with no pad there is left out. An output's runs fill its rows in</span>
+<span class="sd">    prompt order, so the rows a token range reads are one slice."""</span>
+    <span class="n">rows</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">filled</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">off</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"offset"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tokens"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">base</span> <span class="o">=</span> <span class="n">filled</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">off</span><span class="p">,</span> <span class="n">start</span><span class="p">),</span> <span class="nb">min</span><span class="p">(</span><span class="n">off</span> <span class="o">+</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">hi</span> <span class="o">&gt;</span> <span class="n">lo</span><span class="p">:</span>
+            <span class="n">first</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="n">out</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">out</span> <span class="ow">in</span> <span class="n">rows</span> <span class="k">else</span> <span class="n">base</span> <span class="o">+</span> <span class="n">lo</span> <span class="o">-</span> <span class="n">off</span>
+            <span class="n">rows</span><span class="p">[</span><span class="n">out</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">first</span><span class="p">,</span> <span class="n">base</span> <span class="o">+</span> <span class="n">hi</span> <span class="o">-</span> <span class="n">off</span><span class="p">)</span>
+        <span class="n">filled</span><span class="p">[</span><span class="n">out</span><span class="p">]</span> <span class="o">=</span> <span class="n">base</span> <span class="o">+</span> <span class="n">tokens</span>
+    <span class="k">return</span> <span class="n">rows</span></div>
+
+
+
 <div class="viewcode-block" id="media_encoders">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_encoders">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">media_encoders</span><span class="p">(</span><span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">],</span> <span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">]:</span>

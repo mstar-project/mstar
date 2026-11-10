@@ -768,6 +768,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_grids"><code class="docutils literal notranslate"><span class="pre">media_grids()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_layout"><code class="docutils literal notranslate"><span class="pre">media_layout()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_prefill_step"><code class="docutils literal notranslate"><span class="pre">media_prefill_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_rows_between"><code class="docutils literal notranslate"><span class="pre">media_rows_between()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walk_name"><code class="docutils literal notranslate"><span class="pre">media_walk_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walk_names"><code class="docutils literal notranslate"><span class="pre">media_walk_names()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walks"><code class="docutils literal notranslate"><span class="pre">media_walks()</span></code></a></li>
@@ -839,40 +840,43 @@ rendered prompt ever does.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_prefill_step" title="mstar.model.multimodal.media_prefill_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_prefill_step</span></code></a>(signals, encoders[, ...])</p></td>
 <td><p>The one prefill walk a request runs over its whole prompt (<code class="docutils literal notranslate"><span class="pre">text_inputs</span></code>, one tensor), marked <cite>FINAL_PREFILL</cite>: with media in its <code class="docutils literal notranslate"><span class="pre">layout</span></code>, the walk over the encoders it runs (<cite>media_encoders</cite>), which carries the layout; without, <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>, which a graph built with <code class="docutils literal notranslate"><span class="pre">text</span></code> False (<cite>media_walks</cite>) does not have.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walk_name" title="mstar.model.multimodal.media_walk_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walk_name</span></code></a>(encoders)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_rows_between" title="mstar.model.multimodal.media_rows_between"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_rows_between</span></code></a>(layout, start, end)</p></td>
+<td><p>The rows <code class="docutils literal notranslate"><span class="pre">[a,</span> <span class="pre">b)</span></code> of each encoder output that the pads among tokens <code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code> of a <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code>'s prompt read, by output; an output with no pad there is left out.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walk_name" title="mstar.model.multimodal.media_walk_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walk_name</span></code></a>(encoders)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walk_names" title="mstar.model.multimodal.media_walk_names"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walk_names</span></code></a>(encoders)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walk_names" title="mstar.model.multimodal.media_walk_names"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walk_names</span></code></a>(encoders)</p></td>
 <td><p>One walk per non-empty subset of <code class="docutils literal notranslate"><span class="pre">encoders</span></code>, in declaration order.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walks" title="mstar.model.multimodal.media_walks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walks</span></code></a>(max_iters[, encoders, text, node])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.media_walks" title="mstar.model.multimodal.media_walks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">media_walks</span></code></a>(max_iters[, encoders, text, node])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> (unless <code class="docutils literal notranslate"><span class="pre">text</span></code> is False), one media walk per subset of <code class="docutils literal notranslate"><span class="pre">encoders</span></code>, and <code class="docutils literal notranslate"><span class="pre">decode</span></code>, over the decoder <code class="docutils literal notranslate"><span class="pre">node</span></code> and the encoders.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.messages_from_parts" title="mstar.model.multimodal.messages_from_parts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">messages_from_parts</span></code></a>(parts[, default_system])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.messages_from_parts" title="mstar.model.multimodal.messages_from_parts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">messages_from_parts</span></code></a>(parts[, default_system])</p></td>
 <td><p>One OpenAI-style message per turn of <code class="docutils literal notranslate"><span class="pre">parts</span></code>, for a chat template to take as is.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.parts_from_modalities" title="mstar.model.multimodal.parts_from_modalities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">parts_from_modalities</span></code></a>(input_modalities[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.parts_from_modalities" title="mstar.model.multimodal.parts_from_modalities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">parts_from_modalities</span></code></a>(input_modalities[, ...])</p></td>
 <td><p>Rebuild the parts for a layout, filling the text slots from <code class="docutils literal notranslate"><span class="pre">texts</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.prefill_plan" title="mstar.model.multimodal.prefill_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_plan</span></code></a>(parts, *[, leading_text])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.prefill_plan" title="mstar.model.multimodal.prefill_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_plan</span></code></a>(parts, *[, leading_text])</p></td>
 <td><p>Order the prefill segments for <code class="docutils literal notranslate"><span class="pre">parts</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.span_name" title="mstar.model.multimodal.span_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">span_name</span></code></a>(name, index)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.span_name" title="mstar.model.multimodal.span_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">span_name</span></code></a>(name, index)</p></td>
 <td><p>The signal that carries slot <code class="docutils literal notranslate"><span class="pre">index</span></code> of a prompt's <code class="docutils literal notranslate"><span class="pre">name</span></code> list on its own: an entry (<cite>split_spans</cite>), or Qwen3-Omni's Thinker step, which holds zero to two.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.splice_media" title="mstar.model.multimodal.splice_media"><code class="xref py py-obj docutils literal notranslate"><span class="pre">splice_media</span></code></a>(embeds, pad, media)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.splice_media" title="mstar.model.multimodal.splice_media"><code class="xref py py-obj docutils literal notranslate"><span class="pre">splice_media</span></code></a>(embeds, pad, media)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">embeds</span></code> with the nth token that <code class="docutils literal notranslate"><span class="pre">pad</span></code> marks replaced by <code class="docutils literal notranslate"><span class="pre">media[n]</span></code>, an index past the end taking the last row.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.split_around_spans" title="mstar.model.multimodal.split_around_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_around_spans</span></code></a>(input_ids, spans)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.split_around_spans" title="mstar.model.multimodal.split_around_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_around_spans</span></code></a>(input_ids, spans)</p></td>
 <td><p>Return the text between the spans, in order, dropping empty pieces.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.split_spans" title="mstar.model.multimodal.split_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_spans</span></code></a>(tensors, names[, kv_layout])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.split_spans" title="mstar.model.multimodal.split_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_spans</span></code></a>(tensors, names[, kv_layout])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">tensors</span></code> with each list in <code class="docutils literal notranslate"><span class="pre">names</span></code> split into one signal per entry, named by <cite>span_name</cite>, for a model that prefills each entry in a walk of its own: its plan binds the walk's input to the entry (<code class="docutils literal notranslate"><span class="pre">WalkStep.bind</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.text_combined_walks" title="mstar.model.multimodal.text_combined_walks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">text_combined_walks</span></code></a>([node])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.text_combined_walks" title="mstar.model.multimodal.text_combined_walks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">text_combined_walks</span></code></a>([node])</p></td>
 <td><p>Text prefill and decode rows of the decoder <code class="docutils literal notranslate"><span class="pre">node</span></code> share a step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.vision_encoder" title="mstar.model.multimodal.vision_encoder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_encoder</span></code></a>(pad_ids)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.vision_encoder" title="mstar.model.multimodal.vision_encoder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_encoder</span></code></a>(pad_ids)</p></td>
 <td><p>The <code class="docutils literal notranslate"><span class="pre">vision_encoder</span></code> node every VLM here declares.</p></td>
 </tr>
 </tbody>
@@ -1328,6 +1332,27 @@ carries the layout; without, <code class="docutils literal notranslate"><span cl
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.multimodal.media_rows_between">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">media_rows_between</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layout</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#media_rows_between"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.media_rows_between" title="Link to this definition">#</a></dt>
+<dd><p>The rows <code class="docutils literal notranslate"><span class="pre">[a,</span> <span class="pre">b)</span></code> of each encoder output that the pads among tokens
+<code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code> of a <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code>’s prompt read, by output; an
+output with no pad there is left out. An output’s runs fill its rows in
+prompt order, so the rows a token range reads are one slice.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>layout</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a>)</p></li>
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>end</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.multimodal.media_walk_name">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">media_walk_name</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">encoders</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#media_walk_name"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.media_walk_name" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1649,6 +1674,7 @@ entry <code class="docutils literal notranslate"><span class="pre">k</span></cod
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_grids"><code class="docutils literal notranslate"><span class="pre">media_grids()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_layout"><code class="docutils literal notranslate"><span class="pre">media_layout()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_prefill_step"><code class="docutils literal notranslate"><span class="pre">media_prefill_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_rows_between"><code class="docutils literal notranslate"><span class="pre">media_rows_between()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walk_name"><code class="docutils literal notranslate"><span class="pre">media_walk_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walk_names"><code class="docutils literal notranslate"><span class="pre">media_walk_names()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.media_walks"><code class="docutils literal notranslate"><span class="pre">media_walks()</span></code></a></li>
