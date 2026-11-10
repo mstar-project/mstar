@@ -635,13 +635,19 @@ unchanged.
 - **A failed or regressed check is a finding** at the bar's priority, with the run as proof: the
   config, the input, the observed and expected outcome, and where the evidence is.
 - **Outcome**, one of:
-  - `pass`: every planned check ran, reached the changed code and passed. Any ➖ for a planned check
-    that wasn't exercised or didn't reach the changed code, or any 👂 (needs human review) row, makes
-    the outcome `partial`. A ➖ for a claimed number that isn't comparable (another GPU, harness or
-    metric) doesn't: the report names it as a problem with the description;
-  - `partial`: some planned checks couldn't run, didn't reach the changed code or need a human
-    review; name them and why;
-  - `fail`: a check failed or regressed (this outranks `partial`);
+  - `pass`: what the change is meant to do works, the risk checks show no regression against the
+    base, and every perf claim points the right way: some claimed gain is real (beyond noise), and
+    no measured cell is worse than the base beyond noise. A claimed number measured smaller than
+    stated, or within noise, is ✅ with a note ("the description says X, measured Y"), not ➖; a
+    claimed row the plan cut, or one that isn't a risk, goes under Not tested; a claimed number that
+    isn't comparable (another GPU, harness or metric) is a problem with the description. None of
+    those makes the outcome `partial`;
+  - `partial`: a check that matters couldn't be judged: what the change is meant to do, or a risk
+    check, couldn't run or didn't reach the changed code, a changed test that skips without CUDA
+    didn't really run or pass (the live-pr-test skill's ➖ rules), or a 👂 (needs human review) row
+    needs a person; name them and why;
+  - `fail`: a check failed or regressed, a perf cell worse than the base beyond noise included
+    (this outranks `partial`);
   - `unavailable`: the box couldn't run it; say why.
 
 ## 8. Output
