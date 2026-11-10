@@ -43,41 +43,30 @@ pub fn flatten_messages(
             Some(Content::Parts(content)) => content,
         };
         for part in content {
-            let obj = match part.as_object() {
-                Some(o) => o,
-                None => continue,
-            };
-            let ptype = obj.get("type").and_then(Value::as_str).unwrap_or("");
-            match ptype {
-                "text" => {
-                    if let Some(t) = obj.get("text").and_then(Value::as_str) {
-                        if !t.is_empty() {
-                            add_text(&mut parts, t, role);
-                        }
-                    }
+            // an empty or unknown part is refused, as OpenAI does, not dropped
+            match content_part(part)? {
+                ContentPart::Text(t) => add_text(&mut parts, t, role),
+                _ if role == "system" => {
+                    // it would reach the model as a user's attachment
+                    let ptype = part.get("type").and_then(Value::as_str).unwrap_or("");
+                    return Err(format!(
+                        "a system message takes text parts only, not {}",
+                        media::py_repr(ptype)
+                    ));
                 }
-                "image_url" | "video_url" | "audio_url" => {
-                    let url = nested_url(obj, ptype);
-                    if !url.is_empty() {
-                        let fallback = ptype.trim_end_matches("_url");
-                        let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut saved.paths, m, p);
-                    }
-                }
-                "input_audio" => {
+                ContentPart::InputAudio { data, format } => {
                     // OpenAI-native audio input: base64 + format.
-                    let ia = obj.get("input_audio").and_then(Value::as_object);
-                    if let Some(ia) = ia {
-                        let data = ia.get("data").and_then(Value::as_str).unwrap_or("");
-                        let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
-                        if !data.is_empty() {
-                            let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut saved.paths, m, p);
-                        }
-                    }
+                    let (m, p) = media::save_base64(data, format, "audio", upload_dir)?;
+                    add_file(&mut parts, &mut saved.paths, m, p);
                 }
-                _ => {}
+                ContentPart::Url { ptype, url } => {
+                    // image_url; video_url and audio_url are extensions
+                    let fallback = ptype.trim_end_matches("_url");
+                    let (m, p) = media::resolve_media_ref(url, upload_dir, allow_remote)?;
+                    // a MIME that names no modality (application/octet-stream) takes the part's
+                    let m = if m == "unknown" { fallback.to_string() } else { m };
+                    add_file(&mut parts, &mut saved.paths, m, p);
+                }
             }
         }
     }
@@ -86,6 +75,50 @@ pub fn flatten_messages(
     let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
     let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
     Ok((text, saved.keep(), input_modalities, parts))
+}
+
+/// A chat content part's content (`_content_part` in `api_server/openai/adapters.py`).
+enum ContentPart<'a> {
+    Text(&'a str),
+    Url { ptype: &'a str, url: &'a str },
+    InputAudio { data: &'a str, format: &'a str },
+}
+
+/// A part that is empty, malformed or of a type no model here reads is refused.
+fn content_part(part: &Value) -> Result<ContentPart<'_>, String> {
+    let ptype = part.get("type");
+    fn non_empty(v: Option<&Value>) -> Option<&str> {
+        v.and_then(Value::as_str).filter(|s| !s.is_empty())
+    }
+    match ptype.and_then(Value::as_str) {
+        Some("text") => non_empty(part.get("text"))
+            .map(ContentPart::Text)
+            .ok_or_else(|| "a text content part needs a non-empty 'text' string".to_string()),
+        Some(p @ ("image_url" | "video_url" | "audio_url")) => non_empty(part.get(p).and_then(|b| b.get("url")))
+            .map(|url| ContentPart::Url { ptype: p, url })
+            .ok_or_else(|| format!("the {p} content part needs a non-empty 'url' string")),
+        Some("input_audio") => {
+            let body = part.get("input_audio");
+            let format = match body.and_then(|b| b.get("format")) {
+                None => Some("wav"),
+                Some(f) => f.as_str(),
+            };
+            match (non_empty(body.and_then(|b| b.get("data"))), format, body.is_some_and(Value::is_object)) {
+                (Some(data), Some(format), true) => Ok(ContentPart::InputAudio { data, format }),
+                _ => Err("an input_audio content part needs non-empty base64 'data' and a 'format' string".to_string()),
+            }
+        }
+        _ => {
+            let shown = match ptype {
+                None | Some(Value::Null) => "None".to_string(),
+                Some(Value::String(s)) => media::py_repr(s),
+                Some(v) => v.to_string(),
+            };
+            Err(format!(
+                "unsupported content part type {shown}; parts are text, image_url, video_url, audio_url or input_audio"
+            ))
+        }
+    }
 }
 
 pub(super) fn add_file(
@@ -126,16 +159,6 @@ pub(super) fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
         index: 0,
         role: Some(role.to_string()),
     });
-}
-
-/// `{ "<key>": { "url": "..." } }` -> the url string (or "").
-pub(super) fn nested_url(obj: &Map<String, Value>, key: &str) -> String {
-    obj.get(key)
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("url"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
 
 /// `max_completion_tokens`, else `max_tokens`, as Python reads them: an

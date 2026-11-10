@@ -74,6 +74,26 @@ fn a_role_a_chat_cannot_render_is_refused() {
     assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
 }
 
+#[test]
+fn an_empty_unknown_or_misplaced_chat_part_is_refused() {
+    let image = r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}"#;
+    let dir = std::env::temp_dir().join(format!("mstar_parts_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&dir).unwrap();
+    for (role, part, error) in [
+        ("user", r#"{"type":"image_url","image_url":{"url":""}}"#, "the image_url content part needs a non-empty 'url' string"),
+        ("user", r#"{"type":"input_audio","input_audio":{"data":""}}"#, "an input_audio content part needs non-empty base64 'data' and a 'format' string"),
+        ("user", r#"{"type":"text","text":""}"#, "a text content part needs a non-empty 'text' string"),
+        ("user", r#"{"type":"file","file":{"file_id":"f"}}"#, "unsupported content part type 'file'; parts are text, image_url, video_url, audio_url or input_audio"),
+        ("system", image, "a system message takes text parts only, not 'image_url'"),
+        ("developer", image, "a system message takes text parts only, not 'image_url'"),
+    ] {
+        let messages = format!(r#"[{{"role":"{role}","content":[{part}]}},{{"role":"user","content":[{image}]}}]"#);
+        assert_eq!(flatten(&messages, &dir).unwrap_err(), error, "{role} {part}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{role} {part} left an upload");
+    }
+    std::fs::remove_dir(&dir).unwrap();
+}
+
 /// The surfaces a class serves: chat, speech, images, videos.
 fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 4] {
     [adapter.supports_chat(), adapter.supports_speech(), adapter.supports_images(), adapter.supports_videos()]

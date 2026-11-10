@@ -84,6 +84,31 @@ class Transcript:
     unfinished: bool = False
 
 
+def _content_part(part) -> tuple[str, str | dict]:
+    """A chat content part's type and its content: the text of a ``text`` part,
+    else the part's object (``{"url"}``, or ``input_audio``'s ``{"data", "format"}``).
+    A part that is empty, malformed or of a type no model here reads is refused."""
+    ptype = part.get("type") if isinstance(part, dict) else None
+    if ptype == "text":
+        if not isinstance(part.get("text"), str) or not part["text"]:
+            raise ValueError("a text content part needs a non-empty 'text' string")
+        return ptype, part["text"]
+    if ptype in ("image_url", "video_url", "audio_url"):
+        body = part.get(ptype)
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str) or not body["url"]:
+            raise ValueError(f"the {ptype} content part needs a non-empty 'url' string")
+        return ptype, body
+    if ptype == "input_audio":
+        body = part.get(ptype)
+        if (not isinstance(body, dict) or not isinstance(body.get("data"), str) or not body["data"]
+                or not isinstance(body.get("format", "wav"), str)):
+            raise ValueError("an input_audio content part needs non-empty base64 'data' and a 'format' string")
+        return ptype, body
+    raise ValueError(
+        f"unsupported content part type {ptype!r}; parts are text, image_url, video_url, audio_url or input_audio"
+    )
+
+
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
@@ -135,24 +160,21 @@ def flatten_messages(
                     add_text(content, role)
                 continue
             for part in content:
-                if not isinstance(part, dict):
-                    continue
-                ptype = part.get("type")
+                # an empty or unknown part is refused, as OpenAI does, not dropped
+                ptype, body = _content_part(part)
                 if ptype == "text":
-                    if part.get("text"):
-                        add_text(part["text"], role)
-                elif ptype in ("image_url", "video_url", "audio_url"):  # video and audio are extensions
-                    url = (part.get(ptype) or {}).get("url", "")
-                    if url:
-                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        # a MIME that names no modality (application/octet-stream) takes the part's
-                        add_file(mod if mod != "unknown" else ptype.removesuffix("_url"), path)
-                elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
-                    ia = part.get("input_audio") or {}
-                    data, fmt = ia.get("data"), ia.get("format", "wav")
-                    if data:
-                        mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                        add_file(mod, path)
+                    add_text(body, role)
+                    continue
+                if role == "system":
+                    # it would reach the model as a user's attachment
+                    raise ValueError(f"a system message takes text parts only, not {ptype!r}")
+                if ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
+                    mod, path = media_io.save_base64(body["data"], body.get("format", "wav"), "audio", upload_dir)
+                    add_file(mod, path)
+                else:  # image_url; video_url and audio_url are extensions
+                    mod, path = media_io.resolve_media_ref(body["url"], upload_dir, allow_remote=allow_remote)
+                    # a MIME that names no modality (application/octet-stream) takes the part's
+                    add_file(mod if mod != "unknown" else ptype.removesuffix("_url"), path)
     except BaseException:
         # A refused chat is never submitted, so no deferred cleanup covers
         # the attachments saved before the refusal.
