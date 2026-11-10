@@ -834,10 +834,11 @@ _ERROR_ROUTES = {
 
 
 @pytest.mark.parametrize("route", list(_ERROR_ROUTES))
-@pytest.mark.parametrize("status", [413, None])
+@pytest.mark.parametrize("status", [413, 503, None])
 def test_an_error_chunk_reaches_the_client_with_its_status(tmp_path, route, status):
     """Every error chunk was raised as a RuntimeError, so a request the engine
-    refused with a 4xx reached its Dynamo client as a server error."""
+    refused with a 4xx, or a worker failure's 503, reached its Dynamo client
+    as a plain 500."""
     chunk = SimpleNamespace(modality="error", data=b"engine said no",
                             metadata={} if status is None else {"status": status})
     server = _FakeRealtimeServer([chunk], tmp_path)
@@ -845,12 +846,10 @@ def test_an_error_chunk_reaches_the_client_with_its_status(tmp_path, route, stat
     with pytest.raises(Exception) as failed:
         _ERROR_ROUTES[route](server)
     assert "engine said no" in str(failed.value)
-    if status is None:  # no status is the engine's own failure
-        assert not isinstance(failed.value, ValueError)
-    elif route != "realtime":
-        assert (failed.value.code, failed.value.message) == (413, "engine said no")
-    else:
-        assert isinstance(failed.value, ValueError)
+    if route == "realtime":  # in-band, where only a 4xx is the client's error
+        assert isinstance(failed.value, ValueError) == (status == 413)
+    else:  # no status is the engine's own failure
+        assert (failed.value.code, failed.value.message) == (status or 500, "engine said no")
     assert server.aborted
 
 

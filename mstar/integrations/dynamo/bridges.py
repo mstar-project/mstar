@@ -112,7 +112,7 @@ def _inline_result(response_format, n=1) -> None:
     try:
         check_inline_result(response_format, n)
     except ValueError as exc:
-        raise _BadRequestError(str(exc)) from exc
+        raise _StatusError(str(exc)) from exc
 
 
 def _image_body(request: dict) -> dict:
@@ -163,12 +163,13 @@ def _speech_body(request: dict) -> dict:
     return body
 
 
-class _BadRequestError(ValueError):
-    """A 4xx (400 unless given) whose message reaches the client as written.
+class _StatusError(ValueError):
+    """A failure with an HTTP status (400 unless given) for Dynamo to send.
 
     Dynamo's worker reads ``code`` and ``message`` off any exception the
-    handler raises; a bare ``ValueError`` is a 400 too, but reaches the client
-    as ``ValueError: <message>``.
+    handler raises, before it looks at the type, and sanitizes a 5xx body
+    itself; a bare ``ValueError`` is a 400 too, but reaches the client as
+    ``ValueError: <message>``.
     """
 
     def __init__(self, message: str, code: int = 400):
@@ -178,11 +179,10 @@ class _BadRequestError(ValueError):
 
 
 def _chunk_error(chunk) -> Exception:
-    """An engine error chunk as the exception to raise: a 4xx the engine
-    refused the request with keeps its status, anything else is a server error."""
+    """An engine error chunk as the exception to raise, with the chunk's
+    status (a 4xx refusal, a 503 from a failed worker), else 500."""
     message = chunk.data.decode("utf-8", "replace")
-    status = int((chunk.metadata or {}).get("status") or 500)
-    return _BadRequestError(message, status) if 400 <= status < 500 else RuntimeError(message)
+    return _StatusError(message, int((chunk.metadata or {}).get("status") or 500))
 
 
 class RequestBridge:
@@ -234,7 +234,7 @@ class RequestBridge:
         try:
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
-            raise _BadRequestError(str(exc)) from exc
+            raise _StatusError(str(exc)) from exc
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 
@@ -304,7 +304,7 @@ class RequestBridge:
             try:
                 n = image_count(req)
             except ValueError as exc:
-                raise _BadRequestError(str(exc)) from exc
+                raise _StatusError(str(exc)) from exc
             submits = [args]
             seed = args.model_kwargs.get("seed")
             for i in range(1, n):
@@ -700,15 +700,18 @@ class RealtimeBridge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
-            logger.exception("realtime turn %s failed", turn.response_id)
-            kind = error_type(exc.code if isinstance(exc, _BadRequestError) else 500)
-            await events.put(error_event(str(exc), kind=kind, code="generation_error"))
+            status = exc.code if isinstance(exc, _StatusError) else 500
+            # a refusal is the client's, sent as main's realtime route sends it
+            code = "generation_error" if status >= 500 else None
+            if code:
+                logger.exception("realtime turn %s failed", turn.response_id)
+            else:
+                logger.info("realtime turn %s refused (%d): %s", turn.response_id, status, exc)
+            error = error_event(str(exc), kind=error_type(status), code=code)
+            await events.put(error)
             await events.put(server_event("response.done", response=response_object(
                 turn.response_id, "failed", modalities,
-                status_details={
-                    "type": "failed",
-                    "error": {"code": "generation_error", "type": kind},
-                })))
+                status_details={"type": "failed", "error": error["error"]})))
         finally:
             await events.put(None)
 
