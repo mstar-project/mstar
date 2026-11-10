@@ -27,6 +27,11 @@ class Phi4MMLLMSubmodule(SampledTokenDecoder):
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
+    def resident_walks(self) -> frozenset[str]:
+        # the layers rotate inside the graph at the position resource's planned
+        # table ids, and decode's `preprocess` reads only the loop-back tokens
+        return frozenset({self.DECODE_WALK})
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
