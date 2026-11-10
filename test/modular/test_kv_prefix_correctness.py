@@ -75,12 +75,12 @@ class _Node:
     def __init__(self, cached: bool = True, window: int | None = None):
         device = torch.device("cpu")
         cfg = PagedKVConfig(
-            num_layers=2, num_kv_heads=1, head_dim=4, max_seq_len=4096,
+            num_layers=3, num_kv_heads=1, head_dim=4, max_seq_len=4096,
             max_num_pages=128, page_size=PAGE_SIZE,
         )
         if window is not None:
-            # layer 1 keeps the last ``window`` tokens
-            cfg.keep_window(window, (1,))
+            # layers 1 and 2 keep the last ``window`` tokens, in pages of half the full layer's
+            cfg.keep_window(window, (1, 2))
         self.kv = KVManager(
             cfg=cfg,
             name=KV, joint_comm_group=None, transfer_engine_info=None,
@@ -88,6 +88,8 @@ class _Node:
         )
         if cached:
             self.kv.enable_prefix_cache(ROOT)
+        # what each step's forward reads (`attended`)
+        self.reads: list[torch.Tensor] = []
         self.rope = RopeManager(
             config=PositionConfig(kv_cache=KV), device=device,
             dtype=torch.float32,
@@ -129,6 +131,7 @@ class _Node:
         results = self.runner.plan(step)
         positions = results[ROPE]["main"].tolist()
         self._write(rid, positions)
+        self.reads.append(self.attended(rid, span))
         self.runner.commit(step)
         return positions
 
@@ -152,12 +155,13 @@ class _Node:
                 slot = part.stored_len + offset
                 view[part.page_indices[slot // page_size], :, slot % page_size] = float(position) + 0.5
 
-    def attended(self, rid: str) -> torch.Tensor:
-        """Every slot this request would attend over, in order, layer by layer."""
+    def attended(self, rid: str, written: int = 0) -> torch.Tensor:
+        """Every slot this request would attend over, in order, layer by layer, with ``written`` slots a step
+        wrote and hasn't committed."""
         return torch.stack([
             view[part.page_indices[at // page_size], :, at % page_size].clone()
             for view, part, page_size in self._slots(rid)
-            for at in range(part.stored_len)
+            for at in range(part.stored_len + written)
         ])
 
 
@@ -168,7 +172,7 @@ def _schedule_a(node: _Node, rid: str, tokens: list[int]) -> None:
     node.step(rid, len(tokens))
 
 
-def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int]]:
+def _schedule_b(node: _Node, rid: str, tokens: list[int], chunks: tuple[int, ...] = (37, 61)) -> tuple[int, list[int]]:
     """The same request, arriving in uneven chunks after whatever was cached.
 
     Gives back how much it skipped and the positions it actually computed.
@@ -177,7 +181,7 @@ def _schedule_b(node: _Node, rid: str, tokens: list[int]) -> tuple[int, list[int
     matched = node.resolve(rid)
     positions: list[int] = []
     at = matched
-    for chunk in (37, 61, len(tokens)):
+    for chunk in (*chunks, len(tokens)):
         end = min(at + chunk, len(tokens))
         if end <= at:
             break
@@ -197,7 +201,9 @@ def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed(window):
 
     matched, cached = _schedule_b(warm, "b", PROMPT + SUFFIX)
     fresh_node = _Node(cached=False, window=window)
-    skipped, fresh = _schedule_b(fresh_node, "b", PROMPT + SUFFIX)
+    # its second step, like the cached run's first, writes tokens 192-229 while the window still holds the hit's
+    # pages, and both end with a step to the prompt's end
+    skipped, fresh = _schedule_b(fresh_node, "b", PROMPT + SUFFIX, chunks=(192, 37, 61))
 
     assert matched == 192, "the run found nothing in the cache"
     assert skipped == 0, "the fresh run found a cache it was supposed to be without"
@@ -208,6 +214,10 @@ def test_a_run_that_hit_the_cache_attends_what_a_fresh_run_computed(window):
         warm.attended("b"), fresh_node.attended("b"), atol=0.0, rtol=0.0,
         msg="a request served from the cache attends different bytes than the "
             "same request computed from nothing",
+    )
+    torch.testing.assert_close(
+        warm.reads[-2], fresh_node.reads[-2], atol=0.0, rtol=0.0,
+        msg="the first step past the hit reads different bytes than the same step of a run with no cache",
     )
 
 
