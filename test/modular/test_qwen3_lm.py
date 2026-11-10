@@ -486,6 +486,24 @@ def test_a_layer_takes_the_op_only_for_a_plain_rope_with_q_and_k_norms():
     assert pos.rotated == TINY["num_hidden_layers"], "a rope the kernel doesn't compute rotates through the array"
 
 
+def test_a_decoder_without_qk_norm_rotates_through_the_array_with_a_plain_rope():
+    """The kernel norms q and k, so Qwen2's flags (no QK norm, q/k/v biases) keep the unfused path on a plain rope."""
+    config = Qwen3LMConfig.from_hf({**TINY, "qk_norm": False, "attention_bias": True})
+    torch.manual_seed(0)
+    ours = Qwen3DenseLM(config, array=KV).eval()
+    pages, pos = _FakePages(), _FakePositions()
+    array = _declared()  # a plain rope, which a decoder with QK norms would fuse
+    handle = build_handle(array, {KV: pages, ATTN: pages, position_key(array): pos}, _resolve([array], StateSetup()))
+    for module in ours.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV: handle})
+    assert not ours.layers[0].self_attn._fuse
+    _next_step(handle, 3)
+    with torch.no_grad():
+        ours(ours.embed(torch.tensor([1, 2, 3])))
+    assert pos.rotated == TINY["num_hidden_layers"]
+
+
 def _capture_frames(num_layers: int) -> int:
     torch._dynamo.reset()
     _, ours, handle, _ = _on_state(num_layers=num_layers)
