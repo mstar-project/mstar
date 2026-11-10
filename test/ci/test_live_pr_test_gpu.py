@@ -278,6 +278,8 @@ class TestEras(unittest.TestCase):
                       "a launch under budget.max_running would be refused")
         self.assertIn(("exit", 4), [c[:2] for c in self.eras_launch(max_running=1, held=(), boxes=2)],
                       "the first of a run's two boxes would start with room for one, and the second be refused")
+        self.assertEqual([c[:2] for c in self.eras_launch(max_running=0, held=(), boxes=0) if c[0] != "GET"],
+                         [("exit", 1)], "--boxes 0 would launch past budget.max_running")
 
 
 def do_size(slug, model, count, vram, price, regions=("nyc2", "tor1"), available=True):

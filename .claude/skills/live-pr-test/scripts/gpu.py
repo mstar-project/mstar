@@ -818,6 +818,8 @@ def check_total(cfg, committed: float, allow: bool) -> None:
 
 
 def cmd_launch(args, cfg):
+    if args.boxes < 1:  # fewer would let budget.max_running pass a launch past it
+        die(f"--boxes is {args.boxes}; it counts this launch, so it is at least 1")
     o = find_offer(cfg, args.offer)
     if not o["storage"]:
         die(f"{o['region']} has no team storage; the HF cache would be cold. Pick a region with storage.")
