@@ -42,6 +42,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
@@ -1733,11 +1734,7 @@ def test_the_fmha_gather_kernel_reads_the_second_pools_table():
     assert wrapper._table[2, :1].tolist() == rows[0, 10:11].tolist()
 
 
-class _Attention(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
-
+class _Attention(StubResource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
@@ -1782,10 +1779,8 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
 # ---- refusals ----
 
-class _Spare(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
+class _Spare(StubResource):
+    pass
 
 
 def _build(resources, nodes=None, walks=(WALK,), max_bs=4):

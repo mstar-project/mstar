@@ -46,6 +46,7 @@ its positions under ``POS_KEY`` (``ROPE`` by default).
 import functools
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from time import perf_counter
 from typing import Any
 
@@ -65,7 +66,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows_between, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -75,7 +76,11 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
+
+# A media-mixed step's mask of its prompt rows' tokens (`_mask_prompt_tokens`)
+PROMPT_TOKENS = "prompt_tokens"
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
@@ -112,6 +117,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4]
     # A mixed step's token ladder; None runs it on PREFILL_TOKEN_BUCKETS
     MIXED_TOKEN_BUCKETS: list[int] | None = None
+    # Whether a mixed step also carries media prompt rows beside its decode rows
+    # (a model listing its media walks in its combined walk): its capture then
+    # holds every encoder's buffer, so a replay splices them in.
+    MIXED_MEDIA: bool = False
+    # Whether the model chunks its media prompt rows (a chunkable
+    # ``ChunkingPolicy`` on its media walks): their lengths are then reported
+    # before prepare, so a token budget can cut them (`split_inputs`).
+    CHUNKS_MEDIA: bool = False
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -179,9 +192,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """A media prompt's own position ids and how far it advances the
         position counter, for a model whose media do not take one position
         per token (MRoPE). ``start`` is the counter's value, ``layout`` the
-        walk's ``MEDIA_LAYOUT`` (each run's offset, tokens and grid). The
-        default, ``(None, None)``, leaves the position resource to place every
-        token."""
+        walk's ``MEDIA_LAYOUT`` (each run's offset, tokens and grid). Built on
+        the host, from the layout alone: the scaffold moves them to the device,
+        and a chunked row's cut rebuilds them (`split_inputs`). The default,
+        ``(None, None)``, leaves the position resource to place every token."""
         return None, None
 
     def decoder_kwargs(
@@ -243,11 +257,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_token_lengths=(
                     self.PREFILL_TOKEN_BUCKETS if self.MIXED_TOKEN_BUCKETS is None else self.MIXED_TOKEN_BUCKETS
                 ),
-                make_node_input=ids,
+                make_node_input=media if self._mixes_media else ids,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
+                input_seq_dims=(
+                    {PROMPT_TOKENS: 0, **{e.output: 0 for e in self._encoders}} if self._mixes_media else None
+                ),
             )]
         if self._encoders and self.CAPTURE_PREFILL:
             walks = media_walk_names(self._encoders)
@@ -273,8 +290,13 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
 
+    @property
+    def _mixes_media(self) -> bool:
+        return self.MIXED_MEDIA and bool(self._encoders)
+
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
-        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == self.PREFILL_WALK else None
+        prompt = graph_walk == self.PREFILL_WALK or (self._mixes_media and graph_walk in self._media_walks)
+        return self.MIXED_MAX_PREFILL_ROWS if prompt else None
 
     # ------------------------------------------------------------------
     # Inputs
@@ -312,6 +334,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # the stream's counter is keyed by the worker's handle (AGENTS.md invariant 14)
         start = self.node_resources[self.POS_KEY].position(rid=fwd_info.rid_handle, label="main")
         pos_ids, advance = self.prompt_positions(start, layout, ids.shape[0])
+        if pos_ids is not None:
+            pos_ids = to_device_nonblocking(pos_ids, self.get_device())
         return ARNodeInputs(
             input_seq_len=ids.shape[0],
             input_ids=ids,
@@ -341,12 +365,51 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
-        # a media row's length depends on its attachments; it is admitted whole
         if graph_walk == self.DECODE_WALK:
             return InputSeqLenInfo(1)
-        if graph_walk == self.PREFILL_WALK and "text_inputs" in inputs:
+        # a media row's ids hold a pad per media token, so they measure it; it
+        # is left unmeasured, and admitted whole, unless the model chunks it
+        media = self.CHUNKS_MEDIA and graph_walk in self._media_walks
+        if (graph_walk == self.PREFILL_WALK or media) and "text_inputs" in inputs:
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         return None
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        """A media row's chunk also takes the rows of each encoder output its
+        pads read (from the host layout), and the part of the row's position
+        advance its tokens place: the advance through ``end`` less that
+        through ``start``, so a row's chunks advance by the whole row's."""
+        if graph_walk not in self._media_walks:
+            return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, tensor_inputs={}, resource_step_info=None), start, end,
+        )
+        layout = fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}
+        cut.tensor_inputs = {
+            out: inputs.tensor_inputs[out][a:b]
+            for out, (a, b) in media_rows_between(layout, start, end).items()
+            if out in inputs.tensor_inputs
+        }
+        if inputs.resource_step_info is not None:
+            through = self._advance_through(layout, inputs, end) - self._advance_through(layout, inputs, start)
+            cut.resource_step_info = through
+        return cut
+
+    def _advance_through(self, layout: Mapping, inputs: ARNodeInputs, t: int) -> int:
+        """How far a media row's first ``t`` tokens move the position counter:
+        one past the largest position they hold, from the row's first. The
+        row's own positions are on the device by now, so they are rebuilt on
+        the host from the layout (based at 0: the advance doesn't depend on
+        where the row starts)."""
+        if t == 0:
+            return 0
+        if t >= inputs.input_seq_len:
+            return int(inputs.resource_step_info)
+        pos, _ = self.prompt_positions(0, layout, inputs.input_seq_len)
+        return int(pos[..., :t].max()) + 1
 
     def speculative_input_seq_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, prev_seq_len: int,
@@ -409,14 +472,46 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             laps.lap("splice")
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
-            return {"input_ids": ids}
+            out = {"input_ids": ids}
+            if not decode and self._mixes_media:
+                # a mixed step's media prompt rows
+                self._pack_media(out, inputs)
+                self._mask_prompt_tokens(out, graph_walk, inputs)
+            return out
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
+        self._pack_media(out, inputs)
+        self._mask_prompt_tokens(out, graph_walk, inputs)
+        return out
+
+    def _mask_prompt_tokens(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
+        """A media-mixed step's ``PROMPT_TOKENS``: which of its ids are prompt
+        rows' own. A decode row's id is a sampled token, and a sampled media
+        pad would otherwise take the next media row's embedding and shift every
+        row after it. Both of the walk's paths emit it, so the capture (which
+        runs on prompt rows) holds the buffer every replay stages. A fill per
+        run of rows (decode rows come first, so usually two), no host copy."""
+        if graph_walk != MIXED or not self._mixes_media:
+            return
+        device = out["input_ids"].device
+        pieces: list[torch.Tensor] = []
+        run_len, run_prompt = 0, None
+        for inp in inputs:
+            prompt = (inp.graph_walk or graph_walk) != self.DECODE_WALK
+            n = 1 if inp.input_ids is None else inp.input_ids.numel()
+            if prompt != run_prompt and run_len:
+                pieces.append(torch.full((run_len,), run_prompt, dtype=torch.bool, device=device))
+                run_len = 0
+            run_prompt, run_len = prompt, run_len + n
+        if run_len:
+            pieces.append(torch.full((run_len,), run_prompt, dtype=torch.bool, device=device))
+        out[PROMPT_TOKENS] = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+
+    def _pack_media(self, out: dict, inputs: list[ARNodeInputs]) -> None:
         for e in self._encoders:
             # in row order, as the forward's cumulative pad count reads them
             rows = [inp.tensor_inputs[e.output] for inp in inputs if e.output in inp.tensor_inputs]
             if rows:
                 out[e.output] = torch.cat(rows, dim=0)
-        return out
 
     def declare_step(
         self,
@@ -435,10 +530,16 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         } if graph_walk != self.DECODE_WALK else {}
 
         # None advances by the span; a media prompt placing its own
-        # positions advances by what it says (see `_media_inputs`)
+        # positions advances by what it says (see `_media_inputs`), and so does
+        # each such row of a mixed step, beside rows advancing by their span
+        def places_own(inp: ARNodeInputs) -> bool:
+            return (inp.graph_walk or graph_walk) in self._media_walks and inp.resource_step_info is not None
+
         advance = None
-        if graph_walk in self._media_walks and inputs[0].resource_step_info is not None:
-            advance = tuple(int(inp.resource_step_info) for inp in inputs)
+        if any(places_own(inp) for inp in inputs):
+            advance = tuple(
+                int(inp.resource_step_info) if places_own(inp) else int(inp.input_seq_len) for inp in inputs
+            )
 
         return SubmoduleStep(
             segments=[
@@ -474,13 +575,15 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if input_ids is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         media = {e.output: tensors.pop(e.output) for e in self._encoders if e.output in tensors}
+        prompt_tokens = tensors.pop(PROMPT_TOKENS, None)
         decoder_kwargs = self.decoder_kwargs(graph_walk, engine_inputs, input_ids.shape[0], **tensors)
         embeds = self.model.embed(input_ids)
         for e in self._encoders:
             rows = media.get(e.output)
             # a host shape: an eager step without this medium skips it
             if rows is not None and rows.shape[0]:
-                embeds = splice_media(embeds, e.pads(input_ids), rows)
+                pads = e.pads(input_ids)
+                embeds = splice_media(embeds, pads if prompt_tokens is None else pads & prompt_tokens, rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head
