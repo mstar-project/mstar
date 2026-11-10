@@ -305,14 +305,19 @@ DO_SIZES = [  # two pages, as the API pages them
 ]
 
 
+def ago(hours):
+    """A time `hours` ago as DigitalOcean writes created_at."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours * 3600))
+
+
 class TestDigitalOcean(unittest.TestCase):
     def setUp(self):
         self.calls, self.keys = [], []
-        self.droplets = [{"id": 3164444, "name": "live-pr-7-1-1-amd", "status": "active",
+        self.droplets = [{"id": 3164444, "name": "live-pr-7-1-1-amd", "status": "active", "created_at": ago(1),
                           "networks": {"v4": [{"ip_address": "10.0.0.2", "type": "private"},
                                               {"ip_address": "104.236.32.182", "type": "public"}]}},
-                         {"id": 3164445, "name": "someone-else", "status": "active"},
-                         {"id": 3164446, "name": "live-pr-6-x", "status": "archive"}]
+                         {"id": 3164445, "name": "someone-else", "status": "active", "created_at": ago(1)},
+                         {"id": 3164446, "name": "live-pr-6-x", "status": "archive", "created_at": ago(1)}]
         saved = {k: GPU[k] for k in ("digitalocean", "STATE", "LEDGER", "find_offer")}
         self.addCleanup(GPU.update, saved)
         state = Path(tempfile.mkdtemp())
@@ -329,6 +334,9 @@ class TestDigitalOcean(unittest.TestCase):
             return {"droplets": self.droplets, "links": {}, "meta": {"total": len(self.droplets)}}
         if path == "/droplets":
             return {"droplet": {"id": 3164447, "name": body["name"], "status": "new"}, "links": {"actions": []}}
+        if method == "DELETE":
+            self.droplets = [d for d in self.droplets if f"/droplets/{d['id']}" != path]
+            return {}
         if path.startswith("/droplets/"):
             found = [d for d in self.droplets if str(d["id"]) == path.split("/")[-1]]
             if not found:
@@ -433,6 +441,25 @@ class TestDigitalOcean(unittest.TestCase):
         self.assertEqual(GPU["status"](e, {}), ("active", "104.236.32.182", 22))
         self.assertEqual(GPU["status"]({**e, "instance_id": "9"}, {})[0], "ended",
                          "the bot would wait on a deleted droplet until its timeout")
+
+    def test_reap_releases_only_this_tools_boxes_past_their_deadline(self):
+        self.droplets = [{"id": 1, "name": "live-pr-7-1-1-amd", "status": "active", "created_at": ago(6)},  # runaway
+                         {"id": 2, "name": "live-pr-8-2-1-amd", "status": "active", "created_at": ago(4.5)},
+                         {"id": 3, "name": "someone-else", "status": "active", "created_at": ago(30)},
+                         {"id": 4, "name": "live-pr-9-3-1-amd", "status": "active", "created_at": ago(0.5)}]
+        GPU["save_ledger"]({"digitalocean:4": {"provider": "digitalocean", "instance_id": "4",
+                                               "name": "live-pr-9-3-1-amd", "launched_at": time.time() - 1800,
+                                               "deadline": time.time() - 60, "usd_per_hour": 1.99}})
+        self.addCleanup(GPU.update, {"eras": GPU["eras"]})
+        GPU["eras"] = lambda *a, **k: {"items": [{"id": "e1", "name": "live-pr-5-x", "status": "active"}]}
+        with keys("digitalocean", "eras"), contextlib.redirect_stderr(io.StringIO()):
+            created = self.launch(None, cfg={"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4,
+                                                        "max_concurrent_instances": 2}})
+        self.assertEqual(sorted(d["name"] for d in self.droplets), ["live-pr-8-2-1-amd", "someone-else"],
+                         "a box whose runner died would bill until someone noticed, or a live or foreign one would go")
+        self.assertIsNotNone(created, "runaway boxes would hold budget.max_running")
+        self.assertNotIn("POST", [m for m, path, *_ in self.calls if path.startswith("/instances")],
+                         "an Eras box, which its Pod's deadline ends, would be released early")
 
 
 if __name__ == "__main__":

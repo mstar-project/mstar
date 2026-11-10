@@ -15,6 +15,7 @@ usage:
   gpu.py extend <instance> --hours H [--allow-over-budget]
                                                  move the watchdog deadline to now + H (Eras: earlier only)
   gpu.py terminate <instance>
+  gpu.py reap                                    release this tool's runaway boxes (below), from any session
 
 Offers only cover regions where the team has persistent storage (a RunPod global volume
 mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region), since the
@@ -36,6 +37,10 @@ droplet stays up until terminated.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
+`reap`, which every launch under budget.max_running runs first, is the backstop for a box whose
+watchdog's machine is gone too: on a provider whose instances have no deadline of their own, it
+releases this tool's instances past their ledger deadline, or past budget.max_hours plus an hour
+from their creation when this machine's ledger doesn't have them.
 
 `launch` exits 4 when budget.max_running refuses it, 1 on any other error.
 
@@ -47,6 +52,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import datetime
 import fcntl
 import functools
 import gzip
@@ -281,10 +287,12 @@ GIB = re.compile(r"(\d+(?:\.\d+)?)\s*([GT])i?", re.I)
 # ---------------------------------------------------------------- providers
 
 class Instance(NamedTuple):
-    """One of a provider's instances, as its listing shows it."""
+    """One of a provider's instances, as its listing shows it; `created` in epoch seconds, None where it doesn't
+    say."""
     id: str
     name: str
     status: str
+    created: float | None = None
 
 
 class Provider:
@@ -643,7 +651,8 @@ class DigitalOcean(Provider):
 
     def instances(self):
         # GPU droplets are listed only with type=gpus.
-        return [Instance(str(d["id"]), d.get("name"), d.get("status"))
+        return [Instance(str(d["id"]), d.get("name"), d.get("status"),
+                         datetime.datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")).timestamp())
                 for d in digitalocean_list("/droplets", "droplets", {"type": "gpus"}) if d.get("status") != "archive"]
 
     def release(self, iid, e):
@@ -839,6 +848,8 @@ def cmd_launch(args, cfg):
                     f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
             if max_running is not None and not args.allow_over_budget:
                 try:
+                    for line in reap(cfg):
+                        print(f"gpu.py: {line}", file=sys.stderr)
                     up = running(cfg)
                 except ApiError as err:
                     die(f"can't count this tool's instances for budget.max_running: {err}")
@@ -1168,6 +1179,23 @@ def running(cfg: dict) -> list[str]:
             if str(i.name).startswith(JOB_PREFIX)]
 
 
+def reap(cfg: dict) -> list[str]:
+    """Release this tool's instances, from every session and machine, that outlived their deadline: their
+    ledger entry's, else budget.max_hours plus an hour from their creation. Only on enabled providers whose
+    instances have no deadline of their own and whose listing dates them. What it released, one line each."""
+    d, grace, released = ledger(), (cfg["budget"]["max_hours"] + 1) * 3600, []
+    for p in enabled_providers(cfg):
+        if p.fixed_deadline:
+            continue
+        for i in p.instances():
+            e = d.get(f"{p.name}:{i.id}")
+            deadline = e["deadline"] if e else i.created and i.created + grace
+            if str(i.name).startswith(JOB_PREFIX) and deadline and time.time() > deadline:
+                p.release(i.id, e or {})
+                released.append(f"released {p.name}:{i.id}  {i.name}, past its deadline")
+    return released
+
+
 def release_by_name(cfg: dict, pr: int, tag: str) -> None:
     """End whatever this tool launched for `pr` and `tag` on any enabled provider, by its name, for a launch
     cancelled before its instance was recorded. Every provider is tried; the first error is raised after."""
@@ -1204,6 +1232,11 @@ def cmd_list(args, cfg):
             up = [f"? {err}"]
         for line in up:
             print(line)
+
+
+def cmd_reap(args, cfg):
+    for line in reap(cfg) or ["nothing past its deadline"]:
+        print(line)
 
 
 def cmd_watchdog(args, cfg):
@@ -1297,13 +1330,14 @@ def main():
     p.add_argument("--allow-over-budget", action="store_true")
     p = sub.add_parser("terminate")
     p.add_argument("instance")
+    sub.add_parser("reap")
     p = sub.add_parser("watchdog")
     p.add_argument("instance")
     args = ap.parse_args()
     cfg = load_config()
     handler = {"check": cmd_check, "offers": cmd_offers, "launch": cmd_launch, "wait": cmd_wait,
                "ssh": cmd_ssh, "push": cmd_copy, "pull": cmd_copy, "list": cmd_list, "extend": cmd_extend,
-               "terminate": cmd_terminate, "watchdog": cmd_watchdog}[args.cmd]
+               "terminate": cmd_terminate, "reap": cmd_reap, "watchdog": cmd_watchdog}[args.cmd]
     try:
         handler(args, cfg)
     except ApiError as e:
