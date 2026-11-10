@@ -8,7 +8,7 @@ One denoise step over a row's tokens, ``[txt (Lt) | img (target + references)]``
     drop txt tokens -> AdaLN (norm_out) -> proj_out (D -> 64)
 
 ``zero_cond_t`` (Edit-2511): the reference images' tokens are modulated as at timestep 0,
-the target's at the step's timestep (the layout's ``modulate_index``).
+the target's at the step's timestep (the layout's ``target_tokens`` splits them).
 
 Each row's text is left-padded to the step's ``Lt``, so the joint sequence of a row is
 ``[pad | txt | img]`` and attends within the segments the step declares: the pad on its own,
@@ -16,9 +16,11 @@ and the real ``[txt | img]`` as the reference attends it. RoPE follows ``QwenEmb
 (``scale_rope``): the target at frame 0 and reference ``i`` at frame ``i``, heights and widths
 centred, text from ``max(h/2, w/2)`` over every image. The rotation is the reference's
 complex product itself: its rounding is the device's complex multiply (fused multiply-adds on
-CUDA), which no one real-arithmetic formula reproduces on every device. Under ``torch.compile``
-inductor runs that product as an aten fallback outside its fused kernels, which a compile on/off
-comparison has to account for.
+CUDA), which no one real-arithmetic formula reproduces on every device.
+
+On CUDA the elementwise work between the GEMMs runs as fused kernels (``kernels``) that round where
+the eager ops do: the q/k norms with the rotation, the modulation and the gated residuals. The
+output is bit-identical to the eager ops (the CPU path), in a fraction of the memory traffic.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
@@ -37,6 +39,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.model.components.diffusion.qwen import dit_kernels as kernels
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import QwenRMSNorm
 
@@ -81,11 +84,11 @@ class QwenImageTransformerConfig:
 
 
 class QwenStepLayout(NamedTuple):
-    """Per-step derived tensors (``build_layout``): complex64 rotary tables and the modulation index."""
+    """Per-step derived tables (``build_layout``): complex64 rotary tables and where the target's tokens end."""
 
     img_freqs: torch.Tensor        # [L_img, head_dim / 2]
     txt_freqs: torch.Tensor        # [branches, Lt, head_dim / 2], one row per local branch
-    modulate_index: torch.Tensor   # [L_img] int: 0 the target's tokens, 1 the references'
+    target_tokens: int             # the image tokens before the references'; zero_cond_t modulates the rest at t=0
 
 
 def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
@@ -209,32 +212,51 @@ class QwenImageJointAttention(nn.Module):
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x.unflatten(-1, (-1, self.head_dim))
 
-        q_i = apply_rope(self.norm_q(heads(self.to_q(img))), layout.img_freqs)
-        k_i = apply_rope(self.norm_k(heads(self.to_k(img))), layout.img_freqs)
-        q_t = apply_rope(self.norm_added_q(heads(self.add_q_proj(txt))), txt_freqs)
-        k_t = apply_rope(self.norm_added_k(heads(self.add_k_proj(txt))), txt_freqs)
-        q = torch.cat([q_t, q_i], dim=1)
-        k = torch.cat([k_t, k_i], dim=1)
+        q = self._norm_rope(heads(self.add_q_proj(txt)), heads(self.to_q(img)), self.norm_added_q, self.norm_q,
+                            txt_freqs, layout.img_freqs)
+        k = self._norm_rope(heads(self.add_k_proj(txt)), heads(self.to_k(img)), self.norm_added_k, self.norm_k,
+                            txt_freqs, layout.img_freqs)
         v = torch.cat([heads(self.add_v_proj(txt)), heads(self.to_v(img))], dim=1)
         out = attend(q, k, v).flatten(2, 3).to(q.dtype)
         num_txt = txt.shape[1]
         return self.to_out[0](out[:, num_txt:].contiguous()), self.to_add_out(out[:, :num_txt].contiguous())
 
+    @staticmethod
+    def _norm_rope(txt, img, txt_norm, img_norm, txt_freqs, img_freqs) -> torch.Tensor:
+        """``[txt | img]`` along the tokens, each per-head normed and rotated: one fused pass each on CUDA."""
+        if kernels.fits(txt, img) and txt.shape[-1] == 128 and txt_norm.eps == img_norm.eps:
+            return kernels.joint_qk_norm_rope(
+                txt, img, txt_norm.weight, img_norm.weight, txt_freqs, img_freqs, txt_norm.eps,
+            )
+        return torch.cat([apply_rope(txt_norm(txt), txt_freqs), apply_rope(img_norm(img), img_freqs)], dim=1)
 
-def _modulate(x: torch.Tensor, params: torch.Tensor, index: torch.Tensor | None = None):
-    """``(x (1 + scale) + shift, gate)`` from ``params [B, 3D]``; with ``index`` (``zero_cond_t``),
-    ``params`` is ``[2B, 3D]`` (the step's timestep rows, then timestep 0's) and each token takes
-    the half its index names."""
-    shift, scale, gate = params.chunk(3, dim=-1)
-    if index is None:
-        shift, scale, gate = shift.unsqueeze(1), scale.unsqueeze(1), gate.unsqueeze(1)
-    else:
-        rows = shift.shape[0] // 2
-        pick = index.view(1, -1, 1) == 0
-        shift, scale, gate = (
-            torch.where(pick, p[:rows].unsqueeze(1), p[rows:].unsqueeze(1)) for p in (shift, scale, gate)
-        )
-    return x * (1 + scale) + shift, gate
+
+def _by_token(fn, split: int, tokens: tuple[torch.Tensor, ...], params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """``fn(*tokens, *params)`` with ``params [sets * R, D]`` broadcast over the tokens: one set for every token, or
+    (``zero_cond_t``) set 0 for the tokens before ``split`` and set 1 from it."""
+    rows = tokens[0].shape[0]
+    if params[0].shape[0] == rows:
+        return fn(*tokens, *(p[:, None] for p in params))
+    return torch.cat([fn(*(t[:, :split] for t in tokens), *(p[:rows, None] for p in params)),
+                      fn(*(t[:, split:] for t in tokens), *(p[rows:, None] for p in params))], dim=1)
+
+
+def _modulate(x: torch.Tensor, params: torch.Tensor, split: int):
+    """``(x (1 + scale) + shift, gate)`` from ``params [sets * B, 3D]`` (``zero_cond_t``: the step's timestep rows,
+    then timestep 0's, the second set from token ``split``); ``gate`` stays ``[sets * B, D]`` for
+    :func:`_gated_add`."""
+    shift, scale, gate = (p.contiguous() for p in params.chunk(3, dim=-1))
+    scale1p = 1 + scale
+    if kernels.fits(x, shift) and x.is_contiguous():
+        return kernels.modulate(x, scale1p, shift, split), gate
+    return _by_token(lambda t, s1p, sh: t * s1p + sh, split, (x,), (scale1p, shift)), gate
+
+
+def _gated_add(x: torch.Tensor, gate: torch.Tensor, y: torch.Tensor, split: int) -> torch.Tensor:
+    """``x + gate * y``, ``gate`` by token as in :func:`_modulate`."""
+    if kernels.fits(x, gate, y) and x.is_contiguous() and y.is_contiguous():
+        return kernels.gated_add(x, gate, y, split)
+    return _by_token(lambda t, u, g: t + g * u, split, (x, y), (gate,))
 
 
 class QwenImageBlock(nn.Module):
@@ -258,21 +280,23 @@ class QwenImageBlock(nn.Module):
         self, img: torch.Tensor, txt: torch.Tensor, temb: torch.Tensor, layout: QwenStepLayout,
         txt_freqs: torch.Tensor, attend,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        index = layout.modulate_index if self.zero_cond_t else None
+        # zero_cond_t: the references' tokens (from target_tokens on) take timestep 0's parameters
+        split = layout.target_tokens if self.zero_cond_t else img.shape[1]
         img_mod1, img_mod2 = self.img_mod(temb).chunk(2, dim=-1)
         txt_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
         txt_mod1, txt_mod2 = self.txt_mod(txt_temb).chunk(2, dim=-1)
+        txt_split = txt.shape[1]
 
-        img_in, img_gate1 = _modulate(self.img_norm1(img), img_mod1, index)
-        txt_in, txt_gate1 = _modulate(self.txt_norm1(txt), txt_mod1)
+        img_in, img_gate1 = _modulate(self.img_norm1(img), img_mod1, split)
+        txt_in, txt_gate1 = _modulate(self.txt_norm1(txt), txt_mod1, txt_split)
         img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs, attend)
-        img = img + img_gate1 * img_attn
-        txt = txt + txt_gate1 * txt_attn
+        img = _gated_add(img, img_gate1, img_attn, split)
+        txt = _gated_add(txt, txt_gate1, txt_attn, txt_split)
 
-        img_in, img_gate2 = _modulate(self.img_norm2(img), img_mod2, index)
-        img = img + img_gate2 * self.img_mlp(img_in)
-        txt_in, txt_gate2 = _modulate(self.txt_norm2(txt), txt_mod2)
-        txt = txt + txt_gate2 * self.txt_mlp(txt_in)
+        img_in, img_gate2 = _modulate(self.img_norm2(img), img_mod2, split)
+        img = _gated_add(img, img_gate2, self.img_mlp(img_in), split)
+        txt_in, txt_gate2 = _modulate(self.txt_norm2(txt), txt_mod2, txt_split)
+        txt = _gated_add(txt, txt_gate2, self.txt_mlp(txt_in), txt_split)
         return img, txt
 
 

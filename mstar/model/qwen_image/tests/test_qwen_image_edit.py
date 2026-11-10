@@ -205,6 +205,45 @@ def test_rope_rounds_as_the_reference(device):
         assert torch.equal(apply_rope(x, freqs), apply_rotary_emb_qwen(x, freqs, use_real=False))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernels run on CUDA")
+@pytest.mark.parametrize("zero_cond_t", [True, False])
+def test_the_fused_kernels_round_as_the_eager_ops(zero_cond_t, monkeypatch):
+    """On CUDA the q/k norms with the rotation, the modulation and the gated residuals run as fused kernels. They
+    round where the eager ops do, so a bf16 forward is the eager forward (and so the reference's) bit for bit."""
+    from mstar.model.components.diffusion.attention import joint_attention
+    from mstar.model.components.diffusion.qwen import dit_kernels as kernels
+    from mstar.model.qwen_image.components.transformer import QwenStepLayout, apply_rope, qwen_rope_tables
+
+    config = QwenImageTransformerConfig(**{**TINY, "attention_head_dim": 128, "axes_dims_rope": (16, 56, 56)},
+                                        zero_cond_t=zero_cond_t)
+    torch.manual_seed(0)
+    dit = QwenImageTransformer(config).eval()
+    with torch.no_grad():
+        for p in dit.parameters():
+            p.normal_(std=0.2)
+    dit = dit.to("cuda", torch.bfloat16)
+    # two rows (the guidance branches), the target 4x4 then a 4x6 reference, the second prompt left-padded
+    img_freqs, txt_freqs = qwen_rope_tables(config.axes_dims_rope, [(4, 4), (4, 6)], [7, 5], 7)
+    layout = QwenStepLayout(img_freqs.cuda(), txt_freqs.cuda(), 16)
+    g = torch.Generator().manual_seed(1)
+    img = torch.randn(2, 40, 64, generator=g).to("cuda", torch.bfloat16)
+    txt = torch.randn(2, 7, 24, generator=g).to("cuda", torch.bfloat16)
+    timestep = torch.tensor([0.3, 0.7], device="cuda", dtype=torch.bfloat16)
+
+    def forward():
+        with torch.no_grad():
+            return dit(img, txt, timestep, layout, joint_attention)
+
+    fused = forward()
+    monkeypatch.setattr(kernels, "fits", lambda *tensors: False)
+    assert torch.equal(fused, forward())
+    # the one-part op on a token axis of its own ([N, H, 128], Qwen-Image-2.1's layout)
+    attn = dit.transformer_blocks[0].attn
+    x = torch.randn(40, 2, 128, generator=g).to("cuda", torch.bfloat16)
+    want = apply_rope(attn.norm_q(x[None]), layout.img_freqs)[0]
+    assert torch.equal(kernels.qk_norm_rope(x, attn.norm_q.weight, layout.img_freqs, attn.norm_q.eps), want)
+
+
 def _vaes():
     from diffusers import AutoencoderKLWan
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
