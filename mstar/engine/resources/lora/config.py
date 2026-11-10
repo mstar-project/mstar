@@ -17,7 +17,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes, instance_key
+from mstar.engine.resources.spec import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    check_sizes,
+    instance_key,
+    parse_yaml_dtype,
+    require_unscaled_dtype,
+)
 from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
@@ -379,8 +386,8 @@ class LoraSpec(NodeResourceSpec):
     # and prefix-keyed under; every read must match it. The API server fills these in for
     # the serving config's adapters, and a runtime load carries its own.
     adapter_digests: dict[str, bytes] = field(default_factory=dict)
-    # the slot weights' dtype; None takes the nodes' compute dtype (the serving config's
-    # ``autocast_dtype``), which is what their base linears run in
+    # the slot weights' dtype; None takes the dtype its nodes compute in
+    # (``EngineResourceInfo.resolve_dtype``), which is what their base linears run in
     dtype: torch.dtype | None = None
     # the kernels behind the custom ops: "auto" registers Triton's on CUDA and leaves the
     # torch reference elsewhere; "torch" registers none, so the reference runs unless
@@ -474,8 +481,9 @@ class LoraSpec(NodeResourceSpec):
         runtime_updates: bool | None = None,
         runtime_update_timeout_s: float | None = None,
         targets: list[str] | None = None,
+        dtype: str | torch.dtype | None = None,
     ):
-        """How many adapters stay resident, the largest rank served, and which adapters
+        """The slot weights' ``dtype``, how many adapters stay resident, the largest rank served, and which adapters
         this deployment serves. ``targets`` serves just those of the model's declared
         targets, the experts targets included (served only when named,
         ``dropped_targets``): dropping the LM head and embedding saves their
@@ -491,6 +499,8 @@ class LoraSpec(NodeResourceSpec):
             if value is not None
         }
         check_sizes(sizes)
+        if dtype is not None:
+            dtype = require_unscaled_dtype(parse_yaml_dtype(dtype), f"resources.{self.resource_key}.dtype")
         if runtime_updates is not None and not isinstance(runtime_updates, bool):
             raise ValueError(f"runtime_updates must be true or false; got {runtime_updates!r}")
         if runtime_update_timeout_s is not None and (
@@ -536,6 +546,8 @@ class LoraSpec(NodeResourceSpec):
 
         for name, value in sizes.items():
             setattr(self, name, value)
+        if dtype is not None:
+            self.dtype = dtype
         if runtime_updates is not None:
             self.runtime_updates = runtime_updates
         if runtime_update_timeout_s is not None:

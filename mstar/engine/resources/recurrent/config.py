@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, check_sizes
+from mstar.engine.resources.spec import NodeResourceSpec, check_sizes, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -343,6 +343,10 @@ class RecurrentStateConfig:
             block.shard(num_shards)
 
 
+# the blocks holding a pool's recurrent state, which ``state_dtype`` in YAML retypes
+_STATE_BLOCKS = ("state", "ssm")
+
+
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
@@ -381,21 +385,15 @@ class RecurrentStateSpec(NodeResourceSpec):
             self.config.prefix_slots = prefix_slots
         self.config.check_slots()
         if state_dtype is not None:
-            try:
-                dtype = getattr(torch, state_dtype)
-            except AttributeError:
-                dtype = None
-            if not isinstance(dtype, torch.dtype):
+            dtype = parse_yaml_dtype(state_dtype)
+            # the recurrent state: DeltaNet's "state", Mamba2's "ssm"
+            name = next((n for n in _STATE_BLOCKS if n in self.config.blocks), None)
+            if name is None:
                 raise ValueError(
-                    f"state_dtype {state_dtype!r} is not a torch dtype"
+                    "state_dtype was set but this pool has no state block "
+                    f"({' or '.join(map(repr, _STATE_BLOCKS))}); it has {sorted(self.config.blocks)}"
                 )
-            block = self.config.blocks.get("state")
-            if block is None:
-                raise ValueError(
-                    "state_dtype was set but this pool has no 'state' block; "
-                    f"it has {sorted(self.config.blocks)}"
-                )
-            self.config.blocks["state"] = replace(block, dtype=dtype)
+            self.config.blocks[name] = replace(self.config.blocks[name], dtype=dtype)
 
 
 @dataclass(frozen=True)

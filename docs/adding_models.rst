@@ -984,9 +984,9 @@ steps none of whose rows names an adapter, in every kind of capture; and a sampl
 model declares nothing for these.
 
 **Resource dtype.** ``KVConfig`` (paged and ring), ``BoundedKVConfig``,
-``AttentionConfig``, ``CrossAttentionConfig`` and ``RaggedAttentionConfig`` each take an
-optional ``dtype``, as does each ``RecurrentBlockConfig`` of a recurrent pool. For a cache
-or pool, ``dtype`` is the storage dtype. For an attention resource, it is the dtype the
+``AttentionConfig``, ``CrossAttentionConfig``, ``RaggedAttentionConfig`` and ``LoraSpec``
+each take an optional ``dtype``, as does each ``RecurrentBlockConfig`` of a recurrent pool.
+For a cache or pool, ``dtype`` is the storage dtype; for a LoRA pool, its slot weights'. For an attention resource, it is the dtype the
 kernel is planned in. The engine resolves each resource's dtype once, at load:
 
 1. the spec's own ``dtype``, if set;
@@ -2795,8 +2795,8 @@ that a misspelled setting is never silently ignored:
        draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
        each batched capture)
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
-       ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
+     - ``max_slots``, ``state_dtype`` (the state block's: DeltaNet's ``state``, Mamba2's
+       ``ssm``), ``prefix_slots`` (see **Cross-request prefix reuse**). ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
        slot for a request is refused at startup.
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
@@ -2826,8 +2826,9 @@ that a misspelled setting is never silently ignored:
        left with none gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
        ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
-       worker to answer one before giving up on it). The one ``lora:`` block sizes the
-       pool of every node the model's spec reaches
+       worker to answer one before giving up on it), ``dtype`` (the slot weights'; by
+       default the dtype the nodes compute in). The one ``lora:`` block sizes the pool of
+       every node the model's spec reaches
 
 ``dtype`` takes a torch dtype name, such as ``bfloat16`` or ``torch.bfloat16``, and sets
 the resource's dtype as if the model had declared it on the spec (see

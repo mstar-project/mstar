@@ -350,9 +350,9 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     _, paths = adapters
     spec = make_spec(paths)
     digests = spec.adapter_digests
-    whole = LoraAdapterStore(spec).load("a1", paths["a1"], digests["a1"])
+    whole = LoraAdapterStore(spec, torch.float32).load("a1", paths["a1"], digests["a1"])
     for rank in range(2):
-        part = LoraAdapterStore(spec, rank=rank, world_size=2).load("a1", paths["a1"], digests["a1"])
+        part = LoraAdapterStore(spec, torch.float32, rank=rank, world_size=2).load("a1", paths["a1"], digests["a1"])
         # qkv: B rows split per slice, A whole; o: A columns split, B whole
         torch.testing.assert_close(part.b["qkv"][:, :8], whole.b["qkv"][:, rank * 8:(rank + 1) * 8])
         torch.testing.assert_close(part.b["qkv"][:, 8:12], whole.b["qkv"][:, 16 + rank * 4:16 + (rank + 1) * 4])
@@ -360,7 +360,7 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
         torch.testing.assert_close(part.a["o"], whole.a["o"][..., rank * 8:(rank + 1) * 8])
         torch.testing.assert_close(part.b["o"], whole.b["o"])
         assert part.digest == whole.digest
-    store = LoraAdapterStore(make_spec(paths, cpu_capacity=2))
+    store = LoraAdapterStore(make_spec(paths, cpu_capacity=2), torch.float32)
     for name in ("a1", "a2"):
         store.load(name, paths[name], digests[name])
     assert not store.hold("a1")  # a1 now most recent

@@ -49,7 +49,7 @@ class BoundedKVConfig:
     min_source_len: int = 0
     # None is its nodes' common dtype (``EngineResourceInfo.resolve_dtype``), settled
     # when the resource is built
-    dtype: torch.dtype | None = torch.float32
+    dtype: torch.dtype | None = None
     # A step's tokens join the stream last-first. Only for attention that
     # ignores key order, where it decides which of the oldest step's tokens are
     # evicted first: Step-Audio2's flow decoder keeps the front of each chunk.

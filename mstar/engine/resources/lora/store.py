@@ -188,12 +188,12 @@ class LoraAdapterStore:
     """
 
     def __init__(
-        self, spec: LoraSpec, rank: int = 0, world_size: int = 1, pin: bool | None = None,
-        dtype: torch.dtype | None = None,
+        self, spec: LoraSpec, dtype: torch.dtype, rank: int = 0, world_size: int = 1,
+        pin: bool | None = None,
     ):
         self._spec = spec
         # the device slots' dtype, so a slot load is a plain copy
-        self._dtype = dtype or spec.dtype or torch.float32
+        self._dtype = dtype
         self._rank = rank
         self._world_size = world_size
         self._pin = torch.accelerator.is_available() if pin is None else pin
