@@ -91,7 +91,7 @@ def main():
         ref_in["prompt"], ["text", "image"], ["video_frame"], tensors={"image_inputs": [ref_in["image_rgb"]]},
         camera_poses=np.load(Path(args.example) / "poses.npy"),
         intrinsics=np.load(Path(args.example) / "intrinsics.npy"), num_frames=meta["frame_num_requested"],
-    )
+    ).new_input_tensors
     poses, intr = tensors["camera_poses"][0], tensors["intrinsics"][0]
     lat_f = poses.shape[0]
     _, _, lat_h, lat_w = ref_in["vae_latent"].shape

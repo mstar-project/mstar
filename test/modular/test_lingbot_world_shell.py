@@ -30,7 +30,11 @@ from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     ChunkOnlyStore,
 )
 from mstar.model.lingbot_world.components.schedule import make_fast_schedule  # noqa: E402
-from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
+from mstar.model.lingbot_world.lingbot_world_model import (  # noqa: E402
+    DIT_KV_TOKENS,
+    REFERENCE_MODEL_KWARGS,
+    LingBotWorldModel,
+)
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_ATTN,
     DIT_KV,
@@ -282,7 +286,7 @@ def test_one_chunk_needs_thirteen_poses(model, monkeypatch):
     out = model.process_prompt("p", ["text", "image"], ["video_frame"], tensors={"image_inputs": [image]},
                                camera_poses=np.tile(np.eye(4), (13, 1, 1)), **req)
     assert seen["text"] == "p"
-    assert out["camera_poses"][0].shape[0] == 4  # one chunk of latent frames
+    assert out.new_input_tensors["camera_poses"][0].shape[0] == 4  # one chunk of latent frames
 
 
 @pytest.mark.parametrize("num_frames,num_poses", [(13, 13), (93, 269), (361, 269)])
@@ -294,7 +298,7 @@ def test_the_rollout_loop_is_capped_at_the_chunks_process_prompt_lays_out(model,
     req = dict(intrinsics=[415.0, 415.0, 416.0, 240.0], num_frames=num_frames, camera_poses=poses)
     out = model.process_prompt("p", ["text", "image"], ["video_frame"],
                                tensors={"image_inputs": [torch.zeros(3, 480, 832, dtype=torch.uint8)]}, **req)
-    chunks = out["camera_poses"][0].shape[0] // model.config.chunk_size
+    chunks = out.new_input_tensors["camera_poses"][0].shape[0] // model.config.chunk_size
     assert model.get_loop_caps(**req) == {ROLLOUT_LOOP_NAME: chunks}
 
 
@@ -395,7 +399,7 @@ def test_poses_may_drop_the_constant_bottom_row(model, monkeypatch):
                                 camera_poses=poses.tolist(), **req)
     top = model.process_prompt("p", ["text", "image"], ["video_frame"], tensors={"image_inputs": [image]},
                                camera_poses=poses[:, :3].tolist(), **req)
-    assert torch.equal(full["camera_poses"][0], top["camera_poses"][0])
+    assert torch.equal(full.new_input_tensors["camera_poses"][0], top.new_input_tensors["camera_poses"][0])
     with pytest.raises(ValueError, match=r"\[F, 3, 4\]"):
         model.process_prompt("p", ["text", "image"], ["video_frame"], tensors={"image_inputs": [image]},
                              camera_poses=poses[:, :2].tolist(), **req)
@@ -544,20 +548,20 @@ def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(mod
         assert last.sink + last.window <= model.max_window_tokens(), image_hw
 
 
-def _signal(*dims: int) -> list[TensorPointerInfo]:
-    return [TensorPointerInfo(dims=list(dims), dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
-                              source_session_id="", source_entity="")]
-
-
 @pytest.mark.parametrize("image_hw", [(464, 832), (720, 1280)])
-def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(model, image_hw):
-    """The sink and window its steps will keep, at the output size: the engine
-    queues the request until the pool has that room, and refuses one that can
-    never fit before it reaches a worker."""
-    signals = {"text_inputs": _signal(512), "image_inputs": _signal(3, *image_hw),
-               "camera_poses": _signal(64, 4, 4), "intrinsics": _signal(64, 4)}
-    fwd = model.get_initial_forward_pass_args("main", ["image"], ["video_frame"], signals)
-    configs = model.get_request_resource_configs({"main": fwd})
+def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(model, monkeypatch, image_hw):
+    """The sink and window its steps will keep, at the output size process_prompt
+    settles: the engine queues the request until the pool has that room, and
+    refuses one that can never fit before it reaches a worker."""
+    monkeypatch.setattr(model, "_ensure_tokenizer", lambda: None)
+    monkeypatch.setattr(model, "tokenizer", lambda text, **kwargs: type("Ids", (), {"input_ids": [0, 1]})())
+    req = dict(intrinsics=[415.0, 415.0, 416.0, 240.0], camera_poses=np.tile(np.eye(4), (93, 1, 1)),
+               height=image_hw[0], width=image_hw[1])
+    out = model.process_prompt("p", ["text", "image"], ["video_frame"],
+                               tensors={"image_inputs": [torch.zeros(3, *image_hw, dtype=torch.uint8)]}, **req)
+    assert tuple(out.new_input_tensors["image_inputs"][0].shape[1:]) == image_hw
+    # the data worker folds the metadata into the request's kwargs, which the conductor resolves configs from
+    configs = model.get_request_resource_configs(["text", "image"], ["video_frame"], {**req, **out.metadata})
     first = _bare_dit_submodule(model, {}).chunk_spans(0, image_hw).position
     assert configs == {DIT_KV: RollingKVReqConfig(tokens=first.sink + first.window)}
     (kv, _) = model.get_node_resources()
@@ -565,6 +569,12 @@ def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(mode
     kv.apply_yaml_overrides(pool_tokens=first.sink + first.window - 1)
     with pytest.raises(ValueError, match="pool_tokens"):
         configs[DIT_KV].validate(kv)
+
+
+def test_only_process_prompt_sets_the_rolling_kv_size():
+    """A client can't size its own region: the data worker drops a model's
+    INTERNAL_KWARGS from the request before process_prompt sets them."""
+    assert DIT_KV_TOKENS in LingBotWorldModel.INTERNAL_KWARGS
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")

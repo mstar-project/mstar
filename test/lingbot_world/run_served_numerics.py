@@ -58,6 +58,8 @@ class Session:
             request_id=f"served-{rid}", graph_walk=ROLLOUT_WALK, fwd_index=0, random_seed=seed, max_tokens=0,
             step_metadata=md, rid_handle=rid,
         )
+        # the engine counts the loop's iterations; the DiT reads its chunk from the count
+        self.info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = 0
         self.inputs = {"text_embeds_pos": [text_embeds], "image_inputs": [tensors["image_inputs"][0].to(DEVICE)],
                        "camera_poses": tensors["camera_poses"], "intrinsics": tensors["intrinsics"], "clock": []}
         self.latents: list[torch.Tensor] = []
@@ -117,7 +119,7 @@ def main():
         return model.process_prompt(
             PROMPT, ["text", "image"], ["video_frame"], tensors={"image_inputs": [image]},
             camera_poses=trajectory(num_frames, yaw, 0.02), intrinsics=intrinsics, num_frames=num_frames,
-        )
+        ).new_input_tensors
 
     tensors_a, tensors_b = prompt_tensors(0.002), prompt_tensors(-0.004)
 

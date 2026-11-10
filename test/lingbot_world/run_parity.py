@@ -218,7 +218,7 @@ def main():
         ref_in["prompt"], ["text", "image"], ["video_frame"],
         tensors={"image_inputs": [ref_in["image_rgb"]]},
         camera_poses=poses, intrinsics=intr, num_frames=meta["frame_num_requested"],
-    )
+    ).new_input_tensors
     lat_f = int(tensors["camera_poses"][0].shape[0])
     md = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
     image = tensors["image_inputs"][0]
