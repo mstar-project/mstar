@@ -846,6 +846,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -1031,8 +1032,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">_unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,</span>
 <span class="sd">cached_prefix} (purged by clear_rid), Admission.{held_until, parked}</span>
 <span class="sd">(purged by clear), Lockstep.read_failed_rids (purged by clear),</span>
-<span class="sd">Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info, _fwd_by_partition}</span>
-<span class="sd">and StreamBufferManager._rids (purged by remove_request), the engine's and</span>
+<span class="sd">Rebuilds.{_kept, _cursors}, Preemption._preempted, RequestStateManager.{per_request_info,</span>
+<span class="sd">_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine's and</span>
 <span class="sd">tensor manager's per-request state (including ChunkingManagement.prepared,</span>
 <span class="sd">Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and</span>
 <span class="sd">the tensor store's rid -&gt; uuids ownership, held in the Rust bookkeeper under</span>

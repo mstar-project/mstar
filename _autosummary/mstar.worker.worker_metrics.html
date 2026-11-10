@@ -493,6 +493,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -725,6 +726,14 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.drops"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.drops</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.preempted_again"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.preempted_again</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.rebuild_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.returns_preempted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.victims"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.victims</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.maybe_report"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.maybe_report()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.snapshot"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.snapshot()</span></code></a></li>
@@ -761,15 +770,61 @@ Recording never changes what any rank runs.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.worker_metrics.WorkerMetrics" title="mstar.worker.worker_metrics.WorkerMetrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a>(worker_id, interval_s, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.worker_metrics.PreemptionCounts" title="mstar.worker.worker_metrics.PreemptionCounts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PreemptionCounts</span></code></a>([victims, drops, ...])</p></td>
+<td><p>A node's preemptions since its worker started.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.worker_metrics.WorkerMetrics" title="mstar.worker.worker_metrics.WorkerMetrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a>(worker_id, interval_s, ...)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">PreemptionCounts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">victims</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drops</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuild_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">preempted_again</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returns_preempted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#PreemptionCounts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A node’s preemptions since its worker started.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>victims</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>drops</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>rebuild_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>preempted_again</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>returns_preempted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.drops">
+<span class="sig-name descname"><span class="pre">drops</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.drops" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.preempted_again">
+<span class="sig-name descname"><span class="pre">preempted_again</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.preempted_again" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens">
+<span class="sig-name descname"><span class="pre">rebuild_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.returns_preempted">
+<span class="sig-name descname"><span class="pre">returns_preempted</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.victims">
+<span class="sig-name descname"><span class="pre">victims</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.victims" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.WorkerMetrics">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuilds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuilds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_transfers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">preemptions</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -782,6 +837,7 @@ Recording never changes what any rank runs.</p>
 <li><p><strong>rebuilds</strong> (<a class="reference internal" href="mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds" title="mstar.worker.rebuild.Rebuilds"><em>Rebuilds</em></a>)</p></li>
 <li><p><strong>send</strong> (<em>Callable</em><em>[</em><em>[</em><a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><em>WorkerStatus</em></a><em>]</em><em>, </em><em>None</em><em>]</em>)</p></li>
 <li><p><strong>enable_transfers</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><em>EdgeTransfers</em></a><em>]</em>)</p></li>
+<li><p><strong>preemptions</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.worker.worker_metrics.PreemptionCounts" title="mstar.worker.worker_metrics.PreemptionCounts"><em>PreemptionCounts</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -893,6 +949,14 @@ not counted twice.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.drops"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.drops</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.preempted_again"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.preempted_again</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.rebuild_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.returns_preempted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.victims"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.victims</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.maybe_report"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.maybe_report()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.WorkerMetrics.snapshot"><code class="docutils literal notranslate"><span class="pre">WorkerMetrics.snapshot()</span></code></a></li>

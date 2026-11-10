@@ -493,6 +493,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -1020,6 +1021,22 @@ Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.</p>
 <code class="docutils literal notranslate"><span class="pre">rate(mstar_prefix_cache_query_tokens_total[5m])</span></code>. For Qwen3.5 these are the KV
 cache’s tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
 cuts to 0 still counts.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_preemptions_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Requests chosen to move to the host or drop because a grant past a request’s reservation ran short
+of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves
+itself to the host to wait.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_drops_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Chosen requests whose KV was dropped. A request leaves before its drop when
+its client goes away.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_rebuild_tokens_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Tokens the rebuild rows prefilled, cache hits included.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_rebuild_cached_pages_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Pages a rebuild row found in the prefix cache.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_preempted_again_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Requests preempted a second time. A steady rate means the pool is too small
+for the load, and more pages or fewer concurrent requests stop it.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_returns_preempted_total{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Counter. Dropped requests preempted again after their return, before they kept another token.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_component_pending_steps{model_name,</span> <span class="pre">component}</span></code></dt><dd><p>Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
 running: waiting for room in a step, or for the worker to pick the node.</p>

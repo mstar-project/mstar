@@ -846,6 +846,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -1023,9 +1024,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">array</span><span class="w"> </span><span class="kn">import</span> <span class="n">array</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">ItemsView</span><span class="p">,</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">MutableMapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">ItemsView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">MutableMapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">replace</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1060,21 +1061,51 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Prefilling">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Prefilling">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Prefilling</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A prompt mid-prefill on a node: the walk it prefills in, the tokens its chunks have run, and its length."""</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">done</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">total</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
 <div class="viewcode-block" id="RebuildCursor">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.RebuildCursor">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RebuildCursor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""A rebuild under way: the policy's walk, the request's kept ids, the dtype the walk reads them in, and the</span>
-<span class="sd">    end of its chunks that have landed, 0 before the first. It writes every id but the last (``total``), which</span>
-<span class="sd">    the next decode step reads."""</span>
+<span class="w">    </span><span class="sd">"""A rebuild under way: the walk its rows run, the tokens it writes (``total``) of an input ``length`` long,</span>
+<span class="sd">    and the end of its chunks that have landed, 0 before the first.</span>
+
+<span class="sd">    A rebuild from kept ids reads ``ids`` in ``dtype`` and writes every id but the last, which the next decode</span>
+<span class="sd">    step reads. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut from the</span>
+<span class="sd">    input the engine keeps for the prompt, up to where the prompt stood."""</span>
     <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">ids</span><span class="p">:</span> <span class="n">array</span>
-    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="n">total</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">ids</span><span class="p">:</span> <span class="n">array</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">done</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">total</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ids</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resumes_prefill</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether its request's prompt goes on past it, from the input the engine keeps for the prompt."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">total</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">length</span></div>
+
+
+
+<div class="viewcode-block" id="policies_run_here">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.policies_run_here">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">policies_run_here</span><span class="p">(</span>
+    <span class="n">policies</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RebuildPolicy</span><span class="p">],</span> <span class="n">graphs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">],</span> <span class="n">my_walks</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RebuildPolicy</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The policies whose rebuild this worker runs: it runs the node in the policy's walk and in every walk its</span>
+<span class="sd">    loop grows the KV in. A disaggregated decode node can't run the prefill walk its rebuild needs."""</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="n">node</span><span class="p">:</span> <span class="n">policy</span> <span class="k">for</span> <span class="n">node</span><span class="p">,</span> <span class="n">policy</span> <span class="ow">in</span> <span class="n">policies</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">((</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span> <span class="ow">in</span> <span class="n">my_walks</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="p">{</span><span class="n">policy</span><span class="o">.</span><span class="n">walk</span><span class="p">,</span> <span class="o">*</span><span class="n">policy</span><span class="o">.</span><span class="n">loop_walks</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">)})</span>
+    <span class="p">}</span></div>
 
 
 
@@ -1107,9 +1138,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">nodes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">KeysView</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""The nodes that declare a `RebuildPolicy`."""</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">nodes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The nodes whose requests can be rebuilt here."""</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="p">)</span>
+
+<div class="viewcode-block" id="Rebuilds.kept">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.kept">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">kept</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">KeptIds</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="Rebuilds.keep_prompts">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.keep_prompts">[docs]</a>
@@ -1190,13 +1227,18 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Rebuilds.refusal">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.refusal">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">refusal</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">loop_iters</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None when its kept ids cover its</span>
-<span class="sd">        KV: the prefill and each iteration of the policy's loop sample one id, and the KV holds all but</span>
-<span class="sd">        the last."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">refusal</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">loop_iters</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">prefilling</span><span class="p">:</span> <span class="n">Prefilling</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None. A request ``prefilling`` its</span>
+<span class="sd">        prompt is rebuilt from the input the engine keeps for the prompt, which covers what its KV holds. Any</span>
+<span class="sd">        other is rebuilt from its kept ids, which cover its KV when the prefill and each iteration of the</span>
+<span class="sd">        policy's loop sampled one id, since the KV holds all but the last."""</span>
         <span class="n">policy</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">policy</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> declares no rebuild policy"</span>
+        <span class="k">if</span> <span class="n">prefilling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
         <span class="n">kept</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="p">[</span><span class="n">node</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">kept</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="sa">f</span><span class="s2">"it keeps no ids on </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">"</span>
@@ -1211,21 +1253,28 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Rebuilds.tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.tokens">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""How many tokens ``rid``'s rebuild on ``node`` writes: its kept prompt and every sample but the last."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">prefilling</span><span class="p">:</span> <span class="n">Prefilling</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How many tokens ``rid``'s rebuild on ``node`` writes: the chunks its prompt was ``prefilling`` ran, or</span>
+<span class="sd">        else its kept prompt and every sample but the last."""</span>
+        <span class="k">if</span> <span class="n">prefilling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">prefilling</span><span class="o">.</span><span class="n">done</span>
         <span class="n">kept</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="p">[</span><span class="n">node</span><span class="p">][</span><span class="n">rid</span><span class="p">]</span>
         <span class="k">return</span> <span class="n">kept</span><span class="o">.</span><span class="n">prompt</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span></div>
 
 
 <div class="viewcode-block" id="Rebuilds.start">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.start">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Rebuild</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Open ``rid``'s rebuild on ``node``, and return what it writes."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">prefilling</span><span class="p">:</span> <span class="n">Prefilling</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Rebuild</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Open ``rid``'s rebuild on ``node``, and return what it writes from its kept ids, or None when it runs</span>
+<span class="sd">        the chunks its prompt was ``prefilling`` again, which the request's layout already describes."""</span>
         <span class="k">assert</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2">'s rebuild on </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> starts once per drop"</span>
+        <span class="k">if</span> <span class="n">prefilling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span> <span class="o">=</span> <span class="n">RebuildCursor</span><span class="p">(</span><span class="n">prefilling</span><span class="o">.</span><span class="n">walk</span><span class="p">,</span> <span class="n">prefilling</span><span class="o">.</span><span class="n">done</span><span class="p">,</span> <span class="n">prefilling</span><span class="o">.</span><span class="n">total</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">None</span>
         <span class="n">kept</span><span class="p">,</span> <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept</span><span class="p">[</span><span class="n">node</span><span class="p">][</span><span class="n">rid</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="p">[</span><span class="n">node</span><span class="p">]</span><span class="o">.</span><span class="n">walk</span>
         <span class="n">ids</span> <span class="o">=</span> <span class="n">array</span><span class="p">(</span><span class="s2">"i"</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">prompt</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">tobytes</span><span class="p">())</span>
         <span class="n">ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span> <span class="o">=</span> <span class="n">RebuildCursor</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="n">ids</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">prompt</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span> <span class="o">=</span> <span class="n">RebuildCursor</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ids</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">prompt</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">Rebuild</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="n">ids</span><span class="p">)</span></div>
 
 
@@ -1235,17 +1284,16 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span></div>
 
 
+<div class="viewcode-block" id="Rebuilds.cursor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.cursor">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cursor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RebuildCursor</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span></div>
+
+
 <div class="viewcode-block" id="Rebuilds.cursors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.cursors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">cursors</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ItemsView</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">RebuildCursor</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="o">.</span><span class="n">items</span><span class="p">()</span></div>
-
-
-<div class="viewcode-block" id="Rebuilds.host_inputs">
-<a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.host_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">host_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The input of ``rid``'s rebuild row on the host, which its length is measured from."""</span>
-        <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="p">[</span><span class="n">node</span><span class="p">]</span><span class="o">.</span><span class="n">ids_input</span><span class="p">:</span> <span class="p">[</span><span class="n">_row_ids</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)])]}</span></div>
 
 
 <div class="viewcode-block" id="Rebuilds.fill">
@@ -1254,29 +1302,29 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">chunk_ranges</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">ChunkRange</span><span class="p">],</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">MutableMapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">],</span> <span class="n">infos</span><span class="p">:</span> <span class="n">MutableMapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Give each rebuild row of ``rids`` the policy's walk, and its ids on the device when it runs its first</span>
-<span class="sd">        chunk or runs whole. A later chunk is cut from the input the engine prepared on the first."""</span>
+<span class="w">        </span><span class="sd">"""Give each rebuild row of ``rids`` its walk, and its kept ids on the device when it runs its first</span>
+<span class="sd">        chunk or runs whole. A later chunk is cut from the input the engine prepared on the first, and every</span>
+<span class="sd">        chunk of a prompt's rebuild from the input the engine keeps for the prompt."""</span>
         <span class="n">ids_input</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="p">[</span><span class="n">node</span><span class="p">]</span><span class="o">.</span><span class="n">ids_input</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
             <span class="n">cursor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span>
             <span class="n">infos</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">replace</span><span class="p">(</span><span class="n">infos</span><span class="p">[</span><span class="n">rid</span><span class="p">],</span> <span class="n">graph_walk</span><span class="o">=</span><span class="n">cursor</span><span class="o">.</span><span class="n">walk</span><span class="p">)</span>
             <span class="n">chunk</span> <span class="o">=</span> <span class="n">chunk_ranges</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">chunk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">chunk</span><span class="o">.</span><span class="n">is_first</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">cursor</span><span class="o">.</span><span class="n">ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">chunk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">chunk</span><span class="o">.</span><span class="n">is_first</span><span class="p">):</span>
                 <span class="n">ids</span> <span class="o">=</span> <span class="n">_row_ids</span><span class="p">(</span><span class="n">cursor</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">cursor</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
                 <span class="n">inputs</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">ids_input</span><span class="p">:</span> <span class="p">[</span><span class="n">to_device_nonblocking</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span><span class="o">.</span><span class="n">device</span><span class="p">)]}</span></div>
 
 
 <div class="viewcode-block" id="Rebuilds.land_chunk">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.land_chunk">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">land_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">chunk</span><span class="p">:</span> <span class="n">ChunkRange</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return whether</span>
-<span class="sd">        the rebuild has finished."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">land_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">chunk</span><span class="p">:</span> <span class="n">ChunkRange</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RebuildCursor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its</span>
+<span class="sd">        cursor once the rebuild has finished."""</span>
         <span class="n">cursor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span>
         <span class="n">cursor</span><span class="o">.</span><span class="n">done</span> <span class="o">=</span> <span class="n">cursor</span><span class="o">.</span><span class="n">total</span> <span class="k">if</span> <span class="n">chunk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">chunk</span><span class="o">.</span><span class="n">end</span>
         <span class="k">if</span> <span class="n">cursor</span><span class="o">.</span><span class="n">done</span> <span class="o">&lt;</span> <span class="n">cursor</span><span class="o">.</span><span class="n">total</span><span class="p">:</span>
-            <span class="k">return</span> <span class="kc">False</span>
-        <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="p">[(</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">)]</span>
-        <span class="k">return</span> <span class="kc">True</span></div>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cursors</span><span class="o">.</span><span class="n">pop</span><span class="p">((</span><span class="n">node</span><span class="p">,</span> <span class="n">rid</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="Rebuilds.remove_request">

@@ -18,6 +18,7 @@ mstar.engine.resources.admission
    .. autosummary::
    
       Admission
+      Refusal
    
    
 

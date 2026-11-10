@@ -493,6 +493,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -758,8 +759,8 @@ RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step
 _unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{held_until, parked}
 (purged by clear), Lockstep.read_failed_rids (purged by clear),
-Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info, _fwd_by_partition}
-and StreamBufferManager._rids (purged by remove_request), the engine’s and
+Rebuilds.{_kept, _cursors}, Preemption._preempted, RequestStateManager.{per_request_info,
+_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine’s and
 tensor manager’s per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule’s MTP maps, cleared by its cleanup_request, and
 the tensor store’s rid -&gt; uuids ownership, held in the Rust bookkeeper under

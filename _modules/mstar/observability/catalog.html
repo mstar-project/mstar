@@ -846,6 +846,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -1127,6 +1128,36 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"Prompt tokens the prefix cache already held at that lookup."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
+<span class="n">KV_PREEMPTIONS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_preemptions_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Requests chosen to move to the host or drop when an older request's grant, or their own, ran short of KV pages."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_DROPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_drops_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Preempted requests whose KV was dropped, to be rebuilt from their token ids."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_REBUILD_TOKENS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_rebuild_tokens_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Tokens of kept history the rebuild rows prefilled, cache hits included."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_REBUILD_CACHED_PAGES</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_rebuild_cached_pages_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Pages a rebuild row found in the prefix cache."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_PREEMPTED_AGAIN</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_preempted_again_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Requests preempted a second time."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_RETURNS_PREEMPTED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_returns_preempted_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Dropped requests preempted again after their return, before they kept another token."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
 <span class="n">COMPONENT_PENDING_STEPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_component_pending_steps"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
     <span class="s2">"Requests whose next step on this graph node is ready (its inputs arrived) "</span>
@@ -1183,7 +1214,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">WORKER_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
-        <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
+        <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">KV_PREEMPTIONS</span><span class="p">,</span> <span class="n">KV_DROPS</span><span class="p">,</span> <span class="n">KV_REBUILD_TOKENS</span><span class="p">,</span>
+        <span class="n">KV_PREEMPTED_AGAIN</span><span class="p">,</span> <span class="n">KV_RETURNS_PREEMPTED</span><span class="p">,</span> <span class="n">KV_REBUILD_CACHED_PAGES</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
         <span class="n">REBUILD_HOST_BYTES_USED</span><span class="p">,</span> <span class="n">REBUILD_HOST_BYTES_TOTAL</span><span class="p">,</span>
         <span class="n">TRANSFER_BYTES</span><span class="p">,</span> <span class="n">TRANSFERS</span><span class="p">,</span> <span class="n">TRANSFER_SECONDS</span><span class="p">,</span>
     <span class="p">)</span>

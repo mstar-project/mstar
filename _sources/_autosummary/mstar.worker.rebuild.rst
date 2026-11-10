@@ -9,6 +9,12 @@ mstar.worker.rebuild
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      policies_run_here
+   
    
 
    
@@ -18,6 +24,7 @@ mstar.worker.rebuild
    .. autosummary::
    
       KeptIds
+      Prefilling
       RebuildCursor
       Rebuilds
    

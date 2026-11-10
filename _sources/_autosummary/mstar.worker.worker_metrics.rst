@@ -17,6 +17,7 @@ mstar.worker.worker\_metrics
 
    .. autosummary::
    
+      PreemptionCounts
       WorkerMetrics
    
    

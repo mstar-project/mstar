@@ -493,6 +493,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.preemption.html">mstar.worker.preemption</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
@@ -1526,7 +1527,7 @@ resource that holds only some lengths.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.check_drop">
 <span class="sig-name descname"><span class="pre">check_drop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.check_drop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.check_drop" title="Link to this definition">#</a></dt>
-<dd><p>Raise if <code class="docutils literal notranslate"><span class="pre">drop</span></code> would refuse <code class="docutils literal notranslate"><span class="pre">rid</span></code>, whose rebuild writes <code class="docutils literal notranslate"><span class="pre">tokens</span></code> tokens. Changes nothing.</p>
+<dd><p>Why <code class="docutils literal notranslate"><span class="pre">drop</span></code> would refuse <code class="docutils literal notranslate"><span class="pre">rid</span></code>, whose rebuild writes <code class="docutils literal notranslate"><span class="pre">tokens</span></code> tokens, or None. Changes nothing.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1535,7 +1536,7 @@ resource that holds only some lengths.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p>None</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
 </dd>
 </dl>
 </dd></dl>
