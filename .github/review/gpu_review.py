@@ -255,8 +255,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for about two hours of
   testing once compile caches are warm (compiling doesn't count). That is a target, not a limit:
-  don't design a plan that needs much longer, and if the claims don't fit, cover the riskiest
-  first and say in the report what was left out.
+  don't design a plan that needs much longer. It comes before closing your "Not tested" list: if
+  the checks don't fit, cover them in the test matrix's priority order and list the rest as not
+  tested.
 """
 
 
