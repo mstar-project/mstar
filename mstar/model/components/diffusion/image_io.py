@@ -93,7 +93,8 @@ def truncate_to_uint8(pixels: torch.Tensor) -> torch.Tensor:
 def uint8_to_png(
     image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
 ) -> bytes:
-    """Encode one uint8 ``[3, H, W]`` (or ``[1, 3, H, W]``) tensor as PNG bytes, losslessly.
+    """Encode one uint8 ``[C, H, W]`` (or ``[1, C, H, W]``) tensor as PNG bytes, losslessly: RGB for
+    ``C`` 3, RGBA for 4.
 
     The default writer emits every scanline with PNG filter 0 and deflates the image in
     ``workers`` independent blocks (default: the CPU plan's ``png_threads``) stitched into one
@@ -106,14 +107,14 @@ def uint8_to_png(
     """
     if image.ndim == 4:
         image = image[0]
-    if image.dtype != torch.uint8 or image.ndim != 3 or image.shape[0] != 3:
-        raise ValueError(f"expected a uint8 [3, H, W] image, got {tuple(image.shape)} {image.dtype}")
-    rows = image.permute(1, 2, 0).contiguous().cpu().numpy()  # [H, W, 3]
+    if image.dtype != torch.uint8 or image.ndim != 3 or image.shape[0] not in _MODES:
+        raise ValueError(f"expected a uint8 [3 or 4, H, W] image, got {tuple(image.shape)} {image.dtype}")
+    rows = image.permute(1, 2, 0).contiguous().cpu().numpy()  # [H, W, C]
     if adaptive_filters:
         from PIL import Image
 
         buffer = io.BytesIO()
-        Image.fromarray(rows, mode="RGB").save(buffer, format="PNG", compress_level=compress_level)
+        Image.fromarray(rows, mode=_MODES[image.shape[0]]).save(buffer, format="PNG", compress_level=compress_level)
         return buffer.getvalue()
     height, width, channels = rows.shape
     raw = np.empty((height, 1 + width * channels), dtype=np.uint8)
@@ -121,12 +122,16 @@ def uint8_to_png(
     raw[:, 1:] = rows.reshape(height, width * channels)
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
-        _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
+        # 8-bit truecolor (2) or truecolor with alpha (6)
+        _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2 if channels == 3 else 6, 0, 0, 0)),
         _png_chunk(b"IDAT", _zlib_parallel(
             memoryview(raw).cast("B"), compress_level, workers or cpus.plan().png_threads,
         )),
         _png_chunk(b"IEND", b""),
     ))
+
+
+_MODES = {3: "RGB", 4: "RGBA"}
 
 
 def _zlib_parallel(data, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
@@ -206,7 +211,8 @@ def image_output_format(request_kwargs: dict | None) -> str:
 
 
 def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> bytes:
-    """Encode a uint8 ``[3, H, W]`` image for the client per the OpenAI images knobs.
+    """Encode a uint8 ``[3, H, W]`` (RGB) or ``[4, H, W]`` (RGBA) image for the client per the OpenAI
+    images knobs. JPEG has no alpha channel, so it refuses an RGBA image.
 
     ``output_format`` (``png`` default | ``jpeg`` | ``webp``) and ``output_compression``
     (0-100; the JPEG / WebP quality, default 95 / 80) come from the request; for PNG,
@@ -222,10 +228,12 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
 
     if image.ndim == 4:
         image = image[0]
+    if fmt == "jpeg" and image.shape[0] == 4:
+        raise ValueError("output_format jpeg cannot carry this image's alpha channel; use png or webp")
     quality = kwargs.get("output_compression")
     quality = int(quality) if quality is not None else (95 if fmt == "jpeg" else 80)
     buffer = io.BytesIO()
-    Image.fromarray(image.permute(1, 2, 0).contiguous().cpu().numpy(), mode="RGB").save(
+    Image.fromarray(image.permute(1, 2, 0).contiguous().cpu().numpy(), mode=_MODES[image.shape[0]]).save(
         buffer, format=fmt.upper(), quality=quality,
     )
     return buffer.getvalue()
