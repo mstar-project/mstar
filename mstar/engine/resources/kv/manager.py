@@ -3925,7 +3925,9 @@ class KVManager(AttentionResource):
             for claim in moved:
                 stream = streams[claim.label]
                 # the offload takes its pages off the allotment too, so every page it frees is room
-                self._release(rid, stream, held_pages(claim.groups), refund=False)
+                self._release(
+                    rid, stream, held_pages(claim.groups), refund=False, windows=held_pages(claim.groups[1:]),
+                )
                 # Offload changes residency, not logical stream contents.
                 stream.reset(freed=True, content_reset=False)
                 if claim.keys:
@@ -5425,8 +5427,9 @@ class KVManager(AttentionResource):
         the allotment keeps the page for the walk that writes it again. The caller recounts.
 
         ``windows`` are the window pages among ``pages``. They give back the room `_shared` kept for the ones
-        another stream still holds (`_unshare`), and none shrinks the allotment, since a window's pages only cycle:
-        the page is still held, or only the index holds it, as a leaf that can be evicted, and a page replaces it.
+        another stream still holds (`_unshare`). With ``refund`` none shrinks the allotment, since a window's pages
+        only cycle: the page is still held, or only the index holds it, as a leaf that can be evicted, and a page
+        replaces it. Without ``refund`` (an offload) they leave the allotment like any other page.
         """
         self._unshare(windows)
         self._arena.release(pages)
@@ -5435,8 +5438,8 @@ class KVManager(AttentionResource):
             evictable = () if self._index is None else self._index.evictable()
             gone = sum(
                 1 for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
-                if page not in stream.lent and page not in windows and (
-                    not refund or (owners and page not in evictable)
+                if page not in stream.lent and (
+                    not refund or (page not in windows and owners and page not in evictable)
                 )
             )
             allotment.pages = max(0, allotment.pages - gone)
