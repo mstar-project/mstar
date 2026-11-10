@@ -45,7 +45,7 @@ class _GraphSampler:
     def __init__(self):
         self.calls: list[tuple] = []
 
-    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True, greedy=False):
         self.calls.append((tuple(request_ids), apply_penalty))
         return torch.zeros(len(request_ids), dtype=torch.long)
 
@@ -72,7 +72,7 @@ class _GraphBuffers:
 
 
 def _resource(monkeypatch, buffers=None) -> tuple[SamplerResource, list[bool]]:
-    res = SamplerResource(vocab_size=V, enable_repetion_penalty=False, device=torch.device("cpu"))
+    res = SamplerResource(vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"))
     res._cg_buffers = buffers
     traced = []
 
