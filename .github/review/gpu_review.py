@@ -219,7 +219,7 @@ def beyond_vendors(text, vendors):
 
 def carry(out, pr, head_sha, runner_temp, rereview=""):
     """What the live test runs, as outputs: the review's call, read as its enums only (model output on its way to
-    the brief), and on which vendors' GPUs (`vendors`, vendors_of). Nothing runs while the review left something
+    the brief), and on which vendors' GPUs (`vendors`, bot.vendors_for). Nothing runs while the review left something
     to fix first (to_fix_first): `gated`, with the reasons in $RUNNER_TEMP/gate.txt, never in the outputs, since
     they hold model text. Otherwise the call stands unless the PR's last live test didn't pass on an ancestor of
     the head, or passed there on fewer GPU vendors than this run needs; then the run is full, with every kind of
@@ -979,7 +979,7 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner,
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
-ERR_TAIL = 4096  # how much of a box session's stderr the run's artifact keeps
+ERR_TAIL = 4096  # how much of a box session's stderr, redacted, the run's artifact keeps: its last 4 KB
 
 
 def redact(out, runner_temp, s2="", s3="", s4=""):
