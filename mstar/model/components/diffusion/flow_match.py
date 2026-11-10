@@ -63,6 +63,12 @@ class FlowMatchConfig:
     # float32 torch.linspace (Z-Image). Not in the scheduler config; the pipeline picks.
     torch_linspace: bool = False
 
+    @property
+    def min_steps(self) -> int:
+        """The fewest steps a schedule takes. The stretch to ``shift_terminal`` divides by ``1 - sigmas[-1]``, which
+        is 0 on a one-step grid (the reference yields NaN), so it needs two."""
+        return 1 if self.shift_terminal is None else 2
+
     @classmethod
     def from_scheduler_config(cls, cfg: dict, empirical_mu: bool = False) -> "FlowMatchConfig":
         """Build from a diffusers ``FlowMatchEulerDiscreteScheduler`` config dict.
@@ -139,11 +145,8 @@ class FlowMatchSchedule:
 
     @classmethod
     def build(cls, config: FlowMatchConfig, num_steps: int, image_seq_len: int) -> "FlowMatchSchedule":
-        if num_steps < 1:
-            raise ValueError(f"num_steps must be >= 1, got {num_steps}")
-        if config.shift_terminal is not None and num_steps < 2:
-            # The stretch divides by 1 - sigmas[-1], which is 0 on a one-step grid (the reference yields NaN).
-            raise ValueError(f"num_steps must be >= 2 with shift_terminal, got {num_steps}")
+        if num_steps < config.min_steps:
+            raise ValueError(f"num_steps must be >= {config.min_steps}, got {num_steps}")
         # The pipelines' explicit grid, then the scheduler's float32 numpy arithmetic.
         if config.torch_linspace:
             sigmas = torch.linspace(1.0, 1 / num_steps, num_steps, dtype=torch.float32).numpy()

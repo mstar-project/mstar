@@ -214,8 +214,7 @@ class QwenImageModel(Model):
             raise ValueError("true_cfg_scale is not a knob of this server: send the CFG scale as guidance_scale")
         steps = kwargs.get("num_inference_steps")
         steps = recipe.default_steps if steps is None else steps
-        # the schedule's stretch to shift_terminal needs two steps (one is NaN in the reference)
-        fewest, most = 1 if self.config.scheduler.shift_terminal is None else 2, self.config.max_denoise_steps
+        fewest, most = self.config.scheduler.min_steps, self.config.max_denoise_steps
         if isinstance(steps, bool) or not isinstance(steps, int) or not fewest <= steps <= most:
             raise ValueError(f"num_inference_steps must be an integer in [{fewest}, {most}]; got {steps!r}")
         scale = kwargs.get(GUIDANCE_SCALE)
