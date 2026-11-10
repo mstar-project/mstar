@@ -213,8 +213,10 @@ class GrammarRows:
         self._batch = xgr.BatchGrammarMatcher()
         self._device = device
         self._rows: dict[Any, _Row] = {}
-        # (rids, host tokens, event) per committed step not yet accepted, oldest first
-        self._pending: list[tuple[list, torch.Tensor, Any]] = []
+        # (rows, host tokens, event) per committed step not yet accepted, oldest first.
+        # Rows, not handles: a request removed meanwhile leaves its row here, and its
+        # last draw never reaches the next request given its handle.
+        self._pending: list[tuple[list[_Row], torch.Tensor, Any]] = []
         self._token_ids: dict[bytes, int] | None = None
         self._shifts = torch.arange(32, dtype=torch.int32, device=device)
 
@@ -254,7 +256,7 @@ class GrammarRows:
         index = [i for i, rid in enumerate(rids) if rid in self._rows and (kept is None or rid in kept)]
         if not index:
             return
-        rows = [rids[i] for i in index]
+        rows = [self._rows[rids[i]] for i in index]
         picked = tokens.reshape(-1)[torch.tensor(index, device=tokens.device)]
         if picked.device.type == "cpu":
             self._pending.append((rows, picked.clone(), None))
@@ -266,13 +268,11 @@ class GrammarRows:
         self._pending.append((rows, host, event))
 
     def _accept_pending(self) -> None:
-        for rids, host, event in self._pending:
+        for rows, host, event in self._pending:
             if event is not None:
                 event.synchronize()
-            for rid, token in zip(rids, host.tolist()):
-                row = self._rows.get(rid)
-                if row is not None:
-                    row.accept(token)
+            for row, token in zip(rows, host.tolist(), strict=True):
+                row.accept(token)
         self._pending.clear()
 
     def fill(self, rids) -> torch.Tensor:

@@ -61,7 +61,7 @@ def _decode(res, rids, graph, steps=40, seed=0):
         logits = torch.randn(4 if graph else len(live), V, generator=gen)
         tokens = res.sample(list(live), logits)
         res.commit(step, ctx)
-        for rid, tok in zip(list(live), tokens.tolist()):
+        for rid, tok in zip(list(live), tokens.tolist(), strict=False):
             out[rid].append(tok)
             if tok == EOS:
                 live.remove(rid)
@@ -84,6 +84,17 @@ def test_a_constrained_row_draws_its_grammar_beside_a_free_row(graph):
     assert out["json"][-1] == EOS and isinstance(json.loads(_text(out["json"]))["a"], int)
     assert out["choice"][-1] == EOS and _text(out["choice"]) in ("ab", "ba")
     assert any(t >= len(VOCAB) for t in out["free"]), "the free row was masked too"
+
+
+def test_a_request_given_a_finished_one_s_handle_starts_its_grammar_afresh():
+    """Worker handles are recycled: the last draw of a finished request is not
+    the next request's."""
+    res = _resource(graph=False)
+    for seed in (0, 1):
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab", "ba"]})))
+        out = _decode(res, [0], graph=False, seed=seed)[0]
+        assert out[-1] == EOS and _text(out) in ("ab", "ba")
+        res.remove_request(0)
 
 
 def test_a_replay_commits_the_draw_of_the_graph_it_replays():
