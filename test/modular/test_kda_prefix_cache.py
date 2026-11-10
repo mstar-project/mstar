@@ -17,11 +17,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.communication.wire import decode, encode
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.chunking import ChunkingManagement, ChunkRange
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import CachedSnapshot, EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
@@ -45,7 +47,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ChunkingPolicy, InputSeqLenInfo
 from mstar.testing_utils.worker import make_scheduler
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import ScheduleTPNode, WorkerMessage, WorkerMessageType
 from mstar.worker.batch_builder import fill_token_budget_in_start_order
 
 NODE, WALK, ROOT = "LLM", "prefill", b"a root"
@@ -315,10 +317,12 @@ def _send(leader: _Node, rid: str, chunk: ChunkRange | None = None, engine: Engi
         node_name=NODE, request_ids=(rid,), chunk_ranges={rid: chunk} if chunk else {},
         step_context=StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False),
     )
-    return ScheduleTPNode(
+    head = ScheduleTPNode(
         NODE, WALK, [f"wire-{rid}"], prefix_hits=engine.decide_cached_prefix(batch),
         page_trails=engine.page_trails(NODE),
     )
+    # the followers read rank 0's leases off the wire
+    return decode(encode(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=head))).body
 
 
 def _follow(follower: _Node, head: ScheduleTPNode, caught_up: bool = True) -> bool:
@@ -348,7 +352,7 @@ def test_a_follower_restores_the_snapshot_rank_0_leased_and_never_looks_one_up(_
     assert follower.runner.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == 0
     assert not follower.pool._leases, "the follower looked a snapshot up for itself"
     head = _send(leader, "b")
-    assert head.prefix_hits["wire-b"]["state"] == [leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE]
+    assert head.prefix_hits["wire-b"]["state"] == CachedSnapshot(leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE)
     assert _follow(follower, head)
     for node in _ranks:
         assert node.probe("b", b) == 2 * PAGE
@@ -370,7 +374,7 @@ def test_a_follower_waits_for_its_own_commit_to_file_the_snapshot(_ranks):
     for node in _ranks:
         node.ingest("b", b)
     head = _send(leader, "b")
-    assert head.prefix_hits["wire-b"]["state"][0] >= 0
+    assert head.prefix_hits["wire-b"]["state"].slot >= 0
     assert not _follow(follower, head, caught_up=False), "the follower took a snapshot it hasn't filed"
     commits[follower]()
     assert _follow(follower, head, caught_up=False)
@@ -382,7 +386,7 @@ def test_a_follower_missing_the_snapshot_rank_0_leased_stops():
     leader.prefill("a", A)
     b = A[:2 * PAGE] + _tokens(7, seed=9)
     follower.ingest("b", b)
-    lease = [leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE]
+    lease = CachedSnapshot(leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE)
     assert not follower.pool.adopt_cached_prefix("b", NODE, WALK, lease, caught_up=False)
     with pytest.raises(RuntimeError, match="rank 0 leased snapshot slot"):
         follower.pool.adopt_cached_prefix("b", NODE, WALK, lease, caught_up=True)
@@ -562,7 +566,7 @@ def test_each_chunks_end_is_kept_alike_on_every_rank_and_a_resend_restores_the_l
     for node in ranks:
         node.ingest("c", c)
     head = _send(leader, "c")
-    assert head.prefix_hits["wire-c"]["state"] == [leader.snapshot("b", 5 * PAGE), 5 * PAGE, 5 * PAGE]
+    assert head.prefix_hits["wire-c"]["state"] == CachedSnapshot(leader.snapshot("b", 5 * PAGE), 5 * PAGE, 5 * PAGE)
     assert _follow(follower, head)
     for node in ranks:
         assert node.probe("c", c) == 5 * PAGE

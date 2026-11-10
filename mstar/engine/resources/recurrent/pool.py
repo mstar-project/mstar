@@ -19,6 +19,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     CachedPrefix,
+    CachedSnapshot,
     CGSlotKey,
     CGSlotSpec,
     EngineResourceInfo,
@@ -911,10 +912,9 @@ class RecurrentStatePool(Resource):
         lease = self._leases[rid] = SnapshotLease(label, snap, pages * self._kv.config.tokens_per_page, hit)
         return lease
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedSnapshot | None:
         """On rank 0 of a TP node, the snapshot the request restores, leased as its step is sent
-        off the KV cache's lease. ``[slot, tokens, hit]``, the slot -1 where none fits: the
-        followers reserve the same snapshot writes off the hit."""
+        off the KV cache's lease. The followers reserve the same snapshot writes off its hit."""
         kv = self._kv
         if kv is None or self._world_size == 1:
             return None
@@ -930,16 +930,16 @@ class RecurrentStatePool(Resource):
                 if not self._can_restore(rid, label):
                     return None
                 lease = self._take_snapshot(rid, label, keys, hit)
-        return [-1 if lease.slot is None else lease.slot, lease.tokens, lease.hit]
+        return CachedSnapshot(-1 if lease.slot is None else lease.slot, lease.tokens, lease.hit)
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedSnapshot, caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease the snapshot rank 0 did (``lease_cached_prefix``'s list). False
+        """On a TP follower, lease the snapshot rank 0 did (``lease_cached_prefix``'s). False
         until this rank's own commit has filed it, which can lag rank 0's; once ``caught_up`` a
         missing snapshot, or one filed in another slot, means the pools diverged, and it raises."""
         kv = self._kv
-        slot, tokens, hit = pages
+        slot, tokens, hit = lease.slot, lease.tokens, lease.hit
         label = kv.keyed_label(rid, node_name, graph_walk) if kv is not None else None
         if label is None:
             raise RuntimeError(
