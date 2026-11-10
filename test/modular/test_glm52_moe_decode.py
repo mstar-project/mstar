@@ -74,7 +74,8 @@ def _quantize(w, block):
 
 def _random_fp8(param, scale, block, std, gen):
     """Fill fp8 expert weights with N(0, std) values times a log-uniform 1/4..4 factor per
-    128 x 128 block, so scales vary across blocks as a checkpoint's do."""
+    128 x 128 block, so scales vary across blocks as a checkpoint's do. ``scale`` is the
+    experts' int32 container of the fp32 scales."""
     E, N, K = param.shape
     bo, bi = block
     for e0 in range(0, E, 32):
@@ -83,11 +84,12 @@ def _random_fp8(param, scale, block, std, gen):
         f = torch.exp2(torch.rand(e1 - e0, N // bo, 1, K // bi, 1, device=param.device,
                                   generator=gen) * 4 - 2)
         w = (w.view(e1 - e0, N // bo, bo, K // bi, bi) * f).view(e1 - e0, N, K)
-        param.data[e0:e1], scale.data[e0:e1] = _quantize(w, block)
+        param.data[e0:e1], scale.data.view(torch.float32)[e0:e1] = _quantize(w, block)
 
 
 def _block(*, hidden=6144, inter=256, experts=256, top_k=8, bias_std=0.02, seed=0):
-    """One TP8 rank's fp8 MoE block on CUDA (a TP1 block of the per-rank intermediate)."""
+    """One TP8 rank's fp8 MoE block on CUDA (a TP1 block of the per-rank intermediate), its
+    experts holding block-fp8 storage as the quantization plan's stored load leaves them."""
     cfg = Glm52ModelConfig.reduced()
     cfg.hidden_size, cfg.moe_intermediate_size = hidden, inter
     cfg.n_routed_experts, cfg.num_experts_per_tok = experts, top_k
@@ -98,11 +100,12 @@ def _block(*, hidden=6144, inter=256, experts=256, top_k=8, bias_std=0.02, seed=
             block = Glm52SparseMoeBlock(cfg)
     finally:
         torch.set_default_dtype(torch.float32)
+    block.experts_prepare("fp8_block", BLOCK)
     gen = torch.Generator(device="cuda").manual_seed(seed)
     exp = block.experts
     with torch.no_grad():
-        _random_fp8(exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv, BLOCK, 0.02, gen)
-        _random_fp8(exp.down_proj_fp8, exp.down_proj_scale_inv, BLOCK, 0.02, gen)
+        _random_fp8(exp.gate_up_proj, exp.gate_up_proj_scale_inv, BLOCK, 0.02, gen)
+        _random_fp8(exp.down_proj, exp.down_proj_scale_inv, BLOCK, 0.02, gen)
         block.gate.weight.normal_(0.0, 0.02, generator=gen)
         block.gate.e_score_correction_bias.normal_(0.0, bias_std, generator=gen)
         for p in block.shared_expert.parameters():
@@ -127,10 +130,10 @@ def _oracle(block, x, topk_w, topk_ids):
     mag = torch.zeros(x.shape, device=x.device)
     for e in topk_ids.unique().tolist():
         gate_up = dequantize_fp8_block_weight(
-            exp.gate_up_proj_fp8[e], exp.gate_up_proj_scale_inv[e],
+            exp.gate_up_proj[e], exp.gate_up_proj_scale_inv[e].view(torch.float32),
             block_size=block.block_size, out_dtype=torch.float32)
         down = dequantize_fp8_block_weight(
-            exp.down_proj_fp8[e], exp.down_proj_scale_inv[e],
+            exp.down_proj[e], exp.down_proj_scale_inv[e].view(torch.float32),
             block_size=block.block_size, out_dtype=torch.float32)
         rows, slots = (topk_ids == e).nonzero(as_tuple=True)
         gate, up = (xs[rows] @ gate_up.T).chunk(2, dim=-1)
