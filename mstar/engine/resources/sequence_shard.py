@@ -174,6 +174,8 @@ class SequenceShard(Resource):
 
     prefix_skip_safe = True
     supports_split_steps = True
+    # holds no per-request state, so a dropped request leaves nothing behind
+    supports_drop = True
 
     def resident_refusal(self) -> str | None:
         return None
