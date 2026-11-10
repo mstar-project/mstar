@@ -938,9 +938,6 @@ whole experts. Attention and dense MLPs stay TP-sharded:
      - ``tp`` (default) or ``ep``.
    * - ``ep_group``
      - The ranks EP spans. Only ``tp``, the group's TP ranks, exists today.
-   * - ``debug_check_routing``
-     - Device-assert that every rank routes each token to the same experts. Costs one
-       all-gather per MoE layer; off by default. Needs ``parallel: ep``.
    * - ``log_expert_load_every``
      - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off.
        Needs ``parallel: ep``.

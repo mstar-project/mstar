@@ -166,6 +166,15 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``MSTAR_DRAIN_TTL_S``
+     - ``120``
+     - Seconds the conductor waits, once a request's teardown starts, for
+       every reader's ``READS_DONE`` before it forces the teardown (logged
+       at ERROR), so a worker that crashed or hung cannot hold the
+       request's concurrency slot or its client's failure notice forever;
+       a stalled reader may then still hold one of the request's segments.
+       Also how long an abort or a ``READS_DONE`` that arrived ahead of its
+       request is kept. Read in ``Conductor.__init__``.
    * - ``NCCL_SOCKET_IFNAME``
      - ``lo``
      - NCCL's own variable. Every worker runs on the conductor's host, so
@@ -474,6 +483,19 @@ and its bridge (see :doc:`installation`).
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_TOKENIZE_CHUNK_CHARS``
+     - ``4096``
+     - A prompt longer than this many characters is encoded as parallel
+       chunks, one per this many characters (at least two, at most
+       ``MSTAR_TOKENIZE_MAX_CHUNKS``), with the same ids as one encode.
+       ``0`` encodes every prompt in one piece. Read once, when
+       ``mstar.utils.fast_tokenize`` is imported, by the models that
+       tokenize through its ``encode_ids`` (Qwen3.5, Glimmer, Ripple,
+       Phi-4-multimodal).
+   * - ``MSTAR_TOKENIZE_MAX_CHUNKS``
+     - ``8``
+     - Most chunks one prompt is cut into; a longer prompt gets longer
+       chunks. Read with ``MSTAR_TOKENIZE_CHUNK_CHARS``.
    * - ``MSTAR_OPENAI_ADAPTER``
      - set by the launcher
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
@@ -577,6 +599,15 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_NUM_SLOTS``
+     - ``2``
+     - Buffer slots a double-buffered node rotates its steps through; each
+       accelerator graph bucket is captured once per slot. A node is
+       double-buffered when pre-planning is on and one of its resources
+       supports it, or when a resource sets ``force_double_buffer``; any
+       other node has one slot whatever this says. A value below ``2`` is
+       raised to ``2`` with a warning: such a node has no single-buffered
+       form. Read in ``SubmoduleManagement.__post_init__``.
    * - ``MSTAR_STEP_THREADS``
      - config's ``knobs: step_threads``, else ``threaded``
      - Where a worker runs a step's host work. ``threaded`` runs admit, plan and
@@ -754,6 +785,12 @@ Worker scheduling
        allocating. ``50000`` removed them on Qwen3.5 0.8B at c=128 (an 8%
        shorter decode step), at the cost of holding at most that many young
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
+   * - ``MSTAR_PY_SWITCH_INTERVAL_SEC``
+     - unset
+     - Seconds each worker process passes to ``sys.setswitchinterval`` at
+       the top of ``Worker.run``: how long one of its Python threads may
+       hold the GIL while another waits for it. Unset keeps CPython's 5 ms;
+       a value that is not a positive number is ignored with a warning.
    * - ``MSTAR_RESIDENT_PLANNING``
      - config's ``knobs: resident_planning``, else ``auto``
      - ``auto`` runs a node's captured decode steps off per-request tables on
@@ -873,6 +910,16 @@ Compilation
        output reproduces across server processes and the cold start shrinks,
        at the cost of one-row decode speed. Only Qwen3.5's text walks read it
        (``knobs.compile_deterministic``).
+   * - ``MSTAR_FLEX_BACKEND``
+     - ``FLASH`` where it can run, else ``TRITON``
+     - The kernel behind the compiled ``flex_attention`` over a ring KV
+       cache (Waypoint's DiT attention): ``FLASH`` is flash-attn-4's,
+       ``TRITON`` Inductor's Triton template. Unset picks ``FLASH`` and
+       falls back to ``TRITON`` with a warning when flash-attn-4 isn't
+       importable or torch is older than 2.11; an explicit ``FLASH`` fails
+       at startup instead, and any other value is refused. Read once at
+       import (``_resolve_flex_backend`` in
+       ``mstar/engine/resources/attn/flex.py``). See :doc:`installation`.
    * - ``TRITON_PTXAS_BLACKWELL_PATH``
      - torch's ptxas, when needed
      - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas
