@@ -1012,15 +1012,19 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
-def test_a_placed_pools_own_tokens_attend_at_the_contexts_sm_scale(monkeypatch):
-    """The two parts merge by log-sum-exp, so a declared ``sm_scale`` must reach both."""
+@pytest.mark.parametrize("over_sp", [False, True], ids=["tp", "sp"])
+def test_a_placed_pools_own_tokens_attend_at_the_contexts_sm_scale(over_sp, monkeypatch):
+    """The two parts merge by log-sum-exp, so a declared ``sm_scale`` must reach both: TP's whole
+    rows on the ragged prefill, SP's zigzag share on one-slot pages."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
+    groups = (CommGroup.trivial(), _group(0, P)) if over_sp else (_group(0, P), CommGroup.trivial())
+    joint = JointGroups(tp_group=groups[0], sp_group=groups[1], instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32, sm_scale=0.5)
     _plan(attn, _Case.build(PREFILL_ROWS, CPU, torch.float32))
     state = attn._current_plan_states["main"]
-    assert state.new.sm_scale == state.context.sm_scale == 0.5
+    own = state.new.kernel.kernel if over_sp else state.new._ragged
+    assert own.sm_scale == state.context.sm_scale == 0.5
 
 
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
