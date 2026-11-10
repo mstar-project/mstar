@@ -28,9 +28,16 @@
         "group": "User guide",
         "pages": [
           "serving",
-          "metrics",
           "clients",
-          "evaluation"
+          "metrics",
+          {
+            "group": "Evaluation",
+            "pages": [
+              "evaluation",
+              "evaluation/compare",
+              "evaluation/full-duplex"
+            ]
+          }
         ]
       },
       {
