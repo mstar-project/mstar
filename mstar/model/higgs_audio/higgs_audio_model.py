@@ -208,7 +208,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
             ids += enc("<think>\n\n</think>\n\n")
         return torch.tensor(ids, dtype=torch.long)
 
-    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         """The reference's front end: fixed ``chunk_size_seconds`` chunks (no
         VAD), whisper-large-v3 mels padded to the longest chunk. The clip
         fills a pad per row the projector keeps; its grid is each chunk's

@@ -286,7 +286,7 @@ def test_two_intakes_may_share_a_placeholder():
 
     model = object.__new__(Model)
     model.media = tuple(
-        MediaIntake(m, encoder, unk, lambda attachment, metadata, n=n: PreparedMedia({}, [n]))
+        MediaIntake(m, encoder, unk, lambda attachment, metadata, request, n=n: PreparedMedia({}, [n]))
         for m, encoder, n in (("image", VISION, 2), ("audio", AUDIO, 3))
     )
     attachments = {"image_inputs": [torch.zeros(1)], "audio_inputs": [torch.zeros(1)]}

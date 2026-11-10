@@ -3423,11 +3423,10 @@ through a sliding-window pool. A model without text prompts (``TEXT_PROMPTS = Fa
 its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
 nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
 renders each), the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+placeholders an attachment fills (``runs(attachment, metadata, request)``, one by default; a Qwen3.5 video fills one
 per temporal group), and ``prepare``, which turns an attachment into the encoder's input
-tensors and each placeholder's tokens (a ``PreparedMedia``). Both see the attachment and its loader
-metadata only; a request knob they read (MiniCPM-o's ``max_slice_nums``) is put in each
-attachment's metadata by the model's ``process_prompt``. ``_prompt_ids`` renders and
+tensors and each placeholder's tokens (a ``PreparedMedia``). Both see the attachment, its loader
+metadata and the request's kwargs, as ``process_prompt`` got them (MiniCPM-o's ``max_slice_nums``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
 to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,

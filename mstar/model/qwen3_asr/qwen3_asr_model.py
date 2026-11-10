@@ -280,7 +280,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             raise ValueError("the prompt must not contain <|audio_pad|>")
         return torch.tensor(ids, dtype=torch.long)
 
-    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         """The samples go to the encoder as they are. The log-mel is its first
         step on the GPU (spectrograms on the data worker's CPU threads were
         the serving bottleneck). The prompt only needs the frame count."""

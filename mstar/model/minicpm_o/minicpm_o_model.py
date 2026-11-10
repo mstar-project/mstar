@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -175,6 +176,11 @@ def _as_pil(image: torch.Tensor):
     if image.shape[0] == 1:
         image = image.expand(3, -1, -1)
     return Image.fromarray(image.permute(1, 2, 0).cpu().contiguous().numpy(), mode="RGB")
+
+
+def _max_slice_nums(request: Mapping) -> int:
+    """The request's ``max_slice_nums`` (`process_prompt` checks it), or the checkpoint's."""
+    return request.get(MAX_SLICE_NUMS_KEY) or processor.MAX_SLICE_NUMS
 
 
 def _image_size(image: torch.Tensor) -> tuple[int, int]:
@@ -508,8 +514,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
     ) -> ProcessPromptOutput:
         """The scaffold's intake, after MiniCPM-o's own request knobs: a
         spoken reply's voice clip joins the prompt as a system-turn audio
-        attachment, and ``max_slice_nums`` rides each image's metadata to its
-        intake. Then the TTS's KV layout and a spoken reply's text cap."""
+        attachment. Then the TTS's KV layout and a spoken reply's text cap."""
         unsupported = set(output_modalities) - {TEXT, "audio"}
         if unsupported:
             raise ValueError(f"MiniCPM-o outputs text and audio; got {sorted(unsupported)}")
@@ -563,11 +568,6 @@ class MiniCPMOModel(MultimodalDecoderModel):
             tensors["audio_inputs"] = [voice, *tensors.get("audio_inputs", [])]
             if metadata.get("audio_inputs"):
                 metadata["audio_inputs"] = [{}, *metadata["audio_inputs"]]
-        images = tensors.get("image_inputs", [])
-        given = list(metadata.get("image_inputs") or ())
-        metadata["image_inputs"] = [
-            {**(given[i] if i < len(given) else {}), MAX_SLICE_NUMS_KEY: max_slice_nums} for i in range(len(images))
-        ]
         # the parts carry the text; an empty request is refused above
         out = super().process_prompt(
             "" if prompt is None else prompt, [p.modality for p in parts], output_modalities, tensors, parts,
@@ -608,40 +608,37 @@ class MiniCPMOModel(MultimodalDecoderModel):
             use_tts_template=kwargs.get("use_tts_template", bool(raw.get("audio"))),
             enable_thinking=kwargs.get("enable_thinking", False),
         )
-        max_slice_nums = kwargs.get(MAX_SLICE_NUMS_KEY) or processor.MAX_SLICE_NUMS
+        max_slice_nums = _max_slice_nums(kwargs)
         text = processor.expand_tags(
             text,
             [
                 processor.image_placeholder(i, processor.slice_grid(_image_size(image), max_slice_nums))
                 for i, image in enumerate(raw.get("image", []))
             ],
-            [processor.audio_placeholder(self._audio_runs(clip, {})) for clip in raw.get("audio", [])],
+            [processor.audio_placeholder(self._audio_runs(clip, {}, kwargs)) for clip in raw.get("audio", [])],
         )
         listen = self.tokenizer.convert_tokens_to_ids("<|listen|>")
         return torch.tensor([t for t in self.tokenizer.encode(text) if t != listen], dtype=torch.long)
 
-    def _image_runs(self, image: torch.Tensor, metadata: dict) -> int:
+    def _image_runs(self, image: torch.Tensor, metadata: dict, request: Mapping = {}) -> int:
         """The source image's run, and one per slice."""
-        grid = processor.slice_grid(_image_size(image), metadata.get(MAX_SLICE_NUMS_KEY, processor.MAX_SLICE_NUMS))
-        return processor.image_runs(grid)
+        return processor.image_runs(processor.slice_grid(_image_size(image), _max_slice_nums(request)))
 
-    def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _image_intake(self, image: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         """Each slice's patches, its ``num_queries`` tokens and its ``(h, w)``
         in patches, which the tower lays its segments out by."""
         p = self.config.vision.patch_size
-        slices, _ = processor.slice_image(
-            _as_pil(image), metadata.get(MAX_SLICE_NUMS_KEY, processor.MAX_SLICE_NUMS), p,
-        )
+        slices, _ = processor.slice_image(_as_pil(image), _max_slice_nums(request), p)
         patches, grids = zip(*(processor.slice_patches(s, p) for s in slices), strict=True)
         queries = self.config.resampler.num_queries
         # bf16 is what the tower casts them to before its patch conv, so the cast is exact
         return PreparedMedia({"pixel_values": torch.cat(patches).to(torch.bfloat16)}, [queries] * len(grids), grids)
 
-    def _audio_runs(self, clip: torch.Tensor, metadata: dict) -> int:
+    def _audio_runs(self, clip: torch.Tensor, metadata: dict, request: Mapping = {}) -> int:
         """One run a clip, none for a clip too short to pool to a token."""
         return 1 if processor.audio_tokens(clip.numel(), self.config.audio) > 0 else 0
 
-    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         """A clip's log-mel pieces (30 s each at most), cut to their frames
         and joined; its run's tokens, and its pieces' mel lengths, which the
         encoder lays its segments out by."""

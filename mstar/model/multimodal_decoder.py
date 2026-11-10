@@ -85,12 +85,14 @@ class PreparedMedia(NamedTuple):
 class MediaIntake:
     """How a prompt's attachments of one ``modality`` reach their encoder.
 
-    Each attachment fills ``runs(attachment, metadata)`` placeholders
+    Each attachment fills ``runs(attachment, metadata, request)`` placeholders
     ``pad`` in the rendered prompt (one when ``runs`` is None);
-    ``prepare(attachment, metadata)`` gives its `PreparedMedia`, and each
-    placeholder is expanded to its run's tokens, between ``sentinels`` when
-    given. ``metadata`` is the attachment's loader metadata, ``{}`` when it
-    came with none. Intakes may share a ``pad`` (and then its sentinels):
+    ``prepare(attachment, metadata, request)`` gives its `PreparedMedia`, and
+    each placeholder is expanded to its run's tokens, between ``sentinels``
+    when given. ``metadata`` is the attachment's loader metadata, ``{}`` when
+    it came with none, and ``request`` the request's kwargs, as
+    ``process_prompt`` got them (a knob such as MiniCPM-o's
+    ``max_slice_nums``). Intakes may share a ``pad`` (and then its sentinels):
     the nth placeholder of a pad goes to the nth attachment of that pad in
     the order of the prompt's parts, which is where `_prompt_ids` renders
     each attachment.
@@ -99,9 +101,9 @@ class MediaIntake:
     modality: str
     encoder: MediaEncoder
     pad: int
-    prepare: Callable[[torch.Tensor, dict], PreparedMedia]
+    prepare: Callable[[torch.Tensor, dict, Mapping], PreparedMedia]
     sentinels: tuple[int, int] | None = None
-    runs: Callable[[torch.Tensor, dict], int] | None = None
+    runs: Callable[[torch.Tensor, dict, Mapping], int] | None = None
 
 
 class MediaPrompt(NamedTuple):
@@ -326,7 +328,7 @@ class MultimodalDecoderModel(Model):
         want: dict[int, int] = {}
         for m, intake in media.items():
             want[intake.pad] = want.get(intake.pad, 0) + sum(
-                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i)) for i in range(len(raw[m]))
+                1 if intake.runs is None else intake.runs(raw[m][i], metadata(m, i), kwargs) for i in range(len(raw[m]))
             )
         for pad, n in want.items():
             found = int((ids == pad).sum())
@@ -347,7 +349,7 @@ class MultimodalDecoderModel(Model):
             intake = media.get(part.modality)
             if intake is None:
                 continue
-            prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index))
+            prepared = intake.prepare(raw[part.modality][part.index], metadata(part.modality, part.index), kwargs)
             grids = [()] * len(prepared.tokens) if prepared.grids is None else prepared.grids
             pad_runs[intake.pad] += [
                 MediaRun(n, intake.encoder.output, grid) for n, grid in zip(prepared.tokens, grids, strict=True)

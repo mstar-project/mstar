@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -304,7 +305,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         video = sample_video(filepath, self.video_processor)
         return TensorAndMetadata(data=video.frames, metadata=video.metadata)
 
-    def _video_runs(self, video: torch.Tensor, metadata: dict) -> int:
+    def _video_runs(self, video: torch.Tensor, metadata: dict, request: Mapping = {}) -> int:
         """A video's pad runs: one per temporal group."""
         return len(self._video_timestamps(metadata))
 
@@ -387,7 +388,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             raise ValueError("this Qwen3.5 checkpoint has no vision tower; send text only")
         return self.vision_config.spatial_merge_size
 
-    def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _image_intake(self, image: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         merge = self._merge()
         # Resized and patchified here, still bytes: the vision encoder
         # rescales and normalizes on the device (`pixel_normalizer`). That is
@@ -402,7 +403,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
 
-    def _video_intake(self, frames: torch.Tensor, metadata: dict) -> PreparedMedia:
+    def _video_intake(self, frames: torch.Tensor, metadata: dict, request: Mapping = {}) -> PreparedMedia:
         """Each temporal group is placed like a one-frame image."""
         merge = self._merge()
         video = self._preprocess_video(frames, metadata, self._video_timestamps(metadata))
