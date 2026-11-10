@@ -29,7 +29,7 @@ def test_longctx_config_window_fits_its_pages():
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks
     ladders = cfg["prefill_token_buckets"]["LLM"]["prefill"]
-    assert max(n for ladder in ladders.values() for n in ladder) <= model.config.prefill_chunk_tokens
+    assert max(n for ladder in ladders.values() for n in ladder) <= model.config.prefill_window_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -38,7 +38,7 @@ def test_longctx_config_window_fits_its_pages():
 
 
 def test_long_context_bind_refuses_an_empty_prefill_window():
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=0)
+    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_window_tokens=0)
     with pytest.raises(ValueError, match="must be >= 1"):
         _submodule(cfg).bind_node_resources({})
 
@@ -47,7 +47,7 @@ def test_long_context_captures_no_prefill_bucket_past_the_chunk():
     import torch
 
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
+    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_window_tokens=chunk)
     sub = _submodule(cfg)
     sub._moe_capture_blocked = lambda tp_world_size: False
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
