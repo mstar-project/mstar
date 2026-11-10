@@ -213,7 +213,10 @@ def main():
     args = ap.parse_args()
     MSTAR_URL = args.mstar_url
 
-    import uvicorn
+    try:
+        import uvicorn
+    except ImportError:
+        sys.exit("this UI runs on uvicorn, which mstar no longer installs: pip install uvicorn")
 
     print(f"Nemotron-Duplex web UI -> model server {MSTAR_URL}")
     print(f"open http://{args.host}:{args.port}/  (mic needs localhost or HTTPS)")

@@ -54,7 +54,11 @@ def offline_windows(paths: list[str], checkpoint: str, tokenizer: str, size: str
     """What the server should return for over-40 s uploads: the route's own
     windows, each transcribed alone by the offline model, joined by a space."""
     from mstar.api_server.openai.adapters import OmnilingualASRAdapter
-    from mstar.api_server.openai.serving_transcriptions import planner_for
+    from mstar.api_server.openai.serving_transcriptions import (
+        CUT_FRAME_SECONDS,
+        CUT_SEARCH_SECONDS,
+        WindowPlanner,
+    )
     from mstar.model.omnilingual_asr import audio, config, weight_loader
     from mstar.model.omnilingual_asr import tokenizer as tok_mod
     from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC
@@ -74,7 +78,17 @@ def offline_windows(paths: list[str], checkpoint: str, tokenizer: str, size: str
             # the planner deletes its input on cleanup, as the route deletes the upload
             copy = Path(tmp) / Path(path).name
             shutil.copyfile(path, copy)
-            planner = planner_for(OmnilingualASRAdapter(), str(copy), Path(tmp))
+            # the adapter's window policy, as mstar-server applies it (rust/server/src/transcription/)
+            adapter = OmnilingualASRAdapter()
+            planner = WindowPlanner(
+                str(copy), adapter.window_seconds or adapter.max_audio_seconds, Path(tmp),
+                balanced=adapter.balanced_windows,
+                search_seconds=CUT_SEARCH_SECONDS if adapter.window_search_seconds is None
+                else adapter.window_search_seconds,
+                frame_seconds=CUT_FRAME_SECONDS if adapter.window_frame_seconds is None
+                else adapter.window_frame_seconds,
+                whole_seconds=adapter.whole_seconds,
+            )
             texts, windows = [], planner.fixed()
             for window in windows:
                 wave = audio.preprocess(audio.load_waveform(window.path))

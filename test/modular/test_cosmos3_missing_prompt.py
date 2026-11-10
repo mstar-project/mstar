@@ -1,17 +1,13 @@
 """A Cosmos3 request with no prompt must still feed the DiT prefill its
 ``text_inputs``, or that node never becomes ready and the request hangs with
-the worker idle. /generate sends an empty ``text`` field as None, so an empty
-task ends up here too."""
+the worker idle. An empty ``text`` field must not hang either."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
 from test_ingest_unpersist import plan_step
 
-from mstar.api_server import entrypoint
 from mstar.graph.base import TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.model.base import ProcessPromptOutput
@@ -55,22 +51,3 @@ def test_prefill_nodes_ready_without_prompt(prompt, out_mod, kwargs) -> None:
     for edge in plan_step(model, plan, 0, signals).inputs:
         assert io.ingest_input(edge), edge.name
     assert io.ready_node_names == {DIT_NODE, VAE_ENCODER_NODE}
-
-
-def test_generate_form_turns_empty_text_into_none(monkeypatch) -> None:
-    seen = {}
-
-    class Server:
-        async def wait_for_request_id(self, request_id):
-            return None
-
-        def submit_request(self, **kwargs):
-            seen.update(kwargs)
-            raise HTTPException(status_code=418)
-
-    monkeypatch.setattr(entrypoint, "api_server", Server())
-    response = TestClient(entrypoint.app).post("/generate", data={
-        "text": "", "input_modalities": "image,text", "output_modalities": "action",
-    })
-    assert response.status_code == 418
-    assert seen["text"] is None and seen["input_modalities"] == ["image"]

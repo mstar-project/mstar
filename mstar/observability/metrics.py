@@ -24,8 +24,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterable
-from contextvars import ContextVar
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 try:
@@ -259,96 +258,6 @@ class _Refusals:
         for (route, status), n in sorted(counts.items()):
             family.add_metric([self.model_name, route, status], n)
         yield family
-
-
-class _Request:
-    """One HTTP request seen by :class:`RefusalMiddleware`."""
-
-    __slots__ = ("submitted",)
-
-    def __init__(self):
-        self.submitted = False
-
-
-# A mutable holder rather than a bool: run_in_threadpool and new tasks run in
-# a copy of the context, which still holds the same object.
-_REQUEST: ContextVar[_Request | None] = ContextVar("mstar_http_request", default=None)
-
-
-def mark_submitted() -> None:
-    """The HTTP request being served reached ``APIServer``: it is counted in
-    ``mstar_requests_total`` when it ends, so it is never a refusal."""
-    request = _REQUEST.get()
-    if request is not None:
-        request.submitted = True
-
-
-def route_template(scope: dict, routes: Iterable) -> str:
-    """The route path the request matched (``/v1/chat/completions``), never
-    the raw URL; ``unmatched`` when no route matches. ``routes`` are the
-    app's routes, searched for a request refused before routing (the API
-    key, a declared body size) the way the router matches: a full match
-    before a method-only one."""
-    route = scope.get("route")
-    if route is None:
-        from starlette.routing import Match
-
-        partial = None
-        for candidate in routes:
-            # FastAPI 0.150+ lists an included router as one entry with no
-            # path, whose match names no route; its routes are listed too.
-            if getattr(candidate, "path", None) is None:
-                continue
-            match, _ = candidate.matches(scope)
-            if match is Match.FULL:
-                route = candidate
-                break
-            if match is Match.PARTIAL and partial is None:
-                partial = candidate
-        route = route or partial
-    return getattr(route, "path", None) or "unmatched"
-
-
-class RefusalMiddleware:
-    """Counts ``mstar_http_refusals_total`` for the Python frontend: every
-    HTTP response with a 4xx status for a request that never reached
-    ``APIServer.submit_request`` (:func:`mark_submitted`). A request that was
-    submitted and then failed is counted by ``mstar_requests_total`` instead.
-
-    Sits outside the API key and body limit middlewares (their 401 and 413 are
-    sent before routing) and inside CORS (a preflight is not a request).
-    WebSocket handshakes are not counted. With metrics off it only checks
-    ``metrics()`` for None.
-    """
-
-    def __init__(
-        self, app, metrics: Callable[[], ServingMetrics | None], routes: Callable[[], Iterable],
-    ):
-        self.app = app
-        self.metrics = metrics
-        self.routes = routes
-
-    async def __call__(self, scope, receive, send):
-        metrics = self.metrics() if scope["type"] == "http" else None
-        if metrics is None:
-            await self.app(scope, receive, send)
-            return
-        request = _Request()
-        status = 0
-
-        async def send_and_note_status(message):
-            nonlocal status
-            if message["type"] == "http.response.start":
-                status = message["status"]
-            await send(message)
-
-        token = _REQUEST.set(request)
-        try:
-            await self.app(scope, receive, send_and_note_status)
-        finally:
-            _REQUEST.reset(token)
-            if 400 <= status < 500 and not request.submitted:
-                metrics.refusals.inc(route_template(scope, self.routes()), status)
 
 
 class _DataWorkerSeries(NamedTuple):

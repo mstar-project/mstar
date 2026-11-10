@@ -19,21 +19,16 @@ the order the conductor and the data worker send them.
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import queue
 import threading
 import time
 from types import SimpleNamespace
 
-import httpx
 import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
-from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
@@ -575,73 +570,7 @@ def test_an_id_is_free_once_its_request_finished_even_before_it_is_read():
     assert pw.aborted == [] and not s.pending_requests
 
 
-def test_an_immediate_retry_waits_for_the_dropped_request_s_abort():
-    """The retry arrives before the server has aborted the stream its client
-    dropped: it waits for that abort instead of being refused."""
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    s.submit_request(text="first", request_id="X", **TEXT)
-
-    async def run():
-        asyncio.get_running_loop().call_later(0.02, s.abort_request, "X")
-        await s.wait_for_request_id("X")
-        s.submit_request(text="retry", request_id="X", **TEXT)
-
-    asyncio.run(run())
-    assert [inp.text for inp in pw.inputs] == ["first", "retry"]
-    assert pw.aborted == [pw.inputs[0].request_id]
-
-
-def test_the_wait_for_a_running_id_is_bounded(monkeypatch):
-    monkeypatch.setattr(entrypoint, "DUPLICATE_ID_GRACE_S", 0.05)
-    s = _api_server(_PreprocessWorker())
-    s.submit_request(text="first", request_id="X", **TEXT)
-
-    t0 = time.monotonic()
-    asyncio.run(s.wait_for_request_id("X"))
-
-    assert 0.05 <= time.monotonic() - t0 < 1.0
-    assert s._id_waiters == set()
-
-
-def test_one_caller_at_a_time_waits_on_a_running_id(monkeypatch):
-    """N duplicates of a running id cost one poll loop: while one caller
-    waits, another returns at once (and submit_request then refuses it)."""
-    monkeypatch.setattr(entrypoint, "DUPLICATE_ID_GRACE_S", 0.3)
-    s = _api_server(_PreprocessWorker())
-    s.submit_request(text="first", request_id="X", **TEXT)
-
-    async def run():
-        first = asyncio.create_task(s.wait_for_request_id("X"))
-        await _await(lambda: "X" in s._id_waiters)
-        t0 = time.monotonic()
-        await s.wait_for_request_id("X")
-        second_s = time.monotonic() - t0
-        assert not first.done(), "the first caller stopped waiting"
-        await first
-        return second_s
-
-    assert asyncio.run(run()) < 0.1
-    assert s._id_waiters == set()
-
-
-def test_a_cancelled_wait_frees_the_id_for_the_next_caller(monkeypatch):
-    monkeypatch.setattr(entrypoint, "DUPLICATE_ID_GRACE_S", 5.0)
-    s = _api_server(_PreprocessWorker())
-    s.submit_request(text="first", request_id="X", **TEXT)
-
-    async def run():
-        waiting = asyncio.create_task(s.wait_for_request_id("X"))
-        await _await(lambda: "X" in s._id_waiters)
-        waiting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiting
-
-    asyncio.run(run())
-    assert s._id_waiters == set()
-
-
-# ── a duplicate of a running id, through the routes ─────────────────────────
+# ── the result stream of a reused id ─────────────────────────────────────────
 
 def _complete(s, key, data):
     """The engine's whole answer for ``key`` lands."""
@@ -666,140 +595,22 @@ async def _await(pred, timeout=5.0):
         await asyncio.sleep(0.005)
 
 
-def _routes(monkeypatch, s, tmp_path=None):
-    monkeypatch.setattr(entrypoint, "api_server", s)
-    monkeypatch.setattr(entrypoint, "DUPLICATE_ID_GRACE_S", 0.05)
-    s.upload_dir = tmp_path
-    s.model_name = "bagel"
-    s.model = None
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_a_duplicate_generate_gets_a_409_and_the_running_one_completes(monkeypatch, streaming):
-    """Two /generate calls under X; the second arrives while the first runs and
-    is refused with an HTTP 409 before any stream opens. The first is not
-    aborted and gets its whole answer."""
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    _routes(monkeypatch, s)
-    form = {"text": "first", "request_id": "X", "streaming": str(streaming).lower()}
-
-    async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            first = asyncio.create_task(client.post("/generate", data=form))
-            await _await(lambda: len(pw.inputs) == 1)
-            second = await client.post("/generate", data={**form, "text": "second"})
-            _complete(s, pw.inputs[0].request_id, b"first")
-            return await first, second
-
-    r1, r2 = asyncio.run(run())
-
-    assert r2.status_code == 409, r2.text
-    assert r2.json()["detail"] == request_id_in_use("X")
-    assert r1.status_code == 200, r1.text
-    if streaming:
-        lines = [json.loads(line) for line in r1.text.splitlines()]
-        assert [(line["modality"], base64.b64decode(line["data"])) for line in lines] == [
-            ("text", b"first"),
-        ]
-    else:
-        assert [base64.b64decode(o["data"]) for o in r1.json()["outputs"]["text"]] == [b"first"]
-    assert len(pw.inputs) == 1 and pw.aborted == []
-    assert not s.pending_requests and s._live == {}
-
-
-def test_a_duplicate_websocket_request_gets_an_in_band_409(monkeypatch, tmp_path, caplog):
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    _routes(monkeypatch, s, tmp_path)
-    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"text": "first", "request_id": "X"}))
-        _wait(lambda: len(pw.inputs) == 1)
-        ws.send_text(json.dumps({"text": "second", "request_id": "X"}))
-
-        reply = json.loads(ws.receive_text())
-        assert reply == {"request_id": "X", "error": request_id_in_use("X"), "status": 409}
-
-        _complete(s, pw.inputs[0].request_id, b"first")
-        chunk, finish = json.loads(ws.receive_text()), json.loads(ws.receive_text())
-    assert chunk["request_id"] == "X" and base64.b64decode(chunk["data"]) == b"first"
-    assert finish == {"request_id": "X", "finish": True}
-    assert len(pw.inputs) == 1 and pw.aborted == []
-    assert not [r for r in caplog.records if r.exc_info], "an expected 409 logged a traceback"
-
-
-@pytest.mark.parametrize("path,body", [
-    ("/v1/chat/completions", {"model": "bagel", "messages": [{"role": "user", "content": "hi"}]}),
-    ("/v1/videos/generations", {"model": "wan22", "prompt": "a cat"}),
-], ids=["chat", "videos"])
-@pytest.mark.parametrize("stream", [False, True])
-def test_an_openai_route_answers_a_refused_id_with_a_409(monkeypatch, tmp_path, path, body, stream):
-    """The OpenAI routes mint their own ids, so a client cannot pin one; if a
-    minted id were still in flight, the route answers the 409 as its status."""
-    from mstar.api_server.openai import serving_chat, serving_videos
-
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    _routes(monkeypatch, s, tmp_path)
-    s.model_name = body["model"]
-    for module in (serving_chat, serving_videos):
-        monkeypatch.setattr(module, "rid", lambda prefix: "X")
-    s.submit_request(text="first", request_id="X", **TEXT)
-    body = {**body, "stream": True} if path.endswith("completions") and stream else body
-    if path.endswith("generations") and stream:
-        body = {**body, "stream_video": True}
-
-    r = TestClient(entrypoint.app).post(path, json=body)
-
-    assert r.status_code == 409, r.text
-    assert r.json()["error"]["message"] == request_id_in_use("X")
-    assert len(pw.inputs) == 1 and pw.aborted == []
-
-
 def test_a_stream_is_bound_to_its_submission_before_it_is_iterated():
-    """/generate hands the body to Starlette, which iterates it later; a
-    submission under the same id in between (the first one has finished, so
-    the id is free) is not this stream's."""
+    """A frontend makes the result stream and iterates it later; a submission
+    under the same id in between (the first one has finished, so the id is
+    free) is not this stream's."""
     pw = _PreprocessWorker()
     s = _api_server(pw)
     s.submit_request(text="first", request_id="X", **TEXT)
 
     async def run():
-        body = s.async_stream_results("X")
+        body = s.iter_result_chunks("X")
         _complete(s, pw.inputs[0].request_id, b"first")
         s.submit_request(text="second", request_id="X", **TEXT)
         _complete(s, pw.inputs[1].request_id, b"second")
-        return [json.loads(line) async for line in body]
+        return [c.data async for c in body]
 
-    lines = asyncio.run(run())
-
-    assert [base64.b64decode(line["data"]) for line in lines] == [b"first"], (
-        "the stream read the newer request")
-    assert [c.data for c in s.pending_requests[pw.inputs[1].request_id].chunks] == [b"second"]
-
-
-def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
-    """The chat stream is bound when it is made: Starlette first iterates it
-    after the id is reused, and it still reads its own request's result."""
-    from mstar.api_server.openai.serving_chat import _stream_events
-
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    s.submit_request(text="first", request_id="X", **TEXT)
-
-    async def run():
-        body = _stream_events(s.iter_result_chunk_batches("X"), "m", "X", 24000)
-        _complete(s, pw.inputs[0].request_id, b"first")
-        s.submit_request(text="second", request_id="X", **TEXT)
-        _complete(s, pw.inputs[1].request_id, b"second")
-        return [frame async for frame in body]
-
-    frames = asyncio.run(run())
-
-    events = [json.loads(f[len("data: "):]) for f in frames if f.startswith("data: {")]
-    contents = [e["choices"][0]["delta"].get("content") for e in events if e.get("choices")]
-    assert "first" in contents and "second" not in contents, events
+    assert asyncio.run(run()) == [b"first"], "the stream read the newer request"
     assert [c.data for c in s.pending_requests[pw.inputs[1].request_id].chunks] == [b"second"]
 
 
@@ -901,86 +712,3 @@ def test_nothing_is_kept_once_the_request_is_done():
 
     assert s._live == {} and s._client_ids == {}
     assert not s.pending_requests and not s.recently_completed
-
-
-# ── a served retry right after a dropped stream ─────────────────────────────
-
-class _StreamingWorker(_PreprocessWorker):
-    """Each submission streams ``tokens`` text chunks, a few ms apart, until
-    it is aborted, then finishes."""
-
-    def __init__(self, tokens):
-        super().__init__()
-        self.server = None
-        self.tokens = tokens
-
-    def new_request(self, inp):
-        super().new_request(inp)
-        threading.Thread(target=self._run, args=(inp.request_id,), daemon=True).start()
-
-    def _run(self, key):
-        s = self.server
-        for i in range(self.tokens + 1):
-            time.sleep(0.003)
-            with s.request_lock:
-                req = s.pending_requests.get(key)
-                if req is None or key in self.aborted:
-                    return
-                if i < self.tokens:
-                    req.chunks.append(ResultChunk(request_id="X", modality="text", data=b"t"))
-                else:
-                    req.event.set()
-            req.notify()
-
-    def shutdown(self):
-        pass
-
-
-def test_a_retry_right_after_a_dropped_stream_is_served(monkeypatch):
-    """The client reads 3 chunks of a /generate stream under X from a real
-    server, drops the connection and resubmits X at once on a connection it
-    opened earlier, before the server has seen the drop. The retry must get
-    its whole answer rather than a 409, and so must the next reuse of X once
-    that answer is read, round after round."""
-    import socket
-
-    import uvicorn
-
-    pw = _StreamingWorker(tokens=60)
-    s = _api_server(pw)
-    pw.server = s
-    monkeypatch.setattr(entrypoint, "api_server", s)
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(entrypoint.app, port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    _wait(lambda: server.started, timeout=15)
-    url = f"http://127.0.0.1:{port}/generate"
-    form = {"text": "count", "request_id": "X", "streaming": "true"}
-
-    def answer(client):
-        with client.stream("POST", url, data=form) as r:
-            if r.status_code != 200:
-                return f"{r.status_code} {r.read()[:120]!r}"
-            lines = [json.loads(line) for line in r.iter_lines() if line.strip()]
-        return [line["modality"] for line in lines]
-
-    try:
-        with httpx.Client(timeout=10) as warm:
-            for _ in range(5):
-                warm.get(f"http://127.0.0.1:{port}/health")
-                with httpx.Client(timeout=10) as dropped, dropped.stream("POST", url, data=form) as r:
-                    lines = r.iter_lines()
-                    for _ in range(3):
-                        assert next(lines)
-                for request in ("retry", "reuse"):
-                    got = answer(warm)
-                    assert got == ["text"] * 60, f"the {request} got {got}"
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
-
-    assert len(pw.inputs) == 15
-    assert pw.aborted == [inp.request_id for inp in pw.inputs[::3]], "a retry or reuse was cut short"

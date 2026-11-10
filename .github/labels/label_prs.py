@@ -63,8 +63,9 @@ AREAS = [
     ("mstar/model/", "area/model-shared"),
     ("mstar/integrations/", "area/integrations"),
     ("mstar/default_configs/", "area/infra"),
-    # The Rust frontend, graph runtime and transport mirror their Python
-    # counterparts and change with them (AGENTS.md invariant 5).
+    # The graph runtime and transport mirror their Python counterparts and
+    # change with them (AGENTS.md invariant 5); mstar-server ports the Python
+    # adapters, which change with it.
     ("rust/server/Cargo.lock", "area/infra"),
     ("rust/server/", ("area/rust", "area/api")),
     ("rust/src/graph/", ("area/rust", "area/graph")),

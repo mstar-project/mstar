@@ -14,8 +14,6 @@ is described in [`docs/metrics.rst`](../../docs/metrics.rst).
    curl -s localhost:8000/metrics | grep '^mstar_'
    ```
 
-   `--python-frontend` serves the same `/metrics` on the same port.
-
 2. Start Prometheus and Grafana from the repository root:
 
    ```bash

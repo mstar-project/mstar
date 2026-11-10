@@ -385,3 +385,16 @@ def test_text_chat_passes_those_fields_off(tmp_path):
         best_of=1, response_format={"type": "text"}, stop_token_ids=[],
     )
     assert adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs == {}
+
+
+@pytest.mark.parametrize("ref,message", [
+    ("/etc/passwd", "server file paths are refused"),
+    ("file:///etc/passwd", "server file paths are refused"),
+    (123, "got int"),
+    ({"url": "x"}, "got dict"),
+])
+def test_chatterbox_adapter_refuses_a_bad_ref_audio(ref, message, tmp_path):
+    # refused as a client error (ValueError) before anything is opened
+    req = SpeechRequest.model_validate({"model": "chatterbox", "input": "hi", "ref_audio": ref})
+    with pytest.raises(ValueError, match=message):
+        adapters.ChatterboxAdapter().speech_to_request(req, tmp_path)

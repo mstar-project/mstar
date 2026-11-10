@@ -1,9 +1,10 @@
-"""Prometheus metrics at ``/metrics`` (``--enable-metrics``).
+"""Prometheus metrics (``--enable-metrics``), which mstar-server's ``/metrics``
+serves from the registry's text that the bridge relays.
 
-Requests go through the FastAPI app and the API server's real message thread;
-the conductor is a stand-in fed the messages the real one sends, and so is the
-data worker except in the data worker's own tests, which run its real thread.
-Each test scrapes ``/metrics`` and reads the samples back.
+Requests go through ``APIServer`` and its real message thread; the conductor
+is a stand-in fed the messages the real one sends, and so is the data worker
+except in the data worker's own tests, which run its real thread. Each test
+renders the registry and reads the samples back.
 """
 
 from __future__ import annotations
@@ -18,11 +19,9 @@ import threading
 import time
 import types
 
-import httpx
 import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
 import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 from mstar.api_server import entrypoint
@@ -150,10 +149,10 @@ class _Served:
         )))
 
     def scrape(self) -> dict:
-        r = TestClient(entrypoint.app).get("/metrics")
-        assert r.status_code == 200, r.text
-        assert r.headers["content-type"].startswith("text/plain")
-        return _parse(r.text)
+        """The samples, from the text the bridge relays to ``/metrics``."""
+        metrics = self.server.metrics
+        assert metrics.content_type.startswith("text/plain")
+        return _parse(metrics.render().decode())
 
 
 def _complete(key, conductor_ingest_time=0.0, conductor_finish_time=0.0, **kwargs):
@@ -182,7 +181,6 @@ def _serve(monkeypatch, tmp_path, metrics=True):
     )
     if metrics:
         server.enable_metrics()
-    monkeypatch.setattr(entrypoint, "api_server", server)
     thread = threading.Thread(target=server._process_messages, daemon=True)
     thread.start()
     try:
@@ -223,31 +221,31 @@ def _wait(pred, timeout=5.0):
         time.sleep(0.005)
 
 
-def test_metrics_answer_404_until_enabled(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", make_test_api_server())
-    r = TestClient(entrypoint.app).get("/metrics")
-    assert r.status_code == 404
-    assert "--enable-metrics" in r.json()["detail"]
+async def _read(served, request_id, streaming):
+    """What a frontend does with a submitted request's result."""
+    if streaming:
+        return [c async for c in served.server.iter_result_chunks(request_id)]
+    return await served.server.collect_results(request_id)
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_a_generate_request_moves_the_counter_and_both_histograms(served, streaming):
-    form = {"text": "hi", "output_modalities": "text,audio", "streaming": str(streaming).lower()}
+def test_a_request_moves_the_counter_and_both_histograms(served, streaming):
     labels = _labels(output_modalities="audio,text")
 
     async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            pending = asyncio.create_task(client.post("/generate", data=form))
-            while not served.data_worker.inputs:
-                await asyncio.sleep(0.005)
-            during = served.scrape()
-            served.answer(served.key())
-            return await pending, during
+        served.server.submit_request(
+            text="hi", input_modalities=["text"], output_modalities=["text", "audio"],
+            request_id="r", streaming=streaming,
+        )
+        pending = asyncio.create_task(_read(served, "r", streaming))
+        await asyncio.sleep(0)
+        during = served.scrape()
+        served.answer(served.key())
+        return await pending, during
 
-    r, during = asyncio.run(run())
+    chunks, during = asyncio.run(run())
 
-    assert r.status_code == 200, r.text
+    assert [c.data for c in chunks] == [b"hi"]
     assert during[("mstar_requests_in_flight", _labels())] == 1
     after = served.scrape()
     assert after[("mstar_requests_in_flight", _labels())] == 0
@@ -265,24 +263,6 @@ def test_a_generate_request_moves_the_counter_and_both_histograms(served, stream
     first = after[("mstar_time_to_first_output_seconds_sum", labels)]
     e2e = after[("mstar_e2e_request_latency_seconds_sum", labels)]
     assert 0 < first <= e2e
-
-
-def test_metrics_need_no_api_key_while_generate_still_does(served):
-    """Scrapers carry no key, like the /health probe; the request routes keep it."""
-    from mstar.api_server import auth
-
-    entrypoint.api_key_guard.set("s3cret-key")
-    try:
-        client = TestClient(entrypoint.app)
-        assert client.post("/generate", data={"text": "hi"}).status_code == 401
-        assert client.post("/generate", data={"text": "hi"},
-                           headers={"Authorization": "Bearer wrong"}).status_code == 401
-        assert not served.data_worker.inputs
-        r = client.get("/metrics")
-        assert r.status_code == 200
-        assert "mstar_requests_in_flight" in r.text
-    finally:
-        entrypoint.api_key_guard.set(auth.resolve_api_key())
 
 
 class _BridgeSocket:
@@ -313,10 +293,9 @@ def _serve_bridge(server, script, sent: list) -> None:
     asyncio.run(bridge._serve())
 
 
-def test_the_rust_bridge_answers_metrics_with_what_the_python_route_serves(served):
-    """``mstar-server``'s ``/metrics`` relays this reply, so both frontends
-    show the same registry, and requests that came in through the bridge
-    move it."""
+def test_the_rust_bridge_answers_metrics_with_the_registry_s_text(served):
+    """``mstar-server``'s ``/metrics`` relays this reply: the registry, which
+    requests that came in through the bridge move."""
     sent = []
 
     def scrape_while_in_flight():
@@ -383,122 +362,22 @@ _KEY = {"Authorization": "Bearer s3cret-key"}
 _CHAT = {"model": "dummy", "messages": [{"role": "user", "content": "hi"}]}
 
 
-@pytest.fixture
-def refusing(served, monkeypatch):
-    """The served app with an API key and a 1 MiB body limit."""
-    from mstar.api_server import auth
-
-    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
-    # BodyLimitMiddleware reads the limit when the stack is built.
-    monkeypatch.setattr(entrypoint.app, "middleware_stack", entrypoint.app.build_middleware_stack())
-    entrypoint.api_key_guard.set("s3cret-key")
-    yield TestClient(entrypoint.app)
-    entrypoint.api_key_guard.set(auth.resolve_api_key())
-
-
-def _chunked(total: int):
-    for _ in range(total // 2**16):
-        yield b"x" * 2**16
-
-
-def _in_flight_id(served, client):
-    served.server.submit_request(text="x", request_id="X", streaming=False, **TEXT)
-    return client.post("/generate", data={"text": "hi", "request_id": "X"}, headers=_KEY)
-
-
-@pytest.mark.parametrize("send,status,route", [
-    (lambda s, c: c.post("/generate", data={"text": "hi"}), 401, "/generate"),
-    (lambda s, c: c.post("/no/such/route"), 401, "unmatched"),
-    # Declared Content-Length: refused before routing; chunked: while the route reads it.
-    (lambda s, c: c.post("/v1/chat/completions", content=b"x" * 2**21,
-                         headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
-    (lambda s, c: c.post("/generate", content=_chunked(2**21),
-                         headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
-    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 400, "/v1/chat/completions"),
-    (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
-    (_in_flight_id, 409, "/generate"),
-    (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
-    # The served model has no OpenAI adapter.
-    (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
-    (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
-], ids=["401", "401-unmatched", "413-declared", "413-chunked", "400-schema", "400", "409", "404-unmatched",
-        "404-no-adapter", "405"])
-def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
-        served, refusing, send, status, route):
-    assert send(served, refusing).status_code == status
-    assert _refusals(served.scrape()) == {(route, str(status)): 1}
-    assert len(served.data_worker.inputs) == (1 if status == 409 else 0)
-
-
-def test_every_route_keeps_its_template_when_refused_before_routing(served, refusing):
-    """The API key refuses before the router picks a route; the refusal still
-    carries the route's template, for every route the app serves (a router
-    included later must also be listed in ``RefusalMiddleware``'s routes)."""
-    from mstar.api_server.auth import UNAUTHENTICATED_PATHS
-
-    paths = {path: next(iter(ops)) for path, ops in entrypoint.app.openapi()["paths"].items()
-             if path not in UNAUTHENTICATED_PATHS}
-    assert {"/generate", "/v1/chat/completions", "/v1/images/edits"} <= set(paths)
-    for path, method in paths.items():
-        assert refusing.request(method, path).status_code == 401, path
-    assert _refusals(served.scrape()) == {(path, "401"): 1 for path in paths}
-
-
-def test_a_request_the_engine_fails_is_not_a_refusal_but_one_refused_first_is(served, refusing):
-    """Both answer 400. The submitted one is counted once, as an error in
-    ``mstar_requests_total``; only the other is a refusal."""
-
-    async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test", headers=_KEY) as client:
-            pending = asyncio.create_task(client.post("/generate", data={"text": "hi", "streaming": "false"}))
-            while not served.data_worker.inputs:
-                await asyncio.sleep(0.005)
-            served.fail(served.key(), status=400)
-            failed = await pending
-            refused = await client.post("/generate", data={"text": "hi", "model_kwargs": "[1]"})
-            return failed, refused
-
-    failed, refused = asyncio.run(run())
-
-    assert (failed.status_code, refused.status_code) == (400, 400)
-    samples = served.scrape()
-    assert _refusals(samples) == {("/generate", "400"): 1}
-    assert _count(samples, "error") == 1
-
-
 def test_a_served_request_is_not_a_refusal(served):
-    async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            pending = asyncio.create_task(client.post("/generate", data={"text": "hi", "streaming": "false"}))
-            while not served.data_worker.inputs:
-                await asyncio.sleep(0.005)
-            served.answer(served.key())
-            return await pending
+    """A request that reached the API server is counted by
+    ``mstar_requests_total`` only; the refusal family is still exported."""
 
-    assert asyncio.run(run()).status_code == 200
+    async def run():
+        served.server.submit_request(text="hi", request_id="r", streaming=False, **TEXT)
+        pending = asyncio.create_task(served.server.collect_results("r"))
+        await asyncio.sleep(0)
+        served.answer(served.key())
+        return await pending
+
+    assert [c.data for c in asyncio.run(run())] == [b"hi"]
+    assert "mstar_http_refusals_total" in served.server.metrics.render().decode()
     samples = served.scrape()
-    assert "mstar_http_refusals_total" in TestClient(entrypoint.app).get("/metrics").text
     assert _refusals(samples) == {}
     assert _count(samples, "success") == 1
-
-
-def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
-    pytest.importorskip("prometheus_client")
-    from mstar.api_server import auth
-
-    server = make_test_api_server(preprocess_worker=_DataWorker())
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    client = TestClient(entrypoint.app)
-    entrypoint.api_key_guard.set("s3cret-key")
-    try:
-        assert client.post("/generate", data={"text": "hi"}).status_code == 401
-        server.enable_metrics()
-        assert client.post("/generate", data={"text": "hi"}).status_code == 401
-    finally:
-        entrypoint.api_key_guard.set(auth.resolve_api_key())
-    assert _refusals(_parse(client.get("/metrics").text)) == {("/generate", "401"): 1}
 
 
 def _engine_fails(served):
@@ -591,18 +470,17 @@ def test_a_request_s_stages_are_observed_from_its_timestamps(served):
     stamps = {}
 
     async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            pending = asyncio.create_task(client.post("/generate", data={"text": "hi"}))
-            while not served.data_worker.inputs:
-                await asyncio.sleep(0.005)
-            stamps["ingest"] = time.perf_counter()
-            await asyncio.sleep(0.05)
-            stamps["finish"] = time.perf_counter()
-            served.answer(served.key(), ingest=stamps["ingest"], finish=stamps["finish"])
-            return await pending
+        served.server.submit_request(text="hi", request_id="r", **TEXT)
+        pending = asyncio.create_task(_read(served, "r", streaming=True))
+        while not served.data_worker.inputs:
+            await asyncio.sleep(0.005)
+        stamps["ingest"] = time.perf_counter()
+        await asyncio.sleep(0.05)
+        stamps["finish"] = time.perf_counter()
+        served.answer(served.key(), ingest=stamps["ingest"], finish=stamps["finish"])
+        return await pending
 
-    assert asyncio.run(run()).status_code == 200
+    assert [c.data for c in asyncio.run(run())] == [b"hi"]
 
     s = served.scrape()
     e2e_n, e2e = _hist(s, "mstar_e2e_request_latency_seconds", output_modalities="text")
@@ -903,14 +781,14 @@ def test_counter_and_histogram_snapshots_render_as_prometheus_client_would(monke
 
 def test_the_rust_bridge_serves_the_conductor_families(served):
     served.conductor.inbox.put(_status(waiting=1, running=2, enc=2))
-    python_route = _scrape_until(served, lambda s: _conductor_samples(s)[0])
+    registry = _scrape_until(served, lambda s: _conductor_samples(s)[0])
     sent = []
     _serve_bridge(served.server, [[{"t": "metrics", "rid": "metrics-a", "sub": 1}]], sent)
 
     (reply,) = sent
     bridged = _parse(reply["data"].decode())
     assert _conductor_samples(bridged) == ({"waiting": 1, "running": 2, "draining": 0}, {"enc": 2})
-    assert _without_age(bridged) == _without_age(python_route)
+    assert _without_age(bridged) == _without_age(registry)
 
 
 # ── tensor transfers ─────────────────────────────────────────────────────────
@@ -959,7 +837,8 @@ def test_transfers_reach_metrics_from_the_conductor_and_the_data_worker(served, 
 
     served.conductor.inbox.put(wire.decode(wire.encode(
         APIServerMessage("conductor_status", conductor._status()))))
-    samples = _scrape_until(served, _transfers)
+    # the data worker's read is summed in at once, the conductor's with its status
+    samples = _scrape_until(served, lambda s: {k[2] for k in _transfers(s)} == {"llm", "api_server"})
     got = _transfers(samples)
     sums = [v for k, v in got.items() if k[0] == "mstar_transfer_seconds_sum"]
     assert len(sums) == 2 and all(s > 0 for s in sums)
@@ -1116,7 +995,6 @@ def real_data_worker(monkeypatch, tmp_path):
     def start(**kwargs):
         served = _RealDataWorker(tmp_path, **kwargs)
         started.append(served)
-        monkeypatch.setattr(entrypoint, "api_server", served.server)
         return served
 
     yield start
@@ -1170,8 +1048,8 @@ def _preprocessed(samples):
 def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modalities(
         real_data_worker, monkeypatch, tmp_path):
     """Each request the real data worker takes up is timed if it reaches the
-    conductor, or counted once as a failure (a corrupt upload through
-    ``/generate``, too many images, audio over the length limit, the prompt
+    conductor, or counted once as a failure (a corrupt upload, too
+    many images, audio over the length limit, the prompt
     processing raising); every image and audio file is sized either way."""
     monkeypatch.setenv("MSTAR_MAX_AUDIO_SECONDS", "2")
     served = real_data_worker(metrics=True)
@@ -1183,11 +1061,8 @@ def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modali
     served.submit("slow")
     served.submit("describe", [("image", png)], ("image", "text"))
     served.submit("transcribe", [("audio", short)], ("audio", "text"))
-    r = TestClient(entrypoint.app).post(
-        "/generate", data={"text": "describe", "streaming": "false"},
-        files={"files": ("upload.png", corrupt, "image/png")},
-    )
-    assert r.status_code == 400 and "image is not in a format" in r.text, r.text
+    (tmp_path / "upload.png").write_bytes(corrupt)
+    served.submit("describe", [("image", str(tmp_path / "upload.png"))], ("image", "text"))
     served.submit("compare", [("image", png), ("image", png2)], ("image", "text"))
     served.submit("transcribe", [("audio", long)], ("audio", "text"))
     served.submit("raise")
@@ -1390,71 +1265,12 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     assert events == ["setup", "warmup", "metrics", "bind"]
 
 
-def test_python_frontend_serves_from_uvicorn_without_mstar_server(monkeypatch, tmp_path):
-    """``--python-frontend`` binds uvicorn, after the warmups and metrics as
-    mstar-server is, and never looks for an mstar-server build."""
-    from mstar.api_server import rust_frontend
-
-    events = []
-
-    class _Server:
-        fatal_error = None
-        model_config: dict = {}
-
-        def __init__(self, **kwargs):
-            pass
-
-        def finalize_setup(self):
-            events.append("setup")
-
-        def enable_metrics(self):
-            events.append("metrics")
-
-        def set_on_fatal(self, callback):
-            pass
-
-        def cleanup(self):
-            pass
-
-    class _Uvicorn:
-        started = True
-
-        def __init__(self, config):
-            pass
-
-        def run(self):
-            events.append("bind")
-
-    def no_binary(explicit=None):
-        raise AssertionError("--python-frontend looked for mstar-server")
-
-    cfg = _config(monkeypatch, tmp_path, "model: fake\nwarmup_requests:\n  - text: hi\n")
-    monkeypatch.setattr(rust_frontend, "find_server_binary", no_binary)
-    monkeypatch.setattr(entrypoint, "api_server", None, raising=False)
-    monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
-    monkeypatch.setattr(entrypoint, "APIServer", _Server)
-    monkeypatch.setattr(entrypoint.mp, "get_context",
-                        lambda method: types.SimpleNamespace(Process=lambda **kw: types.SimpleNamespace(
-                            pid=1, start=lambda: None)))
-    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
-                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
-                        lambda server, specs, replicas, **kw: events.append("warmup"))
-    monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
-    monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
-    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
-
-    entrypoint.main(["--config", cfg, "--enable-metrics", "--python-frontend"])
-
-    assert events == ["setup", "warmup", "metrics", "bind"]
-
-
-@pytest.mark.parametrize("extra", [["--rust-frontend"], ["--rust-frontend-bin", "/x/mstar-server"]])
-def test_python_frontend_takes_no_mstar_server_flags(monkeypatch, tmp_path, extra):
+def test_python_frontend_is_refused_with_what_replaced_it(monkeypatch, tmp_path, capsys):
     cfg = _config(monkeypatch, tmp_path)
     with pytest.raises(SystemExit) as exited:
-        entrypoint.main(["--config", cfg, "--python-frontend", *extra])
+        entrypoint.main(["--config", cfg, "--python-frontend"])
     assert exited.value.code == 2
+    assert "mstar-server is the only HTTP frontend" in capsys.readouterr().err
 
 
 def _serve_against(monkeypatch, tmp_path, server_code: str, bridge_runs: bool):
@@ -1563,7 +1379,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
             pass
 
     cfg = _config(monkeypatch, tmp_path)
-    monkeypatch.setattr(entrypoint, "api_server", entrypoint.api_server)
+    monkeypatch.setattr(entrypoint, "api_server", None, raising=False)
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context", lambda method: types.SimpleNamespace(

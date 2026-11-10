@@ -1,13 +1,12 @@
-"""Binary frame streaming for ``/generate`` (no live server, no GPU).
+"""The SDK's reader for binary-framed result streams (no live server, no GPU).
 
 The NDJSON form base64s the payload so it can live inside a JSON string, which
 at 720p costs ~85 ms of CPU per chunk against a 66.67 ms budget. Binary framing
 sends a one-line JSON header carrying ``nbytes`` and then the payload untouched.
-These tests pin the framing, the reader's tolerance for short socket reads, and
-— most importantly — that an un-negotiated request still gets the old bytes.
+These tests pin the framing and the reader's tolerance for short socket reads;
+mstar-server's side of the negotiation is tested in test/rust/.
 """
 
-import base64
 import io
 import json
 import threading
@@ -16,15 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
-from fastapi.testclient import TestClient
+from stream_frames import binary_frame
 
-from mstar.api_server import entrypoint
-from mstar.api_server.entrypoint import (
-    BINARY_STREAM_MEDIA_TYPE,
-    NDJSON_STREAM_MEDIA_TYPE,
-    _chunk_to_binary_frame,
-    _chunk_to_ndjson_payload,
-)
+from mstar.api_server.entrypoint import BINARY_STREAM_MEDIA_TYPE
 from mstar.api_server.request_types import ResultChunk
 from mstar.client.client import MStarClient
 from mstar.client.media import BINARY_STREAM_MEDIA_TYPE as CLIENT_BINARY_MEDIA_TYPE
@@ -46,7 +39,7 @@ def _chunks():
 
 
 def _wire(chunks):
-    return b"".join(b"".join(_chunk_to_binary_frame(c)) for c in chunks)
+    return b"".join(b"".join(binary_frame(c)) for c in chunks)
 
 
 class _Dribble:
@@ -162,7 +155,7 @@ def test_binary_frames_reject_truncated_payload():
 
 
 def test_binary_frames_reject_truncated_header():
-    header, _ = _chunk_to_binary_frame(_chunks()[0])
+    header, _ = binary_frame(_chunks()[0])
     with pytest.raises(RuntimeError, match="ended mid-header"):
         list(iter_binary_frames(io.BytesIO(header[:20])))
 
@@ -180,7 +173,7 @@ def test_binary_frame_header_is_always_one_line():
         data=b"payload\nwith\nnewlines",
         metadata={"note": "line\nbreak", "unicode": "café é"},
     )
-    header, payload = _chunk_to_binary_frame(chunk)
+    header, payload = binary_frame(chunk)
 
     assert header.count(b"\n") == 1 and header.endswith(b"\n")
     (frame,) = iter_binary_frames(io.BytesIO(header + payload))
@@ -203,97 +196,3 @@ def test_binary_error_chunk_reaches_the_sdk_error_path():
     (frame,) = iter_binary_frames(io.BytesIO(_wire([chunk])))
     with pytest.raises(RuntimeError, match=r"Server stream failed \(status 500\): capture failed"):
         MStarClient._to_event(frame)
-
-
-# ----------------------------------------------------------------------
-# End to end through the real FastAPI route (no model, no GPU)
-# ----------------------------------------------------------------------
-
-
-class _ChunkServer:
-    """Stand-in for ``APIServer`` that replays canned chunks.
-
-    Borrows the real serialization methods so the route, the framing and the
-    NDJSON fallback are all the production code paths.
-    """
-
-    enable_nvtx = False
-    async_stream_results = entrypoint.APIServer.async_stream_results
-    open_result_stream = entrypoint.APIServer.open_result_stream
-    _stream_ndjson = entrypoint.APIServer._stream_ndjson
-    _stream_binary = entrypoint.APIServer._stream_binary
-    _chunk_to_ndjson = entrypoint.APIServer._chunk_to_ndjson
-
-    def __init__(self, chunks):
-        self._chunks = chunks
-
-    async def wait_for_request_id(self, request_id):
-        pass
-
-    def submit_request(self, **kwargs):
-        return None
-
-    def submission_key(self, request_id):
-        return None
-
-    def release_submission(self, key):
-        pass
-
-    async def iter_result_chunks(self, request_id):
-        for chunk in self._chunks:
-            yield chunk
-
-
-def _post(monkeypatch, chunks, headers=None):
-    monkeypatch.setattr(entrypoint, "api_server", _ChunkServer(chunks))
-    return TestClient(entrypoint.app).post(
-        "/generate",
-        data={"output_modalities": "video_frame", "streaming": "true"},
-        headers=headers or {},
-    )
-
-
-def test_generate_streams_binary_frames_when_negotiated(monkeypatch):
-    chunks = _chunks()
-    response = _post(monkeypatch, chunks, {"Accept": BINARY_STREAM_MEDIA_TYPE})
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith(BINARY_STREAM_MEDIA_TYPE)
-    assert "Accept" in response.headers["vary"].split(", ")
-    frames = list(iter_binary_frames(io.BytesIO(response.content)))
-    assert [f["bytes"] for f in frames] == [c.data for c in chunks]
-    assert len(response.content) < len(b"".join(
-        _chunk_to_ndjson_payload(c).encode() for c in chunks
-    ))
-
-
-def test_generate_defaults_to_unchanged_ndjson(monkeypatch):
-    """Regression gate on the default path: an un-negotiated request must get
-    byte-identical output to what the server produced before this change."""
-    chunks = _chunks()
-    response = _post(monkeypatch, chunks)
-
-    assert response.headers["content-type"].startswith(NDJSON_STREAM_MEDIA_TYPE)
-    expected = "".join(_chunk_to_ndjson_payload(c) for c in chunks).encode()
-    assert response.content == expected
-
-
-def test_generate_ignores_unrelated_accept_headers(monkeypatch):
-    response = _post(monkeypatch, _chunks(), {"Accept": "application/json, */*"})
-    assert response.headers["content-type"].startswith(NDJSON_STREAM_MEDIA_TYPE)
-
-
-def test_generate_binary_and_ndjson_deliver_identical_payloads(monkeypatch):
-    """The property the GPU benchmark checks with SHA-256, asserted here for
-    free: switching protocol must not change a single delivered byte."""
-    chunks = _chunks()
-    binary = _post(monkeypatch, chunks, {"Accept": BINARY_STREAM_MEDIA_TYPE})
-    ndjson = _post(monkeypatch, chunks)
-
-    from_binary = [f["bytes"] for f in iter_binary_frames(io.BytesIO(binary.content))]
-    from_ndjson = [
-        base64.b64decode(json.loads(line)["data"])
-        for line in ndjson.content.decode().splitlines()
-        if line
-    ]
-    assert from_binary == from_ndjson == [c.data for c in chunks]

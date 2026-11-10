@@ -50,7 +50,7 @@ NDJSON stream.
 
 A client ``request_id`` is at most 128 characters from ``[A-Za-z0-9._:-]``; any other is
 refused with ``400`` (on ``/generate/ws``, with the in-band error below). An empty
-``request_id`` counts as none: the server mints a fresh one, on both frontends and on
+``request_id`` counts as none: the server mints a fresh one, on ``/generate`` and on
 ``/generate/ws``.
 
 A non-streaming response groups outputs by modality, each payload base64-encoded:
@@ -98,9 +98,7 @@ WebSocket ``/generate/ws``
 
 ``/generate/ws`` is the same request over one persistent WebSocket, for control loops
 that cannot afford an HTTP round trip per step (robot policies, streaming world models).
-The server negotiates per-message deflate on its WebSocket routes unless the deployment
-turns it off (``ws_per_message_deflate`` in :doc:`serving`, as the Nemotron VoiceChat
-configs do).
+The server offers no per-message deflate, so frames travel uncompressed.
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
@@ -116,12 +114,6 @@ send the next observation before the current action chunk has returned — and t
 ``request_id`` tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one ``request_id`` it is the later one that gets the
 ``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
-A JSON message over 1 MiB, or a msgpack one over 32 MiB, is parsed and its files decoded
-and saved in a separate process rather than on the server's event loop. Taking the message
-in still runs on the loop, and every other request on the server waits for it: about
-2 ms per MiB as JSON and 1 as msgpack, and with deflate on about 9 and 2. Text and
-``model_kwargs`` come back through the loop, so only ``files`` should be large. A
-deployment taking large messages should turn ``ws_per_message_deflate`` off.
 
 .. code-block:: python
 
@@ -255,14 +247,13 @@ On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as op
 server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
-handshake and has no ``/healthz``. Both of ``mstar serve``'s frontends serve this
-route; the Dynamo worker logs a warning and serves without it.
+handshake and has no ``/healthz``. ``mstar serve`` serves this route; the Dynamo
+worker logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
 observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
-send several raw high-resolution cameras raises it. An observation is parsed on the server's
-event loop, so a very large one holds up the server's other requests while it is parsed.
+send several raw high-resolution cameras raises it.
 
 .. code-block:: python
 

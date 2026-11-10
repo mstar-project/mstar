@@ -10,10 +10,8 @@ Drives the real code from a RESULT_TOKENS frame to the SSE text a
            (detokenize) and the reorder buffer
   drain    one ``_process_messages`` pass with no frame: ``get_result_chunks``,
            append to each ``PendingRequest``, ``notify_many``
-  sse      the event loop running every handler's ``_stream_events`` until
-           each has yielded this step's token (no HTTP write; see ``--http``)
-  relay    instead of ``sse`` with ``--frontend rust``: the Rust-frontend
-           bridge relaying the chunks (msgpack + a real Rust ZMQ send)
+  relay    the Rust-frontend bridge relaying the chunks (msgpack + a real
+           Rust ZMQ send) to mstar-server
 
 ``stages`` runs them one after another on one thread and times each. ``threaded``
 runs the real threads (message thread, data worker thread, event loop) over a
@@ -43,7 +41,6 @@ import torch
 from mstar.api_server import data_worker as dw
 from mstar.api_server import entrypoint as ep
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
-from mstar.api_server.openai import serving_chat
 from mstar.api_server.request_types import APIServerMessage, ResultTokens
 from mstar.communication import wire
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -234,35 +231,21 @@ def one_message_pass(server) -> None:
 
 
 class Consumers:
-    """One ``_stream_events`` (or bridge ``_relay``) task per request."""
+    """One bridge ``_relay`` task per request."""
 
-    def __init__(self, server, rids, frontend: str, bridge=None):
-        self.events = 0  # SSE events (or relayed chunks) seen
+    def __init__(self, server, rids, bridge):
+        self.events = 0  # relayed chunks seen
         self.bytes = 0
         self.tasks = []
-        self.first_seen: list[float] = []  # per token, perf_counter when yielded
+        self.first_seen: list[float] = []  # per token, perf_counter when relayed
         self.track = False
         for rid in rids:
-            if frontend == "python":
-                gen = serving_chat._stream(server, MODEL_NAME, rid, 24000)
-                self.tasks.append(asyncio.ensure_future(self._consume_sse(gen)))
-            else:
-                key = server.submission_key(rid)
-                bridge._keys[id(rid)] = key
-                bridge.loop = asyncio.get_running_loop()
-                server.relay_chunks_to(key, bridge, id(rid))
-                chunks = server.iter_result_chunks(rid)
-                self.tasks.append(asyncio.ensure_future(
-                    bridge._relay(rid, id(rid), chunks)))
-
-    async def _consume_sse(self, gen):
-        async for s in gen:
-            n = s.count("data: ")
-            self.events += n
-            self.bytes += len(s)
-            if self.track:
-                t = time.perf_counter()
-                self.first_seen.extend([t] * n)
+            key = server.submission_key(rid)
+            bridge._keys[id(rid)] = key
+            bridge.loop = asyncio.get_running_loop()
+            server.relay_chunks_to(key, bridge, id(rid))
+            chunks = server.iter_result_chunks(rid)
+            self.tasks.append(asyncio.ensure_future(bridge._relay(rid, id(rid), chunks)))
 
 
 class _CountingSend:
@@ -345,10 +328,8 @@ async def run_stages(args):
     server.communicator = comm
     sock_dir = tempfile.mkdtemp(prefix="aop", dir="/tmp")
     ref = [None]
-    bridge = sink = None
-    if args.frontend == "rust":
-        bridge, sink = make_bridge(server, sock_dir, ref)
-    cons = Consumers(server, rids, args.frontend, bridge)
+    bridge, sink = make_bridge(server, sock_dir, ref)
+    cons = Consumers(server, rids, bridge)
     ref[0] = cons
     await asyncio.sleep(0)  # let every handler bind its wake event
 
@@ -356,7 +337,7 @@ async def run_stages(args):
     # as the API server does once the workers report ready
     freeze_after_setup("harness")
     gcs = GCStats()
-    names = ("decode", "route", "emit", "drain", args.frontend == "python" and "sse" or "relay")
+    names = ("decode", "route", "emit", "drain", "relay")
     times = {n: [] for n in names}
     # thread CPU, not wall: the data worker's pass ends in a 1 ms idle sleep
     clock = time.thread_time
@@ -387,7 +368,7 @@ async def run_stages(args):
     cpu = time.process_time() - cpu0
 
     warm = args.steps // 10
-    print(f"rows={args.rows} steps={args.steps} frontend={args.frontend} "
+    print(f"rows={args.rows} steps={args.steps} "
           f"tokenizer={'stub' if args.stub_tokenizer else 'qwen3.5'} "
           f"(first {warm} steps dropped)")
     print(f"{'stage':8s} {'mean_ms/step':>13s} {'p50':>8s} {'p95':>8s} {'us/token':>9s}")
@@ -438,10 +419,8 @@ async def run_threaded(args):
     rids, keys = submit(server, args.rows)
     mark_live(thread, keys)
     ref = [None]
-    bridge = sink = None
-    if args.frontend == "rust":
-        bridge, sink = make_bridge(server, sock_dir, ref)
-    cons = Consumers(server, rids, args.frontend, bridge)
+    bridge, sink = make_bridge(server, sock_dir, ref)
+    cons = Consumers(server, rids, bridge)
     ref[0] = cons
     await asyncio.sleep(0)
 
@@ -501,7 +480,7 @@ async def run_threaded(args):
     wakeup.signal()
 
     print(f"rows={args.rows} target={args.rate} tok/s step={step_period * 1e3:.2f} ms "
-          f"steps={steps} frontend={args.frontend} "
+          f"steps={steps} "
           f"tokenizer={'stub' if args.stub_tokenizer else 'qwen3.5'}")
     got = cons.events
     print(f"delivered {got}/{target} tokens")
@@ -540,7 +519,6 @@ def main():
     p.add_argument("--steps", type=int, default=400)
     p.add_argument("--rate", type=float, default=16000, help="threaded: tokens/s")
     p.add_argument("--seconds", type=float, default=8.0)
-    p.add_argument("--frontend", choices=["python", "rust"], default="python")
     p.add_argument("--stub-tokenizer", action="store_true")
     args = p.parse_args()
     import logging

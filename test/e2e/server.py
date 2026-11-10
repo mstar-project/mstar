@@ -262,7 +262,7 @@ class Server:
             code = self.poll()
             if code is not None:
                 log = self.log_path.read_text(errors="replace").lower()
-                if "address already in use" in log:  # mstar-server and uvicorn both log it on a failed bind
+                if "address already in use" in log:  # mstar-server's bind error
                     raise PortTakenError(f"port {self.port} was taken by another process while the server loaded")
                 raise ServerError(f"server exited with code {code} during startup; see {self.log_path}")
             if self._listening() is not False:  # ours, or no /proc to tell

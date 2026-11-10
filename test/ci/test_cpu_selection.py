@@ -197,6 +197,12 @@ RETIRED = {
         "tested the send stage's stream-consumption report, dropped with stream_tokens_consumed"
     ),
     "test/modular/test_kv_decode_plan_cache.py": "tested the KV decode-plan cache, deleted with it",
+    "test/modular/test_images_n_release.py": (
+        "tested the Python /v1/images/generations handler, deleted with the FastAPI frontend"
+    ),
+    "test/modular/test_transcription_utf8.py": (
+        "tested the Python /v1/audio/transcriptions route, deleted with the FastAPI frontend"
+    ),
 }
 
 

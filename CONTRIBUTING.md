@@ -23,7 +23,7 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 
 ### HTTP routes and OpenAI adapters
 
-The Python HTTP frontend is being retired in favor of the Rust one (`rust/server/`). A new route, request field, response format or model OpenAI adapter goes into both in the same PR, with a test in `test/rust/` comparing the two; see invariant 15 in [AGENTS.md](AGENTS.md).
+HTTP is served by `mstar-server` (`rust/server/`) alone. A new route, request field or response format lands there, with a test in `test/rust/`, and a model OpenAI adapter is a class in `ADAPTER_REGISTRY` plus its Rust port in `rust/server/src/adapters/`; see invariant 15 in [AGENTS.md](AGENTS.md).
 
 ### Documentation
 

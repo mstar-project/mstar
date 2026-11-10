@@ -9,6 +9,8 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+# the Python frontend's recorded answers, which test/rust's parity suites replay
+!test/rust/python_oracle/*.json
 # the Python turn segmenter's recorded outputs, which mstar-server's vad tests replay
 !rust/server/src/realtime/testdata/*.json
 !docs/mintlify/docs.json

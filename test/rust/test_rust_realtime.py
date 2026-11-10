@@ -1,11 +1,12 @@
-"""``/v1/realtime`` on mstar-server against the Python route.
+"""``/v1/realtime`` transcription on mstar-server, held to the Python route: the
+Python route's answers replayed as it gave them before it was removed
+(``python_oracle``).
 
-Each session sends the same client events to both frontends, served by one
-scripted ASR (it continues from the assistant prefix as Qwen3-ASR does), and
-compares every server event (ids and timestamps aside) and every step the
-engine got: its kwargs and the audio it heard, sample for sample. Turn
-detection runs the real Silero VAD on both, through the same ONNX Runtime.
-"""
+Each session sends client events to mstar-server, served by a scripted ASR (it
+continues from the assistant prefix as Qwen3-ASR does), and compares every
+server event (ids and timestamps aside) and every step the engine got: its
+kwargs and the audio it heard, sample for sample. Turn detection runs the real
+Silero VAD through the ONNX Runtime the Python route used."""
 
 import base64
 import contextlib
@@ -20,17 +21,16 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("mstar_rust")
-pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 np = pytest.importorskip("numpy")
 sf = pytest.importorskip("soundfile")
 
 import websockets.exceptions
 import websockets.sync.client
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 
-from mstar.api_server import entrypoint, media_io
+from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.rust_frontend import (
@@ -142,7 +142,7 @@ class _ASR:
         self._chunks[request_id] = chunks
         return request_id
 
-    async def collect_results(self, request_id, raw_request=None):
+    async def collect_results(self, request_id):
         return self._chunks.pop(request_id, [])
 
     async def iter_result_chunks(self, request_id):
@@ -217,18 +217,6 @@ def _is_end(e: dict) -> bool:
     return e.get("type") == "error" and e["error"]["message"] == "unknown event 'mstar.end'"
 
 
-def _python(server, frames):
-    entrypoint.api_server = server
-    events = []
-    with TestClient(entrypoint.app).websocket_connect("/v1/realtime?intent=transcription") as ws:
-        events.append(json.loads(ws.receive_text()))
-        for f in [*frames, json.dumps(END)]:
-            (ws.send_bytes if isinstance(f, bytes) else ws.send_text)(f)
-        while not events or not _is_end(events[-1]):
-            events.append(json.loads(ws.receive_text()))
-    return events
-
-
 def _rust_session(port, frames):
     events = []
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription",
@@ -242,15 +230,13 @@ def _rust_session(port, frames):
 
 
 def _both(stack, monkeypatch, events):
+    """Each frontend's (events, steps): the Python route's as recorded."""
     server, port = stack
-    monkeypatch.setattr(entrypoint, "api_server", server)
     frames = [e if isinstance(e, (str, bytes)) else json.dumps(e) for e in events]
-    server.steps = []
-    py = _normalized(_python(server, frames))
-    py_steps = server.steps
+    py = python_side()
     server.steps = []
     rust = _normalized(_rust_session(port, frames))
-    return (py, py_steps), (rust, server.steps)
+    return py, (rust, server.steps)
 
 
 def _appends(audio: np.ndarray, rate: int, seconds: float = 0.3) -> list[dict]:
@@ -415,8 +401,7 @@ def test_every_input_format_reaches_the_engine_alike(stack, monkeypatch, fmt):
 
 
 def test_a_model_without_realtime_is_closed_with_pythons_reason(stack, monkeypatch):
-    server, port = stack
-    monkeypatch.setattr(entrypoint, "api_server", server)
+    _, port = stack
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime?intent=conversation") as ws:
         with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
             ws.recv(timeout=10)

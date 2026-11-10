@@ -2,7 +2,7 @@
 
 Byte-level detokenizers (Cosmos3, Whisper) send each token's raw bytes as
 one chunk, so a CJK character or emoji can span two chunks. Every consumer
-here (chat completions, ``/v1/realtime``, the Python SDK, the Dynamo bridge)
+here (the Python SDK, the Dynamo bridge)
 must join or incrementally decode the bytes instead of decoding each chunk
 on its own. The Rust frontend's twins are the tests in
 ``rust/server/src/{utf8,main,serving,tokenizer}.rs``.
@@ -65,109 +65,6 @@ def test_decode_joined():
 
 
 # ----------------------------------------------------------------------
-# chat completions
-# ----------------------------------------------------------------------
-
-class _BatchAPI:
-    """Just enough APIServer to feed ``serving_chat._stream_events``."""
-
-    def __init__(self, batches):
-        self._batches = batches
-
-    async def iter_result_chunk_batches(self, request_id):
-        for batch in self._batches:
-            yield batch
-
-
-def _sse_events(frames):
-    events = []
-    for frame in frames:
-        for line in frame.splitlines():
-            if line.startswith("data: ") and line != "data: [DONE]":
-                events.append(json.loads(line[len("data: "):]))
-    return events
-
-
-def _stream_chat(batches):
-    pytest.importorskip("fastapi")
-    from mstar.api_server.openai.serving_chat import _stream_events
-
-    async def run():
-        return [f async for f in _stream_events(_BatchAPI(batches).iter_result_chunk_batches("r"), "m", "r", 24000)]
-
-    events = _sse_events(asyncio.run(run()))
-    content = "".join(e["choices"][0]["delta"].get("content") or "" for e in events)
-    return content, events
-
-
-def test_chat_response_joins_text_before_decoding():
-    pytest.importorskip("fastapi")
-    from mstar.api_server.openai.serving_chat import _build_response
-
-    resp = _build_response("m", "r", [_chunk(p) for p in PIECES], 24000)
-    assert resp["choices"][0]["message"]["content"] == TEXT
-
-
-@pytest.mark.parametrize("batched", [False, True], ids=["one-per-batch", "one-batch"])
-def test_chat_stream_deltas_hold_split_characters(batched):
-    chunks = [_chunk(p) for p in PIECES]
-    content, events = _stream_chat([chunks] if batched else [[c] for c in chunks])
-    assert content == TEXT
-    assert "\ufffd" not in json.dumps(events, ensure_ascii=False)
-    assert events[-1]["choices"][0]["finish_reason"] == "stop"
-
-
-@pytest.mark.parametrize("batched", [False, True], ids=["one-per-batch", "one-batch"])
-def test_chat_stream_sends_no_empty_deltas(batched):
-    # the first piece completes no character, and an end token decodes to nothing
-    chunks = [_chunk(p) for p in PIECES] + [_chunk(b"")]
-    content, events = _stream_chat([chunks] if batched else [[c] for c in chunks])
-    assert content == TEXT
-    deltas = [e["choices"][0]["delta"] for e in events]
-    assert deltas == [{"role": "assistant", "content": "中"}, {"content": "文 "}, {"content": "😀"}, {}]
-
-
-def test_chat_stream_keeps_text_whole_across_an_audio_chunk():
-    chunks = [_chunk(PIECES[0]), _chunk(b"\x00\x00", "audio"), *[_chunk(p) for p in PIECES[1:]]]
-    content, _ = _stream_chat([[c] for c in chunks])
-    assert content == TEXT
-
-
-def test_chat_stream_flushes_an_unfinished_character_before_stop():
-    content, events = _stream_chat([[_chunk(p) for p in TRUNCATED]])
-    assert content == "中文 \ufffd"
-    assert events[-1]["choices"][0]["delta"] == {"content": "\ufffd"}
-    assert events[-1]["choices"][0]["finish_reason"] == "stop"
-
-
-# ----------------------------------------------------------------------
-# /v1/realtime
-# ----------------------------------------------------------------------
-
-def test_realtime_step_joins_text_before_decoding(tmp_path):
-    pytest.importorskip("fastapi")
-    from mstar.api_server.openai.adapters import SubmitArgs
-    from mstar.api_server.openai.protocol import TranscriptionRequest
-    from mstar.api_server.openai.serving_realtime import RealtimeSession, _run_step
-
-    class API:
-        upload_dir = str(tmp_path)
-
-        def submit_request(self, **kwargs):
-            pass
-
-        async def collect_results(self, request_id):
-            return [_chunk(p) for p in PIECES]
-
-    adapter = SimpleNamespace(realtime_step_request=lambda req, path, prefix: SubmitArgs(
-        text="", file_paths={"audio": [path]}, input_modalities=["audio"],
-        output_modalities=["text"], model_kwargs={},
-    ))
-    session = RealtimeSession(session_id="s", request=TranscriptionRequest(model="m"))
-    assert asyncio.run(_run_step(API(), adapter, session, "prefix ")) == "prefix " + TEXT
-
-
-# ----------------------------------------------------------------------
 # Python SDK
 # ----------------------------------------------------------------------
 
@@ -216,13 +113,14 @@ def test_sdk_stream_flushes_an_unfinished_character_at_the_end():
 
 def test_sdk_binary_stream_text_chunks_never_end_mid_character():
     pytest.importorskip("requests")
-    from mstar.api_server.entrypoint import _chunk_to_binary_frame
+    from stream_frames import binary_frame
+
     from mstar.api_server.request_types import ResultChunk
     from mstar.client import MStarClient
     from mstar.client.media import BINARY_STREAM_MEDIA_TYPE
 
     body = b"".join(
-        b"".join(_chunk_to_binary_frame(ResultChunk(request_id="r", modality="text", data=p, metadata={})))
+        b"".join(binary_frame(ResultChunk(request_id="r", modality="text", data=p, metadata={})))
         for p in PIECES
     )
     resp = _ndjson_response([])

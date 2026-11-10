@@ -23,7 +23,7 @@ class _FakeServer:
         self.submitted.append(kwargs)
         return kwargs["request_id"]
 
-    async def collect_results(self, request_id, raw_request=None):
+    async def collect_results(self, request_id):
         self.collected.append(request_id)
         if self.fail_on == request_id:
             raise RuntimeError("compile blew up")
@@ -216,9 +216,9 @@ def test_replicated_warmup_runs_one_request_alone_first() -> None:
             events.append(("submit", kwargs["request_id"]))
             return super().submit_request(**kwargs)
 
-        async def collect_results(self, request_id, raw_request=None):
+        async def collect_results(self, request_id):
             events.append(("done", request_id))
-            return await super().collect_results(request_id, raw_request)
+            return await super().collect_results(request_id)
 
     specs = [{"text": "a"}, {"text": "b"}]
     entrypoint._run_warmup_requests(_OrderedServer(), specs, entrypoint.DataParallelReplicas(2, 1))
@@ -240,7 +240,7 @@ def test_a_failing_copy_lets_its_siblings_finish(caplog) -> None:
     import asyncio
 
     class _SlowServer(_FakeServer):
-        async def collect_results(self, request_id, raw_request=None):
+        async def collect_results(self, request_id):
             if request_id == "warmup-0.0":
                 raise RuntimeError("compile blew up")
             await asyncio.sleep(0.01)

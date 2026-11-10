@@ -2,10 +2,11 @@
 the launcher names the model's adapter class (``MSTAR_OPENAI_ADAPTER``) and
 the Rust frontend translates requests with its port of that class.
 
-Checks, against ``ADAPTER_REGISTRY`` itself: every class and surface the Rust
-frontend serves or lists as not ported yet; for each chat class, that a chat
-reaches the backend as the Python adapter builds it; and, where fastapi is
-installed, that both frontends answer a chat with the same status and body.
+Checks, against ``ADAPTER_REGISTRY`` itself: every class and surface
+mstar-server serves or lists as not ported yet; for each chat class, that a
+chat reaches the backend as the Python adapter builds it (live); and that
+mstar-server answers a chat with the Python route's status and body, as it
+answered before it was removed (``python_oracle``).
 Skipped unless the ``mstar_rust`` extension is installed and the server binary
 is built."""
 import base64
@@ -24,20 +25,17 @@ import pytest
 
 pytest.importorskip("mstar_rust")
 
+from python_oracle import python_side
 from test_rust_frontend import (
-    _USAGE,
     BINARY,
-    _Chunk,
     _free_port,
     _model_stack,
     _StubAPIServer,
     _wait_healthy,
 )
 
-from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
-from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -288,30 +286,6 @@ def test_an_image_chat_takes_the_data_urls_the_python_adapter_takes(cls, tmp_pat
 
 # ── both frontends answer a chat the same way ────────────────────────────────
 
-class _PythonServer:
-    """What the Python routes call on APIServer, replying as the stub does."""
-
-    open_result_stream = APIServer.open_result_stream
-    lora_kwargs = APIServer.lora_kwargs
-
-    def __init__(self, model_name, upload_dir):
-        self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
-        self.served_models = ServedModels.of(model_name, None)
-        self.tail = []
-
-    def submit_request(self, **kwargs):
-        if kwargs.get("report_usage"):
-            self.tail = [_Chunk("usage", b"", _USAGE)]
-        return kwargs["request_id"]
-
-    async def collect_results(self, request_id, raw_request=None):
-        return [_Chunk("text", b"Hello "), _Chunk("text", b"world"), *self.tail]
-
-    async def iter_result_chunk_batches(self, request_id):
-        yield [_Chunk("text", b"Hello ")]
-        yield [_Chunk("text", b"world"), *self.tail]
-
-
 def _normalized(status, data: bytes, stream: bool):
     """The body with ids and timestamps blanked; SSE as its list of events."""
     def blank(obj):
@@ -350,18 +324,12 @@ PARITY_CASES = {
 @pytest.mark.parametrize("case", sorted(PARITY_CASES))
 @pytest.mark.parametrize("model", ["qwen3_5_0.8b", "cosmos3_edge", "pi05"])
 def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model, tmp_path, monkeypatch):
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    from mstar.api_server import entrypoint
-
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     body, stream = PARITY_CASES[case]
-    monkeypatch.setattr(entrypoint, "api_server", _PythonServer(model, tmp_path))
-    py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    want = python_side()
     with _model_stack(model, _StubAPIServer()) as (port, _upload):
         rust = _post(port, "/v1/chat/completions", body, timeout=30)
-    assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+    assert _normalized(*rust, stream) == want
 
 
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────
@@ -391,25 +359,17 @@ def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypat
     """Both ask the model (``serving_speech.list_voices``) per request, so a voice
     added while serving shows on both; a model with none, or no speech surface,
     gets the same 404."""
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    from mstar.api_server import entrypoint
-
-    server = _PythonServer(model, tmp_path)
     stub = _StubAPIServer()
-    server.model = stub.model = _VoicedModel() if voiced else None
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    py = TestClient(entrypoint.app)
+    stub.model = _VoicedModel() if voiced else None
     with _model_stack(model, stub) as (port, _upload):
         for added in ([], ["nova"]):
             if voiced:
-                server.model.voices += added
-            expected = py.get("/v1/audio/voices")
+                stub.model.voices += added
+            expected = python_side()
             status, body = _get(port, "/v1/audio/voices")
-            assert (status, json.loads(body)) == (expected.status_code, expected.json())
+            assert (status, json.loads(body)) == expected
     if voiced and model == "orpheus":
-        assert expected.json()["voices"][-1] == {"id": "nova", "name": "nova"}
+        assert expected[1]["voices"][-1] == {"id": "nova", "name": "nova"}
 
 
 # ── text-only chat (TextChatAdapter) ─────────────────────────────────────────

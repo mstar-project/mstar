@@ -1,9 +1,8 @@
 """An Orpheus request with no text is refused with a 400 before the conductor
-sees it, on both frontends.
+sees it.
 
-FastAPI reads an empty ``text`` form field as missing, so ``/generate`` hands
-``None`` to ``process_prompt``; the Rust frontend passes ``""`` through. Either
-way Orpheus has nothing to speak. Before this check ``process_prompt`` returned
+mstar-server passes an empty ``text`` form field through as ``""``; Orpheus
+has nothing to speak. Before this check ``process_prompt`` returned
 no ``text_inputs`` for ``None``, the request was admitted, and the LLM's
 ``prepare_inputs`` failed with an ``IndexError`` (a 500); ``""`` and blank text
 were admitted and generated from the voice prefix alone.
@@ -22,13 +21,11 @@ import threading
 import time
 from types import SimpleNamespace
 
-import httpx
 import pytest
 import torch
 from api_server_helpers import StandInSocket, make_test_api_server
 from test_request_id_reuse import _Socket, _TensorManager
 
-from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.communication.event import EventWakeup
 from mstar.model.orpheus.config import OrpheusModelConfig
@@ -106,54 +103,11 @@ class _Server:
 
 
 @pytest.fixture
-def server(monkeypatch, tmp_path):
+def server(tmp_path):
     s = _Server()
     s.api.upload_dir = tmp_path
-    monkeypatch.setattr(entrypoint, "api_server", s.api)
     yield s
     s.close()
-
-
-def _post(form=None, path="/generate", json_body=None):
-    async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.post(path, data=form, json=json_body)
-
-    return asyncio.run(run())
-
-
-TEXT_FIELDS = {"empty": {"text": ""}, "omitted": {}, "blank": {"text": " \n\t"}}
-
-
-@pytest.mark.parametrize("field", TEXT_FIELDS.values(), ids=TEXT_FIELDS.keys())
-def test_generate_without_text_is_a_400(server, field):
-    form = {**field, "output_modalities": "audio", "streaming": "false", "model_kwargs": '{"voice": "tara"}'}
-
-    r = _post(form)
-
-    assert r.status_code == 400, r.text
-    assert REFUSAL in r.json()["detail"]
-    assert server.new_requests() == [], "a request with no text reached the conductor"
-
-
-@pytest.mark.parametrize("field", TEXT_FIELDS.values(), ids=TEXT_FIELDS.keys())
-def test_a_streamed_generate_without_text_is_a_400(server, field):
-    """A stream waits for its first chunk, so a preprocess refusal is the status, not a 200."""
-    r = _post({**field, "output_modalities": "audio", "model_kwargs": '{"voice": "tara"}'})
-
-    assert r.status_code == 400, r.text
-    assert REFUSAL in r.json()["detail"]
-    assert server.new_requests() == []
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_speech_with_empty_input_is_a_400(server, stream):
-    r = _post(path="/v1/audio/speech", json_body={"input": "", "voice": "tara", "stream": stream})
-
-    assert r.status_code == 400, r.text
-    assert REFUSAL in r.json()["error"]["message"]
-    assert server.new_requests() == []
 
 
 @pytest.mark.parametrize("text", ["", " \n\t"], ids=["empty", "blank"])

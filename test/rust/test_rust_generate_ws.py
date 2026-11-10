@@ -1,9 +1,10 @@
-"""``/generate/ws`` on mstar-server against the Python route.
+"""``/generate/ws`` on mstar-server, held to the Python route: the Python route's
+answers replayed as it gave them before it was removed (``python_oracle``).
 
-Each case sends the same frames (JSON text, or msgpack binary) to both
-frontends, served by one scripted data plane that acts as ``APIServer`` does
-for a submission and for a live call's appends, and compares every reply
-(grouped by request, in order) and what each submission and append carried."""
+Each case sends frames (JSON text, or msgpack binary) to mstar-server, served by
+a scripted data plane that acts as ``APIServer`` does for a submission and for a
+live call's appends, and compares every reply (grouped by request, in order) and
+what each submission and append carried."""
 
 import asyncio
 import base64
@@ -21,17 +22,15 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("mstar_rust")
-pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 msgpack = pytest.importorskip("msgpack")
 
 import websockets.exceptions
 import websockets.sync.client
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 from test_rust_release import IN_USE, _until
 
-from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -195,19 +194,6 @@ def _ended(reply: dict) -> bool:
     return reply.get("finish") is True or ("error" in reply and not reply.get("append"))
 
 
-def _python(server, frames, settle, ending):
-    entrypoint.api_server = server
-    replies = []
-    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        for frame in frames:
-            (ws.send_bytes if isinstance(frame, bytes) else ws.send_text)(frame)
-            if settle:
-                time.sleep(0.05)
-        while len([r for r in replies if _ended(r) or r.get("append")]) < ending:
-            replies.append(_decode(ws.receive_bytes() if isinstance(frames[0], bytes) else ws.receive_text()))
-    return replies
-
-
 def _rust_session(port, frames, settle, ending):
     replies = []
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/generate/ws", compression=None, max_size=None) as ws:
@@ -234,14 +220,11 @@ def _both(stacks, monkeypatch, live, messages, *, binary=False, ending=None, set
     pack = (lambda m: msgpack.packb(m, use_bin_type=True)) if binary else json.dumps
     frames = [m if isinstance(m, (str, bytes)) else pack(m) for m in messages]
     ending = len(frames) if ending is None else ending
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    server.reset()
-    py = _python(server, frames, settle, ending)
-    py_record = (list(server.submitted), list(server.appended))
+    py = python_side()
     server.reset()
     rust = _rust_session(port, frames, settle, ending)
     rust_record = (list(server.submitted), list(server.appended))
-    return (_by_request(py), py_record), (_by_request(rust), rust_record)
+    return py, (_by_request(rust), rust_record)
 
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489")
@@ -364,8 +347,7 @@ def test_live_call_refusals_read_as_pythons(stacks, monkeypatch):
 @pytest.mark.parametrize("path", ["/", "/generate/ws", "/v1/realtime"])
 def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch, method, path):
     server, port = stacks(False)
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    py = TestClient(entrypoint.app).request(method, path)
+    py = python_side()
     body = b"" if method == "POST" else None
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=body)
     try:
@@ -373,7 +355,7 @@ def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch,
             rust = (r.status, json.loads(r.read()))
     except urllib.error.HTTPError as e:
         rust = (e.code, json.loads(e.read()))
-    assert rust == (py.status_code, py.json())
+    assert rust == py
 
 
 

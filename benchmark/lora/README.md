@@ -265,7 +265,7 @@ uv venv ~/venvs/sglang --python 3.12 && uv pip install --python ~/venvs/sglang/b
 uv pip install peft          # in mstar's own venv, for the HF + PEFT reference
 ```
 
-Then, from mstar's venv (activated, so `ninja` is on `PATH`), with the Rust extension built:
+Then, from mstar's venv (activated, so `ninja` is on `PATH`), with the Rust extension and `mstar-server` built:
 
 ```
 python -m benchmark.lora.compare_engines --out ~/lora_compare --dry-run      # the plan

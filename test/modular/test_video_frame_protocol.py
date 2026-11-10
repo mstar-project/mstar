@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import queue
 import runpy
 import signal
@@ -14,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
-from fastapi import HTTPException
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -24,7 +22,6 @@ pytest.importorskip("requests")
 
 from api_server_helpers import make_test_api_server  # noqa: E402
 
-from mstar.api_server import entrypoint  # noqa: E402
 from mstar.api_server.data_worker import (  # noqa: E402
     PreprocessWorkerThread,
     RequestOutputState,
@@ -114,59 +111,6 @@ def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
             output_modalities=["text"],
             streaming=True,
         )
-
-
-def _form_request(**fields):
-    async def form():
-        return fields
-
-    return SimpleNamespace(form=form, headers={})
-
-
-def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", object())
-
-    with pytest.raises(HTTPException) as raised:
-        asyncio.run(
-            entrypoint.generate(
-                request=_form_request(streaming="false"),
-                text=None,
-                files=None,
-                input_modalities=None,
-                output_modalities="video_frame",
-                streaming=False,
-                model_kwargs=None,
-                request_id=None,
-            )
-        )
-
-    assert raised.value.status_code == 400
-    # test/rust/test_rust_frontend.py checks mstar-server sends the same
-    assert raised.value.detail == (
-        "Output modality video_frame requires streaming=true; raw frame "
-        "chunks cannot be returned as an aggregated response."
-    )
-
-
-def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", object())
-
-    with pytest.raises(HTTPException) as raised:
-        asyncio.run(
-            entrypoint.generate(
-                request=_form_request(input_modalities="video_frame"),
-                text=None,
-                files=None,
-                input_modalities="video_frame",
-                output_modalities="text",
-                streaming=True,
-                model_kwargs=None,
-                request_id=None,
-            )
-        )
-
-    assert raised.value.status_code == 400
-    assert raised.value.detail == "'video_frame' is an output-only modality"
 
 
 def test_server_metadata_is_canonical_and_counts_raw_frames():
@@ -744,14 +688,11 @@ def test_rollout_harness_shutdown_signals_only_the_api_parent(monkeypatch):
     assert proc.signals == [signal.SIGINT]
 
 
-def test_waypoint_has_no_encoded_video_adapter(monkeypatch):
-    from mstar.api_server.openai import router
+def test_waypoint_has_no_encoded_video_adapter():
+    """No adapter, so ``/v1/videos/generations`` answers waypoint with a 404."""
     from mstar.api_server.openai.adapters import get_adapter
 
     assert get_adapter("waypoint") is None
-    monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(model_name="waypoint"))
-    _api, _model_name, _adapter, error = router._resolve("supports_videos")
-    assert error.status_code == 404
 
 
 def test_waypoint_emits_only_generated_raw_frame_chunks():

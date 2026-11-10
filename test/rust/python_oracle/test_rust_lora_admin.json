@@ -1,0 +1,746 @@
+{
+"test_a_body_that_is_not_json_is_refused_alike_but_for_the_decoders_words[[1, 2]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'json_invalid', 'loc': ('body', 5), 'msg': 'JSON decode error', 'input': {}, 'ctx': {'error': \"Expecting ',' delimiter\"}}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_body_that_is_not_json_is_refused_alike_but_for_the_decoders_words[not json]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'json_invalid', 'loc': ('body', 0), 'msg': 'JSON decode error', 'input': {}, 'ctx': {'error': 'Expecting value'}}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_body_that_is_not_json_is_refused_alike_but_for_the_decoders_words[{\"lora_name\": \"a\",}]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'json_invalid', 'loc': ('body', 18), 'msg': 'JSON decode error', 'input': {}, 'ctx': {'error': 'Expecting property name enclosed in double quotes'}}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[a-string]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'model_attributes_type', 'loc': ('body',), 'msg': 'Input should be a valid dictionary or object to extract fields from', 'input': 'nope'}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[empty]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'missing', 'loc': ('body',), 'msg': 'Field required', 'input': None}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[missing]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'missing', 'loc': ('body', 'lora_path'), 'msg': 'Field required', 'input': {'lora_name': 'a'}}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[no-type]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'model_attributes_type', 'loc': ('body',), 'msg': 'Input should be a valid dictionary or object to extract fields from', 'input': b'{\"lora_name\": \"a\", \"lora_path\": \"/p\"}'}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[not-an-object]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'model_attributes_type', 'loc': ('body',), 'msg': 'Input should be a valid dictionary or object to extract fields from', 'input': [1]}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[plus-json]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'string_type', 'loc': ('body', 'lora_name'), 'msg': 'Input should be a valid string', 'input': ['a']}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[text]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'model_attributes_type', 'loc': ('body',), 'msg': 'Input should be a valid dictionary or object to extract fields from', 'input': b\"{'it': 's'}\"}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[types]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'string_type', 'loc': ('body', 'lora_name'), 'msg': 'Input should be a valid string', 'input': 5}, {'type': 'string_type', 'loc': ('body', 'lora_path'), 'msg': 'Input should be a valid string', 'input': None}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_a_malformed_body_is_refused_alike[unload-missing]#0": [
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "[{'type': 'missing', 'loc': ('body', 'lora_name'), 'msg': 'Field required', 'input': {}}]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+],
+"test_loads_and_unloads_answer_alike_and_change_what_is_served#0": [
+{
+"__tuple__": [
+200,
+"text/plain; charset=utf-8",
+"Success: LoRA adapter 'chat' added successfully."
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "The lora adapter 'chat' has already been loaded.",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "'qwen3_5_0.8b' is the base model's name",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "LoRA adapter 'x': x.safetensors: not a LoRA adapter",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+400,
+"application/json",
+{
+"error": {
+"code": 400,
+"message": "Both 'lora_name' and 'lora_path' must be non-empty.",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+404,
+"application/json",
+{
+"error": {
+"code": 404,
+"message": "The lora adapter 'nope' cannot be found.",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+200,
+"text/plain; charset=utf-8",
+"Success: LoRA adapter 'sql' removed successfully."
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"chat",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+200,
+"text/plain; charset=utf-8",
+"Success: LoRA adapter 'chat' removed successfully."
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+}
+]
+]
+}
+],
+"test_without_runtime_updates_the_routes_are_404_alike#0": [
+{
+"__tuple__": [
+404,
+"application/json",
+{
+"error": {
+"code": 404,
+"message": "Not Found",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+},
+{
+"__tuple__": [
+404,
+"application/json",
+{
+"error": {
+"code": 404,
+"message": "Not Found",
+"type": "invalid_request_error"
+}
+}
+]
+},
+{
+"__tuple__": [
+200,
+[
+{
+"__tuple__": [
+"qwen3_5_0.8b",
+null
+]
+},
+{
+"__tuple__": [
+"sql",
+"qwen3_5_0.8b"
+]
+}
+]
+]
+}
+]
+}

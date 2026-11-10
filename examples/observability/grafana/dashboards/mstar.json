@@ -3070,7 +3070,7 @@
       "id": 43,
       "type": "timeseries",
       "title": "HTTP refusals by status",
-      "description": "Requests the HTTP frontend answered with a 4xx (or the Rust frontend's admission cap 503) without submitting them to the API server, per second, by status. Submitted requests that fail are under 'Request rate by outcome' instead. A series that appears at 1 loses that first refusal to rate().",
+      "description": "Requests the HTTP frontend answered with a 4xx (or the admission cap's 503) without submitting them to the API server, per second, by status. Submitted requests that fail are under 'Request rate by outcome' instead. A series that appears at 1 loses that first refusal to rate().",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"

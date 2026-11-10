@@ -11,10 +11,8 @@ Each loader runs with ``soundfile`` when it is installed and with a standard
 library stand-in otherwise (``soundfile`` is the optional ``audio`` extra).
 """
 
-import io
 import math
 import sys
-import tempfile
 import types
 import wave
 from pathlib import Path
@@ -188,91 +186,60 @@ def test_common_rates_still_decode(load, target, rate, sf, tmp_path):
 
 # ---------------------------------------------------------------------------
 # /v1/audio/transcriptions: an upload over the model's clip length is decoded
-# (and resampled) by the route itself
+# (and resampled) when mstar-server asks the bridge to plan its windows
 # ---------------------------------------------------------------------------
 
-class _StubAPI:
-    def __init__(self):
-        self.model_name = "whisper_large"
-        self.model = None
-        self.upload_dir = Path(tempfile.mkdtemp())
-        self.submits: list = []
+def _plan(upload: Path, *ops: str) -> dict:
+    """The bridge's answer to the last of ``ops`` on ``upload``'s Whisper windows."""
+    import asyncio
 
-    def submit_request(self, **kw):
-        self.submits.append(kw)
-        return kw["request_id"]
+    from mstar.api_server.openai.serving_transcriptions import CUT_FRAME_SECONDS, CUT_SEARCH_SECONDS
+    from mstar.api_server.rust_frontend import RustFrontendBridge
 
-    async def collect_results(self, request_id, raw_request=None):
-        return []
-
-    async def iter_result_chunks(self, request_id):
-        return
-        yield
-
-    def release_request(self, request_id):
-        pass
-
-
-@pytest.fixture
-def client_and_stub(monkeypatch):
-    pytest.importorskip("fastapi")
-    pytest.importorskip("httpx")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    import mstar.api_server
-
-    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
-    stub = fake_ep.api_server = _StubAPI()
-    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
-    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
-    from mstar.api_server.openai.router import router
-
-    app = FastAPI()
-    app.include_router(router)
-    return TestClient(app), stub
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.sent, bridge._planners = [], {}
+    bridge._send = bridge.sent.append
+    bridge.server = types.SimpleNamespace(upload_dir=str(upload.parent))
+    bridge.loop = asyncio.new_event_loop()
+    try:
+        for op in ops:
+            bridge._windows({"op": op, "plan": 1, "rid": "r", "sub": 0, "path": str(upload), "max_seconds": 30.0,
+                             "balanced": False, "search_seconds": CUT_SEARCH_SECONDS,
+                             "frame_seconds": CUT_FRAME_SECONDS, "whole_seconds": 30.0})
+            bridge.loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(bridge.loop)))
+    finally:
+        bridge.loop.close()
+    return bridge.sent[-1]["metadata"]
 
 
-def _long_upload(sf, tmp_path: Path, rate: int) -> bytes:
-    # longer than Whisper's 30 s clip, so the route decodes it to cut windows
-    return Path(_clip(sf, tmp_path / "long.wav", rate, seconds=31.0)).read_bytes()
+def _long_upload(sf, tmp_path: Path, rate: int) -> Path:
+    # longer than Whisper's 30 s clip, so the bridge decodes it to cut windows
+    (tmp_path / "uploads").mkdir()
+    return Path(_clip(sf, tmp_path / "uploads" / "long.wav", rate, seconds=31.0))
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_transcription_upload_at_a_coprime_rate_is_a_400(stream, sf, no_resample, client_and_stub, tmp_path):
-    client, stub = client_and_stub
-    data = {"model": "whisper_large", "stream": "true" if stream else "false"}
-    files = {"file": ("odd.wav", io.BytesIO(_long_upload(sf, tmp_path, BAD_RATE)), "audio/wav")}
-    r = client.post("/v1/audio/transcriptions", data=data, files=files)
-    assert r.status_code == 400, r.text
-    assert f"unsupported sample rate {BAD_RATE} Hz" in r.text
-    assert stub.submits == []
-    assert list(stub.upload_dir.iterdir()) == []
+def test_transcription_upload_at_a_coprime_rate_is_a_400(sf, no_resample, tmp_path):
+    upload = _long_upload(sf, tmp_path, BAD_RATE)
+    error = _plan(upload, "plan")["error"]
+    assert error["status"] == 400, error
+    assert f"unsupported sample rate {BAD_RATE} Hz" in error["message"]
+    assert list(upload.parent.iterdir()) == []
 
 
-@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("error", [RuntimeError, ImportError])
-def test_transcription_upload_that_fails_to_decode_is_removed(
-    stream, error, sf, client_and_stub, tmp_path, monkeypatch,
-):
+def test_transcription_upload_that_fails_to_decode_is_removed(error, sf, tmp_path, monkeypatch):
     # header readable, body not: soundfile's read raises and the torchcodec
     # fallback raises something other than ValueError
     def broken(path, sample_rate, max_seconds):
         raise error("corrupt stream")
 
     monkeypatch.setattr(media_io, "decode_audio", broken)
-    client, stub = client_and_stub
-    data = {"model": "whisper_large", "stream": "true" if stream else "false"}
-    files = {"file": ("corrupt.wav", io.BytesIO(_long_upload(sf, tmp_path, 44100)), "audio/wav")}
-    r = client.post("/v1/audio/transcriptions", data=data, files=files)
-    assert r.status_code == 500, r.text
-    assert stub.submits == []
-    assert list(stub.upload_dir.iterdir()) == []
+    upload = _long_upload(sf, tmp_path, 44100)
+    assert _plan(upload, "plan")["error"]["status"] == 500
+    assert list(upload.parent.iterdir()) == []
 
 
-def test_transcription_upload_at_a_common_rate_is_windowed(sf, client_and_stub, tmp_path):
-    client, stub = client_and_stub
-    files = {"file": ("long.wav", io.BytesIO(_long_upload(sf, tmp_path, 44100)), "audio/wav")}
-    r = client.post("/v1/audio/transcriptions", data={"model": "whisper_large"}, files=files)
-    assert r.status_code == 200, r.text
-    assert len(stub.submits) == 2
+def test_transcription_upload_at_a_common_rate_is_windowed(sf, tmp_path):
+    answer = _plan(_long_upload(sf, tmp_path, 44100), "plan", "fixed")
+    assert "error" not in answer, answer
+    assert len(answer["windows"]) == 2

@@ -1,9 +1,9 @@
-"""FastAPI server entry point for multimodal inference requests."""
+"""The API server (``APIServer``: preprocessing, the conductor protocol and
+results) and ``mstar serve``'s entry point, which puts ``mstar-server`` in front
+of it."""
 
 import asyncio
-import base64
 import collections
-import contextlib
 import itertools
 import json
 import logging
@@ -21,31 +21,21 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-import msgpack
 import torch
-import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
-from starlette.concurrency import run_in_threadpool
+from fastapi import HTTPException
 
-from mstar.api_server import media_io, ws_frames
+import mstar.engine  # noqa: F401  (sets the compile-cache defaults; must precede torchaudio's import of torch._dynamo)
 from mstar.api_server.auth import (
     API_KEY_ENV,
-    APIKeyGuard,
-    APIKeyMiddleware,
     keep_api_key_from_children,
     resolve_api_key,
-    warn_if_no_api_key,
 )
-from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
-from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.body_limit import max_body_bytes
+from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.lora_admin import LoraAdmin
-from mstar.api_server.openpi import OpenpiPolicy, serve_connection
+from mstar.api_server.openpi import OpenpiPolicy
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -54,7 +44,6 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import Selected, ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -68,14 +57,11 @@ from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.metrics import (
     INSTALL_HINT,
     MISSING_DEPENDENCY,
-    RefusalMiddleware,
     ServingMetrics,
-    mark_submitted,
 )
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import cpus, knobs, profiler
-from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
@@ -263,16 +249,10 @@ def _shutdown_conductor_process(
 # ------------------------------------------------------------------
 
 
-#: How long ``/generate`` waits for a request still in flight under a
-#: ``request_id`` to end before it refuses a new one with a 409. A client that
-#: drops a stream and resubmits at once can arrive before the server has seen
-#: the drop and aborted the old stream; that takes a few event-loop steps.
-#: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
-DUPLICATE_ID_GRACE_S = 0.5
 
-#: How often a non-streaming handler (``collect_results``) asks whether its
-#: client left while it waits for the request to finish.
-DISCONNECT_CHECK_S = 0.1
+#: How often ``collect_results`` checks its timeout while it waits for the
+#: request to finish.
+TIMEOUT_CHECK_S = 0.1
 
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
@@ -413,47 +393,6 @@ def notify_many(reqs) -> None:
             loop.call_soon_threadsafe(_set_events, wakes)
         except RuntimeError:
             pass  # the loop is closed: the client is gone
-
-
-def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
-    """Serialize one result chunk as an NDJSON line."""
-    return json.dumps({
-        "modality": chunk.modality,
-        "data": base64.b64encode(chunk.data).decode("ascii"),
-        "metadata": chunk.metadata,
-    }) + "\n"
-
-
-async def _disconnected(raw_request: Request) -> None:
-    """Return once the client has gone; the body is already read."""
-    while (await raw_request.receive())["type"] != "http.disconnect":
-        pass
-
-
-async def _empty_stream():
-    """The body for a client that left before its first chunk."""
-    return
-    yield
-
-
-def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
-    """Serialize one result chunk as a header line plus its untouched payload.
-
-    ``nbytes`` lets the reader frame by length instead of by delimiter, and no
-    delimiter means no escaping — which is the only reason the NDJSON form has
-    to base64 the payload. A 720p video_frame chunk costs two full passes over
-    ~14.7 MB in that form (base64, then ``json.dumps`` escape-scanning every
-    character it just produced); here the payload is handed on by reference.
-
-    ``json.dumps`` escapes control characters, so the header can never contain
-    a raw newline and the reader's line split is always unambiguous.
-    """
-    header = json.dumps({
-        "modality": chunk.modality,
-        "nbytes": len(chunk.data),
-        "metadata": chunk.metadata,
-    }, separators=(",", ":"))
-    return header.encode("utf-8") + b"\n", chunk.data
 
 
 def _call_input_limit(model_config: dict | None) -> int:
@@ -637,8 +576,6 @@ class APIServer:
         # until the key has left both dicts above.
         self._live: dict[str, str] = {}
         self._client_ids: dict[str, str] = {}
-        # request_ids a caller is waiting on in wait_for_request_id
-        self._id_waiters: set[str] = set()
         self._generation = itertools.count(1)
         self.request_lock = threading.Lock()
         self.running = True
@@ -911,8 +848,6 @@ class APIServer:
                 input_bytes=input_bytes,
                 report_usage=report_usage,
             )
-        if self.metrics is not None:
-            mark_submitted()
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
@@ -949,33 +884,6 @@ class APIServer:
         finished, failed or aborted. Caller holds ``request_lock``."""
         req = self.pending_requests.get(self._live.get(request_id))
         return req is not None and not req.event.is_set()
-
-    async def wait_for_request_id(self, request_id: str | None) -> None:
-        """Give a request still in flight under ``request_id`` up to
-        :data:`DUPLICATE_ID_GRACE_S` to end, so a client's immediate retry
-        after dropping a stream is not refused before the server has seen the
-        drop. A request that is still running after that is refused by
-        :meth:`submit_request`.
-
-        One caller per id waits; another that arrives meanwhile returns at
-        once and is refused while the id is in flight, so N duplicates of a
-        live id cost one poll loop, not N."""
-        if request_id is None:
-            return
-        with self.request_lock:
-            if not self._in_flight(request_id) or request_id in self._id_waiters:
-                return
-            self._id_waiters.add(request_id)
-        try:
-            deadline = time.monotonic() + DUPLICATE_ID_GRACE_S
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-                with self.request_lock:
-                    if not self._in_flight(request_id):
-                        return
-        finally:
-            with self.request_lock:
-                self._id_waiters.discard(request_id)
 
     def _retire(self, key: str) -> None:
         """Forget ``key``'s request_id once neither dict holds the key.
@@ -1537,10 +1445,8 @@ class APIServer:
     def iter_result_chunks(self, request_id: str):
         """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.
 
-        Shared source for both output surfaces: ``/generate`` formats each
-        chunk as NDJSON (via :meth:`async_stream_results`), while the
-        OpenAI-compatible endpoints translate the same chunks into SSE. This
-        is a flattening wrapper over :meth:`iter_result_chunk_batches`, which
+        What the bridge relays to mstar-server and the Dynamo bridge serves.
+        This is a flattening wrapper over :meth:`iter_result_chunk_batches`, which
         hands out the chunks the way they arrive (several per wake under load)
         and owns the timeout, the drain and the abort on an early exit.
         """
@@ -1678,143 +1584,20 @@ class APIServer:
             if not finished:
                 self.abort_submission(key, outcome="timeout" if timed_out else "abort")
 
-    def async_stream_results(self, request_id: str, binary: bool = False, chunks=None):
-        """Yield the serialized body of ``/generate`` one piece at a time.
-
-        ``binary`` selects the length-framed form negotiated through ``Accept``.
-        The default stays NDJSON, so a client that did not negotiate — including
-        the Rust frontend, which never reads ``Accept`` — sees today's bytes.
-
-        Deliberately a plain ``def`` returning the chosen async generator rather
-        than an ``async def`` delegating to it: the branch is per-request, not
-        per-chunk, and this keeps both bodies flat. It also binds the
-        submission now, before Starlette starts iterating the body.
-
-        ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
-        already read from it (``open_result_stream``); None opens a fresh one.
-        """
-        chunks = errors_in_band(
-            request_id, chunks if chunks is not None else self.iter_result_chunks(request_id),
-        )
-        if binary:
-            return self._stream_binary(chunks)
-        return self._stream_ndjson(chunks)
-
-    async def open_result_stream(
-        self, request_id: str, raw_request: Request | None = None, *, batches: bool = False,
-    ):
-        """The request's result iterator, after its first item has arrived.
-
-        A request the engine refuses raises ``HTTPException`` with its status
-        here, before the caller commits a 200; otherwise the iterator replays
-        the first item. ``batches`` selects ``iter_result_chunk_batches``. A
-        client that disconnects first is aborted and gets an empty iterator.
-        """
-        items = (self.iter_result_chunk_batches if batches else self.iter_result_chunks)(request_id)
-        first_read = asyncio.ensure_future(anext(items, None))
-        gone = asyncio.ensure_future(_disconnected(raw_request)) if raw_request is not None else None
-        try:
-            await asyncio.wait({first_read, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            # a pending receive() would take the disconnect StreamingResponse listens for
-            for task in (gone, first_read):
-                if task is not None and not task.done():
-                    # cancelling the read unwinds the iterator, which aborts the request
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-        if first_read.cancelled():
-            return _empty_stream()
-        first = first_read.result()
-        head = first[0] if batches and first else first
-        if head is not None and head.modality == "error":
-            # read to the end, so the finished request is not aborted
-            async for _ in items:
-                pass
-            raise HTTPException(
-                status_code=int((head.metadata or {}).get("status", 500)),
-                detail=bytes(head.data).decode("utf-8", "replace"),
-            )
-
-        async def replay():
-            if first is not None:
-                yield first
-            async for item in items:
-                yield item
-        return replay()
-
-    async def _stream_ndjson(self, chunks):
-        async for chunk in chunks:
-            line = self._chunk_to_ndjson(chunk)
-            if not self.enable_nvtx:
-                yield line
-                continue
-            profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
-            # Spans the handoff to Starlette/uvicorn: chunked-transfer framing
-            # and the socket writes for ~14.7 MB, plus any transport
-            # backpressure. The generator resumes only once that is done, so
-            # this range is the server's share of the client's blocking read.
-            profiler.range_push(f"apiserver.socket_write.bytes[{len(line)}]")
-            try:
-                yield line
-            finally:
-                profiler.range_pop()
-
-    async def _stream_binary(self, chunks):
-        async for chunk in chunks:
-            header, payload = _chunk_to_binary_frame(chunk)
-            # Two yields rather than one concatenation: joining them would copy
-            # the whole payload to prepend ~100 bytes, which is the class of
-            # work this framing exists to remove.
-            yield header
-            if not self.enable_nvtx:
-                yield payload
-                continue
-            profiler.mark(f"apiserver.yield_frame.bytes[{len(payload)}]")
-            # Same range name as the NDJSON path on purpose, so the two
-            # protocols stay directly comparable in one analyzer run.
-            profiler.range_push(f"apiserver.socket_write.bytes[{len(payload)}]")
-            try:
-                yield payload
-            finally:
-                profiler.range_pop()
-
-    def _chunk_to_ndjson(self, chunk: ResultChunk) -> str:
-        if not self.enable_nvtx:
-            return _chunk_to_ndjson_payload(chunk)
-
-        # Split rather than wrapped as one range: the question these markers
-        # answer is which of the two full passes over the payload dominates.
-        profiler.range_push(f"apiserver.b64encode.bytes[{len(chunk.data)}]")
-        encoded = base64.b64encode(chunk.data).decode("ascii")
-        profiler.range_pop()
-
-        profiler.range_push(f"apiserver.json_dumps.chars[{len(encoded)}]")
-        line = json.dumps({
-            "modality": chunk.modality,
-            "data": encoded,
-            "metadata": chunk.metadata,
-        }) + "\n"
-        profiler.range_pop()
-        return line
-
     # ----------------------------------------------------------
     # Non-streaming helper
     # ----------------------------------------------------------
 
-    async def collect_results(
-        self, request_id: str, raw_request: Request | None = None
-    ) -> list[ResultChunk]:
-        """Wait for the request to finish (or the client to disconnect), then
-        return its chunks. Disconnecting, timing out, or cancelling the wait
-        releases the submission."""
+    async def collect_results(self, request_id: str) -> list[ResultChunk]:
+        """Wait for the request to finish, then return its chunks. Timing out,
+        or cancelling the wait, releases the submission."""
         start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
         # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
         # request (lock, cancel scope, timer) held the event loop at high
-        # concurrency; the timeout is checked on each pass and a disconnect
-        # every DISCONNECT_CHECK_S.
+        # concurrency; the timeout is checked on each pass, at least every
+        # TIMEOUT_CHECK_S.
         wake = asyncio.Event()
         with self.request_lock:
             req = self.pending_requests.get(key)
@@ -1822,7 +1605,6 @@ class APIServer:
                 req.loop = asyncio.get_running_loop()
                 req.wake = wake
                 req.wake_on_finish = True
-        checked = start
         try:
             while True:
                 # Cleared before the read: a notification that lands after this
@@ -1837,13 +1619,8 @@ class APIServer:
                 if now - start > self.timeout_seconds:
                     self.abort_submission(key, outcome="timeout")
                     raise HTTPException(status_code=500, detail="Request timed out")
-                if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
-                    checked = now
-                    if await raw_request.is_disconnected():
-                        self.abort_submission(key)
-                        return []
                 try:
-                    await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+                    await asyncio.wait_for(wake.wait(), timeout=TIMEOUT_CHECK_S)
                 except asyncio.TimeoutError:
                     pass
         except asyncio.CancelledError:
@@ -2171,823 +1948,6 @@ def _run_warmup_requests(
 
 
 # ------------------------------------------------------------------
-# FastAPI application
-# ------------------------------------------------------------------
-
-# Behind an ingress that serves the app under a sub-path -- Run:AI routes a
-# workload at /<project>/<job-name>/ and does NOT strip the prefix before it
-# reaches the pod -- FastAPI has to be told, or every route 404s on a path it
-# considers unknown. Empty by default, so a direct deployment is unaffected.
-app = FastAPI(
-    title="mstar API",
-    description="Multimodal Inference API",
-    root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
-)
-# Added before CORS so CORS stays outermost and a 413 still carries its headers.
-app.add_middleware(BodyLimitMiddleware)
-# Added after the body limit and before CORS, so it runs between them: CORS
-# answers browser preflights (which carry no credentials) and still stamps its
-# headers on a 401, and an unauthenticated request is refused before its body
-# is read.
-api_key_guard = APIKeyGuard(
-    resolve_api_key(), serves_openpi=lambda: getattr(api_server, "openpi_policy", None) is not None,
-)
-app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
-# Outside the key check and the body limit, which refuse before routing, and
-# inside CORS, so a browser preflight is not counted. ``routes`` must list
-# every included router's routes (test_serving_metrics checks each route).
-app.add_middleware(
-    RefusalMiddleware,
-    metrics=lambda: getattr(api_server, "metrics", None),
-    routes=lambda: (*app.router.routes, *openai_router.routes),
-)
-
-
-@app.exception_handler(RequestValidationError)
-async def request_validation_error(request: Request, exc: RequestValidationError):
-    """A body that fails its schema is a 400 like every other refused input,
-    in the envelope of the route family it was sent to."""
-    if request.url.path.startswith("/v1/"):
-        return JSONResponse(
-            status_code=400,
-            content={"error": {
-                "message": str(exc.errors()), "type": "invalid_request_error", "code": 400,
-            }},
-        )
-    return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-api_server: APIServer | None = None
-
-# Mount the OpenAI-compatible routes (/v1/*) alongside the native /generate.
-# The router resolves the loaded model's adapter lazily per request, so models
-# without an adapter simply return a 404 there and keep working via /generate.
-from mstar.api_server.openai.router import router as openai_router  # noqa: E402
-
-app.include_router(openai_router)
-
-
-def _decode_ws_files(
-    files: list | None, upload_dir: Path,
-) -> tuple[dict[str, list[str]], list[PromptPart]]:
-    """Persist a websocket message's media (``{"name", "data"}`` entries;
-    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame, or a
-    ``SavedUpload`` a large frame's parse already saved) under the upload dir,
-    grouped by the modality of each file name, the way the multipart
-    ``/generate`` route does. A message rejected halfway leaves no files
-    behind."""
-    if files is not None and not isinstance(files, list):
-        raise ValueError("files must be a list of {name, data} objects")
-    file_paths: dict[str, list[str]] = {}
-    parts: list[PromptPart] = []
-    saved: list[Path] = []
-    try:
-        for entry in files or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                raise ValueError("each file needs a string name")
-            name = entry["name"]
-            modality = _detect_modality(name)
-            if modality == "unknown":
-                raise ValueError(f"Cannot determine modality for file: {name}")
-            data = entry.get("data")
-            save_path = (
-                Path(data.claim()) if isinstance(data, ws_frames.SavedUpload)
-                else ws_frames.save_entry(name, data, upload_dir)
-            )
-            saved.append(save_path)
-            paths = file_paths.setdefault(modality, [])
-            parts.append(PromptPart(modality=modality, index=len(paths)))
-            paths.append(str(save_path))
-    except Exception:
-        for path in saved:
-            path.unlink(missing_ok=True)
-        for entry in files or []:  # the ones not reached
-            if isinstance(entry, dict) and isinstance(entry.get("data"), ws_frames.SavedUpload):
-                Path(entry["data"].claim()).unlink(missing_ok=True)
-        raise
-    return file_paths, parts
-
-
-async def _decode_ws_files_off_loop(
-    files: list | None, upload_dir: Path,
-) -> tuple[dict[str, list[str]], list[PromptPart]]:
-    """``_decode_ws_files`` on the threadpool. A cancel (the socket closed)
-    can't stop the thread, and the caller never learns its paths, so what
-    it saved is removed once it returns."""
-    decode = asyncio.ensure_future(run_in_threadpool(_decode_ws_files, files, upload_dir))
-    try:
-        return await asyncio.shield(decode)
-    except asyncio.CancelledError:
-        decode.add_done_callback(
-            lambda done: done.cancelled() or done.exception() or unlink_files(done.result()[0])
-        )
-        raise
-
-
-def _ws_modalities(value, key: str) -> list[str] | None:
-    """A modality list as a message may spell it: a comma-separated string or
-    a list of strings. Anything else is rejected by name."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return [m.strip() for m in value.split(",") if m.strip()]
-    if isinstance(value, list) and all(isinstance(m, str) for m in value):
-        return list(value)
-    raise ValueError(f"{key} must be a comma-separated string or a list of strings")
-
-
-def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
-    if file_paths:
-        media_io.remove_uploads(file_paths, api_server.upload_dir)
-
-
-def _schedule_upload_cleanup(file_paths: dict[str, list[str]]) -> None:
-    """Delete a request's uploaded files once the preprocess worker has had
-    time to read them. Shared by the HTTP and WebSocket routes."""
-    if file_paths:
-        media_io.schedule_upload_cleanup(file_paths, api_server.upload_dir)
-
-
-def _ws_input_layout(
-    text: str | None, input_modalities: list[str] | None, parts: list[PromptPart],
-) -> tuple[list[str], list[PromptPart]]:
-    """Resolve a websocket message's input layout the way ``/generate`` does:
-    an explicit list is the layout (a text prompt keeps its slot), else the
-    order the files and text arrived in."""
-    if text:
-        parts = [*parts, PromptPart(modality="text", text=text)]
-    if input_modalities is not None:
-        in_mods = list(input_modalities)
-        if text and "text" not in in_mods:
-            in_mods.append("text")
-        if not text:
-            in_mods = [m for m in in_mods if m != "text"]
-        return in_mods, []
-    return [p.modality for p in parts], parts
-
-
-# A message's input. An end of input without any is no request: none
-# could run without input.
-_WS_INPUT_FIELDS = frozenset({"text", "files"})
-
-
-def _ws_is_append(message: dict) -> bool:
-    """Whether a ``/generate/ws`` message feeds a live call rather than opening
-    a request: it carries ``append``, or ends input and carries none. Only
-    the top level counts: what an append record holds never opens one."""
-    end_input = message.get("end_input")
-    ends = end_input is True or (isinstance(end_input, list) and bool(end_input))
-    return "append" in message or (ends and not _WS_INPUT_FIELDS & message.keys())
-
-
-def _ws_end_input(message: dict, absent: bool = False) -> bool | list[str]:
-    """A message's ``end_input``: true for all of the call's client streams,
-    or a list of the ones it ends; ``absent`` when it is absent or null."""
-    value = message.get("end_input")
-    if value is None:
-        return absent
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, list) and all(isinstance(name, str) for name in value):
-        return value
-    raise ValueError("end_input must be true, false or a list of client stream names")
-
-
-# What an append record may carry; ``"append": [files]`` is short for ``{"files": [files]}``.
-_WS_APPEND_FIELDS = frozenset({"text", "files", "model_kwargs"})
-
-
-def _ws_append_record(value) -> dict:
-    """An append's record with its null fields dropped, as a null field
-    anywhere else is."""
-    if isinstance(value, list):
-        return {"files": value}
-    if not isinstance(value, dict):
-        raise ValueError("append must be an object or a list of files")
-    record = {k: v for k, v in value.items() if v is not None}
-    unknown = record.keys() - _WS_APPEND_FIELDS
-    if unknown:
-        raise ValueError(f"an append carries only {sorted(_WS_APPEND_FIELDS)}; got {sorted(unknown)}")
-    return record
-
-
-def _ws_model_kwargs(value) -> dict | None:
-    """``model_kwargs`` as a message may carry it: an object, or one as JSON text."""
-    if isinstance(value, str):
-        value = json.loads(value)
-    if value is not None and not isinstance(value, dict):
-        raise ValueError("model_kwargs must be a JSON object")
-    return value
-
-
-def _ws_file_streams(
-    files: list | None, parts: list[PromptPart],
-) -> dict[str, list[str | None]] | None:
-    """Per modality, in ``_decode_ws_files``' order, the client stream each
-    file names (``{"name", "data", "stream"}``); None when none names one."""
-    streams: dict[str, list[str | None]] = {}
-    for entry, part in zip(files or [], parts, strict=True):
-        stream = entry.get("stream")
-        if stream is not None and not isinstance(stream, str):
-            raise ValueError("a file's stream must be a client stream's name")
-        streams.setdefault(part.modality, []).append(stream)
-    if not any(name is not None for names in streams.values() for name in names):
-        return None
-    return streams
-
-
-def _pass_turn(turn: asyncio.Future) -> None:
-    if not turn.done():
-        turn.set_result(None)
-
-
-@app.websocket("/generate/ws")
-async def generate_ws(websocket: WebSocket):
-    """``/generate`` over one persistent WebSocket, for control loops.
-
-    Each incoming message is one request with the ``/generate`` fields —
-    ``text``, ``files`` (``[{"name", "data"}]``), ``input_modalities``,
-    ``output_modalities``, ``model_kwargs``, ``request_id`` — either a JSON
-    text frame (``data`` base64) or a msgpack binary frame (``data`` raw
-    bytes). Every result chunk comes back as a frame of the same encoding,
-    ``{"request_id", "modality", "data", "metadata"}``, followed by
-    ``{"request_id", "finish": true}``. A rejected message answers
-    ``{"request_id", "error": ...}``, and so does a request that fails after
-    it was accepted. Both carry the HTTP ``status`` when there is one (409
-    for a ``request_id`` still in flight, as on ``/generate``); no finish
-    follows an error. Messages may be pipelined: a client can
-    send the next observation before the previous action chunk has returned,
-    and the ``request_id`` tells the replies apart. They are submitted in the
-    order they were sent; their replies may interleave. Closing the socket aborts
-    whatever is still in flight.
-
-    A request to a model with client streams ends its input at open, as on
-    ``/generate``, unless the opening carries ``"end_input": false`` (or a list
-    of the streams it ends): then the input stays open until the client ends
-    it. ``{"request_id", "append": {"text", "files", "model_kwargs"}}`` feeds
-    the request's streams (each file may name its ``stream``; ``"append":
-    [files]`` is short for ``{"files": [files]}``), and ``{"request_id",
-    "end_input": true}`` (alone or on an append) ends them, or a list of
-    stream names only those. A live call needs a ``request_id``, and only the
-    socket that opened it can append to it. A message with ``append``, or with ``end_input`` (true or a list) and
-    no ``text`` or ``files``, is an append; one that opens a request under a live call's
-    id is refused with a 409. A null field counts as absent. A rejected
-    append ends the call with its error (``status`` 400) and no finish; an
-    append after the input or the call ended is answered with
-    ``{"request_id", "append": true, "error"}`` and the call goes on.
-    """
-    if api_server is None:
-        await websocket.close(code=1013, reason="Server not ready")
-        return
-    await websocket.accept()
-    tasks: set[asyncio.Task] = set()
-    # live calls this socket opened, by request_id: resolves to the call's
-    # submission key once it is submitted, None if it never was. The task
-    # serving a call is handed its entry and removes it when the call ends.
-    live: dict[str, asyncio.Future] = {}
-    # each live call's latest append task; the next one waits for it
-    appends: dict[str, asyncio.Task] = {}
-    # keys of requests this socket submitted that haven't finished: aborted if
-    # it closes
-    submitted: set[str] = set()
-    # Pipelined requests reply from separate tasks; one frame at a time.
-    send_lock = asyncio.Lock()
-
-    async def send(payload: dict, binary: bool) -> None:
-        async with send_lock:
-            if binary:
-                await websocket.send_bytes(msgpack.packb(payload, use_bin_type=True))
-            else:
-                if isinstance(payload.get("data"), (bytes, bytearray)):
-                    payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
-                await websocket.send_text(json.dumps(payload))
-
-    def reply(payload: dict, binary: bool) -> None:
-        """Send the receive loop's reply to a message from a task: awaited
-        there it would hold up reading behind the calls' output, and a client
-        that writes before it reads would stall on its own writes."""
-        async def send_reply() -> None:
-            try:
-                await send(payload, binary)
-            except Exception:  # noqa: BLE001 — the socket closed; the receive loop ends on it
-                pass
-        task = asyncio.create_task(send_reply())
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-
-    async def serve_one(
-        message: dict, binary: bool, call: asyncio.Future | None,
-        after: asyncio.Future | None, turn: asyncio.Future,
-    ) -> None:
-        """``call`` is the message's entry in ``live`` when it opens a live
-        call. ``after`` is done once the message before this one was submitted
-        or refused; ``turn`` is this message's, for the one after it."""
-        request_id = message.get("request_id")
-        file_paths: dict[str, list[str]] | None = None
-        key: str | None = None
-
-        def release_turn() -> None:
-            """Let the next message submit, once the one before this one has."""
-            if turn.done():
-                return
-            if after is None or after.done():
-                _pass_turn(turn)
-            else:
-                after.add_done_callback(lambda _: _pass_turn(turn))
-
-        try:
-            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
-            text = message.get("text")
-            if text is not None and not isinstance(text, str):
-                raise ValueError("text must be a string")
-            # an opening is one-shot unless it says otherwise
-            end_input = _ws_end_input(message, absent=True)
-            if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
-                # a one-shot opening: the client may have meant a live one
-                hint = " (open a live call with end_input: false)" if api_server.takes_stream_input else ""
-                raise ValueError("message carries neither text nor files" + hint)
-            file_paths, parts = await _decode_ws_files_off_loop(
-                message.get("files"), api_server.upload_dir,
-            )
-            file_streams = _ws_file_streams(message.get("files"), parts)
-            in_mods, parts = _ws_input_layout(
-                text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
-            )
-            model_kwargs = _ws_model_kwargs(message.get("model_kwargs"))
-            # Messages decode side by side but are submitted in the order they
-            # were sent; a message that decodes faster waits here.
-            if after is not None:
-                await asyncio.shield(after)
-            await api_server.wait_for_request_id(request_id)
-            request_id = api_server.submit_request(
-                text=text,
-                file_paths=file_paths or None,
-                input_modalities=in_mods,
-                output_modalities=out_mods,
-                model_kwargs=model_kwargs,
-                prompt_parts=parts or None,
-                streaming=True,
-                request_id=request_id,
-                end_input=end_input,
-                file_streams=file_streams,
-            )
-            key = api_server.submission_key(request_id)
-            submitted.add(key)
-            if call is not None:
-                call.set_result(key)
-            _pass_turn(turn)
-            # Closing the socket cancels this task; the receive loop's
-            # ``finally`` then aborts what the socket submitted.
-            failed = False
-            async for chunk in api_server.iter_result_chunks(request_id):
-                if chunk.modality == "error":
-                    # The request failed after it was accepted. This is the
-                    # iterator's last chunk, so the loop ends here; the error
-                    # is the reply and no finish follows.
-                    failed = True
-                    await send({
-                        "request_id": request_id,
-                        "error": bytes(chunk.data).decode("utf-8", "replace"),
-                        "status": chunk.metadata.get("status", 500),
-                    }, binary)
-                    continue
-                await send({
-                    "request_id": request_id, "modality": chunk.modality,
-                    "data": bytes(chunk.data), "metadata": chunk.metadata,
-                }, binary)
-            if not failed:
-                await send({"request_id": request_id, "finish": True}, binary)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            raise
-        except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            # before the send, which can wait on the socket: the call's appends
-            # and the next message wait on these
-            if call is not None and not call.done():
-                call.set_result(None)
-            release_turn()
-            if isinstance(exc, HTTPException):
-                payload = {"request_id": request_id, "error": exc.detail, "status": exc.status_code}
-                if exc.status_code < 500:
-                    logger.info(
-                        "generate/ws request %s refused (%d): %s",
-                        request_id, exc.status_code, exc.detail,
-                    )
-                else:
-                    logger.exception("generate/ws request failed")
-            else:
-                text, _ = client_error_text(
-                    exc, f"generate/ws request {request_id} failed", log=logger, type_name=False,
-                )
-                # the status /generate would have answered with
-                status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
-                payload = {"request_id": request_id, "error": text, "status": status}
-            try:
-                await send(payload, binary)
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            submitted.discard(key)
-            if call is not None:
-                if not call.done():
-                    call.set_result(None)
-                del live[request_id]
-                appends.pop(request_id, None)
-            if file_paths:
-                _schedule_upload_cleanup(file_paths)
-            release_turn()   # cancelled before submitting
-
-    async def append_one(
-        message: dict, binary: bool, call: asyncio.Future, before: asyncio.Task | None,
-    ) -> None:
-        """Feed an append to ``call``, the live call it named when it was read,
-        after ``before``, that call's previous append. A bad append ends the
-        call: the audio it carried is lost to it."""
-        request_id = message["request_id"]
-        file_paths: dict[str, list[str]] | None = None
-        late = {"request_id": request_id, "append": True,
-                "error": f"request {request_id!r} is not taking input"}
-        if before is not None:
-            await asyncio.wait([before])
-        # in order behind the call's own submission, which may still be running
-        key = await call
-        # checked before decoding, so a bad append to a call that has ended is
-        # answered as late rather than ending anything
-        if key is None or not api_server.taking_input(key):
-            reply(late, binary)
-            return
-        try:
-            misplaced = sorted(_WS_APPEND_FIELDS & message.keys()) if "append" in message else []
-            if misplaced:
-                raise ValueError(f"an append carries {', '.join(misplaced)} under 'append'")
-            record = _ws_append_record(message.get("append", {}))
-            end_input = _ws_end_input(message)
-            text = record.get("text")
-            if text is not None and not isinstance(text, str):
-                raise ValueError("text must be a string")
-            model_kwargs = _ws_model_kwargs(record.get("model_kwargs"))
-            file_paths, parts = await _decode_ws_files_off_loop(
-                record.get("files"), api_server.upload_dir,
-            )
-            file_streams = _ws_file_streams(record.get("files"), parts)
-            if not file_paths and not text and not model_kwargs and not end_input:
-                raise ValueError("an append needs text, files, model_kwargs or end_input")
-            loop = asyncio.get_running_loop()
-
-            def on_late(error: str) -> None:
-                try:
-                    loop.call_soon_threadsafe(reply, {**late, "error": error}, binary)
-                except RuntimeError:
-                    pass  # the socket's loop has closed, and the client with it
-
-            if api_server.stream_input(
-                key, file_paths or None, end_input=end_input, text=text or None,
-                file_streams=file_streams, model_kwargs=model_kwargs, on_late=on_late,
-            ):
-                file_paths = None  # the preprocess worker deletes them once loaded
-            else:
-                reply(late, binary)  # the call ended meanwhile: leave it be
-        except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            if isinstance(exc, ValueError):  # the client's fault: no traceback
-                text, status = scrub_paths(str(exc)), 400
-                logger.info("generate/ws append for %s refused: %s", request_id, text)
-            else:
-                text, _ = client_error_text(
-                    exc, f"generate/ws append for {request_id} failed", log=logger, type_name=False,
-                )
-                status = 500
-            error = f"append rejected: {text}"
-            # the call's stream sends the error and no finish; False if the
-            # call ended meanwhile, and then the append was late
-            if not api_server.reject_input(key, error, status):
-                reply(late, binary)
-        finally:
-            unlink_files(file_paths)
-
-    previous_turn: asyncio.Future | None = None
-    try:
-        while True:
-            # not kept while the socket idles: a refused message's saved files go with it
-            frame = message = None
-            frame = await websocket.receive()
-            if frame.get("type") == "websocket.disconnect":
-                break
-            binary = frame.get("bytes") is not None
-            try:
-                message = await ws_frames.parse_frame(
-                    frame["bytes"] if binary else frame.get("text") or "", api_server.upload_dir,
-                )
-            except OSError as exc:  # the server's side of a large frame, not the frame
-                text, _ = client_error_text(exc, "generate/ws frame hand-off failed", log=logger, type_name=False)
-                reply({"request_id": None, "error": text, "status": 500}, binary)
-                continue
-            except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
-                reply({"request_id": None, "error": f"undecodable frame: {scrub_paths(str(exc))}"}, binary)
-                continue
-            if not isinstance(message, dict):
-                reply({"request_id": None, "error": "message must be an object"}, binary)
-                continue
-            # a null field is an absent one, to routing and validation alike
-            message = {k: v for k, v in message.items() if v is not None}
-            if message.get("request_id") == "":
-                # An empty form field reaches /generate as None; same here.
-                del message["request_id"]
-            request_id = message.get("request_id")
-            if request_id is not None and not isinstance(request_id, str):
-                reply({"request_id": None, "error": "request_id must be a string"}, binary)
-                continue
-            try:
-                check_request_id(request_id)
-            except ValueError as exc:
-                reply({"request_id": request_id, "error": str(exc), "status": 400}, binary)
-                continue
-            if _ws_is_append(message):
-                if request_id not in live:
-                    reply({"request_id": request_id, "append": True,
-                           "error": f"request {request_id!r} is not taking input on this socket"}, binary)
-                    continue
-                # A task per append, chained per call: awaited here, an append
-                # whose call waits its turn to submit would hold up reading
-                # every other call's.
-                task = asyncio.create_task(
-                    append_one(message, binary, live[request_id], appends.get(request_id)),
-                )
-                appends[request_id] = task
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-                continue
-            if request_id in live:
-                # refused as any id in flight is, and the call goes on
-                reply({"request_id": request_id, "error": request_id_in_use(request_id),
-                       "status": 409}, binary)
-                continue
-            call = None
-            if api_server.takes_stream_input and message.get("end_input") not in (None, True):
-                # a live call: appends find it by id, from the moment it is read
-                if request_id is None:
-                    reply({"request_id": None, "error": "a live call needs a request_id"}, binary)
-                    continue
-                call = live[request_id] = asyncio.get_running_loop().create_future()
-            turn = asyncio.get_running_loop().create_future()
-            task = asyncio.create_task(serve_one(message, binary, call, previous_turn, turn))
-            previous_turn = turn
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        for task in list(tasks):
-            task.cancel()
-        # A task cancelled mid-send leaves its stream's generator suspended,
-        # and the generator's finally (the usual abort) runs only once it is
-        # garbage collected: abort now what this socket submitted.
-        for key in list(submitted):
-            api_server.abort_submission(key)
-
-
-@app.post("/generate")
-async def generate(
-    request: Request,
-    text: Optional[str] = Form(None),
-    files: Optional[list[UploadFile]] = File(None),
-    input_modalities: Optional[str] = Form(None),
-    output_modalities: str = Form("text"),
-    streaming: bool = Form(True),
-    model_kwargs: Optional[str] = Form(None),
-    request_id: Optional[str] = Form(None),
-):
-    """Submit a multimodal generation request.
-
-    Args:
-        text: Optional text input.
-        files: Optional media files (images, audio, video).  The modality of
-            each file is inferred from its extension.
-        input_modalities: Comma-separated list of input modalities.  When
-            omitted, modalities are auto-detected from the provided data.
-        output_modalities: Comma-separated list of desired output modalities
-            (default ``"text"``).
-        streaming: If ``True``, return an NDJSON stream of result chunks.
-        model_kwargs: Optional JSON string of model-specific parameters.
-        request_id: Optional client-supplied request id. When omitted, the
-            server generates a fresh uuid4. Pinning this is useful for
-            deterministic-noise debugging because the conductor seeds its
-            per-request RNG via ``hash(request_id)``. An id that still has
-            a request in flight is refused with a 409; it is free again once
-            that request finished, failed or was aborted.
-    """
-    if api_server is None:
-        raise HTTPException(status_code=503, detail="Server not ready")
-    try:
-        check_request_id(request_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from None
-
-    # Every field is a form field: any other body (JSON, say) parses as an
-    # empty form, and would be submitted as an empty request.
-    content_type = request.headers.get("content-type", "")
-    if content_type and content_type.split(";", 1)[0].strip().lower() not in (
-        "multipart/form-data", "application/x-www-form-urlencoded",
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"/generate takes multipart/form-data or urlencoded fields, not {content_type}",
-        )
-
-    # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
-    # HTML checkbox) instead of its declared default, for Optional[bool] too.
-    if "streaming" not in await request.form():
-        streaming = True
-
-    out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
-    streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
-    if streaming_only and not streaming:
-        names = ", ".join(sorted(streaming_only))
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Output modality {names} requires streaming=true; raw frame "
-                "chunks cannot be returned as an aggregated response."
-            ),
-        )
-
-    # --- save uploaded files, grouped by modality ----------------
-    file_paths: dict[str, list[str]] = {}
-    parts: list[PromptPart] = []
-    if files:
-        for f in files:
-            modality = _detect_modality(f.filename or "")
-            if modality == "unknown":
-                # a refused request is never submitted, so the deferred cleanup
-                # below never sees what it saved
-                _remove_uploads(file_paths)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot determine modality for file: {f.filename}",
-                )
-            # Sanitize: only the final path component of the client name;
-            # embedded separators (../) would escape upload_dir.
-            base = os.path.basename(f.filename or "") or "upload"
-            save_name = f"{uuid.uuid4()}_{base}"
-            save_path = api_server.upload_dir / save_name
-            content = await f.read()
-            await run_in_threadpool(save_path.write_bytes, content)
-            paths = file_paths.setdefault(modality, [])
-            parts.append(PromptPart(modality=modality, index=len(paths)))
-            paths.append(str(save_path))
-    if text:
-        parts.append(PromptPart(modality="text", text=text))
-
-    # --- resolve input modalities --------------------------------
-    # An explicit list is then the layout on its own, so the derived parts go
-    # rather than disagree with it.
-    if input_modalities is not None:
-        in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
-        parts = []
-        # A layout with no text slot would drop the prompt on the floor; it
-        # went at the end before ordering was kept, so put it back there.
-        if text and "text" not in in_mods:
-            in_mods.append("text")
-        # And a declared text slot with no text renders to nothing, so the
-        # prompt has one fewer span than the layout plans for. Drop it here,
-        # where intake and the schedule builder both still read the same list.
-        if not text:
-            in_mods = [m for m in in_mods if m != "text"]
-    else:
-        in_mods = [p.modality for p in parts]
-
-    if "video_frame" in in_mods:
-        _remove_uploads(file_paths)
-        raise HTTPException(
-            status_code=400,
-            detail="'video_frame' is an output-only modality",
-        )
-
-    try:
-        parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
-    except json.JSONDecodeError as e:
-        _remove_uploads(file_paths)
-        raise HTTPException(
-            status_code=400,
-            detail="model_kwargs must be valid JSON",
-        ) from e
-
-    if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
-        _remove_uploads(file_paths)
-        raise HTTPException(
-            status_code=400,
-            detail="model_kwargs must be a JSON object",
-        )
-
-    try:
-        await api_server.wait_for_request_id(request_id)
-        try:
-            request_id = api_server.submit_request(
-                text=text,
-                file_paths=file_paths or None,
-                input_modalities=in_mods,
-                output_modalities=out_mods,
-                model_kwargs=parsed_kwargs,
-                prompt_parts=parts or None,
-                streaming=streaming,
-                request_id=request_id,
-            )
-        except json.JSONDecodeError:
-            raise   # a downstream parse failure, not a bad request (a 500 below)
-        except ValueError as e:   # submit_request's refusals are the client's fault
-            raise HTTPException(status_code=400, detail=scrub_paths(str(e))) from e
-
-        if streaming:
-            # Substring match, not RFC 7231 q-value parsing: the value is a
-            # private vendor type that appears in no other media range, and a
-            # client that does not ask for it keeps the historical NDJSON body.
-            binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
-            key = api_server.submission_key(request_id)
-            # wait for the first chunk: a refused request gets its real status, not a 200
-            chunks = await api_server.open_result_stream(request_id, request)
-            return ReleasingStreamingResponse(
-                api_server.async_stream_results(request_id, binary=binary, chunks=chunks),
-                release=lambda: api_server.release_submission(key),
-                media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
-                headers={"Cache-Control": "no-cache", "Vary": "Accept"},
-            )
-
-        chunks = await api_server.collect_results(request_id, request)
-        outputs: dict[str, list[dict]] = {}
-        for chunk in chunks:
-            outputs.setdefault(chunk.modality, []).append({
-                "data": base64.b64encode(chunk.data).decode("ascii"),
-                "metadata": chunk.metadata,
-            })
-        return JSONResponse({
-            "request_id": request_id,
-            "outputs": outputs,
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        text, _ = client_error_text(
-            e, f"generate request {request_id} failed", log=logger, type_name=False,
-        )
-        raise HTTPException(status_code=500, detail=text) from e
-    finally:
-        # Deferred cleanup of uploaded files
-        if file_paths:
-            _schedule_upload_cleanup(file_paths)
-
-
-@app.get("/health")
-async def health_check():
-    # Report unhealthy while shutting down, so a load balancer stops sending here.
-    if api_server is not None and api_server.fatal_error is not None:
-        raise HTTPException(status_code=503, detail=api_server.fatal_error)
-    return {"status": "healthy"}
-
-
-@app.get("/healthz", include_in_schema=False)
-async def healthz():
-    """``/health`` as openpi's policy server answers its probe, on a server that
-    serves the openpi socket; elsewhere there is no such route."""
-    if getattr(api_server, "openpi_policy", None) is None:
-        raise HTTPException(status_code=404, detail="Not Found")
-    await health_check()
-    return PlainTextResponse("OK\n")
-
-
-@app.websocket("/")
-async def openpi_ws(websocket: WebSocket):
-    """openpi's policy protocol (see :mod:`mstar.api_server.openpi`), where
-    ``openpi_client`` connects: the server's root. Refused unless the config
-    has an ``openpi:`` block."""
-    if api_server is None:
-        await websocket.close(code=1013, reason="Server not ready")
-        return
-    await serve_connection(websocket, api_server)
-
-
-@app.get("/metrics", include_in_schema=False)
-async def metrics():
-    """Prometheus metrics, when the server runs with ``--enable-metrics``."""
-    if api_server is None or api_server.metrics is None:
-        raise HTTPException(
-            status_code=404,
-            detail="metrics are off; start the server with --enable-metrics",
-        )
-    return Response(api_server.metrics.render(), media_type=api_server.metrics.content_type)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if api_server is not None:
-        api_server.cleanup()
-
-
-# ------------------------------------------------------------------
 # CLI entry point
 # ------------------------------------------------------------------
 
@@ -3042,18 +2002,6 @@ def _ws_max_size(config: dict) -> int:
     if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
         raise ValueError(f"ws_max_message_mb must be a positive number of MiB, not {mb!r}")
     return int(mb * (1 << 20))
-
-
-def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
-    # Per-message deflate is negotiated server-wide, for every WebSocket route,
-    # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
-    # own, uvicorn's records reach the root logger and its writer thread.
-    return uvicorn.Config(
-        app, host=host, port=port, access_log=False, log_config=None,
-        ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
-        ws_max_size=_ws_max_size(config),
-    )
 
 
 def _set_preprocess_threads(model, config: dict) -> None:
@@ -3139,13 +2087,10 @@ def main(argv: list[str] | None = None):
         "--enable-metrics", action="store_true",
         help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
-    parser.add_argument(
-        "--python-frontend", action="store_true",
-        help="Serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
-             "of mstar-server, the default",
-    )
-    # the default since mstar-server became it; kept so existing commands run
+    # mstar-server is the only HTTP frontend; the flag that chose it is accepted, and warned about
     parser.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
+    # and the one that left it is refused, with what replaced it
+    parser.add_argument("--python-frontend", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
         help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
@@ -3153,8 +2098,8 @@ def main(argv: list[str] | None = None):
              "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
-    if args.python_frontend and (args.rust_frontend or args.rust_frontend_bin):
-        parser.error("--python-frontend serves without mstar-server, so it takes no --rust-frontend(-bin)")
+    if args.python_frontend:
+        parser.error("the Python frontend (--python-frontend) was removed; mstar-server is the only HTTP frontend")
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
     if args.socket_path_prefix is None:
@@ -3166,9 +2111,10 @@ def main(argv: list[str] | None = None):
     )
     quiet_noisy_loggers()
     log_off_thread()
+    if args.rust_frontend:
+        logger.warning("--rust-frontend is the default now, and the only frontend; drop the flag")
     api_key = resolve_api_key(args.api_key)
-    api_key_guard.set(api_key)
-    # The Rust frontend gets the key explicitly.
+    # mstar-server gets the key explicitly
     keep_api_key_from_children(api_key)
 
     with open(args.config) as f:
@@ -3178,14 +2124,13 @@ def main(argv: list[str] | None = None):
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
         raise SystemExit(f"mstar: {e}") from None
-    if not args.python_frontend:
-        from mstar.api_server.rust_frontend import find_server_binary
+    from mstar.api_server.rust_frontend import find_server_binary
 
-        # Before anything loads, so a missing or stale binary fails fast.
-        try:
-            rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
-        except (FileNotFoundError, RuntimeError) as e:
-            raise SystemExit(f"mstar: {e}\n(--python-frontend serves from uvicorn instead)") from None
+    # Before anything loads, so a missing or stale binary fails fast.
+    try:
+        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise SystemExit(f"mstar: {e}") from None
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3274,62 +2219,43 @@ def main(argv: list[str] | None = None):
             _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
-        if not args.python_frontend:
-            import tempfile
+        import tempfile
 
-            from mstar.api_server.openai.adapters import get_adapter
-            from mstar.api_server.rust_frontend import (
-                RustFrontendBridge,
-                launch_rust_server,
-                openpi_facts,
-                realtime_facts,
-                transcription_facts,
-            )
+        from mstar.api_server.openai.adapters import get_adapter
+        from mstar.api_server.rust_frontend import (
+            RustFrontendBridge,
+            launch_rust_server,
+            openpi_facts,
+            realtime_facts,
+            transcription_facts,
+        )
 
-            bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
-            # Forward --host to the Rust frontend (it binds 127.0.0.1 by
-            # default; --host 0.0.0.0 for the multi-node / container case).
-            os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
-            model = api_server.model
-            rust_proc = launch_rust_server(
-                rust_frontend_bin, model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key,
-                timeout_s=args.timeout,
-                sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
-                served_models=api_server.served_models,
-                transcription=transcription_facts(api_server, get_adapter(model_name)),
-                openpi=openpi_facts(api_server.openpi_policy),
-                ws_max_bytes=_ws_max_size(config),
-                client_streams=api_server.client_streams,
-                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
-            logger.info("Starting mstar API server (mstar-server) on port %s",
-                        args.port)
-            bridge = RustFrontendBridge(api_server, bridge_dir)
-            api_server.set_on_fatal(bridge.stop)
-            Thread(target=_stop_with, args=(rust_proc, bridge), name="mstar-server-watch", daemon=True).start()
-            bridge.run(frontend=rust_proc)
-            if (code := rust_proc.poll()) not in (None, 0):
-                # it exits 0 when a signal stops it, so this is a crash, a kill or a lost port
-                logger.error("mstar-server exited with code %d; stopping the deployment", code)
-                exit_code = 3
-        else:
-            logger.warning("--python-frontend: the uvicorn/FastAPI frontend is deprecated and will be removed; "
-                           "mstar-server is the default")
-            # (mstar-server logs the same warning for itself.)
-            warn_if_no_api_key(api_key, args.host, args.port)
-            logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-            # uvicorn.run() inlined so the server object is reachable. The
-            # message thread stops it when the conductor dies.
-            server = uvicorn.Server(_uvicorn_config(app, args.host, args.port, config))
-
-            def _stop_server():
-                server.should_exit = True
-
-            api_server.set_on_fatal(_stop_server)
-            ws_frames.start()
-            server.run()
-            if not server.started:
-                exit_code = 3  # uvicorn.run()'s own code for a server that never came up
+        bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
+        # Forward --host to the Rust frontend (it binds 127.0.0.1 by
+        # default; --host 0.0.0.0 for the multi-node / container case).
+        os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+        model = api_server.model
+        rust_proc = launch_rust_server(
+            rust_frontend_bin, model_name,
+            args.port, bridge_dir, args.upload_dir, api_key=api_key,
+            timeout_s=args.timeout,
+            sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
+            served_models=api_server.served_models,
+            transcription=transcription_facts(api_server, get_adapter(model_name)),
+            openpi=openpi_facts(api_server.openpi_policy),
+            ws_max_bytes=_ws_max_size(config),
+            client_streams=api_server.client_streams,
+            realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
+        logger.info("Starting mstar API server (mstar-server) on port %s",
+                    args.port)
+        bridge = RustFrontendBridge(api_server, bridge_dir)
+        api_server.set_on_fatal(bridge.stop)
+        Thread(target=_stop_with, args=(rust_proc, bridge), name="mstar-server-watch", daemon=True).start()
+        bridge.run(frontend=rust_proc)
+        if (code := rust_proc.poll()) not in (None, 0):
+            # it exits 0 when a signal stops it, so this is a crash, a kill or a lost port
+            logger.error("mstar-server exited with code %d; stopping the deployment", code)
+            exit_code = 3
     except KeyboardInterrupt:
         pass
     except DeadConductorError as e:
@@ -3351,7 +2277,6 @@ def main(argv: list[str] | None = None):
             shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
-        ws_frames.stop()
         _shutdown_conductor_process(conductor_proc)
     # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
     if api_server.fatal_error is not None:

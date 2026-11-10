@@ -641,10 +641,8 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     # is left as it is, so a longer hypothesis still parses to a longer text
     looped = "language English<asr_text>yes" + " no" * 40
     assert ad.parse_transcript(looped, free).text == "yes" + " no" * 40
-    from mstar.api_server.openai.serving_transcriptions import Window, merge_windows
-
-    merged = merge_windows([Window(path="w.wav", offset=0.0, duration=5.0, raw_text=looped)], ad, free)
-    assert merged.text == "yes no" and merged.language == "en"
+    finished = ad.parse_transcript(looped, free)
+    assert ad.final_text(finished.text) == "yes no" and finished.language == "en"
     assert ad.parse_transcript(" plain words ", req).language == "en"
     # the stream shows nothing until the language line has closed, then only the text after the tag
     assert ad.stream_text("language") == "" and ad.stream_text("language English") == ""
@@ -722,10 +720,14 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
 
 
 def test_the_transcription_route_sees_the_keys_qwen3_asr_reads():
-    """The long-form route carries earlier windows' text only to a model that reads
-    ``initial_prompt``, and logs any key a model doesn't declare as ignored."""
-    from mstar.api_server.openai.serving_transcriptions import _reads
+    """mstar-server's long-form route carries earlier windows' text only to a
+    model that reads ``initial_prompt``, and logs any key a model doesn't
+    declare as ignored: the launcher hands it the keys the model declares."""
+    pytest.importorskip("pydantic")
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.rust_frontend import transcription_facts
 
     api = SimpleNamespace(model=_make_model())
-    assert all(_reads(api, key) for key in ("initial_prompt", "language", "assistant_prefix"))
-    assert not _reads(api, "timestamps")
+    declared = transcription_facts(api, adapters.get_adapter("qwen3_asr"))["request_kwargs"]
+    assert {"initial_prompt", "language", "assistant_prefix"} <= set(declared)
+    assert "timestamps" not in declared

@@ -445,50 +445,18 @@ def test_tokenize_prompt_truncation() -> None:
     assert short_default == short_capped
 
 
-def test_create_images_n_expands_requests() -> None:
-    import asyncio
-    import base64
-
+def test_image_request_carries_its_seed() -> None:
+    """The adapter passes a client seed through, which the frontend advances
+    per image for ``n > 1`` (image i takes seed + i); an unseeded request
+    gets none, so each image draws its own."""
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import ImageGenerationRequest
-    from mstar.api_server.openai.serving_images import create_images
-    from mstar.api_server.request_types import ResultChunk  # noqa: I001
-
-    class _Api:
-        upload_dir = "/tmp"
-
-        def __init__(self):
-            self.submits = []
-
-        def submit_request(self, **kw):
-            self.submits.append(kw)
-            return kw["request_id"]
-
-        async def collect_results(self, request_id, raw_request=None):
-            return [ResultChunk(request_id=request_id, modality="image", data=request_id.encode())]
 
     adapter = get_adapter("cosmos3")
-
-    # n=3 with a seed: the reference contract gives image i seed + i, so
-    # image 0 bit-matches the same request with n=1; results keep seed order.
-    api = _Api()
-    out = asyncio.run(
-        create_images(api, "cosmos3", adapter, ImageGenerationRequest(prompt="x", n=3, seed=7))
-    )
-    assert [s["model_kwargs"]["seed"] for s in api.submits] == [7, 8, 9]
-    ids = [s["request_id"] for s in api.submits]
-    assert [base64.b64decode(d["b64_json"]).decode() for d in out["data"]] == ids
-
-    # n=1 (default): exactly one submit, kwargs untouched.
-    api = _Api()
-    asyncio.run(create_images(api, "cosmos3", adapter, ImageGenerationRequest(prompt="x", seed=7)))
-    assert len(api.submits) == 1 and api.submits[0]["model_kwargs"]["seed"] == 7
-
-    # Unseeded n=2: independent per-request seeds, none injected here.
-    api = _Api()
-    asyncio.run(create_images(api, "cosmos3", adapter, ImageGenerationRequest(prompt="x", n=2)))
-    assert len(api.submits) == 2
-    assert all("seed" not in s["model_kwargs"] for s in api.submits)
+    seeded = adapter.image_to_request(ImageGenerationRequest(prompt="x", n=3, seed=7), "/tmp")
+    assert seeded.model_kwargs["seed"] == 7 and seeded.output_modalities == ["image"]
+    unseeded = adapter.image_to_request(ImageGenerationRequest(prompt="x", n=2), "/tmp")
+    assert "seed" not in unseeded.model_kwargs
 
 
 def test_normalize_condition_frame_indexes() -> None:

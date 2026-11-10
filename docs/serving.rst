@@ -199,13 +199,13 @@ set.
 .. code-block:: bash
 
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
-   mstar serve qwen3_omni            # or: mstar-serve --config ... [--python-frontend]
+   mstar serve qwen3_omni            # or: mstar-serve --config ...
 
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 :ref:`serving-metrics`) answers ``401`` unless the request carries
 ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
-``/generate/ws``) refuse the handshake without it. The check is one middleware over the
-whole app (``mstar-server`` and the Python frontend alike), and the comparison takes the same time
+``/generate/ws``) refuse the handshake without it. The check is one layer over the
+whole app (``rust/server/src/auth.rs``), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. ``--api-key`` overrides the environment variable, but
 prefer the variable: a command-line flag is visible to every local user in the process
@@ -318,15 +318,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the model can't serve (more cameras than ``num_cameras``, an unknown key) stops
        the server at startup.
    * - ``ws_per_message_deflate``
-     - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes; it applies to every route.
-       Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
-       55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
-       costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
-       ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck. ``mstar-server``, the default
-       frontend, offers no deflate whatever this says, so this applies only under
-       ``--python-frontend``.
+     - *(ignored)* Has no effect: ``mstar-server`` offers no per-message deflate on its
+       WebSocket routes, so a client that asks for it gets uncompressed frames.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
@@ -1158,10 +1151,9 @@ Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network.
-``mstar-server`` serves the same text as the Python frontend: it asks the API server for
-it over the bridge, so both frontends show the same names, and it answers ``503`` if the
-bridge does not reply within two seconds, as ``/health`` does.
+matters for a deployment, keep the port on an internal network. ``mstar-server`` asks
+the API server for the text over the bridge, and answers ``503`` if the bridge does not
+reply within two seconds, as ``/health`` does.
 
 :doc:`metrics` documents every family in one place, with a Prometheus and Grafana setup.
 
@@ -1191,13 +1183,13 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   (missing or wrong API key), ``413`` (body over ``MSTAR_MAX_BODY_MB``), ``422`` (body
   that fails validation), ``400`` (a bad form field or request), ``409`` (a
   ``request_id`` in flight), ``404`` (unknown route, or a model without the endpoint),
-  ``405`` (wrong method), plus ``503`` when the Rust frontend's
+  ``405`` (wrong method), plus ``503`` when the
   ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
   path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
   A request that was submitted and then failed counts once, as an ``error`` in
   ``mstar_requests_total``, never here. WebSocket handshakes are not counted.
-  ``mstar-server`` keeps these counts and sends them with each
-  ``/metrics`` request, so the API server exports them under the same name.
+  ``mstar-server`` keeps these counts and sends them with each ``/metrics`` request,
+  and the API server exports them.
 - ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
   successful requests, from the conductor taking the request in to admitting it for
   dispatch. Zero unless the request queued at ``max_concurrent_requests``.

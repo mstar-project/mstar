@@ -1,0 +1,1614 @@
+{
+"test_a_live_call_takes_appends_until_its_input_ends[json]#0": {
+"__tuple__": [
+{
+"call": [
+{
+"data": "eyJpbnB1dHMiOiBbIm1vcmUiLCBudWxsLCBudWxsLCAibGFzdCJdfQ==",
+"metadata": {},
+"modality": "text",
+"request_id": "call"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "call"
+},
+{
+"finish": true,
+"request_id": "call"
+},
+{
+"append": true,
+"error": "request 'call' is not taking input on this socket",
+"request_id": "call"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[
+{
+"end_input": false,
+"file_streams": {
+"audio": [
+"audio"
+]
+},
+"files": {
+"audio": [
+{
+"__tuple__": [
+"a.wav",
+{
+"__bytes__": "UklGRjE="
+}
+]
+}
+]
+},
+"key": "call",
+"mk": null,
+"text": "more"
+},
+{
+"end_input": [
+"audio"
+],
+"file_streams": null,
+"files": {
+"audio": [
+{
+"__tuple__": [
+"b.wav",
+{
+"__bytes__": "UklGRjI="
+}
+]
+}
+]
+},
+"key": "call",
+"mk": null,
+"text": null
+},
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"key": "call",
+"mk": {
+"k": 2
+},
+"text": null
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"key": "call",
+"mk": {
+"k": 1
+},
+"text": "last"
+}
+]
+]
+}
+]
+},
+"test_a_live_call_takes_appends_until_its_input_ends[msgpack]#0": {
+"__tuple__": [
+{
+"call": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbIm1vcmUiLCBudWxsLCBudWxsLCAibGFzdCJdfQ=="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "call"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "call"
+},
+{
+"finish": true,
+"request_id": "call"
+},
+{
+"append": true,
+"error": "request 'call' is not taking input on this socket",
+"request_id": "call"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[
+{
+"end_input": false,
+"file_streams": {
+"audio": [
+"audio"
+]
+},
+"files": {
+"audio": [
+{
+"__tuple__": [
+"a.wav",
+{
+"__bytes__": "UklGRjE="
+}
+]
+}
+]
+},
+"key": "call",
+"mk": null,
+"text": "more"
+},
+{
+"end_input": [
+"audio"
+],
+"file_streams": null,
+"files": {
+"audio": [
+{
+"__tuple__": [
+"b.wav",
+{
+"__bytes__": "UklGRjI="
+}
+]
+}
+]
+},
+"key": "call",
+"mk": null,
+"text": null
+},
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"key": "call",
+"mk": {
+"k": 2
+},
+"text": null
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"key": "call",
+"mk": {
+"k": 1
+},
+"text": "last"
+}
+]
+]
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/-GET]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/-POST]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/generate/ws-GET]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/generate/ws-POST]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/v1/realtime-GET]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_plain_request_to_a_socket_route_reads_as_pythons[/v1/realtime-POST]#0": {
+"__tuple__": [
+404,
+{
+"detail": "Not Found"
+}
+]
+},
+"test_a_refused_message_reads_as_pythons[json]#0": {
+"__tuple__": [
+{
+"None": [
+{
+"error": "request_id must be a string",
+"request_id": null
+},
+{
+"error": "message must be an object",
+"request_id": null
+},
+{
+"error": "the model refuses this text",
+"request_id": null,
+"status": 400
+}
+],
+"e1": [
+{
+"error": "message carries neither text nor files",
+"request_id": "e1",
+"status": 400
+}
+],
+"e10": [
+{
+"data": "cGFydGlhbA==",
+"metadata": {},
+"modality": "text",
+"request_id": "e10"
+},
+{
+"error": "the engine gave up",
+"request_id": "e10",
+"status": 503
+}
+],
+"e11": [
+{
+"error": "end_input must be true, false or a list of client stream names",
+"request_id": "e11",
+"status": 400
+}
+],
+"e2": [
+{
+"error": "text must be a string",
+"request_id": "e2",
+"status": 400
+}
+],
+"e3": [
+{
+"error": "files must be a list of {name, data} objects",
+"request_id": "e3",
+"status": 400
+}
+],
+"e4": [
+{
+"error": "Cannot determine modality for file: a.xyz",
+"request_id": "e4",
+"status": 400
+}
+],
+"e5": [
+{
+"error": "each file needs a string name",
+"request_id": "e5",
+"status": 400
+}
+],
+"e6": [
+{
+"error": "file 'a.png' carries no data",
+"request_id": "e6",
+"status": 400
+}
+],
+"e7": [
+{
+"error": "output_modalities must be a comma-separated string or a list of strings",
+"request_id": "e7",
+"status": 400
+}
+],
+"e8": [
+{
+"error": "model_kwargs must be a JSON object",
+"request_id": "e8",
+"status": 400
+}
+],
+"e9": [
+{
+"error": "the model refuses this text",
+"request_id": "e9",
+"status": 400
+}
+],
+"gen-1": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "gen-1"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "gen-1"
+},
+{
+"finish": true,
+"request_id": "gen-1"
+}
+],
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": [
+{
+"error": "request_id must be at most 128 characters from [A-Za-z0-9._:-]",
+"request_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"fail later",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "fail later"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"empty id is no id",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "empty id is no id"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_refused_message_reads_as_pythons[msgpack]#0": {
+"__tuple__": [
+{
+"None": [
+{
+"error": "request_id must be a string",
+"request_id": null
+},
+{
+"error": "message must be an object",
+"request_id": null
+},
+{
+"error": "the model refuses this text",
+"request_id": null,
+"status": 400
+}
+],
+"e1": [
+{
+"error": "message carries neither text nor files",
+"request_id": "e1",
+"status": 400
+}
+],
+"e10": [
+{
+"data": {
+"__bytes__": "cGFydGlhbA=="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "e10"
+},
+{
+"error": "the engine gave up",
+"request_id": "e10",
+"status": 503
+}
+],
+"e11": [
+{
+"error": "end_input must be true, false or a list of client stream names",
+"request_id": "e11",
+"status": 400
+}
+],
+"e2": [
+{
+"error": "text must be a string",
+"request_id": "e2",
+"status": 400
+}
+],
+"e3": [
+{
+"error": "files must be a list of {name, data} objects",
+"request_id": "e3",
+"status": 400
+}
+],
+"e4": [
+{
+"error": "Cannot determine modality for file: a.xyz",
+"request_id": "e4",
+"status": 400
+}
+],
+"e5": [
+{
+"error": "each file needs a string name",
+"request_id": "e5",
+"status": 400
+}
+],
+"e6": [
+{
+"error": "file 'a.png' carries no data",
+"request_id": "e6",
+"status": 400
+}
+],
+"e7": [
+{
+"error": "output_modalities must be a comma-separated string or a list of strings",
+"request_id": "e7",
+"status": 400
+}
+],
+"e8": [
+{
+"error": "model_kwargs must be a JSON object",
+"request_id": "e8",
+"status": 400
+}
+],
+"e9": [
+{
+"error": "the model refuses this text",
+"request_id": "e9",
+"status": 400
+}
+],
+"gen-1": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbXX0="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "gen-1"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "gen-1"
+},
+{
+"finish": true,
+"request_id": "gen-1"
+}
+],
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": [
+{
+"error": "request_id must be at most 128 characters from [A-Za-z0-9._:-]",
+"request_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"fail later",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "fail later"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"empty id is no id",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "empty id is no id"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_rejected_append_ends_the_call_with_its_error[bad-text]#0": {
+"__tuple__": [
+{
+"r": [
+{
+"error": "append rejected: text must be a string",
+"request_id": "r",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_rejected_append_ends_the_call_with_its_error[empty]#0": {
+"__tuple__": [
+{
+"r": [
+{
+"error": "append rejected: an append needs text, files, model_kwargs or end_input",
+"request_id": "r",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_rejected_append_ends_the_call_with_its_error[misplaced]#0": {
+"__tuple__": [
+{
+"r": [
+{
+"error": "append rejected: an append carries text under 'append'",
+"request_id": "r",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_rejected_append_ends_the_call_with_its_error[unknown-field]#0": {
+"__tuple__": [
+{
+"r": [
+{
+"error": "append rejected: an append carries only ['files', 'model_kwargs', 'text']; got ['audio']",
+"request_id": "r",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[]
+]
+}
+]
+},
+"test_a_rejected_append_ends_the_call_with_its_error[unknown-stream]#0": {
+"__tuple__": [
+{
+"r": [
+{
+"error": "append rejected: no client stream named 'video'; this model takes ['audio', 'text']",
+"request_id": "r",
+"status": 400
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[]
+]
+}
+]
+},
+"test_an_undecodable_frame_is_answered_and_the_socket_goes_on#0": {
+"__tuple__": [
+{
+"None": [
+{
+"error": "undecodable frame: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+"request_id": null
+}
+],
+"ok": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "ok"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "ok"
+},
+{
+"finish": true,
+"request_id": "ok"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"fine",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "fine"
+}
+],
+[]
+]
+}
+]
+},
+"test_live_call_refusals_read_as_pythons#0": {
+"__tuple__": [
+{
+"None": [
+{
+"error": "a live call needs a request_id",
+"request_id": null
+}
+],
+"empty": [
+{
+"error": "message carries neither text nor files (open a live call with end_input: false)",
+"request_id": "empty",
+"status": 400
+}
+],
+"late": [
+{
+"append": true,
+"error": "the model's text stream has ended",
+"request_id": "late"
+},
+{
+"data": "eyJpbnB1dHMiOiBbInRvbyBsYXRlIl19",
+"metadata": {},
+"modality": "text",
+"request_id": "late"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "late"
+},
+{
+"finish": true,
+"request_id": "late"
+}
+],
+"nobody": [
+{
+"append": true,
+"error": "request 'nobody' is not taking input on this socket",
+"request_id": "nobody"
+}
+],
+"once": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "once"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "once"
+},
+{
+"finish": true,
+"request_id": "once"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"x",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "x"
+},
+{
+"end_input": false,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"start",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "start"
+}
+],
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"key": "late",
+"mk": null,
+"text": "too late"
+}
+]
+]
+}
+]
+},
+"test_requests_and_their_files_reach_the_engine_alike[json]#0": {
+"__tuple__": [
+{
+"a": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "a"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "a"
+},
+{
+"finish": true,
+"request_id": "a"
+}
+],
+"b": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "b"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "b"
+},
+{
+"finish": true,
+"request_id": "b"
+}
+],
+"c": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "c"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "c"
+},
+{
+"finish": true,
+"request_id": "c"
+}
+],
+"gen-2": [
+{
+"data": "eyJpbnB1dHMiOiBbXX0=",
+"metadata": {},
+"modality": "text",
+"request_id": "gen-2"
+},
+{
+"data": "AAH/",
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "gen-2"
+},
+{
+"finish": true,
+"request_id": "gen-2"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"hello",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "hello"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"audio": [
+{
+"__tuple__": [
+"x.wav",
+{
+"__bytes__": "UklGRg=="
+}
+]
+}
+],
+"image": [
+{
+"__tuple__": [
+"cat.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image",
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text",
+"audio"
+],
+"parts": [
+{
+"__tuple__": [
+"image",
+null,
+0,
+null
+]
+},
+{
+"__tuple__": [
+"audio",
+null,
+0,
+null
+]
+},
+{
+"__tuple__": [
+"text",
+"what is it",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "what is it"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"image": [
+{
+"__tuple__": [
+"p.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [],
+"streaming": true,
+"text": "no id"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"image": [
+{
+"__tuple__": [
+"only.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image"
+],
+"mk": {
+"seed": 3
+},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"image",
+null,
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": null
+}
+],
+[]
+]
+}
+]
+},
+"test_requests_and_their_files_reach_the_engine_alike[msgpack]#0": {
+"__tuple__": [
+{
+"a": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbXX0="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "a"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "a"
+},
+{
+"finish": true,
+"request_id": "a"
+}
+],
+"b": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbXX0="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "b"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "b"
+},
+{
+"finish": true,
+"request_id": "b"
+}
+],
+"c": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbXX0="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "c"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "c"
+},
+{
+"finish": true,
+"request_id": "c"
+}
+],
+"gen-2": [
+{
+"data": {
+"__bytes__": "eyJpbnB1dHMiOiBbXX0="
+},
+"metadata": {},
+"modality": "text",
+"request_id": "gen-2"
+},
+{
+"data": {
+"__bytes__": "AAH/"
+},
+"metadata": {
+"sample_rate": 24000
+},
+"modality": "audio",
+"request_id": "gen-2"
+},
+{
+"finish": true,
+"request_id": "gen-2"
+}
+]
+},
+{
+"__tuple__": [
+[
+{
+"end_input": true,
+"file_streams": null,
+"files": {},
+"in": [
+"text"
+],
+"mk": {
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"text",
+"hello",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "hello"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"audio": [
+{
+"__tuple__": [
+"x.wav",
+{
+"__bytes__": "UklGRg=="
+}
+]
+}
+],
+"image": [
+{
+"__tuple__": [
+"cat.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image",
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text",
+"audio"
+],
+"parts": [
+{
+"__tuple__": [
+"image",
+null,
+0,
+null
+]
+},
+{
+"__tuple__": [
+"audio",
+null,
+0,
+null
+]
+},
+{
+"__tuple__": [
+"text",
+"what is it",
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": "what is it"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"image": [
+{
+"__tuple__": [
+"p.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"parts": [],
+"streaming": true,
+"text": "no id"
+},
+{
+"end_input": true,
+"file_streams": null,
+"files": {
+"image": [
+{
+"__tuple__": [
+"only.png",
+{
+"__bytes__": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+}
+]
+}
+]
+},
+"in": [
+"image"
+],
+"mk": {
+"seed": 3
+},
+"out": [
+"text"
+],
+"parts": [
+{
+"__tuple__": [
+"image",
+null,
+0,
+null
+]
+}
+],
+"streaming": true,
+"text": null
+}
+],
+[]
+]
+}
+]
+}
+}

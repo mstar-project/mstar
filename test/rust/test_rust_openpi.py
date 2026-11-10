@@ -1,9 +1,11 @@
-"""openpi's policy socket at ``/`` on mstar-server against the Python route.
+"""openpi's policy socket at ``/`` on mstar-server, held to the Python route: the
+Python route's answers replayed as it gave them before it was removed
+(``python_oracle``).
 
-Each case sends the same frames to both frontends (openpi_client's
-``msgpack_numpy`` encoding) and compares the metadata frame, every reply, what
-reached ``submit_request`` (the images as the model gets them, the state, the
-seed), and, for a refused call, the text frame and the close."""
+Each case sends frames (openpi_client's ``msgpack_numpy`` encoding) and compares
+the metadata frame, every reply, what reached ``submit_request`` (the images as
+the model gets them, the state, the seed), and, for a refused call, the text
+frame and the close."""
 
 import asyncio
 import contextlib
@@ -17,7 +19,6 @@ import threading
 import pytest
 
 pytest.importorskip("mstar_rust")
-pytest.importorskip("fastapi")
 pytest.importorskip("websockets")
 np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
@@ -25,11 +26,10 @@ msgpack = pytest.importorskip("msgpack")
 
 import websockets.exceptions
 import websockets.sync.client
-from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _free_port, _wait_healthy
 
-from mstar.api_server import entrypoint, openpi
+from mstar.api_server import openpi
 from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.rust_frontend import RustFrontendBridge, openpi_facts
 
@@ -151,26 +151,6 @@ def stack():
         yield server, port
 
 
-def _python_calls(server, frames):
-    """The Python route's metadata frame and its answer to each frame, until it closes."""
-    entrypoint.api_server = server
-    out = []
-    with TestClient(entrypoint.app).websocket_connect("/") as ws:
-        metadata = ws.receive_bytes()
-        for frame in frames:
-            (ws.send_text if isinstance(frame, str) else ws.send_bytes)(frame)
-            message = ws.receive()
-            out.append(message.get("bytes") if message.get("bytes") is not None else message.get("text"))
-            if message.get("text") is not None:
-                try:
-                    closed = ws.receive()
-                    out.append(("close", closed.get("code")))
-                except WebSocketDisconnect as e:
-                    out.append(("close", e.code))
-                break
-    return metadata, out
-
-
 def _rust_calls(port, frames):
     out = []
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/", compression=None, max_size=None) as ws:
@@ -201,19 +181,18 @@ def _same_replies(py, rust):
 
 
 def _both(stack, monkeypatch, frames, **server_setup):
+    """Each frontend's (metadata, replies, submissions), the Python route's as recorded."""
     server, port = stack
-    monkeypatch.setattr(entrypoint, "api_server", server)
     for k, v in server_setup.items():
         setattr(server, k, v)
-    server.submitted.clear()
-    py_meta, py = _python_calls(server, frames)
-    py_submits = list(server.submitted)
-    server.submitted.clear()
-    rust_meta, rust = _rust_calls(port, frames)
-    rust_submits = list(server.submitted)
-    for k in server_setup:
-        setattr(server, k, None)
-    return (py_meta, py, py_submits), (rust_meta, rust, rust_submits)
+    try:
+        py = python_side()
+        server.submitted.clear()
+        rust_meta, rust = _rust_calls(port, frames)
+        return py, (rust_meta, rust, list(server.submitted))
+    finally:
+        for k in server_setup:
+            setattr(server, k, None)
 
 
 def test_the_metadata_frame_and_each_call_read_as_pythons(stack, monkeypatch):
@@ -350,3 +329,29 @@ def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
             with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
                 ws.recv(timeout=10)
     assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG
+
+
+def test_the_api_key_takes_openpi_clients_scheme_on_its_socket_only():
+    """openpi_client sends ``Authorization: Api-Key <key>``; the openpi socket
+    takes it (and Bearer), ``/healthz`` stays open, and every other route
+    still wants Bearer."""
+    import urllib.error
+    import urllib.request
+
+    key = "s3cret"
+    with _rust(_Server(), MSTAR_API_KEY=key) as port:
+        url = f"ws://127.0.0.1:{port}/"
+        for headers in ({}, {"Authorization": "Api-Key wrong"}, {"Authorization": f"Basic {key}"}):
+            with pytest.raises(websockets.exceptions.InvalidStatus) as refused:
+                websockets.sync.client.connect(url, additional_headers=headers, open_timeout=10)
+            assert refused.value.response.status_code == 403, headers
+        for scheme in ("Api-Key", "Bearer", "api-key"):
+            with websockets.sync.client.connect(url, additional_headers={"Authorization": f"{scheme} {key}"},
+                                                compression=None, max_size=None, open_timeout=10) as ws:
+                assert ws.recv(timeout=10)  # the metadata frame
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as r:
+            assert r.status == 200
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models", headers={"Authorization": f"Api-Key {key}"})
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(req, timeout=10)
+        assert refused.value.code == 401

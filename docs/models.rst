@@ -851,9 +851,9 @@ Under TP the LLM's targets split as its linears do (the 27B's single K/V head pe
 at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
 on one GPU in every shipped config.
 
-Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
-(``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
-Both serve runtime updates (below) too: ``mstar-server`` selects the adapter itself,
+A request's ``model`` names the adapter it runs under (``ServedModels``), and
+``/v1/models`` lists the adapters beside the base model. This holds after runtime
+updates (below) too: ``mstar-server`` selects the adapter itself,
 and the API server pushes it the served set after every change, so a request pays no
 extra round trip for it.
 
