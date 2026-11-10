@@ -19,7 +19,7 @@ from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, StepAllowance
 from mstar.engine.resources.kv.config import SpanKind, StreamLayout, rebuild_refusal
 from mstar.graph.base import GraphSection
-from mstar.model.rebuild import RebuildPolicy
+from mstar.model.rebuild import RebuildPolicy, loop_walks
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.worker.host_pool import HostPool, HostSlice, aligned
 
@@ -155,7 +155,7 @@ def policies_run_here(
             walk for walk in policy.walks
             if (node, walk) in my_walks and not (copied[walk] and node in parallel_nodes)
         )
-        if walks and all((node, walk) in my_walks for walk in policy.loop_walks(node, graphs)):
+        if walks and all((node, walk) in my_walks for walk in loop_walks(graphs, policy.loop, node)):
             here[node] = replace(policy, walks=walks)
     return here
 
@@ -201,7 +201,8 @@ class Rebuilds:
         self._policies = dict(policies)
         # node -> the dtype it runs in, which its host copies take. A node missing here copies nothing.
         self._node_dtypes = node_dtypes
-        self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
+        # the walks a request can be dropped in
+        self._loop_walks = {node: loop_walks(graphs, policy.loop, node) for node, policy in policies.items()}
         assert pool is not None or not policies, "a node that rebuilds requests keeps their ids in the host pool"
         self._pool = pool
         # node -> handle -> its log. Per node, since a colocated node of another partition samples ids of its own.

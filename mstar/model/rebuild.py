@@ -42,10 +42,6 @@ class RebuildPolicy:
     copy_width: Mapping[str, int] = field(default_factory=dict)
     pad_ids: frozenset[int] = frozenset()
 
-    def loop_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
-        """The walks in which ``loop`` runs ``node``: those a request can be dropped in."""
-        return loop_walks(graphs, self.loop, node)
-
     def ids_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
         """The walks of ``walks`` in which ``node`` reads ``ids_input``: those an ids span can be written in."""
         return frozenset(walk for walk in self.walks if self.ids_input in self._reads(node, graphs, walk))
@@ -75,7 +71,7 @@ class RebuildPolicy:
                     f"{node} reads {sorted(copied[walk])} besides its ids in {walk!r}, and its rebuild policy doesn't "
                     "say how many values their host copies hold per slot"
                 )
-        if not self.loop_walks(node, graphs):
+        if not loop_walks(graphs, self.loop, node):
             raise ValueError(f"{node}'s rebuild policy names loop {self.loop!r}, which runs {node} in no walk")
         return copied
 
