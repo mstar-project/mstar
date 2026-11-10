@@ -605,6 +605,34 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
         assert rel < 2e-3, (w, rel)
 
 
+@needs_ckpt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_batched_flow_matches_the_driver_on_the_real_weights():
+    """The served (bounded-cache) flow against the one-request driver on MiniCPM-o's own
+    weights and voice, where the conformer's relative-position term is large: reading its
+    band backwards put window mels up to 4 off (mel peaks ~7.5)."""
+    import soundfile as sf
+
+    from mstar.model.components.token2wav.model import load_token2wav
+
+    model = load_token2wav(f"{CKPT}/assets/token2wav", "cuda")
+    wav, _ = sf.read(f"{CKPT}/assets/HT_ref_audio.wav", dtype="float32")
+    voice = model.prepare_voice(model.voice_encoder(torch.from_numpy(wav)))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cuda")
+    ref = new_state(model, voice)
+    gen = torch.Generator().manual_seed(0)
+    with torch.inference_mode():
+        for win, last in reference_windows(torch.randint(0, 6561, (160,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32, device="cuda")
+            want = flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            got = model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            # loose for TF32 in the served attention kernel, far under the 1.6-4 the bug gave
+            assert (got.float() - want.float()).abs().max().item() < 0.15
+
+
 @pytest.mark.parametrize(("n", "stop"), [
     *((n, True) for n in [1, 21, 22, 23, 24, 25, 49, 99, 100, 230]), (0, False), (25, False), (50, False),
 ])
