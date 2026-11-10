@@ -46,6 +46,7 @@ from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD
 from mstar.model.base import LabelLayout, Span
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import StubModel, make_model
+from mstar.testing_utils.resource import StubResource, make_resource
 
 PAGE_SIZE = 16
 WALK = "prefill"
@@ -173,12 +174,8 @@ def test_a_second_drop_before_the_rebuild_lands_is_refused():
     assert kv._dropped["r"] == held, "a second drop would overwrite what the rebuild has to write again"
 
 
-class _Recording:
+class _Recording(StubResource):
     """A resource that records the rebuild hooks it is called with."""
-
-    supports_preplan = False
-    force_double_buffer = False
-    lean_capture = False
 
     def __init__(self):
         self.calls = []
@@ -390,8 +387,7 @@ def test_a_rebuild_policy_on_a_node_with_a_resource_that_cant_drop_is_refused_at
     _boot_engine({"kv": _manager()})._check_rebuild_policies(_model())
 
     with pytest.raises(ValueError, match=r"\['bounded'\] can't drop"):
-        bounded = SimpleNamespace(supports_drop=False, supports_preplan=False, force_double_buffer=False,
-                                  lean_capture=False)
+        bounded = make_resource(supports_drop=False)
         engine = _boot_engine({"kv": _manager(), "bounded": bounded})
         engine._check_rebuild_policies(_model())
 

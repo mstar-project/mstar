@@ -26,20 +26,18 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, WorkerGraph
+from mstar.testing_utils.resource import StubResource
 from mstar.validation import DeploymentError
 from mstar.validation.placement import MAX_NODE_INPUTS, _sharding_groups
 
 
-class _Stub(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
+class _Stub(StubResource):
+    pass
 
 
 @dataclass

@@ -17,17 +17,18 @@ from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
-from mstar.engine.resources.base import CGSlotSpec, Resource, build_resource
+from mstar.engine.resources.base import CGSlotSpec, build_resource
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep, lean_subsets
 from mstar.model.submodule_base import ARNodeInputs
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 WALK = "decode"
 
 
-class _Plain(Resource):
-    build = None
+class _Plain(StubResource):
+    pass
 
 
 def test_a_bucket_is_plain_unless_it_names_resources_running_lean():
@@ -73,9 +74,8 @@ def test_a_built_resource_knows_its_key():
 
 # ---- which bucket a step leases ----
 
-class _Lean(Resource):
+class _Lean(StubResource):
     """Lean for the rows not in ``busy``."""
-    build = None
     lean_capture = True
 
     def __init__(self, busy=()):

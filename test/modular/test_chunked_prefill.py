@@ -654,9 +654,9 @@ def _budgeted_engine(align: int = 1):
 
     from mstar.model.submodule_base import ChunkingPolicy
     from mstar.testing_utils.engine import make_engine, make_mgmt
+    from mstar.testing_utils.resource import make_resource
 
-    state = SimpleNamespace(chunk_alignment=align, force_double_buffer=False, supports_preplan=False,
-                            lean_capture=False)
+    state = make_resource(chunk_alignment=align)
     engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace(), resources={"state": state})})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
