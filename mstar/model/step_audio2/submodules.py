@@ -12,6 +12,7 @@ check already has, so no forward reads its own tokens.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -22,6 +23,9 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseCaptureShape,
+    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
@@ -31,6 +35,7 @@ from mstar.engine.resources import (
     PositionStep,
     SamplerStep,
     Segment,
+    SlotLease,
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.base import AttentionManager
@@ -270,14 +275,25 @@ class LLMSubmodule(ARNodeSubmodule):
                 outputs[SPEECH_IDS] = outputs["new_token"]
 
 
-class AudioEncoderSubmodule(NodeSubmodule):
-    """A request's 25 s clips, each a key-prefix segment of the tower's attention; requests
-    pack too, each clip laid out against its own request's longest (``request_layout``).
+# The Whisper block loop, as a piecewise capture region
+AUDIO_BLOCK_LOOP = "audio_block_loop"
 
-    Eager: every clip has its own length. The block loop is shape-only in the frame
-    count, so it can become a piecewise region bucketed by frames, as MiniCPM-o's is.
+
+class AudioEncoderSubmodule(NodeSubmodule):
+    """A request's 25 s clips, each a key-prefix segment of the tower's attention, laid out
+    against the request's longest (``request_layout``).
+
+    The convolutions, the pool and the adapter run eagerly around a captured block loop
+    (32 layers), one request per replay, bucketed by its total frames: eager, the tower is
+    launch-bound. A request past the largest bucket, or with more clips than a replay's
+    plan holds, runs the block loop eagerly, still one request a step.
     """
 
+    # 50 post-conv frames a second, at most 1249 per 25 s clip: 5 s up to two full clips
+    BLOCK_LOOP_FRAME_BUCKETS = [256, 512, 1024, 1280, 2560]
+
+    # Every clip has its own length, which a compiled forward would recompile for; the
+    # captured block loop is what makes it fast.
     disable_torch_compile = True
 
     def __init__(self, model: StepAudio2Audio, config: StepAudio2Config):
@@ -290,6 +306,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         mel_frames = list(fwd_info.step_metadata[AUDIO_MEL_FRAMES])
         layout = request_layout(mel_frames)
+        # the captured block loop's step reads them (``_block_loop_step``)
+        self.request_state(fwd_info.rid_handle).add("key_lens", [c.key_len for c in layout])
         return NodeInputs(
             input_seq_len=sum(c.frames for c in layout),
             tensor_inputs={"mels": inputs[AUDIO_MELS][0]},
@@ -297,8 +315,12 @@ class AudioEncoderSubmodule(NodeSubmodule):
         )
 
     def declare_step(
-        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
-    ) -> SubmoduleStep:
+        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
+        piecewise_leases: Mapping[str, SlotLease] | None = None, **kwargs,
+    ) -> SubmoduleStep | None:
+        # leased, the captured block loop plans its own attention per replay
+        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP):
+            return None
         clips = [(rid, c) for rid, inp in zip(request_ids, inputs, strict=True) for c in inp.kwargs["layout"]]
         return SubmoduleStep(steps={AUDIO_ATTN: KeyPrefixAttentionStep(
             segments=tuple(Segment(request_id=rid, label="main", span=c.frames) for rid, c in clips),
@@ -307,6 +329,61 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        # one request a step, so it can take the captured block loop
+        return 1
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        d_model = self.config.audio.n_audio_state
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            return {"hidden": torch.zeros(shape.total_tokens, d_model, dtype=autocast_dtype, device=device)}
+
+        return {
+            AUDIO_BLOCK_LOOP: PiecewisePackedConfig(
+                capture_fn=lambda inp: {"hidden": self.model.encoder.encode(inp.static_inputs["hidden"])},
+                make_static_inputs=make_static_inputs,
+                declare_step=self._block_loop_step,
+                lease_before_step=True,
+                can_lease=self._fits_block_loop,
+                total_tokens=self.BLOCK_LOOP_FRAME_BUCKETS,
+                capture_batch_sizes=[1],
+            )
+        }
+
+    def _block_loop_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+        """A replay's step: the request's clips, each attending its valid keys. At capture
+        the row is the runner's padding, which attends all of its frames."""
+        (rid,) = request_ids
+        state = self.request_states.get(rid)
+        key_lens = state.kwargs["key_lens"] if state is not None and "key_lens" in state.kwargs else seq_lens
+        return SubmoduleStep(steps={AUDIO_ATTN: KeyPrefixAttentionStep(
+            segments=tuple(Segment(request_id=rid, label="main", span=n) for n in seq_lens),
+            key_lens=tuple(key_lens),
+        )})
+
+    def _fits_block_loop(self, inputs: list[NodeInputs]) -> bool:
+        """Whether the request's clips fit a replay's attention plan: the resource's
+        per-request ceiling, read from it so a YAML override holds."""
+        per_request = self.node_resources[AUDIO_ATTN].max_segments_per_request
+        return sum(len(inp.kwargs["layout"]) for inp in inputs) <= per_request * len(inputs)
+
+    @torch.compiler.disable
+    def _replay_block_loop(
+        self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, layout: list,
+    ) -> torch.Tensor | None:
+        """The block loop replayed for the step's one request, or None if not leased."""
+        if AUDIO_BLOCK_LOOP not in engine_inputs.piecewise_leases:
+            return None
+        return engine_inputs.piecewise_runners[AUDIO_BLOCK_LOOP].run(
+            static_inputs={"hidden": hidden},
+            request_ids=[engine_inputs.request_ids[0]],
+            seq_lens=[c.frames for c in layout],
+            real_bs=1,
+        ).get_view("hidden")
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
@@ -328,7 +405,12 @@ class AudioEncoderSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, mels: list[torch.Tensor],
         layout: list, tokens_per_request: list[int], **kwargs,
     ) -> dict[str, NameToTensorList]:
-        embeds = self.model(mels, layout)
+        encoder = self.model.encoder
+        hidden = encoder.frontend(mels, layout)
+        encoded = self._replay_block_loop(engine_inputs, hidden, layout)
+        if encoded is None:
+            encoded = encoder.encode(hidden)
+        embeds = self.model.adapter(encoder.pool(encoded, layout), layout)
         return {
             rid: {AUDIO_EMBEDS: [rows]}
             for rid, rows in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)
