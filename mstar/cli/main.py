@@ -45,6 +45,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
+    "minicpm_o": "minicpm_o.yaml",
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
@@ -153,7 +154,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer", "ripple_65b"):
+    if model in (
+        "bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "minicpm_o", "muse_glimmer", "ripple_65b",
+    ):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model == "deepseek_ocr":
         lines.append("    print(client.chat(\"Free OCR.\", images=[\"page.png\"]).text)")
@@ -343,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--enable-metrics", action="store_true",
-        help="serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     serve.add_argument(
         "--rust-frontend", action="store_true",

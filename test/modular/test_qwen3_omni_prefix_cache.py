@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import FINAL_PREFILL
-from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
+from mstar.engine.resources import PositionStep, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv.config import PrefixSpan
 from mstar.engine.resources.kv.manager import SpanCursor
@@ -28,6 +28,7 @@ from mstar.model.qwen3_omni.config import (
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 RID = "r0"
 NODE = "Thinker"
@@ -40,16 +41,12 @@ class _StubThinker(nn.Module):
         self.model.embed_tokens = nn.Embedding(16, HIDDEN)
 
 
-class _Holding(Resource):
+class _Holding(StubResource):
 
     supports_preplan = True
 
     def __init__(self, tokens: int, position: int):
         self._prefix = CachedPrefix("main", tokens, position)
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return self._prefix
@@ -463,3 +460,23 @@ def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch,
     engine._compile_submodules()
 
     assert not compiled and engine._submodules[node].forward == "eager"
+
+
+@pytest.mark.parametrize("walk", ["prefill_text", "prefill_audio", "prefill_vision"])
+def test_a_request_with_no_audio_output_builds_no_talker_masks(thinker, walk):
+    inputs = {
+        "prefill_text": {"text_inputs": [torch.arange(8, 12)]},
+        "prefill_audio": {"audio_embeds": [torch.randn(6, HIDDEN)], "text_inputs": [torch.arange(8, 12)]},
+        "prefill_vision": {
+            "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
+            "image_grid_thw": [torch.tensor([1, 4, 6])], "text_inputs": [torch.arange(8, 12)],
+        },
+    }[walk]
+    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 0}
+    info = SimpleNamespace(rid_handle=RID, step_metadata={"text_before": 1, "audio_output": False})
+
+    row = thinker.prepare_inputs(walk, info, inputs)
+
+    assert "masks_for_talker" not in row.tensor_inputs
+    cut = thinker.split_inputs(walk, info, row, 2, row.input_seq_len)
+    assert "masks_for_talker" not in cut.tensor_inputs, "a chunk cuts what the row has"

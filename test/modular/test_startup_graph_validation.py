@@ -717,12 +717,22 @@ def _higgs(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.multimodal_decoder import MediaIntake
     config = HiggsAudioModelConfig()
     pad = config.audio_in_token_idx
-    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.kokoro.kokoro_model import KokoroModel, KokoroModelConfig
     return _bare(KokoroModel, config=KokoroModelConfig())
+
+
+def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+    config = MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
+    )
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -761,7 +771,7 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     )
     return _bare(
         Qwen3_5DenseModel, config=config, vision_config=None,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -798,7 +808,7 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
     config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
     return _bare(
         MuseGlimmerModel, config=config, vision_config=vision_config,
-        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
     )
 
 
@@ -850,7 +860,7 @@ def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
     config = Qwen3ASRModelConfig()
     pad = config.audio_token_id
-    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
@@ -917,6 +927,7 @@ _FACTORIES = {
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
+    "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
     "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,

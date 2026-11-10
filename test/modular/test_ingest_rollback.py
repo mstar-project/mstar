@@ -7,10 +7,11 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 from mstar.testing_utils.worker import make_worker
 
 
-class _Res:
+class _Res(StubResource):
     def __init__(self, name, log, fail=False):
         self.name, self.log, self.fail = name, log, fail
 
@@ -45,10 +46,11 @@ def _raise(err):
     raise err
 
 
-@pytest.mark.parametrize("raises_in", ["engine_add", "input_read"])
+@pytest.mark.parametrize("raises_in", ["rebuild_room", "engine_add", "input_read"])
 def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
-    """An engine that refuses the request, or a read that raises as it starts
-    (a CUDA OOM in the H2D copy, say): the request fails, alone."""
+    """A pinned allocation for the request's rebuild log, an engine that
+    refuses the request, or a read that raises as it starts (a CUDA OOM in
+    the H2D copy, say): the request fails, alone."""
     registered, processed, reads = [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
@@ -74,6 +76,8 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
             ),
         ),
     )
+    if raises_in == "rebuild_room":
+        w.ingest._set_rebuildable = lambda rid, configs: _raise(RuntimeError("CUDA error: out of memory"))
     assert w.lifecycle.park(parked)
     w.ingest._dispatch = processed.extend
     body = SimpleNamespace(
