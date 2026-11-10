@@ -569,8 +569,7 @@ def test_spoken_reply_text_fits_the_tts(model):
     assert model.get_max_output_tokens(**text, max_output_tokens=8192) == 8192
 
 
-@needs_ckpt
-def test_an_image_and_a_clip_sharing_unk_take_their_own_encoders_rows(model):
+def test_an_image_and_a_clip_sharing_unk_take_their_own_encoders_rows(chat_model):
     """Images and audio share ``<unk>``: every one of the prompt's ``<unk>`` is
     a run's, each run names its own encoder, each encoder lays its segments out
     by its runs' grids, and the LLM splices each encoder's rows at its own runs."""
@@ -578,6 +577,7 @@ def test_an_image_and_a_clip_sharing_unk_take_their_own_encoders_rows(model):
     from mstar.model.minicpm_o.submodules import AudioEncoderSubmodule, VisionEncoderSubmodule
     from mstar.model.multimodal import PromptPart, splice_media
 
+    model = chat_model
     prompt = model.process_prompt(
         None, ["image", "audio", "text"], ["text"],
         tensors={"image_inputs": [an_image()], "audio_inputs": [a_clip()]},
