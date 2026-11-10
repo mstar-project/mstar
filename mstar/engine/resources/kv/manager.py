@@ -5258,10 +5258,13 @@ class KVManager(AttentionResource):
         return (0 if allotment is None else allotment.remaining - allotment.lends) + self._room_for(rid)
 
     def _hit_allowance(self, rid: str) -> int:
-        """The pages ``rid``'s cache hits on evictable pages may take: `_allowance`, or `_room_for` alone for a
-        guaranteed request. Its allotment keeps every page the request's walks write until the request adopts its
-        lease, since a cut leaves the walk to write the cut pages again."""
-        return self._room_for(rid) if rid in self._guaranteed else self._allowance(rid)
+        """The pages ``rid``'s cache hits on evictable pages may take: `_allowance`, or for a guaranteed request
+        `_room_for` alone, and only the room once it holds no allotment, since what moves could free isn't room yet.
+        Its allotment keeps every page the request's walks write until the request adopts its lease, since a cut
+        leaves the walk to write the cut pages again."""
+        if rid not in self._guaranteed:
+            return self._allowance(rid)
+        return self._room_for(rid) if rid in self._allotments else max(0, self._room())
 
     def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.
