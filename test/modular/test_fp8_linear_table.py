@@ -1,8 +1,10 @@
-"""The fp8_linear table: bench_linears turns per-kernel timings into per-token-count rows, and the committed
-H200 entries for Qwen3.5-27B's shapes pick the kernels job 1438 measured fastest (FlashInfer's swapAB GEMM, the
-one vLLM runs below 32 tokens, where the built-in rule ran w8a16)."""
+"""The fp8_linear table: bench_linears turns per-kernel timings into per-token-count rows; the H200 table has swept
+rows for every Qwen3.5 FP8 checkpoint linear; a row naming DeepGEMM (an optional import) runs the built-in rule's
+W8A8 GEMM where DeepGEMM doesn't."""
 
 from pathlib import Path
+
+import pytest
 
 from benchmark.quantization.bench_linears import _write_tables
 from mstar.kernels.table import load_table
@@ -42,10 +44,40 @@ def test_a_swiglu_with_fp8_activations_counts_and_a_wrong_kernel_does_not(tmp_pa
     assert _entry(path, 128, 1) == {None: "flashinfer"}
 
 
-def test_the_h200_table_runs_flashinfer_where_vllm_does():
-    entries = {tuple(sorted(dict(e.shape).items())): {b: c.impl for b, c in e.rows}
-               for e in load_table(TABLE, "fp8_linear")}
-    # qkv, o / delta-net out, down, the fused SwiGLU, the delta net's fp8 input (q|k|v|z)
-    for n, k, glu in ((14336, 5120, 0), (5120, 6144, 0), (5120, 17408, 0), (17408, 5120, 1), (16384, 5120, 0)):
-        rows = entries[tuple(sorted({"N": n, "K": k, "glu": glu}.items()))]
-        assert all(rows[m] == "flashinfer" for m in (2, 8, 16, 24, 48, 64)), (n, k, glu, rows)
+def test_the_h200_table_covers_the_qwen3_5_fp8_checkpoints():
+    """Every block-fp8 linear Qwen3.5-27B-FP8 (TP1) and 397B-A17B-FP8 (TP4) dispatch has swept H200 rows: a shape
+    without them takes the built-in rule, whose untuned w8a16 tile ran 2.3x flashinfer's time on 397B's 5120 x 4096
+    at 2-16 tokens (sweep in slurm-1 job 1815)."""
+    entries = {tuple(sorted(dict(e.shape).items())): e for e in load_table(TABLE, "fp8_linear")}
+    shapes = ((14336, 5120, 0), (16384, 5120, 0), (17408, 5120, 1), (5120, 17408, 0), (5120, 6144, 0),  # 27B TP1
+              (5120, 4096, 0), (4608, 4096, 0), (4096, 2048, 0), (256, 4096, 1), (4096, 256, 0))  # 397B TP4
+    for n, k, glu in shapes:
+        entry = entries.get(tuple(sorted({"N": n, "K": k, "glu": glu}.items())))
+        assert entry is not None and "sweep" in entry.provenance["harness"], (n, k, glu)
+
+
+def test_without_deepgemm_its_rows_run_the_builtin_w8a8_gemm(monkeypatch):
+    """DeepGEMM is optional: where it doesn't import, the probe says so (without touching the GPU) and a table row
+    naming it runs the built-in rule's W8A8 GEMM for the count, flashinfer's or cuBLAS's."""
+    pytest.importorskip("triton")
+    import sys
+
+    import torch
+
+    from mstar.kernels import Choice
+    from mstar.utils import dense_fp8
+
+    dev = torch.device("cuda", 0)
+    monkeypatch.setattr(dense_fp8.current_platform, "cuda_capability", lambda device: (9, 0))
+    monkeypatch.setitem(sys.modules, "deep_gemm", None)  # not installed: the import raises
+    probed = dense_fp8._probe_dg(dev)
+    assert probed is False
+
+    monkeypatch.setattr(dense_fp8, "_table_rows", lambda *a: ((16,), (Choice("triton8"), Choice("deepgemm"))))
+    monkeypatch.setitem(dense_fp8._FI_OK, dev, True)
+    monkeypatch.setitem(dense_fp8._W8A8_OK, dev, True)
+    monkeypatch.setitem(dense_fp8._DG_OK, dev, probed)
+    assert [dense_fp8._choose(dev, 5120, 17408, False, m)[0] for m in (8, 32, 4096)] == ["triton8", "flashinfer",
+                                                                                       "cublas"]
+    monkeypatch.setitem(dense_fp8._DG_OK, dev, True)
+    assert dense_fp8._choose(dev, 5120, 17408, False, 32) == ("deepgemm", None)

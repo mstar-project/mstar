@@ -4,10 +4,11 @@ e4m3 with one fp32 scale per 128 x 128 block: a decode step reads half the bytes
 Decode batches meet the weights as bf16 (w8a16): a few tokens as fp32 FMAs on weights converted
 in registers (fused_moe.decode's per-pair GEMV), more as a bf16 ``tl.dot`` per scale block
 (e4m3 to bf16 is exact). The last program of an output tile sums its split-K partials in split
-order, so the result does not depend on scheduling. Larger batches quantize x to e4m3 per 128
-columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's.
+order, so the result does not depend on scheduling. The same kernel with an e4m3 dot (triton8) quantizes x
+per 128 columns in its loop (W8A8). Larger batches quantize x first: flashinfer's SM90 block-scale GEMM, then
+cuBLAS's; where DeepGEMM is installed (an optional import), its SM90 GEMM, the one vLLM runs from 32 tokens.
 
-Which of the three runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
+Which of these runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
 shape and token count where it has one (``mstar/kernels/tables/fp8_linear/``) and the GPU can run
 it, else the built-in rule in ``_builtin``.
 
@@ -23,7 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from mstar.kernels import Impl, KernelOp, register
+from mstar.kernels import Choice, Impl, KernelOp, register
 from mstar.kernels.registry import on_reset, row_bounds
 from mstar.platforms import current_platform
 from mstar.utils.fp8_block import FP8_DTYPE
@@ -41,6 +42,9 @@ _FI_MAX_TOKENS = 512
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
+# DeepGEMM (deepseek-ai/DeepGEMM) where it imports and runs: its module, probed per device by reserve()
+_DG_OK: dict[torch.device, bool] = {}
+_DG = None
 # Blackwell (sm_100 / sm_103), set per device by reserve(): neither block-fp8 GEMM above runs there, and w8a16
 # is ~10x slower than bf16 from 512 tokens (B300: Qwen3.5-27B's 5120 x 4352 down, 187 vs 17 us). So above
 # _DEQUANT_MIN_TOKENS the weight is dequantized to bf16 per call and cuBLAS runs it: exact up to the fp8 weights,
@@ -56,9 +60,21 @@ def _w8a16_unavailable(target) -> str | None:
     return None if target.device.type == "cuda" else f"needs a GPU, not {target.device.type}"
 
 
+def _triton8_unavailable(target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return f"needs an NVIDIA GPU, not {target.device.type}"
+    capability = current_platform.cuda_capability(target.device)
+    return None if capability is not None and capability >= (8, 9) else "an e4m3 dot needs SM89 or newer"
+
+
 def _fi_unavailable(target) -> str | None:
     reserve(target.device)
     return None if _FI_OK.get(target.device) else "flashinfer's SM90 block-scale GEMM does not run here"
+
+
+def _dg_unavailable(target) -> str | None:
+    reserve(target.device)
+    return None if _DG_OK.get(target.device) else "DeepGEMM is not installed or its SM90 GEMM does not run here"
 
 
 def _cublas_unavailable(target) -> str | None:
@@ -72,8 +88,13 @@ FP8_LINEAR = register(KernelOp(
         Impl("w8a16", _w8a16_unavailable,
              doc="the Triton kernel here; its config is the tile (DOT, BN, BK, SPLIT, STAGES, num_warps[, TB]), "
                  "none for the built-in tile of the token count"),
+        Impl("triton8", _triton8_unavailable,
+             doc="the Triton kernel here with an e4m3 dot (W8A8, x quantized per 128 columns inside it); its config "
+                 "is the tile (BN, SPLIT, STAGES, num_warps[, TB]), none for the built-in tile"),
         Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
         Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
+        Impl("deepgemm", _dg_unavailable,
+             doc="DeepGEMM's SM90 block-scaled GEMM (an optional import), x quantized per 128 columns"),
         Impl("dequant", _w8a16_unavailable,
              doc="the weight dequantized to bf16 per call, then cuBLAS's bf16 GEMM (exact up to the fp8 weights)"),
     ),
@@ -125,6 +146,35 @@ def _dot_loop(x, w, s, rows, live_n, t, live_t, k_lo, n0, K: tl.constexpr, I: tl
                 acc += d * tl.where(up, tl.load(su_row + k // BI), sg)[:, None]
             else:
                 acc += d * sg
+    return acc
+
+
+@triton.jit
+def _dot8_loop(x, w, s, rows, live_n, t, live_t, k_lo, n0, K: tl.constexpr, I: tl.constexpr,
+               BO: tl.constexpr, BI: tl.constexpr, BN: tl.constexpr, R: tl.constexpr,
+               TB: tl.constexpr, KS: tl.constexpr, GLU: tl.constexpr, STAGES: tl.constexpr):
+    """``_dot_loop`` with an e4m3 dot (W8A8): each step is one scale block of BI columns, x's [TB, BI] slice
+    quantized here as per_token_group_quant_fp8 would (one scale per token per block), the weight tile fed to
+    the dot as stored (no conversion), the block's partial scaled by both scales into the fp32 accumulator."""
+    kk = tl.arange(0, BI)
+    w_row = w + rows[:, None].to(tl.int64) * K + kk[None, :]
+    x_row = x + t[:, None].to(tl.int64) * K + kk[None, :]
+    sg_row = s + (n0 // BO) * (K // BI)
+    su_row = s + ((I + n0) // BO) * (K // BI)
+    up = tl.arange(0, R) >= BN
+    acc = tl.zeros([R, TB], tl.float32)
+    for k in tl.range(k_lo, k_lo + KS, BI, num_stages=STAGES):
+        wk = tl.load(w_row + k, mask=live_n[:, None], other=0).to(tl.float8e4nv, bitcast=True)
+        xk = tl.load(x_row + k, mask=live_t[:, None], other=0.0).to(tl.float32)
+        xs = tl.maximum(tl.max(tl.abs(xk), 1), 1e-10) / 448.0
+        xq = tl.clamp(xk / xs[:, None], -448.0, 448.0).to(tl.float8e4nv)
+        d = tl.dot(wk, tl.trans(xq))
+        sg = tl.load(sg_row + k // BI)
+        if GLU:
+            d = d * tl.where(up, tl.load(su_row + k // BI), sg)[:, None]
+        else:
+            d = d * sg
+        acc += d * xs[None, :]
     return acc
 
 
@@ -217,9 +267,9 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
                   K: tl.constexpr, I: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
                   BN: tl.constexpr, BK: tl.constexpr, SB: tl.constexpr, TB: tl.constexpr,
                   SPLIT: tl.constexpr, GLU: tl.constexpr, DOT: tl.constexpr,
-                  STAGES: tl.constexpr):
+                  STAGES: tl.constexpr, A8: tl.constexpr = False):
     """Program (output tile, K split, token tile): BN output columns (and their up rows under
-    GLU) for TB tokens over K / SPLIT."""
+    GLU) for TB tokens over K / SPLIT. A8: the e4m3 dot (x quantized per block in the loop)."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     pid_m = tl.program_id(2)
@@ -238,8 +288,12 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
             rows = tl.where(r < BN, n0 + r, I + n0 + r - BN)
         else:
             rows = n0 + r
-        acc = _dot_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
-                        BK, SB, TB, KS, GLU, STAGES)
+        if A8:
+            acc = _dot8_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
+                             TB, KS, GLU, STAGES)
+        else:
+            acc = _dot_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
+                            BK, SB, TB, KS, GLU, STAGES)
         if SPLIT == 1:
             _epilogue(acc, out, n0, t, live_t, N_OUT, BN, TB, GLU)
         else:
@@ -270,6 +324,7 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        _DG_OK[device] = _probe_dg(device)
         capability = current_platform.cuda_capability(device)
         _BLACKWELL[device] = capability is not None and capability[0] == 10
 
@@ -302,6 +357,89 @@ def _probe_fi(device: torch.device) -> bool:
         return True
     except Exception:  # noqa: BLE001 — not built for this GPU / version: cuBLAS instead
         return False
+
+
+@triton.jit
+def _swiglu_kernel(h, out, I: tl.constexpr, BLOCK: tl.constexpr):
+    """``out[t, c] = silu(h[t, c]) * h[t, I + c]`` over one token's BLOCK columns: act_and_mul_triton's math."""
+    t = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = c < I
+    gate = tl.load(h + t * (2 * I) + c, mask=live, other=0.0)
+    up = tl.load(h + t * (2 * I) + I + c, mask=live, other=0.0)
+    g32 = gate.to(tl.float32)
+    act = (g32 * tl.sigmoid(g32)).to(h.dtype.element_ty)
+    tl.store(out + t * I + c, (act * up).to(out.dtype.element_ty), mask=live)
+
+
+def _swiglu(h):
+    """SwiGLU of a ``[gate | up]`` GEMM output ``(M, 2 I)``, one program per (token, BLOCK columns).
+    act_and_mul_triton's one program per token cost Qwen3.5-27B's MLP ~15 us a call at 2-64 tokens on H200."""
+    M, two_i = h.shape
+    out = torch.empty(M, two_i // 2, dtype=h.dtype, device=h.device)
+    block = 1024
+    _swiglu_kernel[(M, triton.cdiv(two_i // 2, block))](h, out, I=two_i // 2, BLOCK=block, num_warps=4)
+    return out
+
+
+def _probe_dg(device: torch.device) -> bool:
+    """DeepGEMM is installed and its SM90 GEMM runs here (compiled and loaded before any capture)."""
+    global _DG
+    if current_platform.cuda_capability(device) != (9, 0):
+        return False
+    try:
+        import deep_gemm
+    except Exception:  # noqa: BLE001 - not installed (the usual case), or built for another torch
+        return False
+    try:
+        # programmatic dependent launch, as vLLM runs it: the GEMM's prologue overlaps the quantize's tail
+        deep_gemm.set_pdl(True)
+        _DG = deep_gemm
+        _dg(torch.zeros(4, 128, dtype=torch.bfloat16, device=device),
+            torch.zeros(128, 128, dtype=torch.uint8, device=device), torch.ones(1, 1, device=device), False)
+        return True
+    except Exception as exc:  # noqa: BLE001 - no NVCC for its JIT, or a GPU it wasn't built for
+        logger.warning("DeepGEMM is installed but its SM90 GEMM does not run (%r); fp8_linear won't use it", exc)
+        return False
+
+
+@triton.jit
+def _quant_mn_major_kernel(x, q, s, M, MP, K: tl.constexpr, G: tl.constexpr, BR: tl.constexpr,
+                           eps, fp8_min, fp8_max):
+    """BR rows of one G-column group of ``x (M, K)``: e4m3 values into ``q`` and the group's scale into
+    ``s[group * MP + row]``, the MN-major layout DeepGEMM reads without converting."""
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    c = tl.program_id(1) * G + tl.arange(0, G)
+    live = (r < M)[:, None]
+    offs = r.to(tl.int64)[:, None] * K + c[None, :]
+    y = tl.load(x + offs, mask=live, other=0.0).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y), 1), eps) / fp8_max
+    y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max)
+    tl.store(q + offs, y_q.to(q.dtype.element_ty), mask=live)
+    tl.store(s + tl.program_id(1) * MP + r, y_s, mask=r < M)
+
+
+def _quant_mn_major(x, group):
+    """(e4m3 values, fp32 scales per ``group`` columns) of ``x (M, K)``: per_token_group_quant_fp8's math, the
+    scales ``(M, K / group)`` with their token stride 1 and group stride M rounded up to 4 (TMA's 16 bytes)."""
+    M, K = x.shape
+    mp = -(-M // 4) * 4
+    q = torch.empty(M, K, dtype=FP8_DTYPE, device=x.device)
+    s = torch.empty(K // group, mp, dtype=torch.float32, device=x.device)
+    br = 16 if M <= 256 else 32
+    fp8 = torch.finfo(FP8_DTYPE)
+    _quant_mn_major_kernel[(triton.cdiv(M, br), K // group)](
+        x, q, s, M, mp, K=K, G=group, BR=br, eps=1e-10, fp8_min=fp8.min, fp8_max=fp8.max, num_warps=4)
+    return q, s.t()[:M]
+
+
+def _dg(x, w, s, glu):
+    """DeepGEMM's SM90 GEMM, ``fp8_gemm_nt``: x quantized per 128 columns, the weight's 128 x 128 scales as
+    they are (its 1D2D kernel); SwiGLU after it with glu, as on flashinfer's path."""
+    q, a_scale = _quant_mn_major(x, 128)
+    h = torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+    _DG.fp8_gemm_nt((q, a_scale), (w.view(FP8_DTYPE), s), h)
+    return _swiglu(h) if glu else h
 
 
 def _counters(device: torch.device) -> torch.Tensor:
@@ -403,12 +541,30 @@ def _w8a16(x, w, s, block_size, glu, cfg=None):
     return out
 
 
+def _triton8_tiles(M: int, N: int, K: int, glu: bool) -> dict:
+    """triton8's built-in tile: 64 output columns, token tiles of 16 to 64, K split until about two programs
+    per SM."""
+    tb = min(64, max(16, triton.next_power_of_2(M)))
+    programs = triton.cdiv(N, 64) * triton.cdiv(M, tb)
+    split = 1
+    while programs * split < 264 and K % (2 * split * 128) == 0 and K // (2 * split) >= 512:
+        split *= 2
+    return dict(BN=64, SPLIT=split, STAGES=4, num_warps=4)
+
+
+def _triton8(x, w, s, block_size, glu, cfg=None):
+    """The split-K kernel with its e4m3 dot: one scale block per step, so BK is the block's width."""
+    M, K = x.shape
+    N = w.shape[0] // 2 if glu else w.shape[0]
+    cfg = dict(cfg or _triton8_tiles(M, N, K, glu))
+    return _w8a16(x, w, s, block_size, glu, dict(cfg, DOT=True, BK=block_size[1], A8=True))
+
+
 def _w8a8(x, w, s, block_size, glu):
     """cuBLAS's block-scaled fp8 GEMM: x group-quantized to e4m3 per 128 columns
     (fused_moe.prefill's kernel), the weight's 128 x 128 scales as they are. cuBLAS wants the
     activation scales token-major with the token count a multiple of 4 (x is zero-padded) and
     the weight's K blocks padded to a multiple of 4."""
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
     from mstar.utils.fused_moe.prefill import _group_quant
 
     M, K = x.shape
@@ -421,23 +577,17 @@ def _w8a8(x, w, s, block_size, glu):
                     output_dtype=x.dtype)[:M]
     if not glu:
         return h
-    out = torch.empty(M, h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 def _fi(x, w, s, glu):
     """flashinfer's SM90 block-scale GEMM; it group-quantizes x per 128 columns itself."""
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
     h = fp8_blockscale_gemm_sm90(x, w.view(FP8_DTYPE), None, s)
     if not glu:
         return h
-    out = torch.empty(h.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 @triton.jit
@@ -469,11 +619,7 @@ def _dequant_linear(x, w, s, block_size, glu):
     h = F.linear(x, dequantize(w, s, block_size, x.dtype))
     if not glu:
         return h
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
-    out = torch.empty(x.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 def _table_rows(device: torch.device, n: int, k: int, glu: bool):
@@ -501,15 +647,20 @@ def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
 def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=(128, 128)):
     """``(implementation, config)`` for ``m`` tokens: the table's row where it names one that runs
     on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
-    The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
+    DeepGEMM is optional, so where it doesn't run a deepgemm row takes the built-in rule's W8A8 GEMM for the
+    count (flashinfer's up to _FI_MAX_TOKENS, cuBLAS's above). The table is keyed by 128 x 128 scale blocks;
+    any other block runs w8a16."""
     if tuple(block_size) != (128, 128):
         return ("dequant" if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS else "w8a16"), None
     rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
     if rows is not None:
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
-        if (choice.impl in ("w8a16", "dequant") or (choice.impl == "flashinfer" and _FI_OK.get(device))
-                or (choice.impl == "cublas" and _W8A8_OK.get(device))):
+        if choice.impl == "deepgemm" and not _DG_OK.get(device):
+            choice = Choice("flashinfer" if m <= _FI_MAX_TOKENS else "cublas")
+        if (choice.impl in ("w8a16", "dequant", "triton8") or (choice.impl == "flashinfer" and _FI_OK.get(device))
+                or (choice.impl == "cublas" and _W8A8_OK.get(device))
+                or (choice.impl == "deepgemm" and _DG_OK.get(device))):
             return choice.impl, choice.config
     return _builtin(device, n, k, glu, m), None
 
@@ -529,6 +680,10 @@ def _linear(x, w, s, block_size, glu):
         return _fi(x, w, s, glu)
     if impl == "cublas":
         return _w8a8(x, w, s, block_size, glu)
+    if impl == "deepgemm":
+        return _dg(x, w, s, glu)
+    if impl == "triton8":
+        return _triton8(x, w, s, block_size, glu, config)
     return _w8a16(x, w, s, block_size, glu, config)
 
 

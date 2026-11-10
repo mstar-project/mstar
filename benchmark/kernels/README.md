@@ -80,6 +80,8 @@ gets faster on a GPU without a change to model code.
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
   per-pair tiles by token count, then the grouped `"*"` row.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
-  `w8a16` at its built-in tile or a swept one, `flashinfer` or `cublas`; `--dtype float8_e4m3fn
+  `w8a16` at its built-in tile or a swept one, `triton8` (the same kernel with an e4m3 dot), `flashinfer`,
+  `cublas`, or `deepgemm` where DeepGEMM imports (a row naming it takes flashinfer or cuBLAS without it);
+  `--dtype float8_e4m3fn
   --shape N=...,K=...,glu=0|1`, N per half with glu). `benchmark/quantization/fp8_rows.py` gathers
   every shape a server logged without rows (or a named per-rank set) into one sweep.
