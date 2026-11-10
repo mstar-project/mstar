@@ -224,6 +224,10 @@ class SamplingReqConfig(ResourceReqConfig):
                 check_bool_knob(name, value)
         if self.logprobs_mode not in (None, "raw", "processed"):
             raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
+        # a finished grammar allows only a stop token
+        if self.grammar is not None and (self.min_tokens or self.ignore_eos):
+            raise ValueError("structured_outputs ends the reply where its grammar ends; "
+                             "send it without min_tokens and ignore_eos")
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter

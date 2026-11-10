@@ -259,6 +259,14 @@ def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it
     assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own config was dropped"
 
 
+@pytest.mark.parametrize("knob", [{"min_tokens": 4}, {"ignore_eos": True}], ids=str)
+def test_a_grammar_with_a_knob_that_bars_or_ignores_its_end_is_refused(knob):
+    """A finished grammar allows only a stop token: ``min_tokens`` would bar
+    every token, and under ``ignore_eos`` the reply would go on unconstrained."""
+    with pytest.raises(ValueError, match="structured_outputs"):
+        SamplingReqConfig(grammar=grammar_request({"regex": "a+"}), **knob).validate()
+
+
 def test_enable_grammar_on_a_sampler_narrower_than_the_text_vocabulary_is_refused():
     """A non-text sampler (an audio codec's, say) draws ids no grammar describes."""
     text_output = SimpleNamespace(detokenizer=SimpleNamespace(tokenizer=[b""] * (V + 1)), stop_token_ids=())
