@@ -59,11 +59,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
-       LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
-       drafts with MTP k=3 (greedy only). ``configs/glm5_next_tp8_longctx.yaml`` serves a
-       1M-token window, and ``configs/glm5_next_tp8_longctx_mtp.yaml`` keeps MTP on there;
-       ``python -m benchmark.glm.longctx_probe`` measures decode speed and passkey retrieval
-       by prompt length against a running server.
+       LM, text in / text out, fp8 checkpoint, on 8x or 4x H200, plain or with greedy MTP k=3. See
+       `GLM-5.3-Flash and GLM-5.2`_ for the configs and the long-context override.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -89,11 +86,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        RVQ codec; user speech in, agent text and 22.05 kHz speech out.
    * - ``glm52``
      - ``zai-org/GLM-5.2-FP8``
-     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
-       ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or ``reference``, the numerics
-       anchor, served eager. ``configs/glm52_tp8_mtp.yaml`` drafts with MTP k=3 (greedy only).
-       ``configs/glm52_tp8_longctx.yaml`` serves 256k tokens on the paged DSA (``dsa_long_context``),
-       and ``configs/glm52_tp8_longctx_mtp.yaml`` keeps MTP on there.
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, on 8x H200,
+       plain or with greedy MTP k=3. ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or
+       ``reference``, the numerics anchor, served eager. See `GLM-5.3-Flash and GLM-5.2`_.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -939,6 +934,163 @@ On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
 Not supported yet: FP8 weights and prefill CUDA graphs.
+
+GLM-5.3-Flash and GLM-5.2
+-------------------------
+
+Text chat, with tool calls and reasoning, on one config per deployment:
+
+.. list-table:: GLM deployments
+   :header-rows: 1
+   :widths: 32 16 18 10 24
+
+   * - Config
+     - Model
+     - GPUs
+     - MTP
+     - Context (tokens)
+   * - ``configs/glm5_next_tp8.yaml``
+     - GLM-5.3-Flash
+     - 8x H200, TP8
+     - off
+     - 2048
+   * - ``configs/glm5_next_tp4.yaml``
+     - GLM-5.3-Flash
+     - 4x H200, TP4
+     - off
+     - 2048
+   * - ``configs/glm52_tp8.yaml``
+     - GLM-5.2-FP8
+     - 8x H200, TP8
+     - off
+     - 2048
+
+::
+
+    mstar serve glm5_next --gpus 0,1,2,3,4,5,6,7
+    mstar serve glm5_next --config configs/glm5_next_tp4.yaml --gpus 0,1,2,3
+    mstar serve glm52 --gpus 0,1,2,3,4,5,6,7
+
+The OpenAI routes (``/v1/chat/completions``, ``/v1/messages``, ``/v1/responses``, with the
+GLM tool-call and reasoning parser) are served by the Python frontend only: the Rust frontend
+has no GLM adapter, so under ``--rust-frontend`` they answer 404 and only ``POST /generate``
+is served. See :doc:`clients` for the agent clients.
+
+Any sampling works on these configs: ``temperature``, ``top_p``, ``max_tokens`` and
+``seed`` are the standard fields, and ``repetition_penalty`` goes in the request body.
+GLM-5.3-Flash always reasons, so a request that turns thinking off (``enable_thinking:
+false``) is a 400.
+
+**MTP, for greedy workloads.** Each decode step can draft 3 tokens from the checkpoint's MTP
+layer and verify them in one pass (GLM-5.3-Flash emits about 2.6 tokens a step).
+GLM-5.3-Flash on 4x H200 (1024 in, 256 out) gains 53%, 38%, 21% and 15% output tok/s at 1, 8,
+32 and 64 concurrent requests; GLM-5.2 on 8x H200 (1024 in, 512 out) 47%, 36%, 26% and 26%.
+The drafts are verified greedily, so on a deployment with MTP a request that sets no
+``temperature`` runs greedy, and one with a ``temperature`` above 0 or a
+``repetition_penalty`` other than 1 is a 400: MTP serves no sampled request, so a workload
+that samples needs a deployment without this override. A GLM-5.3 verify step books its whole
+block of k + 1 cache rows, so its pool is four times the plain one; GLM-5.2 overwrites its
+rejected rows and needs one more page a request:
+
+.. code-block:: yaml
+
+   # glm5_next: greedy requests (MTP)
+   model_kwargs:
+     mtp_num_draft_tokens: 3
+   resources:
+     kv_cache:
+       # 64 x 2048 x 4 / 128 + 1; 12 latent planes (the MTP layer's too) of 576: ~7.2 GB/rank
+       max_num_pages: 4097
+
+.. code-block:: yaml
+
+   # glm52: greedy requests (MTP)
+   model_kwargs:
+     mtp_num_draft_tokens: 3
+   resources:
+     kv:
+       # 64 x ceil((2048 + 4) / 128) + 1; 79 latent planes of 576: ~12.7 GB/rank
+       max_num_pages: 1089
+
+**Context.** The configs hold a request to ``index_topk``, 2048 tokens, where dense MLA
+computes exactly what the sparse DSA attention would. Longer contexts take the paged DSA
+path (``dsa_long_context``); it needs no other capture set, so it is an override of the same
+config, and the page counts below hold with the MTP override too (apply that one first).
+GLM-5.3-Flash serves its native 1M tokens:
+
+.. code-block:: yaml
+
+   # glm5_next: long context
+   max_seq_len: 1048576
+   model_kwargs:
+     dsa_long_context: true
+     max_seq_len: 1048576
+     # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
+     dsa_shard_prefill: true
+   resources:
+     kv_cache:
+       # 11 latent planes (512 wide) and 11 index planes (384 wide), bf16: 19.7 KB a token
+       # (23 KB with MTP's plane). 8960 x 128 = one 1M-token request and ~100k tokens of
+       # others, ~22.6 GB/rank (26.4 with MTP).
+       max_num_pages: 8960
+   # A prefill step past the captured 8192 tokens runs eager, 8192 at a time, and compiles
+   # its kernels on first use: two and three windows' prompts take those compiles before the
+   # server binds.
+   warmup_requests:
+     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+
+GLM-5.2 serves 256k (the model's own window is 1M; the pool is what 141 GB GPUs hold beside
+~96 GB/rank of weights):
+
+.. code-block:: yaml
+
+   # glm52: long context
+   max_seq_len: 262144
+   model_kwargs:
+     dsa_long_context: true
+     max_seq_len: 262144
+     # rows per trunk pass of a long prefill, which bounds its activations
+     prefill_window_tokens: 8192
+     dsa_shard_prefill: true
+   resources:
+     kv:
+       # 78 latent planes (576 wide) and 21 index planes (128 wide), bf16: 95 KB a token
+       # (97 KB with MTP's). 2304 x 128 = one 256k window and ~33k tokens of others, ~28 GB/rank.
+       max_num_pages: 2304
+   # A prefill past the captured 4096 tokens runs eager and compiles on first use (6k to 20k
+   # tokens here). With MTP, its prefill over DSA always runs eager: add a 1k-token prompt
+   # (repeat: 100).
+   warmup_requests:
+     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
+     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+
+With long context the pool holds about one full window and cannot evict or preempt: the
+index planes rule out ``cpu_offload_pages`` and the GLMs declare no rebuild policy. So each
+request reserves its whole footprint, its prompt and ``max_tokens``, when it is admitted, and
+waits in the queue until that fits (see :doc:`serving`). With MTP, a GLM-5.3 verify step
+books k + 1 rows of the window, so ``max_tokens`` may be at most a quarter of what the prompt
+leaves.
+``python -m benchmark.glm.longctx_probe`` measures decode speed and passkey retrieval by
+prompt length against a running server.
+
+**Pool sizes** follow from the context, not from free memory (the engine does not size
+pools from free memory yet):
+
+- ``max_concurrent_requests`` is 64, the largest captured decode batch; past it the
+  scheduler splits decode into two steps. GLM-5.3's KDA pool holds one slot per request plus
+  the sink (``kda_state.max_slots: 65``), so a prefill never waits in the worker for a slot.
+- KV pages = requests x the rows a request books / 128 + the sink page: 64 x 2048 / 128 + 1
+  = 1025, ~1.5 GB/rank for GLM-5.3 and ~11.8 GB/rank for GLM-5.2 (the MTP override's
+  arithmetic is above). More pages hold nothing at 2048 tokens: under TP the prefix cache is
+  off. At TP4 GLM-5.3 leaves ~50 GB/rank unused (53.7 GB free after capture, 4096 ladder).
+
+**Prefill graphs.** A GLM-5.3 prefill step takes up to 4 prompts (the largest capture batch),
+so its ladder runs to 4 x 2048 = 8192 tokens and no step runs eager; with long context a
+longer step runs eager in 8192-token windows, and 8192 is also the most a captured DSA
+prefill plans. GLM-5.2 captures one prompt's prefill every 64 tokens to 2048 and a batch's
+(up to 16 prompts) to 4096; a longer step runs the compiled eager forward.
 
 Kokoro notes
 ------------

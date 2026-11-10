@@ -80,7 +80,7 @@ class Glm52ModelConfig:
     # MTP speculative decoding: draft k tokens per step with the layer-78 module; 0 (off)
     # neither builds nor loads it.
     mtp_num_draft_tokens: int = 0
-    # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
+    # Engine half of DSA (opt-in; the long-context override in docs/models.rst). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
     # the exact DSA computation. On: the guard checks max_seq_len instead, and
     # every row past index_topk, prefill rows included, attends its indexer's

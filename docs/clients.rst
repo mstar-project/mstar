@@ -795,9 +795,9 @@ stateless.
   prompt leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
   lowers that.
 
-An agent's system prompt and tools alone outgrow the 2,048-token window of the plain GLM
-configs: serve them with a long-context one (``configs/glm5_next_tp8_longctx.yaml``, 1M
-tokens on GLM-5.3-Flash; ``configs/glm52_tp8_longctx.yaml``, 256k on GLM-5.2).
+An agent's system prompt and tools alone outgrow the 2,048-token window of the GLM
+configs: serve them with the long-context override in :doc:`models` (1M tokens on
+GLM-5.3-Flash, 256k on GLM-5.2).
 
 **Claude Code** sends the key as ``x-api-key``, which the Anthropic routes take
 (:ref:`api-key`):
