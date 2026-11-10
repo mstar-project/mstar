@@ -1114,7 +1114,7 @@ def test_qwen3_tts_postprocess_routes_a_prefills_text_and_no_decode_rows():
 @pytest.mark.parametrize("min_frames, suppressed_steps", [(0, ()), (1, ()), (2, (0,)), (3, (0, 1))])
 def test_qwen3_tts_suppresses_eos_by_the_frames_the_loop_counter_implies(min_frames, suppressed_steps):
     """The prefill makes frame 1 and decode iteration ``step`` makes frame ``step + 2``, so a decode row's count is
-    ``step + 1``: the count `postprocess` kept, whichever step reads it and however often."""
+    ``step + 1``, whichever step reads it and however often."""
     config = _tiny_model_config()
     config.generation.min_new_tokens = min_frames
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
