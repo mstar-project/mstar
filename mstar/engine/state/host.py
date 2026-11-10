@@ -5,7 +5,7 @@ and a step that never runs commits nothing, so applying them any earlier would c
 """
 
 from collections.abc import Collection, Mapping
-from typing import get_args, get_origin
+from typing import NamedTuple, get_args, get_origin
 
 from mstar.engine.state.contract import Array, ArrayStep, FrozenMap, is_value
 
@@ -26,6 +26,12 @@ def _zero(kind: type) -> object:
     return () if get_origin(kind) is tuple else kind()
 
 
+class EntryKey(NamedTuple):
+    array: str
+    label: str
+    layer: int
+
+
 class HostFields:
     """Every entry's host fields on one engine, by request handle, then array, label and layer.
 
@@ -36,7 +42,7 @@ class HostFields:
 
     def __init__(self):
         self._arrays: dict[str, Array] = {}
-        self._fields: dict[int, dict[tuple[str, str, int], FrozenMap]] = {}
+        self._fields: dict[int, dict[EntryKey, FrozenMap]] = {}
 
     def declare(self, array: Array) -> None:
         assert is_value(array), f"Array {array.name!r}: only a Value holds host fields"
@@ -46,7 +52,9 @@ class HostFields:
         """Fill ``request``'s entries with their zero values, once its handle is minted."""
         if self._arrays:
             self._fields[request] = {
-                (array.name, label, layer): FrozenMap({name: _zero(kind) for name, kind in array.entry.host.items()})
+                EntryKey(array.name, label, layer): FrozenMap(
+                    {name: _zero(kind) for name, kind in array.entry.host.items()},
+                )
                 for array in self._arrays.values() for label in array.labels for layer in array.layers
             }
 
@@ -58,14 +66,14 @@ class HostFields:
 
     def fields(self, request: int, array: str, label: str, layer: int) -> Mapping[str, object] | None:
         """One entry's fields, or None for an entry that doesn't exist."""
-        return self._fields.get(request, {}).get((array, label, layer))
+        return self._fields.get(request, {}).get(EntryKey(array, label, layer))
 
     def commit(self, array: Array, declared: ArrayStep, rows: Collection[int]) -> None:
         """Apply what a kept step declares of ``array``: a fork at its start copies before the step's writes, and a fork
         at its end after them."""
         self._fork(array, declared, "start", rows)
         for (row, label, layer), written in declared.host.items():
-            entries, key = self._fields[row], (array.name, label, layer)
+            entries, key = self._fields[row], EntryKey(array.name, label, layer)
             entries[key] = FrozenMap({**entries[key], **written})
         self._fork(array, declared, "end", rows)
 
@@ -75,4 +83,5 @@ class HostFields:
                 for row in rows if fork.rows is None else fork.rows:
                     entries = self._fields[row]
                     for layer in array.layers:
-                        entries[array.name, fork.dst, layer] = entries[array.name, fork.src, layer]
+                        src, dst = EntryKey(array.name, fork.src, layer), EntryKey(array.name, fork.dst, layer)
+                        entries[dst] = entries[src]
