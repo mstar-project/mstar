@@ -28,13 +28,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
-from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
+from mstar.model.components.diffusion.denoise_loop import StepKey, UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.guidance import Guidance, cfg
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
-from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import Wan22Config
 
@@ -163,7 +162,7 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         tensor_inputs = {"positive_ids": inputs["text_inputs"][0]}
         # CFG off: skip the negative prompt's UMT5 forward entirely (see the
         # class docstring); forward emits the placeholder when the key is absent.
-        if float(fwd_info.step_metadata["guidance_scale"]) > 1.0:
+        if Wan22DitSubmodule.GUIDANCE.active(fwd_info.step_metadata):
             tensor_inputs["negative_ids"] = inputs["text_inputs"][1]
         return NodeInputs(tensor_inputs=tensor_inputs)
 
@@ -274,13 +273,11 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 # ---------------------------------------------------------------------------
 
 class WanStepKey(NamedTuple):
-    """What has to match for two rows to share a dit forward."""
+    """What has to match for two rows to share a dit forward (whether guidance is on is the scaffold's step key)."""
 
     frames: int
     height: int
     width: int
-    # one combine per forward; above 1.0 is what turns the negative branch on
-    guidance: float
     # I2V rows carry ``image_latent`` and keep frame 0 clean
     i2v: bool
 
@@ -288,9 +285,10 @@ class WanStepKey(NamedTuple):
 class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     """Dense 5B video DiT on the scaffold's denoise loop, stepped by its UniPC.
 
-    One loop iteration is one transformer forward over every row's positive and
-    negative embeddings (with cfg_size 2, one branch per cfg rank), plus a UniPC
-    predictor/corrector update per row.
+    One loop iteration is one transformer forward over every row's guidance
+    branches (the scaffold's ``GUIDANCE``: positive and negative embeddings, one
+    branch per cfg rank under cfg_size 2), plus a UniPC predictor/corrector
+    update per row.
 
     Loop-carried edges, all float32 over ``[1, C, T, H, W]``:
 
@@ -316,23 +314,20 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     # The ragged self-attention resource (Wan22Model.get_node_resources).
     SELF_ATTN = "dit_self_attn"
-    # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
-    CFG_BRANCHES = 2
+    # Under cfg_size 2 each rank forwards one branch of every row and the scaffold gathers the predictions, so a
+    # step costs one branch's forward plus a latent-sized gather; without guidance both ranks run the whole step.
+    GUIDANCE = Guidance(
+        branches=({"text_embeds": "text_embeds_pos"}, {"text_embeds": "text_embeds_neg"}), combine=cfg,
+    )
 
     def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
+            cfg_group=cfg_group,
         )
         self.transformer = transformer
         self.config = config
-        # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
-        # the ranks split the CFG stack (my_rows, then an all-gather), each
-        # running one branch over the batch's rows, so the step costs one
-        # branch's forward plus a latent-sized gather. Every rank then runs the
-        # same combine and UniPC step on replicated latents. Without guidance
-        # both ranks compute the whole step, correct but no faster.
-        self.cfg_group = cfg_group or CommGroup.trivial()
         self._record_fp32_islands()
         # The WHOLE forward cannot be one compiled region: Inductor would fuse the
         # UniPC step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma
@@ -365,29 +360,13 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata
-        return WanStepKey(
-            *_latent_grid(self.config, meta), guidance=float(meta["guidance_scale"]),
-            i2v=fwd_info.graph_walk == self._I2V_WALK,
-        )
+        return WanStepKey(*_latent_grid(self.config, meta), i2v=fwd_info.graph_walk == self._I2V_WALK)
 
     def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> FlowMatchSchedule:
         sigmas, timesteps = make_unipc_tables(
             int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
         )
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
-
-    def _branch_rows(self, guidance_scale: float) -> slice:
-        """This rank's branches of the [cond, uncond] stack; the unguided step is
-        the one conditional branch, which every rank runs.
-
-        ``guidance_scale`` is in the bucket key, identical on every rank of the
-        instance, so all ranks agree on whether the forward's gather runs."""
-        return my_rows(self.cfg_group, self.CFG_BRANCHES) if guidance_scale > 1.0 else slice(0, 1)
-
-    def attention_segments(self, bucket_key: WanStepKey):
-        # one segment per guidance branch this rank computes, all the same span
-        rows = self._branch_rows(bucket_key.guidance)
-        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (rows.stop - rows.start)
 
     def seed_latents(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
@@ -397,15 +376,16 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         return torch.randn(shape, generator=generator, dtype=torch.float32)
 
     def request_inputs(
-        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: WanStepKey,
+        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, key: StepKey,
     ) -> dict[str, torch.Tensor]:
         tensors = {name: inputs[name][0] for name in ("text_embeds_pos", "text_embeds_neg")}
-        if bucket_key.i2v:
+        if key.bucket.i2v:
             tensors["image_latent"] = inputs["image_latent"][0]
         return tensors
 
-    def num_tokens(self, bucket_key: WanStepKey) -> int:
-        return bucket_key.frames * bucket_key.height * bucket_key.width // 4  # patch_size (1, 2, 2)
+    def num_tokens(self, key: StepKey) -> int:
+        grid = key.bucket
+        return grid.frames * grid.height * grid.width // 4  # patch_size (1, 2, 2)
 
     @staticmethod
     def _first_frame_mask(sample: torch.Tensor) -> torch.Tensor:
@@ -415,14 +395,14 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         return mask
 
     def denoise(
-        self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey, latents: torch.Tensor,
+        self, engine_inputs: ModelInputsFromEngine, key: StepKey, latents: torch.Tensor,
         timestep: torch.Tensor, **kwargs,
     ) -> dict[str, torch.Tensor]:
         """A row of ``latents`` is ``[1, C, T, H, W]``: it keeps the batch dim the
         transformer and the solver see it with."""
         with _inference_ctx():
-            out = super().denoise(engine_inputs, bucket_key, latents, timestep, **kwargs)
-            if bucket_key.i2v:
+            out = super().denoise(engine_inputs, key, latents, timestep, **kwargs)
+            if key.bucket.i2v:
                 # The reference injects post-loop, and the final iteration is where
                 # the latents edge routes to the VAE decoder.
                 mask = self._first_frame_mask(latents)
@@ -438,15 +418,14 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     def model_output(
         self,
         engine_inputs: ModelInputsFromEngine,
-        bucket_key: WanStepKey,
+        key: StepKey,
         latents: torch.Tensor,
         timestep: torch.Tensor,
-        text_embeds_pos: torch.Tensor,
-        text_embeds_neg: torch.Tensor,
+        text_embeds: torch.Tensor,
         image_latent: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = latents.flatten(0, 1)
-        if bucket_key.i2v:
+        if key.bucket.i2v:
             mask = self._first_frame_mask(batch)
             model_input = (1 - mask) * image_latent.flatten(0, 1) + mask * batch
         else:
@@ -455,31 +434,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
         # expand_timesteps: every token of a latent frame takes its frame's
         # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
-        temp_ts = (mask[0, 0, :, 0, 0] * timestep[:, None]).squeeze(0)
-        output = self._noise_prediction(
-            model_input.to(self.transformer.dtype), temp_ts, text_embeds_pos.flatten(0, 1),
-            text_embeds_neg.flatten(0, 1), bucket_key.guidance,
-        )
+        temp_ts = mask[0, 0, :, 0, 0] * timestep[:, None]
+        output = self._noise_prediction(model_input.to(self.transformer.dtype), temp_ts, text_embeds.flatten(0, 1))
         return output[:, None]
 
     def _noise_prediction(
-        self,
-        model_input: torch.Tensor,
-        temp_ts: torch.Tensor,
-        text_embeds_pos: torch.Tensor,
-        text_embeds_neg: torch.Tensor,
-        guidance_scale: float,
+        self, hidden_states: torch.Tensor, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        """CFG noise prediction; one forward over every row's two branches instead
-        of the reference's two sequential forwards. The combine runs in the
-        transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
-        row, ``[B, frames]``, or one row's ``[frames]``."""
-        do_cfg = guidance_scale > 1.0
-        rows = model_input.shape[0]
-        branch_rows = self._branch_rows(guidance_scale)
-        branches = branch_rows.stop - branch_rows.start
-        hidden_states = model_input.repeat(branches, 1, 1, 1, 1)
-        timestep = temp_ts.repeat(branches, 1)
+        """The transformer's prediction for every row, guidance branches included: one forward instead of the
+        reference's two sequential ones. ``timestep`` is per row, ``[R, frames]``."""
         # dynamic=False keys the compiled trace on the full input shape (batch
         # included, so each row count and CFG on or off are distinct graphs). Announce
         # the one-time compile pause the first time a shape is seen, so an operator
@@ -494,26 +457,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                     "this resolution now (one-time pause); later requests reuse it.",
                     shape_key,
                 )
-        if do_cfg:
-            # this rank's branches of the CFG stack, gathered back after the forward
-            stack = torch.cat([text_embeds_pos, text_embeds_neg], dim=0)
-            encoder_hidden_states = stack[branch_rows.start * rows : branch_rows.stop * rows]
-        else:
-            encoder_hidden_states = text_embeds_pos
         transformer = self.transformer
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
-        out = transformer(
+        return transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
             self_attn_fn=self._ragged(),
         )
-        if not do_cfg:
-            return out
-        out = self.cfg_group.all_gather(out.contiguous(), dim=0)
-        noise_cond, noise_uncond = out[:rows], out[rows:]
-        return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
 
 # ---------------------------------------------------------------------------

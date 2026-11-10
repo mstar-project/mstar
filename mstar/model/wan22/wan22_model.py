@@ -156,7 +156,7 @@ class Wan22Model(Model):
                     num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
-                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
+                    max_segments_per_request=len(Wan22DitSubmodule.GUIDANCE.branches),
                     # the DiT is compiled, not captured: keep attention in its graph
                     # (under SP, the fragment between the all-to-all breaks)
                     compile_op=True,
@@ -172,7 +172,7 @@ class Wan22Model(Model):
         # no shard_dim entries.
         return ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
-            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
+            cfg_enabled_nodes={"dit": len(Wan22DitSubmodule.GUIDANCE.branches)},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

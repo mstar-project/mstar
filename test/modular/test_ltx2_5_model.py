@@ -20,6 +20,7 @@ from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, Ragg
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.components.diffusion.denoise_loop import StepKey
 from mstar.model.ltx2_5.components.transformer import (
     LTX2Attends,
     LTX2DiT,
@@ -341,7 +342,7 @@ def test_pack_unpack_round_trip():
 def test_declare_step_spans_and_pairs():
     cfg = LTX25Config()
     shape = LTXShape(frames=2, height=3, width=4, audio_frames=5, fps=24.0, text_len=16)
-    inputs = [NodeInputs(resource_step_info=shape) for _ in range(2)]
+    inputs = [NodeInputs(resource_step_info=StepKey(shape)) for _ in range(2)]
     step = _dit(cfg).declare_step("generate_av", [11, 12], inputs)
     video, audio = step.steps[VIDEO_ATTN], step.steps[AUDIO_ATTN]
     assert isinstance(video, AttentionStep) and not video.causal and not audio.causal
@@ -353,7 +354,7 @@ def test_declare_step_spans_and_pairs():
     assert set(audio_x.pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
     spans = {(s.request_id, s.label): s.span for s in audio_x.segments}
     assert spans == {(r, label): n for r in (11, 12) for label, n in (("video", 24), ("audio", 5), ("text", 16))}
-    assert step.cg_key_info == shape
+    assert step.cg_key_info == StepKey(shape)
     assert _dit(cfg, use_ragged=False).declare_step("generate_av", [11], inputs[:1]) is None
 
 
@@ -366,7 +367,7 @@ def test_declare_step_under_sequence_parallelism(rank, shard):
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
     sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
                               sp_group=CommGroup(rank, rank, [0, 1]))
-    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=shape)])
+    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=StepKey(shape))])
     assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
     for key in (VIDEO_XATTN, AUDIO_XATTN):
         assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard

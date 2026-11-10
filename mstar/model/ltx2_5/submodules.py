@@ -36,7 +36,7 @@ from mstar.engine.resources import (
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.distributed.sequence_parallel import sp_seq_split
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
@@ -286,13 +286,14 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         )
         return {LATENTS: pack_video(video)[0], AUDIO_LATENTS: pack_audio(audio)[0]}
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: LTXShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         return {TEXT_VIDEO: inputs[TEXT_VIDEO][0], TEXT_AUDIO: inputs[TEXT_AUDIO][0]}
 
-    def num_tokens(self, bucket_key: LTXShape) -> int:
-        return bucket_key.total_tokens
+    def num_tokens(self, key: StepKey) -> int:
+        return key.bucket.total_tokens
 
-    def capture_request_inputs(self, bucket_key: LTXShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
+        bucket_key: LTXShape = key.bucket
         cfg = self.config.transformer
         dtype = self.transformer.dtype
         return {
@@ -303,7 +304,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             TEXT_AUDIO: torch.zeros(bucket_key.text_len, cfg.audio_cross_attention_dim, dtype=dtype, device=device),
         }
 
-    def build_layout(self, bucket_key: LTXShape, device):
+    def build_layout(self, key: StepKey, device):
+        bucket_key: LTXShape = key.bucket
         # TODO: per-row tables (a positions resource) would let mixed fps/resolutions share a batch.
         return build_rope(
             self.config.transformer, bucket_key.frames, bucket_key.height, bucket_key.width, bucket_key.fps,
@@ -311,13 +313,13 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         )
 
     def denoise(
-        self, engine_inputs, bucket_key: LTXShape, latents, timestep, sigma, sigma_next,
+        self, engine_inputs, key: StepKey, latents, timestep, sigma, sigma_next,
         audio_latents, text_video, text_audio, **cond,
     ):
         dtype = self.transformer.dtype
         velocity, audio_velocity = self.transformer(
             latents.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep,
-            self.layout(bucket_key, latents.device), self.attends(),
+            self.layout(key, latents.device), self.attends(),
         )
         return {
             LATENTS: ltx_step(latents, velocity, sigma, sigma_next),
@@ -358,7 +360,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         sp = self.sp_group
         video, video_shard, audio, text = [], [], [], []
         for rid, inp in zip(request_ids, inputs, strict=True):
-            shape: LTXShape = inp.resource_step_info
+            shape: LTXShape = inp.resource_step_info.bucket
             video.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shape.video_tokens))
             # the cross-attentions attend from (and the audio queries over) this rank's share
             # of the video tokens; LTX2Block merges the shards' audio-over-video attentions

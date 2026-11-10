@@ -243,6 +243,7 @@ def test_refiners_and_main_layers_use_their_own_attention_span(pair):
 
 
 def test_denoise_node_declares_the_three_spans():
+    from mstar.model.components.diffusion.denoise_loop import StepKey
     from mstar.model.z_image.components.transformer import CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.submodules import ZImageDenoiseSubmodule, ZShape
@@ -252,7 +253,7 @@ def test_denoise_node_declares_the_three_spans():
         None, config, loop_name="denoise_loop", attn_resource_key="dit_attn", compile_transformer=False,
     )
     key = ZShape(grid=(3, 5), cap_len=padded_length(11))
-    assert node.attention_segments(key) == (
+    assert node.attention_segments(StepKey(key)) == (
         (IMAGE_SPAN, padded_length(15)), (CAPTION_SPAN, padded_length(11)), (MAIN_SPAN, key.total_tokens),
     )
     assert node._ragged_spans() is None  # no resource bound -> SDPA everywhere

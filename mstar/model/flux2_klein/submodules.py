@@ -33,8 +33,8 @@ from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     WarmedDecode,
 )
-from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
-from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import (
     image_grid_ids,
     normalize_pixels,
@@ -193,16 +193,17 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         noise = torch.randn(shape, generator=generator, dtype=self.transformer.dtype)
         return pack_latents(noise)[0]
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: KleinShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
         tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0][0]}
-        if bucket_key.ref_grids:
+        if key.bucket.ref_grids:
             tensors[REF_LATENTS] = inputs[REF_LATENTS][0][0]
         return tensors
 
-    def num_tokens(self, bucket_key: KleinShape) -> int:
-        return bucket_key.total_tokens
+    def num_tokens(self, key: StepKey) -> int:
+        return key.bucket.total_tokens
 
-    def capture_request_inputs(self, bucket_key: KleinShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
+        bucket_key: KleinShape = key.bucket
         dtype = self.transformer.dtype
         tcfg = self.config.transformer
         tensors = {
@@ -215,17 +216,18 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             )
         return tensors
 
-    def build_layout(self, bucket_key: KleinShape, device) -> tuple[torch.Tensor, torch.Tensor]:
+    def build_layout(self, key: StepKey, device) -> tuple[torch.Tensor, torch.Tensor]:
+        bucket_key: KleinShape = key.bucket
         ids = [text_ids(bucket_key.text_len), image_grid_ids(*bucket_key.grid)]
         scale = self.config.ref_image_time_scale
         ids += [image_grid_ids(h, w, t=scale * (i + 1)) for i, (h, w) in enumerate(bucket_key.ref_grids)]
         cos, sin = self.rope(torch.cat(ids))
         return cos.to(device), sin.to(device)
 
-    def denoise(self, engine_inputs, bucket_key: KleinShape, latents, timestep, sigma, sigma_next, **cond):
+    def model_output(self, engine_inputs, key: StepKey, latents, timestep, **cond):
         text_embeds = cond[TEXT_EMBEDS]
         ref_latents = cond.get(REF_LATENTS)
-        rope = self.layout(bucket_key, latents.device)
+        rope = self.layout(key, latents.device)
         model_input = latents if ref_latents is None else torch.cat([latents, ref_latents], dim=1)
         # The reference hands the transformer ``t.to(latents.dtype) / 1000``; the double
         # rounding through bf16 is part of what the checkpoint saw.
@@ -235,10 +237,9 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        transformer = self.bf16_transformer if key.dtype == BF16 else self.transformer
         velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
-        velocity = velocity[:, : latents.shape[1]]
-        return euler_step(latents, velocity, sigma, sigma_next)
+        return velocity[:, : latents.shape[1]]
 
 
 # ---------------------------------------------------------------------------

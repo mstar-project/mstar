@@ -20,6 +20,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
+    StepKey,
     StepScalar,
 )
 from mstar.model.components.diffusion.flow_match import (  # noqa: E402
@@ -27,6 +28,7 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     FlowMatchSchedule,
     euler_step,
 )
+from mstar.model.components.diffusion.guidance import Guidance, cfg, cfg_renorm  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
 LOOP = "denoise_loop"
@@ -51,19 +53,18 @@ class ToyDenoise(DenoiseLoopSubmodule):
     def seed_latents(self, fwd_info, bucket_key, generator):
         return torch.randn(bucket_key[0], 4, generator=generator)
 
-    def request_inputs(self, fwd_info, inputs, bucket_key):
+    def request_inputs(self, fwd_info, inputs, key):
         return {"cond": inputs["cond"][0]}
 
-    def num_tokens(self, bucket_key):
-        return bucket_key[0] + bucket_key[1]
+    def num_tokens(self, key):
+        return key.bucket[0] + key.bucket[1]
 
-    def capture_request_inputs(self, bucket_key, device):
-        return {LATENTS: torch.zeros(bucket_key[0], 4, device=device), "cond": torch.zeros(3, device=device)}
+    def capture_request_inputs(self, key, device):
+        return {LATENTS: torch.zeros(key.bucket[0], 4, device=device), "cond": torch.zeros(3, device=device)}
 
-    def denoise(self, engine_inputs, bucket_key, latents, timestep, sigma, sigma_next, **cond):
-        self.calls.append((tuple(latents.shape), tuple(timestep.shape), tuple(sigma.shape), tuple(cond["cond"].shape)))
-        velocity = -latents * self.scale
-        return euler_step(latents, velocity, sigma, sigma_next)
+    def model_output(self, engine_inputs, key, latents, timestep, **cond):
+        self.calls.append((tuple(latents.shape), tuple(timestep.shape), tuple(cond["cond"].shape)))
+        return -latents * self.scale
 
 
 _HANDLES: dict[str, int] = {}
@@ -97,7 +98,7 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     c = sub.prepare_inputs(WALK, _info("r2", 0, seed=8), _inputs())
     assert torch.equal(a.tensor_inputs[LATENTS], b.tensor_inputs[LATENTS])
     assert not torch.equal(a.tensor_inputs[LATENTS], c.tensor_inputs[LATENTS])
-    assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
+    assert a.input_seq_len == 8 + 3 and a.resource_step_info == StepKey((8, 3))
     state = sub.request_state(_handle("r0"))
     assert state["schedule"].num_steps == 4
     # step scalars come off the device-resident schedule
@@ -149,7 +150,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     kwargs = sub.preprocess(WALK, engine_inputs, [a, b])
     assert kwargs[LATENTS].shape == (2, 8, 4) and kwargs["cond"].shape == (2, 3)
     assert kwargs["sigma"].shape == (2, 1, 1) and kwargs["timestep"].shape == (2,)
-    assert kwargs["bucket_key"] == (8, 3)
+    assert kwargs["step_key"] == StepKey((8, 3))
     out = sub.forward_batched(WALK, engine_inputs, **kwargs)
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
@@ -157,7 +158,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     sched_b = sub.request_state(_handle("b"))["schedule"]
     expected_b = euler_step(torch.ones(8, 4), -torch.ones(8, 4) * 0.5, sched_b.sigmas[1], sched_b.sigmas[2])
     assert torch.equal(out["b"][LATENTS][0], expected_b)
-    assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 1, 1), (2, 3))
+    assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 3))
     # the single-request path goes through forward and returns the row directly
     single = sub.forward(WALK, ModelInputsFromEngine(request_ids=["a"], per_request_info={}),
                          **sub.preprocess(WALK, engine_inputs, [a]))
@@ -167,16 +168,16 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
 def test_cg_key_info_and_declare_step_agree():
     sub = ToyDenoise(attn_resource_key="dit_attn")
     infos = {"a": _info("a", 0), "b": _info("b", 3)}
-    assert sub.cg_key_info(WALK, infos) == (8, 3)
+    assert sub.cg_key_info(WALK, infos) == StepKey((8, 3))
     infos["c"] = _info("c", 0, tokens=16)
     assert sub.cg_key_info(WALK, infos) is None
     # padding rows (no step metadata) do not vote
     pad = CurrentForwardPassInfo(request_id="pad", graph_walk=WALK, fwd_index=0, random_seed=0, max_tokens=1)
-    assert sub.cg_key_info(WALK, {"a": _info("a", 0), "pad": pad}) == (8, 3)
+    assert sub.cg_key_info(WALK, {"a": _info("a", 0), "pad": pad}) == StepKey((8, 3))
     a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
     b = sub.prepare_inputs(WALK, _info("b", 0), _inputs())
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
-    assert step.cg_key_info == (8, 3)
+    assert step.cg_key_info == StepKey((8, 3))
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 11), ("b", "main", 11)]
     assert set(step.steps) == {"dit_attn"} and step.steps["dit_attn"].causal is False
     # every row of a bucket spans its tokens, so the bucket's layout is fixed
@@ -187,11 +188,11 @@ def test_cg_key_info_and_declare_step_agree():
 def test_accelerator_graph_configs_one_bucket_per_shape():
     sub = ToyDenoise(capture_buckets=[(WALK, (8, 3)), (WALK, (16, 3))], capture_batch_sizes=(4, 1))
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    assert [c.additional_key_info for c in configs] == [(8, 3), (16, 3)]
+    assert [c.additional_key_info for c in configs] == [StepKey((8, 3)), StepKey((16, 3))]
     cfg = configs[0]
     assert cfg.capture_graph_walk == WALK and cfg.capture_batch_sizes == [1, 4]
     assert cfg.single_request_inputs.input_seq_len == 11
-    assert cfg.single_request_inputs.resource_step_info == (8, 3)
+    assert cfg.single_request_inputs.resource_step_info == StepKey((8, 3))
     assert set(cfg.single_request_inputs.tensor_inputs) == {LATENTS, "cond", "sigma", "sigma_next", "timestep"}
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
@@ -203,29 +204,36 @@ def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
     built = []
 
     class Layouts(ToyDenoise):
-        def build_layout(self, bucket_key, device):
-            built.append(bucket_key)
+        def build_layout(self, key, device):
+            built.append(key.bucket)
             return object()
 
     sub = Layouts(capture_buckets=[(WALK, (8, 3))], max_uncaptured_layouts=2)
     cpu = torch.device("cpu")
-    captured = sub.layout((8, 3), cpu)
-    a, b = sub.layout((1, 3), cpu), sub.layout((2, 3), cpu)
-    assert sub.layout((1, 3), cpu) is a             # a hit refreshes (1, 3)
-    sub.layout((4, 3), cpu)                         # evicts (2, 3), the least recent
-    assert sub.layout((1, 3), cpu) is a
-    assert sub.layout((2, 3), cpu) is not b         # rebuilt
+
+    def layout(tokens, **fields):
+        return sub.layout(StepKey((tokens, 3), **fields), cpu)
+
+    captured = layout(8)
+    a, b = layout(1), layout(2)
+    assert layout(1) is a                           # a hit refreshes (1, 3)
+    layout(4)                                       # evicts (2, 3), the least recent
+    assert layout(1) is a
+    assert layout(2) is not b                       # rebuilt
     for tokens in range(10, 20):
-        sub.layout((tokens, 3), cpu)
-    assert sub.layout((8, 3), cpu) is captured      # never evicted
+        layout(tokens)
+    assert layout(8) is captured                    # never evicted
     assert built.count((8, 3)) == 1 and built.count((2, 3)) == 2
+    # the step's dtype changes no layout; another branch share is another layout
+    assert layout(8, dtype="mxfp8") is captured
+    assert layout(8, guided=True, branches=(1,)) is not captured
 
 
 class TwoSpanDenoise(ToyDenoise):
     """A model whose refiner layers attend over the image tokens alone."""
 
-    def attention_segments(self, bucket_key):
-        return (("image", bucket_key[0]), ("main", self.num_tokens(bucket_key)))
+    def attention_segments(self, key):
+        return (("image", key.bucket[0]), ("main", self.num_tokens(key)))
 
 
 def test_declare_step_lists_every_attention_span_per_row():
@@ -256,13 +264,13 @@ class UniPCDenoise(ToyDenoise):
             "history": torch.zeros(bucket_key[0], 4),
         }
 
-    def capture_request_inputs(self, bucket_key, device):
+    def capture_request_inputs(self, key, device):
         return {
-            **super().capture_request_inputs(bucket_key, device),
-            "history": torch.zeros(bucket_key[0], 4, device=device),
+            **super().capture_request_inputs(key, device),
+            "history": torch.zeros(key.bucket[0], 4, device=device),
         }
 
-    def denoise(self, engine_inputs, bucket_key, latents, timestep, sigma, sigma_next, history, **cond):
+    def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, history, **cond):
         velocity = -(latents + history) * self.scale
         return {LATENTS: euler_step(latents, velocity, sigma, sigma_next), "history": velocity}
 
@@ -334,7 +342,7 @@ class GuidedDenoise(ToyDenoise):
             guidances=torch.arange(float(base.num_steps)),
         )
 
-    def denoise(self, engine_inputs, bucket_key, latents, timestep, sigma, sigma_next, guidance, **cond):
+    def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, guidance, **cond):
         self.calls.append(tuple(guidance.shape))
         return euler_step(latents, -latents * self.scale * guidance.view(-1, 1, 1), sigma, sigma_next)
 
@@ -430,7 +438,7 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     sub = ToyDenoise()
     assert sub.cg_key_info(
         WALK, {"a": _info("a", 0)}, per_request_input_metadata={"a": object()},
-    ) == (8, 3)
+    ) == StepKey((8, 3))
 
 
 class ToyRefine(ToyDenoise):
@@ -595,3 +603,120 @@ def test_iteration_zero_stages_its_schedule_and_seeds_without_a_host_sync():
     want = PrefetchingToy().prepare_inputs(WALK, _info("s1", 0, seed=4), _inputs())
     for name in (LATENTS, "sigma", "timestep"):
         assert torch.equal(got.tensor_inputs[name].cpu(), want.tensor_inputs[name].cpu()), name
+
+
+# ----------------------------------------------------------------------------- guidance
+
+
+class GuidedToy(ToyDenoise):
+    """A CFG model: the prediction is each row's own conditioning, broadcast over its tokens, so every row of the
+    stacked forward shows which branch it was."""
+
+    GUIDANCE = Guidance(branches=({"cond": "cond_pos"}, {"cond": "cond_neg"}), combine=cfg)
+
+    def request_inputs(self, fwd_info, inputs, key):
+        return {name: inputs[name][0] for name in ("cond_pos", "cond_neg")}
+
+    def model_output(self, engine_inputs, key, latents, timestep, cond):
+        self.calls.append((tuple(latents.shape), tuple(cond[:, 0].tolist())))
+        return cond[:, :1, None].expand(-1, latents.shape[1], latents.shape[2]).clone()
+
+
+def _guided_info(rid, scale, k=1):
+    info = _info(rid, k)
+    info.step_metadata["guidance_scale"] = scale
+    return info
+
+
+def _guided_inputs(pos, neg):
+    return {"cond_pos": [torch.full((3,), pos)], "cond_neg": [torch.full((3,), neg)], LATENTS: [torch.zeros(8, 4)]}
+
+
+def _guided_step(sub, rows):
+    """One stacked step over ``rows`` of (rid, scale, pos, neg): the base's prediction for each row."""
+    inputs = [
+        sub.prepare_inputs(WALK, _guided_info(rid, scale), _guided_inputs(pos, neg)) for rid, scale, pos, neg in rows
+    ]
+    engine_inputs = ModelInputsFromEngine(request_ids=[r[0] for r in rows], per_request_info={})
+    kwargs = sub.preprocess(WALK, engine_inputs, inputs)
+    key = kwargs.pop("step_key")
+    for name in ("sigma", "sigma_next", LATENTS):
+        kwargs.pop(name)
+    return key, sub.guided_output(engine_inputs, key, torch.zeros(len(rows), 8, 4), kwargs.pop("timestep"), **kwargs)
+
+
+class _Group:
+    """One rank of a cfg group, whose all-gather returns what every rank's forward computes."""
+
+    def __init__(self, world_size, rank=0, full=None):
+        self.world_size, self.rank, self.full, self.gathers = world_size, rank, full, 0
+
+    def all_gather(self, x, dim):
+        self.gathers += 1
+        assert dim == 1 and torch.equal(x, self.full[:, self.rank:self.rank + 1])
+        return self.full
+
+
+def test_guided_rows_batch_across_scales_and_combine_per_row():
+    """Rows at different scales share one forward (the scale is a step scalar, not part of the key), each request's
+    branches are adjacent rows, and each row combines with its own scale at the prediction's rank."""
+    sub = GuidedToy()
+    key, pred = _guided_step(sub, [("a", 3.0, 2.0, 1.0), ("b", 5.0, 4.0, -1.0)])
+    assert key == StepKey((8, 3), guided=True, branches=(0, 1))
+    assert sub.calls[-1] == ((4, 8, 4), (2.0, 1.0, 4.0, -1.0))   # request-major: a's branches, then b's
+    assert torch.equal(pred[0], torch.full((8, 4), 1.0 + 3.0 * (2.0 - 1.0)))
+    assert torch.equal(pred[1], torch.full((8, 4), -1.0 + 5.0 * (4.0 + 1.0)))
+
+
+def test_an_unguided_request_runs_branch_zero_alone():
+    sub = GuidedToy()
+    key, pred = _guided_step(sub, [("a", 1.0, 2.0, 7.0)])
+    assert key == StepKey((8, 3), guided=False, branches=(0,))
+    assert sub.calls[-1] == ((1, 8, 4), (2.0,))
+    assert torch.equal(pred, torch.full((1, 8, 4), 2.0))
+    guided = sub.prepare_inputs(WALK, _guided_info("g", 4.0), _guided_inputs(2.0, 1.0))
+    unguided = sub.prepare_inputs(WALK, _guided_info("u", 1.0), _guided_inputs(2.0, 1.0))
+    assert not sub.can_batch(None, [guided, unguided])
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("scale", [5.0, 1.0])
+def test_a_cfg_rank_runs_its_branch_and_matches_one_gpu(rank, scale):
+    """Each rank of a two-rank cfg group forwards its own branch of every row, gathers once and only when guided, and
+    the combine matches the one-GPU step."""
+    rows = [("a", scale, 2.0, 1.0), ("b", scale, 4.0, -1.0)]
+    _, expected = _guided_step(GuidedToy(), rows)
+    full = torch.tensor([[2.0, 1.0], [4.0, -1.0]])[:, :, None, None].expand(2, 2, 8, 4)
+    group = _Group(2, rank, full)
+    sub = GuidedToy(cfg_group=group)
+    key, pred = _guided_step(sub, rows)
+    assert key.branches == ((rank,) if scale > 1.0 else (0,))
+    assert sub.num_tokens(key) == 11 and sub.attention_segments(key) == (("main", 11),)
+    assert torch.equal(pred, expected)
+    assert group.gathers == (1 if scale > 1.0 else 0)
+
+
+def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_construction():
+    with pytest.raises(ValueError, match="evenly"):
+        GuidedToy(cfg_group=_Group(3))
+
+
+def test_guided_capture_buckets_stage_the_scale_and_both_keys():
+    sub = GuidedToy(capture_buckets=[(WALK, (8, 3))])
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    assert [c.additional_key_info for c in configs] == [
+        StepKey((8, 3)), StepKey((8, 3), guided=True, branches=(0, 1)),
+    ]
+    assert torch.equal(configs[1].single_request_inputs.tensor_inputs["guidance_scale"], torch.tensor([1.0]))
+    assert sub.split_batches_by_capture_key(WALK)
+
+
+@pytest.mark.parametrize("combine", [cfg, cfg_renorm])
+def test_the_combines_round_as_the_references_do(combine):
+    """The references multiply a bf16 difference by a Python float; the base hands a per-row fp32 scale."""
+    torch.manual_seed(0)
+    cond, uncond = torch.randn(2, 6, 64, dtype=torch.bfloat16), torch.randn(2, 6, 64, dtype=torch.bfloat16)
+    reference = uncond + 3.3 * (cond - uncond)
+    if combine is cfg_renorm:
+        reference = reference * (torch.norm(cond, dim=-1, keepdim=True) / torch.norm(reference, dim=-1, keepdim=True))
+    assert torch.equal(combine((cond, uncond), torch.full((2, 1, 1), 3.3)), reference)

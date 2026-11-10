@@ -16,7 +16,7 @@ from torch import nn
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components import quant_linear
 from mstar.model.components.block_scaled import MXFP8, NVFP4, Mxfp8Format, Nvfp4Format
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepBucket
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.lora.capable import LoraOutputAdd, lora_capability
@@ -482,17 +482,17 @@ class _Loop(DenoiseLoopSubmodule):
     def seed_latents(self, fwd_info, bucket_key, generator):
         return torch.zeros(bucket_key, 2)
 
-    def request_inputs(self, fwd_info, inputs, bucket_key):
+    def request_inputs(self, fwd_info, inputs, key):
         return {}
 
-    def num_tokens(self, bucket_key):
-        return bucket_key
+    def num_tokens(self, key):
+        return key.bucket
 
-    def capture_request_inputs(self, bucket_key, device):
-        return {"latents": torch.zeros(bucket_key, 2, device=device)}
+    def capture_request_inputs(self, key, device):
+        return {"latents": torch.zeros(key.bucket, 2, device=device)}
 
-    def denoise(self, engine_inputs, bucket_key, latents, timestep, sigma, sigma_next, **cond):
-        self.seen.append((bucket_key, self.step_dtype))
+    def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond):
+        self.seen.append((key.bucket, key.dtype))
         return latents + 1
 
 
@@ -510,10 +510,10 @@ def test_a_steps_key_is_the_same_from_prepare_inputs_and_cg_key_info():
     for k, dtype in ((0, "bf16"), (1, "mxfp8"), (3, "mxfp8")):
         info = _info(k)
         prepared = loop.prepare_inputs("gen", info, {} if k == 0 else latents)
-        assert prepared.resource_step_info == StepBucket(4, dtype)
+        assert prepared.resource_step_info == StepKey(4, dtype)
         assert loop.cg_key_info("gen", {0: info}) == prepared.resource_step_info
     # a padding row carries no metadata and doesn't vote; a mix of dtypes shares no graph
-    assert loop.cg_key_info("gen", {0: _info(0), -1: _info(0, metadata=False)}) == StepBucket(4, "bf16")
+    assert loop.cg_key_info("gen", {0: _info(0), -1: _info(0, metadata=False)}) == StepKey(4, "bf16")
     assert loop.cg_key_info("gen", {0: _info(0), 1: _info(2, rid=1)}) is None
     assert loop.split_batches_by_capture_key("gen")
 
@@ -526,23 +526,24 @@ def test_cg_key_info_takes_the_step_from_the_input_metadata_when_it_has_one():
 
     loop = _Loop(StepDtypes(("bf16", "mxfp8")))
     ahead = {0: InputMetadata(dynamic_loop_iter_counts={"denoise_loop": 1})}
-    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata=ahead) == StepBucket(4, "mxfp8")
-    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata={0: InputMetadata()}) == StepBucket(
+    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata=ahead) == StepKey(4, "mxfp8")
+    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata={0: InputMetadata()}) == StepKey(
         4, "bf16",
     )
 
 def test_without_a_schedule_the_step_key_is_the_requests():
     loop = _Loop()
     info = _info(0)
-    assert loop.prepare_inputs("gen", info, {}).resource_step_info == 4 == loop.cg_key_info("gen", {0: info})
+    assert loop.prepare_inputs("gen", info, {}).resource_step_info == StepKey(4) == loop.cg_key_info("gen", {0: info})
     assert not loop.split_batches_by_capture_key("gen")
-    assert [config.additional_key_info for config in loop.get_accelerator_graph_configs(torch.device("cpu"))] == [4, 8]
+    keys = [config.additional_key_info for config in loop.get_accelerator_graph_configs(torch.device("cpu"))]
+    assert keys == [StepKey(4), StepKey(8)]
 
 
-def test_a_schedule_captures_each_bucket_per_dtype_and_denoise_sees_the_plain_key():
+def test_a_schedule_captures_each_bucket_per_dtype_and_denoise_sees_the_steps_dtype():
     loop = _Loop(StepDtypes(("bf16", "mxfp8")))
     keys = [config.additional_key_info for config in loop.get_accelerator_graph_configs(torch.device("cpu"))]
-    assert keys == [StepBucket(4, "bf16"), StepBucket(4, "mxfp8"), StepBucket(8, "bf16"), StepBucket(8, "mxfp8")]
+    assert keys == [StepKey(4, "bf16"), StepKey(4, "mxfp8"), StepKey(8, "bf16"), StepKey(8, "mxfp8")]
     inputs = [loop.prepare_inputs("gen", _info(0, rid=rid), {}) for rid in (0, 1)]
     assert loop.can_batch(None, inputs)
     engine_inputs = ModelInputsFromEngine(request_ids=[0, 1], per_request_info={})

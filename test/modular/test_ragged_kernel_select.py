@@ -32,7 +32,7 @@ from mstar.kernels import Choice, DeviceKey
 from mstar.kernels import registry as registry_module
 from mstar.kernels.registry import reset_lookups
 from mstar.kernels.table import find_entries
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey
 from mstar.model.submodule_base import NodeInputs
 
 GPU = torch.device("cuda", 0)  # a stand-in: nothing here touches it
@@ -332,13 +332,13 @@ def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stu
 class _Dit(DenoiseLoopSubmodule):
     """The scaffold's step declaration; a bucket key is its token count."""
 
-    def num_tokens(self, bucket_key):
-        return bucket_key
+    def num_tokens(self, key):
+        return key.bucket
 
 
 def test_the_scaffolds_step_captures_its_buckets_on_cudnn(stub_flashinfer):
     dit = _Dit(loop_name="denoise_loop", attn_resource_key="dit_attn")
-    declared = dit.declare_step("image_gen", ["r0", "r1"], [NodeInputs(resource_step_info=4608)] * 2)
+    declared = dit.declare_step("image_gen", ["r0", "r1"], [NodeInputs(resource_step_info=StepKey(4608))] * 2)
     step = declared.steps["dit_attn"]
     assert step.fixed_layout and [seg.span for seg in step.segments] == [4608, 4608]
     m = manager_with(CUDNN_ROWS)

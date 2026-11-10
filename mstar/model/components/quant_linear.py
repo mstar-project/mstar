@@ -113,7 +113,7 @@ def check_linear_keep(keep: Sequence[str] | None, knob: str = "linear_keep_bf16"
 class StepDtypes:
     """The dtype a transformer's quantizable linears run in on each denoise step (``linear_dtype_steps``): step
     ``k`` takes ``steps[k]``, and steps past the list its last entry. The DiT scaffold keys a step on it
-    (``StepBucket``), so steps of two dtypes batch and capture apart."""
+    (``StepKey.dtype``), so steps of two dtypes batch and capture apart."""
 
     steps: tuple[str, ...]
 

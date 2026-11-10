@@ -7,6 +7,7 @@ walk transitions, and the check_stop boundary math. The model is built via
 seam is never exercised.
 """
 
+import dataclasses
 import logging
 import math
 import sys
@@ -21,6 +22,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
@@ -372,7 +374,9 @@ def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
         inputs=_dit_loop_inputs(),
     )
     assert node_inputs is not None
-    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg", "timestep"} | LOOP_BACK_NAMES
+    assert node_inputs.tensor_inputs.keys() == {
+        "text_embeds_pos", "text_embeds_neg", "timestep", "guidance_scale",
+    } | LOOP_BACK_NAMES
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [
@@ -815,38 +819,8 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
 
 
 # ----------------------------------------------------------------------
-# dit attention layout and guidance-branch split
+# dit guidance (the scaffold's GUIDANCE; its branch split is tested there)
 # ----------------------------------------------------------------------
-
-
-class _FakeCfgGroup:
-    def __init__(self, world_size: int, rank: int = 0):
-        self.world_size = world_size
-        self.rank = rank
-
-
-def _dit_info(guidance: float) -> CurrentForwardPassInfo:
-    info = _fwd_info(requested_steps=2, iter_count=1)
-    info.step_metadata["guidance_scale"] = guidance
-    return info
-
-
-@pytest.mark.parametrize("world_size,guidance,branches", [
-    (None, 5.0, 2),  # one GPU: both guidance branches in one forward
-    (None, 1.0, 1),  # guidance off: the conditional branch alone
-    (2, 5.0, 1),     # two ranks split the branches
-    (2, 1.0, 1),     # nothing to split: both ranks run the one branch
-    (3, 5.0, None),  # two branches do not split over three ranks: refused
-])
-def test_wan22_dit_attends_one_segment_per_branch_on_its_rank(world_size, guidance, branches):
-    group = _FakeCfgGroup(world_size) if world_size else None
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), cfg_group=group)
-    key = submodule.bucket_key_for(_dit_info(guidance))
-    if branches is None:
-        with pytest.raises(ValueError, match="evenly"):
-            submodule.attention_segments(key)
-        return
-    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
 
 
 class _BranchEcho(torch.nn.Module):
@@ -857,35 +831,34 @@ class _BranchEcho(torch.nn.Module):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 
-class _TwoRankGroup(_FakeCfgGroup):
-    """One rank of a two-rank instance. The all-gather checks this rank's rows
-    and returns both ranks' rows, as each rank's forward computes them."""
-    def __init__(self, rank: int, full: torch.Tensor, rows: int):
-        super().__init__(world_size=2, rank=rank)
-        self.full, self.rows, self.gathers = full, rows, 0
+def test_wan22_rows_at_different_guidance_scales_share_a_forward():
+    """Each row of a batched guided step combines with its own scale over the [B, 1, C, T, H, W] prediction, and
+    matches the same request stepped alone."""
+    def info(rid, handle, scale):
+        base = _fwd_info(requested_steps=2, iter_count=0)
+        return dataclasses.replace(
+            base, request_id=rid, rid_handle=handle, step_metadata={**base.step_metadata, "guidance_scale": scale},
+        )
 
-    def all_gather(self, x, dim):
-        assert dim == 0 and torch.equal(x, self.full[self.rank * self.rows:(self.rank + 1) * self.rows])
-        self.gathers += 1
-        return self.full
+    def embeds(pos, neg):
+        return {"text_embeds_pos": [torch.full((1, 8, 16), pos)], "text_embeds_neg": [torch.full((1, 8, 16), neg)]}
 
+    def step(rows):
+        sub = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
+        sub.get_device = lambda: torch.device("cpu")
+        infos = {rid: info(rid, handle, scale) for rid, handle, scale, _, _ in rows}
+        inputs = [sub.prepare_inputs(Wan22Model.VIDEO_GEN_WALK, infos[rid], embeds(pos, neg))
+                  for rid, _, _, pos, neg in rows]
+        assert sub.can_batch(None, inputs) or len(rows) == 1
+        engine_inputs = ModelInputsFromEngine(request_ids=list(infos), per_request_info=infos)
+        out = sub.forward_batched(Wan22Model.VIDEO_GEN_WALK, engine_inputs,
+                                  **sub.preprocess(Wan22Model.VIDEO_GEN_WALK, engine_inputs, inputs))
+        return {rid: tensors["latents"][0] for rid, tensors in out.items()}
 
-@pytest.mark.parametrize("rows", [1, 2])
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("guidance", [5.0, 1.0])
-def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rows, rank, guidance):
-    """Each rank of the CFG-parallel pair forwards its own branch of every row,
-    gathers once and only when guided, and the combine matches the one-GPU forward."""
-    latents, ts = torch.zeros(rows, 4, 2, 2, 2), torch.zeros(rows, 2)
-    pos = torch.arange(3.0, 3.0 + rows)[:, None, None].expand(rows, 8, 16)
-    neg = -torch.arange(1.0, 1.0 + rows)[:, None, None].expand(rows, 8, 16)
-    one_gpu = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
-    expected = one_gpu._noise_prediction(latents, ts, pos, neg, guidance)
-    full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]), None)
-    group = _TwoRankGroup(rank, full, rows)
-    pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), cfg_group=group)
-    assert torch.equal(pair._noise_prediction(latents, ts, pos, neg, guidance), expected)
-    assert group.gathers == (1 if guidance > 1.0 else 0)
+    rows = [("a", 0, 5.0, 3.0, -1.0), ("b", 1, 2.5, 4.0, -2.0)]
+    batched = step(rows)
+    for row in rows:
+        assert torch.equal(batched[row[0]], step([row])[row[0]])
 
 
 @pytest.mark.parametrize("cfg_size,ok", [(None, True), (1, True), (2, True), (3, False), (4, False)])
@@ -908,7 +881,8 @@ def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(cfg_size, ok):
 def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
     submodule = _dit()
     node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_fwd_info(requested_steps=2, iter_count=1),
+        inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
     assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}

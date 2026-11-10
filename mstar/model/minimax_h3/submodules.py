@@ -29,7 +29,7 @@ from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepScalar
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey, StepScalar
 from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
@@ -311,7 +311,8 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             rows = torch.cat([*cond_noise, rows])
         return {LATENTS: rows, AUDIO_LATENTS: audio}
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: H3Layout) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, key: StepKey) -> dict[str, torch.Tensor]:
+        bucket_key: H3Layout = key.bucket
         # host-side, so what depends on the first step is decided without a sync
         tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0], FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0)}
         if bucket_key.num_condition_rows:
@@ -321,14 +322,16 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
     def padded_rows(self, bucket_key: H3Layout) -> int:
         return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
 
-    def num_tokens(self, bucket_key: H3Layout) -> int:
-        return self.padded_rows(bucket_key)
+    def num_tokens(self, key: StepKey) -> int:
+        return self.padded_rows(key.bucket)
 
-    def attention_segments(self, bucket_key: H3Layout) -> tuple[tuple[str, int], ...]:
+    def attention_segments(self, key: StepKey) -> tuple[tuple[str, int], ...]:
+        bucket_key: H3Layout = key.bucket
         rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
         return ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())
 
-    def capture_request_inputs(self, bucket_key: H3Layout, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, key: StepKey, device) -> dict[str, torch.Tensor]:
+        bucket_key: H3Layout = key.bucket
         cfg = self.config.transformer
         return {
             LATENTS: torch.zeros(bucket_key.num_condition_rows + bucket_key.num_video_rows, cfg.patch_dim,
@@ -341,7 +344,8 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
                if bucket_key.num_condition_rows else {}),
         }
 
-    def build_layout(self, bucket_key: H3Layout, device) -> H3StepLayout:
+    def build_layout(self, key: StepKey, device) -> H3StepLayout:
+        bucket_key: H3Layout = key.bucket
         pad = self.padded_rows(bucket_key) - bucket_key.total_rows
 
         def padded(rows: torch.Tensor) -> torch.Tensor:
@@ -370,11 +374,11 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         return functools.partial(joint_attention, ragged=ragged)
 
     def denoise(
-        self, engine_inputs, bucket_key: H3Layout, latents, timestep, sigma, sigma_next,
+        self, engine_inputs, key: StepKey, latents, timestep, sigma, sigma_next,
         audio_latents, audio_timestep, audio_sigma, audio_sigma_next, cond_timestep, text_embeds,
         first_step, cond_latents=None, **cond,
     ):
-        layout = self.layout(bucket_key, latents.device)
+        layout = self.layout(key, latents.device)
         n = layout.num_condition_rows
         first = bool(first_step.all())  # a CPU tensor: no sync
         if n and first:

@@ -137,6 +137,7 @@ def run(args, report: dict, failures: list[str]) -> None:
 
     import mstar
     from mstar.model.components.diffusion.attention import sdpa_attention
+    from mstar.model.components.diffusion.denoise_loop import StepKey
     from mstar.model.minimax_h3 import weight_loader
     from mstar.model.minimax_h3.components.layout import (
         modality_tags,
@@ -286,7 +287,7 @@ def run(args, report: dict, failures: list[str]) -> None:
     if stages & {"dit", "loop"}:
         dit = weight_loader.build_transformer(config, args.snapshot, dev)
         sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop", attn_resource_key=None)
-        step_layout = sub.build_layout(layout, dev)
+        step_layout = sub.build_layout(StepKey(layout), dev)
         sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
         text = text_rows.to(dev)
         plans = {entry["k"]: (entry["timestep"], entry["timestep_indices"]) for entry in oracle["steps"]}

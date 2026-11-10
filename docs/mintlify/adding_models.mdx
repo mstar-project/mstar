@@ -1418,20 +1418,24 @@ The `dit` node subclasses `DenoiseLoopSubmodule` (`denoise_loop.py`), which owns
 
 ```python
 class MyDenoise(DenoiseLoopSubmodule):
+    GUIDANCE = Guidance(branches=({"text_embeds": "text_embeds_pos"}, {"text_embeds": "text_embeds_neg"}),
+                        combine=cfg)    # a CFG checkpoint only; a distilled one declares none
     def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
-    def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
-    def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+    def schedule_for(self, fwd_info, bucket): ... # FlowMatchSchedule (flow_match.py)
+    def seed_latents(self, fwd_info, bucket, gen): ...  # [L, C] initial noise, seeded
     def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
-    def num_tokens(self, key): ...                # image tokens for the attention step
+    def num_tokens(self, key): ...                # one branch's tokens for the attention step
     def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
-    def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+    def model_output(self, engine_inputs, key, latents, timestep, **cond): ...  # the prediction
     # optional: extra attention spans (a refiner over the image tokens alone, ...)
-    def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+    def attention_segments(self, key): return (("main", self.num_tokens(key)),) * len(key.branches)
 ```
 
-`bucket_key` is whatever has to match for two rows to share a forward, and it is also the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
+`bucket_key_for` returns whatever has to match for two rows to share a forward, the model's own key. The per-step hooks get the step's `StepKey` instead: that key, plus what the base adds per step (the linears' dtype under a step schedule, whether the request is guided, and the guidance branches this rank runs), so they read the model's fields as `key.bucket.<field>`. The step key is also the CUDA-graph bucket key.
 
-A multi-step scheduler that carries solver state between iterations names it in `SOLVER_STATE`; those become loop-back edges alongside `latents`, seeded by `seed_loop_back` and returned from `denoise` as a `{name: tensor}` mapping. UniPC comes with the scaffold: a subclass of `UniPCDenoiseLoopSubmodule` implements `model_output` in place of `denoise`, and the base carries `unipc_model_outputs` and `unipc_last_sample` and steps each row by the loop counter from its own tables, with no host read, so rows at different steps share a forward (wan22 is the example). A scheduler needing another per-step scalar adds a `STEP_SCALARS` entry naming the attribute of its `FlowMatchSchedule` to slice it from — the base stages that tensor on the device and slices it per step, so nothing in the batching path has to change.
+The default `denoise` is the Euler step of `model_output`. A model that steps itself (two streams, a model-specific update) overrides `denoise` instead. Guidance is a declaration: `GUIDANCE` names, per branch, the request inputs that branch reads, and a `combine` function (`guidance.cfg` or `guidance.cfg_renorm`). A guided step runs each branch as a row of `model_output`, splits the branches over the node's `cfg_size` ranks, gathers their predictions and combines them with the request's `guidance_scale` (a step scalar, so rows at different scales share a forward). `Guidance.active` is the one rule for whether a request is guided, which the text encoder also asks before it encodes a negative prompt.
+
+A multi-step scheduler that carries solver state between iterations names it in `SOLVER_STATE`; those become loop-back edges alongside `latents`, seeded by `seed_loop_back` and returned from `denoise` as a `{name: tensor}` mapping. UniPC comes with the scaffold: a subclass of `UniPCDenoiseLoopSubmodule` implements `model_output` as any model does, and the base carries `unipc_model_outputs` and `unipc_last_sample` and steps each row by the loop counter from its own tables, with no host read, so rows at different steps share a forward (wan22 is the example). A scheduler needing another per-step scalar adds a `STEP_SCALARS` entry naming the attribute of its `FlowMatchSchedule` to slice it from — the base stages that tensor on the device and slices it per step, so nothing in the batching path has to change.
 
 A model whose `seed_loop_back` depends on nothing but the bucket key and the request's seed sets `PREFETCH_SEEDS = True` (klein and Z-Image do): the base then draws the noise when the request reaches the worker, on a thread of its own, and iteration 0 only copies it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per joining row.
 
