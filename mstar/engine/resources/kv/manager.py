@@ -971,6 +971,10 @@ class KVManager(AttentionResource):
         released = group.retention.released_pages(end, group.page_size)
         return [*range(released.start), *range(released.stop, end // group.page_size)]
 
+    def _indexed(self, rooted: list[bytes], g: int, kept: list[int]) -> list[int | None]:
+        """The index's page for each of group ``g``'s pages ``kept``, None where it holds none."""
+        return [self._index.page_for(self._window_key(rooted[self._ends_on(g, i)], g, i)) for i in kept]
+
     def _match(
         self, rooted: list[bytes], limit: int, among: Collection[int] | None = None,
     ) -> tuple[int, list[list[int]]]:
@@ -985,7 +989,7 @@ class KVManager(AttentionResource):
             groups, lower = [run[:end // page_size]], end
             for g, group in self._windows:
                 kept = self._kept(g, end)
-                held = [index.page_for(self._window_key(rooted[self._ends_on(g, i)], g, i)) for i in kept]
+                held = self._indexed(rooted, g, kept)
                 if among is not None:
                     held = [page if page in among else None for page in held]
                 missing = [i for i, page in zip(kept, held, strict=True) if page is None]
@@ -1005,10 +1009,12 @@ class KVManager(AttentionResource):
             return []
         pages, leased, at = [], {page for group in groups for page in group}, 0
         for span in chain.spans:
-            if span.opens_step and 0 < at < end:
-                found, kept = self._match(chain.rooted, at // self.config.tokens_per_page)
-                if found == at:
-                    pages += [page for group in kept[1:] for page in group if page not in leased and page not in pages]
+            # The first group's pages under ``end`` are the lease's, so the index serves a walk start on a hit
+            # boundary when it holds every window page kept there.
+            if span.opens_step and 0 < at < end and not at % self._hit_unit:
+                held = [page for g, _ in self._windows for page in self._indexed(chain.rooted, g, self._kept(g, at))]
+                if None not in held:
+                    pages += [page for page in held if page not in leased and page not in pages]
             at += span.length
         return pages
 
