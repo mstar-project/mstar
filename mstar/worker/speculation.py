@@ -342,7 +342,8 @@ class SpeculationBuilder:
                 for walk in set(request_walks.values())
             },
             # Reported by whichever step chose the target -- speculate_node on
-            # the leader, get_spec_target on a follower -- so the hot path does
+            # the leader, get_spec_target on a follower, or the rebuild above
+            # for a step that collapsed to another walk -- so the hot path does
             # not cross back into the runtime once per forward pass.
             output_signals=spec_target.output_signals,
             tp_seq=tp_seq,
@@ -757,7 +758,7 @@ class Speculator:
             # The token budget left out every row of N mid-prefill, so the step
             # holds no row of N. It does not follow N: run it as a step of its
             # own, under its own walk. Sent as N's head, a TP follower finds no
-            # row of N to follow it by, and one GPU labels it with N's signals.
+            # row of N to follow it by.
             # With no continuing row the prep staged nothing to undo, as for
             # the return above.
             return None if fresh_batch is None else self._yield_away_speculation(fresh_batch, gave_way=True)
