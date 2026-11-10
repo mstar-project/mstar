@@ -1,81 +1,96 @@
 Architecture
 ============
 
-High-level components
----------------------
-
-``mstar`` is organized as a set of cooperating processes:
-
-- **API server** (``mstar/api_server/``): FastAPI layer that accepts ``POST /generate``,
-  tokenizes/loads media, dispatches the request, and streams results back to the client.
-  Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console script).
-- **Conductor** (``mstar/conductor/``): central coordinator. It manages the request
-  lifecycle, handles graph-walk transitions, selects workers, routes inputs, and
-  detects completion.
-- **Workers** (``mstar/worker/``): one process per GPU. Each runs an engine manager and a
-  micro-scheduler (continuous batching), drives eviction and offload, and routes tensors
-  directly to downstream workers.
-- **Engine** (``mstar/engine/engine.py``): the single execution backend that runs
-  submodules on the GPU. It compiles forwards, captures CUDA graphs, batches requests, and
-  runs each step's resource lifecycle: admit, plan, forward, commit.
-- **Resources** (``mstar/engine/resources/``): the state that a node's compute uses. This
-  includes paged KV caches, the attention planned over them (FlashInfer or dense),
-  cross-attention over a fixed context, cacheless (ragged) attention for encoder towers
-  that attend within one packed forward, recurrent state pools and the linear attention
-  planned over them (gated DeltaNet, for hybrid models whose non-KV layers carry a
-  fixed-size state instead of a growing cache), position embeddings, and samplers. A model
-  declares which resources each node needs, and the engine builds them. A node that
-  declares no resources receives none. VAE encoders, codec decoders, and projection and
-  combine stages are examples.
-- **Models** (``mstar/model/``): each model declares its computation graph, tokenization,
-  node resources, and submodules. Registered via ``mstar/model/registry.py``.
-- **Graph** (``mstar/graph/``): computation-graph primitives — ``GraphNode``,
-  ``Sequential``, ``Parallel``, ``Loop``, ``GraphEdge``.
-- **Communication** (``mstar/communication/``): ZMQ-based IPC/TCP messaging; tensor
-  transport over RDMA or TCP.
-- **Streaming** (``mstar/streaming/``): streaming output with configurable chunking
-  policies and async partition topology.
-
-Process failures
-----------------
-
-A worker that dies (an exception during setup, an OOM kill, a segfault) sends nothing, so
-the conductor polls its worker process handles during the startup wait and, twice a
-second, from its main loop. A dead worker is fatal for the deployment. The conductor logs
-the worker, its pid, its exit code or signal and the nodes it hosted, fails every request
-that is still waiting with a 503 that names it, terminates the remaining workers and exits
-non-zero. The API server polls the conductor the same way. If it exits before the workers
-are ready, the server never binds. If it exits while serving, pending requests get a 503,
-new ones are refused, the HTTP server stops and the process exits non-zero. Each worker
-also watches its parent and exits if the conductor is gone, so a conductor that is killed
-outright cannot leave workers behind holding GPU memory. The conductor watches the API
-server the same way, so an API server that is killed outright takes the whole deployment
-down with it. SIGINT and SIGTERM shutdowns are unaffected.
-
-Core design principles
-----------------------
-
-- **Models define execution plans.** Each model provides its own graph walks (e.g.
-  ``prefill``, ``decode``, ``image_gen``) via ``get_graph_walk_graphs()``.
-- **Disaggregated.** Logical computation nodes map to physical workers via the YAML
-  config's ``node_groups`` (node names → GPU ranks).
-- **Models declare, the engine executes.** A model declares its resources in
-  ``get_node_resources()``, and declares what each step does to them in
-  ``NodeSubmodule.declare_step()``. The engine performs admission, planning, capture and
-  commit. A step that cannot be admitted therefore becomes backpressure that the scheduler
-  can resolve by eviction, instead of an error inside a forward pass.
-- **Graph-driven scheduling.** The conductor schedules graph walks and their transitions
-  to coordinate multi-engine pipelines, including async producer/consumer partitions.
+A model describes the computation for a request; the deployment config assigns that computation to GPUs. For example, a text request can run a prefill walk over the prompt, then repeat a decode walk to produce tokens. An image or speech task can follow a different path through the same model graph.
 
 Execution flow (simplified)
 ---------------------------
 
-1. The API server receives a request, loads media, and calls the model's
-   ``process_prompt`` to produce the initial tensors.
-2. The conductor asks the model once, at ingest, for each partition's walk plan
-   (``walk_plan``: e.g. ``prefill`` then ``decode``), and runs it: it sends each walk its
-   inputs and moves to the next walk as each one completes.
-3. Workers execute the ready graph nodes on GPU through the engine. The engine declares
-   and admits each step's resource work around the forward pass. Workers then route the
-   output tensors to downstream nodes and workers.
-4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+.. mermaid::
+
+   flowchart TD
+       Client --> Frontend[HTTP frontend]
+       Frontend --> Python[Python preprocessing]
+       Python --> Conductor
+       Conductor --> Worker[GPU worker]
+       Worker --> Engine
+       Engine --> Output[Postprocessing and streamed output]
+       Output --> Client
+
+The diagram shows responsibilities, not one process per box. An engine runs inside a worker; requests can also span several workers and stream between partitions.
+
+1. The HTTP frontend accepts the request. Python preprocessing loads its media and calls the model’s ``process_prompt`` to produce tensors and metadata.
+2. The conductor obtains the model’s ``walk_plan`` for each partition at request ingestion. It supplies inputs, selects workers, and follows walk transitions as execution completes. Prefill followed by decode is one example of a plan.
+3. Each worker’s scheduler selects ready work. The engine runs the submodule and its declared resources through admission, planning, forward, and commit. Workers route intermediate tensors directly to downstream workers.
+4. Python postprocessing turns client-facing outputs into result chunks. The frontend streams those chunks to the client.
+
+The graph runtime is implemented in ``rust/``; ``mstar/graph/runtime/rust.py`` exposes it to Python. HTTP can use either the Python frontend or the optional Rust frontend. Both keep model preprocessing in Python. See `Serving <serving.html>`__ for frontend selection and the routes each serves.
+
+High-level components
+---------------------
+
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Component             | Owns                                                                                 | Source                                                      |
++=======================+======================================================================================+=============================================================+
+| HTTP frontend         | Request parsing, endpoint adapters, uploads, and client streams                      | ``mstar/api_server/`` or ``rust/server/``                   |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Python preprocessing  | Tokenization, media loading, and model prompt processing                             | ``mstar/api_server/`` and model hooks                       |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Conductor             | Request lifecycle, graph-walk transitions, worker selection, and completion          | ``mstar/conductor/``                                        |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Worker                | One GPU process: scheduling, eviction/offload, engine management, and tensor routing | ``mstar/worker/``                                           |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Engine                | Compilation, accelerator graph capture, batched execution, and resource lifecycle    | ``mstar/engine/engine.py``                                  |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Resources             | Node state and execution plans                                                       | ``mstar/engine/resources/``                                 |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Model                 | Graphs, tokenization, resource declarations, and submodules                          | ``mstar/model/``, registered in ``mstar/model/registry.py`` |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Graph                 | Graph primitives and the Python interface to the Rust runtime                        | ``mstar/graph/`` and ``rust/``                              |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Communication         | ZeroMQ control messages and SHM, TCP, or RDMA tensor transport                       | ``mstar/communication/`` and ``rust/``                      |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+| Streaming             | Output chunking policies and async partition topology                                | ``mstar/streaming/``                                        |
++-----------------------+--------------------------------------------------------------------------------------+-------------------------------------------------------------+
+
+The Python entrypoint is ``mstar.api_server.entrypoint:main``, exposed by ``mstar-serve``. It starts the deployment and can launch ``mstar-server`` when the Rust HTTP frontend is selected.
+
+Core design principles
+----------------------
+
+Separate graph structure from GPU placement
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A model provides graph walks through ``get_graph_walk_graphs()``, using primitives such as ``GraphNode``, ``Sequential``, ``Parallel``, ``Loop``, and ``GraphEdge``. A deployment’s ``node_groups`` maps node names to GPU ranks. Changing a supported placement changes the YAML, rather than adding device indices to model code.
+
+The conductor coordinates walks and their transitions, including producer/consumer partitions that advance asynchronously. Worker scheduling and engine execution handle the ready nodes within that plan.
+
+Models declare, the engine executes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A model declares each node’s resources in ``get_node_resources()`` and each step’s effects in ``NodeSubmodule.declare_step()``. The engine builds and manages those resources, including planning and accelerator graph capture. If a step cannot be admitted, the scheduler can resolve the pressure through eviction; resource exhaustion does not need to become an allocation error inside the forward pass.
+
+Resources include paged KV caches and their FlashInfer or dense attention plans; fixed-context cross-attention; cacheless ragged attention for packed encoder inputs; position embeddings; and samplers. Recurrent state pools and linear-attention plans, such as gated DeltaNet, support layers that carry fixed-size state instead of growing KV caches.
+
+A node receives only the resources it declares. VAE encoders, codec decoders, and projection or combination stages can declare none. This ownership rule lets model code use the same lifecycle for eager and captured execution. The `model-authoring guide <adding_models.html>`__ explains the declarations and hooks.
+
+Process failures
+----------------
+
+A dead worker is fatal for the deployment. The conductor checks worker process handles during startup and every half second in its main loop; this does not depend on the worker sending a final message.
+
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Failure                                              | Supervisor response                                                                                                                                           |
++======================================================+===============================================================================================================================================================+
+| Worker exits, is killed, or crashes                  | Log its worker ID, PID, exit code or signal, and hosted nodes; fail waiting requests with a 503 naming the worker; terminate remaining workers; exit nonzero. |
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Conductor exits before workers are ready             | The Python API process detects the exit and does not bind its HTTP server.                                                                                    |
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Conductor exits while the Python frontend is serving | Fail pending requests with 503, refuse new requests, stop HTTP serving, and exit nonzero.                                                                     |
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Conductor disappears outright                        | Each worker’s parent watcher exits so it does not retain GPU memory.                                                                                          |
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Python API process disappears outright               | The conductor’s parent watcher tears down the deployment.                                                                                                     |
++------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+SIGINT and SIGTERM continue to use the normal shutdown path. These are deployment failure rules; a request-level validation error does not imply that a worker has died.

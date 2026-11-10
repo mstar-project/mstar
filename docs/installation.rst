@@ -1,75 +1,80 @@
 Installation
 ============
 
+Install a release to serve a model, or use an editable checkout to contribute to M\*. Both paths below prepare the BAGEL example in `Quickstart <quickstart.html>`__. For another model, choose its dependencies from `Supported models <models.html>`__.
+
 Requirements
 ------------
 
-- **Python 3.12+**.
-- **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families, or **Intel GPUs with XPU PyTorch** for BAGEL
-  (see `Using Docker image on Intel GPU`_).
-  A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
-  (submodules return ``None``) for development and the modular tests, but not real model
-  inference.
-- Enough GPU memory for the model you intend to serve — several families (e.g.
-  BAGEL-7B, Qwen3-Omni-30B) are multi-GPU-class models.
+- Python 3.12 or later.
+- For the NVIDIA instructions below, Linux and a supported NVIDIA GPU/driver. Models with source-built or JIT-compiled CUDA extensions also need a compatible CUDA toolkit; see `Matching your CUDA toolkit <installation.html#matching-your-cuda-toolkit>`__.
+- Enough device memory for the selected model, precision, and resource configuration. The number of GPU ranks in a config specifies placement, not a minimum memory guarantee.
+- Access to the model checkpoint. Gated checkpoints may require accepting a license and setting ``HF_TOKEN``.
+
+BAGEL also has an `Intel GPU container path <installation.html#using-docker-image-on-intel-gpu>`__. A CPU-only machine can run development tests in dummy mode, where submodules return ``None``; it does not run the GPU model examples.
 
 Install from PyPI
 -----------------
 
-Released versions are on PyPI as ``mstar-ai`` (``mstar-project`` and ``mstar-serve`` are
-alias packages that install the same thing). The import package and the console scripts
-are still ``mstar``. We recommend `uv <https://docs.astral.sh/uv/>`_ to create the
-Python 3.12 environment:
+Use `uv <https://docs.astral.sh/uv/>`__ to create an environment and install BAGEL’s dependencies:
 
-.. code-block:: bash
+.. code:: bash
 
-   # Create and activate a Python 3.12 virtualenv (--seed adds pip to it)
    uv venv --python 3.12 --seed
    source .venv/bin/activate
+   uv pip install --torch-backend=auto "mstar-ai[bagel]"
 
-   uv pip install --torch-backend=auto "mstar-ai[all]"
-   mstar serve bagel
+The distribution is ``mstar-ai``; its Python import and CLI are ``mstar``. The alias distributions ``mstar-project`` and ``mstar-serve`` install the same package. Default deployment configs ship with the release, so this path does not need a repository checkout.
 
-The extras are the same as for a source install (see `Optional dependencies`_), so
-``mstar-ai[bagel]`` or ``mstar-ai[qwen3_omni,audio]`` work the same way. The default
-deployment configs ship inside the package, so ``mstar serve <model>`` works without a
-checkout. Keep ``--torch-backend=auto`` on every install, see the note below.
+The Linux wheels for x86_64 and aarch64, CPython 3.12–3.14, include the required Rust extension. A pure-Python wheel does not: importing ``mstar`` alone cannot establish that the installation can serve. Continue with `Verify the install <installation.html#verify-the-install>`__, then the quickstart.
+
+For a different model, replace ``bagel`` with the required extra. Combine extras with a comma, such as ``mstar-ai[qwen3_omni,audio]``. The ``all`` extra installs a broader set of dependencies, but does not replace the separate model-specific installs listed below.
 
 Install from source
 -------------------
 
-To work on the code, install from source in editable mode:
+An editable install uses your checkout when Python imports M\*. Run these commands from the directory where you want to clone the repository:
 
-.. code-block:: bash
+.. code:: bash
 
    git clone https://github.com/mstar-project/mstar.git
    cd mstar
-
-   # Create and activate a Python 3.12 virtualenv (--seed adds pip to it)
    uv venv --python 3.12 --seed
    source .venv/bin/activate
+   uv pip install --torch-backend=auto -e ".[bagel,dev]"
 
-   uv pip install --torch-backend=auto -e .
+The ``bagel`` extra supports the quickstart; ``dev`` adds lint and test tools. Use another model’s extra for a different serving task. For core development without model inference, ``.[dev]`` is sufficient for the Python dependencies.
 
-This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
-console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
-extension (see `Rust extension`_).
+**Build the Rust extension before serving or running runtime tests.** An editable Python install does not compile it. Install `rustup <https://rustup.rs/>`__ first; it supplies the compiler pinned by ``rust-toolchain.toml``. In the same environment, from the repository root, run:
 
-.. important::
+.. code:: bash
 
-   **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
-   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` /
-   ``torchaudio>=2.10.0,!=2.11.1``; torchaudio 2.11.1 needs a newer torch than its
-   metadata says and fails to load next to torch 2.11 or 2.12).
-   The flag tells
-   ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
-   — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
-   compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
-   compile against your *system* CUDA toolkit, whose major version must match torch's.
-   Without the flag ``uv`` installs PyPI's default (cu128) build. You can set it once
-   with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
-   CUDA toolkit`_ for details and the manual fallback.
+   uv pip install maturin
+   maturin develop --release -m rust/Cargo.toml
+
+Continue with the checks below. Rebuild after changing ``rust/`` or pulling changes to it; the runtime rejects an extension built from different sources. `Rust extension <installation.html#rust-extension>`__ explains the source check, test commands, and wheel/checkout precedence.
+
+Verify the install
+------------------
+
+In the environment you installed, check the package, the extension, and the CLI:
+
+.. code:: bash
+
+   python -c "import mstar; print('mstar import OK')"
+   python -c "from mstar.graph.runtime.utils import require_rust_extension; require_rust_extension(); print('Rust extension OK')"
+   mstar --help
+   mstar-serve --help
+
+The extension check raises an error if the build is missing or stale in a checkout. Follow its rebuild command before continuing. These checks do not load model weights or run inference.
+
+For an NVIDIA deployment, also confirm that PyTorch sees the GPU:
+
+.. code:: bash
+
+   python -c "import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.is_available(), torch.cuda.device_count())"
+
+The availability value should be ``True``, with enough visible devices for the selected config. Use the XPU check in the Intel instructions instead on that platform. Finish with `Quickstart <quickstart.html>`__ to start a server and generate text.
 
 Using Docker image on Intel GPU
 -------------------------------
@@ -111,91 +116,101 @@ one for the encoders and decoder, and two for the LLM.
 Optional dependencies
 ---------------------
 
-Model families and some output formats need extra packages, exposed as pip *extras*:
+Choose the extra for the model you will run. Extras add Python dependencies;
+they do not download weights, grant checkpoint access, or prove that a model fits
+in memory. The complete set is declared in ``pyproject.toml``.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 22 78
+For a release, use ``mstar-ai[bagel,audio]``. In an editable checkout, use
+``.[bagel,audio,dev]``. The entries below explain model-specific requirements and
+separate installs.
 
-   * - Extra
-     - Installs / use for
-   * - ``.[bagel]``
-     - BAGEL runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``einops``, ``Pillow``, ``torchvision`` / ``torchaudio`` / ``torchcodec``,
-       ``huggingface-hub``, ``regex``, and ``mooncake-transfer-engine`` (RDMA transport).
-   * - ``.[bagel_xpu]``
-     - BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for
-       batched token sampling with per-request RNG state on the device.
-       Install the matching XPU build of PyTorch.
-   * - ``.[command_a_plus]``
-     - Command A+ runtime: ``flashinfer-python>=0.6.18`` (its one-kernel all-reduce),
-       ``transformers>=5.17`` (the version its Hugging Face parity checks use),
-       ``huggingface-hub``, ``safetensors``, ``mooncake-transfer-engine``, and ``ninja``
-       (speeds up the JIT build of the vendored MoE align kernel). Set ``CUDA_HOME`` to a
-       CUDA toolkit matching PyTorch's so that kernel can build. ``.[all]`` allows older
-       FlashInfer and Transformers for the other models, so add ``.[command_a_plus]``
-       when installing both.
-   * - ``.[qwen3_omni]``
-     - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
-       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). It needs
-       ``transformers>=5.18``. Its encoders attend through FlashInfer, so it needs no
-       ``flash-attn``.
-   * - ``.[orpheus]``
-     - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
-   * - ``.[fish_s2_pro]``
-     - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
-   * - ``.[omnivoice]``
-     - OmniVoice TTS. The extra is empty on purpose: the runtime is the
-       ``omnivoice`` package, installed separately from git —
-       see `omnivoice (OmniVoice)`_.
-   * - ``.[pi05]``
-     - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
-       comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
-       Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
-   * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
-     - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
-       ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
-   * - ``.[glm]``
-     - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
-       (speeds up the JIT build of the vendored MoE align kernel).
-   * - ``.[waypoint]``
-     - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
-       and ``tensordict`` for reference validation. The pinned TAEHV implementation
-       must be installed separately as shown below; keeping its direct URL out of
-       package metadata allows ``m-star`` to be published on PyPI. **Also needs**
-       ``flash-attn-4``, which is installed separately —
-       see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
-   * - ``.[asr]``
-     - Speech recognition models: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``einops``, ``soundfile`` (WAV / FLAC / OGG / MP3 uploads), ``torchcodec``
-       (FFmpeg-backed decoding of the other formats), ``huggingface-hub``,
-       ``mooncake-transfer-engine``, and ``datasets`` / ``jiwer`` for
-       ``benchmark/asr_eval.py``.
-   * - ``.[audio]``
-     - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
-       from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
-   * - ``.[audioseal]``
-     - ``audioseal`` (``>=0.2,<0.3``, MIT code and weights) for the opt-in AudioSeal
-       watermark on generated speech (Qwen3-TTS ``audio_watermark``, see the
-       Qwen3-TTS notes in :doc:`models`). Not part of ``.[all]``; a deployment that
-       enables the watermark without it fails at startup with this install hint.
-       The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
-   * - ``.[metrics]``
-     - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
-       ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
-       model's runtime, so not part of ``.[all]``.
-   * - ``.[dev]``
-     - ``ruff`` + ``pytest`` for linting and the test suite.
-   * - ``.[all]``
-     - The union of the index-hosted dependencies from every model extra above.
-       Convenient for a machine that serves multiple models; heavier and slower to
-       install than a single family's extra. It excludes the separately installed
-       TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
-       `flash-attn (LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
+bagel
+~~~~~
+
+BAGEL runtime: ``transformers``, ``flashinfer-python``, ``safetensors``, ``einops``, ``Pillow``, ``torchvision`` / ``torchaudio`` / ``torchcodec``, ``huggingface-hub``, ``regex``, and ``mooncake-transfer-engine`` (RDMA transport).
+
+bagel_xpu
+~~~~~~~~~
+
+BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for batched token sampling with per-request RNG state on the device. Install the matching XPU build of PyTorch.
+
+command_a_plus
+~~~~~~~~~~~~~~
+
+Command A+ runtime: ``flashinfer-python>=0.6.18`` (its one-kernel all-reduce), ``transformers>=5.17`` (the version its Hugging Face parity checks use), ``huggingface-hub``, ``safetensors``, ``mooncake-transfer-engine``, and ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). Set ``CUDA_HOME`` to a CUDA toolkit matching PyTorch's so that kernel can build. ``.[all]`` allows older FlashInfer and Transformers for the other models, so add ``.[command_a_plus]`` when installing both.
+
+qwen3_omni
+~~~~~~~~~~
+
+Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). It needs ``transformers>=5.18``. Its encoders attend through FlashInfer, so it needs no ``flash-attn``.
+
+orpheus
+~~~~~~~
+
+Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``, ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+
+fish_s2_pro
+~~~~~~~~~~~
+
+Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``, ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
+
+omnivoice
+~~~~~~~~~
+
+OmniVoice TTS. The extra is empty on purpose: the runtime is the ``omnivoice`` package, installed separately from git — see `omnivoice (OmniVoice)`_.
+
+pi05
+~~~~
+
+Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``, ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer comes from the gated ``google/paligemma-3b-pt-224``: accept its license on Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
+
+vjepa2 and vjepa2_ac
+~~~~~~~~~~~~~~~~~~~~
+
+V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``, ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+
+glm
+~~~
+
+GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
+
+waypoint
+~~~~~~~~
+
+Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``, and ``tensordict`` for reference validation. The pinned TAEHV implementation must be installed separately as shown below; keeping its direct URL out of package metadata allows ``mstar-ai`` to be published on PyPI. **Also needs** ``flash-attn-4``, which is installed separately — see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
+
+asr
+~~~
+
+Speech recognition models: ``transformers``, ``flashinfer-python``, ``safetensors``, ``einops``, ``soundfile`` (WAV / FLAC / OGG / MP3 uploads), ``torchcodec`` (FFmpeg-backed decoding of the other formats), ``huggingface-hub``, ``mooncake-transfer-engine``, and ``datasets`` / ``jiwer`` for ``benchmark/asr_eval.py``.
+
+audio
+~~~~~
+
+``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…) from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
+
+audioseal
+~~~~~~~~~
+
+``audioseal`` (``>=0.2,<0.3``, MIT code and weights) for the opt-in AudioSeal watermark on generated speech (Qwen3-TTS ``audio_watermark``, see the Qwen3-TTS notes in :doc:`models`). Not part of ``.[all]``; a deployment that enables the watermark without it fails at startup with this install hint. The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
+
+metrics
+~~~~~~~
+
+``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a model's runtime, so not part of ``.[all]``.
+
+dev
+~~~
+
+``ruff`` + ``pytest`` for linting and the test suite.
+
+all
+~~~
+
+The union of the index-hosted dependencies from every model extra above. Convenient for a machine that serves multiple models; heavier and slower to install than a single family's extra. It excludes the separately installed TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below, `flash-attn (LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
+
+Combining extras and installing Waypoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -227,8 +242,8 @@ Or, in an existing Python 3.12 environment:
 
 .. tip::
 
-   If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
-   index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
+   For a machine serving several model families, ``.[all]`` installs all
+   index-hosted model dependencies in one install. Waypoint still needs the pinned TAEHV
    command above, and Qwen3-TTS still needs ``qwen-tts`` (see `qwen-tts (Qwen3-TTS)`_):
 
    .. code-block:: bash
@@ -242,13 +257,39 @@ Or, in an existing Python 3.12 environment:
    backbones, Transformers, safetensors, any codec/media libraries, and the Mooncake RDMA
    transport for disaggregated deployments.
 
+Matching your CUDA toolkit
+--------------------------
+
+PyTorch’s CUDA build, the installed driver, and the toolkit used to compile extensions are separate compatibility checks. For CUDA installs, use ``--torch-backend=auto`` to let uv select a PyTorch index from the detected driver. You can also set ``UV_TORCH_BACKEND=auto``. See `uv’s backend selection <https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection>`__.
+
+Automatic selection does not inspect or replace the toolkit selected by ``CUDA_HOME``. Before building ``flash-attn`` or a model’s JIT extension, compare PyTorch’s CUDA build with ``nvcc``:
+
+.. code:: bash
+
+   python -c "import torch; print(torch.__version__, torch.version.cuda)"
+   nvcc --version
+
+Use a toolkit compatible with PyTorch’s CUDA major version. ``nvidia-smi`` describes driver compatibility; it is not the version of the installed compiler. If uv selects a build incompatible with your toolkit, select the backend explicitly or change the toolkit. For example, for the CUDA 12.8 / torch 2.10 set used by the ASR extra:
+
+.. code:: bash
+
+   uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+     --index-url https://download.pytorch.org/whl/cu128
+   uv pip install -e ".[all]" "torchcodec==0.10.*"
+
+Run that example from a checkout, and use it only when its CUDA build matches your environment. For other builds, consult `PyTorch’s installation selector <https://pytorch.org/get-started/locally/>`__. Keep ``torch``, ``torchvision``, and ``torchaudio`` on compatible release lines.
+
+M\* currently requires ``torch>=2.10.0,<2.13.0``, ``torchvision>=0.25.0``, and ``torchaudio>=2.10.0,!=2.11.1``. The excluded torchaudio build requires symbols unavailable in torch 2.11/2.12. The ``asr`` extra pins torch and torchaudio to 2.10 and torchcodec to 0.10, as the Docker images do; torchcodec does not declare its torch compatibility, so installing its newest release is not a substitute for that pin.
+
+On a CUDA 13 PyTorch build, the CUDA 12 Mooncake wheel installed by the extras cannot load for ``TCP`` or ``RDMA``. ``SHM`` is unaffected. Follow the `Mooncake CUDA 13 remedy <installation.html#mooncake-cuda13>`__ if startup reports ``libcudart.so.12`` missing.
+
 GPU libraries
 -------------
 
-The GPU model families depend on:
+GPU dependencies vary by model and attention backend:
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
-  autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
+  autoregressive backbones (when the node selects the FlashInfer attention backend).
   Pinned to the version the attention wrappers' direct planner calls were checked against
   (``DIRECT_PLAN_FLASHINFER_VERSIONS`` in ``mstar/engine/resources/attn/wrappers.py``); on any
   other version they fall back to FlashInfer's own ``plan()``.
@@ -269,9 +310,7 @@ The GPU model families depend on:
   (``+cu130``) swap in its CUDA 13 build, as the Docker images do (see
   :ref:`mooncake-cuda13`).
 
-Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
-installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
-that for you (next section).
+Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. For source-built extensions, check the toolkit separately; see `Matching your CUDA toolkit`_.
 
 omnivoice (OmniVoice)
 ---------------------
@@ -341,9 +380,9 @@ Check both first:
 Pick the release that has a wheel for your torch minor (each flash-attn release lists which
 ``torchX.Y`` tags it ships), then install it by **direct URL** (don't use ``--find-links`` —
 uv sorts the ``+cu13…`` local version above ``+cu12…`` and will grab cu13 even on a CUDA 12
-box). The example below is for **torch 2.10**, the floor. The prebuilt wheels **top out at**
-``torch2.10``, and only for ``cu13`` (release ``v2.8.3``): on a cu12 torch, or on torch 2.11+,
-you must build from source instead:
+box). The example below is for **torch 2.10**, the floor. For release ``v2.8.3``, the newest torch wheel tag is
+``torch2.10``, available only for ``cu13``. Use the source-build path below when
+that release has no wheel for your installed torch:
 
 .. code-block:: bash
 
@@ -365,8 +404,7 @@ torch.version.cuda)"`` and pick the matching wheel.)
 No matching wheel — build from source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-If no prebuilt wheel matches your torch minor (the wheels stop at ``torch2.10``, so this is
-the case on **torch 2.11+**), compile from source. A source build compiles against **whatever
+If no prebuilt wheel matches your torch minor, compile from source. A source build compiles against **whatever
 torch you have installed**, so the torch-minor mismatch goes away. flash-attn 2.8.3 builds
 against a CUDA-13 toolkit, but **only if you restrict the target architectures** (see below) —
 the default arch list pulls in Blackwell targets that don't compile under nvcc 13.x. It is a
@@ -406,8 +444,8 @@ Install it after ``flash-attn`` (FA2): the FA2 package ships an older
 
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with ``Block sparse tensors ...
-require explicit sparse_block_size[0]``. Note this rules out the flash-attn
-prebuilt wheels above, which stop at ``torch2.10``.
+require explicit sparse_block_size[0]``. The ``v2.8.3`` wheel example above targets torch 2.10, so it cannot be used
+with this setup; build FA2 from source if you also need it.
 
 Install it from the upstream repo's ``flash_attn/cute`` subdirectory, pinned to
 the revision this was tested against (with ``nvidia-cutlass-dsl`` 4.7.1 and
@@ -429,59 +467,7 @@ but slower — about 1.8x per attention call at 720p. Set
 ``MSTAR_FLEX_BACKEND=TRITON`` to choose it explicitly, or
 ``MSTAR_FLEX_BACKEND=FLASH`` to fail at startup instead of falling back.
 
-Matching your CUDA toolkit
---------------------------
-
-PyPI's default ``torch`` wheel targets one specific CUDA release (cu128), which may not match
-your machine. ``flash-attn`` compiles from source, and the vendored MoE align kernel
-JIT-compiles on first use, both against your *system* CUDA — so a mismatch with torch's
-CUDA breaks the build. The simplest fix is to let ``uv`` choose the right build
-automatically:
-
-.. code-block:: bash
-
-   uv pip install --torch-backend=auto -e ".[all]"
-
-``--torch-backend=auto`` detects your driver (via ``nvidia-smi``) and selects the matching
-PyTorch index — cu128 on CUDA 12.x, cu130 on CUDA 13.x — for the runtime *and* for the
-isolated environment that builds ``flash-attn``. The same command therefore
-works unchanged across machines. (Needs a recent ``uv`` — run ``uv pip install --help`` and
-look for ``--torch-backend`` if unsure; ``export UV_TORCH_BACKEND=auto`` is equivalent.)
-
-.. note::
-
-   **Mooncake on a CUDA 13 torch.** The extras install Mooncake's CUDA 12 wheel, which can't
-   load next to a cu130 torch, so ``TCP`` and ``RDMA`` transport fail at startup; ``SHM`` is
-   not affected. Swap in its CUDA 13 build as described in :ref:`mooncake-cuda13`.
-
-**Manual fallback.** If you can't use the flag, install the pinned torch trio from the
-matching CUDA index **first**, then install ``mstar`` (the resolver then treats the
-requirement as already satisfied):
-
-.. code-block:: bash
-
-   # pick the index for your CUDA toolkit: cu128 (CUDA 12.8), cu130 (CUDA 13.x), …
-   uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
-       --index-url https://download.pytorch.org/whl/cu128
-   uv pip install -e ".[all]" "torchcodec==0.10.*"
-
-Check your driver's CUDA version with ``nvidia-smi`` and pick the closest build at
-https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.10`` /
-``0.25`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
-``torchcodec`` doesn't declare its ``torch`` version, so the resolver otherwise picks the
-newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
-is the release built against it.
-The ``[asr]`` extra pins that set itself (``torch`` 2.10 with ``torchaudio`` 2.10 and
-``torchcodec`` 0.10, as in the Docker images), so installing it puts ``torch`` on 2.10.
-
-Verify the install
-------------------
-
-.. code-block:: bash
-
-   python -c "import mstar; print('mstar import OK')"
-   mstar --help
-   mstar-serve --help
+.. _optional-rust-support:
 
 Rust extension
 --------------
@@ -508,6 +494,9 @@ The extension carries (see :doc:`environment_variables` for the flags):
   extension or not. The legacy ``pickle`` codec is no longer supported.
   Loosely typed metadata uses data-only extensions; upgrade all deployment
   processes together, since legacy pickle frames are rejected.
+
+Install or rebuild the extension
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 There are two ways to get it. The Linux wheels of ``mstar-ai`` on PyPI (x86_64
 and aarch64, CPython 3.12 to 3.14) carry the extension, so ``pip install
@@ -548,6 +537,9 @@ removes the other's files. Verify with:
 ``test/rust`` is skipped wholesale when the extension is not importable, so
 a green run there without the build above proves nothing.
 
+Run the Rust-side tests
+~~~~~~~~~~~~~~~~~~~~~~~
+
 The Rust-side tests need different features. The crate's default features turn
 on ``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
 for the cdylib, which resolves CPython symbols from the interpreter that
@@ -581,10 +573,9 @@ it. Then opt in:
    mstar serve qwen3_omni --rust-frontend
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
-Use it when benchmarking or tuning streaming throughput: its output path costs
-about 8 µs of API-server CPU per streamed token against 18 µs for the Python
-frontend (``benchmark/api_output_path``), so at high token rates the Python
-frontend, not the model, can be the limit.
+Use ``benchmark/api_output_path`` to compare the frontends when tuning
+streaming throughput. It measures API-server CPU work per streamed token;
+run it for your deployment before attributing a bottleneck to the frontend.
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
@@ -599,8 +590,7 @@ frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
 ported class is served. Chat, speech, images and videos are served for every
 model the Python frontend serves them for. The transcription and realtime
-routes are not ported yet (``NOT_PORTED`` in
-``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
+routes are not ported yet (see ``test/rust/test_rust_frontend.py`` for route coverage); there ``mstar-server`` answers 404,
 logs a warning at startup, and ``/generate`` still works.
 
 Troubleshooting

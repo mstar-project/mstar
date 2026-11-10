@@ -1,9 +1,9 @@
 API Reference
 =============
 
-This reference is generated automatically from the docstrings in each module. It mirrors
-the package layout under ``mstar/``; expand a subpackage to drill down to individual
-modules, classes, and functions.
+Use this generated reference to look up modules, classes, and functions under
+``mstar/``. For requests sent to a running server, use :doc:`clients`.
+The entries below come from module docstrings; expand a subpackage to find a symbol.
 
 .. note::
 

@@ -1,101 +1,84 @@
 Quickstart
 ==========
 
-This page serves a model and sends a first request. If you haven't installed ``mstar``
-yet, see :doc:`installation`.
+Start BAGEL and send it a text prompt. This guide uses the Python SDK and a server on the same machine.
 
-1. Start a server
------------------
+Before starting, follow `Installation <installation.html>`_ for Linux with an NVIDIA GPU, Python 3.12 or later, and the ``bagel`` extra. The default BAGEL deployment puts all nodes on one GPU; that GPU must have enough memory for the model and its resources. The server downloads ``ByteDance-Seed/BAGEL-7B-MoT`` from Hugging Face when it is not cached, so it needs access to that checkpoint. For Intel GPUs, use the `Intel installation path <installation.html#using-docker-image-on-intel-gpu>`_ instead.
 
-The ``mstar`` CLI launches a server for a model with a sensible default config:
+.. _1-start-a-server:
+
+Start a server
+--------------
+
+In your installed M* environment, run:
 
 .. code-block:: bash
 
    mstar serve bagel
 
-It listens on ``http://localhost:8000`` by default. Other models:
+Leave this terminal open. The server listens at ``http://localhost:8000``. This command selects the default single-GPU BAGEL configuration and Python HTTP frontend. See `Serving <serving.html>`_ for a different GPU layout, port, or the Rust frontend.
+
+.. _3-check-health:
+
+Check health
+------------
+
+In a second terminal on the same machine, check the server:
 
 .. code-block:: bash
 
-   mstar serve bagel_cfg_parallel   # BAGEL with CFG branches split across GPUs (faster image gen)
-   mstar serve qwen3_omni           # omni: text/image/audio/video in, text/speech out
-   mstar serve orpheus              # text-to-speech
-   mstar serve pi05                 # vision-language-action (robotics)
-   mstar serve vjepa2               # video world model
+   curl --fail http://localhost:8000/health
 
-Defaults vary by model: most fit on a single GPU, but some ship with multi-GPU layouts —
-``qwen3_omni`` uses 2 GPUs and ``bagel_cfg_parallel`` uses 3 (the main branch plus the two
-classifier-free-guidance branches on their own GPUs). Choose GPUs and a port with
-``--gpus`` / ``--port``:
+A healthy response contains:
+
+.. code-block:: json
+
+   {"status":"healthy"}
+
+If the connection is refused, check the first terminal for a startup error or wait for startup to finish and retry. This check confirms HTTP health; the next request checks that the model can produce text.
+
+.. _2-send-a-request:
+
+Send a request
+--------------
+
+In the second terminal, activate the same Python environment you used to start M*. Run:
 
 .. code-block:: bash
 
-   mstar serve qwen3_omni --gpus 0,1 --port 9000
+   python - <<'PYTHON'
+   from mstar import MStarClient
 
-For custom layouts, disaggregation, and tensor parallelism, see :doc:`serving`.
+   client = MStarClient("http://localhost:8000")
+   response = client.chat("What is the capital of France?")
+   print(response.text)
+   PYTHON
 
-.. note::
+The program prints the model's answer from ``response.text``. Look for a text response to the question; the exact wording can vary. The first request may take longer while M* compiles the paths it uses. Do not use that request to judge steady-state latency.
 
-   The **first request(s) on a fresh environment can be slow** — often tens of seconds to a
-   few minutes. mstar ``torch.compile``\ s the model on first use, and that compilation
-   happens lazily on the first request that exercises each path. Subsequent requests run at
-   full speed, and the compiled artifacts are cached on disk, so later runs and restarts
-   warm up much faster. To avoid paying it on a real request, send a throwaway warmup
-   request right after the server reports ready.
-
-2. Send a request
------------------
-
-**Python SDK** — works for every model and modality. Each line below targets the model
-that supports it, so run the matching server first:
+To stream a response from the same server:
 
 .. code-block:: python
 
    from mstar import MStarClient
-
-   client = MStarClient("http://localhost:8000")
-
-   print(client.chat("What is the capital of France?").text)              # text  (BAGEL / Qwen3-Omni)
-   open("cat.png", "wb").write(client.generate_image("a cat in a hat"))   # image (BAGEL)
-   client.tts("Hello there", voice="tara").to_wav("out.wav")             # speech (Orpheus)
-
-Streaming yields typed chunks (``TextChunk`` / ``ImageChunk`` / ``AudioChunk``):
-
-.. code-block:: python
-
    from mstar.client import TextChunk
 
+   client = MStarClient("http://localhost:8000")
    for event in client.chat("Tell me a short story.", stream=True):
        if isinstance(event, TextChunk):
            print(event.text, end="", flush=True)
+   print()
 
-**curl** — the native ``/generate`` endpoint works for every model:
+When finished, press Ctrl+C in the server terminal.
 
-.. code-block:: bash
+Try another task
+----------------
 
-   curl -s http://localhost:8000/generate -F 'text=Hello, how are you?'
+- **Generate an image with BAGEL:** keep this server running and follow `the image SDK example <https://github.com/mstar-project/mstar/blob/main/examples/sdk_image.py>`_.
+- **Generate speech with Orpheus:** install the ``orpheus`` extra, stop BAGEL, and start ``mstar serve orpheus``. Follow `the speech SDK example <https://github.com/mstar-project/mstar/blob/main/examples/sdk_tts.py>`_.
+- **Use text, image, audio, or video inputs with Qwen3-Omni:** follow `the model guidance <models.html>`_ and `Serving <serving.html>`_. Its default configuration uses two GPUs; it is a separate server setup.
+- **Explore robotics and video models:** see `supported models <models.html>`_ for Pi0.5 and V-JEPA 2 and their installation requirements.
+- **Use curl or an OpenAI client:** see `the native endpoint <clients.html#native-generate>`_ or `OpenAI-compatible APIs <clients.html#openai-compatible-api>`_. Check that the chosen endpoint and modality are supported by your model.
+- **Change GPU placement:** see `Serving <serving.html>`_, including the three-GPU ``bagel_cfg_parallel`` configuration.
 
-**OpenAI-compatible API** — a drop-in client for ``bagel``, ``qwen3_omni``, and
-``orpheus``:
-
-.. code-block:: python
-
-   from openai import OpenAI
-
-   client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
-   resp = client.chat.completions.create(
-       model="bagel",
-       messages=[{"role": "user", "content": "Give me one fun fact."}],
-   )
-   print(resp.choices[0].message.content)
-
-Runnable versions of all of these live in the repo's ``examples/`` directory
-(``sdk_chat.py``, ``sdk_image.py``, ``sdk_tts.py``, ``openai_chat.py``, ``openai_tts.py``,
-``curl.sh``). For the full client surface, see :doc:`clients`.
-
-3. Check health
----------------
-
-.. code-block:: bash
-
-   curl http://localhost:8000/health        # -> {"status": "healthy"}
+The repository also contains `the chat SDK example <https://github.com/mstar-project/mstar/blob/main/examples/sdk_chat.py>`_, `OpenAI chat <https://github.com/mstar-project/mstar/blob/main/examples/openai_chat.py>`_, `OpenAI speech <https://github.com/mstar-project/mstar/blob/main/examples/openai_tts.py>`_, and `curl examples <https://github.com/mstar-project/mstar/blob/main/examples/curl.sh>`_.

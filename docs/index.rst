@@ -1,22 +1,14 @@
-M* Documentation
-================
+M\* documentation
+=================
 
-``mstar`` is the package behind **M\*** ("M-star"), a **disaggregated, any-to-any
-multimodal inference engine**. It serves models built from structurally distinct
-components — vision encoders, transformer backbones, diffusion / flow heads, audio codecs,
-action generators, world-model predictors — whose execution path changes with the input
-and the task.
+M\* (“M-star”) serves models that generate or process text, images, speech, video, and actions. Start with a supported model and deployment config, then send requests through the Python SDK, an OpenAI-compatible endpoint, or the native API. Available interfaces depend on the model and task.
 
-The core abstraction is the *graph walk*: each model declares its computation as a
-dataflow graph of components, and every request is a walk over that graph. A request flows
-``HTTP / SDK → API server → conductor → workers → streamed results``; the conductor schedules
-the model's graph walks to coordinate multi-engine pipelines across one or more GPUs. Logical
-graph structure is decoupled from physical placement, so the *same* model runs single-GPU
-or fully disaggregated by changing only a YAML config.
+- `Install M\* <installation.html>`__ and `send your first request <quickstart.html>`__.
+- `Choose a model <models.html>`__ and check its dependencies, inputs, and deployment examples.
+- `Configure a deployment <serving.html>`__ or `connect a client <clients.html>`__.
+- `Follow a request through the system <architecture.html>`__ or `add a model <adding_models.html>`__.
 
-One runtime serves unified multimodal models, omni models, speech LMs,
-vision-language-action policies, and world models — through a **Python SDK**, an
-**OpenAI-compatible API**, and a native streaming endpoint.
+A model declares a graph of components, such as an encoder, a transformer, or an audio decoder. Each request follows graph walks through those components. The deployment YAML assigns nodes to GPU ranks, so supported placement changes do not require rewriting the model. The conductor coordinates the walks; workers execute ready nodes and return streamed results.
 
 .. toctree::
    :maxdepth: 2
