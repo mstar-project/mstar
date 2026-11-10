@@ -4810,12 +4810,14 @@ class KVManager(AttentionResource):
             return self._earmark(Earmark(rid, max(pages_short, self._allotments[rid].lends), set()), victims)
 
     def _wait(self, rid: str, pages: int) -> None:
-        """Make ``rid``, which holds its allotment, ask for the ``pages`` its grant needed past it. Any move of ``rid``
-        from here on returns it with them, since back with a page alone it would run short again at once. A return
-        counts every page its streams hold, lent ones included."""
+        """Make ``rid``, which holds its allotment, ask for the ``pages`` its grant needed past what the allotment holds
+        back. Any move of ``rid`` from here on returns it with those of them past the allotment, since back with a page
+        alone it would run short again at once. A return counts every page its streams hold, lent ones included. The
+        pages a guaranteed request lends are inside its allotment, so it still returns with its footprint."""
         allotment = self._allotments[rid]
         lent = sum(len(stream.lent) for stream in self._streams[rid].values())
-        allotment.asks_again = max(allotment.asks_again, max(allotment.pages, self._held(rid)) + lent + pages)
+        past = max(0, pages - allotment.lends)
+        allotment.asks_again = max(allotment.asks_again, max(allotment.pages, self._held(rid)) + lent + past)
         self._asks[rid] = pages
         self._stalled.add(rid)
 
