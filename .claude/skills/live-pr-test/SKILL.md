@@ -64,7 +64,7 @@ On the review bot's box there is no `gh`: read the PR's title and description fr
 - **Test on the merged tree too.** Run the risk checks once more on the PR merged into the current base, and on top of its stacked neighbours when it has them. Bugs on #346 and #519 only showed up there. Label each row with the tree it came from.
 - Map touched files to regression suites with the test matrix.
 - Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget. When the code branches on architecture (`has_cuda_capability`, sm80 paths, ROCm), list the architectures you couldn't run under "Not tested".
-- If the PR changes only docs, tests, comments or benchmarks and claims no number, run the changed tests that skip without CUDA, if any, then say so and stop: those tests passing is a pass.
+- If the PR changes only docs, tests, comments or benchmarks and claims no number, run the changed tests that skip without CUDA, if any, then say so and stop: those tests running and passing is a pass (not skipping, or failing on the base too).
 - **Correctness is checked against the reference, never only against main.** A check that compares PR with main shows the outputs moved or didn't; it can't show that either side is right. #452 shipped noise because every check compared Orpheus with itself.
   - The reference is the official implementation (transformers, or the model's own package or `trust_remote_code` files), pinned, in its own venv.
   - Compare at the lowest level that both sides expose: logits or hidden states for the same inputs, then greedy tokens, then decoded output.
@@ -108,7 +108,7 @@ python3 $S/gpu.py ssh <instance> 'bash ~/bootstrap.sh <n> --hf-home <hf_home fro
 
 In cluster mode, run the same script on the cluster with `--workdir` and `--hf-home` from the config.
 
-**Then the PR's changed tests that skip without CUDA**, before any server starts (they would compete with it for GPU memory): the test files the PR adds or changes that skip on CI's CPU job, in `arm pr`, with `HF_HUB_OFFLINE=1 python -m pytest -ra <files>`. Rerun a failure once, serially, so a flake drops out, and rerun what still fails in `arm main` (where the file exists there). A test only the PR fails makes the verdict Fail; one the base fails too doesn't count. With none, skip this and say so in the report's Tests block.
+**Then the PR's changed tests that skip without CUDA**, before any server starts (they would compete with it for GPU memory): the test files the PR adds or changes that skip on CI's CPU job, in `arm pr`, with `HF_HUB_OFFLINE=1 python -m pytest -ra <files>`. Rerun a failure once, serially, and rerun what still fails in `arm main` (where the file exists there). A test only the PR fails makes the verdict Fail. One that fails on the base too, one that failed and then passed on the rerun (a possible flake), and a changed file whose tests all skip on the box are ➖, so the verdict is Partial. With none, skip this and say so in the report's Tests block.
 
 Installing packages and making new venvs is fine, and expected when a check needs them: a PR that changes dependencies, an extra the shared environment lacks (a G2P package, an older `setuptools`), a pinned torch build, or a library version the code requires (e.g. FlashInfer). Build them in the work directory, never in the shared environment, and name them in `harness-notes.md`. A `--no-deps` overlay put first on `PYTHONPATH` is often enough for one package.
 
