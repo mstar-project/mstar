@@ -767,7 +767,7 @@ protocol are untouched):</p>
 <div><dl>
 <dt>frontend -&gt; bridge:  {t:”submit”, rid, sub, text, file_paths,</dt><dd><blockquote>
 <div><p>input_modalities, output_modalities, model_kwargs,
-prompt_parts, streaming, accepts_chunks}</p>
+prompt_parts, streaming, accepts_chunks, report_usage}</p>
 </div></blockquote>
 <div class="line-block">
 <div class="line">{t:”abort”, rid, sub}</div>
@@ -801,6 +801,9 @@ rather than one per request. Only a submit that sets <code class="docutils liter
 them, so a frontend binary older than this bridge still gets <code class="docutils literal notranslate"><span class="pre">chunk``s.</span> <span class="pre">A</span>
 <span class="pre">submission's</span> <span class="pre">error</span> <span class="pre">chunk,</span> <span class="pre">and</span> <span class="pre">anything</span> <span class="pre">its</span> <span class="pre">handler</span> <span class="pre">finds</span> <span class="pre">unrelayed</span> <span class="pre">at</span> <span class="pre">the</span>
 <span class="pre">end,</span> <span class="pre">always</span> <span class="pre">goes</span> <span class="pre">out</span> <span class="pre">as</span> <span class="pre">``chunk</span></code>.</p>
+<p>A submit that sets <code class="docutils literal notranslate"><span class="pre">report_usage</span></code> (a chat) gets a last <code class="docutils literal notranslate"><span class="pre">chunk</span></code> of
+modality <code class="docutils literal notranslate"><span class="pre">usage</span></code> before <code class="docutils literal notranslate"><span class="pre">done</span></code>: its token counts and finish reason in
+<code class="docutils literal notranslate"><span class="pre">metadata</span></code> (<code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code>’s <code class="docutils literal notranslate"><span class="pre">report_usage</span></code>).</p>
 <p><code class="docutils literal notranslate"><span class="pre">sub</span></code> names one submission and is never reused. A client may resubmit its
 <code class="docutils literal notranslate"><span class="pre">rid</span></code> as soon as it drops a stream, and that stream’s <code class="docutils literal notranslate"><span class="pre">done</span></code> or late
 chunks can cross the retry, so everything about a submission is addressed by

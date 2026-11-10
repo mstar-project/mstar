@@ -24,6 +24,7 @@ mstar.api\_server.openai.protocol
       ModelCard
       ModelList
       SpeechRequest
+      StreamOptions
       TranscriptionRequest
       UnloadLoraAdapterRequest
       VideoGenerationRequest

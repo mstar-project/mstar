@@ -744,7 +744,8 @@
 <p>Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 <code class="docutils literal notranslate"><span class="pre">message.content</span></code>, audio into <code class="docutils literal notranslate"><span class="pre">message.audio</span></code> (base64, in <code class="docutils literal notranslate"><span class="pre">audio.format</span></code>), images into
-<code class="docutils literal notranslate"><span class="pre">image_url</span></code> data-URL content parts.</p>
+<code class="docutils literal notranslate"><span class="pre">image_url</span></code> data-URL content parts, and the closing <code class="docutils literal notranslate"><span class="pre">usage</span></code> chunk into
+<code class="docutils literal notranslate"><span class="pre">usage</span></code> and <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code>.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>

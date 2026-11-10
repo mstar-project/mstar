@@ -1118,7 +1118,7 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">numba</span><span class="w"> </span><span class="kn">import</span> <span class="n">njit</span>
     <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"numba is not installed: word timestamps run the DTW in plain Python, far slower. "</span>
-                       <span class="s2">"Install mstar[asr]."</span><span class="p">)</span>
+                       <span class="s2">"Install mstar-ai[asr]."</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">_dtw_trace</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">fast</span> <span class="o">=</span> <span class="n">njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">nogil</span><span class="o">=</span><span class="kc">True</span><span class="p">)(</span><span class="n">_dtw_trace</span><span class="p">)</span>

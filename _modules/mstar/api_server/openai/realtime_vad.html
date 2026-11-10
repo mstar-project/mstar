@@ -1030,7 +1030,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">The probability comes from Silero VAD (MIT), its 2 MB ONNX export run by</span>
 <span class="sd">onnxruntime on one CPU thread, about 0.15 ms per 32 ms frame. Its weights are</span>
 <span class="sd">read from disk only: ``MSTAR_SILERO_VAD_PATH``, else the copy bundled with</span>
-<span class="sd">the ``silero-vad`` package (``pip install 'mstar[vad]'``). ``semantic_vad`` adds</span>
+<span class="sd">the ``silero-vad`` package (``pip install 'mstar-ai[vad]'``). ``semantic_vad`` adds</span>
 <span class="sd">Pipecat's Smart Turn v3 (BSD-2), an 8 MB ONNX model that judges from the audio</span>
 <span class="sd">whether a pause ends the turn; without it (or onnxruntime), or with a file</span>
 <span class="sd">that is not that model, ``semantic_vad`` is refused with an error event.</span>
@@ -1230,7 +1230,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">SmartTurn</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — missing onnxruntime/transformers or a bad file</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"semantic_vad is unavailable: cannot load Smart Turn from </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">); "</span>
-                       <span class="s2">"it needs mstar[vad] and the </span><span class="si">%s</span><span class="s2"> file"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">exc</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span><span class="p">)</span>
+                       <span class="s2">"it needs mstar-ai[vad] and the </span><span class="si">%s</span><span class="s2"> file"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">exc</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="ne">ImportError</span><span class="p">):</span>
             <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"onnxruntime or transformers is not installed"</span>
         <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">_NotSmartTurnError</span><span class="p">):</span>
@@ -1328,7 +1328,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">path</span> <span class="o">=</span> <span class="n">silero_weights</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"server_vad is unavailable: no Silero VAD weights (set MSTAR_SILERO_VAD_PATH "</span>
-                       <span class="s2">"or install mstar[vad])"</span><span class="p">)</span>
+                       <span class="s2">"or install mstar-ai[vad])"</span><span class="p">)</span>
         <span class="k">return</span> <span class="kc">None</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">onnxruntime</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ort</span>
@@ -1341,7 +1341,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">session</span> <span class="o">=</span> <span class="n">ort</span><span class="o">.</span><span class="n">InferenceSession</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">options</span><span class="p">,</span> <span class="n">providers</span><span class="o">=</span><span class="p">[</span><span class="s2">"CPUExecutionProvider"</span><span class="p">])</span>
     <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — a bad file disables server_vad, not the server</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"server_vad is unavailable: cannot load Silero VAD from </span><span class="si">%s</span><span class="s2"> (needs onnxruntime, "</span>
-                         <span class="s2">"mstar[vad])"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+                         <span class="s2">"mstar-ai[vad])"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
         <span class="k">return</span> <span class="kc">None</span>
     <span class="k">if</span> <span class="p">(</span><span class="n">why</span> <span class="o">:=</span> <span class="n">_mismatch</span><span class="p">(</span><span class="n">session</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"server_vad is unavailable: </span><span class="si">%s</span><span class="s2"> is not the Silero VAD export this server runs "</span>

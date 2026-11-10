@@ -726,10 +726,19 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer.to_bytes()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer.token_bytes()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.is_byte_level"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.is_byte_level()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.to_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.token_bytes()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelTextOutput"><code class="docutils literal notranslate"><span class="pre">ByteLevelTextOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelTextOutput.text_output"><code class="docutils literal notranslate"><span class="pre">ByteLevelTextOutput.text_output()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.KeysAndConverter"><code class="docutils literal notranslate"><span class="pre">KeysAndConverter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -857,8 +866,14 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code></a>(tokenizer[, keep_special])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.ByteIdDetokenizer" title="mstar.model.utils.ByteIdDetokenizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ByteIdDetokenizer</span></code></a>()</p></td>
+<td><p>Token ids that are bytes, as a reduced model's byte tokenizer (<code class="docutils literal notranslate"><span class="pre">tokenizer_mode:</span> <span class="pre">byte</span></code>) makes them: an id is its low byte.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code></a>(tokenizer[, keep_special])</p></td>
 <td><p>Byte-faithful per-token detokenization for byte-level BPE tokenizers (GPT-2 / Whisper / Qwen).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.ByteLevelTextOutput" title="mstar.model.utils.ByteLevelTextOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ByteLevelTextOutput</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Model.text_output</span></code> for a model over a byte-level BPE tokenizer: each token's raw bytes with special tokens dropped, <code class="docutils literal notranslate"><span class="pre">config.eos_token_ids</span></code> ending a reply.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.KeysAndConverter" title="mstar.model.utils.KeysAndConverter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KeysAndConverter</span></code></a>(keys, converter)</p></td>
 <td><p></p></td>
@@ -884,6 +899,40 @@
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.utils.ByteIdDetokenizer">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">ByteIdDetokenizer</span></span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteIdDetokenizer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteIdDetokenizer" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Token ids that are bytes, as a reduced model’s byte tokenizer
+(<code class="docutils literal notranslate"><span class="pre">tokenizer_mode:</span> <span class="pre">byte</span></code>) makes them: an id is its low byte.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.utils.ByteIdDetokenizer.to_bytes">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">to_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteIdDetokenizer.to_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteIdDetokenizer.to_bytes" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>token_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.utils.ByteIdDetokenizer.token_bytes">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">token_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteIdDetokenizer.token_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteIdDetokenizer.token_bytes" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>token_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.utils.ByteLevelDetokenizer">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">ByteLevelDetokenizer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keep_special</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteLevelDetokenizer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteLevelDetokenizer" title="Link to this definition">#</a></dt>
@@ -938,6 +987,27 @@ ByteLevel decoder (fast) or a GPT-2 byte map (slow), and no
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.utils.ByteLevelTextOutput">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">ByteLevelTextOutput</span></span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteLevelTextOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteLevelTextOutput" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p><code class="docutils literal notranslate"><span class="pre">Model.text_output</span></code> for a model over a byte-level BPE tokenizer: each
+token’s raw bytes with special tokens dropped, <code class="docutils literal notranslate"><span class="pre">config.eos_token_ids</span></code>
+ending a reply. Built on first use, as the host’s <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> may load
+lazily; a reduced model’s byte ids (<code class="docutils literal notranslate"><span class="pre">_tokenizer_mode</span></code> of <code class="docutils literal notranslate"><span class="pre">&quot;byte&quot;</span></code>)
+never touch it.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.utils.ByteLevelTextOutput.text_output">
+<span class="sig-name descname"><span class="pre">text_output</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#ByteLevelTextOutput.text_output"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.ByteLevelTextOutput.text_output" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#mstar.model.utils.TextOutput" title="mstar.model.utils.TextOutput"><em>TextOutput</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1125,14 +1195,14 @@ derive their text paths from it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>detokenizer</strong> (<a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><em>ByteLevelDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><em>TextChunkDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><em>SentencePieceDetokenizer</em></a>)</p></li>
+<li><p><strong>detokenizer</strong> (<a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><em>ByteLevelDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><em>TextChunkDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><em>SentencePieceDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.ByteIdDetokenizer" title="mstar.model.utils.ByteIdDetokenizer"><em>ByteIdDetokenizer</em></a>)</p></li>
 <li><p><strong>stop_token_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Container" title="(in Python v3.12)"><em>Container</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.utils.TextOutput.detokenizer">
-<span class="sig-name descname"><span class="pre">detokenizer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><span class="pre">ByteLevelDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><span class="pre">TextChunkDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><span class="pre">SentencePieceDetokenizer</span></a></span><a class="headerlink" href="#mstar.model.utils.TextOutput.detokenizer" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">detokenizer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><span class="pre">ByteLevelDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><span class="pre">TextChunkDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><span class="pre">SentencePieceDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.ByteIdDetokenizer" title="mstar.model.utils.ByteIdDetokenizer"><span class="pre">ByteIdDetokenizer</span></a></span><a class="headerlink" href="#mstar.model.utils.TextOutput.detokenizer" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
@@ -1506,10 +1576,19 @@ serving config entry that sets it.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer.to_bytes()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteIdDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">ByteIdDetokenizer.token_bytes()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.is_byte_level"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.is_byte_level()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.to_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer.token_bytes()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelTextOutput"><code class="docutils literal notranslate"><span class="pre">ByteLevelTextOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.ByteLevelTextOutput.text_output"><code class="docutils literal notranslate"><span class="pre">ByteLevelTextOutput.text_output()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.KeysAndConverter"><code class="docutils literal notranslate"><span class="pre">KeysAndConverter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

@@ -1024,6 +1024,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Container</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">cached_property</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
@@ -1521,6 +1522,28 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="ByteIdDetokenizer">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.ByteIdDetokenizer">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ByteIdDetokenizer</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Token ids that are bytes, as a reduced model's byte tokenizer</span>
+<span class="sd">    (``tokenizer_mode: byte``) makes them: an id is its low byte."""</span>
+
+<div class="viewcode-block" id="ByteIdDetokenizer.to_bytes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.ByteIdDetokenizer.to_bytes">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_bytes</span><span class="p">(</span><span class="n">token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">t</span> <span class="o">&amp;</span> <span class="mh">0xFF</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">token_ids</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ByteIdDetokenizer.token_bytes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.ByteIdDetokenizer.token_bytes">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">token_bytes</span><span class="p">(</span><span class="n">token_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">bytes</span><span class="p">((</span><span class="n">token_id</span> <span class="o">&amp;</span> <span class="mh">0xFF</span><span class="p">,))</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="SentencePieceDetokenizer">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.SentencePieceDetokenizer">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SentencePieceDetokenizer</span><span class="p">:</span>
@@ -1566,9 +1589,31 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``</span>
 <span class="sd">    derive their text paths from it."""</span>
 
-    <span class="n">detokenizer</span><span class="p">:</span> <span class="n">ByteLevelDetokenizer</span> <span class="o">|</span> <span class="n">TextChunkDetokenizer</span> <span class="o">|</span> <span class="n">SentencePieceDetokenizer</span>
+    <span class="n">detokenizer</span><span class="p">:</span> <span class="n">ByteLevelDetokenizer</span> <span class="o">|</span> <span class="n">TextChunkDetokenizer</span> <span class="o">|</span> <span class="n">SentencePieceDetokenizer</span> <span class="o">|</span> <span class="n">ByteIdDetokenizer</span>
     <span class="c1"># ids that end a reply, dropped unless the request sets ``ignore_eos``</span>
     <span class="n">stop_token_ids</span><span class="p">:</span> <span class="n">Container</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="ByteLevelTextOutput">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.ByteLevelTextOutput">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ByteLevelTextOutput</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``Model.text_output`` for a model over a byte-level BPE tokenizer: each</span>
+<span class="sd">    token's raw bytes with special tokens dropped, ``config.eos_token_ids``</span>
+<span class="sd">    ending a reply. Built on first use, as the host's ``tokenizer`` may load</span>
+<span class="sd">    lazily; a reduced model's byte ids (``_tokenizer_mode`` of ``"byte"``)</span>
+<span class="sd">    never touch it."""</span>
+
+    <span class="nd">@cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_text_output</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TextOutput</span><span class="p">:</span>
+        <span class="n">detokenizer</span> <span class="o">=</span> <span class="n">ByteIdDetokenizer</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer_mode</span> <span class="o">==</span> <span class="s2">"byte"</span> <span class="k">else</span> <span class="n">ByteLevelDetokenizer</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">TextOutput</span><span class="p">(</span><span class="n">detokenizer</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">eos_token_ids</span><span class="p">))</span>
+
+<div class="viewcode-block" id="ByteLevelTextOutput.text_output">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.ByteLevelTextOutput.text_output">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">text_output</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TextOutput</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_text_output</span></div>
+</div>
 
 
 

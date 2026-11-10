@@ -1485,7 +1485,7 @@ starts with that frame. A client <code class="docutils literal notranslate"><spa
 drops what the VAD has not put in a turn yet. <code class="docutils literal notranslate"><span class="pre">create_response</span></code> and
 <code class="docutils literal notranslate"><span class="pre">interrupt_response</span></code> are accepted and echoed but do nothing in a transcription
 session; <code class="docutils literal notranslate"><span class="pre">idle_timeout_ms</span></code> and other types are refused. With 24 kHz input each
-decision waits 3 ms more for the resampler. Install <code class="docutils literal notranslate"><span class="pre">mstar[vad]</span></code> (Silero VAD, MIT,
+decision waits 3 ms more for the resampler. Install <code class="docutils literal notranslate"><span class="pre">mstar-ai[vad]</span></code> (Silero VAD, MIT,
 bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
 <code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code> at the ONNX file (<code class="docutils literal notranslate"><span class="pre">silero_vad.onnx</span></code>; the package’s other
 exports take other inputs, and with one of them <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> is refused); weights are
@@ -1501,7 +1501,7 @@ otherwise the server keeps listening. A silence of 2, 4 or 8 s always ends the t
 Speech starts on Silero’s 0.5 with 300 ms of prefix padding; the events are the same
 as server_vad’s. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
 thread) runs off the event loop. It needs <code class="docutils literal notranslate"><span class="pre">onnxruntime</span></code> and <code class="docutils literal notranslate"><span class="pre">transformers</span></code>
-(<code class="docutils literal notranslate"><span class="pre">mstar[vad]</span></code>) and its weights at <code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code> or in the local Hugging
+(<code class="docutils literal notranslate"><span class="pre">mstar-ai[vad]</span></code>) and its weights at <code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code> or in the local Hugging
 Face cache (<code class="docutils literal notranslate"><span class="pre">hf</span> <span class="pre">download</span> <span class="pre">pipecat-ai/smart-turn-v3</span> <span class="pre">smart-turn-v3.2-cpu.onnx</span></code>). Without
 them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
 and refuses <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> with an <code class="docutils literal notranslate"><span class="pre">error</span></code> event that says why (no weights, a

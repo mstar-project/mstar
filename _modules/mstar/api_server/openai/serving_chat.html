@@ -1022,7 +1022,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Translates an OpenAI chat request into a submit_request via the model adapter,</span>
 <span class="sd">then maps the resulting modality chunks back to OpenAI shapes: text into</span>
 <span class="sd">``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into</span>
-<span class="sd">``image_url`` data-URL content parts.</span>
+<span class="sd">``image_url`` data-URL content parts, and the closing ``usage`` chunk into</span>
+<span class="sd">``usage`` and ``finish_reason``.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -1034,6 +1035,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">SSE_DONE</span><span class="p">,</span> <span class="n">error_type</span><span class="p">,</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">sse</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.request_types</span><span class="w"> </span><span class="kn">import</span> <span class="n">USAGE</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.streaming_response</span><span class="w"> </span><span class="kn">import</span> <span class="n">ReleasingStreamingResponse</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LORA_ADAPTER_KWARG</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.utf8_stream</span><span class="w"> </span><span class="kn">import</span> <span class="n">Utf8Stream</span>
@@ -1066,12 +1068,14 @@ window.runMermaid = runMermaid;</script>
             <span class="n">prompt_parts</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">prompt_parts</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">),</span>
             <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
+            <span class="n">report_usage</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
             <span class="c1"># a request the engine refuses gets its status, not a 200</span>
             <span class="n">batches</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">open_result_stream</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">,</span> <span class="n">batches</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">include_usage</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream_options</span> <span class="ow">and</span> <span class="n">req</span><span class="o">.</span><span class="n">stream_options</span><span class="o">.</span><span class="n">include_usage</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">ReleasingStreamingResponse</span><span class="p">(</span>
-                <span class="n">_stream_events</span><span class="p">(</span><span class="n">batches</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span>
+                <span class="n">_stream_events</span><span class="p">(</span><span class="n">batches</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">include_usage</span><span class="p">),</span>
                 <span class="n">release</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">api</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">),</span>
                 <span class="n">media_type</span><span class="o">=</span><span class="s2">"text/event-stream"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
             <span class="p">)</span>
@@ -1094,10 +1098,22 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="s2">"pcm"</span> <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm16"</span> <span class="k">else</span> <span class="n">fmt</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_usage</span><span class="p">(</span><span class="n">reported</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""OpenAI ``usage`` from a ``usage`` chunk's metadata; zeros without one."""</span>
+    <span class="n">prompt</span> <span class="o">=</span> <span class="p">(</span><span class="n">reported</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"prompt_tokens"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">completion</span> <span class="o">=</span> <span class="p">(</span><span class="n">reported</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"completion_tokens"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"prompt_tokens"</span><span class="p">:</span> <span class="n">prompt</span><span class="p">,</span> <span class="s2">"completion_tokens"</span><span class="p">:</span> <span class="n">completion</span><span class="p">,</span> <span class="s2">"total_tokens"</span><span class="p">:</span> <span class="n">prompt</span> <span class="o">+</span> <span class="n">completion</span><span class="p">}</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_finish_reason</span><span class="p">(</span><span class="n">reported</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">reported</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"finish_reason"</span><span class="p">,</span> <span class="s2">"stop"</span><span class="p">)</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_response</span><span class="p">(</span><span class="n">model_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">chunks</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">audio_format</span><span class="o">=</span><span class="s2">"wav"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
     <span class="n">text_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">audio_pcm</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">images</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">usage</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
             <span class="n">text_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
@@ -1105,6 +1121,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">audio_pcm</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span><span class="p">:</span>
             <span class="n">images</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="n">USAGE</span><span class="p">:</span>
+            <span class="n">usage</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">metadata</span>
 
     <span class="c1"># a byte-level BPE token's bytes can end inside a character</span>
     <span class="n">text</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">text_parts</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">)</span>
@@ -1131,12 +1149,12 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"object"</span><span class="p">:</span> <span class="s2">"chat.completion"</span><span class="p">,</span>
         <span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span>
         <span class="s2">"model"</span><span class="p">:</span> <span class="n">model_name</span><span class="p">,</span>
-        <span class="s2">"choices"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"index"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">"finish_reason"</span><span class="p">:</span> <span class="s2">"stop"</span><span class="p">}],</span>
-        <span class="s2">"usage"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"prompt_tokens"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"completion_tokens"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"total_tokens"</span><span class="p">:</span> <span class="mi">0</span><span class="p">},</span>
+        <span class="s2">"choices"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"index"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">"finish_reason"</span><span class="p">:</span> <span class="n">_finish_reason</span><span class="p">(</span><span class="n">usage</span><span class="p">)}],</span>
+        <span class="s2">"usage"</span><span class="p">:</span> <span class="n">_usage</span><span class="p">(</span><span class="n">usage</span><span class="p">),</span>
     <span class="p">}</span>
 
 
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_events</span><span class="p">(</span><span class="n">batches</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">):</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_events</span><span class="p">(</span><span class="n">batches</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">include_usage</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
     <span class="n">created</span> <span class="o">=</span> <span class="n">now</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">chunk</span><span class="p">(</span><span class="n">delta</span><span class="p">,</span> <span class="n">finish</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -1155,6 +1173,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># first chunk, so nothing may go out before the model has produced one.</span>
     <span class="n">role</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"assistant"</span><span class="p">}</span>
     <span class="n">failed</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">usage</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># a byte-level BPE token's bytes can end inside a character: hold them</span>
     <span class="n">text</span> <span class="o">=</span> <span class="n">Utf8Stream</span><span class="p">()</span>
     <span class="k">try</span><span class="p">:</span>
@@ -1170,6 +1189,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="k">if</span> <span class="n">content</span><span class="p">:</span>
                         <span class="n">text_events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">chunk</span><span class="p">({</span><span class="o">**</span><span class="n">role</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">content</span><span class="p">}))</span>
                         <span class="n">role</span> <span class="o">=</span> <span class="p">{}</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="n">USAGE</span><span class="p">:</span>
+                    <span class="n">usage</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">metadata</span>
                     <span class="k">continue</span>
                 <span class="k">if</span> <span class="n">text_events</span><span class="p">:</span>
                     <span class="k">yield</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">text_events</span><span class="p">)</span>
@@ -1202,7 +1224,16 @@ window.runMermaid = runMermaid;</script>
         <span class="k">yield</span> <span class="n">error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">failed</span><span class="p">:</span>
         <span class="n">tail</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
-        <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="o">**</span><span class="n">role</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">tail</span><span class="p">}</span> <span class="k">if</span> <span class="n">tail</span> <span class="k">else</span> <span class="n">role</span><span class="p">,</span> <span class="n">finish</span><span class="o">=</span><span class="s2">"stop"</span><span class="p">)</span>
+        <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="o">**</span><span class="n">role</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">tail</span><span class="p">}</span> <span class="k">if</span> <span class="n">tail</span> <span class="k">else</span> <span class="n">role</span><span class="p">,</span> <span class="n">finish</span><span class="o">=</span><span class="n">_finish_reason</span><span class="p">(</span><span class="n">usage</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">include_usage</span><span class="p">:</span>
+            <span class="k">yield</span> <span class="n">sse</span><span class="p">({</span>
+                <span class="s2">"id"</span><span class="p">:</span> <span class="n">request_id</span><span class="p">,</span>
+                <span class="s2">"object"</span><span class="p">:</span> <span class="s2">"chat.completion.chunk"</span><span class="p">,</span>
+                <span class="s2">"created"</span><span class="p">:</span> <span class="n">created</span><span class="p">,</span>
+                <span class="s2">"model"</span><span class="p">:</span> <span class="n">model_name</span><span class="p">,</span>
+                <span class="s2">"choices"</span><span class="p">:</span> <span class="p">[],</span>
+                <span class="s2">"usage"</span><span class="p">:</span> <span class="n">_usage</span><span class="p">(</span><span class="n">usage</span><span class="p">),</span>
+            <span class="p">})</span>
     <span class="k">yield</span> <span class="n">SSE_DONE</span>
 </pre></div>
 

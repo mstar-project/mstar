@@ -38,7 +38,9 @@ mstar.model.utils
 
    .. autosummary::
    
+      ByteIdDetokenizer
       ByteLevelDetokenizer
+      ByteLevelTextOutput
       KeysAndConverter
       ModuleAndPrefix
       Operation

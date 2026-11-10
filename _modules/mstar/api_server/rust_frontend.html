@@ -1028,7 +1028,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    frontend -&gt; bridge:  {t:"submit", rid, sub, text, file_paths,</span>
 <span class="sd">                          input_modalities, output_modalities, model_kwargs,</span>
-<span class="sd">                          prompt_parts, streaming, accepts_chunks}</span>
+<span class="sd">                          prompt_parts, streaming, accepts_chunks, report_usage}</span>
 <span class="sd">                       | {t:"abort", rid, sub}</span>
 <span class="sd">                       | {t:"ping", rid, sub}</span>
 <span class="sd">                       | {t:"metrics", rid, sub, refusals:{route, status, count}}</span>
@@ -1056,6 +1056,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">them, so a frontend binary older than this bridge still gets ``chunk``s. A</span>
 <span class="sd">submission's error chunk, and anything its handler finds unrelayed at the</span>
 <span class="sd">end, always goes out as ``chunk``.</span>
+
+<span class="sd">A submit that sets ``report_usage`` (a chat) gets a last ``chunk`` of</span>
+<span class="sd">modality ``usage`` before ``done``: its token counts and finish reason in</span>
+<span class="sd">``metadata`` (``APIServer.submit_request``'s ``report_usage``).</span>
 
 <span class="sd">``sub`` names one submission and is never reused. A client may resubmit its</span>
 <span class="sd">``rid`` as soon as it drops a stream, and that stream's ``done`` or late</span>
@@ -1337,6 +1341,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">prompt_parts</span><span class="o">=</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">(</span><span class="o">**</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">]</span> <span class="k">if</span> <span class="n">parts</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"streaming"</span><span class="p">,</span> <span class="kc">True</span><span class="p">)),</span>
                 <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
+                <span class="n">report_usage</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"report_usage"</span><span class="p">)),</span>
             <span class="p">)</span>
         <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="c1"># a refused input: an in-band error chunk carries its 400 to the client.</span>

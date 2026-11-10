@@ -1152,7 +1152,7 @@ Metrics
 
 Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
 Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
-(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
+(``pip install 'mstar-ai[metrics]'``); without it the server stops at startup with that
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that

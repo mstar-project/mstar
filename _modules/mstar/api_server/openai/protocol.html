@@ -1045,6 +1045,14 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="StreamOptions">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.StreamOptions">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StreamOptions</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+    <span class="c1"># a bool as pydantic reads one ("false" is False), like the Rust frontend's flex::opt_bool</span>
+    <span class="n">include_usage</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
 <div class="viewcode-block" id="ChatCompletionRequest">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ChatCompletionRequest</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
@@ -1060,6 +1068,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">stop</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">stream</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># {"include_usage": true} ends a stream with a chunk that carries ``usage``</span>
+    <span class="n">stream_options</span><span class="p">:</span> <span class="n">StreamOptions</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Multimodal output (OpenAI chat-completions ``modalities`` and ``audio``)</span>
     <span class="n">modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>

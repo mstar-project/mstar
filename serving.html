@@ -1940,7 +1940,7 @@ conductor, and data worker skip the timing/transfer bookkeeping entirely.</p>
 <span id="serving-metrics"></span><h2>Metrics<a class="headerlink" href="#metrics" title="Link to this heading">#</a></h2>
 <p>Pass <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> (to either <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> or <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>) to serve
 Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/metrics</span></code>. It needs the <code class="docutils literal notranslate"><span class="pre">metrics</span></code> extra
-(<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar[metrics]'</span></code>); without it the server stops at startup with that
+(<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar-ai[metrics]'</span></code>); without it the server stops at startup with that
 hint. Off by default, and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> answers 404 then. Like <code class="docutils literal notranslate"><span class="pre">/health</span></code>, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
