@@ -727,7 +727,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted"><code class="docutils literal notranslate"><span class="pre">Preempted</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.returned_at"><code class="docutils literal notranslate"><span class="pre">Preempted.returned_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.sampled_at"><code class="docutils literal notranslate"><span class="pre">Preempted.sampled_at</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.times"><code class="docutils literal notranslate"><span class="pre">Preempted.times</span></code></a></li>
 </ul>
 </li>
@@ -736,6 +736,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.make_room"><code class="docutils literal notranslate"><span class="pre">Preemption.make_room()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.preempt"><code class="docutils literal notranslate"><span class="pre">Preemption.preempt()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.rebuilt"><code class="docutils literal notranslate"><span class="pre">Preemption.rebuilt()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.refuse_drops"><code class="docutils literal notranslate"><span class="pre">Preemption.refuse_drops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.remove_request"><code class="docutils literal notranslate"><span class="pre">Preemption.remove_request()</span></code></a></li>
 </ul>
 </li>
@@ -758,8 +759,8 @@ outlives a call.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.preemption.Preempted" title="mstar.worker.preemption.Preempted"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Preempted</span></code></a>([times, returned_at])</p></td>
-<td><p>How often a request was preempted, and how many samples it had kept when it last returned.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.preemption.Preempted" title="mstar.worker.preemption.Preempted"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Preempted</span></code></a>([times, sampled_at])</p></td>
+<td><p>How often a request was preempted, and how many samples it had kept when it was last preempted.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.preemption.Preemption" title="mstar.worker.preemption.Preemption"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Preemption</span></code></a>(engine_manager, rebuilds, ...)</p></td>
 <td><p></p></td>
@@ -769,20 +770,20 @@ outlives a call.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.preemption.Preempted">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.preemption.</span></span><span class="sig-name descname"><span class="pre">Preempted</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">times</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returned_at</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/preemption.html#Preempted"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.preemption.Preempted" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.preemption.</span></span><span class="sig-name descname"><span class="pre">Preempted</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">times</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampled_at</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/preemption.html#Preempted"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.preemption.Preempted" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>How often a request was preempted, and how many samples it had kept when it last returned.</p>
+<p>How often a request was preempted, and how many samples it had kept when it was last preempted.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>times</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>returned_at</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sampled_at</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.preemption.Preempted.returned_at">
-<span class="sig-name descname"><span class="pre">returned_at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.preemption.Preempted.returned_at" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.worker.preemption.Preempted.sampled_at">
+<span class="sig-name descname"><span class="pre">sampled_at</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.preemption.Preempted.sampled_at" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -852,13 +853,30 @@ only one, or when <cite>KVManager.preempt</cite> returns None.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.preemption.Preemption.rebuilt">
 <span class="sig-name descname"><span class="pre">rebuilt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/preemption.html#Preemption.rebuilt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.preemption.Preemption.rebuilt" title="Link to this definition">#</a></dt>
-<dd><p>Count the <code class="docutils literal notranslate"><span class="pre">tokens</span></code> of <code class="docutils literal notranslate"><span class="pre">rid</span></code>’s rebuild on <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, which has landed.</p>
+<dd><p>Count the <code class="docutils literal notranslate"><span class="pre">tokens</span></code> a row of <code class="docutils literal notranslate"><span class="pre">rid</span></code>’s rebuild on <code class="docutils literal notranslate"><span class="pre">node_name</span></code> ran.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.preemption.Preemption.refuse_drops">
+<span class="sig-name descname"><span class="pre">refuse_drops</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/preemption.html#Preemption.refuse_drops"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.preemption.Preemption.refuse_drops" title="Link to this definition">#</a></dt>
+<dd><p>Tell each paged KV cache of <code class="docutils literal notranslate"><span class="pre">node_name</span></code> that no drop can free <code class="docutils literal notranslate"><span class="pre">rids</span></code>, whose ids the node forgot.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -932,7 +950,7 @@ only one, or when <cite>KVManager.preempt</cite> returns None.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted"><code class="docutils literal notranslate"><span class="pre">Preempted</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.returned_at"><code class="docutils literal notranslate"><span class="pre">Preempted.returned_at</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.sampled_at"><code class="docutils literal notranslate"><span class="pre">Preempted.sampled_at</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preempted.times"><code class="docutils literal notranslate"><span class="pre">Preempted.times</span></code></a></li>
 </ul>
 </li>
@@ -941,6 +959,7 @@ only one, or when <cite>KVManager.preempt</cite> returns None.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.make_room"><code class="docutils literal notranslate"><span class="pre">Preemption.make_room()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.preempt"><code class="docutils literal notranslate"><span class="pre">Preemption.preempt()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.rebuilt"><code class="docutils literal notranslate"><span class="pre">Preemption.rebuilt()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.refuse_drops"><code class="docutils literal notranslate"><span class="pre">Preemption.refuse_drops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.preemption.Preemption.remove_request"><code class="docutils literal notranslate"><span class="pre">Preemption.remove_request()</span></code></a></li>
 </ul>
 </li>

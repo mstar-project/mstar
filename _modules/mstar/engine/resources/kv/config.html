@@ -1433,6 +1433,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="step_end">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.step_end">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">step_end</span><span class="p">(</span><span class="n">spans</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PrefixSpan</span><span class="p">],</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Where the step that writes ``spans[start]`` stops. One step writes a span and each span after it in the</span>
+<span class="sd">    same walk that doesn't open a step, in one row, as text around an attachment is written."""</span>
+    <span class="n">end</span> <span class="o">=</span> <span class="n">start</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">while</span> <span class="n">end</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">spans</span><span class="p">)</span> <span class="ow">and</span> <span class="n">spans</span><span class="p">[</span><span class="n">end</span><span class="p">]</span><span class="o">.</span><span class="n">walk</span> <span class="o">==</span> <span class="n">spans</span><span class="p">[</span><span class="n">start</span><span class="p">]</span><span class="o">.</span><span class="n">walk</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">spans</span><span class="p">[</span><span class="n">end</span><span class="p">]</span><span class="o">.</span><span class="n">opens_step</span><span class="p">:</span>
+        <span class="n">end</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">return</span> <span class="n">end</span></div>
+
+
+
 <div class="viewcode-block" id="KVReqConfig">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1516,6 +1528,24 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">loop</span><span class="p">:</span> <span class="n">loop_caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span>
                 <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">growth</span>
             <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="KVReqConfig.keys_of">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.keys_of">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keys_of</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``label``'s prefix keys, or None when the request keys nothing there, as with ``prefix_cache`` off."""</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="k">else</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="KVReqConfig.keyed_layouts">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.keyed_layouts">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keyed_layouts</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"StreamLayout"</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Its layouts, each keying none of its spans where the request has no keys for the label, as with the prefix</span>
+<span class="sd">        cache off for the request or for the server."""</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="n">layout</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">keys_of</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="k">else</span> <span class="n">replace</span><span class="p">(</span><span class="n">layout</span><span class="p">,</span> <span class="n">keyed_spans</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.loop_room">
@@ -1655,12 +1685,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="rebuild_refusal">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.rebuild_refusal">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">rebuild_refusal</span><span class="p">(</span><span class="n">layouts</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="s2">"StreamLayout"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""</span>
+<span class="w">    </span><span class="sd">"""Why rebuild rows can't write a request's laid-out labels again, or None.</span>
+
+<span class="sd">    The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write</span>
+<span class="sd">    every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.</span>
+<span class="sd">    A keyed label is keyed again by extending its keys, which needs them to cover every span. A layout keys only the</span>
+<span class="sd">    spans its request has keys for (`KVReqConfig.keyed_layouts`).</span>
+<span class="sd">    """</span>
     <span class="n">laid_out</span> <span class="o">=</span> <span class="p">[</span><span class="n">layout</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">layouts</span> <span class="k">if</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">]</span>
-    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">kind</span> <span class="o">!=</span> <span class="n">SpanKind</span><span class="o">.</span><span class="n">IDS</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">):</span>
-        <span class="k">return</span> <span class="s2">"it holds KV that can't be recomputed from token ids"</span>
-    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">laid_out</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span><span class="p">):</span>
-        <span class="k">return</span> <span class="s2">"it writes more than one label, span or growth loop, which one rebuild row can't lay out again"</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">laid_out</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">"it writes more than one label or growth loop, which its rebuild rows can't lay out again"</span>
+    <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">laid_out</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">kind</span> <span class="o">!=</span> <span class="n">SpanKind</span><span class="o">.</span><span class="n">IDS</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s2">"its prompt ends on a span of no ids, where the ids it sampled can't follow"</span>
+        <span class="k">if</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="n">layout</span><span class="o">.</span><span class="n">keyed_spans</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">):</span>
+            <span class="k">return</span> <span class="s2">"it keys only part of its prompt, which a rebuild can't key again"</span>
     <span class="k">return</span> <span class="kc">None</span></div>
 
 
@@ -1910,6 +1949,28 @@ window.runMermaid = runMermaid;</script>
         <span class="n">grown</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">grown</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_growth</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">min</span><span class="p">(</span><span class="n">grown</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_growth</span><span class="p">)</span>
 
+<div class="viewcode-block" id="StreamLayout.steps">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.steps">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">steps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">PrefixSpan</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The spans grouped by the step that writes them (`step_end`), in walk order."""</span>
+        <span class="n">steps</span><span class="p">,</span> <span class="n">start</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span>
+        <span class="k">while</span> <span class="n">start</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">):</span>
+            <span class="n">end</span> <span class="o">=</span> <span class="n">step_end</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">,</span> <span class="n">start</span><span class="p">)</span>
+            <span class="n">steps</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">])</span>
+            <span class="n">start</span> <span class="o">=</span> <span class="n">end</span>
+        <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">steps</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StreamLayout.rebuilt">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.rebuilt">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rebuilt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"StreamLayout"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This layout once a rebuild has written ``slots`` slots into it: the last span, which `rebuild_refusal`</span>
+<span class="sd">        requires to be ids, grows by the slots past the layout, the ids sampled since it was laid out."""</span>
+        <span class="n">grown</span> <span class="o">=</span> <span class="n">slots</span> <span class="o">-</span> <span class="nb">sum</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">)</span>
+        <span class="o">*</span><span class="n">spans</span><span class="p">,</span> <span class="n">last</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span>
+        <span class="k">return</span> <span class="n">replace</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spans</span><span class="o">=</span><span class="p">(</span><span class="o">*</span><span class="n">spans</span><span class="p">,</span> <span class="n">replace</span><span class="p">(</span><span class="n">last</span><span class="p">,</span> <span class="n">length</span><span class="o">=</span><span class="n">last</span><span class="o">.</span><span class="n">length</span> <span class="o">+</span> <span class="n">grown</span><span class="p">,</span> <span class="n">advance</span><span class="o">=</span><span class="n">last</span><span class="o">.</span><span class="n">advance</span> <span class="o">+</span> <span class="n">grown</span><span class="p">)))</span></div>
+
+
 <div class="viewcode-block" id="StreamLayout.pages">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.pages">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span>
@@ -1928,11 +1989,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">pages</span>
         <span class="n">prefix</span> <span class="o">=</span> <span class="n">retention</span><span class="o">.</span><span class="n">protected_prefix</span>
-        <span class="n">step</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="n">step</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">,</span> <span class="n">scratch</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
         <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
+            <span class="c1"># One step writes a span that opens a step and every span after it that doesn't.</span>
+            <span class="k">if</span> <span class="n">span</span><span class="o">.</span><span class="n">opens_step</span><span class="p">:</span>
+                <span class="n">start</span><span class="p">,</span> <span class="n">scratch</span> <span class="o">=</span> <span class="n">end</span><span class="p">,</span> <span class="mi">0</span>
+            <span class="n">scratch</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">scratch</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
             <span class="n">end</span> <span class="o">+=</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span>
-            <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">prefix</span><span class="p">:</span>
-                <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="n">start</span> <span class="o">+</span> <span class="n">scratch</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">prefix</span><span class="p">:</span>
+                <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span> <span class="n">scratch</span><span class="p">)</span>
         <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">([</span><span class="n">step</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">slots</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span><span class="p">)])</span>
         <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">retention</span><span class="o">.</span><span class="n">max_pages</span><span class="p">(</span><span class="n">page_size</span><span class="p">,</span> <span class="n">step</span><span class="p">))</span></div>
 </div>

@@ -35,6 +35,7 @@ mstar.engine.resources.base
       Rebuild
       Residency
       Resource
+      StepAllowance
    
    
 

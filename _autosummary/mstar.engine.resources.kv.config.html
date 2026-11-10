@@ -751,6 +751,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.final_publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.final_publish_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.get_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_labels()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.get_publish_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_publish_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.keyed_layouts"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.keyed_layouts()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.keys_of"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.keys_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.kv_layout"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.kv_layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.loop_caps"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_caps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.loop_room"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_room()</span></code></a></li>
@@ -865,10 +867,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.max_growth"><code class="docutils literal notranslate"><span class="pre">StreamLayout.max_growth</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.pages"><code class="docutils literal notranslate"><span class="pre">StreamLayout.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.positions"><code class="docutils literal notranslate"><span class="pre">StreamLayout.positions()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.rebuilt"><code class="docutils literal notranslate"><span class="pre">StreamLayout.rebuilt()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.retention"><code class="docutils literal notranslate"><span class="pre">StreamLayout.retention</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.scratch"><code class="docutils literal notranslate"><span class="pre">StreamLayout.scratch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.slots"><code class="docutils literal notranslate"><span class="pre">StreamLayout.slots()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.spans"><code class="docutils literal notranslate"><span class="pre">StreamLayout.spans</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.steps"><code class="docutils literal notranslate"><span class="pre">StreamLayout.steps()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.instance_size"><code class="docutils literal notranslate"><span class="pre">instance_size()</span></code></a></li>
@@ -877,6 +881,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.prefix_caches_by_rank"><code class="docutils literal notranslate"><span class="pre">prefix_caches_by_rank()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.rebuild_refusal"><code class="docutils literal notranslate"><span class="pre">rebuild_refusal()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.refuse_undeclared_labels"><code class="docutils literal notranslate"><span class="pre">refuse_undeclared_labels()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.step_end"><code class="docutils literal notranslate"><span class="pre">step_end()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.unrestorable"><code class="docutils literal notranslate"><span class="pre">unrestorable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.without_layouts"><code class="docutils literal notranslate"><span class="pre">without_layouts()</span></code></a></li>
 </ul>
@@ -911,15 +916,18 @@ without pulling FlashInfer in behind it.</p>
 <td><p>The caches each rank's engine opens: <cite>opening_prefix_caches</cite> over the nodes on the rank, each at its lockstep instance size, as <cite>Engine.load_model</cite> evaluates it, less the caches with no node there, which that engine counts at one rank for its item encoders but never builds.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.rebuild_refusal" title="mstar.engine.resources.kv.config.rebuild_refusal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild_refusal</span></code></a>(layouts)</p></td>
-<td><p>Why one rebuild row can't write a request's laid-out labels again from its token ids, or None.</p></td>
+<td><p>Why rebuild rows can't write a request's laid-out labels again, or None.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.refuse_undeclared_labels" title="mstar.engine.resources.kv.config.refuse_undeclared_labels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">refuse_undeclared_labels</span></code></a>(model, declared, ...)</p></td>
 <td><p>The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.unrestorable" title="mstar.engine.resources.kv.config.unrestorable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unrestorable</span></code></a>(specs, opened)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.step_end" title="mstar.engine.resources.kv.config.step_end"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step_end</span></code></a>(spans, start)</p></td>
+<td><p>Where the step that writes <code class="docutils literal notranslate"><span class="pre">spans[start]</span></code> stops.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.unrestorable" title="mstar.engine.resources.kv.config.unrestorable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unrestorable</span></code></a>(specs, opened)</p></td>
 <td><p>The resources that can't restore what a hit skips while <code class="docutils literal notranslate"><span class="pre">opened</span></code> open: those that set <cite>NodeResourceSpec.restores_prefix</cite> and keep no open cache of their own, unless they are over open caches that restore.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.without_layouts" title="mstar.engine.resources.kv.config.without_layouts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">without_layouts</span></code></a>(configs)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.without_layouts" title="mstar.engine.resources.kv.config.without_layouts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">without_layouts</span></code></a>(configs)</p></td>
 <td><p>Only the KV manager's ingest reads the layouts and caps, so they are dropped before the configs go out with every frame between workers.</p></td>
 </tr>
 </tbody>
@@ -1169,6 +1177,32 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVReqConfig.keyed_layouts">
+<span class="sig-name descname"><span class="pre">keyed_layouts</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.keyed_layouts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.keyed_layouts" title="Link to this definition">#</a></dt>
+<dd><p>Its layouts, each keying none of its spans where the request has no keys for the label, as with the prefix
+cache off for the request or for the server.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><em>StreamLayout</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVReqConfig.keys_of">
+<span class="sig-name descname"><span class="pre">keys_of</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.keys_of"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.keys_of" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">label</span></code>’s prefix keys, or None when the request keys nothing there, as with <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> off.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a>] | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2029,6 +2063,21 @@ the prefix.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.StreamLayout.rebuilt">
+<span class="sig-name descname"><span class="pre">rebuilt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slots</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#StreamLayout.rebuilt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.rebuilt" title="Link to this definition">#</a></dt>
+<dd><p>This layout once a rebuild has written <code class="docutils literal notranslate"><span class="pre">slots</span></code> slots into it: the last span, which <cite>rebuild_refusal</cite>
+requires to be ids, grows by the slots past the layout, the ids sampled since it was laid out.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>slots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><em>StreamLayout</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.StreamLayout.retention">
 <span class="sig-name descname"><span class="pre">retention</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><span class="pre">RetentionPolicy</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.retention" title="Link to this definition">#</a></dt>
@@ -2056,6 +2105,17 @@ the prefix.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.StreamLayout.spans">
 <span class="sig-name descname"><span class="pre">spans</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.kv.config.PrefixSpan" title="mstar.engine.resources.kv.config.PrefixSpan"><span class="pre">PrefixSpan</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.spans" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.StreamLayout.steps">
+<span class="sig-name descname"><span class="pre">steps</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#StreamLayout.steps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.steps" title="Link to this definition">#</a></dt>
+<dd><p>The spans grouped by the step that writes them (<cite>step_end</cite>), in walk order.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference internal" href="#mstar.engine.resources.kv.config.PrefixSpan" title="mstar.engine.resources.kv.config.PrefixSpan"><em>PrefixSpan</em></a>, …], …]</p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -2147,7 +2207,11 @@ group’s ranks, instance size and nodes.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.rebuild_refusal">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">rebuild_refusal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layouts</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#rebuild_refusal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.rebuild_refusal" title="Link to this definition">#</a></dt>
-<dd><p>Why one rebuild row can’t write a request’s laid-out labels again from its token ids, or None.</p>
+<dd><p>Why rebuild rows can’t write a request’s laid-out labels again, or None.</p>
+<p>The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write
+every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.
+A keyed label is keyed again by extending its keys, which needs them to cover every span. A layout keys only the
+spans its request has keys for (<cite>KVReqConfig.keyed_layouts</cite>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>layouts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><em>StreamLayout</em></a><em>]</em>)</p>
@@ -2173,6 +2237,24 @@ group’s ranks, instance size and nodes.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.step_end">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">step_end</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spans</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#step_end"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.step_end" title="Link to this definition">#</a></dt>
+<dd><p>Where the step that writes <code class="docutils literal notranslate"><span class="pre">spans[start]</span></code> stops. One step writes a span and each span after it in the
+same walk that doesn’t open a step, in one row, as text around an attachment is written.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>spans</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.config.PrefixSpan" title="mstar.engine.resources.kv.config.PrefixSpan"><em>PrefixSpan</em></a><em>]</em>)</p></li>
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -2286,6 +2368,8 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.final_publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.final_publish_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.get_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_labels()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.get_publish_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_publish_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.keyed_layouts"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.keyed_layouts()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.keys_of"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.keys_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.kv_layout"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.kv_layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.loop_caps"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_caps</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVReqConfig.loop_room"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_room()</span></code></a></li>
@@ -2400,10 +2484,12 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.max_growth"><code class="docutils literal notranslate"><span class="pre">StreamLayout.max_growth</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.pages"><code class="docutils literal notranslate"><span class="pre">StreamLayout.pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.positions"><code class="docutils literal notranslate"><span class="pre">StreamLayout.positions()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.rebuilt"><code class="docutils literal notranslate"><span class="pre">StreamLayout.rebuilt()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.retention"><code class="docutils literal notranslate"><span class="pre">StreamLayout.retention</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.scratch"><code class="docutils literal notranslate"><span class="pre">StreamLayout.scratch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.slots"><code class="docutils literal notranslate"><span class="pre">StreamLayout.slots()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.spans"><code class="docutils literal notranslate"><span class="pre">StreamLayout.spans</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.StreamLayout.steps"><code class="docutils literal notranslate"><span class="pre">StreamLayout.steps()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.instance_size"><code class="docutils literal notranslate"><span class="pre">instance_size()</span></code></a></li>
@@ -2412,6 +2498,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.prefix_caches_by_rank"><code class="docutils literal notranslate"><span class="pre">prefix_caches_by_rank()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.rebuild_refusal"><code class="docutils literal notranslate"><span class="pre">rebuild_refusal()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.refuse_undeclared_labels"><code class="docutils literal notranslate"><span class="pre">refuse_undeclared_labels()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.step_end"><code class="docutils literal notranslate"><span class="pre">step_end()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.unrestorable"><code class="docutils literal notranslate"><span class="pre">unrestorable()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.without_layouts"><code class="docutils literal notranslate"><span class="pre">without_layouts()</span></code></a></li>
 </ul>

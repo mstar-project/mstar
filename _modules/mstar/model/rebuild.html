@@ -1020,7 +1020,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""How a node recomputes a dropped request's KV, as the model declares it."""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphSection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">chunk_tick_name</span>
@@ -1030,17 +1030,30 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.rebuild.html#mstar.model.rebuild.RebuildPolicy">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RebuildPolicy</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""One row of ``walk`` prefills the request's prompt and every id it has sampled since, but the</span>
-<span class="sd">    last, which the next decode step reads.</span>
+<span class="w">    </span><span class="sd">"""A request that prefilled in ``walks`` is rebuilt by one row per prefill step, each run in its step's walk.</span>
+<span class="sd">    The rows recompute the request's prompt and every id it has sampled since, except the last, which the next</span>
+<span class="sd">    decode step reads.</span>
 
-<span class="sd">    ``ids_input`` is the input of ``walk`` that carries the prompt's ids, and the row's ids go under it.</span>
+<span class="sd">    ``ids_input`` is the input a row's ids go under, and the ids sampled since the prompt follow it in the last row.</span>
+<span class="sd">    It needn't carry all the prompt's ids. Whatever else the node reads in a walk, such as the encoder's output for a</span>
+<span class="sd">    prompt with images, or the text before the audio in a Higgs Audio prompt, the worker copies to the host when the</span>
+<span class="sd">    walk prefills a request, and the rebuild row reads it again. ``copy_width`` gives, for each such walk, how many</span>
+<span class="sd">    values its copies hold per KV slot, each in the dtype the node runs in.</span>
 <span class="sd">    ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of</span>
 <span class="sd">    whose iterations samples one.</span>
+
+<span class="sd">    ``pad_ids`` are the ids a step replaces with the encoders' outputs, one row each in order. A request whose last</span>
+<span class="sd">    prefill step read more than its ids and that samples one is never dropped after, since the rebuild row of that</span>
+<span class="sd">    step would hold a pad its host copies have no row for, and every row after it in the step would read the wrong</span>
+<span class="sd">    encoder rows. A step of ids alone runs with no encoder output, so a pad in its rebuild row is embedded as the</span>
+<span class="sd">    decode step embedded it.</span>
 <span class="sd">    """</span>
-    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">ids_input</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">sample_output</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">loop</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">copy_width</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">pad_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
 <div class="viewcode-block" id="RebuildPolicy.loop_walks">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.rebuild.html#mstar.model.rebuild.RebuildPolicy.loop_walks">[docs]</a>
@@ -1052,32 +1065,53 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="RebuildPolicy.ids_walks">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.rebuild.html#mstar.model.rebuild.RebuildPolicy.ids_walks">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ids_walks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graphs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The walks of ``walks`` in which ``node`` reads ``ids_input``: those an ids span can be written in."""</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">walk</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">walks</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reads</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">,</span> <span class="n">walk</span><span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="RebuildPolicy.check">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.rebuild.html#mstar.model.rebuild.RebuildPolicy.check">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graphs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Raise unless ``walk`` runs ``node``, which reads only ``ids_input``, the one input a rebuild row</span>
-<span class="sd">        carries, and outputs ``sample_output`` there, and some walk runs ``node`` inside ``loop``.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graphs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""What ``node`` reads in each of ``walks`` besides ``ids_input``, which the worker copies. Raise unless</span>
+<span class="sd">        every walk runs ``node``, some walk reads ``ids_input``, ``copy_width`` names each walk where ``node`` reads</span>
+<span class="sd">        more than ``ids_input``, and some walk runs ``node`` inside ``loop``. Also raise when ``node`` reads</span>
+<span class="sd">        ``ids_input`` in a walk without outputting ``sample_output`` there, since such a walk can end a prompt."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">ids_walks</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild row carries its ids as </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span><span class="si">!r}</span><span class="s2">, which </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> reads in none of its walks"</span>
+            <span class="p">)</span>
+        <span class="n">copied</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">walks</span><span class="p">):</span>
+            <span class="n">reads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reads</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span> <span class="ow">in</span> <span class="n">reads</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">sample_output</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">{</span>
+                <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">graphs</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()[</span><span class="n">node</span><span class="p">]</span><span class="o">.</span><span class="n">outputs</span>
+            <span class="p">}:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy keeps samples from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">sample_output</span><span class="si">!r}</span><span class="s2">, which </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> doesn't output "</span>
+                    <span class="sa">f</span><span class="s2">"in </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">, where it reads </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span><span class="si">!r}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">copied</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">reads</span> <span class="o">-</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span><span class="p">})</span>
+            <span class="k">if</span> <span class="n">copied</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span> <span class="ow">and</span> <span class="n">walk</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">copy_width</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> reads </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">copied</span><span class="p">[</span><span class="n">walk</span><span class="p">])</span><span class="si">}</span><span class="s2"> besides its ids in </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">, and its rebuild policy doesn't "</span>
+                    <span class="s2">"say how many values their host copies hold per slot"</span>
+                <span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_walks</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy names loop </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="si">!r}</span><span class="s2">, which runs </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> in no walk"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">copied</span></div>
 
-<span class="sd">        The tick of ``node``'s chunk Loop in ``walk`` is left out of what it reads, since the tick carries</span>
-<span class="sd">        no tensor."""</span>
-        <span class="n">graph</span> <span class="o">=</span> <span class="n">graphs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reads</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graphs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">],</span> <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""What ``node`` reads in ``walk``, less its chunk Loop's tick, which carries no tensor."""</span>
+        <span class="n">graph</span> <span class="o">=</span> <span class="n">graphs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
         <span class="n">graph_node</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">graph</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">graph</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">graph_node</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy names walk </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">, which doesn't run </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="n">reads</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">graph_node</span><span class="o">.</span><span class="n">input_names</span><span class="p">)</span> <span class="o">-</span> <span class="p">{</span><span class="n">chunk_tick_name</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="p">)}</span>
-        <span class="k">if</span> <span class="n">reads</span> <span class="o">!=</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span><span class="p">}:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild row carries only </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ids_input</span><span class="si">!r}</span><span class="s2">, and </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> reads </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">reads</span><span class="p">)</span><span class="si">}</span><span class="s2"> "</span>
-                <span class="sa">f</span><span class="s2">"in </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">"</span>
-            <span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sample_output</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">graph_node</span><span class="o">.</span><span class="n">outputs</span><span class="p">}:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy keeps samples from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">sample_output</span><span class="si">!r}</span><span class="s2">, which </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> doesn't output "</span>
-                <span class="sa">f</span><span class="s2">"in </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">"</span>
-            <span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_walks</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">graphs</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy names loop </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="si">!r}</span><span class="s2">, which runs </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> in no walk"</span><span class="p">)</span></div>
-</div>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">'s rebuild policy names walk </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2">, which doesn't run </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">set</span><span class="p">(</span><span class="n">graph_node</span><span class="o">.</span><span class="n">input_names</span><span class="p">)</span> <span class="o">-</span> <span class="p">{</span><span class="n">chunk_tick_name</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">)}</span></div>
 
 </pre></div>
 

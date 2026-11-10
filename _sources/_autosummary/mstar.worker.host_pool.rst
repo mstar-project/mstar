@@ -9,6 +9,12 @@ mstar.worker.host\_pool
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      aligned
+   
    
 
    

@@ -727,18 +727,18 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy"><code class="docutils literal notranslate"><span class="pre">HostCopy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.has_landed"><code class="docutils literal notranslate"><span class="pre">HostCopy.has_landed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.landed"><code class="docutils literal notranslate"><span class="pre">HostCopy.landed</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.slice"><code class="docutils literal notranslate"><span class="pre">HostCopy.slice</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.view"><code class="docutils literal notranslate"><span class="pre">HostCopy.view</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool"><code class="docutils literal notranslate"><span class="pre">HostPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.copy_in"><code class="docutils literal notranslate"><span class="pre">HostPool.copy_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.copy_out"><code class="docutils literal notranslate"><span class="pre">HostPool.copy_out()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.give"><code class="docutils literal notranslate"><span class="pre">HostPool.give()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.nbytes"><code class="docutils literal notranslate"><span class="pre">HostPool.nbytes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.nbytes_used"><code class="docutils literal notranslate"><span class="pre">HostPool.nbytes_used()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.take"><code class="docutils literal notranslate"><span class="pre">HostPool.take()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.view"><code class="docutils literal notranslate"><span class="pre">HostPool.view()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostSlice"><code class="docutils literal notranslate"><span class="pre">HostSlice</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -746,6 +746,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostSlice.offset"><code class="docutils literal notranslate"><span class="pre">HostSlice.offset</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.aligned"><code class="docutils literal notranslate"><span class="pre">aligned()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -760,11 +761,20 @@
   <section id="module-mstar.worker.host_pool">
 <span id="mstar-worker-host-pool"></span><h1>mstar.worker.host_pool<a class="headerlink" href="#module-mstar.worker.host_pool" title="Link to this heading">#</a></h1>
 <p>Host memory a worker copies request state into, so a request can leave the device and come back.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.host_pool.aligned" title="mstar.worker.host_pool.aligned"><code class="xref py py-obj docutils literal notranslate"><span class="pre">aligned</span></code></a>(nbytes)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nbytes</span></code> rounded up to where the next slice can start.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.host_pool.HostCopy" title="mstar.worker.host_pool.HostCopy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostCopy</span></code></a>(slice, view, landed)</p></td>
-<td><p>A device tensor copied into the pool: its slice, None for a copy outside the pool, a view of the copy, and the event that records the copy, None when it copied in place.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.host_pool.HostCopy" title="mstar.worker.host_pool.HostCopy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostCopy</span></code></a>(view, landed)</p></td>
+<td><p>A device tensor copied into the pool: a view of where it went, and the event that records the copy, None when it copied in place.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.host_pool.HostPool" title="mstar.worker.host_pool.HostPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostPool</span></code></a>(nbytes, device)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nbytes</span></code> of host memory allocated once, pinned where <code class="docutils literal notranslate"><span class="pre">device</span></code> takes pinned memory, and handed out first fit.</p></td>
@@ -777,45 +787,28 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.host_pool.HostCopy">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.host_pool.</span></span><span class="sig-name descname"><span class="pre">HostCopy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slice</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">view</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">landed</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostCopy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostCopy" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.host_pool.</span></span><span class="sig-name descname"><span class="pre">HostCopy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">view</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">landed</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostCopy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostCopy" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
-<p>A device tensor copied into the pool: its slice, None for a copy outside the pool, a view of the copy, and
-the event that records the copy, None when it copied in place.</p>
+<p>A device tensor copied into the pool: a view of where it went, and the event that records the copy, None
+when it copied in place.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>slice</strong> (<a class="reference internal" href="#mstar.worker.host_pool.HostSlice" title="mstar.worker.host_pool.HostSlice"><em>HostSlice</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>view</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>landed</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Event.html#torch.Event" title="(in PyTorch v2.15)"><em>Event</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.worker.host_pool.HostCopy.has_landed">
-<span class="sig-name descname"><span class="pre">has_landed</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostCopy.has_landed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostCopy.has_landed" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.host_pool.HostCopy.landed">
 <span class="sig-name descname"><span class="pre">landed</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Event.html#torch.Event" title="(in PyTorch v2.15)"><span class="pre">Event</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.host_pool.HostCopy.landed" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 2</p>
-</dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.worker.host_pool.HostCopy.slice">
-<span class="sig-name descname"><span class="pre">slice</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.worker.host_pool.HostSlice" title="mstar.worker.host_pool.HostSlice"><span class="pre">HostSlice</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.host_pool.HostCopy.slice" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 0</p>
+<dd><p>Alias for field number 1</p>
 </dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.host_pool.HostCopy.view">
 <span class="sig-name descname"><span class="pre">view</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.worker.host_pool.HostCopy.view" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 1</p>
+<dd><p>Alias for field number 0</p>
 </dd></dl>
 
 </dd></dl>
@@ -825,7 +818,9 @@ the event that records the copy, None when it copied in place.</p>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.host_pool.</span></span><span class="sig-name descname"><span class="pre">HostPool</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nbytes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p><code class="docutils literal notranslate"><span class="pre">nbytes</span></code> of host memory allocated once, pinned where <code class="docutils literal notranslate"><span class="pre">device</span></code> takes pinned memory, and handed out
-first fit. Copies run on a stream of the pool’s own, so they never wait behind a later step.</p>
+first fit. The pool rounds <code class="docutils literal notranslate"><span class="pre">nbytes</span></code> up to a power of two, as the pinned allocator does, so it hands out all it
+pins. Copies run on streams of the pool’s own, one each way, so a copy never waits behind a later step, and a
+copy back to the device never waits behind copies to the host.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -835,21 +830,35 @@ first fit. Copies run on a stream of the pool’s own, so they never wait behind
 </dd>
 </dl>
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.host_pool.HostPool.copy_in">
+<span class="sig-name descname"><span class="pre">copy_in</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">view</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.copy_in"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.copy_in" title="Link to this definition">#</a></dt>
+<dd><p>Copy <code class="docutils literal notranslate"><span class="pre">view</span></code>, a tensor in the pool whose copy from the device has landed, to the device, and return the copy
+with the event recorded once it lands. Where the device is the host, return <code class="docutils literal notranslate"><span class="pre">view</span></code> as it is and no event.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>view</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Event.html#torch.Event" title="(in PyTorch v2.15)"><em>Event</em></a> | None]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.host_pool.HostPool.copy_out">
-<span class="sig-name descname"><span class="pre">copy_out</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">after</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spill</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.copy_out"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.copy_out" title="Link to this definition">#</a></dt>
-<dd><p>Copy <code class="docutils literal notranslate"><span class="pre">src</span></code> as it is into a slice once <code class="docutils literal notranslate"><span class="pre">after</span></code> (the step that wrote it) completes, running nothing on
-the device but the copy. None when no free slice holds it, unless <code class="docutils literal notranslate"><span class="pre">spill</span></code>, which copies it outside the pool
-then.</p>
+<span class="sig-name descname"><span class="pre">copy_out</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">into</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">after</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.copy_out"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.copy_out" title="Link to this definition">#</a></dt>
+<dd><p>Copy <code class="docutils literal notranslate"><span class="pre">src</span></code> as it is to the start of <code class="docutils literal notranslate"><span class="pre">into</span></code> once <code class="docutils literal notranslate"><span class="pre">after</span></code> (the step that wrote it) completes, running
+nothing on the device but the copy.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>src</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>into</strong> (<a class="reference internal" href="#mstar.worker.host_pool.HostSlice" title="mstar.worker.host_pool.HostSlice"><em>HostSlice</em></a>)</p></li>
 <li><p><strong>after</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Event.html#torch.Event" title="(in PyTorch v2.15)"><em>Event</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>spill</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference internal" href="#mstar.worker.host_pool.HostCopy" title="mstar.worker.host_pool.HostCopy"><em>HostCopy</em></a> | None</p>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.worker.host_pool.HostCopy" title="mstar.worker.host_pool.HostCopy"><em>HostCopy</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -884,13 +893,36 @@ then.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.host_pool.HostPool.take">
-<span class="sig-name descname"><span class="pre">take</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nbytes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.take"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.take" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<span class="sig-name descname"><span class="pre">take</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nbytes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spill</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.take"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.take" title="Link to this definition">#</a></dt>
+<dd><p>A free slice of <code class="docutils literal notranslate"><span class="pre">nbytes</span></code>, or None when no free slice holds it, unless <code class="docutils literal notranslate"><span class="pre">spill</span></code>, which then allocates
+memory for the slice alone and places it past the pool’s end.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>nbytes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>nbytes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>spill</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.worker.host_pool.HostSlice" title="mstar.worker.host_pool.HostSlice"><em>HostSlice</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.host_pool.HostPool.view">
+<span class="sig-name descname"><span class="pre">view</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">into</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#HostPool.view"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.HostPool.view" title="Link to this definition">#</a></dt>
+<dd><p>The start of <code class="docutils literal notranslate"><span class="pre">into</span></code> as a tensor of <code class="docutils literal notranslate"><span class="pre">dtype</span></code> and <code class="docutils literal notranslate"><span class="pre">shape</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>into</strong> (<a class="reference internal" href="#mstar.worker.host_pool.HostSlice" title="mstar.worker.host_pool.HostSlice"><em>HostSlice</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
+<li><p><strong>shape</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/size.html#torch.Size" title="(in PyTorch v2.15)"><em>Size</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -921,6 +953,20 @@ then.</p>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.worker.host_pool.aligned">
+<span class="sig-prename descclassname"><span class="pre">mstar.worker.host_pool.</span></span><span class="sig-name descname"><span class="pre">aligned</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nbytes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/host_pool.html#aligned"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.host_pool.aligned" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">nbytes</span></code> rounded up to where the next slice can start.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>nbytes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -973,18 +1019,18 @@ then.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy"><code class="docutils literal notranslate"><span class="pre">HostCopy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.has_landed"><code class="docutils literal notranslate"><span class="pre">HostCopy.has_landed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.landed"><code class="docutils literal notranslate"><span class="pre">HostCopy.landed</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.slice"><code class="docutils literal notranslate"><span class="pre">HostCopy.slice</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostCopy.view"><code class="docutils literal notranslate"><span class="pre">HostCopy.view</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool"><code class="docutils literal notranslate"><span class="pre">HostPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.copy_in"><code class="docutils literal notranslate"><span class="pre">HostPool.copy_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.copy_out"><code class="docutils literal notranslate"><span class="pre">HostPool.copy_out()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.give"><code class="docutils literal notranslate"><span class="pre">HostPool.give()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.nbytes"><code class="docutils literal notranslate"><span class="pre">HostPool.nbytes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.nbytes_used"><code class="docutils literal notranslate"><span class="pre">HostPool.nbytes_used()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.take"><code class="docutils literal notranslate"><span class="pre">HostPool.take()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostPool.view"><code class="docutils literal notranslate"><span class="pre">HostPool.view()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostSlice"><code class="docutils literal notranslate"><span class="pre">HostSlice</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -992,6 +1038,7 @@ then.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.HostSlice.offset"><code class="docutils literal notranslate"><span class="pre">HostSlice.offset</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.host_pool.aligned"><code class="docutils literal notranslate"><span class="pre">aligned()</span></code></a></li>
 </ul>
   </nav></div>
 

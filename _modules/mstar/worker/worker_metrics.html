@@ -1069,7 +1069,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">PreemptionCounts</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""A node's preemptions since its worker started."""</span>
     <span class="c1"># `rebuild_tokens`: tokens the rebuild rows prefilled.</span>
-    <span class="c1"># `returns_preempted`: returned requests preempted again before they kept another token.</span>
+    <span class="c1"># `returns_preempted`: requests preempted again before they sampled a token since they were last preempted.</span>
     <span class="n">victims</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">drops</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">rebuild_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
@@ -1121,7 +1121,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">]</span>
         <span class="c1"># one kept-id pool serves every node here with a rebuild policy, and shows under each of them</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_host_pool</span> <span class="o">=</span> <span class="n">rebuilds</span><span class="o">.</span><span class="n">pool</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_host_nodes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">rebuilds</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">components</span><span class="p">)</span> <span class="k">if</span> <span class="n">rebuilds</span><span class="o">.</span><span class="n">pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_host_nodes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">rebuilds</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">components</span><span class="p">)</span>
         <span class="c1"># when the worker's last step finished postprocessing</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_done</span> <span class="o">=</span> <span class="mf">0.0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_step_seconds</span> <span class="o">=</span> <span class="n">Histogram</span><span class="p">(</span><span class="n">catalog</span><span class="o">.</span><span class="n">STEP_SECONDS</span><span class="p">)</span>

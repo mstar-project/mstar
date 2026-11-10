@@ -736,6 +736,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.aside"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.aside</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.check_budget"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.check_budget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.chunkable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
@@ -746,6 +747,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.policy"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.policy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.prepared"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.prepared</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.release"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.restore"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.restore()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_aside"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_aside()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_policies"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.walk_caps"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.walk_caps()</span></code></a></li>
@@ -853,6 +856,11 @@ even past a cached prefix, and a later chunk’s is its own span, which starts p
 <dd class="field-odd"><p><strong>submodules</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>SubmoduleManagement</em><em>]</em>)</p>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.aside">
+<span class="sig-name descname"><span class="pre">aside</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><span class="pre">NodeInputs</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.aside" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.check_budget">
 <span class="sig-name descname"><span class="pre">check_budget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.check_budget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.check_budget" title="Link to this definition">#</a></dt>
@@ -1029,6 +1037,40 @@ needs it too: a chunkable walk runs the node inside a Loop, and
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.restore">
+<span class="sig-name descname"><span class="pre">restore</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.restore"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.restore" title="Link to this definition">#</a></dt>
+<dd><p>Put a prompt’s whole input back, for its rebuild and then its own chunks to cut from.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.set_aside">
+<span class="sig-name descname"><span class="pre">set_aside</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.set_aside"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.set_aside" title="Link to this definition">#</a></dt>
+<dd><p>Move a prompt’s whole input out of <cite>prepared</cite>, where its rebuild’s rows prepare their own.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.set_budgets">
 <span class="sig-name descname"><span class="pre">set_budgets</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">overrides</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">combined_walk_of</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">override_mixed</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_chunking</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">DEFAULT_MIN_CHUNK_TOKENS</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.set_budgets"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.set_budgets" title="Link to this definition">#</a></dt>
 <dd><p>Apply a serving config’s <code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code> and
@@ -1160,6 +1202,7 @@ walks with a budget of their own. None otherwise.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.aside"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.aside</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.check_budget"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.check_budget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.chunkable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
@@ -1170,6 +1213,8 @@ walks with a budget of their own. None otherwise.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.policy"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.policy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.prepared"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.prepared</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.release"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.restore"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.restore()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_aside"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_aside()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.set_policies"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.set_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.walk_caps"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.walk_caps()</span></code></a></li>

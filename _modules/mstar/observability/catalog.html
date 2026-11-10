@@ -1135,7 +1135,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="n">KV_DROPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_kv_drops_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
-    <span class="s2">"Preempted requests whose KV was dropped, to be rebuilt from their token ids."</span><span class="p">,</span>
+    <span class="s2">"Preempted requests whose KV was dropped, to be rebuilt from their token ids and any host copies."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 <span class="n">KV_REBUILD_TOKENS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
@@ -1155,7 +1155,8 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="n">KV_RETURNS_PREEMPTED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_kv_returns_preempted_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
-    <span class="s2">"Dropped requests preempted again after their return, before they kept another token."</span><span class="p">,</span>
+    <span class="s2">"Requests preempted again before they sampled a token since they were last preempted. Only requests that "</span>
+    <span class="s2">"keep a rebuild log are counted."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 <span class="n">COMPONENT_PENDING_STEPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
@@ -1167,8 +1168,8 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="n">REBUILD_HOST_BYTES_USED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_rebuild_host_bytes_used"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
-    <span class="s2">"Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "</span>
-    <span class="s2">"request dropped from the KV cache is rebuilt from."</span><span class="p">,</span>
+    <span class="s2">"Bytes of a worker's rebuild host pool that hold kept prompt ids and host "</span>
+    <span class="s2">"copies, which a request dropped from the KV cache is rebuilt from."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 <span class="n">REBUILD_HOST_BYTES_TOTAL</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>

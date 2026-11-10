@@ -1024,7 +1024,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
@@ -1043,9 +1043,9 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.preemption.html#mstar.worker.preemption.Preempted">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Preempted</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""How often a request was preempted, and how many samples it had kept when it last returned."""</span>
+<span class="w">    </span><span class="sd">"""How often a request was preempted, and how many samples it had kept when it was last preempted."""</span>
     <span class="n">times</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">returned_at</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span></div>
+    <span class="n">sampled_at</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span></div>
 
 
 
@@ -1146,11 +1146,17 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Preemption.rebuilt">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.preemption.html#mstar.worker.preemption.Preemption.rebuilt">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">rebuilt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">counts</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">rebuild_tokens</span> <span class="o">+=</span> <span class="n">tokens</span>
-        <span class="n">kept</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rebuilds</span><span class="o">.</span><span class="n">kept</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preempted</span> <span class="ow">and</span> <span class="n">kept</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preempted</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">returned_at</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span></div>
+<span class="w">        </span><span class="sd">"""Count the ``tokens`` a row of ``rid``'s rebuild on ``node_name`` ran."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">counts</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">rebuild_tokens</span> <span class="o">+=</span> <span class="n">tokens</span></div>
+
+
+<div class="viewcode-block" id="Preemption.refuse_drops">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.preemption.html#mstar.worker.preemption.Preemption.refuse_drops">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">refuse_drops</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Tell each paged KV cache of ``node_name`` that no drop can free ``rids``, whose ids the node forgot."""</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="p">[</span><span class="n">node_name</span><span class="p">]:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_caches</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">cache</span><span class="o">.</span><span class="n">refuse_drops</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="Preemption.remove_request">
@@ -1220,7 +1226,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">counts</span><span class="o">.</span><span class="n">victims</span> <span class="o">+=</span> <span class="mi">1</span>
             <span class="n">counts</span><span class="o">.</span><span class="n">preempted_again</span> <span class="o">+=</span> <span class="n">record</span><span class="o">.</span><span class="n">times</span> <span class="o">==</span> <span class="mi">2</span>
             <span class="n">kept</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">kept</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">nodes</span> <span class="k">if</span> <span class="p">(</span><span class="n">kept</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rebuilds</span><span class="o">.</span><span class="n">kept</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="n">counts</span><span class="o">.</span><span class="n">returns_preempted</span> <span class="o">+=</span> <span class="n">kept</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">record</span><span class="o">.</span><span class="n">returned_at</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">kept</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">counts</span><span class="o">.</span><span class="n">returns_preempted</span> <span class="o">+=</span> <span class="n">record</span><span class="o">.</span><span class="n">sampled_at</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">sampled_at</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">sampled</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_scheduler</span><span class="o">.</span><span class="n">return_backlogged</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">victims</span><span class="o">.</span><span class="n">to_host</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="n">kv</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>

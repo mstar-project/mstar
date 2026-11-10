@@ -1032,6 +1032,14 @@ window.runMermaid = runMermaid;</script>
 <span class="n">_ALIGN</span> <span class="o">=</span> <span class="mi">8</span>
 
 
+<div class="viewcode-block" id="aligned">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.aligned">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">aligned</span><span class="p">(</span><span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``nbytes`` rounded up to where the next slice can start."""</span>
+    <span class="k">return</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">nbytes</span> <span class="o">//</span> <span class="n">_ALIGN</span><span class="p">)</span> <span class="o">*</span> <span class="n">_ALIGN</span></div>
+
+
+
 <div class="viewcode-block" id="HostSlice">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostSlice">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">HostSlice</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
@@ -1043,17 +1051,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="HostCopy">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostCopy">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">HostCopy</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""A device tensor copied into the pool: its slice, None for a copy outside the pool, a view of the copy, and</span>
-<span class="sd">    the event that records the copy, None when it copied in place."""</span>
-    <span class="nb">slice</span><span class="p">:</span> <span class="n">HostSlice</span> <span class="o">|</span> <span class="kc">None</span>
+<span class="w">    </span><span class="sd">"""A device tensor copied into the pool: a view of where it went, and the event that records the copy, None</span>
+<span class="sd">    when it copied in place."""</span>
     <span class="n">view</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="n">landed</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span>
-
-<div class="viewcode-block" id="HostCopy.has_landed">
-<a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostCopy.has_landed">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">has_landed</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">landed</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">landed</span><span class="o">.</span><span class="n">query</span><span class="p">()</span></div>
-</div>
+    <span class="n">landed</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span></div>
 
 
 
@@ -1061,14 +1062,21 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">HostPool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``nbytes`` of host memory allocated once, pinned where ``device`` takes pinned memory, and handed out</span>
-<span class="sd">    first fit. Copies run on a stream of the pool's own, so they never wait behind a later step."""</span>
+<span class="sd">    first fit. The pool rounds ``nbytes`` up to a power of two, as the pinned allocator does, so it hands out all it</span>
+<span class="sd">    pins. Copies run on streams of the pool's own, one each way, so a copy never waits behind a later step, and a</span>
+<span class="sd">    copy back to the device never waits behind copies to the host."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
+        <span class="n">nbytes</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">nbytes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">bit_length</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">)</span>
         <span class="c1"># sorted by offset, with no two adjacent</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_free</span> <span class="o">=</span> <span class="p">[</span><span class="n">HostSlice</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)]</span>
+        <span class="c1"># offset -&gt; the memory of a slice taken past the pool's end, and the offset the next one takes</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spilled</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spill_end</span> <span class="o">=</span> <span class="n">nbytes</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_in_stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">nbytes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1082,8 +1090,10 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="HostPool.take">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool.take">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">take</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">HostSlice</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">size</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">nbytes</span> <span class="o">//</span> <span class="n">_ALIGN</span><span class="p">)</span> <span class="o">*</span> <span class="n">_ALIGN</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">take</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">spill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">HostSlice</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A free slice of ``nbytes``, or None when no free slice holds it, unless ``spill``, which then allocates</span>
+<span class="sd">        memory for the slice alone and places it past the pool's end."""</span>
+        <span class="n">size</span> <span class="o">=</span> <span class="n">aligned</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">free</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">free</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">&gt;=</span> <span class="n">size</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">free</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">==</span> <span class="n">size</span><span class="p">:</span>
@@ -1091,12 +1101,23 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">HostSlice</span><span class="p">(</span><span class="n">free</span><span class="o">.</span><span class="n">offset</span> <span class="o">+</span> <span class="n">size</span><span class="p">,</span> <span class="n">free</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">-</span> <span class="n">size</span><span class="p">)</span>
                 <span class="k">return</span> <span class="n">HostSlice</span><span class="p">(</span><span class="n">free</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
-        <span class="k">return</span> <span class="kc">None</span></div>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">spill</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">piece</span> <span class="o">=</span> <span class="n">HostSlice</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_spill_end</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spilled</span><span class="p">[</span><span class="n">piece</span><span class="o">.</span><span class="n">offset</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+            <span class="n">size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spill_end</span> <span class="o">+=</span> <span class="n">size</span>
+        <span class="k">return</span> <span class="n">piece</span></div>
 
 
 <div class="viewcode-block" id="HostPool.give">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool.give">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">give</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">piece</span><span class="p">:</span> <span class="n">HostSlice</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">piece</span><span class="o">.</span><span class="n">offset</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nbytes</span><span class="p">:</span>
+            <span class="c1"># A spilled slice is freed whole, so the tail its owner gives back first stays with it.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_spilled</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">piece</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">return</span>
         <span class="n">i</span> <span class="o">=</span> <span class="n">bisect</span><span class="o">.</span><span class="n">bisect</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">,</span> <span class="n">piece</span><span class="p">)</span>
         <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">piece</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="n">piece</span><span class="o">.</span><span class="n">offset</span> <span class="o">+</span> <span class="n">piece</span><span class="o">.</span><span class="n">nbytes</span>
         <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">offset</span> <span class="o">==</span> <span class="n">end</span><span class="p">:</span>
@@ -1107,23 +1128,44 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">HostSlice</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">))</span></div>
 
 
+<div class="viewcode-block" id="HostPool.view">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool.view">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">view</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">into</span><span class="p">:</span> <span class="n">HostSlice</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Size</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The start of ``into`` as a tensor of ``dtype`` and ``shape``."""</span>
+        <span class="n">nbytes</span> <span class="o">=</span> <span class="n">shape</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">dtype</span><span class="o">.</span><span class="n">itemsize</span>
+        <span class="k">assert</span> <span class="n">nbytes</span> <span class="o">&lt;=</span> <span class="n">into</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"a copy of </span><span class="si">{</span><span class="n">nbytes</span><span class="si">}</span><span class="s2"> bytes doesn't fit the </span><span class="si">{</span><span class="n">into</span><span class="o">.</span><span class="n">nbytes</span><span class="si">}</span><span class="s2"> bytes it was given"</span>
+        <span class="n">memory</span><span class="p">,</span> <span class="n">offset</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory</span><span class="p">,</span> <span class="n">into</span><span class="o">.</span><span class="n">offset</span>
+        <span class="k">if</span> <span class="n">offset</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nbytes</span><span class="p">:</span>
+            <span class="n">start</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">start</span> <span class="k">for</span> <span class="n">start</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spilled</span> <span class="k">if</span> <span class="n">start</span> <span class="o">&lt;=</span> <span class="n">offset</span><span class="p">)</span>
+            <span class="n">memory</span><span class="p">,</span> <span class="n">offset</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spilled</span><span class="p">[</span><span class="n">start</span><span class="p">],</span> <span class="n">offset</span> <span class="o">-</span> <span class="n">start</span>
+        <span class="k">return</span> <span class="n">memory</span><span class="p">[</span><span class="n">offset</span><span class="p">:</span><span class="n">offset</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="HostPool.copy_in">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool.copy_in">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy_in</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">view</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Copy ``view``, a tensor in the pool whose copy from the device has landed, to the device, and return the copy</span>
+<span class="sd">        with the event recorded once it lands. Where the device is the host, return ``view`` as it is and no event."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cpu"</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">view</span><span class="p">,</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_in_stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_in_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_in_stream</span><span class="p">:</span>
+            <span class="n">copy</span> <span class="o">=</span> <span class="n">view</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">ready</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">ready</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_in_stream</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">copy</span><span class="p">,</span> <span class="n">ready</span></div>
+
+
 <div class="viewcode-block" id="HostPool.copy_out">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool.copy_out">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">copy_out</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">after</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">spill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">HostCopy</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Copy ``src`` as it is into a slice once ``after`` (the step that wrote it) completes, running nothing on</span>
-<span class="sd">        the device but the copy. None when no free slice holds it, unless ``spill``, which copies it outside the pool</span>
-<span class="sd">        then."""</span>
-        <span class="n">piece</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">take</span><span class="p">(</span><span class="n">src</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">piece</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">memory</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory</span><span class="p">[</span><span class="n">piece</span><span class="o">.</span><span class="n">offset</span><span class="p">:</span><span class="n">piece</span><span class="o">.</span><span class="n">offset</span> <span class="o">+</span> <span class="n">src</span><span class="o">.</span><span class="n">nbytes</span><span class="p">]</span>
-        <span class="k">elif</span> <span class="n">spill</span><span class="p">:</span>
-            <span class="n">memory</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">src</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="kc">None</span>
-        <span class="n">view</span> <span class="o">=</span> <span class="n">memory</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">src</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">src</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy_out</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">into</span><span class="p">:</span> <span class="n">HostSlice</span><span class="p">,</span> <span class="n">after</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">HostCopy</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Copy ``src`` as it is to the start of ``into`` once ``after`` (the step that wrote it) completes, running</span>
+<span class="sd">        nothing on the device but the copy."""</span>
+        <span class="n">view</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">into</span><span class="p">,</span> <span class="n">src</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">src</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">after</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">view</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">src</span><span class="p">)</span>
-            <span class="k">return</span> <span class="n">HostCopy</span><span class="p">(</span><span class="n">piece</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">HostCopy</span><span class="p">(</span><span class="n">view</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stream</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">after</span><span class="p">)</span>
@@ -1133,7 +1175,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">src</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_stream</span><span class="p">)</span>
         <span class="n">landed</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="n">landed</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_stream</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">HostCopy</span><span class="p">(</span><span class="n">piece</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="n">landed</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">HostCopy</span><span class="p">(</span><span class="n">view</span><span class="p">,</span> <span class="n">landed</span><span class="p">)</span></div>
 </div>
 
 </pre></div>

@@ -776,10 +776,13 @@
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>The queues of the resources that ask, and the nodes each request was admitted on.</p>
 <p>A waiting request is admitted once it is first in every queue it is in and each resource it
-asked reserves for it, all or nothing. A request that asks again (<cite>readmit</cite>) waits in no queue, and
-<cite>admit_waiting</cite> tries it, oldest first, whenever what it didn’t fit has grown. It holds up no newer request
-unless it is the oldest request that has asked a resource it waits for, when that resource’s queue admits no
-one it hasn’t already reserved for, so newer prompts can’t keep passing it.</p>
+asked reserves for it, all or nothing. It may also pass the first request of a queue whose resource
+overrides <cite>Resource.reserve_past</cite>, while that request can’t start (<cite>_pass</cite>), and stand anywhere in the queue of
+such a resource once it asks nothing more of the request (<cite>Resource.ask</cite>), since that takes nothing from the
+requests ahead of it. A request that asks again (<cite>readmit</cite>) waits in no queue, and <cite>admit_waiting</cite> tries it,
+oldest first, whenever what it didn’t fit has grown. It holds up no newer request unless it is the oldest
+request that has asked a resource it waits for, when that resource’s queue admits no one it hasn’t already
+reserved for, so newer prompts can’t keep passing it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -813,12 +816,13 @@ resources of <code class="docutils literal notranslate"><span class="pre">node_n
 <dt class="sig sig-object py" id="mstar.engine.resources.admission.Admission.admit_waiting">
 <span class="sig-name descname"><span class="pre">admit_waiting</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">published_of</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/admission.html#Admission.admit_waiting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.admission.Admission.admit_waiting" title="Link to this definition">#</a></dt>
 <dd><p>Admit each return that now fits, oldest first, then each waiting request that is now first
-in every queue it is in, held back by no return, and fits, and return the (node, rid) pairs that may start.
-<code class="docutils literal notranslate"><span class="pre">published_of(rid,</span> <span class="pre">node)</span></code> gives what the request published for that node’s resources.</p>
-<p>Nothing is tried until a resource whose first waiting request didn’t fit has grown, or a
-queue has a new first request, and a return is tried once it starts to return or what it
-didn’t fit has grown. A pass that changed none of these costs one <cite>Resource.grew_since</cite> for
-each such resource and return.</p>
+in every queue it is in, held back by no return, and fits, then each that passes a first request that can’t
+start, or waits where a resource holds what it asked for, in arrival order, and return the (node, rid) pairs
+that may start. <code class="docutils literal notranslate"><span class="pre">published_of(rid,</span> <span class="pre">node)</span></code> gives what the request published for that node’s resources.</p>
+<p>Nothing is tried until a resource whose first waiting request didn’t fit has grown, a mark that
+requests passing were refused against has grown, or a queue has a new first request, and a return
+is tried once it starts to return or what it didn’t fit has grown. A pass that changed none of
+these costs one <cite>Resource.grew_since</cite> for each such resource, mark and return.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>published_of</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a><em>] </em><em>| </em><em>None</em><em>]</em>)</p>

@@ -24,11 +24,17 @@ mstar.worker.rebuild
 
    .. autosummary::
    
+      Ingested
       KeptIds
+      LayoutRow
       NodeWrites
+      PlannedRow
       Prefilling
+      QueuedCopy
       RebuildCursor
       Rebuilds
+      RowRecord
+      RowRun
    
    
 

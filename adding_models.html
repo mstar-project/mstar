@@ -745,6 +745,7 @@
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-lora-adapters">Per-request LoRA adapters</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#admission-capacity-a-request-holds-until-it-is-removed">Admission: capacity a request holds until it is removed</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
@@ -1204,9 +1205,17 @@ A layout has six fields:</p>
 <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.Span</span></code> has a <code class="docutils literal notranslate"><span class="pre">kind</span></code>: <code class="docutils literal notranslate"><span class="pre">&quot;ids&quot;</span></code> for token ids from the tensor
 <code class="docutils literal notranslate"><span class="pre">source</span></code> names, <code class="docutils literal notranslate"><span class="pre">&quot;digest&quot;</span></code> for KV made from an uploaded file (<code class="docutils literal notranslate"><span class="pre">source</span></code> is
 <code class="docutils literal notranslate"><span class="pre">(modality,</span> <span class="pre">index)</span></code>), and <code class="docutils literal notranslate"><span class="pre">&quot;rows&quot;</span></code> for KV made from anything else, such as another
-node’s outputs. A request with a <code class="docutils literal notranslate"><span class="pre">&quot;digest&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;rows&quot;</span></code> span can’t be rebuilt from
-its token ids, so in a pool that decides admission it can only move to the host, into room
-the host sets aside for the pages it holds, and reserves its whole footprint when the host can’t.
+node’s outputs. A request whose spans are not all <code class="docutils literal notranslate"><span class="pre">&quot;ids&quot;</span></code> can be rebuilt at one rank when the
+node’s <code class="docutils literal notranslate"><span class="pre">RebuildPolicy</span></code> names their walks in <code class="docutils literal notranslate"><span class="pre">walks</span></code>, whatever their kind: the worker keeps
+host copies of what the node reads in each prefill step, and a rebuild row runs each step again
+from them, in the order the layout’s steps say (<code class="docutils literal notranslate"><span class="pre">opens_step</span></code>). The policy’s <code class="docutils literal notranslate"><span class="pre">copy_width</span></code>
+gives, for each walk where the node reads more than the ids, how many values those copies hold
+per KV slot, in the node’s dtype, and startup raises without it. The last span must be an
+<code class="docutils literal notranslate"><span class="pre">&quot;ids&quot;</span></code> span, and a label the request keys must be keyed over every span. Otherwise, in a pool
+that decides admission, the request can only move to the host, into room the host sets aside for
+the pages it holds, and reserves its whole footprint when the host can’t. A rebuild row gives its
+walk what the step read, under the step’s metadata, and the last row’s ids tensor gets the samples
+appended, so the walk must read its prompt in that shape.
 <code class="docutils literal notranslate"><span class="pre">length</span></code> is the slots the write fills, <code class="docutils literal notranslate"><span class="pre">advance</span></code> how far it moves
 the position counter. A span’s <code class="docutils literal notranslate"><span class="pre">scratch</span></code> is the most one non-committing step writes
 before the span commits into those slots, as a window’s denoise steps do.</p></li>
@@ -2267,6 +2276,39 @@ forgets its host copy and its name’s slot entry, and leaves the slot’s weigh
 standing as they were. Neither touches what an admit decides from, and the next request
 that names the adapter is ingested after a reload, which reaches every rank after the
 unload did. Nothing per model is needed for either.</p>
+</section>
+<section id="admission-capacity-a-request-holds-until-it-is-removed">
+<h3>Admission: capacity a request holds until it is removed<a class="headerlink" href="#admission-capacity-a-request-holds-until-it-is-removed" title="Link to this heading">#</a></h3>
+<p>A resource whose capacity can run out before a request starts, and that the request then holds
+until it is removed (KV pages, recurrent-state slots, sampler rows), answers for that capacity
+through the admission hooks on <code class="docutils literal notranslate"><span class="pre">Resource</span></code>. The runner’s <code class="docutils literal notranslate"><span class="pre">Admission</span></code> decides who gets it and
+when: one arrival order across resources, and a request takes everything it asks for or nothing.
+Capacity a single step takes and gives back goes through <code class="docutils literal notranslate"><span class="pre">admit</span></code> and <code class="docutils literal notranslate"><span class="pre">rollback_admit</span></code>
+instead.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">ask(rid,</span> <span class="pre">node_name,</span> <span class="pre">graph_walk)</span></code> returns <code class="docutils literal notranslate"><span class="pre">ASKS</span></code> while the request needs this resource’s
+capacity to start on the node, None when it needs none, or a failing outcome when it can
+never fit.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">reserve(rid,</span> <span class="pre">node_name,</span> <span class="pre">graph_walk,</span> <span class="pre">published)</span></code> takes what the request asked for and returns
+None, or returns a mark of what it didn’t fit against.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">unreserve(rid)</span></code> gives back what <code class="docutils literal notranslate"><span class="pre">reserve</span></code> took, when another resource the request asks
+didn’t fit.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">grew_since(mark)</span></code> says whether a request that didn’t fit against <code class="docutils literal notranslate"><span class="pre">mark</span></code> may fit now. The
+runner tries a blocked queue again only once it is True, so a pass that changed nothing costs
+one call.</p></li>
+</ul>
+<p>A request is admitted once it is first in every queue it waits in. A resource may also let a later
+request pass a first request that can’t start, by overriding
+<code class="docutils literal notranslate"><span class="pre">reserve_past(rid,</span> <span class="pre">node_name,</span> <span class="pre">graph_walk,</span> <span class="pre">published)</span></code>. It takes the passer’s capacity while
+leaving the first request what it needs, so passing can’t starve that request, or returns a mark,
+and the runner tries a passing request again only once <code class="docutils literal notranslate"><span class="pre">grew_since</span></code> that mark. The runner calls
+it only while the first request can’t start: a resource that lets requests pass refused it and
+hasn’t grown since, or the oldest request holds back that resource’s queue while it waits to return,
+and the passing request passes, or takes nothing, at that resource too. A resource that doesn’t
+override it keeps strict order, and a request waiting in its queue can’t pass anywhere. A resource
+that overrides it asks nothing more of a waiting request whose capacity it set aside on its own, as
+the KV cache does when it moves other requests for it, and the request may then start wherever it
+stands in that resource’s queue.</p>
 </section>
 </section>
 <section id="step-3-declare-the-computation-graph">
@@ -4015,7 +4057,7 @@ which declares the walks (<code class="docutils literal notranslate"><span class
 <code class="docutils literal notranslate"><span class="pre">text_combined_walks()</span></code>), plans the one prefill walk <code class="docutils literal notranslate"><span class="pre">media_prefill_step</span></code> picks
 and then decode (<code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>), decodes text output, and owns
 media intake (<code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>), the decode loop’s cap (<code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, the
-request’s output budget less the prefill’s token), the KV label and its one-span layout (<code class="docutils literal notranslate"><span class="pre">kv_labels</span></code>,
+request’s output budget less the prefill’s token), the KV label and its layout (<code class="docutils literal notranslate"><span class="pre">kv_labels</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code>), the sampler’s per-request config (<code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code>:
 the request’s <code class="docutils literal notranslate"><span class="pre">SAMPLING_KEYS</span></code> over <code class="docutils literal notranslate"><span class="pre">sampling_defaults</span></code>, which <code class="docutils literal notranslate"><span class="pre">__init__</span></code> reads
 from the checkpoint’s <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>), the LLM’s <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>
@@ -4026,11 +4068,12 @@ submodule cache and where the files come from. A model sets <code class="docutil
 <code class="docutils literal notranslate"><span class="pre">config</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> and <code class="docutils literal notranslate"><span class="pre">media</span></code>), its resources (the sampler from
 <code class="docutils literal notranslate"><span class="pre">_sampler_spec</span></code>; <code class="docutils literal notranslate"><span class="pre">MIXED_SPLIT</span></code> is the attention resources’ split of a mixed step),
 <code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>. The scaffold’s
-<code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a text request and reprefill its ids on
-<code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>. A model whose LLM node holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>,
-or the engine refuses to start; Muse Glimmer and Ripple-65B return <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run
-through a sliding-window pool. A model without text prompts (<code class="docutils literal notranslate"><span class="pre">TEXT_PROMPTS</span> <span class="pre">=</span> <span class="pre">False</span></code>) has no
-<code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> walk, so the scaffold returns <code class="docutils literal notranslate"><span class="pre">{}</span></code> for it. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
+<code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a request and reprefill its ids on its prefill
+walk, a media prompt’s with host copies of its encoders’ outputs. A model whose LLM node
+holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>, or the engine refuses to start; Muse
+Glimmer and Ripple-65B return <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run through a sliding-window pool,
+and Qwen3-ASR until one has run through its captured prefill. A model without text prompts
+(<code class="docutils literal notranslate"><span class="pre">TEXT_PROMPTS</span> <span class="pre">=</span> <span class="pre">False</span></code>) is rebuilt on its media walks alone. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
 <code class="docutils literal notranslate"><span class="pre">MediaIntake</span></code> per attachment modality: its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> (modalities may share one),
 its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs</span></code>, one by default; a Qwen3.5 video fills one per
@@ -4041,11 +4084,11 @@ match its attachments, prepares each attachment in prompt order, expands each pl
 to one pad per token with <code class="docutils literal notranslate"><span class="pre">expand_media_pads</span></code>, and <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns the pads’
 layout as <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> metadata and <code class="docutils literal notranslate"><span class="pre">&quot;kv_layout&quot;:</span> <span class="pre">self.kv_layout(layout,</span> <span class="pre">length)</span></code>.
 The layout’s runs say which encoders the prompt runs (<code class="docutils literal notranslate"><span class="pre">media_encoders</span></code>), for the prefill
-schedule’s walk and the KV layout’s alike. <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code>’s <code class="docutils literal notranslate"><span class="pre">advance</span></code>, how far the prompt
-moves the position counter, defaults to the prompt’s length; under Qwen-style MRoPE it is
-the positions’ extent instead, an image spanning <code class="docutils literal notranslate"><span class="pre">max(h',</span> <span class="pre">w')</span></code> positions rather than its
-tokens, which Qwen3.5 computes from the
-runs’ grids in its <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code> override. <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> also empties each sent
+schedule’s walk and the KV layout’s alike. <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code> lays a media prompt’s text out as
+<code class="docutils literal notranslate"><span class="pre">ids</span></code> spans and each run of pads as a <code class="docutils literal notranslate"><span class="pre">rows</span></code> span, which moves the position counter by
+<code class="docutils literal notranslate"><span class="pre">media_advance</span></code>, the run’s tokens by default. Under Qwen-style MRoPE it is the positions’
+extent instead, an image spanning <code class="docutils literal notranslate"><span class="pre">max(h',</span> <span class="pre">w')</span></code> positions rather than its tokens, which
+Qwen3.5’s override computes from the run’s grid. <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> also empties each sent
 attachment’s raw <code class="docutils literal notranslate"><span class="pre">&lt;modality&gt;_inputs</span></code>, spent once prepared. The encoders’ inputs are
 lists in prompt order, as their outputs fill the pads. Each run’s patch grid (the
 <code class="docutils literal notranslate"><span class="pre">grids</span></code> of its <code class="docutils literal notranslate"><span class="pre">PreparedMedia</span></code>) rides <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> rather than a tensor, so a
@@ -4429,6 +4472,7 @@ for a full omni-modal model.</p>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-lora-adapters">Per-request LoRA adapters</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#admission-capacity-a-request-holds-until-it-is-removed">Admission: capacity a request holds until it is removed</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
