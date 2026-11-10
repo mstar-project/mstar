@@ -15,6 +15,7 @@ REVIEW_GPU_MAX_RUNS runs going), after writing each box's unavailable.md.
 """
 import fnmatch
 import html
+import itertools
 import json
 import math
 import os
@@ -618,6 +619,17 @@ def show_progress(box, seen, label):
 
 
 PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
+
+
+def log_lines(f):
+    """The lines of the binary file `f`, without their newline, each cut to LINE_CAP bytes, the rest of it read past
+    in such pieces: only "\\n" ends a line, as wc counts them, so a bare "\\r" (a progress bar) doesn't."""
+    while line := f.readline(LINE_CAP):
+        if not line.endswith(b"\n"):  # longer than the cap, or the last line, unended
+            while (more := f.readline(LINE_CAP)) and not more.endswith(b"\n"):
+                pass
+        yield line.removesuffix(b"\n").decode("utf-8", "replace")
 
 
 def show_rest(path, seen, label):
@@ -625,10 +637,9 @@ def show_rest(path, seen, label):
     too, at most PROGRESS_REST (print_progress); from its start if it got shorter than `seen`."""
     if not path.is_file():
         return
-    lines = path.read_text(errors="replace").split("\n")
-    if not lines[-1]:
-        lines.pop()
-    print_progress(lines[seen if seen <= len(lines) else 0:][:PROGRESS_REST], label)
+    with open(path, "rb") as f:
+        lines = list(itertools.islice(log_lines(f), seen + PROGRESS_REST))
+    print_progress(lines[seen:] if len(lines) >= seen else lines[:PROGRESS_REST], label)
 
 
 def wait(out, runner_temp):
