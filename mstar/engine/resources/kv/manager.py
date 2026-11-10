@@ -4684,7 +4684,7 @@ class KVManager(AttentionResource):
         return self._room() + self._borrowable()
 
     def _borrowable(self) -> int:
-        return sum(self._lends(rid) for rid in self._guaranteed if rid in self._allotments)
+        return sum(self._lends(rid) for rid in self._allotments)
 
     def _lends(self, rid: str) -> int:
         """The pages a guaranteed ``rid`` was allotted and hasn't written, less what it took back."""
@@ -4851,15 +4851,15 @@ class KVManager(AttentionResource):
 
     def _movers(self, rid: str, newer: Collection[str], older: Collection[str], running: bool) -> list[str]:
         """The requests whose moves can make room for ``rid``, newest first, only those that wait holding pages unless
-        ``running``. A preemptible request moves newer ones. A guaranteed request takes back from preemptible ones of
-        any age, since any of them may hold what it lent, and one that asks to be admitted moves none, since its room
-        already counts what they would free."""
+        ``running``. A preemptible request moves newer ones. A guaranteed request takes back from older ones too,
+        since any of them may hold what it lent, and one that asks to be admitted moves none, since its room already
+        counts what they would free."""
         if rid not in self._guaranteed:
             movers = list(newer)
         elif rid not in self._allotments:
             return []
         else:
-            movers = [*newer, *(other for other in older if other not in self._guaranteed)]
+            movers = [*newer, *older]
         return movers if running else [other for other in movers if other in self._stalled]
 
     def _choose(
