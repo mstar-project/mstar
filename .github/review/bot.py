@@ -634,10 +634,10 @@ def touched_files(diff_text):
 
 def last_live_test(comments):
     """The bot's last conclusive live-test comment among `comments` ({"user": login, "body": text}), {"sha",
-    "verdict", "body"}, or None: any but an `unavailable` one (no GPUs, a box that left no results, or a session
-    that couldn't run the test), which says nothing, so a failure before it still stands. A verdict outside
-    pass, partial and fail (`none`: the session wrote no valid one) is conclusive too, and counts as a failure
-    (gpu_review.carry). Only its first line, the marker, is read: the report below it is the box's text."""
+    "verdict", "body"}, or None: any but an `unavailable` one (no GPUs, or a box that couldn't start the
+    session), which says nothing, so a failure before it still stands. A verdict outside pass, partial and fail
+    (`none`: the session wrote no valid one) is conclusive too, and counts as a failure (gpu_review.carry). Only
+    its first line, the marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
