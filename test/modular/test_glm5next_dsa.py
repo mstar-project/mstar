@@ -373,22 +373,10 @@ def test_one_token_prompts_prefill_eager_in_long_mode():
     assert want[True] == want[False]
 
 
-@pytest.mark.parametrize("change, page_size, match", [
-    ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
-    ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
-])
-def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), **change)
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=page_size))
-    with pytest.raises(ValueError, match=match):
-        sub.bind_node_resources({} if page_size is None else {KV_CACHE: kv})
-
-
-def test_long_context_refuses_pools_per_page_off_a_power_of_two():
-    cfg = Glm5NextModelConfig.reduced_long_context()
-    with pytest.raises(ValueError, match="power of two"):
-        cfg.check_long_context(page_size=cfg.index_kpool * 3)
+def test_long_context_refuses_a_window_dense_attention_already_serves():
+    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), max_seq_len=64)
+    with pytest.raises(ValueError, match="past index_topk"):  # reduced index_topk is 64
+        cfg.check_long_context()
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -408,31 +396,6 @@ def test_long_context_refuses_a_knob_it_would_misread(kwargs):
 def test_long_context_keys_need_the_long_context_path(key):
     with pytest.raises(ValueError, match="dsa_long_context"):
         Glm5NextModel("x", config_variant="reduced", **{key: 4096})
-
-
-@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False), (None, False)])
-def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, version, refused):
-    # None: a stub module with no version, as the CPU tests install
-    fake = types.SimpleNamespace() if version is None else types.SimpleNamespace(__version__=version)
-    monkeypatch.setitem(sys.modules, "flashinfer", fake)
-    cfg = Glm5NextModelConfig.reduced_long_context()
-    if refused:
-        with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
-            cfg.check_long_context()
-    else:
-        cfg.check_long_context()
-
-
-def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
-    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
-    nothing captures, so the node refuses it when it binds rather than serving slow."""
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = Glm5NextModelConfig.reduced_long_context()
-    cache = types.SimpleNamespace(dtype=torch.float16, device=torch.device("cuda"))
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=128),
-                               layer_view=lambda *a: cache)
-    with pytest.raises(ValueError, match="bf16"):
-        sub.bind_node_resources({KV_CACHE: kv})
 
 
 def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
@@ -458,24 +421,26 @@ def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatc
 _KV, _PAGE, _D = "kv", 4, 16
 
 
-def _kv_spec(planes=None):
+def _kv_spec(planes=None, page_size=_PAGE):
     from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
 
     planes = {dsa.INDEX_PLANES: AuxPlanes(num_layers=2, width=3 * _D)} if planes is None else planes
     return KVSpec(resource_key=_KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=64, max_num_pages=32,
-        page_size=_PAGE, num_qo_heads=16, layout=KVLayout.MLA, kv_lora_rank=32,
+        page_size=page_size, num_qo_heads=16, layout=KVLayout.MLA, kv_lora_rank=32,
         qk_rope_head_dim=16, aux_planes=planes))
 
 
-def _resource(planes=None, index_head_dim=_D):
+def _resource(planes=None, index_head_dim=_D, page_size=_PAGE, device="cpu",
+              kv_dtype=torch.bfloat16):
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.dsa.config import DSAConfig, DSASpec
 
     spec = DSASpec(resource_key="dsa", nodes={"LLM"}, config=DSAConfig(
         kv_cache=_KV, topk=8, kpool=4, sm_scale=0.1, index_head_dim=index_head_dim))
     return build_resource(spec, EngineResourceInfo(
-        device=torch.device("cpu"), dependencies={_KV: _kv_spec(planes)}))
+        device=torch.device(device), kv_dtype=kv_dtype,
+        dependencies={_KV: _kv_spec(planes, page_size)}))
 
 
 def _kv_step(walk, pages, lengths, to_compute, lease=None, is_preplan=False) -> StepContext:
@@ -506,6 +471,42 @@ def test_a_kpool_dsa_over_planes_it_cannot_hold_is_refused_at_build(planes, head
     """A missing or mis-sized INDEX_PLANES booted, then failed on the first prefill."""
     with pytest.raises(ValueError, match=match):
         _resource(planes, head_dim)
+
+
+@pytest.mark.parametrize("page_size, match", [
+    (18, "multiple of index_kpool"),  # kpool is 4: pools would straddle pages
+    (12, "power of two"),  # 3 pools a page, which flashinfer's page-table transform cannot take
+])
+def test_a_page_size_the_pools_cannot_take_is_refused_at_build(page_size, match):
+    with pytest.raises(ValueError, match=match):
+        _resource(page_size=page_size)
+
+
+def test_a_non_bf16_cache_on_cuda_is_refused_at_build():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the resource refuses it at load rather than serving slow."""
+    with pytest.raises(ValueError, match="bf16"):
+        _resource(device="cuda", kv_dtype=torch.float16)
+    _resource(kv_dtype=torch.float16)  # CPU runs the torch paths on any dtype
+
+
+@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False)])
+def test_a_flashinfer_without_page_size_is_refused_at_build_on_cuda(monkeypatch, version, refused):
+    """FlashInfer's top-k transform takes ``page_size`` from 0.6.18. Only the CUDA paths call
+    it, so a CPU build never asks."""
+    from mstar.engine.resources.attn import flashinfer_mla
+
+    monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace(__version__=version))
+    flashinfer_mla._flashinfer_at_least.cache_clear()  # it remembers the installed version
+    try:
+        _resource()
+        if refused:
+            with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+                _resource(device="cuda")
+        else:
+            _resource(device="cuda")
+    finally:
+        flashinfer_mla._flashinfer_at_least.cache_clear()
 
 
 def test_a_declared_step_plans_its_rows_from_the_kv_plan():

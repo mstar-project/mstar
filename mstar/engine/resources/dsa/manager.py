@@ -334,6 +334,25 @@ class KPoolDSA(Resource):
             # a row is [key | gate | key of the pool ending there]
             raise ValueError(f"DSA's {INDEX_PLANES} rows are 3 x index_head_dim ({d}) wide; "
                              f"{spec.config.kv_cache} declares {planes.width}")
+        page, kpool = kv_config.tokens_per_page, spec.config.kpool
+        if page % kpool:
+            # a pool's key sits in its last token's row: pools must not straddle pages
+            raise ValueError(f"{spec.config.kv_cache} page_size={page} must be a multiple of "
+                             f"index_kpool={kpool}")
+        if (page // kpool) & (page // kpool - 1):
+            # flashinfer's page-table transform takes power-of-two pools per page
+            raise ValueError(f"{spec.config.kv_cache} page_size={page} over index_kpool={kpool} "
+                             "must be a power of two")
+        if info.device.type == "cuda":
+            from mstar.engine.resources.attn.flashinfer_mla import _flashinfer_at_least
+
+            if info.kv_dtype != torch.bfloat16:
+                # the kernels take bf16; the torch paths sync with the host and capture nothing
+                raise ValueError(f"DSA serves a bf16 KV cache on CUDA, not {info.kv_dtype}: set "
+                                 "the node's dtype to bfloat16")
+            if not _flashinfer_at_least("0.6.18"):
+                raise ValueError("DSA needs FlashInfer >= 0.6.18, whose "
+                                 "top_k_page_table_transform takes a page_size")
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         return cls(spec.config, kv_config, info.device)
