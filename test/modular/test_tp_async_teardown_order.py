@@ -269,7 +269,10 @@ def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_build
     freed. A follower whose first try at a step away from its own chain takes the step with no rows tears "gone"
     down before its second try builds N+1, as rank 0 did before it sent N+1."""
     log = []
-    w = make_worker(is_tp_follower=True)
+    w = make_worker(
+        is_tp_follower=True,
+        graph_runtime=SimpleNamespace(get_sharding_config=lambda rid: tp_sharding("rank0", "w0")),
+    )
     w.lifecycle.add(HANDLES["gone"], "gone")
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=0)
     w.lifecycle.remove(HANDLES["gone"], removal, w.lockstep.last_consumed_seq)
