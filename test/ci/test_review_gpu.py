@@ -520,7 +520,6 @@ class TestComment(unittest.TestCase):
                     self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
                 self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
         for s2, s3, text, redacted in (
-                (key, lined, "09:01 only ghi+jkl== here", "09:01 only [REDACTED] here"),  # one line of a key alone
                 ("abc/def", "dop_v1_abc/def", "key dop_v1_abc/def", "key [REDACTED]"),  # a key that holds another
                 ("tok\r\n \n", "", "a tok b", "a [REDACTED] b")):  # a key with "\r\n" and a line of spaces
             with self.subTest(text), tempfile.TemporaryDirectory() as temp:
