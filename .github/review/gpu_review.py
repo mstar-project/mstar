@@ -246,6 +246,8 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   noise, and a control arm only when a claim needs one. Test the PR's head against its base: this
   overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
   on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
+  Never run what CI already runs (its CPU tests, lint, type checks): run only what needs a GPU or
+  what CI can't run.
 - As you go, append one short line per milestone to `$LIVE_PR_OUT/progress.log`, as `HH:MM <what>`:
   the plan written (with its estimated time), bootstrap done, each check started and finished with its
   outcome, writing the report. The workflow's log shows them while you run.
