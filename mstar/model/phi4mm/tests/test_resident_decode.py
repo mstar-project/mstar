@@ -2,14 +2,17 @@
 weights: two short-table and two long-table prompts (LongRoPE takes the long table past
 4096 prompt tokens), decoded greedily side by side in one capture, so each row's
 neighbour reads the other half of the table; then fewer rows, in another order. Once
-with resident planning and once with it off, the same tokens and logits.
+with resident planning and once with it off, the same tokens and logits. Then the same
+with the LoRA pool built as the served config builds it, rows on the checkpoint's
+adapters beside base rows.
 
-Needs CUDA, FlashInfer and the cached checkpoint; the LoRA pool is opt-in and left out."""
+Needs CUDA, FlashInfer and the cached checkpoint."""
 
 from __future__ import annotations
 
 import gc
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -50,13 +53,9 @@ class _StubTransfer:
         pass
 
 
-@pytest.fixture(scope="module")
-def loaded():
-    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
-
-    model = Phi4MMModel(str(snapshot(full=True)))
+def _llm(model):
+    """The LLM node, recording each step's logits from inside the captured graph."""
     llm = model._create_llm("cuda", torch.bfloat16, None)
-    # each step's logits, from inside the captured graph
     logits = torch.zeros(BUCKET, model.config.vocab_size, device="cuda")
     head = llm.model.logits
 
@@ -66,10 +65,30 @@ def loaded():
         return out
 
     llm.model.logits = recorded
-    return model, llm, logits
+    return llm, logits
 
 
-def _engine(model, llm, monkeypatch, resident: bool):
+@pytest.fixture(scope="module")
+def phi4mm():
+    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
+
+    return Phi4MMModel(str(snapshot(full=True)))
+
+
+def _served_config(model) -> dict:
+    """configs/phi4mm.yaml with its adapters resolved, as the API server hands it to the workers."""
+    import yaml
+
+    from mstar.engine.resources.lora.config import LoraSpec
+    from mstar.engine.resources.lora.serving import resolve_lora_adapters
+    from mstar.model.base import declared_resources
+
+    config = yaml.safe_load((Path(__file__).parents[4] / "configs" / "phi4mm.yaml").read_text())
+    resolve_lora_adapters(next(s for s in declared_resources(model, config) if isinstance(s, LoraSpec)), config)
+    return config
+
+
+def _engine(model, llm, monkeypatch, resident: bool, config: dict | None = None):
     from mstar.distributed.communication import WorkerParallelGroups
     from mstar.engine.engine import Engine
     from mstar.engine.resources.kv import manager as manager_mod
@@ -80,7 +99,7 @@ def _engine(model, llm, monkeypatch, resident: bool):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     monkeypatch.setattr(type(llm), "DECODE_CAPTURE_BATCH_SIZES", [BUCKET])
     monkeypatch.setattr(type(llm), "CAPTURE_PREFILL", False)
-    specs = [spec for spec in serving_resources(model, {}) if NODE in spec.nodes]
+    specs = [spec for spec in serving_resources(model, config or {}) if NODE in spec.nodes]
     for spec in specs:
         if isinstance(spec, KVSpec):
             spec.config.page_size = 16
@@ -98,9 +117,11 @@ def _engine(model, llm, monkeypatch, resident: bool):
 class _Driver:
     """Plays the worker, synchronously: one prompt step per request, then decode steps."""
 
-    def __init__(self, eng, logits: torch.Tensor):
+    def __init__(self, eng, logits: torch.Tensor, adapters: dict[int, str] | None = None):
         self.eng = eng
         self.logits = logits
+        # rid -> the LoRA adapter it runs under; the others run the base model
+        self.adapters = adapters or {}
         self.out: dict[int, list[int]] = {}
         self.step_logits: list[torch.Tensor] = []
         self.sampling: dict = {}
@@ -125,7 +146,13 @@ class _Driver:
         self.sampling[rid] = sampling
         # what `process_prompt` sets: the table follows the prompt's length
         rope = PositionReqConfig(max_position=len(prompt))
-        self.eng.add_request(rid, {"kv_cache": kv, "sampler": sampling, "rope": rope})
+        configs = {"kv_cache": kv, "sampler": sampling, "rope": rope}
+        if rid in self.adapters:
+            from mstar.engine.resources.lora.config import LoraReqConfig
+
+            (lora,) = (key for key in self.eng._resources if key.startswith("lora"))
+            configs[lora] = LoraReqConfig(adapter=self.adapters[rid])
+        self.eng.add_request(rid, configs)
         sampler = self.eng._resources["sampler"]
         if sampler.ask(rid, NODE, "prefill_text") is not None:
             sampler.reserve(rid, NODE, "prefill_text", None)
@@ -187,8 +214,11 @@ def _prompts(model) -> dict[int, list[int]]:
     return prompts
 
 
-def _decode(model, llm, logits, monkeypatch, resident: bool, caplog) -> dict:
-    eng = _engine(model, llm, monkeypatch, resident)
+def _decode(
+    model, llm, logits, monkeypatch, resident: bool, steps, config: dict | None = None,
+    adapters: dict[int, str] | None = None,
+) -> dict:
+    eng = _engine(model, llm, monkeypatch, resident, config)
     planner = eng._submodules[NODE].resident
     seen = []
     if planner is not None:
@@ -199,17 +229,21 @@ def _decode(model, llm, logits, monkeypatch, resident: bool, caplog) -> dict:
             plan(step, ctx)
 
         planner.plan = counted
-    driver = _Driver(eng, logits)
+    driver = _Driver(eng, logits, adapters)
     prompts = _prompts(model)
     for rid, prompt in prompts.items():
         driver.add(rid, prompt, 64)
         driver.prefill(rid, prompt)
-    for _ in range(20):
-        driver.step([1, 2, 3, 4])
-    for _ in range(12):
-        driver.step([4, 1, 2])
+    for n, rids in steps:
+        for _ in range(n):
+            driver.step(rids)
     long = set(eng._resources["rope"]._long_rids)
-    out = dict(tokens=driver.out, logits=driver.step_logits, resident_steps=len(seen), planner=planner, long=long)
+    pool = next((r for key, r in eng._resources.items() if key.startswith("lora")), None)
+    adapted = {rid for rid in prompts if pool is not None and pool.runs_adapters([rid])}
+    out = dict(
+        tokens=driver.out, logits=driver.step_logits, resident_steps=len(seen), planner=planner, long=long,
+        adapted=adapted,
+    )
     eng.shutdown()
     del eng, driver
     gc.collect()
@@ -217,19 +251,59 @@ def _decode(model, llm, logits, monkeypatch, resident: bool, caplog) -> dict:
     return out
 
 
-def test_resident_decode_matches_the_host_plan(loaded, monkeypatch, caplog):
-    model, llm, logits = loaded
-    caplog.set_level(logging.INFO)
-    resident = _decode(model, llm, logits, monkeypatch, True, caplog)
-    assert resident["planner"] is not None, [r.message for r in caplog.records if "resident" in r.message]
-    assert any(r.message.startswith(f"resident planning on {NODE}") for r in caplog.records)
-    assert resident["resident_steps"] == 32
-    assert resident["long"] == {2, 4}
+def _planner_logs(caplog) -> list[str]:
+    return [r.message for r in caplog.records if "resident planning" in r.message]
 
-    host = _decode(model, llm, logits, monkeypatch, False, caplog)
+
+def _assert_same(resident: dict, host: dict) -> None:
     assert host["planner"] is None and host["resident_steps"] == 0
-
     assert resident["tokens"] == host["tokens"]
     for t, (a, b) in enumerate(zip(resident["logits"], host["logits"], strict=True)):
-        err = float((a - b).abs().max())
-        assert err <= 0.0625, f"decode step {t}: logits differ by up to {err}"
+        assert torch.equal(a, b), f"decode step {t}: logits differ by up to {float((a - b).abs().max())}"
+
+
+def test_resident_decode_matches_the_host_plan(phi4mm, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    llm, logits = _llm(phi4mm)
+    steps = [(20, [1, 2, 3, 4]), (12, [4, 1, 2])]
+    resident = _decode(phi4mm, llm, logits, monkeypatch, True, steps)
+    assert resident["planner"] is not None, _planner_logs(caplog)
+    assert any(m.startswith(f"resident planning on {NODE}") for m in _planner_logs(caplog))
+    assert resident["resident_steps"] == 32
+    assert resident["long"] == {2, 4}
+    _assert_same(resident, _decode(phi4mm, llm, logits, monkeypatch, False, steps))
+
+
+def _lora_pool_refuses() -> bool:
+    from mstar.engine.resources.lora.pool import LoraAdapterPool
+    from mstar.engine.resources.resident_hooks import ResidentHooks
+
+    return LoraAdapterPool.resident_refusal is ResidentHooks.resident_refusal
+
+
+# The served config's LoRA pool keeps the decode host-planned until #1419 lands;
+# the skip lifts by itself then.
+@pytest.mark.skipif(_lora_pool_refuses(), reason="the LoRA pool refuses resident planning until #1419")
+def test_resident_decode_with_the_served_lora_pool(phi4mm, monkeypatch, caplog):
+    """The served config's LoRA pool, a short and a long row on each of the
+    checkpoint's adapters beside two base rows; the middle steps run the base rows
+    alone, which replays the bucket's lean twin."""
+    caplog.set_level(logging.INFO)
+    config = _served_config(phi4mm)
+    adapters = {2: "vision", 3: "speech"}
+    steps = [(12, [1, 2, 3, 4]), (8, [1, 4]), (8, [3, 1, 2])]
+    runs = {}
+    for resident in (True, False):
+        # a fresh module per engine: the pool attaches its deltas to the layers
+        llm, logits = _llm(phi4mm)
+        runs[resident] = _decode(phi4mm, llm, logits, monkeypatch, resident, steps, config, adapters)
+        if resident:
+            assert runs[True]["planner"] is not None, _planner_logs(caplog)
+            assert any(m.startswith(f"resident planning on {NODE}") for m in _planner_logs(caplog))
+        del llm, logits
+        gc.collect()
+        torch.cuda.empty_cache()
+    assert runs[True]["resident_steps"] == 28
+    # rows 2 and 3 run their deltas, so steps with them replay the plain bucket
+    assert runs[True]["adapted"] == runs[False]["adapted"] == {2, 3}
+    _assert_same(runs[True], runs[False])
