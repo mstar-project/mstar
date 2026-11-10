@@ -1018,8 +1018,10 @@ def test_a_placed_pools_own_tokens_attend_at_the_contexts_sm_scale(over_sp, monk
     rows on the ragged prefill, SP's zigzag share on one-slot pages."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
-    groups = (CommGroup.trivial(), _group(0, P)) if over_sp else (_group(0, P), CommGroup.trivial())
-    joint = JointGroups(tp_group=groups[0], sp_group=groups[1], instance=_group(0, P))
+    if over_sp:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32, sm_scale=0.5)
     _plan(attn, _Case.build(PREFILL_ROWS, CPU, torch.float32))
     state = attn._current_plan_states["main"]
