@@ -61,7 +61,7 @@ Registered model families
 - Models marked *(Beta)* are functionally supported but not yet performance-optimized; treat their throughput/latency as provisional.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's `process_prompt` for the inputs it expects.
-- Models on the fused MoE kernel (Qwen3-Omni, Command A+) take their tiles from the `moe_gemm` table for the GPU (`mstar/kernels/tables/moe_gemm/`) when it has the expert shape, and default tiles otherwise. The server logs the sweep command for each shape it serves untuned; see "Tuned kernel configs" in [Adding a New Model](/adding_models).
+- Models on the fused MoE kernel (Qwen3-Omni, Command A+) take their tiles from the `moe_gemm` table for the GPU (`mstar/kernels/tables/moe_gemm/`) when it has the expert shape, and default tiles otherwise. The server logs the sweep command for each shape it serves untuned; see "Tuned kernel configs" in [Adding a New Model](/adding_models). On AMD GPUs the sweep tunes Triton's HIP compiler options too.
 - To add a new family, see [Adding a New Model](/adding_models).
 
 ### OmniVoice notes {#omnivoice-notes}
@@ -112,6 +112,18 @@ Registered model families
 - Text-to-image runs only the CFG branches a denoising step reads: two with image guidance off, and the main branch alone outside `cfg_interval`, about -37% latency at 1024² on an H200. A step then computes fewer rows and returns the main branch's velocity outside the interval where it used to recombine all three, which is equal only up to rounding, so images move. Against the previous output on one GPU, seeded text-to-image at the default guidance is 34 dB PSNR at worst and 45 dB at the median (58–60 dB between two boots of one version), text-to-image without guidance 42 / 53 dB, and edits 24 / 40 dB, about what two runs of one version's edit differ by (23 / 39 dB).
 - A guided request's steps inside `cfg_interval` run as a walk of their own, `image_gen_guided2` (`image_gen_guided3` with image guidance), between `image_gen_head` and `image_gen`. A config that places `LLM` per walk (`configs/bagel_*_disaggregated.yaml`) lists all four on the rank that generates images.
 - On a CFG-parallel deployment (`configs/bagel_cfg_parallel*.yaml`) those steps run on the guidance GPUs instead, as the `image_gen_cfg2` walk (`image_gen_cfg3` with image guidance); the other steps run on the main GPU. A config that places `LLM_cfg_text` or `LLM_cfg_img` with `graph_walks` names these walks: `LLM_cfg_text` and `combine_cfg` both, `LLM_cfg_img` only `image_gen_cfg3`.
+
+### Qwen3-Omni MoE backend notes {#qwen3-omni-moe-backend-notes}
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE instead, whose kernels read the expert weights re-tiled once at load. Set it in the serving config's `model_kwargs:` block. It's read once when the model is built, so a request's own `model_kwargs` can't change it:
+
+  ```yaml
+  model_kwargs:
+    moe_backend: aiter    # auto (default, Triton) | triton | aiter
+  ```
+
+  `aiter` needs each rank's expert intermediate size to be a multiple of 128 (the Talker's experts at TP2 are not) and refuses to start otherwise. Its output isn't bitwise reproducible (identical calls differ in the last bits), so greedy decoding can flip near-tied tokens and repeated requests may not match. The Triton kernels are reproducible.
+- The Triton kernels take their tiles from the `moe_gemm` table for the GPU (`mstar/kernels/tables/moe_gemm/`); tables ship for MI300X and MI325X at the Thinker's and Talker's expert sizes without TP or EP, swept with Triton's AMD compiler options (`waves_per_eu`, `matrix_instr_nonkdim`, `kpack`).
 
 ## Qwen3.5 / Qwen3.8 (`qwen3_5_*`, `qwen3_8_27b`) {#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b}
 
