@@ -136,6 +136,19 @@ def grammar_request(value: Any) -> GrammarRequest | None:
     return request
 
 
+def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids: torch.Tensor) -> Any:
+    """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt
+    leaves the reasoning open, so a thinking turn reasons freely and then answers
+    in its grammar; as it came on a turn whose prompt ends past the reasoning."""
+    end = None if text_output is None else text_output.reasoning_end
+    if end is None or not isinstance(structured, dict) or "after" in structured:
+        return structured
+    tail = b"".join(text_output.detokenizer.token_bytes(int(i)) for i in prompt_ids[-8:])
+    if tail.decode("utf-8", errors="replace").rstrip().endswith(end):
+        return structured
+    return {**structured, "after": end}
+
+
 def response_format_request(response_format: Any) -> dict | None:
     """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
     text. ``ValueError`` for another type."""

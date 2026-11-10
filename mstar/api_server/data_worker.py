@@ -49,6 +49,7 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, after_reasoning
 from mstar.model.base import (
     ClientChunk,
     Model,
@@ -956,6 +957,10 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and tensors.get("text_inputs"):
+                model_kwargs[STRUCTURED_OUTPUTS_KWARG] = after_reasoning(
+                    model_kwargs[STRUCTURED_OUTPUTS_KWARG], self.model.text_output(), tensors["text_inputs"][0],
+                )
             layouts = model_kwargs.pop("kv_layout", {})
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}

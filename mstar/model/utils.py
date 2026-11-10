@@ -494,6 +494,10 @@ class TextOutput(NamedTuple):
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+    # the text that ends the model's reasoning, None for a model that does not
+    # reason: a reply's ``structured_outputs`` grammar starts after it on a turn
+    # whose prompt leaves the reasoning open (`grammar.after_reasoning`)
+    reasoning_end: str | None = None
 
 
 def drop_stop_tokens(
