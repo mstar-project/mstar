@@ -903,9 +903,16 @@ def redact(out, runner_temp, s2="", s3=""):
     holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key."""
     lt = Path(runner_temp, "lt")
     exact = (s2, s3)
-    for f in (lt / "results/report.md", lt / "results/progress.log", lt / "unavailable.md"):
+    for f in (lt / "results/report.md", lt / "unavailable.md"):
         if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
             f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
+    log = lt / "results/progress.log"
+    if log.is_file():  # line by line, each cut to LINE_CAP (log_lines), so no size of it can fill the job's memory
+        redacted = log.with_name("progress.log.redacted")
+        with open(log, "rb") as f, open(redacted, "w") as out_f:
+            for line in log_lines(f):
+                out_f.write(bot.redact(line, exact=exact) + "\n")
+        redacted.replace(log)
     verdict = lt / "results/result.json"
     if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
         try:

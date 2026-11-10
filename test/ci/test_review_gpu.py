@@ -376,14 +376,16 @@ class TestComment(unittest.TestCase):
             gpu_review.render_comment("0123456789", out, media_url=media_url)
         return out, (out / "comment.md").read_text()
 
-    def test_a_box_file_that_isnt_utf8_is_still_redacted(self):
+    def test_a_box_file_that_isnt_utf8_or_has_an_endless_line_is_still_redacted(self):
         with tempfile.TemporaryDirectory() as temp:
             results = Path(temp, "lt/results")
             results.mkdir(parents=True)
-            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n09:01 key plaintoken123\n")
+            endless = b"x " * gpu_review.LINE_CAP * 4
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key plaintoken123\n")
             gpu_review.redact({}, temp, s3="plaintoken123")
-            self.assertEqual((results / "progress.log").read_text(), "09:00 caf\ufffd\n09:01 key [REDACTED]\n",
-                             "one stray byte from the box would fail the step and lose the finished run")
+            self.assertEqual((results / "progress.log").read_text(),
+                             "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n",
+                             "a stray byte would fail the step; a line of any length is read whole into memory")
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
