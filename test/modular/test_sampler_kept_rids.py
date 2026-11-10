@@ -1,7 +1,7 @@
 """A row whose sampled token is dropped must leave no sampler state behind.
 
 Prefill walks that only keep the last prefill's token (BAGEL, the Qwen3-Omni
-Thinker, Higgs Audio) still sample every row under a captured graph. Without
+Thinker) still sample every row under a captured graph. Without
 ``SamplerStep.kept_rids`` the dropped draws advanced the RNG offset and, under a
 repetition penalty, marked the dropped token as seen, so seeded output depended
 on how the prompt was split into steps.
@@ -46,7 +46,7 @@ def buffer_device(request):
 
 def _resource(graph: bool, device: torch.device) -> SamplerResource:
     res = SamplerResource(
-        vocab_size=V, enable_repetion_penalty=True, device=device,
+        vocab_size=V, enable_repetition_penalty=True, device=device,
     )
     if graph:
         res.build_accelerator_graph_buffers(
@@ -145,7 +145,7 @@ def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
     device = torch.device("cuda")
-    res = SamplerResource(vocab_size=V, enable_repetion_penalty=False, max_repetition_window=4, device=device)
+    res = SamplerResource(vocab_size=V, enable_repetition_penalty=False, max_repetition_window=4, device=device)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=2, max_seq_len=1)
     bufs = res._cg_buffers

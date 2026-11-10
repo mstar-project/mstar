@@ -30,24 +30,19 @@ from mstar.engine.state import (
     sample,
 )
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
-from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
     vision_seq_lengths,
 )
 from mstar.model.components.qwen3_vit import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    # the tower's 2D patch grid, not the 3D MRoPE ids `mrope` places
     vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import (
-    text_position_ids,
-    vision_position_advance,
-    vision_position_ids,
-)
 from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
@@ -58,6 +53,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PhaseLaps
@@ -65,27 +61,31 @@ from mstar.utils.profiler import PhaseLaps
 logger = logging.getLogger(__name__)
 
 
-def _mixed_token_buckets(prefill_buckets) -> list[int]:
-    """The prefill ladder up to 2176, then its powers of two (see
+def _mixed_token_buckets(prefill_buckets, slack: int) -> list[int]:
+    """The prefill ladder's powers of two and ``slack`` (see
     ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
-    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
+    return [b for b in prefill_buckets if b & (b - 1) == 0 or b == slack]
 
 
 class LLMSubmodule(SampledTokenDecoder):
     # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs past 8192. The powers of two stay, since a batch of prompts
-    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
-    # above them for the decode rows a mixed step carries beside four prompts
-    # and for batches a few tokens over, which would otherwise pad to twice the
-    # width. A deployment sets its own with `model_kwargs.prefill_token_buckets`
-    # (static buffers are sized by the largest bucket).
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
-    # Four prompts and their decode rows reach 2176, the only slack bucket a
-    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
-    # the forward all these captures share, and past Dynamo's limit the buckets
-    # compiled last run uncompiled inside their graphs.
-    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
+    # ladder runs to 8192. The powers of two stay, since a batch of prompts up
+    # to a power of two long fills one exactly, and 2176 is a mixed step's
+    # slack (MIXED_SLACK_TOKENS). 1152-1792 hold a prompt a little past 1024
+    # tokens (1024 plus its chat template) without padding it to 2048. Only a
+    # text-prefill step, one with no decode rows beside it, uses them; a mixed
+    # step doesn't capture them. 4096 and 8192 stay for a deployment that
+    # raises `max_batch_tokens` or turns chunking off, which fills them
+    # exactly. The ladder leaves out slack rungs above them (4352, 8704), since
+    # each bucket is one more compile against Dynamo's recompile limit: such a
+    # deployment adds them to its own ladder, and without them a step just past
+    # a power of two pads to the next and one past 8192 runs eagerly. A
+    # deployment sets its own per walk with the serving config's
+    # `prefill_token_buckets`. Static buffers are sized by the largest bucket.
+    PREFILL_TOKEN_BUCKETS = [
+        32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
+    ]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -108,6 +108,18 @@ class LLMSubmodule(SampledTokenDecoder):
     # 4096 gives back most of the short-prompt TTFT gain and doubles decode
     # ITL p99 at c48
     MAX_BATCH_TOKENS = 2048
+    # A mixed step captures only the ladder's powers of two and one slack
+    # bucket, a decode batch's width above the default budget (2176): where a
+    # step's decode rows leave its prompt less than `min_chunk_tokens` of the
+    # budget, the prompt still runs that many, so the step passes the budget by
+    # up to its decode rows. At the default 128-token floor no step does.
+    # Every (rows, tokens) pair here is one more recompile of the forward all
+    # these captures share, and past Dynamo's limit the buckets compiled last
+    # run uncompiled inside their graphs. The slack reads the
+    # scaffold's MIXED_CAPTURE_BATCH_SIZES by name (an inherited name isn't in
+    # scope in a class body), so a class that sets its own sets this too.
+    MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
 
     def __init__(
         self,
@@ -115,16 +127,11 @@ class LLMSubmodule(SampledTokenDecoder):
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
         encoders: tuple[MediaEncoder, ...] = (),
-        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__(model, config, encoders, prefill_token_buckets)
-        if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
-            logger.warning(
-                "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
-                "with `model_kwargs.prefill_token_buckets` in the serving config",
-            )
-        # follows a deployment's own prefill ladder
-        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
+        super().__init__(model, config, encoders)
+        warn_retired_ladder_env(
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "prefill_token_buckets: {LLM: {prefill_text: [...], mixed: [...]}}",
+        )
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 
@@ -180,31 +187,13 @@ class LLMSubmodule(SampledTokenDecoder):
         ``t * h' * w'`` tokens, so the cursor advances by the real amount and
         the position resource is handed the total.
         """
-        device = self.get_device()
-        merge = self._merge_size
-        pos = start
-        pos_ids: list[torch.Tensor] = []
-        cursor = 0
-        for offset, tokens, grid in zip(
-            layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
-        ):
-            # built on the host, copied once below
-            if offset > cursor:
-                pos_ids.append(text_position_ids(offset - cursor, pos))
-                pos += offset - cursor
-            grid = torch.tensor(grid)
-            pos_ids.append(vision_position_ids(grid, merge, pos))
-            pos += vision_position_advance(grid, merge)
-            cursor = offset + tokens
-        if num_tokens > cursor:
-            pos_ids.append(text_position_ids(num_tokens - cursor, pos))
-            pos += num_tokens - cursor
-        return to_device_nonblocking(torch.cat(pos_ids, dim=1), device), pos - start
+        # built on the host: the scaffold moves them, and a chunk's cut rebuilds them
+        return layout_position_ids(layout, self._merge_size, num_tokens, start)
 
     def resident_walks(self) -> frozenset[str]:
         # a captured decode step builds its rope inside the graph on every config
         # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
-        return frozenset({"decode"})
+        return frozenset({self.DECODE_WALK})
 
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
@@ -221,14 +210,15 @@ class LLMSubmodule(SampledTokenDecoder):
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The rotary tables of a decode step from the position resource's
-        planned positions: one token per row, no custom grids."""
+        planned positions: one token per row, no custom grids. Every row is
+        text, whose three MRoPE grids are one position, so the tables are plain
+        RoPE over the 1D positions (`compute_text_cos_sin`)."""
         pos_ids = positions(self.kv)
         assert pos_ids is not None, (
             "position resource has no plan for this step; `plan` must run "
             "before the forward"
         )
-        pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
-        return self.model.model.build_cos_sin(pos, dtype=self.model.embed_dtype)
+        return self.model.model.build_text_cos_sin(pos_ids[:num_tokens], dtype=self.model.embed_dtype)
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(positions(self.kv), inputs)
@@ -316,8 +306,11 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.vision = handles[VISION_TOKENS]
 
-    def _declare(self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]]) -> SubmoduleStep:
-        return SubmoduleStep(segments=super()._declare(rows).segments, state={VISION_TOKENS: ArrayStep()})
+    def _declare(
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
+    ) -> SubmoduleStep:
+        state = {VISION_TOKENS: ArrayStep()} if attention else {}
+        return SubmoduleStep(segments=super()._declare(rows).segments, state=state)
 
     def max_segments_per_step(self) -> int:
         return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
@@ -347,7 +340,8 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
                 "weights": to_device_nonblocking(weights, device),
                 "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
             },
-            # one segment per frame: a frame attends to itself alone
+            # one segment per frame: a frame attends to itself alone, and the frames, in
+            # order, are the rows the tower's linears see (the merger's folded)
             resource_step_info={"main": vision_seq_lengths(grid)},
         )
 

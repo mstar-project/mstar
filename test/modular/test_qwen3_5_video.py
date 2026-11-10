@@ -376,10 +376,10 @@ def test_only_a_text_prompt_is_keyed_for_the_prefix_cache(model, processor):
     assert keyed_labels(model) == {KV_CACHE: {"main": model.kv_labels()[KV_CACHE]["main"]}}
     question = "Question 0: what happens?"
     text = model.process_prompt(question, [TEXT], ["text"], prompt_parts=parts_from_modalities([TEXT], [question]))
-    layouts = kv_layouts(model.declare_state(), text.metadata["state_layout"], {})
+    layouts = kv_layouts(model.declare_state(), text.metadata["state_layout"], text.metadata.get("keyed_spans", {}))
     assert layouts[KV_CACHE]["main"].keyed_count() == 1
     _, out, _ = run_both(model, processor, "mixed")
-    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], {})
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
     assert layouts[KV_CACHE]["main"].keyed_count() == 0
 
 
@@ -414,10 +414,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     tensors = out.new_input_tensors
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     assert step.walk == "prefill_vision"
-    # the encoder gets each image and video once, in prompt order
-    assert all(a is b for a, b in zip(
-        step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
-    ))
 
     media = out.metadata[MEDIA_LAYOUT]
     (prompt,) = tensors["text_inputs"]
@@ -430,9 +426,8 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
     llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0)))
-    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.metadata)
-    (ids,) = step.input_tensors[("LLM", "text_inputs")]
-    row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.step_metadata)
+    row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
@@ -784,6 +779,15 @@ def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_wit
         _ = model.video_processor
 
 
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
+    image = torch.randint(0, 256, (3, height, 64), dtype=torch.uint8)
+    out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
+    (_, rows, cols), = out.metadata[MEDIA_LAYOUT]["grid"]
+    assert rows < cols, "a wide image's patch grid is wide"
+
+
 def test_the_model_pickles_for_its_workers(model):
     """The server pickles the Model into every worker process it spawns."""
     import pickle
@@ -802,7 +806,7 @@ def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
     (spec,) = [s for s in node_resources(model) if s.resource_key == SAMPLER]
-    settings = model.get_request_resource_configs({}, {"min_p": 0.2})
+    settings = model.get_request_resource_configs([], [], {"min_p": 0.2})
     cfg = sampling_configs(settings, model.declare_state())[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
@@ -867,6 +871,126 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
     assert args.prompt_parts[1] == PromptPart(modality="video", index=0, role="user")
 
 
+@pytest.mark.parametrize("samples", [0, 2])
+@pytest.mark.parametrize("layout", ["images", "mixed"])
+def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupted_run(model, layout, samples):
+    """A dropped chat with images or video is rebuilt from its kept ids and host copies of its encoder output, into
+    the slots and pages it held, and decode resumes at the position it left."""
+    from test_worker_rebuild import NODE, R, _worker
+
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.resources import StepAllowance, StepContext
+    from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+    from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.engine.resources.position.config import PositionConfig, PositionStep
+    from mstar.engine.resources.position.manager import RopeManager
+    from mstar.engine.resources.step import Segment
+    from mstar.engine.state.adapters import kv_layouts
+    from mstar.model.qwen3_5.config import KV_CACHE
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.executing_batch import build_executing_batch
+    from mstar.worker.host_pool import HostPool
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.rebuild import NodeWrites, Rebuilds
+
+    modalities, video_names = {"images": (["text", "image", "text", "image", "text"], []), **LAYOUTS}[layout]
+    texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
+    videos = [sampled(*a_video(name), model.video_processor) for name in video_names]
+    out = model.process_prompt(
+        "\n".join(texts), modalities, ["text"],
+        tensors={"image_inputs": [an_image() for _ in range(modalities.count("image"))],
+                 "video_inputs": [frames for frames, _ in videos]},
+        prompt_parts=parts_from_modalities(modalities, texts),
+        input_metadata={"video_inputs": [metadata for _, metadata in videos]},
+    )
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
+    tensors, kv_layout = out.new_input_tensors, layouts[KV_CACHE]["main"]
+    step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
+    rows = sum(out.metadata[MEDIA_LAYOUT]["tokens"])
+    copied = {"vision_embeds": [torch.full((rows, model.config.hidden_size), IMAGE_MARK)]}
+    llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    llm.kv = SimpleNamespace(positions=rope)
+    metadata = {"is_prefill": True, **step.step_metadata}
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=16),
+        name="kv", joint_comm_group=None, device=torch.device("cpu"), dtype=torch.float32,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+    )
+
+    def write(walk, row=None):
+        """A decode step when ``row`` is None, else a ``step.walk`` row."""
+        span = 1 if row is None else row.input_seq_len
+        advance = None if row is None else llm.declare_step(walk, [R], [row]).state[KV_CACHE].advance
+        segments = (Segment(R, "main", span),)
+        kv_step, ctx = KVStep(segments=segments), StepContext((R,), walk, 0, False)
+        assert kv.admit(kv_step, ctx).ok
+        kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        rope.commit(PositionStep(segments=segments, advance=advance), ctx)
+
+    config = KVReqConfig()
+    config.apply_conductor_config(kv_layout={"main": kv_layout.row()}, loop_caps={"decode_loop": 8})
+    kv.ingest_request(R, config)
+    rope.ingest_request(R)
+    (ids,) = tensors["text_inputs"]
+    prefill = llm._media_inputs(
+        SimpleNamespace(request_id=R, rid_handle=R, step_metadata=metadata), {"text_inputs": [ids], **copied},
+    )
+    for walk, row in ((step.walk, prefill), *[("decode", None)] * samples):
+        write(walk, row)
+    stream = kv._streams[R]["main"]
+    held = (stream.stored_len, len(stream.page_indices), rope.position(R, "main"))
+    kv.drop(R, held[0])
+    rope.drop(R, held[0])
+    w, eng = _worker(rebuilds=Rebuilds(
+        model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 20, torch.device("cpu")),
+        StepAllowance(), {NODE: torch.float32},
+    ))
+    writes = {"kv": {NODE: NodeWrites(frozenset({step.walk, "decode"}), frozenset({"decode_loop"}))}}
+    ingested = w._rebuilds.ingest_request(R, writes, {"kv": config.kv_layout.values()}, unpausable=False)
+    assert ingested.rebuildable["kv"], (
+        "a chat with images or video would be guaranteed"
+    )
+    prefilled = SimpleNamespace(
+        node_name=NODE, request_ids=[R],
+        per_request_info={R: SimpleNamespace(graph_walk=step.walk, step_metadata=metadata)},
+        per_request_input_tensors={R: {"text_inputs": [ids], **copied}},
+        step_context=StepContext((R,), step.walk, 0, False), cached_rids=set(), completion_event=None, chunk_ranges={},
+    )
+    w._rebuilds.record(prefilled)
+    w._rebuilds.flush()
+    # the samples before 9 are in the KV, and 9 is the next decode step's input
+    w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
+    eng.dropped.append(R)
+    assert w._rebuilds.tokens(R, NODE, None) == held[0], "the drop would refuse the request"
+    kv.prepare_rebuild(R, w._rebuilds.start(R, NODE, None))
+    batch = build_executing_batch(
+        w.pipeline._services, ScheduledBatch(NODE, step.walk, {R: 0}, rebuild_rids=frozenset({R})),
+    )
+    # the stub worker registers no rid handles, and the rope pool here is keyed by the request id
+    batch.per_request_info[R].rid_handle = R
+    rebuilt = llm._media_inputs(batch.per_request_info[R], batch.per_request_input_tensors[R])
+    write(step.walk, rebuilt)
+
+    advance = prefill.resource_step_info
+    after = torch.arange(advance, advance + samples).expand(3, -1)
+    assert torch.equal(rebuilt.input_ids, torch.cat([ids, torch.tensor([7, 8][:samples])])), (
+        "the rebuild row would read other ids"
+    )
+    assert torch.equal(rebuilt.tensor_inputs["vision_embeds"], copied["vision_embeds"][0]), (
+        "the rebuild row would splice in other encoder output"
+    )
+    assert torch.equal(rebuilt.custom_pos_ids.long(), torch.cat([prefill.custom_pos_ids.long(), after], dim=1)), (
+        "decode would resume at another position"
+    )
+    stream = kv._streams[R]["main"]
+    assert (stream.stored_len, len(stream.page_indices), rope.position(R, "main")) == held, (
+        "the rebuilt KV would sit in other slots, or decode would resume at another position"
+    )
+
+
 def test_patch_embed_matmul_matches_its_conv():
     # The patch embed runs its stride=kernel Conv3d as one GEMM over flattened
     # patches; the checkpoint's conv weights must mean the same thing either way.
@@ -881,7 +1005,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 

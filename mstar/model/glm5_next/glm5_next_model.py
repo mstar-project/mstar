@@ -2,13 +2,15 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -35,7 +37,12 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -60,12 +67,23 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
 
+# what zai-org/GLM-5.3-Flash's generation_config.json declares, for a checkpoint whose file is
+# not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
+# The quantized checkpoint format this loader reads itself: fp8 block-scale (dense
+# weights dequantized on load, routed experts fp8-resident).
+QUANT_METHODS = ("fp8",)
+
 
 class Glm5NextModel(Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
+    DECODE_LOOP = "decode_loop"
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
@@ -106,10 +124,10 @@ class Glm5NextModel(Model):
             if not isinstance(kwargs["prefill_graphs"], bool):
                 raise ValueError(f"prefill_graphs must be true or false, got {kwargs['prefill_graphs']!r}")
             self.config.prefill_graphs = kwargs["prefill_graphs"]
-        # overrides of the submodule's buckets, which **kwargs would otherwise swallow
-        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
-            if kwargs.get(key) is not None:
-                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        # an override of the submodule's batch sizes, which **kwargs would otherwise swallow
+        if kwargs.get("prefill_capture_batch_sizes") is not None:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         # Requests that may hold KDA state at once (the decode batch cap). The
         # pool holds one more slot, its sink; a serve YAML sets the pool's
         # size, sink included, under ``resources: kda_state: {max_slots: N}``.
@@ -122,6 +140,8 @@ class Glm5NextModel(Model):
         self._tokenizer = None
         self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     @property
     def tokenizer(self):
@@ -182,11 +202,14 @@ class Glm5NextModel(Model):
                     sm_scale=self.config.qk_head_dim ** -0.5,
                 ),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
             RecurrentStateSpec(
                 resource_key=KDA_STATE,
@@ -212,20 +235,14 @@ class Glm5NextModel(Model):
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default
-        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
-            if k in model_kwargs:
-                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # MTP verifies greedily: a request that names no temperature gets 0, and an
             # explicit one > 0 is refused in process_prompt
@@ -278,74 +295,21 @@ class Glm5NextModel(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        # seed decode from the persisted emitted token
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -364,11 +328,8 @@ class Glm5NextModel(Model):
         # the conductor reads these kwargs; read here first, a bad one is the
         # client's 400 before the request reaches any rank
         kwargs = normalize_generation_kwargs(kwargs)
-        self.get_request_resource_configs({}, kwargs)
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER]
         self.get_max_output_tokens(**kwargs)
-        if kwargs.get("min_p", 0) > 0:
-            # the node's sampler is built without min-p, and the request configs do not pass it on
-            raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
         if kwargs.get("return_logprobs"):
             # the sampler configs carry none, which the conductor refuses too
             raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
@@ -376,12 +337,10 @@ class Glm5NextModel(Model):
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax; refused here, it is the client's 400 rather than a
             # worker's 500
-            temperature = float(kwargs.get("temperature", 0.0))
-            penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
-            if temperature > 0.0 or penalty != 1.0:
+            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
-                    f"MTP drafting is greedy only (temperature={temperature}, "
-                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                    f"MTP drafting is greedy only (temperature={sampling.temperature}, "
+                    f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
                 )
 
         if self._tokenizer_mode == "byte":
@@ -455,18 +414,17 @@ class Glm5NextModel(Model):
         return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def get_max_output_tokens(self, **model_kwargs):
-        # held to the window: a one-token prompt emits at most index_topk tokens. A request
-        # that names none runs as far as the decode loop can (under MTP the cache rows bind
-        # first), and the conductor fits it to the room its prompt leaves.
+        # A request that names none runs as far as the decode loop can (under MTP the cache
+        # rows bind first), and the conductor fits it to the room its prompt leaves. One that
+        # names more than index_topk, which a one-token prompt's window holds, is refused by
+        # the conductor: its decode loop cap is past max_iters.
         budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         if budget is None:
             return min(self.config.index_topk, self.max_decode_steps() + 1)
-        return min(budget, self.config.index_topk)
+        return budget
 
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so decode runs one fewer; the
-        # conductor refuses a cap past the loop's max_iters
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
@@ -568,7 +526,10 @@ class Glm5NextModel(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            check_loaded(language_model, load_weights(language_model, source, device=device), source)
+            check_loaded(
+                language_model, load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS),
+                source,
+            )
             return
 
         with open(index_file) as f:
@@ -584,7 +545,7 @@ class Glm5NextModel(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         check_loaded(language_model, language_model.load_weights(weights), source)
 

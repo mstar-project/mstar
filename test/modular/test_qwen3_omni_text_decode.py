@@ -15,7 +15,6 @@ from torch.overrides import TorchFunctionMode
 
 pytest.importorskip("flashinfer")
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.graph.base import Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
@@ -123,13 +122,6 @@ def _model():
     return model
 
 
-def _metadata(audio_output: bool, walk="prefill_text") -> CurrentForwardConductorMetadata:
-    return CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"], graph_walk=walk, is_prefill=True,
-        kwargs={"prefill_schedule": [("prefill_text", {})], "prefill_step": 0, "audio_output": audio_output},
-    )
-
-
 def _engine_inputs(request_ids, tokens, captured=False):
     sampler = SimpleNamespace(
         loopback_tokens=lambda rids: torch.tensor(tokens),
@@ -184,12 +176,9 @@ def test_every_config_that_splits_the_thinker_by_walk_places_the_text_walk():
 
 @pytest.mark.parametrize(("audio_output", "walk"), [(False, THINKER_TEXT_DECODE), (True, "thinker_decode")])
 def test_prefill_hands_over_to_the_requests_decode_walk(audio_output, walk):
-    metadata = _metadata(audio_output)
-    args = _model()._get_thinker_forward(metadata, {"new_token": []})
-    assert metadata.graph_walk == walk and not metadata.is_prefill
-    assert args.inputs[0].name == "text_inputs"
-    done = _model()._get_thinker_forward(metadata, {})
-    assert done.request_done
+    outputs = ["text", "audio"] if audio_output else ["text"]
+    *_, decode = _model().walk_plan("Thinker", ["text"], outputs, {}, {})
+    assert decode.walk == walk and dict(decode.bind) == {"text_inputs": "new_token"}
 
 
 def test_only_the_text_walk_keeps_its_token_on_the_device(thinker):

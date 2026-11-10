@@ -41,10 +41,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
+from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
@@ -211,7 +213,8 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, frames]``, one per latent frame; returns
+        """``timestep`` ``[B, frames]``, one per latent frame (under SP, one per
+        run of a frame's tokens on this rank: ``Wan22DiT.forward``); returns
         ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
         batch, frames = timestep.shape
@@ -249,8 +252,9 @@ class Wan22DiTBlock(nn.Module):
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, frames, 6, dim] -> six [B, frames, dim] fp32
-        # tensors, each applied to all of a frame's tokens.
+        # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
+        # applied to one of G equal groups of tokens: a frame, or under SP a run
+        # of a frame's tokens.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
         ).unbind(2)
@@ -267,10 +271,10 @@ class Wan22DiTBlock(nn.Module):
             hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
         )
         ff_output = gelu_tanh_ffn(norm_hidden, self.ffn)
-        frames = timestep_proj.shape[1]
+        groups = timestep_proj.shape[1]
         return (
-            hidden_states.unflatten(1, (frames, -1)).float()
-            + ff_output.unflatten(1, (frames, -1)).float() * c_gate_msa.unsqueeze(2)
+            hidden_states.unflatten(1, (groups, -1)).float()
+            + ff_output.unflatten(1, (groups, -1)).float() * c_gate_msa.unsqueeze(2)
         ).type_as(hidden_states).flatten(1, 2)
 
 
@@ -278,10 +282,21 @@ class Wan22DiT(nn.Module):
     """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
-    ``to_empty(device)`` -> checkpoint load)."""
+    ``to_empty(device)`` -> checkpoint load).
 
-    def __init__(self, config: Wan22Config):
+    ``sp_group`` runs it under Ulysses sequence parallelism: each rank keeps a
+    contiguous slice of the post-patchify tokens, self-attention all-to-alls
+    them around the kernel, and the slices are gathered before unpatchify."""
+
+    def __init__(self, config: Wan22Config, sp_group: CommGroup | None = None):
         super().__init__()
+        self.sp_group = sp_group or CommGroup.trivial()
+        if config.num_attention_heads % self.sp_group.world_size:
+            # Ulysses gives each rank an equal share of the heads
+            raise ValueError(
+                f"sp_size {self.sp_group.world_size} must divide the dit's "
+                f"{config.num_attention_heads} attention heads"
+            )
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
             # Wan22DiTBlock (across-heads q/k RMSNorm, affine norm2 before
@@ -348,6 +363,19 @@ class Wan22DiT(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
+        sizes = sp_seq_split(hidden_states.shape[1], self.sp_group.world_size)
+        sp = SeqParallel(self.sp_group, sizes)
+        if self.sp_group.world_size > 1:
+            # a rank's tokens need not be whole frames, so it modulates per run of
+            # tokens: the longest run that tiles a frame and every rank's share
+            per_frame = hidden_states.shape[1] // grid[0]
+            run = math.gcd(per_frame, *sizes)
+            runs = SeqParallel(self.sp_group, [n // run for n in sizes])
+            timestep = runs.scatter(timestep.repeat_interleave(per_frame // run, dim=1))
+        hidden_states = sp.scatter(hidden_states)
+        rotary_emb = tuple(sp.scatter(t, dim=0) for t in rotary_emb)  # [S, D] tables
+
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
         )
@@ -356,10 +384,10 @@ class Wan22DiT(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
-        # bf16 temb promotes, per frame), then project and unpatchify.
+        # bf16 temb promotes, per group of tokens), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = sp.gather(self.proj_out(hidden_states))
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

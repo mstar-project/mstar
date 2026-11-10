@@ -217,7 +217,7 @@ def _within_handle(ragged=None) -> WithinStepHandle:
 
 
 def _sampler_handle(draws=1) -> SamplerHandle:
-    resource = SamplerResource(vocab_size=8, enable_repetion_penalty=True, device=torch.device("cpu"))
+    resource = SamplerResource(vocab_size=8, enable_repetition_penalty=True, device=torch.device("cpu"))
     resource.ingest_request(1, None)
     return build_handle(Sampler("sampler", nodes={"LLM"}, vocab_size=8, draws=draws), {"sampler": resource})
 

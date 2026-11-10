@@ -1,9 +1,8 @@
 """CPU tests for the DiT scaffold's ``DenoiseLoopSubmodule`` with a toy model.
 
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
-index from the engine's loop counter, the async-overshoot veto, equal-shape batching,
-stacked preprocess and per-row outputs, the stop boundary, the CUDA-graph bucket key
-and the step's arrays and segments.
+index from the engine's loop counter, equal-shape batching, stacked preprocess and
+per-row outputs, the CUDA-graph bucket key and the step's arrays and segments.
 """
 
 from __future__ import annotations
@@ -133,20 +132,7 @@ def test_a_step_without_the_loop_counter_raises():
     """Read as 0, it would reseed from noise every iteration and run to max_iters."""
     sub = ToyDenoise()
     with pytest.raises(KeyError, match=LOOP):
-        sub.prepare_inputs(WALK, dataclasses_replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
-
-
-def test_overshoot_iteration_is_vetoed():
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
-    assert sub.prepare_inputs(WALK, _info("r0", 2, steps=2), _inputs(torch.ones(8, 4))) is None
-
-
-@pytest.mark.parametrize("steps,k,expect", [(1, 0, True), (4, 2, False), (4, 3, True), (4, 4, True)])
-def test_check_stop_boundary(steps, k, expect):
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=steps), _inputs())
-    assert (LOOP in sub.check_stop(_handle("r0"), _info("r0", k, steps=steps), {})) is expect
+        sub.prepare_inputs(WALK, dataclasses.replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
 
 
 def test_can_batch_only_equal_shapes():
@@ -218,7 +204,6 @@ def test_accelerator_graph_configs_one_bucket_per_shape():
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
     assert cfg.input_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
     assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
-
 
 
 def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
@@ -431,21 +416,6 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     ) == (8, 3)
 
 
-def test_check_stop_reads_the_requests_settings_and_keeps_nothing_per_request():
-    """A schedule keyed by the wrong request id once made check_stop miss and run the loop forever, which hung every
-    served request on both klein and Z-Image. A memo of the settings has no such key to get wrong."""
-    sub = ToyDenoise()
-    assert sub.check_stop(_handle("r0"), _info("r0", 3, steps=4), {}) == {LOOP}
-    assert sub.check_stop(_handle("r0"), _info("r0", 2, steps=4), {}) == set()
-    assert not sub.request_states, "the base keeps no per-request state"
-
-
-def test_check_stop_never_stages_a_schedule_on_the_device():
-    sub = ToyDenoise()
-    sub.check_stop(_handle("r0"), _info("r0", 3, steps=4), {})
-    assert sub._staged_schedules.cache_info().misses == 0, "check_stop runs on the worker's main thread"
-
-
 # The memos
 
 
@@ -462,7 +432,7 @@ def test_each_input_of_the_hook_moves_the_memos_key():
     first = sub.schedule_of(_info("a", 0, steps=4, tokens=8))
     assert sub.schedule_of(_info("a", 0, steps=5, tokens=8)) is not first
     assert sub.schedule_of(_info("a", 0, steps=4, tokens=16)) is not first
-    other_walk = dataclasses_replace(_info("a", 0, steps=4, tokens=8), graph_walk="refine")
+    other_walk = dataclasses.replace(_info("a", 0, steps=4, tokens=8), graph_walk="refine")
     assert sub.schedule_of(other_walk) is not first
 
 
@@ -540,11 +510,6 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
     out = sub.prepare_inputs("refine", refine, _inputs())
     assert sub.num_steps_of(refine) == 2 and out.resource_step_info == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
-    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
-
-
-def dataclasses_replace(info, **changes):
-    return dataclasses.replace(info, **changes)
 
 
 class PrefetchingToy(ToyDenoise):

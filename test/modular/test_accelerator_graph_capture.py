@@ -93,7 +93,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier)
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier, instance=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
@@ -182,9 +182,7 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     clean.warmup_and_capture()
     failed.warmup_and_capture()
 
-    assert failed.barrier.count == clean.barrier.count == 2 * len(_specs(
-        walks=("decode", "prefill")
-    ))
+    assert failed.barrier.count == clean.barrier.count == len(_specs(walks=("decode", "prefill")))
 
 
 def test_a_bucket_another_rank_dropped_is_dropped_here_too():
@@ -561,7 +559,8 @@ def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
     the padding rows' zero-length spans, as ``seq_lens`` has them."""
     declared = []
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._label, runner._current_slot, runner._lora_keys, runner._state_handles = "region", 0, (), {}
+    runner._label, runner._current_slot, runner._segment_keys, runner._lean = "region", 0, (), frozenset()
+    runner._state_handles = {}
     runner._config = PiecewisePackedConfig(
         capture_fn=lambda call: {}, make_static_inputs=lambda shape: {}, total_tokens=[8],
         declare_step=lambda rids, seq_lens, label_seq_lens=None: declared.append((seq_lens, label_seq_lens)),

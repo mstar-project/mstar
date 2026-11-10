@@ -227,7 +227,7 @@ def _position_spec(array: Array) -> PositionSpec:
 def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     return SamplerSpec(
         resource_key=sampler.name, nodes=sampler.nodes, vocab_size=sampler.vocab_size,
-        enable_repetion_penalty=sampler.penalty, enable_min_p=sampler.min_p, min_tokens_stop_ids=sampler.eos_ids,
+        enable_repetition_penalty=sampler.penalty, enable_min_p=sampler.min_p, min_tokens_stop_ids=sampler.eos_ids,
     )
 
 

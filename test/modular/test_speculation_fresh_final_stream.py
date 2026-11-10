@@ -11,7 +11,7 @@ batch's edges, not on the chunks the speculation polls itself, so the step has
 to take it from there; dropping it leaves the loop waiting forever for a chunk
 the stream will never send.
 
-Drives the real ``_try_speculate_next`` / ``_try_follow_speculation``,
+Drives the real ``Speculator._try_speculate_next`` / ``Speculator.follow``,
 ``SpeculationBuilder.assemble`` and ``StreamBufferManager.settle_final``; the scheduler, graph
 runtime and tensor store are stubs that hand back one continuing and one fresh
 rid.
@@ -32,8 +32,8 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationPrepOutput,
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
+from mstar.testing_utils.worker import make_services  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
-from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import (  # noqa: E402
     ChainPick,
     MicroScheduler,
@@ -41,9 +41,10 @@ from mstar.worker.micro_scheduler import (  # noqa: E402
     ScheduledBatch,
 )
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
+from mstar.worker.request_lifecycle import RequestLifecycle  # noqa: E402
+from mstar.worker.services import WorkerLayout  # noqa: E402
+from mstar.worker.speculation import SpeculationTarget, Speculator  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
-from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK, LOOP, PART, STREAM = "nano_llm", "decode", "decode_loop", "LLM", "audio_frame"
 CONTINUING, FRESH = 1, 2
@@ -71,7 +72,7 @@ def _prep() -> SpeculationPrepOutput:
     )
 
 
-def _worker(scheduler, runtime):
+def _speculator(scheduler, runtime, lockstep=None):
     def stream_state():
         sbuf = SimpleNamespace(policy=FixedChunkPolicy(chunk_size=1))
         return SimpleNamespace(stream_buffers={STREAM: sbuf}, ended_streams=set())
@@ -81,41 +82,28 @@ def _worker(scheduler, runtime):
             request_id=rid, graph_walk=WALK, fwd_index=0, random_seed=0, max_tokens=0,
         ) for rid in (CONTINUING, FRESH)
     }
-    worker = SimpleNamespace(
-        worker_id="w0",
-        scheduler=scheduler,
-        _graph_runtime=runtime,
-        tensor_manager=SimpleNamespace(
-            get_tensor=lambda uuid: torch.tensor([uuid]),
-            get_tensors=lambda uuids: [torch.tensor([u]) for u in uuids],
-        ),
-        request_state=SimpleNamespace(
-            per_request_info={rid: stream_state() for rid in fwd},
-            get_fwd_info=lambda rid, partition: fwd[rid],
-        ),
-        _in_flight_rids=set(),
-        _rows_by_lane={},
-        chunk_loops=ChunkLoops(),
-        _is_tearing_down=lambda rid: False,
-        _teardowns_pending=lambda: False,
+    tensor_manager = SimpleNamespace(
+        get_tensor=lambda uuid: torch.tensor([uuid]),
+        get_tensors=lambda uuids: [torch.tensor([u]) for u in uuids],
     )
-    streams = StreamBufferManager(worker.request_state, worker.tensor_manager, [])
+    request_state = SimpleNamespace(
+        per_request_info={rid: stream_state() for rid in fwd},
+        get_fwd_info=lambda rid, partition: fwd[rid],
+    )
+    streams = StreamBufferManager(request_state, tensor_manager, [])
     streams.consumer_node = {STREAM: NODE}
     streams._partition = {STREAM: PART}
     streams._rids = {CONTINUING, FRESH}
     streams.poll_for = lambda rid, node: []
     streams.chunks_for = lambda rid, node, inputs: None
-    worker.streams = streams
-    for name in ("_try_speculate_next", "_try_follow_speculation", "_hold_rows"):
-        setattr(worker, name, getattr(Worker, name).__get__(worker))
-    ctx = SpeculationContext(
-        graph_runtime=runtime, tensor_manager=worker.tensor_manager,
-        request_state=worker.request_state, scheduler=scheduler, streams=streams,
+    services = make_services(
+        graph_runtime=runtime, streams=streams, tensor_manager=tensor_manager, request_state=request_state,
     )
-    worker._spec_context = ctx
-    worker._spec_preparer = SpeculationPreparer(ctx)
-    worker._spec_builder = SpeculationBuilder(ctx)
-    return worker
+    layout = WorkerLayout()
+    return Speculator(
+        services=services, layout=layout, scheduler=scheduler,
+        lifecycle=RequestLifecycle(layout=layout, graph_runtime=runtime), lockstep=lockstep, admission=None, timer=None,
+    )
 
 
 def _runtime():
@@ -148,16 +136,16 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
+        pick_chain_step=lambda target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
-        take_chain_step=lambda state, chain, *_: fresh,
+        take_chain_step=lambda chain, *_: fresh,
         rebuilds=Rebuilds({}, {}),
     )
     runtime, target = _runtime()
-    worker = _worker(scheduler, runtime)
-    return worker._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
+    speculator = _speculator(scheduler, runtime)
+    return speculator._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
 
 
 def _follower_speculation(final: bool):
@@ -166,22 +154,21 @@ def _follower_speculation(final: bool):
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
         chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
-    scheduler = SimpleNamespace(
-        peek_tp_follow=lambda: head,
-        settle_tp_follow_delta=lambda caught_up: True,
+    lockstep = SimpleNamespace(
+        follow_head=lambda: head,
+        settle_delta=lambda caught_up: True,
         unread_rows=lambda h, rids: set(),
         tp_rids=lambda h: list(h.request_ids),
         pop_ready_rids=lambda *a, **k: PopReadyResult(
             {FRESH: 0}, _fresh_edges(final), ("prev_text",),
         ),
-        pop_tp_follow_head=lambda: head,
-        combined_walk_of={},
-        rebuilds=Rebuilds({}, {}),
+        pop_follow_head=lambda: head,
+        follow_rebuilds=lambda node, rids: frozenset(),
     )
+    scheduler = SimpleNamespace(combined_walk_of={}, note_follow_pop=lambda key: None, rebuilds=Rebuilds({}, {}))
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()
-    worker = _worker(scheduler, runtime)
-    return worker._try_follow_speculation(_pending())
+    return _speculator(scheduler, runtime, lockstep).follow(_pending())
 
 
 def test_leader_fresh_rid_final_chunk_ends_its_stream():
