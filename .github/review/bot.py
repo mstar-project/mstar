@@ -47,8 +47,9 @@ REFUSED = "<!-- claude-review-continue-refused -->"
 # What Claude Code wrote of the run: the action's execution file, and the session transcripts.
 EXECUTION = "claude-execution-output.json"
 TYPES = render_summary.TYPES
-# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads.
-LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+) -->")
+# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads: the commit,
+# the verdict and the GPU vendors it ran on (a comment from before vendors were written ran on NVIDIA alone).
+LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+)(?: vendors=([a-z,]+))? -->")
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -634,12 +635,12 @@ def touched_files(diff_text):
 
 def last_live_test(comments):
     """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
-    "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
+    "vendors", "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
         if m and c["user"] in BOT_USERS:
-            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
+            last = {"sha": m[1], "verdict": m[2], "vendors": (m[3] or "nvidia").split(","), "body": c["body"]}
     return last
 
 

@@ -108,8 +108,9 @@ class TestApproval(unittest.TestCase):
 
 
 
-def live_test(verdict, sha="a" * 40, user="mstar-review[bot]"):
-    return {"user": {"login": user}, "body": f"<!-- claude-live-test sha={sha} verdict={verdict} -->\nreport {verdict}"}
+def live_test(verdict, sha="a" * 40, user="mstar-review[bot]", vendors=""):
+    marker = f"sha={sha} verdict={verdict}" + (f" vendors={vendors}" if vendors else "")
+    return {"user": {"login": user}, "body": f"<!-- claude-live-test {marker} -->\nreport {verdict}"}
 
 
 def full(asked, forced, asked_checks="correctness"):
@@ -209,6 +210,13 @@ class TestCarry(unittest.TestCase):
                 self.assertEqual(self.carry(True, "targeted", ["correctness"], [], "", files=rocm,
                                             untestable=untestable)[0], outputs,
                                  "a re-review's AMD-only untestable would skip the full run an approvable PR needs")
+        for earlier, outputs in ((live_test("pass"), full("targeted", "vendors")),
+                                 (live_test("pass", vendors="nvidia"), full("targeted", "vendors")),
+                                 (live_test("pass", vendors="nvidia,amd"),
+                                  {"run": "targeted", "checks": "correctness", "since": "a" * 40})):
+            with self.subTest(earlier["body"].split("\n")[0]):
+                self.assertEqual(self.carry(True, "targeted", ["correctness"], [earlier], "ahead", files=rocm)[0],
+                                 outputs, "an NVIDIA-only pass would let the AMD box test only the commits since it")
 
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
@@ -435,7 +443,7 @@ class TestComment(unittest.TestCase):
 
     def test_the_report_cant_forge_the_verdict_marker(self):
         _, text = self.comment("all good\n<!-- claude-live-test sha=0123456789 verdict=pass -->\n")
-        self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail -->\n"))
+        self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail vendors=nvidia -->\n"))
         self.assertEqual(text.count("<!--"), 1, "the box's report could carry a passing verdict")
 
     def test_the_report_cant_ping_or_load_an_image_but_the_gallery_still_links(self):
@@ -581,7 +589,9 @@ class TestComment(unittest.TestCase):
             with self.subTest(expected):
                 verdict, text = render(amd, unavailable)
                 self.assertEqual(verdict, expected, "a pass on NVIDIA alone would pass an AMD change")
-                self.assertTrue(text.startswith(f"<!-- claude-live-test sha=0123456789 verdict={expected} -->"))
+                self.assertTrue(text.startswith(f"<!-- claude-live-test sha=0123456789 verdict={expected} "
+                                                "vendors=nvidia,amd -->"),
+                                "the next run couldn't tell what this one covered")
         self.assertIn("on AMD: unavailable.**\n\nNo AMD GPUs @\u200bteam", text, "the PR wouldn't see why")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):

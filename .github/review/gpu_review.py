@@ -73,7 +73,8 @@ CHECKS = {"correctness": "correctness (served output, parity, regressions)",
           "performance": "performance (throughput and latency A/Bs)"}
 # Why carry made a run full that the review asked to narrow, as the brief says it.
 FORCED = {"failed": "the PR's last live test didn't pass on an ancestor of this head",
-          "untested": "the review built on an earlier review that no live test ran before"}
+          "untested": "the review built on an earlier review that no live test ran before",
+          "vendors": "the PR's last passing live test didn't run on every GPU vendor this one needs"}
 MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MODEL, CLAUDE = "claude-opus-5-5", "stable"  # the box's session: its model, and Claude Code's release
 MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "img",
@@ -222,18 +223,18 @@ def beyond_vendors(text, vendors):
 
 
 def carry(out, pr, head_sha, runner_temp, rereview=""):
-    """What the live test runs, as outputs: the review's call, read as its enums only (model output on
-    its way to the brief), and on which vendors' GPUs (`vendors`, vendors_of). Nothing runs while the review
-    left something to fix first (to_fix_first):
-    `gated`, with the reasons in $RUNNER_TEMP/gate.txt, never in the outputs, since they hold model
-    text. Otherwise the call stands unless the PR's last live test didn't pass on an ancestor of the
-    head; then the run is full, with every kind of check, whatever the review asked for, so a failure is
-    never hidden behind a narrower run. A re-review (`rereview`) with no live test before it judged only
-    what changed since the last review, which no GPU run has covered: its `targeted` is full too, and so
-    is its `none` when the PR touches runtime code (file_gate). A re-review naming something `untestable`
-    is left alone (but for what an AMD run covers): that PR can't be approved, so a full run would rent GPUs for
-    nothing. After a pass on an ancestor, a `targeted` run gets that live test's comment (earlier-live-test.md). A
-    failed read of the PR's comments fails the step: it never reads as "no earlier live test"."""
+    """What the live test runs, as outputs: the review's call, read as its enums only (model output on its way to
+    the brief), and on which vendors' GPUs (`vendors`, vendors_of). Nothing runs while the review left something
+    to fix first (to_fix_first): `gated`, with the reasons in $RUNNER_TEMP/gate.txt, never in the outputs, since
+    they hold model text. Otherwise the call stands unless the PR's last live test didn't pass on an ancestor of
+    the head, or passed there on fewer GPU vendors than this run needs; then the run is full, with every kind of
+    check, whatever the review asked for, so a failure is never hidden behind a narrower run. A re-review
+    (`rereview`) with no live test before it judged only what changed since the last review, which no GPU run
+    has covered: its `targeted` is full too, and so is its `none` when the PR touches runtime code (file_gate).
+    A re-review naming something `untestable` is left alone (but for what an AMD run covers): that PR can't be
+    approved, so a full run would rent GPUs for nothing. After a pass on an ancestor, a `targeted` run gets that
+    live test's comment (earlier-live-test.md). A failed read of the PR's comments fails the step: it never
+    reads as "no earlier live test"."""
     review = json.loads(Path("review.json").read_text())
     first = [*findings_changed(review, pr), *to_fix_first(review, pr, "stacked-above.json")]
     if first:
@@ -253,7 +254,8 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     passed = bot.passed_on_ancestor(REPO, last, head_sha)
     untested = not last and rereview and (run == "targeted" or run == "none" and touches_runtime(pr, head_sha))
     forced = None if rereview and beyond_vendors(live.get("untestable"), vendors) \
-        else "failed" if last and not passed else "untested" if untested else None
+        else "failed" if last and not passed else "untested" if untested \
+        else "vendors" if passed and not set(vendors) <= set(last["vendors"]) else None
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
               "kind of check.")
@@ -872,7 +874,7 @@ def render_comment(sha, lt, vendors, media_url=""):
         verdicts.append(verdict)
         sections.append(title.rstrip() + "\n\n" + report + render_summary.report_closers(report) + cut)
     verdict = min(verdicts, key=WORST_FIRST.index)
-    body = (f"<!-- claude-live-test sha={sha} verdict={verdict} -->\n{head}\n\n{media}"
+    body = (f"<!-- claude-live-test sha={sha} verdict={verdict} vendors={','.join(vendors)} -->\n{head}\n\n{media}"
             + "\n\n".join(sections))
     (lt / "comment.md").write_text(body)
     (lt / "verdict").write_text(verdict)
@@ -958,7 +960,8 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
     elif any(text(box / "unavailable.md") for box in boxes(lt)):  # no box ran
-        body = (f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n" + "\n".join(
+        body = (f"<!-- claude-live-test sha={head_sha} verdict=unavailable "
+                f"vendors={','.join(box.name for box in boxes(lt))} -->\n" + "\n".join(
             f"**{VENDORS[box.name]}:** " + render_summary.inert(text(box / "unavailable.md"))
             for box in boxes(lt) if text(box / "unavailable.md")))
     else:  # the review chose `none` and it stood
