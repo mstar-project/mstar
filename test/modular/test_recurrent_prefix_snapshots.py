@@ -19,7 +19,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.keys import chain
@@ -41,6 +41,7 @@ from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.resource import StubResource
 from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
@@ -66,6 +67,9 @@ class _StubChains:
 
     def chain_keys(self, rid, label, pages):
         return self.keys.get(rid, [])[:pages]
+
+    def bind_snapshots(self, pool):
+        del pool
 
 
 def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
@@ -258,15 +262,11 @@ def test_a_refused_admit_turns_the_restore_back_into_a_lease():
     assert pool._snap_refs == {pool._leases["b"].slot: 1}, "the re-probe took a second reference"
 
 
-class _StubHit(Resource):
+class _StubHit(StubResource):
     """A KV cache that holds the first ``length`` tokens of every prompt."""
 
     def __init__(self, length: int | None):
         self.length = length
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return None if self.length is None else CachedPrefix("main", self.length, self.length)
@@ -322,12 +322,8 @@ class _Keyed(StubModel):
         return {WALK: GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
-class _StubGDN(Resource):
+class _StubGDN(StubResource):
     """A linear-attention resource over the pool, which can't skip a prefix itself."""
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
 
 def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:

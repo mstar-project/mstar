@@ -17,9 +17,15 @@ import lora_module_helpers as Q  # noqa: E402
 import test_lora_pool as P  # noqa: E402
 
 from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
-from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
-from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
+from mstar.engine.resources.lora.ops import (  # noqa: E402
+    LoraOpsBackend,
+    lora_apply_,
+    lora_expand_,
+    lora_experts_apply_,
+    lora_shrink,
+)
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool, _Layout  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -34,6 +40,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.model.keys import MIXED  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 
 F64 = torch.float64
 CPU = torch.device("cpu")
@@ -58,12 +65,14 @@ def _llm(paths, with_pool=True):
 
 def test_custom_ops_pass_opcheck():
     """Schemas (``lora_expand_`` declares the ``y`` it writes), fake shapes and the
-    functionalized path, on addressing with a capture bucket's tail."""
+    functionalized path, on addressing with a capture bucket's tail; and the experts op's."""
     widths, ranks, scalings = [6, 3, 5], torch.tensor([0, 1, 4, 3], dtype=torch.int32), torch.tensor([0, 0.5, 2, -1.0])
     token_slots = torch.tensor([2, 0, 1, 3, 2, 2, 1], dtype=torch.int32)
     order = torch.cat([torch.argsort(token_slots, stable=True).to(torch.int32), torch.zeros(3, dtype=torch.int32)])
     indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.bincount(token_slots, minlength=4).cumsum(0)])
-    common = (order, indptr.to(torch.int32), ranks)
+    # a capture bucket's tail tokens are on the zero adapter
+    token_slot = torch.cat([token_slots, torch.zeros(3, dtype=torch.int32)])
+    common = (order, indptr.to(torch.int32), token_slot, ranks)
     g = torch.Generator().manual_seed(1)
     a, b = torch.randn(4, 3 * 4, 12, generator=g, dtype=F64), torch.randn(4, 14, 4, generator=g, dtype=F64)
     x, y = torch.randn(10, 12, generator=g, dtype=F64), torch.randn(10, 14, generator=g, dtype=F64)
@@ -71,6 +80,11 @@ def test_custom_ops_pass_opcheck():
     h = lora_shrink(x, a, *common, len(widths))
     torch.library.opcheck(lora_expand_, (y, h, b, *common, scalings, widths))
     torch.library.opcheck(lora_apply_, (y, x, a, b, *common, scalings, widths))
+    # an experts target's, with no alignment (off CUDA); ids past `a`'s 6 rows get nothing
+    ids = torch.tensor([[0, 5], [2, 6], [6, 1]], dtype=torch.int32)
+    a, b = torch.randn(6, 2 * 4, 12, generator=g, dtype=F64), torch.randn(6, 9, 4, generator=g, dtype=F64)
+    y, weight = torch.randn(6, 9, generator=g, dtype=F64), torch.rand(3, 2, generator=g, dtype=F64)
+    torch.library.opcheck(lora_experts_apply_, (x[:3], y, a, b, ids, weight, None, None, None, 2, [4, 5], 0))
 
 
 def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
@@ -201,13 +215,11 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
 
 # --- the async worker and the compute scope -------------------------------------------------
 
-class _Plain(Resource):
+class _Plain(StubResource):
     """Admits and records what the runner drives; does not track compute."""
 
     def __init__(self, preplan=False):
         self._preplan, self.calls = preplan, []
-
-    build = None
 
     @property
     def supports_preplan(self):
@@ -541,11 +553,6 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
             call(x, y)
 
 
-class _Attn(Resource):
-    build = None
-    force_double_buffer = False
-
-
 def _region_runner(pool, **config):
     from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
@@ -558,7 +565,7 @@ def _region_runner(pool, **config):
     step_runner = SimpleNamespace(built=[])
     step_runner.build_accelerator_graph_buffers = lambda specs, **kwargs: step_runner.built.extend(specs)
     return PiecewiseAcceleratorGraphRunner(
-        label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
+        label="N_region", config=config, resources={"attn": StubResource(), "lora": pool},
         step_runner=step_runner,
         device=CPU, autocast_dtype=None, num_slots=2, node_name="N", segment_keys=("lora",),
     )

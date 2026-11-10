@@ -366,7 +366,8 @@ Booleans stay strict: ``"false"`` is not a boolean, and ``true`` is not a number
 is the same as leaving the knob out: the model's default applies, which is the
 checkpoint's own ``generation_config.json`` value where it ships one. BAGEL and Orpheus
 are the exception: their files are the backbone's chat presets, so only their
-``do_sample: false`` is read and the models' own defaults stay. Multi-stage models
+``do_sample: false`` is read and the models' own defaults stay. MiniCPM-o keeps
+upstream ``chat``'s defaults over its file. Multi-stage models
 take a stage prefix (``talker_temperature``, ``code_predictor_top_k``) with the same
 rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
 of Qwen3-TTS), and a prefixed one wins over it for its stage.
@@ -705,7 +706,7 @@ Per-model notes:
   drops what the VAD has not put in a turn yet. ``create_response`` and
   ``interrupt_response`` are accepted and echoed but do nothing in a transcription
   session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
-  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  decision waits 3 ms more for the resampler. Install ``mstar-ai[vad]`` (Silero VAD, MIT,
   bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
   ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
@@ -721,7 +722,7 @@ Per-model notes:
   Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
   as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
   thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
-  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  (``mstar-ai[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
   Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
   them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
   and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a

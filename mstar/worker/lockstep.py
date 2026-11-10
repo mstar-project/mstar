@@ -12,14 +12,17 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from torch.distributed import ReduceOp
 
+from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
+    MoveKind,
     OffloadDelta,
     ScheduleTPNode,
     TPNoSpeculation,
@@ -27,6 +30,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.admission import Admission
+from mstar.worker.executing_batch import make_executing_batch
 from mstar.worker.scheduled_batch import (
     REMOVED_RID,
     PopReadyResult,
@@ -79,16 +83,24 @@ def tp_async_sched_setting(
     return parse_tp_async_sched(str(config if config is not None else "1"))
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """Return ``message`` without its rows, prefix hits and page trails, so it carries only rank 0's moves."""
+    return replace(message, request_ids=[], speculative=False, prefix_hits={}, page_trails={})
+
+
 class Lockstep:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, admission: Admission,
         async_sched: tuple[bool, frozenset[str] | None] = (False, None),
+        wg_instances: dict[int, list[list[str]]] | None = None,
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
         self._engine_manager = services.engine_manager
         self._tensor_manager = services.tensor_manager
         self._request_state = services.request_state
+        self._streams = services.streams
+        self._rebuilds = services.rebuilds
         self._communicator = services.communicator
         self._parallel_groups = services.parallel_groups
         self._admission = admission
@@ -109,6 +121,8 @@ class Lockstep:
         self._unread: dict[int, dict[str, set[str]]] = {}
         # (producer, walk) -> {signal: the led nodes it is routed to}; structural
         self._consumers: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
+        # the followers it sends its steps to
+        self._followers = self._instance_followers(wg_instances, layout)
 
         # -- follower --
         self._follow_fifo: deque[ScheduleTPNode] = deque()
@@ -126,7 +140,8 @@ class Lockstep:
         # (TPNoSpeculation) or this rank closed the step
         self._no_spec: RecentSet[int] = RecentSet(_TP_NOSPEC_KEEP)
         self._leader_gap_warned = False
-        self._pending_deltas: dict[str, OffloadDelta] = {}
+        # rank 0's moves this rank has yet to replay, on any of the nodes it follows
+        self._pending_delta = OffloadDelta.new()
         self._last_delta_seq = -1
         # popped, not settled: a settled head can still fail to build, and its
         # removals wait for its admit
@@ -195,6 +210,40 @@ class Lockstep:
     # Leader
     # ------------------------------------------------------------------
 
+    def _instance_followers(
+        self, wg_instances: dict[int, list[list[str]]] | None, layout: WorkerLayout,
+    ) -> dict[str, list[str]]:
+        """The other ranks of the instance of each lockstep node this rank leads, which rank 0 sends its steps to.
+        Known when the worker starts, so rank 0's moves can go out in a step with no rows before it sends any step."""
+        followers = {}
+        for wg_id, instances in (wg_instances or {}).items():
+            for node in layout.all_wg_nodes.get(wg_id, set()) & self._led:
+                for instance in instances:
+                    if self._worker_id in instance:
+                        followers[node] = [worker for worker in instance if worker != self._worker_id]
+        return followers
+
+    def owes_moves(self) -> bool:
+        """Whether the journal of the lockstep instance this rank leads holds moves no step has carried."""
+        return any(self._engine_manager.get_engine(node).owes_moves() for node in self._led)
+
+    def flush_moves(self, pending: PendingBatch | None = None) -> None:
+        """Send the instance's followers a step with no rows while the journal holds moves, unless ``pending``
+        is a step of the instance's own. That step still waits for its speculation decision, which a step with no
+        rows sent first would read as none. A step of any of the instance's nodes carries every move."""
+        if pending is not None and pending.node_name in self._led:
+            return
+        if self.owes_moves():
+            self.broadcast(make_executing_batch(
+                self._streams, node_name=min(self._led), graph_walk="", request_ids=[],
+                per_request_input_tensors={}, per_request_info={},
+            ))
+
+    @property
+    def led(self) -> frozenset[str]:
+        """The lockstep nodes this worker leads."""
+        return self._led
+
     @property
     def last_broadcast_seq(self) -> int:
         """The seq of the last step sent, which orders a forwarded teardown."""
@@ -213,25 +262,19 @@ class Lockstep:
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self._engine_manager.get_engine(node_batch.node_name)
-        resident_delta = engine.take_resident_delta(node_batch.node_name)
-        prefix_hits = engine.decide_cached_prefix(node_batch)
+        resident_delta = engine.take_resident_delta()
+        # taken before the leases, since a follower checks it before it adopts them
         page_trails = engine.page_trails(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
         read_check = self.step_reads(node_batch)
         if read_check:
             node_batch.read_check_rids = tuple(node_batch.request_ids)
-        # this worker is only a part of one TP group for this node,
-        # so, we can just look at the sharding_config for the first
-        # request to get the relevant workers
-        sample_rid = node_batch.request_ids[0]
         ctx = node_batch.step_context
-        workers = self._runtime.get_sharding_config(sample_rid).get_sharding_group(
-            node_batch.node_name, ctx.walk_of(sample_rid)
-        )._workers[1:]
+        workers = self._followers[node_batch.node_name]
+        request_ids = node_batch.request_ids
         walks, walk_idx = [], []
         if ctx.request_walks:
-            rows = RequestWalks.from_walks(
-                node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
-            )
+            rows = RequestWalks.from_walks(request_ids, [ctx.walk_of(r) for r in request_ids])
             walks, walk_idx = rows.walks, rows.walk_idx
         # the leader alone cuts chunks: a follower's own cut could differ
         chunk_starts: list[int] = []
@@ -239,7 +282,7 @@ class Lockstep:
         chunk_totals: list[int] = []
         chunk_strides: list[int] = []
         if node_batch.chunk_ranges:
-            for rid in node_batch.request_ids:
+            for rid in request_ids:
                 start, end, total, stride = node_batch.chunk_ranges.get(rid, _UNCHUNKED)
                 chunk_starts.append(start)
                 chunk_ends.append(end)
@@ -252,7 +295,7 @@ class Lockstep:
                     body=ScheduleTPNode(
                         node_name=node_batch.node_name,
                         graph_walk=node_batch.graph_walk,
-                        request_ids=[self._runtime.get_rid_string(r) for r in node_batch.request_ids],
+                        request_ids=[self._runtime.get_rid_string(r) for r in request_ids],
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
@@ -412,13 +455,7 @@ class Lockstep:
             self._communicator.send(worker, msg=message)
 
     def enqueue_follow(self, message: ScheduleTPNode) -> None:
-        """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
-        if not message.request_ids:
-            logger.warning(
-                "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
-                self._worker_id, message.node_name, message.graph_walk, message.spec_seq,
-            )
-            return
+        """Queue a ScheduleTPNode. A head for a step this rank closed is queued as a step of moves alone."""
         if (
             self.async_for(message.node_name) and message.speculative
             and message.spec_from_seq in self._no_spec
@@ -427,7 +464,7 @@ class Lockstep:
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self._worker_id, message.spec_seq, message.spec_from_seq,
             )
-            return
+            message = moves_alone(message)
         self._follow_fifo.append(message)
         # Count every rid the leader named, including ones this rank cannot
         # resolve yet -- ``tp_rids`` would flatten those to REMOVED_RID and
@@ -437,13 +474,13 @@ class Lockstep:
 
     def close_follow_step(self, pending: PendingBatch) -> None:
         """This step's forward raised (symmetrically on the leader, which never
-        submitted its head): drop a queued head from it, and any arriving later."""
+        submitted its head): a head from it, queued or arriving later, becomes a step of moves alone."""
         self._no_spec.add(pending.tp_seq)
         head = self.follow_head()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
-            self.pop_follow_head()
             # settle may have adopted some of the head's hit, and the leader releases the whole lease
             self._engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
+            self.void_follow_head()
 
     def is_no_spec(self, seq: int) -> bool:
         """Whether no head will follow step ``seq``."""
@@ -466,24 +503,38 @@ class Lockstep:
         """The leader's oldest step not yet taken, if any."""
         return self._follow_fifo[0] if self._follow_fifo else None
 
-    def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None = None) -> bool:
-        if node_name not in self._pending_deltas:
-            self._pending_deltas[node_name] = OffloadDelta.new()
-        delta = self._pending_deltas[node_name]
+    def _apply_resident_delta(
+        self, node_name: str, new_delta: OffloadDelta | None = None, caught_up: bool = True,
+    ) -> bool:
+        delta = self._pending_delta
         if new_delta is not None:
             delta.extend(new_delta)
 
         if not len(delta):
             return True
 
-        engine = self._engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta)
+        return self._engine_manager.get_engine(node_name).apply_resident_delta(delta, self._rebuilds, caught_up)
 
-    def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+    def awaits_commit(self, step_rids: Collection[int]) -> bool:
+        """Whether the replay stopped on what the commit of the step holding ``step_rids`` lets land: a reload, a drop
+        or an offload of one of ``step_rids``, or rank 0's leases once every move has landed."""
+        move = self._pending_delta.peek_left()
+        if move is None:
+            return True
+        rid = self._runtime.get_rid_handle(move.rid)
+        return rid is not None and (
+            move.kind == MoveKind.RELOAD or move.kind in (MoveKind.DROP, MoveKind.OFFLOAD) and rid in step_rids
+        )
+
+    def _apply_delta_from_message(self, message: ScheduleTPNode, caught_up: bool = True) -> bool:
+        new_delta = None
         if self._last_delta_seq < message.spec_seq:
             self._last_delta_seq = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            new_delta = message.resident_delta
+        try:
+            return self._apply_resident_delta(message.node_name, new_delta, caught_up)
+        except Exception as exc:
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def settle_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
@@ -497,12 +548,13 @@ class Lockstep:
         head = self.follow_head()
         if head is None:
             return True
-        if not self._apply_delta_from_message(head):
+        if not self._apply_delta_from_message(head, caught_up):
             return False
-        if not head.prefix_hits and not head.page_trails:
-            return True
         engine = self._engine_manager.get_engine(head.node_name)
         try:
+            self._start_follow_rebuilds(head)
+            if not head.prefix_hits and not head.page_trails:
+                return True
             engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
             return engine.adopt_cached_prefix(head, caught_up)
         except Exception as exc:
@@ -511,18 +563,30 @@ class Lockstep:
             raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def pop_follow_head(self) -> ScheduleTPNode:
-        """Sole exit for a queued follow step: every consumer pops here, so the
-        drain refcount is discharged in one place."""
+        """Sole exit for a queued follow step: every consumer (the serial path
+        and the async follower's build path) pops here. `void_follow_head`
+        discharges the drain refcount of a head this rank won't build."""
         message = self._follow_fifo.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_seq = max(self._last_popped_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self._follow_fifo[0]
+        self._discharge(head.request_ids)
+        self._follow_fifo[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self._follow_count:
                 continue
             self._follow_count[rid] -= 1
             if self._follow_count[rid] <= 0:
                 self._follow_count.pop(rid, None)
-        return message
 
     @property
     def last_consumed_seq(self) -> int:
@@ -616,25 +680,31 @@ class Lockstep:
         if not self.settle_delta(caught_up=True):
             return None
         head = self.follow_head()
+        if not head.request_ids:
+            # a step with no rows, so pop it rather than build an empty batch
+            self.pop_follow_head()
+            return None
         rids = self.tp_rids(head)
         # before anything is popped: lists that do not match the rows raise
         chunk_ranges = tp_chunk_ranges(head, rids)
         unread = self.unread_rows(head, rids)
+        rebuild = self.follow_rebuilds(head.node_name, rids)
+        unpopped = unread | rebuild
         popped = self.pop_ready_rids(
             head.node_name, head.graph_walk,
-            [r for r in rids if r not in unread],
+            [r for r in rids if r not in unpopped],
             walks=head.walks,
             walk_idx=[
-                w for r, w in zip(rids, head.walk_idx, strict=True) if r not in unread
+                w for r, w in zip(rids, head.walk_idx, strict=True) if r not in unpopped
             ] if head.walks else None,
         )
         if popped is None:
             self.warn_unchecked_read_failure(head, rids)
             return None
         request_to_worker_graph, input_edges, output_signals, request_walks, walk_signals = popped
-        if unread:
-            request_to_worker_graph, request_walks = self.with_unread_rows(
-                head, rids, unread, request_to_worker_graph, request_walks,
+        if unpopped:
+            request_to_worker_graph, request_walks = self.with_unpopped_rows(
+                head, rids, unpopped, request_to_worker_graph, request_walks,
             )
 
         self.pop_follow_head()
@@ -648,6 +718,7 @@ class Lockstep:
             tp_seq=head.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            rebuild_rids=rebuild,
             read_check_rids=tuple(rids) if head.read_check else None,
             # the leader's chunks, so the chunk Loop ends on the same step here
             chunk_ranges=chunk_ranges,
@@ -655,6 +726,31 @@ class Lockstep:
         )
         self.cap_chunk_loops(batch)
         return batch
+
+    def follow_rebuilds(self, node_name: str, rids: Iterable[int]) -> frozenset[int]:
+        """The rows of rank 0's step that rebuild a request dropped on ``node_name``, which
+        `_start_follow_rebuilds` started when the step settled."""
+        return frozenset(rid for rid in rids if self._rebuilds.rebuilding(rid, node_name))
+
+    def _start_follow_rebuilds(self, head: ScheduleTPNode) -> None:
+        """Start the rebuild of each request of ``head`` dropped on its node, from the same source as rank 0's,
+        since the request's chunk Loop is lockstep. Rank 0 started it before it sent the step, so rank 0 leased the
+        request's cached prefix under the keys the rebuild lays out, and this rank starts it before it takes that
+        lease."""
+        node_name = head.node_name
+        if node_name not in self._rebuilds.nodes:
+            return
+        engine = self._engine_manager.get_engine(node_name)
+        request_state = self._request_state
+        partition = request_state.get_partition_for_node(node_name)
+        for rid in self.tp_rids(head):
+            # A row a step on the node holds is resident or rebuilding already, since a drop there waits only for that
+            # step.
+            if (
+                rid != REMOVED_RID and not self._rebuilds.rebuilding(rid, node_name)
+                and engine.residency(node_name, rid) is Residency.DROPPED and not engine.in_step(node_name, rid)
+            ):
+                self._admission.start_rebuild(node_name, rid, request_state.get_fwd_info(rid, partition).graph_walk)
 
     def cap_chunk_loops(self, batch: ScheduledBatch) -> None:
         """``cap_chunk_loops`` for a step this rank took from the leader."""
@@ -671,19 +767,20 @@ class Lockstep:
             return set()
         return {r for r in rids if r in failed}
 
-    def with_unread_rows(
-        self, head: ScheduleTPNode, rids: list[int], unread: set[int],
+    def with_unpopped_rows(
+        self, head: ScheduleTPNode, rids: list[int], unpopped: Collection[int],
         request_to_worker_graph: dict[int, int], request_walks: dict[int, str],
     ) -> tuple[dict[int, int], dict[int, str]]:
-        """``request_to_worker_graph`` and ``request_walks`` with ``unread``'s
-        rows put back, in the leader's order: the step has rank 0's rows on
-        every rank until its read check, so it is built, submitted, voided and
-        settled alike. The unread rows were never popped."""
+        """``request_to_worker_graph`` and ``request_walks`` with the rows
+        nothing popped put back, in the leader's order: rows whose read failed
+        here, which the step carries on every rank until its read check takes
+        them out, so it is built, submitted, voided and settled alike, and
+        rebuild rows, which the graph runtime holds no node of."""
         walk_of = dict(zip(rids, (head.walks[w] for w in head.walk_idx), strict=True)) if head.walks else {}
         request_walks = dict(request_walks)
         rows = {}
         for rid in rids:
-            if rid not in unread:
+            if rid not in unpopped:
                 rows[rid] = request_to_worker_graph[rid]
                 continue
             walk = walk_of.get(rid, head.graph_walk)

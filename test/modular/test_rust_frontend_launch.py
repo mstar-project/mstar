@@ -46,6 +46,17 @@ def test_unset_settings_leave_the_frontends_defaults(launched, monkeypatch):
     assert "MSTAR_SAMPLE_RATE" not in launched["env"]
 
 
+def test_the_transcription_facts_are_the_launchers_and_never_inherited(launched, monkeypatch):
+    import json
+
+    monkeypatch.setenv("MSTAR_TRANSCRIPTION", '{"languages": ["stale"]}')
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert "MSTAR_TRANSCRIPTION" not in launched["env"]
+    facts = {"request_kwargs": None, "max_concurrent_requests": 8, "errors_url": "u"}
+    rust_frontend.launch_rust_server("bin", "whisper_large", 8000, "/b", "/u", transcription=facts)
+    assert json.loads(launched["env"]["MSTAR_TRANSCRIPTION"]) == facts
+
+
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
     monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
