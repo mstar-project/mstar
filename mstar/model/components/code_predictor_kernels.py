@@ -60,12 +60,14 @@ def _shared_memory_per_block(device: torch.device) -> int:
     return triton.runtime.driver.active.utils.get_device_properties(device.index)["max_shared_mem"]
 
 
-def _stages_that_fit(block_m: int, block_n: int, block_k: int, operands: int, stages: int, device: torch.device) -> int:
+def _stages_that_fit(
+    block_m: int, block_n: int, block_k: int, operands: int, element_size: int, stages: int, device: torch.device,
+) -> int:
     """``stages`` cut to what the device's shared memory holds: the pipeline keeps
     ``stages - 1`` tiles of ``x`` and of each weight operand resident (an H200
     has 227 KB of it, an MI325X 64 KB)."""
-    per_stage = (block_m + operands * block_n) * block_k * 2
-    return max(2, min(stages, _shared_memory_per_block(device) // per_stage + 1))
+    per_stage = (block_m + operands * block_n) * block_k * element_size
+    return min(stages, _shared_memory_per_block(device) // per_stage + 1)
 
 
 @triton.jit(do_not_specialize=["cache_pos"])
@@ -378,7 +380,7 @@ def cp_linear(
         block_n = STREAM_TILE if epi in (1, 3) else 32 if epi == 2 or (n >= 4096 and block_m >= 32) else 16
         block_k, warps, stages = (128, 4, 5) if block_m >= 64 else (256, 2, 4)
         norm = 0 if norm_eps is None else (2 if n_part else 1)
-    stages = _stages_that_fit(block_m, block_n, block_k, 2 if up is not None else 1, stages, x.device)
+    stages = _stages_that_fit(block_m, block_n, block_k, 2 if up is not None else 1, x.element_size(), stages, x.device)
     assert rows <= _MAX_ROWS and n % block_n == 0 and k % block_k == 0 and w.stride(1) == 1 and x.stride(1) == 1
     if epi in (1, 3) and block_m >= 16:
         assert n // block_n <= _MAX_PARTIALS and partials is not None
