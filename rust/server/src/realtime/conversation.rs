@@ -339,7 +339,11 @@ impl Conversation {
                             }
                             break;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(_))) => {
+                            crate::ws::answer_close(&mut self.socket).await;
+                            break;
+                        }
+                        None => break,
                         Some(Ok(_)) => continue,
                     };
                     match serde_json::from_str::<Value>(&text) {

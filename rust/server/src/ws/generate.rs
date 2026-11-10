@@ -737,6 +737,8 @@ async fn serve(socket: WebSocket, st: AppState) {
                 break;
             }
         }
+        // the reader stops at the client's Close; its reply goes out with this half
+        super::answer_close(&mut sink).await;
     });
     let mut notice_rx = None;
     let notices = match (&st.bridge, takes_stream_input()) {

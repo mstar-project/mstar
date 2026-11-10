@@ -363,6 +363,15 @@ def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch,
 
 
 
+def test_a_client_that_closes_gets_the_close_handshake(stacks):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    _, port = stacks(False)
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/generate/ws", compression=None)
+    ws.close()
+    assert ws.close_code == 1000
+
+
 # what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
 TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
 

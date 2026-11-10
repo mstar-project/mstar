@@ -429,6 +429,16 @@ def test_a_model_without_realtime_is_closed_with_pythons_reason(stack, monkeypat
 TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
 
 
+def test_a_client_that_closes_gets_the_close_handshake(stack):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    _, port = stack
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription", compression=None)
+    ws.recv(timeout=30)  # transcription_session.created
+    ws.close()
+    assert ws.close_code == 1000
+
+
 def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
     with _rust(_ASR(Path(tempfile.mkdtemp(prefix="mstar_rt_up_"))), MSTAR_WS_MAX_BYTES="1000") as port:
         url = f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription"

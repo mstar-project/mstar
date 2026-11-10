@@ -515,3 +515,22 @@ def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
             with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
                 ws.recv(timeout=10)
     assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG
+
+
+def test_a_client_that_closes_mid_call_gets_the_close_handshake(stacks):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    server, port = stacks("marks")
+    server.reset(end=False)  # the call stays open until it is aborted
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime", compression=None, max_size=None)
+    ws.recv(timeout=30)  # session.created
+    ws.send(json.dumps(QUIET))
+    deadline = time.monotonic() + 10
+    while not server.submits and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.submits, "the append never opened the call"
+    ws.close()
+    assert ws.close_code == 1000
+    while not server.aborted and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.aborted, "closing the socket did not abort the call"

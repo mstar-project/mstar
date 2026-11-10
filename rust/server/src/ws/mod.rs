@@ -27,6 +27,15 @@ pub fn max_message_bytes() -> usize {
         .unwrap_or(crate::body_limit_mb() << 20)
 }
 
+/// Completes the close handshake a client started. tungstenite queues its
+/// reply when it reads the client's Close and writes it on the next read,
+/// write or flush, so a route that returns on that Close flushes first, or the
+/// client sees the connection drop (1006) where uvicorn completed the
+/// handshake.
+pub async fn answer_close<S: futures::Sink<Message> + Unpin>(sink: &mut S) {
+    let _ = futures::SinkExt::flush(sink).await;
+}
+
 /// The close a failed read gets: a message past [`max_message_bytes`] is 1009,
 /// with the reason uvicorn's `websockets` gives it. tungstenite answers that
 /// read with an error and queues no close, and it is not a dependency of this
