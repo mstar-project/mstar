@@ -151,7 +151,7 @@ async fn main() {
     }
 
     sndfile::init();
-    if adapters::from_python(&python_adapter).is_some_and(|a| a.supports_realtime_transcription()) {
+    if realtime::live_transcription() || adapters::from_python(&python_adapter).is_some_and(|a| a.supports_realtime_transcription()) {
         realtime::report_availability();
     }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));

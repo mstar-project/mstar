@@ -411,7 +411,9 @@ Read by the ``mstar-server`` binary and its bridge
      - unset
      - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: for a
        model with an audio client stream, what a conversation needs from it
-       (``conversation_facts``); for realtime transcription, the ONNX Runtime
+       (``conversation_facts``), or, for one with no turn tokens, the stream a
+       live transcription feeds and its bound on a call; for realtime
+       transcription, the ONNX Runtime
        library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
        load (if it didn't), and the model's tokenizer. Not for deployments to
        set: ``launch_rust_server`` sets it from ``realtime_facts``.

@@ -315,11 +315,14 @@ def onnxruntime_library() -> str | None:
 
 
 def conversation_facts(server) -> dict | None:
-    """What a ``/v1/realtime`` conversation needs from a model with a
-    ``ClientAudio`` client stream, as the Python route reads it off the model:
-    how many such streams, whether it has turn tokens and its output channels
-    (which decide whether it converses), and, for one that does, its stream
-    and the reply settings. ``None`` for a model with no such stream."""
+    """What ``/v1/realtime`` needs from a model with a ``ClientAudio`` client
+    stream, as the Python route reads it off the model: how many such streams,
+    whether it has turn tokens and its output channels (which decide whether
+    it converses), and, for one that does, its stream and the reply settings.
+    A model that hears transcription as it comes instead
+    (``Model.live_transcription_stream``) gets its stream and that stream's
+    bound on a call's samples (``max_items``, None for none). ``None`` for a
+    model with no such stream."""
     audio = list(getattr(server, "client_audio", None) or [])
     if not audio:
         return None
@@ -333,19 +336,26 @@ def conversation_facts(server) -> dict | None:
             output_rate=model.get_output_sample_rate("audio"), voice=model.get_default_voice(),
             idle_steps=model.turn_idle_steps, silence_rms=float(model.turn_silence_rms),
         )
+    elif (stream := model.live_transcription_stream) is not None:
+        facts.update(
+            stream=stream.edge_name, rate=stream.audio.sample_rate, frame_samples=stream.audio.frame_samples,
+            max_items=stream.limits.max_items if stream.limits is not None else None,
+        )
     return facts
 
 
 def realtime_facts(server, adapter, directory: str) -> dict | None:
     """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
     ``conversation`` is ``conversation_facts``'. For a realtime transcription
-    surface: ONNX Runtime's library and Silero's weights (``None`` where this
-    server has none, which leaves server_vad off as it is here), why Smart
-    Turn did not load (``None`` when it did), and the model's tokenizer,
-    saved under ``directory`` for the stable prefix. ``None`` for any other
-    model."""
+    surface (an adapter that re-decodes, or a model that hears it live): ONNX
+    Runtime's library and Silero's weights (``None`` where this server has
+    none, which leaves server_vad off as it is here), why Smart Turn did not
+    load (``None`` when it did), and the model's tokenizer, saved under
+    ``directory`` for the stable prefix. ``None`` for any other model."""
     conversation = conversation_facts(server)
-    transcribes = adapter is not None and getattr(adapter, "supports_realtime_transcription", False)
+    # a live transcription model's sessions take turn detection as the re-decoding ones do
+    live = conversation is not None and not conversation["turn_tokens"] and "stream" in conversation
+    transcribes = adapter is not None and (getattr(adapter, "supports_realtime_transcription", False) or live)
     if not transcribes and conversation is None:
         return None
     facts = {"conversation": conversation}

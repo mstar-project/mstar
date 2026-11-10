@@ -5,7 +5,9 @@ opening and every append's samples, and plays a fixed script of text and
 audio chunks (each stamped with its loop step and turn marks, as the data
 worker stamps them). Each case sends the same client events to both and
 compares every server event (ids numbered in order of appearance), how the
-socket closed, and the audio the stream got, sample for sample.
+socket closed, and the audio the stream got, sample for sample. Without turn
+tokens and with an adapter, the same model transcribes live: one call per
+item, which its commit ends.
 """
 
 import asyncio
@@ -35,7 +37,14 @@ from starlette.websockets import WebSocketDisconnect
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 
 from mstar.api_server import entrypoint, media_io
-from mstar.api_server.rust_frontend import REALTIME_ENV, RustFrontendBridge, realtime_facts
+from mstar.api_server.openai.adapters import get_adapter
+from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
+    REALTIME_ENV,
+    RustFrontendBridge,
+    openai_adapter_class,
+    realtime_facts,
+)
 from mstar.streaming.topology import CLIENT, ClientAudio, Connection
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -62,18 +71,21 @@ class _Model:
 
 class _Duplex:
     """One live call at a time, on either frontend: plays ``script`` as the
-    call's output once the call has heard audio, then ends it (``end``) or waits until the call is aborted
-    or rejected. ``refuse`` opens are refused at capacity first; past
+    call's output once the call has heard audio, then ends it (``end``) or
+    waits until the call is aborted, rejected or its input ended; an error
+    chunk ends it too. ``refuse`` opens are refused at capacity first; past
     ``BUDGET`` an append is refused as the call's input cap refuses it, and
     an append of one sample of 0.5 fails inside the server."""
 
-    def __init__(self, upload_dir: Path, **model):
-        self.model_name = "duplex_test"
+    def __init__(self, upload_dir: Path, name="duplex_test", **model):
+        self.model_name = name
         self.model = _Model()
         for k, v in model.items():
             setattr(self.model, k, v)
         self.client_audio = [Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None,
                                         audio=ClientAudio(16000, FRAME))]
+        # Model.live_transcription_stream: the one ClientAudio stream, with no turn tokens
+        self.model.live_transcription_stream = self.client_audio[0] if self.model.turn_tokens is None else None
         self.client_streams = frozenset({"audio_in"})
         self.takes_stream_input = True
         self.upload_dir = upload_dir
@@ -84,6 +96,7 @@ class _Duplex:
     def reset(self, script=(), end=True, refuse=0):
         self.script, self.end, self.refuse = list(script), end, refuse
         self.submits, self.appends, self.aborted, self.rejected = [], [], [], []
+        self.ended = 0   # calls whose input the client ended
         self.call = None
 
     def cleanup(self):
@@ -96,8 +109,9 @@ class _Duplex:
         if self.refuse:
             self.refuse -= 1
             raise HTTPException(503, "at capacity")
-        self.submits.append({k: kw.get(k) for k in ("text", "input_modalities", "output_modalities", "end_input")})
-        self.call = {"rid": request_id, "bytes": 0, "error": None, "over": False}
+        self.submits.append({**{k: kw.get(k) for k in ("text", "input_modalities", "output_modalities", "end_input")},
+                             "model_kwargs": kw.get("model_kwargs") or None})
+        self.call = {"rid": request_id, "bytes": 0, "error": None, "over": False, "heard": False}
         return request_id
 
     def submission_key(self, request_id):
@@ -111,7 +125,15 @@ class _Duplex:
 
     def stream_input(self, key, file_paths=None, end_input=False, *, text=None, file_streams=None,
                      model_kwargs=None, on_late=None, samples=None):
-        assert file_paths is None and text is None and set(samples) == {"audio_in"}
+        assert file_paths is None and text is None
+        if end_input is True and not samples:
+            # a live transcription's commit: the call's input ends, and its output with it
+            if not self.taking_input(key):
+                return False
+            self.ended += 1
+            self.call["over"] = True
+            return True
+        assert set(samples) == {"audio_in"}
         audio = samples["audio_in"]
         assert audio.dtype == np.float32
         if not self.taking_input(key):
@@ -121,6 +143,7 @@ class _Duplex:
         if self.call["bytes"] + audio.nbytes > BUDGET:
             raise ValueError(f"call input is past {BUDGET} bytes")
         self.call["bytes"] += audio.nbytes
+        self.call["heard"] = True
         self.appends.append(audio.copy())
         return True
 
@@ -133,11 +156,14 @@ class _Duplex:
 
     async def iter_result_chunks(self, request_id):
         call = self.call
-        # a duplex model speaks once it hears: the script plays after the first append
-        while self.script and not self.appends and not call["over"]:
+        # a duplex model speaks once it hears: the script plays after the call's first append
+        while self.script and not call["heard"] and not call["over"]:
             await asyncio.sleep(0.002)
         for chunk in self.script:
             yield chunk
+            if chunk.modality == "error":
+                call["over"] = True
+                return
             await asyncio.sleep(0)
         while not self.end and not call["over"]:
             await asyncio.sleep(0.005)
@@ -157,7 +183,8 @@ def _rust(server: _Duplex, **extra_env):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_conv_")
     env = {k: v for k, v in os.environ.items() if not k.startswith("MSTAR_")} | extra_env
-    env[REALTIME_ENV] = json.dumps(realtime_facts(server, None, bridge_dir))
+    env[OPENAI_ADAPTER_ENV] = openai_adapter_class(server.model_name)
+    env[REALTIME_ENV] = json.dumps(realtime_facts(server, get_adapter(server.model_name), bridge_dir))
     proc = subprocess.Popen([BINARY, server.model_name, str(port), bridge_dir, str(server.upload_dir)], env=env)
     bridge = RustFrontendBridge(server, bridge_dir)
     threading.Thread(target=bridge.run, daemon=True).start()
@@ -175,6 +202,8 @@ MODELS = {
     "idle": {"turn_idle_steps": 2},
     "no-turns": {"turn_tokens": None},
     "stereo": {"channels": 2},
+    # transcribed as it comes: no turn tokens, and an adapter
+    "live": {"name": "nemotron_asr", "turn_tokens": None},
 }
 
 
@@ -195,14 +224,17 @@ _IDS = re.compile(r"\b(resp|item|sess|event)_[0-9a-f]{12,16}\b")
 
 
 def _normalized(events: list[dict]) -> list[dict]:
-    """Ids numbered in order of appearance (event ids dropped), error ids as X."""
+    """Ids numbered in order of appearance (event and transcription session
+    ids, and timestamps, dropped), error ids as X."""
     seen: dict = {}
 
     def number(m):
         return f"{m.group(1)}_{seen.setdefault(m.group(0), len(seen))}"
     out = []
     for e in events:
-        e = {k: v for k, v in e.items() if k != "event_id"}
+        e = {k: v for k, v in e.items() if k not in ("event_id", "created")}
+        if e["type"].startswith("transcription_session."):
+            e["session"] = {**e["session"], "id": "S"}
         text = re.sub(r"error id [0-9a-f]{12}", "error id X", json.dumps(e, sort_keys=True))
         out.append(json.loads(_IDS.sub(number, text)))
     return out
@@ -258,7 +290,7 @@ def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, u
         server.reset(script, end, refuse)
         evs, code = run()
         out.append((_normalized(evs), code, {"submits": server.submits, "appends": list(server.appends),
-                                              "rejected": server.rejected}))
+                                              "rejected": server.rejected, "ended": server.ended}))
     return out
 
 
@@ -294,6 +326,7 @@ def _assert_same(py, rust, *, audio=True):
     assert rust_code == py_code
     assert rust_call["submits"] == py_call["submits"]
     assert rust_call["rejected"] == py_call["rejected"]
+    assert rust_call["ended"] == py_call["ended"]
     if audio:
         assert len(rust_call["appends"]) == len(py_call["appends"])
         for r, p in zip(rust_call["appends"], py_call["appends"], strict=True):
@@ -422,7 +455,7 @@ def test_settings_are_fixed_once_audio_flows(stacks, monkeypatch):
                      until=lambda evs: _is_end(evs[-1]))
     _assert_same(py, rust)
     assert py[2]["submits"] == [{"text": "Hi.", "input_modalities": ["text"], "output_modalities": ["text", "audio"],
-                                 "end_input": False}]
+                                 "end_input": False, "model_kwargs": None}]
 
 
 def test_client_events_read_as_pythons(stacks, monkeypatch):
@@ -482,6 +515,50 @@ def test_a_paused_client_is_padded_with_whole_frames_of_silence(stacks, monkeypa
         tone, *pads = call["appends"]
         assert tone.size == 4000 and pads and all(not p.any() and p.size % FRAME == 0 for p in pads)
         assert 6 * FRAME <= sum(p.size for p in pads) <= 13 * FRAME
+
+
+def _session(**session) -> dict:
+    return {"type": "transcription_session.update", "session": session}
+
+
+COMMIT = {"type": "input_audio_buffer.commit"}
+LIVE = {
+    # the knobs and prompt a live model can't apply, and a language change mid-item, refused;
+    # two items, each a call, the second opened in the language set between them
+    "completed": ([_text(0, b" hello"), _text(1, " wö".encode()[:3]), _text(2, " wö".encode()[3:] + b"rld")], [
+        _session(mstar={"chunk_seconds": 1.0}), _session(input_audio_transcription={"prompt": "names"}),
+        _append(_tone(16000, 0.3).tobytes()), 0.3, _session(input_audio_transcription={"language": "de"}),
+        _append(_tone(16000, 0.1).tobytes()), COMMIT,
+        _session(input_audio_transcription={"language": "de", "prompt": ""}),
+        _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
+    # each item's call fails after its first append: the rest of the item is dropped, its commit reports it
+    "failed": ([_text(0, b" hello"), _Chunk("error", b"boom reading /srv/ckpt/model.safetensors", {"status": 500})], [
+        _append(_tone(16000, 0.2).tobytes()), 0.3, _append(_tone(16000, 0.2).tobytes()), COMMIT,
+        _append(_tone(16000, 0.1).tobytes()), 0.3, COMMIT, END]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LIVE))
+def test_live_transcription_reads_as_pythons(stacks, monkeypatch, name):
+    """A model with no turn tokens hears transcription as it comes, with the
+    intent omitted: each item is a call its first append opens and its commit
+    ends, whose text streams as deltas and partials."""
+    script, events = LIVE[name]
+    py, rust = _both(stacks, monkeypatch, "live", events, script=script, end=False,
+                     until=lambda evs: _is_end(evs[-1]))
+    _assert_same(py, rust)
+    kinds = _kinds(py[0])
+    if name == "completed":
+        assert [e["error"]["message"].split(":")[0] for e in py[0] if e["type"] == "error"][:3] == [
+            "mstar.chunk_seconds does not apply here",
+            "input_audio_transcription.prompt is not supported by this model",
+            "commit or clear the input audio buffer before changing the language"]
+        assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello wörld"] * 2
+        assert [s["model_kwargs"] for s in py[2]["submits"]] == [None, {"language": "de"}]
+        assert py[2]["ended"] == 2 and "mstar.transcription.partial" in kinds
+    else:
+        assert kinds.count("conversation.item.input_audio_transcription.failed") == 2
+        assert len(py[2]["appends"]) == 2 and py[2]["ended"] == 0
 
 
 @pytest.mark.parametrize("kind, query", [

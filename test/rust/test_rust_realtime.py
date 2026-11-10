@@ -76,6 +76,8 @@ def _tokenizer():
 
 
 class _Model:
+    live_transcription_stream = None   # re-decoded, not heard as it comes
+
     def __init__(self):
         self.tokenizer = _tokenizer()
 

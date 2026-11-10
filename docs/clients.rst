@@ -512,7 +512,8 @@ Endpoints and model coverage:
        each agent reply out as one response (audio and its transcript). The model
        decides when to speak; see below.
    * - ``WS /v1/realtime?intent=transcription``
-     - models whose adapter can continue a hypothesis
+     - models whose adapter can continue a hypothesis, and models that hear audio as it
+       comes (``nemotron_asr`` with ``live_lookahead``; ``intent`` may be omitted)
      - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
