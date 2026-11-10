@@ -664,7 +664,7 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
         plans = {}
         for plan_label, packing in self._query_packings(step, ctx).items():
             request_rows = kernel_rows(
-                self._build_indptrs(packing, context_views, plan_label), page_size,
+                self._build_indptrs(packing, context_views), page_size,
             )
             if lease is not None:
                 num_rows = lease.bucket.num_tokens
