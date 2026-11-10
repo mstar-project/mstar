@@ -138,6 +138,7 @@ def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
     def group(size):
         return CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
@@ -152,6 +153,7 @@ def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
     spec.shard_key = "shard" if ulysses else None
     mgr = build_resource(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
+        dependencies={"shard": SeqShardSpec("shard", {"dit"}, ("main",), 0)} if ulysses else {},
     ))
     assert mgr._kwargs["num_qo_heads"] == heads
 

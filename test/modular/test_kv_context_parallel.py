@@ -973,8 +973,7 @@ def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_
     first whatever the keys' order."""
     # one rank of the two, with no group to connect
     monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
+    groups = _sp_groups(NODE)
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS, max_num_pages=8,
@@ -1452,7 +1451,6 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
     declarations, built as the engine builds them. Two steps (a first prefill, then one over stored
     context with a fresh row and a riding decode row) run split, eager and compiled, and give what
     they give copied; a split prefill samples each row's last token."""
-    from mstar.engine.resources.base import head_shards
     from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
     from mstar.engine.resources.step import SubmoduleStep
     from mstar.model.components import MoeParallelConfig
@@ -1514,7 +1512,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 key: build_resource(spec, EngineResourceInfo(
                     device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
                     dependencies={dep: by_key[dep] for dep in spec.depends_on()},
-                    head_shards=head_shards(joint, placed),
+                    replicated_over_sp=placed,
                 ))
                 for key, spec in by_key.items()
             }

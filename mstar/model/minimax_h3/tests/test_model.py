@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -115,7 +117,7 @@ def test_resources_per_backend():
     specs = {s.resource_key: s for s in _model().get_node_resources()}
     assert set(specs) == {VAE_SHARD, DIT_SHARD, DIT_ATTN, REFINER_ATTN}
     assert specs[DIT_ATTN].nodes == {"dit"} and specs[DIT_ATTN].sp_exchange == "ulysses"
-    assert specs[REFINER_ATTN].nodes == {"text_encoder"} and specs[REFINER_ATTN].sp_exchange is None
+    assert specs[REFINER_ATTN].nodes == {"text_encoder"} and specs[REFINER_ATTN].sp_exchange == "none"
     assert not specs[VAE_SHARD].exchanges and specs[DIT_SHARD].exchanges
 
 
@@ -513,7 +515,8 @@ def _sp_resources(model: H3Model, keys, group) -> dict:
     for key in keys:
         if isinstance(getattr(specs[key], "config", None), RaggedAttentionConfig):
             specs[key].config.dtype, specs[key].config.workspace_mb = torch.float32, 1
-        res[key] = build_resource(specs[key], info)
+        deps = {dep: specs[dep] for dep in specs[key].depends_on()}
+        res[key] = build_resource(specs[key], dataclasses.replace(info, dependencies=deps))
     for key in keys:
         res[key].bind_dependencies({dep: res[dep] for dep in specs[key].depends_on()})
     return res
