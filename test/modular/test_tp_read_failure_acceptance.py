@@ -697,7 +697,7 @@ def _probe(engine, rid, tokens):
     )
     hits = engine.decide_cached_prefix(batch)
     leases = hits.get(rid, {})
-    return {label: list(pages) for label, pages in leases.items()}
+    return {label: lease.pages() for label, lease in leases.items()}
 
 
 def _reporting_failures(all_reduce, rank, outbox):
