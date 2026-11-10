@@ -270,17 +270,18 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
     out.update(run=run, checks=",".join([k for k in CHECKS if k in asked] or CHECKS))
     passed = bot.passed_on_ancestor(REPO, last, head_sha)
+    covered = passed and set(vendors) <= set(last["vendors"])  # that pass ran on every vendor this run needs
     untested = not last and rereview and (run == "targeted" or run == "none" and touches_runtime(pr, head_sha))
     forced = None if rereview and beyond_vendors(live.get("untestable"), vendors) \
-        else "failed" if last and not passed else "untested" if untested \
-        else "vendors" if passed and not set(vendors) <= set(last["vendors"]) else None
+        else "failed" if last and not passed else "untested" if untested else "vendors" if not covered and passed \
+        else None
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
               "kind of check.")
         out.update(run="full", checks=",".join(CHECKS), asked=run, asked_checks=out["checks"], forced=forced)
     elif run == "none":
         out["verdict"] = "skipped"
-    elif run == "targeted" and passed:
+    elif run == "targeted" and covered:
         out["since"] = last["sha"]
         Path("earlier-live-test.md").write_text(last["body"])
 

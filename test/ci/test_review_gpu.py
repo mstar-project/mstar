@@ -217,6 +217,10 @@ class TestCarry(unittest.TestCase):
             with self.subTest(earlier["body"].split("\n")[0]):
                 self.assertEqual(self.carry(True, "targeted", ["correctness"], [earlier], "ahead", files=rocm)[0],
                                  outputs, "an NVIDIA-only pass would let the AMD box test only the commits since it")
+        self.assertEqual(self.carry(True, "targeted", ["correctness"], [live_test("pass", vendors="nvidia")], "ahead",
+                                    files=rocm, untestable="AMD kernels; the Intel XPU path")[0],
+                         {"run": "targeted", "checks": "correctness"},
+                         "an AMD box would test only the commits since an NVIDIA-only pass")
 
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
