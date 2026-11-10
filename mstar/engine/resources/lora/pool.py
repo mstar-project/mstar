@@ -377,7 +377,8 @@ class LoraAdapterPool(Resource):
                 # the instance's leader picks every batch; the others run what it picked
                 decides = joint.rank == 0
         return cls(
-            spec, info.device, rank=rank, world_size=world_size, dtype=info.compute_dtype,
+            spec, info.device, rank=rank, world_size=world_size,
+            dtype=info.resolve_dtype(spec.dtype, spec.resource_key),
             agree=agree, decides=decides,
         )
 
@@ -392,8 +393,8 @@ class LoraAdapterPool(Resource):
         agree: Callable[[list[int]], list[int]] | None = None,
         decides: bool = True,
     ):
-        """``dtype`` is the nodes' compute dtype, which the slot weights take unless the
-        spec names one. ``agree`` takes the lowest of each value across the pool's lockstep
+        """``dtype`` is the slot weights' dtype, as ``build`` resolves it: the spec's,
+        else the nodes' compute dtype. ``agree`` takes the lowest of each value across the pool's lockstep
         instance (a collective); None on a single rank. ``decides`` says whether this rank
         chooses batches, and so admits requests (``ask``): False on a lockstep instance's
         followers."""
@@ -403,8 +404,8 @@ class LoraAdapterPool(Resource):
         self.dtype = spec.dtype or dtype
         if self.dtype is None:
             raise ValueError(
-                f"LoRA resource {spec.resource_key!r} has no dtype: its nodes run outside "
-                "autocast, so the spec must name the dtype of their weights"
+                f"LoRA resource {spec.resource_key!r} has no dtype: name it on the spec, or "
+                "pass the nodes' compute dtype"
             )
         self.backend = backend if backend is not None else make_backend(spec.backend, self._device)
         self._agree = agree

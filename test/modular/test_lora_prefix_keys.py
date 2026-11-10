@@ -204,7 +204,7 @@ def test_each_adapters_requests_are_keyed_under_its_weights(adapters):
     on_b, on_alias = _run(worker, "b", served), _run(worker, "alias", served)
     # the root names the weights a worker's pool serves under the pinned digest
     spec = lora_spec(serving_resources(_Model(), config))
-    pinned = LoraAdapterStore(spec, pin=False).load("a", adapters["a"], spec.adapter_digests["a"])
+    pinned = LoraAdapterStore(spec, torch.float32, pin=False).load("a", adapters["a"], spec.adapter_digests["a"])
     root = adapter_prefix_root(pinned.digest)
     assert on_a["prefix_root"] == root and len(root) == 32
     assert "prefix_root" not in base and _handed_over(base).prefix_root == b""
