@@ -7,6 +7,7 @@ reaches a handle-keyed map just misses.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
@@ -18,6 +19,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.worker.host_pool import HostPool
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import REMOVED_RID
 from mstar.worker.preemption import Preempted
@@ -175,8 +177,11 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
     a, b = t.handle("req-a"), t.handle("req-b")
-    w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": {a, b}}
-    w._rebuilds._refused = {"n": {a: 32}}
+    w._rebuilds._pool = HostPool(16, torch.device("cpu"))
+    pieces = {rid: w._rebuilds._pool.take(8) for rid in (a, b)}
+    w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": dict(pieces)}
+    w._rebuilds._prefilling = {"n": {a, b}}
+    w._rebuilds._writes = {a: {"n": ["kv"]}, b: {"n": ["kv"]}}
     w._rebuilds._cursors[("n", a)] = None
     w.preemption._preempted[a] = Preempted()
     w.streams._rids.add(a)
@@ -192,8 +197,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert b in w.request_state.per_request_info
     assert a not in w.scheduler.admission.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
-    assert w._rebuilds._keeps_ids == {"n": {b}}, "the next request would keep ids it can't be dropped with"
-    assert w._rebuilds._refused == {"n": {}}, "the next request would keep no ids from its last prompt chunk"
+    assert w._rebuilds._keeps_ids == {"n": {b: pieces[b]}}, "the next request would keep ids it can't be dropped with"
+    assert w._rebuilds._prefilling == {"n": {b}}, "the next request's steps would be recorded as this one's"
+    assert w._rebuilds._writes.keys() == {b}, "rank 0's refusal of the next request's log would find this one's"
     assert not (w._rebuilds._cursors or w.preemption._preempted), (
         "the next request would run this one's rebuild, or be counted as preempted"
     )

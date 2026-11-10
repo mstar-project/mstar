@@ -12,17 +12,19 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
-from test_kv_preemption import _pool
+from test_kv_preemption import PAGE_SIZE, _pool, _running
+from test_kv_preemption import _step as _kv_step
 from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, Residency, StepContext
+from mstar.engine.engine import ExecutingBatch, PagedKVCache
+from mstar.engine.resources import AllocationFailed, Residency, StepAllowance, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
@@ -32,9 +34,18 @@ from mstar.testing_utils.model import make_model
 from mstar.testing_utils.worker import make_worker, preempting
 from mstar.worker import worker as worker_mod
 from mstar.worker.executing_batch import build_executing_batch
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, ScheduledBatch
-from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import (
+    KeptIds,
+    LayoutRow,
+    NodeWrites,
+    PlannedRow,
+    Prefilling,
+    RebuildCursor,
+    Rebuilds,
+    RowRecord,
+)
 from mstar.worker.speculation import Speculation
 from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -42,7 +53,7 @@ from mstar.worker.worker import _make_rebuilds
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
-POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="loop")
+POLICY = RebuildPolicy(walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="loop")
 
 
 def _graphs() -> dict:
@@ -55,9 +66,14 @@ def _graphs() -> dict:
     }
 
 
+def _record(prompt=(1, 2, 3)) -> RowRecord:
+    """A prefill step that read ``prompt`` as int64 ids."""
+    return RowRecord({"text_inputs": [torch.tensor(prompt)]}, {"is_prefill": True})
+
+
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    view = torch.tensor(prompt, dtype=torch.long)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", sampled))
+    """A log of one prefill step that read ``prompt``, and ``sampled``."""
+    return KeptIds((LayoutRow(PREFILL, len(prompt)),), [_record(prompt)], array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -165,7 +181,8 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     eng.land_rebuild = lambda node, rid: landed.append(rid)
     w, node, walk = _worker(eng, _Runtime(), (R, 1, 2)), "vocoder", "w"
     w._rebuilds._policies, w._rebuilds._kept = {node: POLICY}, {node: {1: _kept()}}
-    w._rebuilds._cursors[(node, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long)
+    w._rebuilds._prefilling = {node: set()}
+    w._rebuilds._cursors[(node, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, _record()),), array("i"))
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, 1: 0, 2: 0}, rebuild_rids=frozenset({R})), batch, node,
@@ -175,6 +192,93 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
         w.executor.postprocess(pending, outputs)
     assert list(w._rebuilds._kept[node][1].sampled) == [5], "a drop would find no samples and refuse"
     assert landed == [R], "the rebuilt request would never be ready to decode again"
+
+
+def test_a_request_with_images_that_samples_a_pad_id_never_leaves_an_older_one_waiting_for_good(monkeypatch):
+    """A request with images that samples an image pad keeps no ids from then on, since its rebuild row would give
+    the pad an encoder row. Its pool had admitted it as a request a drop frees and was never told otherwise, so
+    with no host pool nothing could move it. An older request that ran short beside it waited for it, and it waited
+    for the older one."""
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = _pool()
+    # R and A hold 3 of the 10 pages each, and the 4 left are what A grows into
+    _running(kv, R, 3, arrival=1)
+    _running(kv, A, 3, arrival=2)
+    eng = _engine(_Sub())
+    w, node, walk = _worker(eng, _Runtime(), (R, A)), "vocoder", "w"
+    w.engine_manager.engine = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({node}), kv)])
+    preempting(w)
+    w._rebuilds._policies = {node: replace(POLICY, pad_ids=frozenset({90}))}
+    # A's prompt step read an encoder's output besides its ids
+    media = RowRecord({"text_inputs": [torch.tensor([1, 2, 3])], "embeds": [torch.zeros(1, 2)]}, {"is_prefill": True})
+    w._rebuilds._kept = {node: {A: replace(_kept(), records=[media])}}
+    w._rebuilds._keeps_ids, w._rebuilds._prefilling = {node: {}}, {node: set()}
+    batch = _step((R, A), walk, node, rebuild=None)
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, A: 0}), batch, node, "p", walk, Future())
+    # A samples the image pad
+    outputs = BatchedModelOutput(per_rid_outputs={R: {"new_token": [torch.tensor([5])]},
+                                                  A: {"new_token": [torch.tensor([90])]}})
+    with pytest.raises(_ReachedRoutingError):
+        w.executor.postprocess(pending, outputs)
+
+    for _ in range(2):
+        _kv_step(kv, R, PAGE_SIZE)
+    assert all(_kv_step(kv, A, PAGE_SIZE).ok for _ in range(4)), (
+        "A ran short beside an older request that can't move it, and each waits for the other"
+    )
+
+
+@pytest.mark.parametrize("build", ["executing", "speculative"])
+def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_ids(build):
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng = _engine(_Sub())
+    eng.land_rebuild = lambda node, rid: None
+    w, node, walk = _worker(eng, _Runtime(), (R, 1, 2)), "vocoder", "w"
+    w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
+    w._rebuilds._copied, w._rebuilds._ids_walks = {node: {walk: frozenset({"embeds"})}}, {node: frozenset({walk})}
+    w._rebuilds._kept = {node: {1: KeptIds((LayoutRow(walk, 4),))}}
+    w._rebuilds._prefilling = {node: {1}}
+    w._rebuilds._pool, w._rebuilds._allowance = (pool := HostPool(1 << 10, torch.device("cpu"))), StepAllowance()
+    w._rebuilds._keeps_ids = {node: {1: pool.take(64)}}
+    embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
+    batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
+        rid: {"embeds": [] if build == "speculative" else [t], "text_inputs": [t]} for rid, t in embeds.items()
+    })
+    if build == "speculative":
+        # a speculated step gets its embeds only once the encoder has run
+        spec = Speculation(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, {("embeds", node)}, {R, 1, 2}, "p",
+                           is_new_iter=False, is_same_node=False)
+        w.speculator.thread_outputs(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
+    for rid, info in batch.per_request_info.items():
+        info.graph_walk, info.step_metadata = walk, {"prefill_order": (rid,)}
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
+    outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
+    with pytest.raises(_ReachedRoutingError):
+        w.executor.postprocess(pending, outputs)
+    # what the worker does once the step's outputs are sent
+    w._rebuilds.flush()
+
+    assert w._rebuilds._kept[node][1].records[0].inputs["embeds"][0].tolist() == embeds[1].tolist(), (
+        "a rebuild would need the encoder to run again"
+    )
+
+
+def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
+    w, _ = _worker()
+    w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
+    record = replace(_record(), step_metadata={})
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, record),), array("i"))
+
+    node_batch = build_executing_batch(
+        w.pipeline._services, ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})),
+    )
+
+    assert node_batch.per_request_info[R].step_metadata == {}, "the rebuild row would run under decode's metadata"
 
 
 @pytest.mark.parametrize("why", ["no ids", "backlog", "prefill walk", "samples short"])
@@ -211,106 +315,108 @@ def test_a_lockstep_node_keeps_ids_and_sets_the_pool_aside():
     model = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
-    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, torch.device("cpu"))
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine)
 
     assert rebuilds.pool is not None and NODE in rebuilds.nodes, "a follower would have no ids to replay a drop from"
 
 
-def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool_and_keeps_every_prompt():
-    """A follower holds the ids of requests rank 0 has torn down until it tears them down too, and has to keep every
-    prompt rank 0 keeps."""
-    model = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+def _make_media_rebuilds(config: dict) -> Rebuilds:
+    """`_make_rebuilds` on a worker whose node copies media."""
+    from test_rebuild_policy import MEDIA, VISION
+    from test_rebuild_policy import _graphs as media_graphs
+
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
+    my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    return _make_rebuilds(model, config, my_walks, set(), torch.device("cpu"), engine)
+
+
+@pytest.mark.parametrize("config, mb", [({}, 1024), ({"rebuild_host_mb": 2}, 2)])
+def test_rebuild_host_mb_alone_sizes_the_pool_of_a_node_that_copies_media(monkeypatch, config, mb):
+    """``rebuild_media_host_mb`` was added to ``rebuild_host_mb`` where a node copies media, so two keys sized one
+    pool and only ever added up."""
+    monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
+
+    assert _make_media_rebuilds(config).pool.nbytes == mb << 20, "the pool would be another size than the key says"
+
+
+def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool():
+    """A follower holds the logs of requests rank 0 has torn down until it tears them down too."""
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
-    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, torch.device("cpu"), frozenset({NODE}))
+    try:
+        leader = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, set(), torch.device("cpu"), engine)
+        follower = _make_rebuilds(
+            model, {"rebuild_host_mb": 1}, my_walks, set(), torch.device("cpu"), engine, frozenset({NODE}),
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert leader.pool.nbytes == 1 << 20 and follower.pool.nbytes == 2 << 20, "the follower's pool is rank 0's size"
+
+
+def test_a_follower_of_a_lockstep_node_takes_room_past_its_pool_for_every_log():
+    """Rank 0's pool decides which requests keep a log, so a follower whose pool is full still takes room for one."""
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    my_walks = {(NODE, PREFILL), (NODE, DECODE)}
+    rebuilds = _make_rebuilds(
+        model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine, frozenset({NODE}),
+    )
     writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
-    layout = StreamLayout(spans=(PrefixSpan(2, 2, PREFILL),), growth=(("loop", 1),))
-    assert rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False) == {"kv": True}
-    ctx = SimpleNamespace(graph_walk=PREFILL, request_walks={})
-    prompt = torch.zeros(3 << 17, dtype=torch.long)
+    # 6 MiB of ids, past the follower's 2 MiB
+    layout = StreamLayout(spans=(PrefixSpan(3 << 18, 3 << 18, PREFILL),), growth=(("loop", 1),))
 
-    assert rebuilds.pool.nbytes == 2 << 20, "the follower's pool is no larger than rank 0's"
-    assert not rebuilds.keep_prompts(SimpleNamespace(
-        node_name=NODE, step_context=ctx, per_request_input_tensors={R: {"text_inputs": [prompt]}},
-        completion_event=None,
-    ))
-    assert rebuilds.kept(R, NODE) is not None, "rank 0 can drop a request the follower keeps no ids for"
+    ingested = rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False)
 
-
-def _journaled(*steps: tuple[dict, set]) -> list[int]:
-    """Postprocess ``steps``, each a step's inputs and its rows mid-prefill, on a node whose pool holds no prompt,
-    and return the requests rank 0 journals as keeping no ids."""
-    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
-
-    eng, journaled = _engine(_Sub()), []
-    eng.keeps_no_ids = lambda node, rid: journaled.append(rid)
-    w, node, walk = _worker(eng, _Runtime(), (1, 2)), "vocoder", "w"
-    w._rebuilds._policies = {node: RebuildPolicy(walk, "text_inputs", "new_token", "loop")}
-    w._rebuilds._kept, w._rebuilds._keeps_ids, w._rebuilds._refused = {node: {}}, {node: {1, 2}}, {node: {}}
-    w._rebuilds._pool = HostPool(8, torch.device("cpu"))
-    for inputs, mid_prefill in steps:
-        batch = _step(tuple(inputs), walk, node)
-        eng.prepare_inputs(batch)
-        batch.per_request_input_tensors = inputs
-        scheduled = ScheduledBatch(node, walk, dict.fromkeys(inputs, 0), incomplete_node_rids=mid_prefill)
-        with pytest.raises(_ReachedRoutingError):
-            w.executor.postprocess(
-                PendingBatch(scheduled, batch, node, "p", walk, Future()), BatchedModelOutput(per_rid_outputs={}),
-            )
-    return journaled
-
-
-def _prompt() -> dict:
-    return {"text_inputs": [torch.arange(4)]}
-
-
-def test_postprocess_journals_a_request_whose_last_prompt_chunk_the_pool_couldnt_hold():
-    """Rank 0 journals each request whose prompt its pool couldn't hold once the prompt's last chunk lands, so the
-    followers give back their copies. A request mid-prefill can still keep its prompt at a later chunk that reads it."""
-    journaled = _journaled(({1: _prompt(), 2: _prompt()}, {1}))
-    assert journaled == [2], "the followers keep ids rank 0 never drops with, or give back ids rank 0 may keep"
-
-
-def test_postprocess_journals_a_prompt_refused_at_its_first_chunk_at_a_speculated_last_chunk():
-    """A speculated chunk has no inputs, so after its first chunk a lone long prompt is never read again. Rank 0
-    refused 1's prompt at that chunk and skipped the last one, so it never journaled 1, and the followers kept their
-    copies of 1's prompt until its teardown."""
-    journaled = _journaled(({1: _prompt()}, {1}), ({1: {}}, set()))
-    assert journaled == [1], "the followers hold ids rank 0 never drops with"
-
-
-def test_a_follower_worker_sets_aside_twice_the_rebuild_pool(monkeypatch):
-    """`Worker.__init__` sizes the pool for the nodes the worker follows. Without them a follower set aside what
-    rank 0 does, which the ids of requests rank 0 has torn down and the follower hasn't fill first."""
-    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
-    monkeypatch.setattr(worker_mod, "make_communicator", lambda **kw: SimpleNamespace(
-        register_event_for_poll=lambda event: None))
-    monkeypatch.setattr(worker_mod, "EventWakeup", object)
-    monkeypatch.setattr(worker_mod, "create_tensor_communication_manager", lambda **kw: SimpleNamespace(
-        transfer_engine=None, my_session_id="s", get_tensor=None))
-    monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
-        set_node_metadata=lambda *a, **kw: None))
-    engine = SimpleNamespace(get_stop_policies=lambda node, walk: None, paged_kv_caches=list)
-    monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
-        build=lambda *a, **kw: SimpleNamespace(engine=engine, get_engine=lambda node: engine, side_keys=())))
-    # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
-    model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds
-    monkeypatch.setattr(worker_mod, "_make_rebuilds", lambda m, config, walks, device, *followed: make(
-        model, {"rebuild_host_mb": 1}, walks, device, *followed))
-    # rank 1 of two on ``NODE``
-    groups = SimpleNamespace(
-        init_dist=lambda **kw: None, get_instance_rank_for_node=lambda node: 1,
-        get_instance_world_size_for_node=lambda node: 2,
-    )
-    section = SimpleNamespace(get_nodes=lambda: {NODE}, get_loops=dict)
-    worker = worker_mod.Worker(
-        worker_id="w1", worker_ids=["w0", "w1"], model=None,
-        my_worker_graphs=[SimpleNamespace(section=section, graph_walks={PREFILL, DECODE})],
-        model_config={}, all_worker_graph_ids_to_graph_walks={}, all_worker_graph_ids_to_nodes={},
-        all_worker_graph_ids_to_dyn_loops={}, sharding_config=None, parallel_groups=groups, device=torch.device("cpu"),
+    assert ingested == ({"kv": True}, set()) and rebuilds.kept(R, NODE) is not None, (
+        "rank 0 can drop a request the follower keeps no log of"
     )
 
-    assert worker.layout.followed_nodes == {NODE}
-    assert worker._rebuilds.pool.nbytes == 2 << 20, "the follower's pool is no larger than rank 0's"
+
+@pytest.mark.parametrize("engine_add", ["holds a", "refuses a"])
+def test_intake_journals_each_log_rank_0s_pool_couldnt_hold_once_the_engine_holds_the_request(engine_add):
+    """A follower takes room for every log, so rank 0 journals each one its pool refused, and the follower takes the
+    request in as one no drop frees. When the engine refused a, a journaled refusal reached a follower whose KV had
+    rolled a back, and the follower stopped."""
+    w, eng = _worker(
+        rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu"))),
+        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
+    )
+    journaled, held = [], []
+    eng.keeps_no_ids = lambda node, rid: journaled.append((node, rid))
+
+    def add_request(rid, configs, info=None):
+        if rid == A and engine_add == "refuses a":
+            raise RuntimeError("over capacity")
+        held.append(rid)
+    w.engine_manager.add_request = add_request
+    w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
+    w._graph_runtime.register_stop_limits = lambda rid, info: None
+    w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
+    w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
+
+    for rid in (R, A):
+        info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=_config(), stream_lead_items={})
+        w.ingest._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
+                                                  worker_graph_to_workers={}, initial_inputs=[], request_info=info))
+
+    assert journaled == ([(NODE, A)] if A in held else []), (
+        "a follower keeps a log rank 0's pool couldn't hold, or replays a refusal for a request no KV holds"
+    )
+
+
+def test_rebuild_host_mb_0_rebuilds_no_request_there():
+    """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
+    preemption still ran its pass for the node, as for one with a rebuild policy."""
+    rebuilds = _make_media_rebuilds({"rebuild_host_mb": 0})
+
+    assert rebuilds.pool is None and not rebuilds.nodes, "a node with no pool would still count as one that drops"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
@@ -342,6 +448,8 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
 def test_a_prompts_rebuild_lands_and_leaves_the_prompts_input_to_its_last_chunk():
     w, eng = _worker()
     w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    # its one prefill step was recorded on its first chunk
+    w._rebuilds._kept[NODE][R] = _kept()
     eng.dropped.append(R)
     w._rebuilds.start(R, NODE, Prefilling(PREFILL, 4, 10))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
@@ -373,6 +481,36 @@ def test_a_rebuild_rows_ids_go_to_the_device_on_its_first_chunk_only(chunk):
         assert inputs["text_inputs"][0].tolist() == [1, 2, 3, 4]
     else:
         assert not inputs, "a later chunk is cut from the input the engine prepared on the first"
+
+
+def test_a_request_dropped_in_its_second_prompt_step_reruns_both_and_its_prompt_goes_on_from_its_own_input():
+    """The first row prepares its own input from the log, where the engine keeps the prompt's, so the prompt's input
+    waits aside until the row that resumes it, and the rebuild lands only after that row."""
+    w, eng = _worker()
+    eng.restored = []
+    eng.restore_chunk_inputs = lambda rid, node: eng.restored.append(rid)
+    w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    rows = (LayoutRow(PREFILL, 3), LayoutRow(PREFILL, 5))
+    w._rebuilds._kept[NODE][R] = KeptIds(rows, [_record(), _record((4, 5, 6, 7, 8))])
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE, Prefilling(PREFILL, 2, 5))
+
+    def run(chunk=None):
+        batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+        if chunk is not None:
+            batch.chunk_ranges[R] = chunk
+        node_batch = build_executing_batch(w.pipeline._services, batch)
+        w.executor.postprocess(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+        return node_batch.per_request_input_tensors.get(R, {})
+
+    first = run()
+    assert first["text_inputs"][0].tolist() == [1, 2, 3], "the first row would read the prompt step's input"
+    assert eng.released == eng.restored == [R] and not eng.landed, (
+        "the first row's input would stay on the device, or the prompt's next chunk would find none"
+    )
+    assert not run(ChunkRange(0, 2, 2, 2)), "the prompt's row would prepare an input the engine already keeps"
+
+    assert eng.landed == [R] and eng.released == [R], "the prompt's next chunk would find no input to be cut from"
 
 
 def test_a_skipped_rebuild_row_fails_its_request():
@@ -517,6 +655,35 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
 
 
+def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
+    """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run. Each such pass
+    refills the allowance, so a copy larger than one allowance lands over two passes, with no tick between them."""
+    from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
+    from test_rebuild_policy import _copying, _vision_step
+
+    rebuilds = _copying(R)
+    # half of the row's 16-byte copy
+    rebuilds._allowance = StepAllowance(8)
+    rebuilds.record(_vision_step((R,), {}, completion_event=None))
+    w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
+    w._rebuilds = w.pipeline._rebuilds = rebuilds
+    waits = []
+
+    def wait_for_work(timeout_ms):
+        waits.append(timeout_ms)
+        if len(waits) == 2:
+            raise _StopLoopError
+
+    w.communicator = w.pipeline.communicator = SimpleNamespace(send=lambda *a, **k: None, wait_for_work=wait_for_work)
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    [record] = rebuilds._kept[NODE][R].records
+    assert record.ready(), "the request would wait for its copies with no step to start them"
+    assert waits == [0, 10], "the loop would wait its tick while copies are queued"
+
+
 def test_the_scheduler_sees_the_rows_every_lane_holds():
     w = make_worker()
     shared = w.pipeline.in_flight_rids
@@ -528,4 +695,49 @@ def test_the_scheduler_sees_the_rows_every_lane_holds():
 
     assert w.scheduler.in_flight_rids is shared and held == {R, A} and shared == {A}, (
         "the scheduler shares the set, and would start a rebuild for a row a step in flight holds"
+    )
+
+
+def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
+    """`Worker.__init__` makes its rebuilds for the nodes the worker follows. Without them a follower set aside what
+    rank 0 does and refused a log rank 0 kept once its pool was full."""
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
+    monkeypatch.setattr(worker_mod, "make_communicator", lambda **kw: SimpleNamespace(
+        register_event_for_poll=lambda event: None))
+    monkeypatch.setattr(worker_mod, "EventWakeup", object)
+    monkeypatch.setattr(worker_mod, "create_tensor_communication_manager", lambda **kw: SimpleNamespace(
+        transfer_engine=None, my_session_id="s", get_tensor=None))
+    monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
+        set_node_metadata=lambda *a, **kw: None))
+    engine = SimpleNamespace(
+        get_stop_policies=lambda node, walk: None, paged_kv_caches=list, host_allowance=StepAllowance(),
+        node_dtype=lambda node: torch.float32,
+    )
+    monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
+        build=lambda *a, **kw: SimpleNamespace(engine=engine, get_engine=lambda node: engine, side_keys=())))
+    # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
+    model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds
+    monkeypatch.setattr(
+        worker_mod, "_make_rebuilds", lambda m, config, *args: make(model, {"rebuild_host_mb": 1}, *args),
+    )
+    # rank 1 of two on ``NODE``
+    groups = SimpleNamespace(
+        init_dist=lambda **kw: None, get_instance_rank_for_node=lambda node: 1,
+        get_instance_world_size_for_node=lambda node: 2,
+    )
+    section = SimpleNamespace(get_nodes=lambda: {NODE}, get_loops=dict)
+    worker = worker_mod.Worker(
+        worker_id="w1", worker_ids=["w0", "w1"], model=None,
+        my_worker_graphs=[SimpleNamespace(section=section, graph_walks={PREFILL, DECODE})],
+        model_config={}, all_worker_graph_ids_to_graph_walks={}, all_worker_graph_ids_to_nodes={},
+        all_worker_graph_ids_to_dyn_loops={}, sharding_config=None, parallel_groups=groups, device=torch.device("cpu"),
+    )
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
+    # 6 MiB of ids, past the follower's 2 MiB
+    layout = StreamLayout(spans=(PrefixSpan(3 << 18, 3 << 18, PREFILL),), growth=(("loop", 1),))
+
+    assert worker.layout.followed_nodes == {NODE}
+    assert worker._rebuilds.pool.nbytes == 2 << 20, "the follower's pool is no larger than rank 0's"
+    assert worker._rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False).unheld == set(), (
+        "rank 0 can drop a request the follower keeps no log of"
     )

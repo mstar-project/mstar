@@ -13,32 +13,40 @@ from mstar.utils.device import DeviceCapability
 _ALIGN = 8
 
 
+def aligned(nbytes: int) -> int:
+    """``nbytes`` rounded up to where the next slice can start."""
+    return -(-nbytes // _ALIGN) * _ALIGN
+
+
 class HostSlice(NamedTuple):
     offset: int
     nbytes: int
 
 
 class HostCopy(NamedTuple):
-    """A device tensor copied into the pool: its slice, None for a copy outside the pool, a view of the copy, and
-    the event that records the copy, None when it copied in place."""
-    slice: HostSlice | None
+    """A device tensor copied into the pool: a view of where it went, and the event that records the copy, None
+    when it copied in place."""
     view: torch.Tensor
     landed: torch.Event | None
-
-    def has_landed(self) -> bool:
-        return self.landed is None or self.landed.query()
 
 
 class HostPool:
     """``nbytes`` of host memory allocated once, pinned where ``device`` takes pinned memory, and handed out
-    first fit. Copies run on a stream of the pool's own, so they never wait behind a later step."""
+    first fit. The pool rounds ``nbytes`` up to a power of two, as the pinned allocator does, so it hands out all it
+    pins. Copies run on streams of the pool's own, one each way, so a copy never waits behind a later step, and a
+    copy back to the device never waits behind copies to the host."""
 
     def __init__(self, nbytes: int, device: torch.device) -> None:
         self.device = device
+        nbytes = 1 << (nbytes - 1).bit_length()
         self._memory = torch.empty(nbytes, dtype=torch.uint8, pin_memory=DeviceCapability.of(device).pin_memory)
         # sorted by offset, with no two adjacent
         self._free = [HostSlice(0, nbytes)]
+        # offset -> the memory of a slice taken past the pool's end, and the offset the next one takes
+        self._spilled: dict[int, torch.Tensor] = {}
+        self._spill_end = nbytes
         self._stream: torch.Stream | None = None
+        self._in_stream: torch.Stream | None = None
 
     @property
     def nbytes(self) -> int:
@@ -47,8 +55,10 @@ class HostPool:
     def nbytes_used(self) -> int:
         return self.nbytes - sum(free.nbytes for free in self._free)
 
-    def take(self, nbytes: int) -> HostSlice | None:
-        size = -(-nbytes // _ALIGN) * _ALIGN
+    def take(self, nbytes: int, spill: bool = False) -> HostSlice | None:
+        """A free slice of ``nbytes``, or None when no free slice holds it, unless ``spill``, which then allocates
+        memory for the slice alone and places it past the pool's end."""
+        size = aligned(nbytes)
         for i, free in enumerate(self._free):
             if free.nbytes >= size:
                 if free.nbytes == size:
@@ -56,9 +66,20 @@ class HostPool:
                 else:
                     self._free[i] = HostSlice(free.offset + size, free.nbytes - size)
                 return HostSlice(free.offset, size)
-        return None
+        if not spill:
+            return None
+        piece = HostSlice(self._spill_end, size)
+        self._spilled[piece.offset] = torch.empty(
+            size, dtype=torch.uint8, pin_memory=DeviceCapability.of(self.device).pin_memory,
+        )
+        self._spill_end += size
+        return piece
 
     def give(self, piece: HostSlice) -> None:
+        if piece.offset >= self.nbytes:
+            # A spilled slice is freed whole, so the tail its owner gives back first stays with it.
+            self._spilled.pop(piece.offset, None)
+            return
         i = bisect.bisect(self._free, piece)
         start, end = piece.offset, piece.offset + piece.nbytes
         if i < len(self._free) and self._free[i].offset == end:
@@ -68,21 +89,36 @@ class HostPool:
             start = self._free.pop(i).offset
         self._free.insert(i, HostSlice(start, end - start))
 
-    def copy_out(self, src: torch.Tensor, after: torch.Event | None, spill: bool = False) -> HostCopy | None:
-        """Copy ``src`` as it is into a slice once ``after`` (the step that wrote it) completes, running nothing on
-        the device but the copy. None when no free slice holds it, unless ``spill``, which copies it outside the pool
-        then."""
-        piece = self.take(src.nbytes)
-        if piece is not None:
-            memory = self._memory[piece.offset:piece.offset + src.nbytes]
-        elif spill:
-            memory = torch.empty(src.nbytes, dtype=torch.uint8, pin_memory=DeviceCapability.of(self.device).pin_memory)
-        else:
-            return None
-        view = memory.view(src.dtype).view(src.shape)
+    def view(self, into: HostSlice, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
+        """The start of ``into`` as a tensor of ``dtype`` and ``shape``."""
+        nbytes = shape.numel() * dtype.itemsize
+        assert nbytes <= into.nbytes, f"a copy of {nbytes} bytes doesn't fit the {into.nbytes} bytes it was given"
+        memory, offset = self._memory, into.offset
+        if offset >= self.nbytes:
+            start = max(start for start in self._spilled if start <= offset)
+            memory, offset = self._spilled[start], offset - start
+        return memory[offset:offset + nbytes].view(dtype).view(shape)
+
+    def copy_in(self, view: torch.Tensor) -> tuple[torch.Tensor, torch.Event | None]:
+        """Copy ``view``, a tensor in the pool whose copy from the device has landed, to the device, and return the copy
+        with the event recorded once it lands. Where the device is the host, return ``view`` as it is and no event."""
+        if self.device.type == "cpu":
+            return view, None
+        if self._in_stream is None:
+            self._in_stream = torch.Stream(device=self.device)
+        with self._in_stream:
+            copy = view.to(self.device, non_blocking=True)
+        ready = torch.Event(device=self.device)
+        ready.record(self._in_stream)
+        return copy, ready
+
+    def copy_out(self, src: torch.Tensor, into: HostSlice, after: torch.Event | None) -> HostCopy:
+        """Copy ``src`` as it is to the start of ``into`` once ``after`` (the step that wrote it) completes, running
+        nothing on the device but the copy."""
+        view = self.view(into, src.dtype, src.shape)
         if after is None:
             view.copy_(src)
-            return HostCopy(piece, view, None)
+            return HostCopy(view, None)
         if self._stream is None:
             self._stream = torch.Stream(device=self.device)
         self._stream.wait_event(after)
@@ -92,4 +128,4 @@ class HostPool:
         src.record_stream(self._stream)
         landed = torch.Event(device=self.device)
         landed.record(self._stream)
-        return HostCopy(piece, view, landed)
+        return HostCopy(view, landed)

@@ -1418,8 +1418,8 @@ def _waits(kv, rid: str) -> None:
     kv._streams[rid]["main"].step_in_flight = False
 
 
-# v's rebuild: its 5-page prompt and the id its next decode reads
-_REBUILD = Rebuild("prefill", [0] * (5 * PAGE_SIZE + 1))
+# v's rebuild: the id its next decode reads, past its 5-page prompt
+_REBUILD = Rebuild([0])
 
 
 def _both_short_then_drop(monkeypatch):
@@ -1435,7 +1435,7 @@ def _both_short_then_drop(monkeypatch):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
         assert _counts(leader) == _counts(follower)
     assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
-    lead.drop_request(NODE, "v", len(_REBUILD.ids) - 1)
+    lead.drop_request(NODE, "v", 5 * PAGE_SIZE + len(_REBUILD.sampled) - 1)
     return (leader, lead), (follower, follow)
 
 
@@ -1560,6 +1560,50 @@ def test_under_debug_asserts_a_commit_moves_nothing_a_page_trail_carries(monkeyp
 
     assert len(leader._streams["r"]["main"].pages()) < 3, "the window released nothing, so the test checks nothing"
     assert leader.page_trail() == trail, "the counts a follower checks moved with rank 0's commit"
+
+
+def test_a_follower_replays_a_request_that_passed_the_head_into_rank_0s_counts(monkeypatch):
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "head", 8, arrival=2)
+    _ingest((leader, follower), "p", 1, arrival=3)
+    assert _admits(leader, "r") and not _admits(leader, "head") and _admits(leader, "p")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "the follower allotted the request that passed another way"
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("p", PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    for engine in (lead, follow):
+        engine.remove_request("p")
+
+    assert _counts(leader) == _counts(follower), "the pages the request that passed freed went elsewhere on one rank"
+
+
+def test_a_follower_settles_a_passer_dropped_for_an_older_request_into_rank_0s_counts(monkeypatch):
+    """r, older than the head, runs short and drops p, which passed the head. Each rank gives r the page it is short
+    of, and rank 0 alone keeps the rest from passers, which no count a follower admits from reads."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "head", 8, arrival=2)
+    _ingest((leader, follower), "p", 1, arrival=3)
+    assert _admits(leader, "r") and not _admits(leader, "head") and _admits(leader, "p")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("p", PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
+    assert _preempt(leader, "r", droppable=True).to_drop == ["p"]
+    lead.drop_request(NODE, "p", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "a rank settled the drop of the request that passed another way"
+    assert leader._kept == 4, "rank 0 left a passer the pages p freed past r's shortage"
+    assert not _returns(leader, "p"), "p, which passed the head, returned into the pages kept for it"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "p's return took the kept pages into its allotment on one rank"
+
+    for engine in (lead, follow):
+        engine.remove_request("r")
+        engine.remove_request("p")
+    assert _admits(leader, "head")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "the head took the kept pages into another allotment on one rank"
 
 
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
@@ -2159,13 +2203,14 @@ def test_an_unreserve_cancels_no_reservation_that_grew_an_allotment(monkeypatch)
 
 
 class _Forgets(_KeepsIds):
-    """Records the requests whose ids it gives back."""
+    """Records the requests whose ids it gives back, each refused a rebuild in ``refused``."""
 
-    def __init__(self):
-        self.forgot = []
+    def __init__(self, refused=()):
+        self.forgot, self._refused = [], list(refused)
 
-    def forget(self, rid, node):
+    def refuse(self, rid, node):
         self.forgot.append((rid, node))
+        return self._refused
 
 
 def test_a_follower_gives_back_the_ids_of_a_request_rank_0_journals_as_keeping_none(monkeypatch):
@@ -2179,6 +2224,22 @@ def test_a_follower_gives_back_the_ids_of_a_request_rank_0_journals_as_keeping_n
 
     assert delta.kinds == [MoveKind.FORGET], "rank 0 journaled no move, or a follower journaled one"
     assert follow.apply_resident_delta(delta, rebuilds) and rebuilds.forgot == [("x", NODE)]
+
+
+def test_a_follower_admits_a_request_rank_0s_rebuild_pool_couldnt_hold_in_rank_0s_class(monkeypatch):
+    """Rank 0's rebuild pool had no room for x's log, so no drop on rank 0 frees x and rank 0 guarantees it. The
+    follower took x's room past its own pool and counted x rebuildable, so it asked for x's prompt where rank 0
+    reserved x's footprint."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader,), "x", 1, arrival=1, rebuildable=False)
+    _ingest((follower,), "x", 1, arrival=1)
+    lead.keeps_no_ids(NODE, "x")
+
+    assert _admits(leader, "x")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _Forgets(["kv"]))
+
+    assert follower._guaranteed == leader._guaranteed == {"x"}, "x is preemptible here and never preempted on rank 0"
+    assert _counts(follower) == _counts(leader)
 
 
 def _follower_of(follow):

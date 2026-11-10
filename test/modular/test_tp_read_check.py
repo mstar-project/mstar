@@ -296,17 +296,18 @@ class _DroppedHere(_Engine):
 
 def _log(kept):
     """A rebuild log keeping ids for ``kept``, which starts each rebuild once, and from its prompt's chunks when
-    the request was mid-prefill."""
+    the request was mid-prefill in its first prefill step."""
     cursors = {}
 
     def start(rid, node, prefilling):
         assert (node, rid) not in cursors, f"{rid}'s rebuild started twice"
         cursors[(node, rid)] = prefilling
-        return None if prefilling is not None else Rebuild(WALK, array("i", [1, 2]))
+        return None if prefilling is not None else Rebuild(array("i", [1, 2]))
 
     return SimpleNamespace(
         kept=lambda rid, node: rid if rid in kept else None, start=start,
         rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items, nodes=frozenset({NODE}),
+        cursor=lambda rid, node: SimpleNamespace(resumes_prefill=cursors[(node, rid)] is not None),
     )
 
 

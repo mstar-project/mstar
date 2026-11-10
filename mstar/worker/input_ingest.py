@@ -6,7 +6,7 @@ teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
 from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
@@ -69,7 +69,7 @@ class InputIngest:
         self, services: WorkerServices, layout: WorkerLayout,
         lifecycle: RequestLifecycle, lockstep: Lockstep, wakeup_event: EventWakeup,
         *, metrics: WorkerMetrics | None = None, enable_nvtx: bool = False,
-        set_rebuildable: Callable[[int, dict[str, ResourceReqConfig]], None] | None = None,
+        set_rebuildable: Callable[[int, dict[str, ResourceReqConfig]], Collection[str]] | None = None,
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
@@ -83,7 +83,8 @@ class InputIngest:
         self._lockstep = lockstep
         self._wakeup_event = wakeup_event
         self._enable_nvtx = enable_nvtx
-        # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it
+        # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it,
+        # and returns the nodes whose log of the request the rebuild pool couldn't hold
         self._set_rebuildable = set_rebuildable
         self.lora_loads = LoraLoads(services)
         self._handlers = {
@@ -205,13 +206,18 @@ class InputIngest:
         if first:
             self._tensors.register_request(rid, runtime.get_sharding_config(rid))
         laps.lap("worker_state")
-        if first and self._set_rebuildable is not None:
-            self._set_rebuildable(rid, body.request_info.resource_configs)
         try:
             if first:
+                unheld = () if self._set_rebuildable is None else self._set_rebuildable(
+                    rid, body.request_info.resource_configs,
+                )
                 self._engines.add_request(
                     rid, body.request_info.resource_configs, body.request_info,
                 )
+                # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
+                # changes the request's KV config.
+                for node in unheld:
+                    self._engines.get_engine(node).keeps_no_ids(node, rid)
                 laps.lap("engine_add")
                 self._skip_unshared_publish(rid, body.worker_graph_to_workers)
                 laps.lap("skip_publish")

@@ -111,9 +111,13 @@ class Admission:
         return outcome.ok and outcome.ready
 
     def start_rebuild(self, node_name: str, rid: int, graph_walk: str) -> None:
+        engine = self._engine_manager.get_engine(node_name)
         rebuild = self._rebuilds.start(rid, node_name, self.prefilling(node_name, rid, graph_walk))
         if rebuild is not None:
-            self._engine_manager.get_engine(node_name).prepare_rebuild(node_name, rid, rebuild)
+            engine.prepare_rebuild(node_name, rid, rebuild)
+        elif not self._rebuilds.cursor(rid, node_name).resumes_prefill:
+            # the rows before its prompt's step in progress prepare their inputs where that step's input is kept
+            engine.set_aside_chunk_inputs(rid, node_name)
 
     def prefilling(self, node_name: str, rid: int, graph_walk: str) -> Prefilling | None:
         """Where ``rid``'s prompt stands while it is mid-prefill in ``graph_walk`` on ``node_name``, read off its

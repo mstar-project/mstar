@@ -543,7 +543,7 @@ def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s
     assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("v", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "v", leader._allotments["v"].pages, [])
     # as rank 0's readiness check starts the rebuild
-    leader.prepare_rebuild("v", Rebuild(WALK, array("i", prompt + reply)))
+    leader.prepare_rebuild("v", Rebuild(array("i", reply)))
     lead = _engine(leader)
     head = ScheduleTPNode(
         NODE, WALK, ["v"], prefix_hits=lead.decide_cached_prefix(_batch("v")), page_trails=lead.page_trails(NODE),
@@ -560,6 +560,16 @@ def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s
         "the follower holds other cached pages for v than rank 0"
     )
 
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_no_rank_above_one_marks_a_request_undroppable_after_admission_on_its_own(rank):
+    """No move tells the other ranks that a request lost its log after admission, so a rank that marked it alone
+    would reserve host room or guarantee it where the others don't, and their counts would part."""
+    kv = _manager(rank)
+    _ingest(kv, "r", _tokens(PAGE_SIZE, 1))
+
+    with pytest.raises(AssertionError, match="above one rank"):
+        kv.refuse_drops("r")
 
 def _write(kv: KVManager, rid: str, length: int, walk: str) -> None:
     step, ctx = KVStep(segments=(Segment(rid, "main", length),)), _ctx(rid, walk)

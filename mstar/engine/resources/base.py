@@ -85,6 +85,8 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
+    host_allowance: StepAllowance | None = None
 
     @property
     def head_shards(self) -> int:
@@ -133,10 +135,36 @@ class Residency(IntEnum):
 
 
 class Rebuild(NamedTuple):
-    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
-    The last id is the one the next decode step reads."""
-    walk: str
-    ids: Sequence[int]
+    """What a dropped request's rebuild writes past its layout: the ids it ``sampled`` since the layout was laid out,
+    but the newest, which the next decode step reads."""
+    sampled: Sequence[int]
+
+
+# What a step may queue for the host. The device has one device-to-host copy engine, which runs copies in the order
+# they were queued whatever their stream or priority, and the copies queue behind the step's own output copy. This
+# bounds how long a step's copies to the host hold the copy engine before the next step's output copy can run (about
+# 1 ms on an H100).
+_WRITE_BYTES_PER_STEP = 32 << 20
+
+
+class StepAllowance:
+    """What a step may still queue for the host once its outputs are sent, shared by every copy to the host on the
+    device: the worker's host copies for rebuilds first, then each pool's cached pages. The engine refills it once
+    the pools have taken theirs, and the worker refills it for its host copies on a pass of its loop that runs no
+    step, once its last copy has landed."""
+
+    def __init__(self, nbytes: int = _WRITE_BYTES_PER_STEP) -> None:
+        self._per_step = nbytes
+        self.left = nbytes
+
+    def spend(self, nbytes: int) -> int:
+        """Take up to ``nbytes`` of what is left, and return how many were taken."""
+        taken = min(nbytes, self.left)
+        self.left -= taken
+        return taken
+
+    def refill(self) -> None:
+        self.left = self._per_step
 
 
 class KeyedWalks(NamedTuple):
@@ -369,6 +397,19 @@ class Resource(ResidentHooks, ABC):
         against for `grew_since`."""
         return None
 
+    def reserve_past(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+    ) -> object | None:
+        """`reserve` for ``rid`` ahead of an earlier request that can't start: take what ``rid`` asked for, or
+        return a mark. When this resource refused that request and hasn't grown since, it leaves that request what
+        it needs. The runner calls it only while ``rid`` passes, or takes nothing, at the resource that refused that
+        request, or whose queue the oldest request holds back while it waits to return. The base refuses, so a
+        resource that doesn't override it admits in order.
+
+        A resource that overrides it asks nothing more of a waiting request (`ask` returns None) only once `reserve`
+        would take nothing for it, and the request may then start wherever it stands in this resource's queue."""
+        return 0
+
     def unreserve(self, rid: str) -> None:
         """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
         return
@@ -553,7 +594,8 @@ class Resource(ResidentHooks, ABC):
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's rebuild has run its last chunk."""
+        """The dropped request's rebuild has run its last chunk, and that chunk's commit has run, so the resource
+        holds everything the rebuild wrote."""
         return
 
     def reload(self, rid: str) -> bool:

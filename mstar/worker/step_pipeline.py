@@ -217,7 +217,9 @@ class StepPipeline:
             if self.side_pending is not None:
                 self._finish_side(block=True)
                 return
-            self.communicator.wait_for_work(10)
+            self._rebuilds.flush_idle()
+            # the next pass's `flush_idle` waits for the copies just started, so it needn't wait the tick too
+            self.communicator.wait_for_work(0 if self._rebuilds.copies_queued else 10)
             return
 
         if self.enable_nvtx:

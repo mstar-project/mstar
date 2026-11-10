@@ -18,6 +18,7 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.transfer import (
@@ -51,7 +52,13 @@ from mstar.worker.micro_scheduler import (
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.phase_timer import PhaseTimer
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
+from mstar.worker.rebuild import (
+    DEFAULT_REBUILD_HOST_MB,
+    DEFAULT_REBUILD_MEDIA_HOST_MB,
+    Rebuilds,
+    node_writes,
+    policies_run_here,
+)
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import (
@@ -108,8 +115,8 @@ def _make_graph_runtime(
 
 
 def _make_rebuilds(
-    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], device: torch.device,
-    followed: frozenset[str] = frozenset(),
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
+    device: torch.device, engine: Engine, followed: frozenset[str] = frozenset(),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
@@ -117,12 +124,25 @@ def _make_rebuilds(
     A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
     rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
-    policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
-    host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-        raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+    policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
+    copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
+    host_mb = _serving_mb(
+        model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
+    )
+    if not host_mb:
+        policies = {}
     nbytes = host_mb << (21 if followed & policies.keys() else 20)
-    return Rebuilds(policies, graphs, HostPool(nbytes, device) if host_mb and policies else None, followed)
+    return Rebuilds(
+        policies, graphs, HostPool(nbytes, device) if policies else None, engine.host_allowance,
+        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None}, followed,
+    )
+
+
+def _serving_mb(model_config: dict | None, key: str, default: int) -> int:
+    value = (model_config or {}).get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key}: {value!r} is not a non-negative int")
+    return value
 
 
 def _wait_ms(raw: str) -> float:
@@ -324,7 +344,10 @@ class Worker:
 
         layout = replace(layout, side_keys=frozenset(self.engine_manager.side_keys))
         self.layout = layout
-        self._rebuilds = _make_rebuilds(model, model_config, layout.my_walks, self.device, layout.followed_nodes)
+        self._rebuilds = _make_rebuilds(
+            model, model_config, layout.my_walks, layout.parallel_nodes, self.device, self.engine_manager.engine,
+            layout.followed_nodes,
+        )
         services = WorkerServices(
             worker_id=worker_id,
             device=device,
@@ -452,13 +475,15 @@ class Worker:
             self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
             kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
 
-    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> frozenset[str]:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
-        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
-        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
+        ingested = self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable)
+        for key, rebuildable in ingested.rebuildable.items():
             if key in configs:
                 configs[key].rebuildable = rebuildable
+        return ingested.unheld
 
     def _plan_step_cpus(
         self, worker_ids: list[str], local_worker_devices: list[str] | None,

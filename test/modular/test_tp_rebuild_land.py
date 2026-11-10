@@ -14,12 +14,13 @@ trail on the step after. The follower builds N+1 with the real `Speculator.follo
 
 from __future__ import annotations
 
+from array import array
 from types import SimpleNamespace
 
 import pytest
 import torch
 from test_resident_delta import NODE, PAGE_SIZE, _both_short_then_drop, _counts, manager_mod
-from test_worker_rebuild import POLICY, _graphs, _kept
+from test_worker_rebuild import POLICY, PREFILL, _graphs, _kept, _record
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
@@ -29,10 +30,9 @@ from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.rebuild import Rebuilds
+from mstar.worker.rebuild import KeptIds, LayoutRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 
-PREFILL = POLICY.walk
 # v's rebuild writes its 5-page prompt: three pages in N and the rest in N+1
 FIRST, WHOLE = 3 * PAGE_SIZE, 5 * PAGE_SIZE
 CHUNKS = {1: ChunkRange(0, FIRST, WHOLE, FIRST), 2: ChunkRange(FIRST, WHOLE, WHOLE, WHOLE - FIRST)}
@@ -85,18 +85,18 @@ class _Rank:
         self.worker.executor._finish_rebuild_rows(pending, {})
 
 
-def _step(seq: int) -> ScheduledBatch:
+def _step(seq: int, chunks=CHUNKS) -> ScheduledBatch:
     """Rank 0's step ``seq``, running the chunk of v's rebuild its log offered."""
-    chunk = CHUNKS[seq]
+    chunk = chunks[seq]
     return ScheduledBatch(
         node_name=NODE, graph_walk=PREFILL, request_to_worker_graph={"v": 0}, rebuild_rids=frozenset({"v"}),
         chunk_ranges={"v": chunk}, incomplete_node_rids=set() if chunk.is_final else {"v"}, tp_seq=seq,
     )
 
 
-def _head(lead, seq: int, rids=(), **kwargs) -> ScheduleTPNode:
+def _head(lead, seq: int, rids=(), chunks=CHUNKS, **kwargs) -> ScheduleTPNode:
     """Rank 0's broadcast of step ``seq``: its moves and its page trail as of now."""
-    chunk = CHUNKS.get(seq)
+    chunk = chunks.get(seq)
     return ScheduleTPNode(
         NODE, PREFILL, list(rids), spec_seq=seq, resident_delta=lead.take_resident_delta(),
         page_trails=lead.page_trails(NODE),
@@ -145,6 +145,37 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
     assert lockstep.settle_delta(caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
     assert not one.rebuilds.rebuilding("v", NODE), "the follower would take v's decode row for a rebuild row"
+
+
+def test_a_rebuild_over_two_rows_lands_on_the_follower_with_rank_0s(monkeypatch):
+    """v prefilled in two steps, so its log rebuilds it in two rows, one a step. Each rank runs them from its own
+    log in N and N+1, and the follower lands v when it replays rank 0's land."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    zero, one = _Rank(leader, lead), _Rank(follower, follow)
+    for rank in (zero, one):
+        rank.rebuilds._kept[NODE]["v"] = KeptIds(
+            (LayoutRow(PREFILL, FIRST), LayoutRow(PREFILL, WHOLE - FIRST)),
+            [_record([0] * FIRST), _record([0] * (WHOLE - FIRST))], array("i", [0]),
+        )
+    rows = {1: ChunkRange(0, FIRST, FIRST, FIRST), 2: ChunkRange(0, WHOLE - FIRST, WHOLE - FIRST, WHOLE - FIRST)}
+    sched, lockstep = one.scheduler, one.lockstep
+    lockstep.enqueue_follow(_head(lead, 0))
+    assert lockstep.settle_delta(caught_up=True)
+    lockstep.pop_follow_head()
+
+    zero.scheduler.admission.start_rebuild(NODE, "v", "decode")
+    for seq in (1, 2):
+        lockstep.enqueue_follow(_head(lead, seq, ["v"], chunks=rows))
+        step = sched._try_schedule_tp_follow()
+        assert step.rebuild_rids == {"v"}, f"the follower took v's row {seq} for one of its own"
+        zero.post_process(_step(seq, rows))
+        one.post_process(step)
+    lockstep.enqueue_follow(_head(lead, 3, chunks=rows))
+
+    assert lockstep.settle_delta(caught_up=True)
+    assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
+    assert not one.rebuilds.rebuilding("v", NODE), "the follower's rebuild of v outlived rank 0's"
 
 
 def test_a_follower_whose_rebuild_cant_start_stops(monkeypatch):
