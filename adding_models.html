@@ -3039,7 +3039,8 @@ captured buffers on each replay.</p></td>
 <li><p><code class="docutils literal notranslate"><span class="pre">capture_graph_walk</span></code> is the walk to capture.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">replay_graph_walks</span></code> lists the walks that may replay this capture. One capture can
 therefore serve several walks, for example <code class="docutils literal notranslate"><span class="pre">prefill_audio</span></code> reusing <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record. <code class="docutils literal notranslate"><span class="pre">None</span></code> uses the runner
+default; <code class="docutils literal notranslate"><span class="pre">[]</span></code> records none.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">additional_key_info</span></code> is an extra hashable component of the capture bucket key. Use it
 when one walk must be captured more than once because the batch shape alone does not
 identify the capture. Its value must equal both the value returned by the submodule’s
@@ -3213,7 +3214,12 @@ more. On a node serving LoRA adapters it is leased only for a step whose rows ru
 none, since its replay would address every request’s tokens to the first request’s
 adapter.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record. <code class="docutils literal notranslate"><span class="pre">None</span></code> uses the runner
-default.</p></li>
+default; <code class="docutils literal notranslate"><span class="pre">[]</span></code> records none, for an eager-only region (below).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">eager_fallback</span></code> runs a shape with no graph eagerly through <code class="docutils literal notranslate"><span class="pre">run</span></code> instead of
+raising: the runner declares, plans and commits the region’s step over the real rows
+(as a replay declares it, without padding), so the caller has one path for captured
+and uncaptured shapes. Off, the caller checks <code class="docutils literal notranslate"><span class="pre">can_run</span></code> first. MiniCPM-o’s vocoder
+uses it, with eager-only regions for the shapes it never captures.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is
 <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode, as on <code class="docutils literal notranslate"><span class="pre">AcceleratorGraphConfig</span></code>.</p></li>

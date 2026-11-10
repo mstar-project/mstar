@@ -1119,7 +1119,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># pick, ``{"max_autotune_gemm_backends": "ATEN"}``</span>
         <span class="n">inductor_options</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 
-        <span class="c1"># Per-config override for the set of batch sizes to capture</span>
+        <span class="c1"># Per-config override for the set of batch sizes to capture (None: the</span>
+        <span class="c1"># runner's defaults; []: none)</span>
         <span class="n">capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="c1"># Method on the submodule to capture</span>
         <span class="n">capture_forward_method</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"forward_batched"</span><span class="p">,</span>
@@ -1615,8 +1616,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">one_row_per_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)</span>
     <span class="n">forward_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
-    <span class="c1"># None =&gt; defer to the runner's default batch-size buckets</span>
+    <span class="c1"># None =&gt; defer to the runner's default batch-size buckets; [] captures nothing</span>
     <span class="n">capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># A shape with no captured graph runs the region eagerly through ``run``, its</span>
+    <span class="c1"># step declared, planned and committed over the real rows, rather than raising;</span>
+    <span class="c1"># the caller then has one path for both. Off: the caller checks ``can_run``.</span>
+    <span class="n">eager_fallback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Whether to torch.compile capture_fn before capture. Default off; the</span>
     <span class="c1"># block loop already benefits from graph capture alone.</span>
     <span class="nb">compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
