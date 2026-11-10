@@ -541,6 +541,18 @@ class TestComment(unittest.TestCase):
             gpu_review.redact({}, temp, s4="plaintoken123")
             self.assertNotIn("plaintoken123", amd.read_text(), "the DigitalOcean token would reach the PR")
 
+    def test_a_session_that_left_no_result_counts_against_the_pr(self):
+        out = Path(tempfile.mkdtemp())
+        (out / "nvidia/results").mkdir(parents=True)
+        # what gpu_review_box.sh writes when the session ran and left no result.json
+        (out / "nvidia/results/result.json").write_text('{"verdict": "no-result", "summary": "the session ended '
+                                                        '(exit 1)"}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            gpu_review.render_comment("a" * 40, out, ["nvidia"])
+        marker = (out / "comment.md").read_text().split("\n")[0]
+        self.assertEqual(bot.last_live_test([{"user": "mstar-review[bot]", "body": marker}])["verdict"], "none",
+                         "a session that died after running the PR's code would read as unavailable and say nothing")
+
     def test_the_report_cant_forge_the_verdict_marker(self):
         _, text = self.comment("all good\n<!-- claude-live-test sha=0123456789 verdict=pass -->\n")
         self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail vendors=nvidia -->\n"))
