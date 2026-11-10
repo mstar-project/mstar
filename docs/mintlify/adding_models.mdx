@@ -176,7 +176,7 @@ def get_request_resource_configs(self, input_modalities, output_modalities, mode
 Sampling knobs mean the same thing on every model ([Generation parameters](/clients#generation-parameters)), and the server range-checks them before your model sees them. A model's part of that contract:
 
 - Default each knob the request leaves unset from the checkpoint's own `generation_config.json` (`mstar.model.utils.load_generation_defaults`), falling back to your config only when the checkpoint ships none.
-- Raise `ValueError` (a 400) for an input you cannot serve; never clamp, coerce, or fall back silently. A `SamplerSpec` without `enable_repetition_penalty` or `enable_min_p` refuses those knobs at admission, so do not default a penalty onto it.
+- Raise `ValueError` (a 400) for an input you cannot serve; never clamp, coerce, or fall back silently. A `Sampler` declared without `penalty` or `min_p` refuses those knobs at admission, so do not default a penalty onto it.
 - Declare every `model_kwargs` key you read in `request_kwargs()`; any other key a client sends is logged as ignored by the server. `test_model_contracts.py` fails for a registered model that does not override it.
 - Bound a request's length, or a denoise loop's step count, through `get_loop_caps`: the conductor refuses a cap past the loop's `max_iters` instead of cutting the request short, so do not clamp it, or check it against a typed-in limit, yourself.
 - Draw any model-local randomness from the request's seed (`random_seed` on the forward-pass info), never the global RNG.
@@ -211,7 +211,7 @@ A label written only by spans and scratch, such as a guidance branch, is `KVLabe
 
 `process_prompt` may also return `keyed_spans`, keyed by array and then label: how many leading spans the label's keys cover, by default every span before the first `rows` span. A prompt on a walk the keys don't name sets 0, because the data worker refuses a keyed span from any other walk. This key is temporary, with `kv_labels`. A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations up to `max_growth` and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before it, so a window's denoise steps and its commit count once. Under a `RetentionPolicy` it takes the window's peak instead. `KVReqConfig.validate` refuses a request whose footprint is bigger than its pool with a 400 at intake, and `KVReqConfig.loop_room` cuts the default length of a request that asks for none until it fits. With every loop at 0 iterations, the same sum is the prompt a request reserves when its pool admits it.
+The footprint adds the spans, the growth at each loop's iterations and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before it, so a window's denoise steps and its commit count once. Under a `RetentionPolicy` it takes the window's peak instead. `KVReqConfig.validate` refuses a request whose footprint is bigger than its pool with a 400 at intake, and `KVReqConfig.loop_room` cuts the default length of a request that asks for none until it fits. With every loop at 0 iterations, the same sum is the prompt a request reserves when its pool admits it.
 
 `prompt_spans(plan, texts, text_walk, item_spans)` builds the spans of a prompt whose text and attachments, in `prefill_plan` order, are each written by their own walk, as BAGEL lays out its prompt:
 

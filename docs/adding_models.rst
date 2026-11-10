@@ -357,8 +357,8 @@ contract:
   ``generation_config.json`` (``mstar.model.utils.load_generation_defaults``),
   falling back to your config only when the checkpoint ships none.
 - Raise ``ValueError`` (a 400) for an input you cannot serve; never clamp, coerce, or
-  fall back silently. A ``SamplerSpec`` without ``enable_repetition_penalty`` or
-  ``enable_min_p`` refuses those knobs at admission, so do not default a penalty onto it.
+  fall back silently. A ``Sampler`` declared without ``penalty`` or ``min_p`` refuses those
+  knobs at admission, so do not default a penalty onto it.
 - Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
   client sends is logged as ignored by the server. ``test_model_contracts.py`` fails for a
   registered model that does not override it.
@@ -443,7 +443,7 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations up to ``max_growth`` and the
+The footprint adds the spans, the growth at each loop's iterations and the
 scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
