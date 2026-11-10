@@ -21,7 +21,7 @@ def _cpu_flashinfer() -> types.ModuleType:
 
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.dsa import paged, sparse_mla  # noqa: E402
-from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAStep  # noqa: E402
 from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
@@ -33,6 +33,7 @@ from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E4
 from mstar.model.glm52.components.indexer import full_indexer_layers  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
+    DSA_RESOURCE,
     KV_RESOURCE,
     Glm52ModelConfig,
 )
@@ -72,7 +73,7 @@ class _Driver:
         engine_inputs = ModelInputsFromEngine(
             request_ids=[self.rid], per_request_info={}, resources=self.resources, step=step)
         packed = self.sub.preprocess(walk, engine_inputs, [ar])
-        self.last_ctx = self.sub._dsa_ctx(packed)
+        self.last_ctx = self.sub._dsa_plan()
         with torch.no_grad():
             logits = self.sub.forward(walk, engine_inputs, **packed)["logits"]
         self.runner.commit(step)
@@ -114,7 +115,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     def checked_update(self, hidden, q_c, position_ids):
         selection = update(self, hidden, q_c, position_ids)
         if self.indexer is not None and selection is not None:
-            ctx = self._dsa.ctx  # the forward's, open on the DSA resource
+            ctx = self._dsa.current()  # the step's plan, on the DSA resource
             n, page = ctx.host_pos[0] + 1, ctx.page_size
             pos = torch.arange(n)
             store = self._kv.aux_view(INDEX_PLANES, self.index_layer_idx)
@@ -127,7 +128,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
         return selection
 
     def checked_attend(self, slots, q_nope, q_pe, latent, dsa_selection=None):
-        ctx = self._dsa.ctx
+        ctx = self._dsa.current()
         out = attend(self, slots, q_nope, q_pe, latent)
         n, page = ctx.host_pos[0] + 1, ctx.page_size
         picked = _positions(slots[0, :ctx.topk], ctx.pages, page)
@@ -323,11 +324,9 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them():
     step.set_ctx(ctx)
     assert runner.admit(step).ok
     runner.plan(step)
-    engine_inputs = ModelInputsFromEngine(
-        request_ids=rids, per_request_info={}, resources=resources, step=step, captured=True)
-    for rows in (8, 16):
+    for rows in (8, 16):  # the plan of each bucket's lease, as a replay's plan stages it
         ctx.slot_lease = SlotLease(slot=0, bucket=BucketKey("prefill", 2, rows))
-        dsa = sub._dsa_ctx(sub.preprocess("prefill", engine_inputs, ars))
+        dsa = resources[DSA_RESOURCE].plan(DSAStep(), ctx)["main"]
         pad = rows - 7
         assert dsa.pos.tolist() == [0, 1, 2, 0, 1, 2, 3] + [0] * pad
         assert dsa.row_req.tolist() == [0, 0, 0, 1, 1, 1, 1] + [0] * pad
@@ -344,11 +343,8 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them():
     assert driver.runner.admit(step).ok
     driver.runner.plan(step)
     ctx.slot_lease = SlotLease(slot=0, bucket=BucketKey("prefill", 1, 4))
-    engine_inputs = ModelInputsFromEngine(
-        request_ids=[driver.rid], per_request_info={}, resources=driver.resources, step=step,
-        captured=True)
     with pytest.raises(RuntimeError, match="sits at 8, past its 4-token bucket"):
-        sub.preprocess("prefill", engine_inputs, [ar])
+        driver.resources[DSA_RESOURCE].plan(DSAStep(), ctx)
 
 
 def test_a_prefill_past_a_cached_prefix_runs_eager():

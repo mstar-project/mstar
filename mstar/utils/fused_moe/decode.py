@@ -4,16 +4,25 @@ then the routed and shared experts, where the grouped-GEMM runner would mostly m
 Up to a per-GPU token count (``_Tuning.pair_max_tokens``) gate/up and down are GEMV kernels
 over (token, expert) pairs; above it experts repeat across the batch, and grouped kernels read
 each expert's weights once. ``swiglu_limit`` picks the clamped SwiGLU or the plain one.
+The same per-pair kernels, as ``routed_experts``, run ``fused_experts``' bf16 / fp16 experts
+(no shared expert) at a few tokens on NVIDIA GPUs, for shapes that pass ``routed_fits``.
+The router's top-k program, as ``router_topk``, also serves softmax routers (``TopKRouter``).
+
+Both paths' crossover and launch tiles of a (GPU, dtype, shape) come from the kernel registry's
+``moe_decode`` tables where one has the shape, else from the built-in table for the GPU and
+dtype (see ``_tuning``).
 """
 from __future__ import annotations
 
 import dataclasses
-import functools
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+from mstar.kernels import Impl, KernelOp, TableEntry, Tolerance, register
+from mstar.kernels.registry import on_reset
 
 
 @dataclasses.dataclass(frozen=True)
@@ -23,12 +32,20 @@ class _Tuning:
     ``(max tokens, tiles)`` rows, the first row that fits wins (None fits all): few pairs
     want narrow row blocks with long K steps so enough programs are in flight, more pairs
     wider blocks. bjs / bks tile the shared expert (tl.dot needs bjs >= 16). ``router``: the
-    logits kernel's K step, most K splits and warps."""
+    logits kernel's K step, most K splits and warps; None where the caller routes."""
 
     pair_max_tokens: int
-    gate_up: tuple[tuple[int | None, dict], ...]
-    down: tuple[tuple[int | None, dict], ...]
-    router: dict
+    gate_up: tuple[tuple[int | None, tuple[tuple[str, int], ...]], ...]  # given as dicts
+    down: tuple[tuple[int | None, tuple[tuple[str, int], ...]], ...]
+    router: dict | None = None
+
+    def __post_init__(self):
+        # The tiles are kept as (name, value) pairs, read as dicts by ``_tiles``: ``_tuning``
+        # hands this to compiled forwards as a constant, and dynamo can't guard a dict that
+        # comes out of a constant, so unpacking one into a launch would fail to trace.
+        for name in ("gate_up", "down"):
+            rows = tuple((bound, tuple(dict(tiles).items())) for bound, tiles in getattr(self, name))
+            object.__setattr__(self, name, rows)
 
 
 # Tiles from sweeps on each GPU: the H200 at hidden 4096, the H100 at hidden 6144.
@@ -49,36 +66,99 @@ _H100 = _Tuning(
 )
 
 
-# GLM-5.2's experts (hidden 6144, 256 experts of 256) on an H200, from a sweep that reads every
-# call's weights from HBM: the per-pair winner per token count up to 8, the grouped kernels from 9.
-_H200_GLM52 = _Tuning(
-    pair_max_tokens=8,
-    gate_up=((1, dict(bj=8, bk=512, bjs=32, bks=256, warps=2)),
-             (2, dict(bj=16, bk=512, bjs=32, bks=256, warps=4)),
-             (3, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
-             (4, dict(bj=16, bk=256, bjs=16, bks=256, warps=4)),
-             (5, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
-             (6, dict(bj=8, bk=512, bjs=32, bks=128, warps=4)),
-             (None, dict(bj=16, bk=256, bjs=16, bks=256, warps=4))),
-    down=((1, dict(bn=16, bc=256, warps=8)),
-          (2, dict(bn=32, bc=128, warps=4)),
-          (3, dict(bn=16, bc=256, warps=8)),
-          (4, dict(bn=32, bc=256, warps=8)),
-          (None, dict(bn=32, bc=128, warps=4))),
-    router=_H200.router,
+# The sweep checks candidates against the kernels at their built-in tiles, within the tolerance
+# of the grouped kernels' other summation order.
+MOE_DECODE = register(KernelOp(
+    name="moe_decode", shape=("H", "E", "I", "K"), bucket="M",
+    impls=(Impl("triton", tolerance=Tolerance(2**-7, 1e-3)),),
+    doc="the small-batch MoE's launch tiles (fused_moe.decode): fp8 experts with a shared expert, or "
+        "bf16 / fp16 ones (routed_experts); hidden H, E experts of per-rank intermediate I, top-K; "
+        "per-pair rows by token count, then the grouped '*' row",
+    # the sweep times the fp8 kernels; a bf16 / fp16 entry is measured end to end
+    sweep_dtypes=("float8_e4m3fn",),
+))
+
+
+# ``routed_experts``' built-in table: weights in x.dtype, no shared expert, the caller routes.
+# Swept on an H100 only, at Qwen3-Omni's Thinker and Talker expert shapes (hidden 2048 / 1024);
+# a GPU or shape without a ``moe_decode`` entry runs these tiles unswept. Past 7 tokens the
+# Thinker's grouped GEMMs read each repeated expert once and win on the H100.
+_UNSCALED = _Tuning(
+    pair_max_tokens=7,
+    gate_up=((1, dict(bj=4, bk=256, warps=4)), (None, dict(bj=2, bk=1024, warps=4))),
+    down=((None, dict(bn=32, bc=128, warps=8)),),
 )
-_GLM52_EXPERTS = (6144, 256, 256)  # (hidden, experts, intermediate)
 
 
-@functools.cache
-def _tuning(device: torch.device, experts: tuple[int, int, int] | None = None) -> _Tuning:
-    """The H100 table on an H100; elsewhere the H200 one, or GLM-5.2's at its ``experts``
-    shape, ``(hidden, experts, intermediate)``."""
+def routed_fits(H, I, tuning):
+    """Whether ``tuning``'s per-pair tiles, unclamped, divide experts of hidden ``H`` and
+    intermediate ``I``; ``fused_experts`` sends other shapes (TP shards of 192 or 96) to its
+    grouped path. A tile clamped to a smaller dimension needn't be a power of two, which
+    ``tl.arange`` requires."""
+    gate_up = [dict(t) for _, t in tuning.gate_up]
+    down = [dict(t) for _, t in tuning.down]
+    return (all(I % t["bj"] == 0 and H % t["bk"] == 0 for t in gate_up)
+            and all(H % t["bn"] == 0 and I % t["bc"] == 0 for t in down))
+
+
+_TUNINGS: dict[tuple, _Tuning] = {}
+on_reset(_TUNINGS.clear)
+
+
+@torch.compiler.assume_constant_result
+def _tuning(device: torch.device, shape: tuple[int, int, int, int] | None = None,
+            dtype: torch.dtype = torch.float8_e4m3fn) -> _Tuning:
+    """The registry's ``moe_decode`` entry for ``dtype`` experts of ``shape`` (H, E, I, K) on
+    this GPU if a table has one; else, for fp8 experts, the H100 table on an H100 and the H200
+    one everywhere else, and for bf16 / fp16 ones (``routed_experts``) ``_UNSCALED``. Picked
+    once per key. A constant to dynamo: the routed path decides inside compiled forwards, where
+    a traced table read would break the graph."""
+    key = (device, shape, dtype)
+    if key not in _TUNINGS:
+        _TUNINGS[key] = _pick_tuning(device, shape, dtype)
+    return _TUNINGS[key]
+
+
+def _pick_tuning(device, shape, dtype) -> _Tuning:
+    if shape is not None and device.type == "cuda":
+        dims = dict(zip("HEIK", shape, strict=True))
+        entry = MOE_DECODE.lookup(dtype, dims, device)
+        if entry is not None:
+            return _from_entry(entry)
+    if dtype != torch.float8_e4m3fn:
+        return _UNSCALED
     if device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
         return _H100
-    if experts == _GLM52_EXPERTS:
-        return _H200_GLM52
     return _H200
+
+
+def _from_entry(entry: TableEntry) -> _Tuning:
+    """A ``moe_decode`` entry as a ``_Tuning``. Its rows are per-pair ones keyed by token count,
+    ``{"path": "pair", "gate_up": ..., "down": ..., "router": ...}``, then the ``"*"`` row
+    ``{"path": "grouped", "router": ...}``: past the last per-pair row the experts run grouped,
+    and an entry of the ``"*"`` row alone runs them grouped at every count. An fp8 entry's
+    router config is one per entry, repeated in every row; a bf16 / fp16 entry's rows have
+    none, as its caller routes."""
+    rows = [(tokens, choice.config) for tokens, choice in entry.rows]
+    if any(config is None for _, config in rows):
+        raise ValueError(f"{entry.source}: every moe_decode row needs a config")
+    routers = [config.get("router") for _, config in rows]
+    fp8 = entry.dtype == "float8_e4m3fn"
+    if any(router != routers[0] for router in routers) or (routers[0] is None) == fp8:
+        need = "the entry's one router config" if fp8 else "no router config (its caller routes)"
+        raise ValueError(f"{entry.source}: every {entry.dtype} moe_decode row needs {need}")
+    *pair, (last_key, last) = rows
+    if last_key is not None or last.get("path") != "grouped":
+        raise ValueError(f"{entry.source}: a moe_decode entry ends with the '*' row, {{\"path\": \"grouped\"}}")
+    if any(row.get("path") != "pair" for _, row in pair):
+        raise ValueError(f"{entry.source}: a moe_decode entry's rows before '*' are per-pair ones")
+    final = len(pair) - 1
+    return _Tuning(
+        pair_max_tokens=pair[-1][0] if pair else 0,
+        gate_up=tuple((None if i == final else t, dict(row["gate_up"])) for i, (t, row) in enumerate(pair)),
+        down=tuple((None if i == final else t, dict(row["down"])) for i, (t, row) in enumerate(pair)),
+        router=None if last.get("router") is None else dict(last["router"]),
+    )
 
 
 @triton.jit
@@ -92,9 +172,10 @@ def _swiglu(g, u, limit, CLAMP: tl.constexpr):
 @triton.jit
 def _routed_gate_up(x, ids, w13, s13, act, limit, q, stride_we, stride_se,
                     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr,
-                    BI: tl.constexpr, BJ: tl.constexpr, BK: tl.constexpr, CLAMP: tl.constexpr):
-    """Program ``q``: BJ columns of one routed (token, slot) pair, fp8 rows scaled per
-    (BO, BI) block."""
+                    BI: tl.constexpr, BJ: tl.constexpr, BK: tl.constexpr, CLAMP: tl.constexpr,
+                    FP8: tl.constexpr):
+    """Program ``q``: BJ columns of one routed (token, slot) pair: fp8 rows scaled per
+    (BO, BI) block, or (not FP8) rows in their own dtype."""
     p = q // (I // BJ)
     j0 = (q % (I // BJ)) * BJ
     j = j0 + tl.arange(0, BJ)
@@ -109,10 +190,14 @@ def _routed_gate_up(x, ids, w13, s13, act, limit, q, stride_we, stride_se,
     acc_u = tl.zeros([BJ, BK], tl.float32)
     for k0 in range(0, H, BK):
         xv = tl.load(xr + k0 + kk).to(tl.float32)
-        g = tl.load(wg + k0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        u = tl.load(wu + k0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        acc_g += g * (xv * tl.load(sg + (k0 + kk) // BI))[None, :]
-        acc_u += u * (xv * tl.load(su + (k0 + kk) // BI))[None, :]
+        if FP8:
+            g = tl.load(wg + k0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            u = tl.load(wu + k0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            acc_g += g * (xv * tl.load(sg + (k0 + kk) // BI))[None, :]
+            acc_u += u * (xv * tl.load(su + (k0 + kk) // BI))[None, :]
+        else:
+            acc_g += tl.load(wg + k0).to(tl.float32) * xv[None, :]
+            acc_u += tl.load(wu + k0).to(tl.float32) * xv[None, :]
     a = _swiglu(tl.sum(acc_g, 1), tl.sum(acc_u, 1), limit, CLAMP)
     tl.store(act + p * I + j, a)
 
@@ -146,12 +231,13 @@ def _gate_up_kernel(
     stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
     BJ: tl.constexpr, BK: tl.constexpr, NS: tl.constexpr, TB: tl.constexpr,
-    BJS: tl.constexpr, BKS: tl.constexpr, CLAMP: tl.constexpr, PDL: tl.constexpr,
+    BJS: tl.constexpr, BKS: tl.constexpr, CLAMP: tl.constexpr, FP8: tl.constexpr,
+    PDL: tl.constexpr,
 ):
     """``act = silu(clamp(x @ gate.T)) * clamp(x @ up.T)`` in fp32 (no clamp without
     CLAMP). Rows ``[0, T*K)`` of ``act`` are the routed (token, slot) pairs, rows
-    ``[T*K, T*K+T)`` the shared expert per token; the NS shared programs come first in the
-    grid."""
+    ``[T*K, T*K+T)`` the shared expert per token; the NS shared programs (none without a
+    shared expert) come first in the grid."""
     if PDL:
         gdc_launch_dependents()
     pid = tl.program_id(0)
@@ -161,7 +247,7 @@ def _gate_up_kernel(
         if PDL:
             gdc_wait()
         _routed_gate_up(x, ids, w13, s13, act, limit, pid - NS, stride_we, stride_se,
-                        K, I, H, BO, BI, BJ, BK, CLAMP)
+                        K, I, H, BO, BI, BJ, BK, CLAMP, FP8)
 
 
 @triton.jit
@@ -169,10 +255,12 @@ def _down_kernel(
     act, ids, topk_w, w2, s2, sw2, out, T,
     stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
-    BN: tl.constexpr, BC: tl.constexpr, PDL: tl.constexpr,
+    BN: tl.constexpr, BC: tl.constexpr, FP8: tl.constexpr, SHARED: tl.constexpr,
+    REDUCE: tl.constexpr, PDL: tl.constexpr,
 ):
     """One program per (token, BN hidden rows): ``sum_k topk_w[k] * act[k] @ down[e_k].T``
-    plus the shared expert's ``act @ down.T``."""
+    plus the shared expert's ``act @ down.T`` (SHARED). Weights as in ``_routed_gate_up``.
+    Without REDUCE, ``out`` is ``(T, K, H)``: each slot's weighted term on its own."""
     if PDL:
         gdc_wait()
     t = tl.program_id(0).to(tl.int64)
@@ -187,14 +275,23 @@ def _down_kernel(
         ws = w2 + e * stride_we + n[:, None] * I + c[None, :]
         ss = s2 + e * stride_se + (n0 // BO) * (I // BI)
         for c0 in tl.static_range(0, I, BC):
-            a = tl.load(act + p * I + c0 + c) * tl.load(ss + (c0 + c) // BI) * wt
-            w = tl.load(ws + c0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-            acc += w * a[None, :]
-    p = T * K + t
-    ws = sw2 + n[:, None] * I + c[None, :]
-    for c0 in tl.static_range(0, I, BC):
-        acc += tl.load(ws + c0).to(tl.float32) * tl.load(act + p * I + c0 + c)[None, :]
-    tl.store(out + t * H + n, tl.sum(acc, 1).to(out.dtype.element_ty))
+            a = tl.load(act + p * I + c0 + c)
+            if FP8:
+                a = a * tl.load(ss + (c0 + c) // BI)
+                w = tl.load(ws + c0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            else:
+                w = tl.load(ws + c0).to(tl.float32)
+            acc += w * (a * wt)[None, :]
+        if not REDUCE:
+            tl.store(out + p * H + n, tl.sum(acc, 1).to(out.dtype.element_ty))
+            acc = tl.zeros([BN, BC], tl.float32)
+    if SHARED:
+        p = T * K + t
+        ws = sw2 + n[:, None] * I + c[None, :]
+        for c0 in tl.static_range(0, I, BC):
+            acc += tl.load(ws + c0).to(tl.float32) * tl.load(act + p * I + c0 + c)[None, :]
+    if REDUCE:
+        tl.store(out + t * H + n, tl.sum(acc, 1).to(out.dtype.element_ty))
 
 
 @triton.jit
@@ -226,9 +323,11 @@ def _router_logits_kernel(x, w, part, T, E: tl.constexpr, H: tl.constexpr, TB: t
 @triton.jit
 def _router_topk_kernel(part, bias, w_out, id_out, T, scale,
                         E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-                        S: tl.constexpr, NORM: tl.constexpr, PDL: tl.constexpr):
-    """One program per token: sum the S partials in a fixed order, then sigmoid -> + bias
-    -> top-K (ties to the lower expert) -> gather the unbiased scores -> normalize. The
+                        S: tl.constexpr, NORM: tl.constexpr, SOFTMAX: tl.constexpr,
+                        PDL: tl.constexpr):
+    """One program per token: sum the S partials in a fixed order and score them, then
+    top-K (ties to the lower expert) -> gather the scores -> normalize -> * scale. Sigmoid
+    scores are picked by score + bias, fp32 softmax scores (SOFTMAX) by themselves. The
     ``1e-20`` guards an all-zero top-K and rounds away for any sum above 2^-42."""
     if PDL:
         gdc_wait()
@@ -238,15 +337,23 @@ def _router_topk_kernel(part, bias, w_out, id_out, T, scale,
     valid = e < E
     logit = tl.zeros([EP], tl.float32)
     for s in tl.static_range(S):
-        logit += tl.load(part + (s * T + t) * E + e, mask=valid, other=0.0)
-    score = tl.sigmoid(logit)
-    biased = tl.where(valid, score + tl.load(bias + e, mask=valid, other=0.0), float("-inf"))
+        logit += tl.load(part + (s * T + t) * E + e, mask=valid, other=0.0).to(tl.float32)
+    if SOFTMAX:
+        x = tl.where(valid, logit, float("-inf"))
+        num = tl.where(valid, tl.exp(x - tl.max(x, 0)), 0.0)
+        score = num / tl.sum(num, 0)
+        rank = tl.where(valid, score, float("-inf"))
+    else:
+        score = tl.sigmoid(logit)
+        rank = tl.where(valid, score + tl.load(bias + e, mask=valid, other=0.0), float("-inf"))
     kk = tl.arange(0, KP)
     ids = tl.zeros([KP], tl.int32)
     for j in tl.static_range(K):
-        idx = tl.argmax(biased, 0)
+        # A NaN row (a captured prefill's padding) compares false everywhere, so argmax can
+        # land on a padding lane: keep the id an expert.
+        idx = tl.minimum(tl.argmax(rank, 0), E - 1)
         ids = tl.where(kk == j, idx, ids)
-        biased = tl.where(e == idx, float("-inf"), biased)
+        rank = tl.where(e == idx, float("-inf"), rank)
     ws = tl.sum(tl.where(e[None, :] == ids[:, None], score[None, :], 0.0), 1)
     ws = tl.where(kk < K, ws, 0.0)
     if NORM:
@@ -477,7 +584,7 @@ def _sum_kernel(part, out, T, K: tl.constexpr, H: tl.constexpr, BN: tl.constexpr
 def _tiles(T, tuning):
     """(gate/up, down) per-pair tiles for T tokens."""
     def pick(rows):
-        return next(tiles for bound, tiles in rows if bound is None or T <= bound)
+        return dict(next(tiles for bound, tiles in rows if bound is None or T <= bound))
 
     return pick(tuning.gate_up), pick(tuning.down)
 
@@ -513,34 +620,44 @@ def _launch_router(x, w, bias, part, topk_w, topk_ids, scale, normalize, pdl, tu
         num_warps=tuning.router["warps"])
     _router_topk_kernel[(T,)](
         part, bias, topk_w, topk_ids, T, float(scale), E=E, EP=triton.next_power_of_2(E),
-        K=K, KP=triton.next_power_of_2(K), S=splits, NORM=normalize, PDL=pdl, num_warps=1,
-        launch_pdl=pdl)
+        K=K, KP=triton.next_power_of_2(K), S=splits, NORM=normalize, SOFTMAX=False, PDL=pdl,
+        num_warps=1, launch_pdl=pdl)
 
 
-def _launch_gate_up(x, ids, w13, s13, sw13, act, block_size, limit, pdl, bj, bk, bjs, bks, warps):
+def _launch_gate_up(x, ids, w13, s13, sw13, act, block_size, limit, pdl, bj, bk, warps,
+                    bjs=16, bks=128):
+    """``s13`` / ``block_size`` None: weights in x.dtype. ``sw13`` None: no shared expert."""
     T, H = x.shape
     K = ids.shape[1]
     I = w13.shape[1] // 2
-    bo, bi = block_size
+    # unscaled weights are one block, so the kernel's scale offsets stay at zero
+    bo, bi = block_size or (I, H)
     bj, bk, bks = min(bj, bo), min(bk, H), min(bks, H)
-    assert bo % bj == 0 and I % bo == 0 and H % bk == 0 and I % bjs == 0 and H % bks == 0
-    _gate_up_kernel[(I // bjs + T * K * (I // bj),)](
-        x, ids, w13, s13, sw13, act, 0.0 if limit is None else float(limit), T, w13.stride(0),
-        s13.stride(0), K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BK=bk, NS=I // bjs,
+    ns = 0 if sw13 is None else I // bjs
+    assert bo % bj == 0 and I % bo == 0 and H % bk == 0
+    assert ns == 0 or (I % bjs == 0 and H % bks == 0)
+    _gate_up_kernel[(ns + T * K * (I // bj),)](
+        x, ids, w13, w13 if s13 is None else s13, w13 if sw13 is None else sw13, act,
+        0.0 if limit is None else float(limit), T, w13.stride(0),
+        0 if s13 is None else s13.stride(0), K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BK=bk, NS=ns,
         TB=max(16, triton.next_power_of_2(T)), BJS=bjs, BKS=bks, CLAMP=limit is not None,
-        PDL=pdl, num_warps=warps, launch_pdl=pdl)
+        FP8=s13 is not None, PDL=pdl, num_warps=warps, launch_pdl=pdl)
 
 
-def _launch_down(act, ids, tw, w2, s2, sw2, out, block_size, pdl, bn, bc, warps):
-    T, H = out.shape
+def _launch_down(act, ids, tw, w2, s2, sw2, out, block_size, pdl, bn, bc, warps, reduce=True):
+    """As ``_launch_gate_up`` for ``s2`` / ``sw2``. Without ``reduce``, ``out`` is
+    ``(T, K, H)``."""
+    T, H = out.shape[0], out.shape[-1]
     K = ids.shape[1]
     I = w2.shape[2]
-    bo, bi = block_size
+    bo, bi = block_size or (H, I)
     bn, bc = min(bn, bo), min(bc, I)
     assert bo % bn == 0 and H % bn == 0 and I % bc == 0
     _down_kernel[(T, H // bn)](
-        act, ids, tw, w2, s2, sw2, out, T, w2.stride(0), s2.stride(0),
-        K=K, I=I, H=H, BO=bo, BI=bi, BN=bn, BC=bc, PDL=pdl, num_warps=warps, launch_pdl=pdl)
+        act, ids, tw, w2, w2 if s2 is None else s2, w2 if sw2 is None else sw2, out, T,
+        w2.stride(0), 0 if s2 is None else s2.stride(0), K=K, I=I, H=H, BO=bo, BI=bi, BN=bn,
+        BC=bc, FP8=s2 is not None, SHARED=sw2 is not None, REDUCE=reduce, PDL=pdl,
+        num_warps=warps, launch_pdl=pdl)
 
 
 def _grouped_tiles(T):
@@ -653,6 +770,33 @@ def _launch_experts(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     _launch_down(buf["act"], ids, tw, w2, s2, sw2, buf["out"], block_size, pdl, **dn)
 
 
+def routed_tuning(x, w13, top_k):
+    """``_tuning`` of ``routed_experts`` over ``x`` and experts ``w13 (E, 2I, H)``."""
+    E, two_inter, H = w13.shape
+    return _tuning(x.device, (H, E, two_inter // 2, top_k), x.dtype)
+
+
+def routed_experts(x, w13, w2, topk_w, topk_ids, *, reduce=True):
+    """``fused_experts`` for up to ``routed_tuning``'s ``pair_max_tokens`` tokens: per-pair
+    GEMVs over ``w13 (E, 2I, H)`` / ``w2 (E, H, I)`` in ``x.dtype``, no shared expert, SwiGLU
+    and the routing weights in fp32. ``(T, H)``, or each slot's term ``(T, K, H)`` without
+    ``reduce``. ``topk_ids``: real experts only, distinct per token; the shapes must pass
+    ``routed_fits``."""
+    T, H = x.shape
+    K = topk_ids.shape[1]
+    tuning = routed_tuning(x, w13, K)
+    assert T <= tuning.pair_max_tokens and x.is_contiguous()
+    assert w13.dtype == w2.dtype == x.dtype and w13.is_contiguous() and w2.is_contiguous()
+    out = torch.empty((T, H) if reduce else (T, K, H), dtype=x.dtype, device=x.device)
+    if T:
+        act = torch.empty(T * K, w2.shape[2], dtype=torch.float32, device=x.device)
+        ids, tw = topk_ids.contiguous(), topk_w.float().contiguous()
+        gu, dn = _tiles(T, tuning)
+        _launch_gate_up(x, ids, w13, None, None, act, None, None, False, **gu)
+        _launch_down(act, ids, tw, w2, None, None, out, None, False, **dn, reduce=reduce)
+    return out
+
+
 def route(x, w, bias, *, top_k, scale, normalize):
     """``(topk_weights fp32, topk_ids int64)``, both ``(T, top_k)``, of the sigmoid router
     on ``x (T, H) @ w (E, H).T``: a split-K logits kernel, then one program per token."""
@@ -669,27 +813,43 @@ def route(x, w, bias, *, top_k, scale, normalize):
     return topk_w, topk_ids
 
 
+@torch.library.custom_op("mstar::moe_route", mutates_args=())
+def route_op(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, top_k: int, scale: float,
+             normalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """``route`` as an op opaque to dynamo, so a compiled gate keeps it whole."""
+    return route(x, w, bias, top_k=top_k, scale=scale, normalize=normalize)
+
+
+@route_op.register_fake
+def _(x, w, bias, top_k, scale, normalize):
+    T = x.shape[0]
+    return (x.new_empty(T, top_k, dtype=torch.float32),
+            x.new_empty(T, top_k, dtype=torch.int64))
+
+
 @torch.library.custom_op("mstar::moe_router_topk", mutates_args=())
-def router_topk(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scale: float,
-                normalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """``route``'s top-k program on precomputed fp32 ``logits (T, E)``. An op opaque to
-    dynamo, so a compiled gate keeps it whole."""
+def router_topk(logits: torch.Tensor, bias: torch.Tensor | None, top_k: int, scale: float,
+                normalize: bool, softmax: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """``route``'s top-k program on precomputed ``logits (T, E)`` of any float dtype, read in
+    fp32. ``softmax``: rank and weight by the fp32 softmax, with no ``bias``; otherwise by
+    the sigmoid router. An op opaque to dynamo, so a compiled gate keeps it whole."""
     T, E = logits.shape
-    assert logits.dtype == torch.float32 and logits.is_contiguous()
+    assert logits.is_contiguous() and (bias is None) == softmax
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=logits.device)
     topk_ids = torch.empty(T, top_k, dtype=torch.int64, device=logits.device)
     if T:
         _router_topk_kernel[(T,)](
-            logits, bias, topk_w, topk_ids, T, float(scale), E=E,
+            logits, logits if bias is None else bias, topk_w, topk_ids, T, float(scale), E=E,
             EP=triton.next_power_of_2(E), K=top_k, KP=triton.next_power_of_2(top_k), S=1,
-            NORM=normalize, PDL=False, num_warps=1)
+            NORM=normalize, SOFTMAX=softmax, PDL=False, num_warps=1)
     return topk_w, topk_ids
 
 
 @router_topk.register_fake
-def _(logits, bias, top_k, scale, normalize):
+def _(logits, bias, top_k, scale, normalize, softmax=False):
     T = logits.shape[0]
-    return logits.new_empty(T, top_k), logits.new_empty(T, top_k, dtype=torch.int64)
+    return (logits.new_empty(T, top_k, dtype=torch.float32),
+            logits.new_empty(T, top_k, dtype=torch.int64))
 
 
 def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
@@ -702,7 +862,7 @@ def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
     experts per token. ``swiglu_limit`` clamps gate from above and up to +-limit before the
     SwiGLU; None: no clamp. Above ``pair_max_tokens`` tokens ``x`` must be bf16."""
     _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
-    tuning = _tuning(x.device, (x.shape[1], w13.shape[0], w13.shape[1] // 2))
+    tuning = _tuning(x.device, (x.shape[1], w13.shape[0], w13.shape[1] // 2, topk_ids.shape[1]))
     buf = _expert_buffers(x, topk_ids.shape[1], w13.shape[0], w13.shape[1] // 2,
                           tuning.pair_max_tokens)
     if x.shape[0]:
@@ -726,7 +886,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     assert gate_w.is_contiguous()
     T, H = x.shape
     _check_router_tokens(T)
-    tuning = _tuning(x.device, (H, w13.shape[0], w13.shape[1] // 2))
+    tuning = _tuning(x.device, (H, w13.shape[0], w13.shape[1] // 2, top_k))
     part = torch.empty(_router_split(H, tuning)[0], T, gate_w.shape[0], dtype=torch.float32,
                        device=x.device)
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=x.device)

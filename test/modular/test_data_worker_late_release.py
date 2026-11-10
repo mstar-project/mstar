@@ -20,10 +20,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
-from mstar.model.base import Model
-from mstar.streaming.topology import PartitionTopology
+from mstar.communication.event import EventWakeup
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -33,20 +33,13 @@ from mstar.utils.ipc_format import (
 )
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, fail_preprocess=False):
         self.fail_preprocess = fail_preprocess
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         if self.fail_preprocess:
             raise ValueError("bad knob")
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -125,7 +118,7 @@ class _TensorManager:
     def force_cleanup_request(self, request_id):
         self.forced.append(request_id)
 
-    def ack_unread_tensors(self, request_id, graph_edges):
+    def ack_unread_tensors(self, graph_edges):
         pass
 
 
@@ -151,8 +144,8 @@ class _Rig:
         self.worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=queue.Queue(),
-            profile_queue=queue.Queue(),
+            out_queue=ResultQueue(EventWakeup()),
+            profile_queue=ResultQueue(EventWakeup()),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),

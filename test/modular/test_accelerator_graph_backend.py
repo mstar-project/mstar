@@ -215,15 +215,10 @@ def test_shared_pool_region_outputs_survive_other_graph_replays(graph_device):
 
 @pytest.mark.parametrize("batched", [False, True])
 def test_worker_output_copy_on_accelerator(graph_device, batched):
-    from collections import defaultdict
-
     from mstar.model.submodule_base import BatchedModelOutput
-    from mstar.worker.worker import Worker
+    from mstar.worker.host_copies import HostCopies
 
-    worker = object.__new__(Worker)
-    worker.device = graph_device
-    worker._d2h_stream = None
-    worker._pinned_d2h_buffers = defaultdict(list)
+    worker = HostCopies(device=graph_device, device_capability=DeviceCapability.of(graph_device))
     value = torch.arange(16, device=graph_device)
     outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [value]}})
     if batched:
@@ -231,7 +226,7 @@ def test_worker_output_copy_on_accelerator(graph_device, batched):
         outputs.row_request_ids = (7, 3)
     event = getattr(torch, graph_device.type).Event()
     event.record()
-    copied, host_rows = worker._prematerialize_for_check_stop(
+    copied, host_rows = worker.prematerialize_for_check_stop(
         outputs, event, request_ids=[3],
     )
     assert copied[7]["token"][0].device.type == "cpu"
@@ -261,7 +256,7 @@ def test_pinned_staging_keeps_copies_intact_across_reuse_and_growth(graph_device
             stager.copy_(dst, [float(i), -float(i)], pad_value=0)
             outputs.append(dst)
     side.synchronize()
-    assert all(buffer.is_pinned() for buffer in stager._bufs)
+    assert stager._arena.is_pinned()
     for i, dst in enumerate(outputs):
         expected = torch.zeros(dst.numel())
         expected[:2] = torch.tensor([float(i), -float(i)])
@@ -276,6 +271,54 @@ def test_pinned_staging_keeps_copies_intact_across_reuse_and_growth(graph_device
     backend.synchronize()
     torch.testing.assert_close(outputs[-1][:2].cpu(), torch.tensor([3., 4.]))
     assert outputs[-1][2:].count_nonzero().item() == 0
+
+
+def _pinnable(monkeypatch, pin: bool):
+    from mstar.utils import h2d
+
+    capability = SimpleNamespace(pin_memory=pin)
+    monkeypatch.setattr(h2d.DeviceCapability, "of", staticmethod(lambda device: capability))
+    return h2d.to_device_nonblocking
+
+
+@pytest.mark.parametrize(("device", "pin"), [("xpu:0", True), ("cuda:0", False)])
+def test_to_device_nonblocking_pins_where_the_device_capability_says(monkeypatch, device, pin):
+    to_device_nonblocking = _pinnable(monkeypatch, pin)
+    pinned = Mock(spec=torch.Tensor)
+    empty = Mock(return_value=pinned)
+    monkeypatch.setattr(torch, "empty", empty)
+    host = Mock(spec=torch.Tensor)
+    host.device = torch.device("cpu")
+    host.is_pinned.return_value = False
+    host.is_contiguous.return_value = True
+    host.numel.return_value = 0
+    to_device_nonblocking(host, device)
+    if pin:
+        assert empty.call_args.kwargs["pin_memory"] is True
+        pinned.to.assert_called_once_with(torch.device(device), non_blocking=True)
+    else:
+        empty.assert_not_called()
+        host.to.assert_called_once_with(torch.device(device))
+
+
+def test_to_device_nonblocking_builds_a_sequence_in_one_pinned_allocation(monkeypatch):
+    to_device_nonblocking = _pinnable(monkeypatch, True)
+    host = Mock(spec=torch.Tensor)
+    build = Mock(return_value=host)
+    monkeypatch.setattr(torch, "tensor", build)
+    out = to_device_nonblocking([True, False], "xpu:0", dtype=torch.bool)
+    build.assert_called_once_with([True, False], dtype=torch.bool, pin_memory=True)
+    host.pin_memory.assert_not_called()
+    host.to.assert_called_once_with(torch.device("xpu:0"), non_blocking=True)
+    assert out is host.to.return_value
+
+
+def test_to_device_nonblocking_takes_a_sequence_on_cpu():
+    from mstar.utils.h2d import to_device_nonblocking
+
+    torch.testing.assert_close(to_device_nonblocking([3, 1], "cpu"), torch.tensor([3, 1]))
+    keep = to_device_nonblocking([True, False], "cpu", dtype=torch.bool)
+    assert keep.dtype == torch.bool and keep.tolist() == [True, False]
 
 
 def test_chatterbox_shape_graphs_keep_results_across_replays(graph_device):

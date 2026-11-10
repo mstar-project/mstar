@@ -37,6 +37,12 @@ class _Communicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 class _Tokenizer:
     def encode_prompt(self, prompt):
@@ -58,6 +64,15 @@ def _case(name, convert):
         model = Pi05Model("unused", skip_weight_loading=True)
         model.tokenizer = _Tokenizer()
         return model, {"robot_state": convert(np.linspace(-1, 1, 32).tolist())}, {}
+    if name == "cosmos_policy":
+        # DROID's state, with the policy's 1 - gripper applied on the way to the DiT
+        model = Cosmos3Model("unused", skip_weight_loading=True)
+        model.config.inverted_action_dims = (7,)
+        state = [0.1 * i for i in range(8)]
+        return model, {
+            "robot_state": convert(state), "action_mode": "policy", "domain_name": "droid_lerobot",
+            "action_chunk_size": 3, "guidance_scale": 1.0, "height": 64, "width": 64,
+        }, {"action_inputs": torch.tensor([state[:7] + [1 - state[7]]])}
     if name == "cosmos":
         model = Cosmos3Model("unused", skip_weight_loading=True)
         action = convert([[0.1 * i] * 7 for i in range(2)])
@@ -83,7 +98,11 @@ def _case(name, convert):
     return model, kwargs, tensors
 
 
-@pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos"])
+# What each case asks for; the rest ask for video.
+_OUTPUTS = {"cosmos_policy": ["action"]}
+
+
+@pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos", "cosmos_policy"])
 @pytest.mark.parametrize("representation", [
     "cpu", "cuda", "noncontiguous-cpu", "noncontiguous-cuda", "list", "numpy",
 ])
@@ -103,6 +122,13 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
     }[representation]
     model, kwargs, expected_tensors = _case(case, convert)
     original_kwargs = dict(kwargs)
+    file_paths = None
+    if case == "pi05":
+        # a pi0.5 request needs a camera image
+        from PIL import Image
+
+        Image.new("RGB", (8, 8)).save(tmp_path / "camera.png")
+        file_paths = {"image": [str(tmp_path / "camera.png")]}
     communicator = _Communicator()
     sender = _manager(tmp_path, "api_server", device, communicator)
     receiver = _manager(tmp_path, "worker_0", device, communicator)
@@ -113,7 +139,8 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         communicator=communicator, tensor_manager=sender, model=model,
     )
     try:
-        worker._process_input(PreprocessInput("r", "Pick up the cup", None, [], ["video"], kwargs))
+        outputs = _OUTPUTS.get(case, ["video"])
+        worker._process_input(PreprocessInput("r", "Pick up the cup", file_paths, [], outputs, kwargs))
         request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
         for name, value in original_kwargs.items():
             assert kwargs[name] is value
@@ -123,14 +150,29 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         if case == "mpc":
             assert request.model_kwargs["mpc"] is True
         if case == "cosmos":
-            args = model.get_initial_forward_pass_args(
-                "p0", ["text"], ["video"], request.initial_signals, request.model_kwargs,
-            )
-            assert args.step_metadata["raw_action_dim"] == 7
-            assert "action" not in args.step_metadata
-            action_edge = next(e for e in args.inputs if e.name == "action_inputs")
+            from test_ingest_unpersist import plan_step
+
+            plan = model.walk_plan("default", ["text"], ["video"], request.initial_signals, request.model_kwargs)
+            prefill = plan[0]
+            assert prefill.step_metadata["raw_action_dim"] == 7
+            assert "action" not in prefill.step_metadata
+            inputs = plan_step(model, plan, 0, request.initial_signals).inputs
+            action_edge = next(e for e in inputs if e.name == "action_inputs")
             assert action_edge.tensor_info == request.initial_signals["action_inputs"]
-            _assert_prefill_ready(model, args)
+            _assert_prefill_ready(model, prefill.walk, inputs)
+        if case == "cosmos_policy":
+            from test_ingest_unpersist import plan_step
+
+            # Only the state's width reaches the conductor; the values ride the edge.
+            assert request.model_kwargs["robot_state_dim"] == 8
+            plan = model.walk_plan("default", ["text"], outputs, request.initial_signals, request.model_kwargs)
+            prefill = plan[0]
+            assert prefill.step_metadata["raw_action_dim"] == 8 and prefill.step_metadata["action_state_rows"] == 1
+            assert prefill.step_metadata["action_chunk_size"] == 3 and prefill.step_metadata["num_frames"] == 4
+            inputs = plan_step(model, plan, 0, request.initial_signals).inputs
+            action_edge = next(e for e in inputs if e.name == "action_inputs")
+            assert action_edge.tensor_info == request.initial_signals["action_inputs"]
+            _assert_prefill_ready(model, prefill.walk, inputs)
         edges = [GraphEdge(next_node="node", name=name, tensor_info=infos)
                  for name, infos in request.initial_signals.items()]
         receiver.start_read_tensors("r", edges)
@@ -166,16 +208,16 @@ def test_cosmos_worker_prepares_action_values(device):
     output = model.process_prompt("Pick up the cup", [], ["video"], **kwargs)
     conductor_kwargs = {k: v for k, v in kwargs.items() if k not in model.PREPROCESS_ONLY_KWARGS}
     conductor_kwargs.update(output.metadata)
-    args = model.get_initial_forward_pass_args(
-        "p0", ["text"], ["video"], {name: [] for name in output.new_input_tensors}, conductor_kwargs,
-    )
+    prefill = model.walk_plan(
+        "default", ["text"], ["video"], {name: [] for name in output.new_input_tensors}, conductor_kwargs,
+    )[0]
     config = _cfg()
     scheduler = UniPCMultistepScheduler.from_config(asdict(config.scheduler))
     dit = Cosmos3DiTSubmodule(Cosmos3OmniTransformer(config).to(device), config, scheduler=scheduler)
     # Run the actual worker preparation: the shorter trajectory repeats its last
     # action to fill the requested chunk, and padding beyond raw_action_dim is zero.
     dit._prepare_action_prefill(
-        SimpleNamespace(rid_handle="r"), args.step_metadata, output.new_input_tensors,
+        SimpleNamespace(rid_handle="r"), dict(prefill.step_metadata), output.new_input_tensors,
         [1, 2, 3], None, 64, 64, 24.0, 1.0, 2, device,
     )
     action = dit.request_state("r")["clean_action"].cpu()
@@ -185,10 +227,13 @@ def test_cosmos_worker_prepares_action_values(device):
 
 
 def test_cosmos_prefill_without_action_has_ready_empty_input():
+    from test_ingest_unpersist import plan_step
+
     model = Cosmos3Model("unused", skip_weight_loading=True)
-    args = model.get_initial_forward_pass_args("p0", ["text"], ["image"], {"text_inputs": []})
-    _assert_prefill_ready(model, args)
-    assert next(e for e in args.inputs if e.name == "action_inputs").tensor_info == []
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": []}, {})
+    inputs = plan_step(model, plan, 0, {"text_inputs": []}).inputs
+    _assert_prefill_ready(model, plan[0].walk, inputs)
+    assert next(e for e in inputs if e.name == "action_inputs").tensor_info == []
 
 
 def test_cosmos_tokenized_prompt_infers_action_width_before_routing(monkeypatch):
@@ -202,12 +247,12 @@ def test_cosmos_tokenized_prompt_infers_action_width_before_routing(monkeypatch)
     torch.testing.assert_close(output.new_input_tensors["action_inputs"][0], kwargs["action"])
 
 
-def _assert_prefill_ready(model, args):
-    graph = model.get_graph_walk_graphs()[args.full_metadata.graph_walk]
+def _assert_prefill_ready(model, walk, inputs):
+    graph = model.get_graph_walk_graphs()[walk]
     nodes = graph.get_nodes()
     registry = WorkerGraphStateRegistry(graph)
     for node in nodes.values():
         node._managing_registry = registry
-    for edge in args.inputs:
+    for edge in inputs:
         assert nodes[edge.next_node].ingest_input(edge)
     assert nodes["dit"].ready_signals.is_ready

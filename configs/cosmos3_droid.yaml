@@ -2,6 +2,9 @@ model: "cosmos3_droid"
 # Sequence-length hint for the scheduler. The conductor only asserts its
 # presence; the real per-request capacity is the KV pool below.
 max_seq_len: 8192
+# A robot sends one request at a time, so there is nothing for the data
+# worker's prepare pool to overlap (Cosmos3 declares PREPROCESS_PARALLEL).
+preprocess_workers: 1
 # KV pool sizing, matching the Nano config: the checkpoint is Nano-sized and
 # still serves the full video paths (forward dynamics decodes a rollout
 # video), so it keeps the pool that covers single-request video at every tier.
@@ -22,6 +25,17 @@ model_kwargs:
   # flow shift stays at the action default (5.0, the 480p training shift).
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
+  # The checkpoint takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): every action comes in and goes out in the robot's own values (the
+  # robot_state, a forward-dynamics action, the predicted rows), the same state
+  # a pi0.5 DROID policy takes.
+  inverted_action_dims: [7]
+  # The policy request defaults the Edge DROID checkpoint ships in its
+  # checkpoint.json (this checkpoint's file is empty), which NVIDIA's RoboLab
+  # server sends to both: 32 predicted rows, 15 fps observations, DROID.
+  policy_action_chunk_size: 32
+  policy_conditioning_fps: 15.0
+  policy_domain_name: droid_lerobot
 node_groups:
   - node_names: ["dit"]
     ranks: [0]

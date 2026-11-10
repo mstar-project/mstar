@@ -2,7 +2,7 @@
 
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
-``message.content``, audio into ``message.audio`` (base64 WAV), images into
+``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
 ``image_url`` data-URL content parts. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 
@@ -12,49 +12,35 @@ as ``reply`` events.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 from mstar.api_server import media_io
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    args = adapter.chat_to_request(req, api.upload_dir)
-    parser = adapter.make_output_parser(req)
-    stops = adapter.stop_strings(req)
-    # checked before the request runs: a raise after submit leaves it running with no reader
+    # checked before the adapter saves any upload, which only the finally below removes,
+    # and before submit, after which a raise leaves the request running with no reader
     stream_options = getattr(req, "stream_options", None) or {}
     if not isinstance(stream_options, dict):
         raise ValueError("stream_options must be an object")
     include_usage = bool(stream_options.get("include_usage"))
-    request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    audio_format = _audio_format(req, sample_rate)
+    # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
+    args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
+    parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
+    request_id = rid("chatcmpl")
 
     try:
-        api.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
-            prompt_parts=args.prompt_parts,
-            streaming=bool(req.stream),
-            request_id=request_id,
-        )
+        model_name = reply.submit(api, request_id, model_name, req, args)
         if req.stream:
-            # named before the wait below, which a resubmission under the id could outlast
-            key = api.submission_key(request_id)
-            # a request the engine refuses gets its status, not a 200
-            batches = await api.open_result_stream(request_id, raw_request, batches=True)
-            return ReleasingStreamingResponse(
-                _stream_events(reply.reply_events(api, request_id, parser, stops, batches=batches, key=key),
-                               model_name, request_id, include_usage),
-                release=lambda: api.release_request(request_id),
-                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
-            )
+            events = await reply.stream_events(api, request_id, raw_request, parser, stops)
+            return reply.sse_response(api, request_id, _stream_events(events, model_name, request_id, include_usage))
         if parser is not None or stops:
             # read chunk by chunk, so a stop string ends the request as it appears
             events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
@@ -62,7 +48,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate, parser)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format, parser)
 
 
 def _usage(usage: reply.Usage) -> dict:
@@ -100,7 +86,19 @@ def _text_response(model_name, request_id, events) -> dict:
     }
 
 
-def _build_response(model_name, request_id, chunks, sample_rate, parser=None) -> dict:
+def _audio_format(req, sample_rate: int) -> str:
+    """The container ``message.audio`` is sent in, from OpenAI's ``audio.format``: a speech
+    container, with ``pcm16`` naming raw PCM. Stream deltas are raw PCM16, so a stream takes only that."""
+    fmt = str((req.audio or {}).get("format") or ("pcm16" if req.stream else "wav")).lower()
+    allowed = ("pcm16",) if req.stream else tuple(
+        "pcm16" if f == "pcm" else f for f in media_io.audio_formats(sample_rate=sample_rate))
+    if fmt not in allowed:
+        how = "streamed" if req.stream else "produced"
+        raise ValueError(f"audio.format {fmt!r} cannot be {how} by this server; use one of: {', '.join(allowed)}")
+    return "pcm" if fmt == "pcm16" else fmt
+
+
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", parser=None) -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -121,10 +119,10 @@ def _build_response(model_name, request_id, chunks, sample_rate, parser=None) ->
         message = parser.message(text)
 
     if audio_pcm:
-        wav = media_io.pcm16_to_wav_bytes(b"".join(audio_pcm), sample_rate)
+        audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
         message["audio"] = {
             "id": rid("audio"),
-            "data": base64.b64encode(wav).decode("ascii"),
+            "data": base64.b64encode(audio).decode("ascii"),
             "expires_at": now() + 86400,
             "transcript": text,
         }

@@ -23,13 +23,7 @@ Changes from the reference, none of which change the math:
 
 * inference only: no training losses, dropout or ``audiotools`` bases;
 * weight norm is folded into plain conv weights at load time (the same
-  ``torch._weight_norm`` the parametrization evaluates per call);
-* the transformers take explicit frame positions, so a window that starts
-  ``offset`` frames into a stream rotates its frames exactly as one decode of
-  the whole stream does (the RoPE table is bfloat16, so attention is not
-  shift invariant);
-* ``FishDACDecoder.decode_window`` decodes the conv stack over a slice of the
-  window only (its new frames and their causal receptive field).
+  ``torch._weight_norm`` the parametrization evaluates per call).
 """
 
 from __future__ import annotations
@@ -137,7 +131,8 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: float = 10000) -> torc
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Interleaved RoPE. ``x``: ``[B, T, H, D]``; ``freqs_cis``: ``[B, T, D/2, 2]``."""
+    """Interleaved RoPE. ``x``: ``[B, T, H, D]``; ``freqs_cis``: ``[B, T, D/2, 2]``, or
+    ``[1, T, D/2, 2]`` for rows at the same positions."""
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.unsqueeze(2)
     out = torch.stack(
@@ -224,8 +219,7 @@ class TransformerBlock(nn.Module):
 class WindowLimitedTransformer(nn.Module):
     """Causal transformer whose frames attend to the last ``window`` frames.
 
-    Channels first in and out (``[B, D, T]``). ``positions`` (``[B, T]``) are
-    the frames' indices in their stream; ``None`` means ``0 .. T-1``.
+    Channels first in and out (``[B, D, T]``), frames at positions ``0 .. T-1``.
     """
 
     def __init__(
@@ -262,12 +256,10 @@ class WindowLimitedTransformer(nn.Module):
         cols = torch.arange(length, device=device).view(1, -1)
         return ((cols <= rows) & (cols > rows - self.window))[None, None]
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)
-        bsz, length, _ = x.shape
-        if positions is None:
-            positions = torch.arange(length, device=x.device).expand(bsz, length)
-        freqs_cis = self.freqs_cis[positions]
+        length = x.shape[1]
+        freqs_cis = self.freqs_cis[None, :length]
         mask = self.window_mask(length, x.device)
         for layer in self.layers:
             x = layer(x, freqs_cis, mask)
@@ -416,25 +408,6 @@ class DownsampleResidualVectorQuantize(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _earliest_input(module: nn.Module, out_index: int) -> int:
-    """First input position output ``out_index`` of ``module`` depends on."""
-    if isinstance(module, (Snake1d, nn.Tanh, nn.Identity)):
-        return out_index
-    if isinstance(module, CausalConvNet):
-        return out_index * module.stride - module.padding
-    if isinstance(module, CausalTransConvNet):
-        # input i writes outputs i*stride .. i*stride + kernel - 1
-        return -((module.kernel_size - 1 - out_index) // module.stride)
-    if isinstance(module, ConvNeXtBlock):
-        return _earliest_input(module.dwconv, out_index)
-    if isinstance(module, (ResidualUnit, DecoderBlock, nn.Sequential)):
-        blocks = module.block if hasattr(module, "block") else module
-        for block in reversed(blocks):
-            out_index = _earliest_input(block, out_index)
-        return out_index
-    raise TypeError(f"no causal receptive-field rule for {type(module).__name__}")
-
-
 class FishDACDecoder(nn.Module):
     """Codes ``[B, 10, T]`` -> audio ``[B, T * 2048]`` (``quantizer.*`` + ``decoder.*`` of ``codec.pth``)."""
 
@@ -449,16 +422,8 @@ class FishDACDecoder(nn.Module):
         """Modules after the post transformer, in execution order."""
         return [*self.quantizer.upsample, *self.decoder.model]
 
-    def conv_receptive_field(self) -> int:
-        """Frames of post-transformer context the conv stack needs for exact audio."""
-        frame = 10_000
-        index = frame * self.hop_length
-        for module in reversed(self.conv_stack()):
-            index = _earliest_input(module, index)
-        return frame - index
-
-    def latents(self, codes: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
-        return self.quantizer.post_module(self.quantizer.embed(codes), positions)
+    def latents(self, codes: torch.Tensor) -> torch.Tensor:
+        return self.quantizer.post_module(self.quantizer.embed(codes))
 
     def run_conv_stack(self, latents: torch.Tensor) -> torch.Tensor:
         for module in self.conv_stack():
@@ -468,28 +433,6 @@ class FishDACDecoder(nn.Module):
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         """One decode of whole streams (frame positions from 0)."""
         return self.run_conv_stack(self.latents(codes))
-
-    def decode_window(
-        self,
-        codes: torch.Tensor,
-        start_offset: torch.Tensor,
-        conv_start: torch.Tensor,
-        conv_frames: int,
-    ) -> torch.Tensor:
-        """Audio of frames ``conv_start .. conv_start + conv_frames`` of each window.
-
-        ``codes`` ``[B, 10, W]`` are windows whose first frame is frame
-        ``start_offset[b]`` of its stream; the transformer runs over the whole
-        window and the conv stack over ``conv_frames`` frames from
-        ``conv_start[b]`` (reading clamped padding past the window, which
-        causal convolutions keep out of the frames before it).
-        """
-        width = codes.shape[-1]
-        positions = start_offset.view(-1, 1) + torch.arange(width, device=codes.device)
-        latents = self.latents(codes, positions.clamp(max=self.config.max_frames - 1))
-        index = (conv_start.view(-1, 1) + torch.arange(conv_frames, device=codes.device)).clamp(max=width - 1)
-        latents = latents.gather(2, index.unsqueeze(1).expand(-1, latents.shape[1], -1))
-        return self.run_conv_stack(latents)
 
 
 class FishDACEncoder(nn.Module):

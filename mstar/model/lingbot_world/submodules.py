@@ -38,9 +38,10 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
+from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.lingbot_world.components.camera import plucker_embedding
 from mstar.model.lingbot_world.components.dit import (
     REFERENCE_ATTENTION,
@@ -50,8 +51,7 @@ from mstar.model.lingbot_world.components.dit import (
 )
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.submodules import _SingleRequestMixin
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule, StepOrder
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +155,7 @@ def encode_condition_chunk(
         enc = vae.quant_conv(torch.cat(outs, dim=2))
         z = config.vae_z_dim
         latent = enc[:, :z].float()
-        mean = torch.tensor(vae.config.latents_mean).view(1, z, 1, 1, 1).to(latent)
-        inv_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, z, 1, 1, 1).to(latent)
+        mean, inv_std = latent_affine(vae, latent.dtype, latent.device)
         latent = ((latent - mean) * inv_std)[0]
         lat_h, lat_w = latent.shape[2:]
         if first_latent == 0:
@@ -166,7 +165,7 @@ def encode_condition_chunk(
         return torch.concat([msk, latent])
 
 
-class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
+class LingBotDitSubmodule(NodeSubmodule):
     """One rollout iteration is one chunk of ``chunk_size`` latent frames:
 
       * the chunk's I2V condition (``encode_condition_chunk``, continuing the
@@ -208,21 +207,17 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
-            # cuDNN has fast bf16 conv3d from 9.16; before that bf16 is slower than fp32
-            cudnn = torch.backends.cudnn.version() or 0
-            if cudnn >= 91600:
-                self._decode_dtype = torch.bfloat16
+            self._decode_dtype = wan_vae_decode_dtype()
+            if self._decode_dtype == torch.bfloat16:
                 vae.to(torch.bfloat16)
             else:
-                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)", cudnn)
-            wan_vae.to_channels_last(vae)
-        self._decode_step = wan_vae.DecoderStep(vae, compile=fast, deterministic=True) if vae is not None else None
+                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
+                            torch.backends.cudnn.version())
+        self._decoder = wan_vae.FastDecoder(vae, channels_last=fast, compile=fast) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
             device = next(vae.parameters()).device
-            shape = (1, config.vae_z_dim, 1, 1, 1)
-            self._latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(shape)
-            self._latents_inv_std = 1.0 / torch.tensor(vae.config.latents_std, device=device).view(shape)
+            self._latents_mean, self._latents_inv_std = latent_affine(vae, torch.float32, device)
             if fast:
                 for lat_hw in warmup_latent_sizes:
                     self.warmup_decode(lat_hw)
@@ -234,6 +229,16 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
         self.keep_chunk_outputs = False
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Every rollout chunk emits frames to the client, so a session's
+        stream keeps moving while others run."""
+        del graph_walk
+        return StepOrder.TURNS
+
+    def max_batch_size(self, graph_walk: str):
+        # not batched: each request rolls out its own K/V cache, generator and VAE caches
+        return 1
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
@@ -252,7 +257,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 self._attention = REFERENCE_ATTENTION
             else:
                 def on(kv_label):
-                    ragged = RaggedAttentionCallable(resource, cross_label(CHUNK_SPAN, kv_label))
+                    ragged = functools.partial(resource.run, label=cross_label(CHUNK_SPAN, kv_label))
                     return functools.partial(joint_attention, ragged=ragged)
                 self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
         return self._attention
@@ -267,16 +272,9 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             text=cfg.text_len,
         )
 
-    def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs | None:
-        state = self.request_state(fwd_info.rid_handle)
-        num_chunks = int(fwd_info.step_metadata["num_chunks"])
-        chunk = int(state.get("chunk", 0))
-        if chunk >= num_chunks:
-            logger.info(
-                "LingBot dit: skipping async-overshoot chunk %d (request %s runs %d chunks)",
-                chunk, fwd_info.request_id, num_chunks,
-            )
-            return None
+    def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs:
+        # the loop's cap is the request's chunk count, so this stays in range
+        chunk = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
         image = inputs["image_inputs"][0]
         return NodeInputs(
             tensor_inputs={
@@ -308,7 +306,6 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         generator.manual_seed(seed)
         noise = torch.randn(cfg.out_dim, lat_f, lat_h, lat_w, dtype=torch.float32, generator=generator, device=device)
         state.add_all(
-            chunk=0,
             frame_seqlen=frame_seqlen,
             generator=generator,
             noise=noise,
@@ -329,7 +326,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         image = image.to(device)
         if "kv" not in state:
             self._seed_request(state, info.step_metadata, info.random_seed, image, device)
-        chunk = int(state["chunk"])
+        chunk = int(info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
         frame_seqlen = int(state["frame_seqlen"])
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
@@ -367,11 +364,10 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             del conditioning
             pixels = self._decode(x0, state, clip_start=chunk == 0)
 
-        state.add("chunk", chunk + 1)
         if self.keep_chunk_outputs:
             state.add_all(chunk_latents=x0.clone(), chunk_pixels=pixels.clone(), chunk_condition=y.clone())
         # quantize from fp32; a bf16 decode's frames round once, here
-        frames_u8 = (pixels[0].float() / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+        frames_u8 = truncate_to_uint8(pixels[0].float()).permute(1, 2, 3, 0).contiguous()
         return {
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
@@ -418,13 +414,5 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         continuation of the request's stream."""
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
-        with torch.amp.autocast("cuda", enabled=False):
-            return wan_vae.decode_causal(
-                self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,
-            )
+        return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
 
-    def check_stop(self, request_id, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        done = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)
-        if done + 1 >= int(request_info.step_metadata.get("num_chunks", 0) or 0):
-            return {ROLLOUT_LOOP_NAME}
-        return set()

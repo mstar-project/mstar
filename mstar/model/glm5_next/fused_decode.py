@@ -1,4 +1,4 @@
-"""Fused Triton kernels for the glm5_next layer: mHC, the router and the SwiGLU.
+"""Fused Triton kernels for the glm5_next layer: mHC and the SwiGLU.
 
 Each replaces a chain of small torch ops that is kernel-count bound at decode batch sizes.
 The math and the bf16 rounding points follow the torch reference in mhc.py and moe.py,
@@ -273,31 +273,6 @@ if _HAS_TRITON:
                     val += tl.load(comb_in + t * HC * HC + j * HC + s) * r
             tl.store(x_out + t * HC * HID + s * HID + i, val.to(x_out.dtype.element_ty))
 
-    @triton.jit
-    def _router_topk_kernel(logits, bias, w_out, id_out, scale,
-                            E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, NORM: tl.constexpr):
-        """sigmoid -> + correction bias -> top-K -> gather unbiased scores -> normalize."""
-        t = tl.program_id(0).to(tl.int64)
-        e = tl.arange(0, EP)
-        valid = e < E
-        s = tl.sigmoid(tl.load(logits + t * E + e, mask=valid, other=0.0))
-        biased = tl.where(valid, s + tl.load(bias + e, mask=valid, other=0.0), float("-inf"))
-        kk = tl.arange(0, K)
-        ids = tl.zeros([K], tl.int64)
-        ws = tl.zeros([K], tl.float32)
-        for j in tl.static_range(K):
-            top = tl.max(biased, 0)
-            # A NaN row (a captured prefill's padding) matches nothing: keep it an expert.
-            idx = tl.minimum(tl.min(tl.where(biased == top, e, EP), 0), E - 1)
-            ids = tl.where(kk == j, idx.to(tl.int64), ids)
-            ws = tl.where(kk == j, tl.sum(tl.where(e == idx, s, 0.0), 0), ws)
-            biased = tl.where(e == idx, float("-inf"), biased)
-        if NORM:
-            ws = ws / (tl.sum(ws, 0) + 1e-20)
-        tl.store(w_out + t * K + kk, ws * scale)
-        tl.store(id_out + t * K + kk, ids)
-
-
 # Above this many tokens (prefill) hc_pre takes the prefill mix kernel, whose fused update
 # pays once the layer carries its closing update into the next site. L2 hints: mix inputs,
 # kept, finalize.
@@ -401,15 +376,3 @@ def swiglu(gate_up, limit):
         _swiglu_kernel[(triton.cdiv(T, 4), triton.cdiv(I, bi))](
             gate_up, out, T, float(limit), I=I, BR=4, BI=bi, num_warps=4)
     return out
-
-
-def router_topk(logits, bias, *, top_k, scale, normalize):
-    """``(topk_weights fp32, topk_ids int64)`` from fp32 router ``logits (T, E)``."""
-    T, E = logits.shape
-    w = torch.empty(T, top_k, dtype=torch.float32, device=logits.device)
-    ids = torch.empty(T, top_k, dtype=torch.int64, device=logits.device)
-    if T:
-        _router_topk_kernel[(T,)](
-            logits, bias, w, ids, float(scale),
-            E=E, EP=triton.next_power_of_2(E), K=top_k, NORM=normalize, num_warps=4)
-    return w, ids

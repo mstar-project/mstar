@@ -29,10 +29,10 @@ from mstar.model.cosmos3.submodules import (
     COND_LABEL,
     KV_CACHE,
     UNCOND_LABEL,
-    VIDEO_GEN_AR_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderARSubmodule,
 )
+from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 
 
@@ -59,10 +59,8 @@ def _dit(cfg=None):
 
 
 def test_windowed_gen_params_and_walk_selection() -> None:
-    """Windowed knobs quantize to latent units, the AR walk is selected at the
-    prefill transition, and every rejection fires at request resolution."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
+    """Windowed knobs quantize to latent units, the plan runs the AR walk after
+    the prefill, and every rejection fires at request resolution."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "size": "832x480"}, [], ["video"],
@@ -74,31 +72,12 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     assert p["num_frames"] == 189
     assert p["flow_shift"] == C.V2V_DEFAULT_FLOW_SHIFT
 
-    md = CurrentForwardConductorMetadata(
-        input_modalities=[], output_modalities=["video"],
-        graph_walk=C.PREFILL_WALK, is_prefill=True, kwargs=p,
-    )
-    args = model.get_partition_forward_pass_args("default", md, {})
-    assert args.full_metadata.graph_walk == C.VIDEO_GEN_AR_WALK
-    assert [e.name for e in args.inputs] == ["latents", "time_index", "cond_latents"]
-    done = model.get_partition_forward_pass_args("default", args.full_metadata, {})
-    assert done.request_done
-
-    dec = model.get_partition_forward_pass_args(
-        C.WINDOW_DECODER_PARTITION,
-        CurrentForwardConductorMetadata(
-            input_modalities=[], output_modalities=["video"],
-            graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs=p,
-        ),
-        {},
-    )
-    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert not dec.request_done and dec.inputs == []
-    init = model.get_initial_forward_pass_args(
+    plan = model.walk_plan("default", [], ["video"], {}, {"window_mode": "chained", "num_frames": 189})
+    assert [step.walk for step in plan] == [C.PREFILL_WALK, C.VIDEO_GEN_AR_WALK]
+    (dec,) = model.walk_plan(
         C.WINDOW_DECODER_PARTITION, ["text"], ["video"], {}, {"window_mode": "kv", "num_frames": 61},
     )
-    assert init.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert init.step_metadata["num_windows"] == 2 and init.inputs == []
+    assert dec.walk == C.VIDEO_DECODE_AR_WALK and dec.step_metadata["num_windows"] == 2
 
     for bad in (
         {"window_mode": "bogus", "num_frames": 189},
@@ -159,7 +138,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     parts = {p.name: p for p in model.get_partitions()}
     assert set(parts) == {"default", C.WINDOW_DECODER_PARTITION}
     assert parts[C.WINDOW_DECODER_PARTITION].graph_walks == {C.VIDEO_DECODE_AR_WALK}
-    assert parts[C.WINDOW_DECODER_PARTITION].initial_walk == C.VIDEO_DECODE_AR_WALK
     assert C.VIDEO_DECODE_AR_WALK not in parts["default"].graph_walks
     topo = model.get_partition_topology()
     (conn,) = topo.connections
@@ -172,24 +150,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     assert plain.get_partition_topology().connections == []
 
 
-def test_windowed_check_stop_counts_all_windows() -> None:
-    """The AR loop stops at num_windows x iterations, not at one scheduler's
-    length."""
-    sub = _dit()
-    st = sub.request_state("r")
-    st.add_all(
-        ar_schedule=WindowSchedule(48, 8, overlap_units=1),
-        ar_total_iters=7 * 5,
-        scheduler=SimpleNamespace(timesteps=list(range(5))),
-    )
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 4})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 33
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 34
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
-
-
 def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     """The last step of a window emits the window's latents on the streaming
     edge, stages the next window (fresh noise, the head built from the
@@ -197,7 +157,8 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     staging."""
     sub = _dit()
     sub.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh-sched")
+    fresh = StubSampler(())
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: fresh)
     monkeypatch.setattr(sub, "_window_statics_for", lambda st, plan, dev: ({"u": plan.units}, None))
     heads = []
     sub._window_head = lambda w, units: heads.append((w, units)) or torch.full_like(w[:, :, -units:], -3.0)
@@ -209,14 +170,12 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
         ar_schedule=schedule, ar_steps=5, ar_total_iters=10, ar_iters_per_window=5,
         ar_flow_shift=None, ar_karras=None, ar_size=(64, 64),
         ar_generator=torch.Generator().manual_seed(0),
-        cond={"u": 8}, uncond=None, scheduler="w0-sched",
+        cond={"u": 8}, uncond=None, scheduler=StubSampler(()),
     )
     w0_shape = sub._window_latent_shape(64, 64, 8)
     x0 = torch.arange(8, dtype=torch.float32).view(1, 1, 8, 1, 1).expand(w0_shape).contiguous()
-    ti = torch.tensor([4])
-    out = sub._finish_window(st, x0, ti, window_index=0)
+    out = sub._finish_window(st, x0, window_index=0)
     assert torch.equal(out["window_latents"][0], x0)
-    assert int(out["time_index"][0].item()) == 5
     # Next window: 5 latent units (12 total - 8 + 1 overlap); its head is the
     # one built from the finished window, the rest fresh noise.
     nxt = out["latents"][0]
@@ -224,13 +183,13 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     assert len(heads) == 1 and heads[0][0] is x0 and heads[0][1] == 1
     assert torch.all(nxt[:, :, 0] == -3.0) and not torch.any(nxt[:, :, 1:] == -3.0)
     assert torch.all(st["cond_video_latents"][:, :, 0] == -3.0)
-    assert st["scheduler"] == "fresh-sched" and st["cond"] == {"u": 5}
+    assert st["scheduler"] is fresh and st["cond"] == {"u": 5}
     assert st["vmask"].shape[2] == 5 and float(st["vmask"][0, 0, 0]) == 1.0
 
     # Final window: emit only, no staging.
     st.add("cond", {"u": 5})
     x1 = torch.zeros(sub._window_latent_shape(64, 64, 5))
-    out = sub._finish_window(st, x1, torch.tensor([9]), window_index=1)
+    out = sub._finish_window(st, x1, window_index=1)
     assert torch.equal(out["window_latents"][0], x1)
     assert torch.equal(out["latents"][0], x1)
     assert len(heads) == 1
@@ -271,9 +230,10 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     sees the tail behind ``chained_head_context_latents`` latents, the encode
     sees those frames quantized as served (``_to_uint8``), and the head's
     first latent is the encoder's clip-start latent."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
     from mstar.model.cosmos3.submodules import ChainedWindowHead, Cosmos3VAEDecoderSubmodule
 
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
     cfg.chained_head_context_latents = ctx
@@ -295,12 +255,29 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     assert not torch.allclose(head, window[:, :, -2:])
 
 
+def test_chained_window_head_encodes_in_the_encode_vaes_dtype(monkeypatch) -> None:
+    """The head encodes in the encode VAE's own dtype (bf16 as built) and never
+    casts it: the instance is the encoder node's when the two share a process."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
+    from mstar.model.cosmos3.submodules import ChainedWindowHead
+
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    encode_vae = _CausalVAE(cfg.latent_channel).to(torch.bfloat16)
+    window = torch.zeros(1, cfg.latent_channel, 8, 4, 4)
+    head = ChainedWindowHead(_CausalVAE(cfg.latent_channel), encode_vae, cfg)(window, 2)
+    assert encode_vae.encoded[0].dtype == torch.bfloat16
+    assert encode_vae.weight.dtype == torch.bfloat16
+    assert head.dtype == window.dtype
+
+
 def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     """A kv request runs steps + 1 loop iterations per window (the +1 is the
     commit pass); the prefill records the pacing, the schedule and the
-    per-unit token stride, and check_stop fires after the final commit."""
+    per-unit token stride."""
     sub = _dit()
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(()))
     md = {
         "window_mode": "kv", "total_latent_units": 12, "window_latent_units": 4,
         "overlap_latent_units": 0, "context_latent_units": 6,
@@ -315,11 +292,6 @@ def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     assert st["ar_tokens_per_unit"] == 4
     assert st["ar_schedule"].context_units == 6
     assert sub._window_step(st, 4) == (0, 4, True) and sub._window_step(st, 7) == (1, 2, False)
-
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 13})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 14
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
 
 
 def test_windowed_kv_statics_absolute_positions() -> None:
@@ -364,7 +336,9 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
             (latents.clone(), [(c.clone(), s.clone()) for c, s in rotary], label, attn)
         ),
     )
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh")
+    fresh = StubSampler(())
+    sub._solver_state = ()
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: fresh)
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))  # no parameters to read it off
 
     stride = 64  # tokens per latent frame (256p tier: pages hold 2 frames)
@@ -386,15 +360,16 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
         ar_schedule=schedule, ar_steps=4, ar_iters_per_window=5, ar_total_iters=15,
         ar_kv_mode=True, ar_rid="r", ar_tokens_per_unit=stride, ar_size=(64, 64),
         ar_generator=torch.Generator().manual_seed(0),
-        cond=cond0, uncond=uncond0, scheduler=SimpleNamespace(timesteps=torch.arange(4), step_index=None),
+        cond=cond0, uncond=uncond0, scheduler=StubSampler(torch.arange(4)),
         latent_shape=sub._window_latent_shape(64, 64, 4), gs=6.0, guidance_interval=None,
     )
     x0 = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1).expand(
         sub._window_latent_shape(64, 64, 4)).contiguous()
-    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
+    counts = {"video_gen_ar_loop": 4}
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0, dynamic_loop_iter_counts=counts)
 
     # Commit iteration (global 4 = window 0's 5th iteration).
-    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([4])]})
+    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0]})
     assert ni.input_seq_len == 4 * stride and ni.resource_step_info.commit
     step = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni])
     assert step.steps[KV_CACHE].commit
@@ -410,37 +385,38 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
 
     # A denoise iteration declares the usual non-committing step, without a
     # retention.
-    ni2 = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([2])]})
+    counts["video_gen_ar_loop"] = 2
+    ni2 = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0]})
     assert ni2.input_seq_len == 4 * stride and not ni2.resource_step_info.commit
     step2 = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni2]).steps[KV_CACHE]
     assert not step2.commit and step2.retention == {}
-    # Past the last iteration the loop's extra dispatch is vetoed.
-    assert sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([15])]}) is None
 
     # Window 0 commit forward, driven through forward() so the step's
     # resources reach it: the full window appended under the combined label
     # through the paged attention, next window staged with absolute positions
     # and a fresh scheduler.
     ei = SimpleNamespace(
-        request_ids=["r"], per_request_states=None, resources={ATTN: "paged"}, step={ATTN: None},
+        request_ids=["r"], per_request_states=None, per_request_info={"r": fwd},
+        resources={ATTN: "paged"}, step={ATTN: None},
     )
-    out = sub.forward(C.VIDEO_GEN_AR_WALK, ei, latents=x0, time_index=torch.tensor([4]))
+    counts["video_gen_ar_loop"] = 4
+    out = sub.forward(C.VIDEO_GEN_AR_WALK, ei, latents=x0)
     assert torch.equal(out["window_latents"][0], x0)
     latents_c, rotary_c, label, attn = commits[-1]
     assert label == CFG_BATCHED_LABEL and attn == "paged"
     assert torch.equal(latents_c, x0)
     for got, static in zip(rotary_c, (cond0, uncond0), strict=True):
         assert torch.equal(got[0], static["rotary"][0]) and torch.equal(got[1], static["rotary"][1])
-    assert st["scheduler"] == "fresh"
+    assert st["scheduler"] is fresh
     assert int(st["cond"]["rotary"][0][0, 0]) == 4 * stride
     assert out["latents"][0].shape == sub._window_latent_shape(64, 64, 4)
 
     # Sequential guidance commits per label.
     sub.batched_cfg = False
-    sub._commit_window("paged", st, x0, torch.tensor([9]), window_index=1)
+    sub._commit_window("paged", st, x0, window_index=1)
     assert [c[2] for c in commits[-2:]] == [COND_LABEL, UNCOND_LABEL]
     # Final window: emit only.
-    out = sub._commit_window("paged", st, x0, torch.tensor([14]), window_index=2)
+    out = sub._commit_window("paged", st, x0, window_index=2)
     assert torch.equal(out["latents"][0], x0) and torch.equal(out["window_latents"][0], x0)
 
 
@@ -453,10 +429,8 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     sub = _dit()
     schedule = WindowSchedule(total_units=14, window_units=8, overlap_units=2)
     latent_shape = sub._window_latent_shape(64, 64, 8)
-    sched = SimpleNamespace(
-        timesteps=torch.arange(4, 0, -1),
-        step=lambda v, t, lat, return_dict=False: (lat * 0.5,),
-    )
+    sched = StubSampler(torch.arange(4, 0, -1), lambda lat, v: lat * 0.5)
+    sub._solver_state = ()
 
     def add_windowed(rid):
         st = sub.request_state(rid)
@@ -481,21 +455,33 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     add_windowed("a")
     add_windowed("b")
     batch = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["a", "b"])
-    inp = lambda t: SimpleNamespace(tensor_inputs={"time_index": torch.tensor([t])})  # noqa: E731
-    assert sub.can_batch(batch, [inp(1), inp(1)])
-    assert sub.can_batch(batch, [inp(3), inp(5)])  # different windows, both denoise
+    inp = lambda commit=False: SimpleNamespace(resource_step_info=SimpleNamespace(commit=commit))  # noqa: E731
+    assert sub.can_batch(batch, [inp(), inp()])  # at any two steps, in any two windows
+
+    # With a cap set (an H100 deployment's 16384), a step whose requests total
+    # more vision tokens than it runs request by request, even when each is
+    # under it. Without one (the default) they batch.
+    cap = 16384
+    for rid, n in (("q1", cap // 4), ("q2", cap // 4), ("h1", cap // 2 + 1), ("h2", cap // 2 + 1)):
+        add_windowed(rid)["cond"]["num_vision_tokens"] = n
+    pair = lambda *rids: SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=list(rids))  # noqa: E731
+    assert sub.config.max_batched_vision_tokens is None
+    assert sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = cap
+    assert sub.can_batch(pair("q1", "q2"), [inp(), inp()])
+    assert not sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = None
 
     # A kv request at its commit iteration vetoes the batch.
     st_kv = add_windowed("c")
     st_kv.add("ar_kv_mode", True)
     st_kv.add("ar_iters_per_window", 5)
     batch_kv = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["a", "c"])
-    assert sub.can_batch(batch_kv, [inp(1), inp(1)])
-    assert not sub.can_batch(batch_kv, [inp(1), inp(4)])  # local 4 == steps
+    assert sub.can_batch(batch_kv, [inp(), inp()])
+    assert not sub.can_batch(batch_kv, [inp(), inp(commit=True)])
 
-    # A prefill batch carries no time_index; with a windowed request in it the
-    # batch must fall to the sequential path (not raise), while plain-only
-    # prefill batches still batch.
+    # With a windowed request in it a prefill batch must fall to the sequential
+    # path (not raise), while plain-only prefill batches still batch.
     noti = SimpleNamespace(tensor_inputs={})
     batch_pre = SimpleNamespace(graph_walk=C.PREFILL_WALK, request_ids=["a", "p"])
     sub.request_state("p").add_all(cond={}, uncond={})
@@ -520,15 +506,16 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
         lambda st, plan, dev: (dict(sub.request_states["a"]["cond"]), None),
     )
     ei = SimpleNamespace(
-        request_ids=["a", "b"], per_request_states=None, per_request_info={},
-        resources={ATTN: "paged"}, step=None,
+        request_ids=["a", "b"], per_request_states=None, resources={ATTN: "paged"}, step=None,
+        per_request_info={
+            r: SimpleNamespace(dynamic_loop_iter_counts={"video_gen_ar_loop": k}) for r, k in (("a", 3), ("b", 1))
+        },
     )
     lat = {r: torch.full(latent_shape, 2.0) for r in ("a", "b")}
-    ti = {"a": torch.tensor([3]), "b": torch.tensor([1])}
     st_rotary = {
         r: (sub.request_states[r]["cond"]["rotary"], sub.request_states[r]["uncond"]["rotary"]) for r in ("a", "b")
     }
-    out = sub.forward_batched(C.VIDEO_GEN_AR_WALK, ei, latents=lat, time_index=ti)
+    out = sub.forward_batched(C.VIDEO_GEN_AR_WALK, ei, latents=lat)
     # Each request's dict carries its statics' tables per branch.
     for req, rid in zip(batched[-1], ("a", "b"), strict=True):
         assert req["rotary_cond"] is st_rotary[rid][0] and req["rotary_uncond"] is st_rotary[rid][1]
@@ -579,7 +566,7 @@ def _ar_decoder(monkeypatch):
 def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     """The AR decoder's context-re-decode + trim reproduces the whole-clip
     decode of the same latent stream, chunk counts drive completion, and the
-    stream's empty terminal flush is skipped."""
+    stream's empty terminal flush is declined."""
     sub = _ar_decoder(monkeypatch)
     # Latent stream of 12 units, value = absolute unit index; windows of 8
     # units with 1-unit overlap: [0..8) then [7..12).
@@ -587,9 +574,9 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     md = {"num_windows": 2, "overlap_latent_units": 1, "num_frames": 45}
     engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": SimpleNamespace(step_metadata=md)})
 
-    flush = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, None, {"window_latents": []})
-    assert flush.tensor_inputs["latents"].numel() == 0
-    assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, flush.tensor_inputs["latents"]) == {}
+    assert sub.prepare_inputs(
+        C.VIDEO_DECODE_AR_WALK, None, {"window_latents": []}, is_final_stream_chunk=True,
+    ) is None
     first = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, None, {"window_latents": [stream[:, :, 0:8]]})
     assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, first.tensor_inputs["latents"]) == {}
     out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
@@ -619,8 +606,6 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
     expected = sub._decode_pixels(stream)[0].transpose(0, 1)
     assert torch.equal(torch.cat([c0, c1]), expected[:43])
     assert sub.request_state("r")["ar_pixels"] == []
-    # The stream's empty terminal flush stays a no-op.
-    assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, torch.empty(0)) == {}
 
 
 def test_windowed_stream_video_gen_params() -> None:
@@ -643,7 +628,11 @@ def test_windowed_stream_video_gen_params() -> None:
 def test_video_streaming_ndjson_lines() -> None:
     """stream_video turns the video handler into an NDJSON generator: indexed
     video lines closed by a done line, an in-band error line terminal instead
-    on failure, and the non-streaming path collecting as before."""
+    on a failure after the first window, a refusal before it raised with its
+    status, and the non-streaming path collecting as before."""
+    from fastapi import HTTPException
+
+    from mstar.api_server.entrypoint import APIServer
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
     from mstar.api_server.openai.serving_videos import create_videos
@@ -651,6 +640,7 @@ def test_video_streaming_ndjson_lines() -> None:
 
     class _Api:
         upload_dir = "/tmp"
+        open_result_stream = APIServer.open_result_stream
 
         def __init__(self, chunks):
             self._chunks = chunks
@@ -695,6 +685,11 @@ def test_video_streaming_ndjson_lines() -> None:
     assert [ln["modality"] for ln in lines] == ["video", "error"]
     assert base64.b64decode(lines[1]["data"]) == b"boom"
 
+    api = _Api([ResultChunk(request_id="r", modality="error", data=b"bad image", metadata={"status": 400})])
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(_lines(api))
+    assert (refused.value.status_code, refused.value.detail) == (400, "bad image")
+
     api = _Api([ResultChunk(request_id="r", modality="video", data=b"v")])
     out = asyncio.run(create_videos(api, "cosmos3", adapter, VideoGenerationRequest(prompt="x", num_frames=57)))
     assert api.submits[0]["streaming"] is False
@@ -733,13 +728,17 @@ def test_session_gen_params() -> None:
         )
     # An id on a non-windowed request is simply not a session.
     assert "session_id" not in model._resolve_gen_params({"num_frames": 189, "session_id": "s"}, [], ["video"])
-    # end_session and the timeout ride along; the timeout is capped and validated.
+    # end_session and the timeout ride along; the timeout is validated against its maximum.
     assert p["end_session"] is False and "session_timeout_s" not in p
     e = model._resolve_gen_params(
-        {"window_mode": "kv", "num_frames": 189, "session_id": "s", "end_session": True, "session_timeout_s": 1e6},
+        {"window_mode": "kv", "num_frames": 189, "session_id": "s", "end_session": True, "session_timeout_s": 3600},
         [], ["video"],
     )
     assert e["end_session"] is True and e["session_timeout_s"] == 3600.0
+    with pytest.raises(ValueError, match=r"session_timeout_s must be in \(0, 3600\]"):
+        model._resolve_gen_params(
+            {"window_mode": "kv", "num_frames": 189, "session_id": "s", "session_timeout_s": 1e6}, [], ["video"],
+        )
     with pytest.raises(ValueError, match="end_session requires"):
         model._resolve_gen_params({"window_mode": "kv", "num_frames": 189, "end_session": True}, [], ["video"])
     with pytest.raises(ValueError, match="session_timeout_s"):
@@ -757,7 +756,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     sub = _dit()
     sub._sessions.capacity = 2
     sub.transformer = _stand_in(sub)
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(()))
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
     # The head is the stored window's re-encoded tail (see
     # test_chained_window_head_layout); here, its last latents plus 10.
@@ -767,9 +766,9 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     shape = sub._window_latent_shape(64, 64, 4)
     for sid, value in (("a", 1.0), ("b", 2.0), ("c", 3.0)):
         st = sub.request_state(f"r-{sid}")
-        st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id=sid)
+        st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id=sid, scheduler=StubSampler(()))
         last = torch.full(shape, value)
-        out = sub._finish_window(st, last, torch.tensor([3]), window_index=0)
+        out = sub._finish_window(st, last, window_index=0)
         assert torch.equal(out["window_latents"][0], last)
     assert sub._sessions.ids() == ["b", "c"]  # "a" evicted (store size 2)
     assert float(sub._sessions.get("c")[0, 0, 0, 0, 0]) == 3.0
@@ -786,7 +785,9 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
         "overlap_latent_units": 0, "context_latent_units": 0,
         "session_id": "c", "resume_latent_units": 2,
     }
-    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
+    fwd = SimpleNamespace(
+        request_id="r", rid_handle="r", random_seed=0, dynamic_loop_iter_counts={"video_gen_ar_loop": 0},
+    )
     sub._prepare_windowed_prefill(fwd, md, list(range(7)), None, 64, 64, 24.0, 1.0, 3, "cpu")
     st = sub.request_states["r"]
     stride = st["ar_tokens_per_unit"]
@@ -795,7 +796,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     assert torch.all(st["cond_video_latents"][:, :, :2] == 13.0)
     # "c" is pinned for this request until it stores its own last window
     assert sub._sessions.ids() == ["b", "c"] and sub._sessions.live("c") == "r"
-    st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3), step_index=None))
+    st.add("scheduler", StubSampler(torch.arange(3)))
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"cond_latents": []})
     lat = ni.tensor_inputs["latents"]
     assert torch.all(lat[:, :, :2] == 13.0) and not torch.all(lat[:, :, 2:] == 13.0)
@@ -839,7 +840,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
 def _session_dit(monkeypatch):
     sub = _dit()
     sub.transformer = _stand_in(sub)
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(()))
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
     return sub
 
@@ -869,11 +870,11 @@ def test_session_in_flight_is_pinned_and_exclusive(monkeypatch) -> None:
     shape = sub._window_latent_shape(64, 64, 4)
     for sid in ("x", "y"):
         st = sub.request_state(f"r-{sid}")
-        st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id=sid)
-        sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+        st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id=sid, scheduler=StubSampler(()))
+        sub._finish_window(st, torch.zeros(shape), window_index=0)
     assert sub._sessions.live("w") == "r1" and sub._sessions.ids() == ["w", "y"]
     # r1's final window (the schedule has two) stores the tail and lets go.
-    sub._finish_window(sub.request_states["r1"], torch.full(shape, 5.0), torch.tensor([7]), window_index=1)
+    sub._finish_window(sub.request_states["r1"], torch.full(shape, 5.0), window_index=1)
     assert sub._sessions.live("w") is None and "w" in sub._sessions
     _prefill(sub, "r2", {**_SESSION_MD, "resume_latent_units": 2})
     assert sub._sessions.live("w") == "r2"
@@ -897,12 +898,16 @@ def test_session_end_and_timeout(monkeypatch) -> None:
     sub._sessions = SessionStore(4, 10.0, 60.0, clock=lambda: clock["t"])
     shape = sub._window_latent_shape(64, 64, 4)
     st = sub.request_state("r-end")
-    st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id="gone", ar_end_session=True)
-    sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+    st.add_all(
+        ar_schedule=WindowSchedule(4, 4), ar_session_id="gone", ar_end_session=True, scheduler=StubSampler(()),
+    )
+    sub._finish_window(st, torch.zeros(shape), window_index=0)
     assert "gone" not in sub._sessions
     st = sub.request_state("r-ttl")
-    st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id="brief", ar_session_ttl=5.0)
-    sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+    st.add_all(
+        ar_schedule=WindowSchedule(4, 4), ar_session_id="brief", ar_session_ttl=5.0, scheduler=StubSampler(()),
+    )
+    sub._finish_window(st, torch.zeros(shape), window_index=0)
     clock["t"] = 4.0
     assert sub._session_tail("brief", 2, 64, 64).shape[2] == 2
     clock["t"] = 6.0
@@ -942,7 +947,7 @@ def test_long_rollout_state_stays_flat(monkeypatch) -> None:
     layout masks follow the current window, and every window is emitted."""
     sub = _dit()
     sub.transformer = _stand_in(sub)
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: SimpleNamespace(timesteps=torch.arange(3)))
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(torch.arange(3)))
     for mode, kv in (("chained", False), ("kv", True)):
         if kv:
             schedule = WindowSchedule(total_units=8 * 24, window_units=8, context_units=16)
@@ -960,11 +965,11 @@ def test_long_rollout_state_stays_flat(monkeypatch) -> None:
             ar_kv_mode=kv, ar_size=(64, 64), ar_fps=24.0, ar_cond_ids=list(range(7)), ar_uncond_ids=list(range(9)),
             ar_has_image_condition=False, ar_flow_shift=None, ar_karras=None, ar_statics={},
             ar_generator=torch.Generator().manual_seed(0), cond=cond0, uncond=uncond0,
-            scheduler=SimpleNamespace(timesteps=torch.arange(3)), latent_shape=sub._window_latent_shape(64, 64, 8),
+            scheduler=StubSampler(torch.arange(3)), latent_shape=sub._window_latent_shape(64, 64, 8),
         )
         x = torch.zeros(sub._window_latent_shape(64, 64, 8))
         for w in range(schedule.num_windows):
-            out = sub._finish_window(st, x, torch.tensor([w * per + 2]), window_index=w)
+            out = sub._finish_window(st, x, window_index=w)
             assert out["window_latents"][0].shape[2] == 8
             # The layout masks are rebuilt for the new window's statics only.
             token_mask, frame_mask = sub._noisy_masks(st, "cpu")

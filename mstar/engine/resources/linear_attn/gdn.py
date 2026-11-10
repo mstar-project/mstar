@@ -17,6 +17,7 @@ import torch
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
@@ -33,9 +34,21 @@ from mstar.engine.resources.recurrent.pool import (
 )
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.platforms.compile import compiled
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 logger = logging.getLogger(__name__)
+
+
+# Run compiled: eager, the normalize is four full-size passes per tensor (fp32
+# copy, norm, divide, cast); compiled, one. Only the token count is dynamic: a
+# symbolic head dim made the reduction ~3x slower.
+def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Both in one compiled call, so a layer pays one guard check, not two."""
+    def norm(t):
+        return torch.nn.functional.normalize(t.float(), dim=-1).to(t.dtype)
+    return norm(q), norm(k)
+
 
 # What each arch's chunked prefill kernel will read as its packed state.
 # SM90 is fp32 only; Blackwell takes the narrower ones, so a bf16 pool is not
@@ -51,6 +64,9 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
+
     def __init__(
         self,
         config: LinearAttnConfig,
@@ -82,6 +98,7 @@ class GDNManager(LinearAttnManager):
             state_dtype if state_dtype in allowed else torch.float32
         )
         self._check_state_dtype(state_dtype, geometry, has_sink)
+        self._stage_prefill = gdn_stage_applies(device, geometry)
 
         # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
@@ -141,6 +158,10 @@ class GDNManager(LinearAttnManager):
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
+    def resident_refusal(self) -> str | None:
+        # decode addresses the pool by slot alone, which the pool's table holds
+        return None
+
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
 
@@ -155,6 +176,9 @@ class GDNManager(LinearAttnManager):
             "linear-attn preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # a replayed decode wrapper reads only the pool's slots, which its graph fills
+            return self._current
         self.reset_default_cursors()
         if self._preplanned:
             self._current = self._cached_plan_output
@@ -226,6 +250,7 @@ class GDNManager(LinearAttnManager):
                         split.max_prefill_rows(self._max_rows_in_combined, lease.bucket.bs)
                         if lease is not None else None
                     ),
+                    stage_inputs=self._stage_prefill,
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -249,6 +274,7 @@ class GDNManager(LinearAttnManager):
                     accelerator_graph=lease is not None,
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
+                    stage_inputs=self._stage_prefill,
                 )
         return store[key]
 
@@ -349,8 +375,7 @@ class GDNManager(LinearAttnManager):
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
-            q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
-            k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
+            q, k = compiled(_l2norm_qk, dynamic_args=(0, 1))(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
         if not plan.takes_strided_inputs:

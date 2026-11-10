@@ -37,6 +37,8 @@ PROMPTS = {"a": list(range(3, 12)), "b": list(range(40, 45))}
 # prefill bucket and eager and replay run the same shapes
 BUCKET_PROMPTS = {"a": list(range(3, 19)), "b": list(range(40, 56))}
 MAX_TOKENS = 12
+# the one prefill capture, which BUCKET_PROMPTS fill
+PREFILL_BUCKET = 16
 # the scale block fused_experts_fp8 compiles for
 FP8_BLOCK = (128, 128)
 
@@ -54,7 +56,7 @@ def _latent_cfg(fp8: bool, **overrides) -> Glm52ModelConfig:
         base = Glm52ModelConfig.reduced()
     cfg = dataclasses.replace(
         base, mla_absorb=True, kv_lora_rank=512, qk_rope_head_dim=64,
-        prefill_token_buckets=[16], prefill_capture_batch_sizes=[1], **overrides,
+        prefill_capture_batch_sizes=[1], **overrides,
     )
     assert flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     return cfg
@@ -107,7 +109,8 @@ class _Node:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
-        self.groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = CommGroup.trivial()
+        self.groups = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         transfer = TransferEngineInfo(
             my_entity_id="glm52_capture", my_session_id="glm52_capture",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -123,10 +126,13 @@ class _Node:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
         self.cg = None
         if capture:
@@ -134,6 +140,8 @@ class _Node:
                 submodule_name=NODE, submodule=submodule, resources=self.resources,
                 step_runner=self.runner, device=DEVICE, autocast_dtype=DTYPE,
                 joint_comm_group=self.groups, num_slots=1,
+                # the serving config's prefill_token_buckets, as the engine hands it over
+                token_ladders={"prefill": [PREFILL_BUCKET]},
             )
             with torch.no_grad():
                 self.cg.warmup_and_capture(None)
@@ -204,6 +212,8 @@ class _Node:
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid].append(int(out["new_token"][0].item()))
             texts[rid] = out["text_inputs"][0].clone()
+        # check_stop stops on EOS only; the token budget is the loop's cap, which the runtime enforces
+        cap = self.model.get_loop_caps(max_output_tokens=MAX_TOKENS)["decode_loop"]
         live = list(self.prompts)
         for it in range(MAX_TOKENS + 2):
             if not live:
@@ -217,7 +227,7 @@ class _Node:
                 streams[rid].append(int(out["new_token"][0].item()))
                 texts[rid] = out["text_inputs"][0].clone()
                 infos[rid].dynamic_loop_iter_counts["decode_loop"] = it
-                if self.sub.check_stop(rid, infos[rid], out):
+                if self.sub.check_stop(rid, infos[rid], out) or it + 1 >= cap:
                     live.remove(rid)
         return streams
 

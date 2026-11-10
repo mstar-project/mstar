@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import random
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -33,10 +32,11 @@ from test_kv_prefix_lease import (
     _StubTransfer,
 )
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -69,7 +69,8 @@ def _stub_transfer(monkeypatch):
 
 def _walk(kv) -> set[int]:
     """Pages only the index holds, with no page below them held."""
-    index, owners = kv._index, kv._arena.num_owners
+    index = kv._index
+    owners = dict(zip(index.pages(), kv._arena.owners_of(index.pages()), strict=True))
     pinned: set[int] = set()
     for page in index.pages():
         if owners[page] > 1:
@@ -465,7 +466,8 @@ def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
+    tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(world_size)))
+    group = None if world_size == 1 else JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
@@ -486,7 +488,7 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     kv.ingest_request("a", KVReqConfig(
         kv_layout={label: _layout(16 * n)["main"] for label, n in (("main", 2), ("cfg_img", 1), ("cfg_text", 3))},
         needed_labels_per_node_walk={
-            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg"): ["cfg_text"],
+            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg2"): ["cfg_text"],
         },
     ))
 
@@ -703,7 +705,7 @@ def test_a_grant_that_evicts_counts_the_pages_the_host_has_no_copy_of():
 
 
 def test_a_run_filed_after_a_page_only_the_index_holds_leaves_that_page_evictable():
-    arena = PageArena(kv_cache=None, allocator=PageAllocator(8))
+    arena = new_page_arena(8)
     arena.index = index = PrefixIndex(arena)
     cached, *run = arena.acquire(3)
     index.insert(b"cached", cached)
@@ -729,4 +731,4 @@ def test_two_copies_under_one_parent_page_release_it_once_each_and_leave_it_cach
 
     host._land(kv)
 
-    assert all(kv._arena.num_owners[page] == 1 for page in shared), "a landing left the shared parent pages held"
+    assert all(kv._arena.owners(page) == 1 for page in shared), "a landing left the shared parent pages held"

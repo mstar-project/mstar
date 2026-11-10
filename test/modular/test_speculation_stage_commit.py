@@ -14,11 +14,16 @@ handed to its StreamBuffer, for two separate reasons:
 The second is what this pins -- it is the one with no loud failure.
 """
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
-from mstar.graph.base import GraphEdge, GraphNode
+from rust_runtime import build_runtime
+
+from mstar.distributed.base import ShardingConfig
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.runtime.base import EdgeSpec, SpeculationPrepInput
+from mstar.model.base import WorkerGraph
+from mstar.utils.containers import ParallelList
 
 
 class _Reg:
@@ -84,46 +89,74 @@ def test_undoing_the_staged_ingest_keeps_the_stream_in_order():
     assert order == ["chunk2", "chunk3"]
 
 
-def _staged_runtime():
-    """A PythonGraphRuntime with one staged speculation over two rids."""
-    from mstar.graph.runtime.python import PythonGraphRuntime
+def _chunk_uuid(rid):
+    return 1000 + rid
 
-    runtime = PythonGraphRuntime.__new__(PythonGraphRuntime)
-    runtime._staged_specs = {}
-    runtime._spec_counter = 0
-    nodes = {7: _node(), 9: _node()}
-    for node in nodes.values():
-        assert node.ingest_input(_chunk(1), can_buffer=False)
-    prepped = [
-        SimpleNamespace(rid=rid, node=node,
-                        into_signals=[(0, "thinker_states")], into_next_iter=[])
-        for rid, node in nodes.items()
+
+def _staged_runtime():
+    """A runtime with one staged speculation over two rids, each holding a chunk."""
+    walk = "talk"
+    section = Sequential(sections=[
+        GraphNode(name="Thinker", input_names={"prompt"}, outputs=[]),
+        Loop(name="talk_loop", max_iters=8, outputs=[], section=_node()),
+    ])
+    nodes = {"Thinker", "Talker"}
+    runtime = build_runtime(
+        my_worker_id="w0",
+        my_worker_graphs=[WorkerGraph(section=section, graph_walks={walk}, ranks=[0], worker_graph_id=0)],
+        all_wg_ids_to_graph_walks={0: {walk}}, all_wg_ids_to_dyn_loops={0: {"talk_loop"}},
+        all_wg_ids_to_nodes={0: nodes}, node_to_partition=dict.fromkeys(nodes, "default"),
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+    )
+    rids = [
+        runtime.add_request(
+            request_id=f"r{i}", partition="default", graph_walk=walk, partition_worker_graph_ids=[0],
+            worker_graph_to_workers=ParallelList([0], [["w0"]]), loop_caps={},
+        )
+        for i in range(2)
     ]
-    spec_id = runtime._stage_spec(prepped)
-    return runtime, nodes, spec_id
+    out = _prep(runtime, rids, chunks=True)
+    assert out.ready_rids == rids and out.spec_id != 0
+    return runtime, rids, out.spec_id
+
+
+def _prep(runtime, rids, chunks):
+    return runtime.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="Talker", curr_node_name="Thinker", graph_walk="talk", rids=rids,
+        room_for_continuing=None,
+        streaming_edges=[
+            EdgeSpec(signal="thinker_states", next_node="Talker", uuids=[_chunk_uuid(r)]) for r in rids
+        ] if chunks else [],
+        streaming_edges_per_rid=[1 if chunks else 0] * len(rids),
+    ))
+
+
+def _held_by(runtime, rid):
+    """The chunk uuids in ``rid``'s input slot."""
+    popped = runtime.pop_rids("Talker", "talk", [rid])
+    return [u for e in popped.input_edges.edge_tuples() for u in e.uuids]
 
 
 def test_commit_keeps_the_ingests_of_rids_that_still_run():
-    runtime, nodes, spec_id = _staged_runtime()
-    runtime.commit_speculation(spec_id, success=True, dropped_rids=[9])
+    runtime, (kept, dropped), spec_id = _staged_runtime()
+    runtime.commit_speculation(spec_id, success=True, dropped_rids=[dropped])
 
-    assert _held(nodes[7].ready_signals) == "chunk1", "rid 7 runs: ingest stands"
-    assert _held(nodes[9].ready_signals) is None, "rid 9 dropped: ingest undone"
-    # Settled: the stage is gone, so a second call cannot undo rid 7 as well.
+    assert _held_by(runtime, dropped) == [], "the dropped rid's ingest is undone"
+    # Settled: the stage is gone, so a second call cannot undo the kept rid as well.
     runtime.commit_speculation(spec_id, success=False)
-    assert _held(nodes[7].ready_signals) == "chunk1"
+    assert _held_by(runtime, kept) == [_chunk_uuid(kept)], "it runs: its ingest stands"
 
 
 def test_commit_with_success_false_undoes_every_rid():
-    runtime, nodes, spec_id = _staged_runtime()
+    runtime, rids, spec_id = _staged_runtime()
     runtime.commit_speculation(spec_id, success=False)
-    assert all(_held(n.ready_signals) is None for n in nodes.values())
+    assert [_held_by(runtime, rid) for rid in rids] == [[], []]
 
 
 def test_a_prep_that_staged_nothing_reports_no_id():
-    runtime, _nodes, _spec_id = _staged_runtime()
-    empty = SimpleNamespace(rid=1, node=_node(), into_signals=[], into_next_iter=[])
-    assert runtime._stage_spec([empty]) == 0
+    runtime, rids, spec_id = _staged_runtime()
+    runtime.commit_speculation(spec_id, success=False)
+    assert _prep(runtime, rids, chunks=False).spec_id == 0
     runtime.commit_speculation(0, success=False)      # no-op, must not raise
 
 

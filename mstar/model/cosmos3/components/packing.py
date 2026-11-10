@@ -122,7 +122,8 @@ def get_3d_mrope_ids_action_tokens(
 #   * inverse_dynamics  -- video is the condition (all latent frames clean);
 #                          every action token is predicted.
 #   * policy            -- video frame 0 is clean (the rest predicted) and every
-#                          action token is predicted.
+#                          action token is predicted, except an optional leading
+#                          state row (the robot's current state, at video frame 0).
 # ---------------------------------------------------------------------------
 
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -131,11 +132,14 @@ ACTION_MODE_POLICY = "policy"
 ACTION_MODES = (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY)
 
 
-def action_condition_frame_indexes(mode: str, action_length: int) -> list[int]:
-    """Clean (conditioning) action tokens for ``mode``."""
+def action_condition_frame_indexes(mode: str, action_length: int, state_rows: int = 0) -> list[int]:
+    """Clean (conditioning) action tokens for ``mode``. A policy request's first
+    ``state_rows`` tokens carry the robot's current state."""
     if mode == ACTION_MODE_FORWARD_DYNAMICS:
         return list(range(action_length))
-    if mode in (ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY):
+    if mode == ACTION_MODE_POLICY:
+        return list(range(state_rows))
+    if mode == ACTION_MODE_INVERSE_DYNAMICS:
         return []
     raise ValueError(f"Unknown Cosmos3 action mode: {mode!r}")
 
@@ -152,15 +156,19 @@ def vision_condition_frame_indexes(mode: str, latent_frames: int) -> list[int]:
 def normalize_condition_frame_indexes(value, default: tuple[int, ...]) -> tuple[int, ...]:
     """Normalize a request's video-conditioning latent-frame indexes.
 
-    Accepts an int, a comma-separated string, or an iterable of ints; returns a
-    sorted, de-duplicated tuple. ``None`` falls back to ``default``."""
+    Accepts an int, a comma-separated string, or an iterable of ints (a whole
+    float such as ``2.0`` counts); returns a sorted, de-duplicated tuple.
+    ``None`` falls back to ``default``."""
     if value is None:
         return tuple(default)
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, int):
+    elif isinstance(value, (int, float)):
         value = [value]
     try:
+        value = [int(v) if isinstance(v, float) and v.is_integer() else v for v in value]
+        if any(isinstance(v, (bool, float)) for v in value):
+            raise TypeError("indexes are integers")
         indexes = tuple(sorted({int(v) for v in value}))
     except (TypeError, ValueError) as exc:
         raise ValueError(
@@ -213,27 +221,35 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
 }
 
 
-def resolve_action_domain_id(domain_id, domain_name) -> int:
+def resolve_action_domain_id(domain_id, domain_name, num_domains: int) -> int:
     """Resolve an action request's embodiment domain. A numeric ``domain_id``
     wins; otherwise ``domain_name`` looks up the published table. One of the
     two is required — the domain conditions the action pathway, and a silent
-    default would predict actions for the wrong embodiment."""
+    default would predict actions for the wrong embodiment. The id indexes the
+    model's ``num_domains``-row embedding table on the GPU, so it must be below."""
     if domain_id is not None:
-        resolved = int(domain_id)
-        if resolved < 0:
-            raise ValueError(f"Cosmos3 domain_id must be non-negative, got {resolved}.")
-        return resolved
-    if domain_name is None or not str(domain_name).strip():
-        raise ValueError(
-            "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
-        )
-    key = str(domain_name).strip().lower()
-    if key not in EMBODIMENT_TO_DOMAIN_ID:
-        raise ValueError(
-            f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "
-            f"{sorted(EMBODIMENT_TO_DOMAIN_ID)} or a numeric domain_id."
-        )
-    return EMBODIMENT_TO_DOMAIN_ID[key]
+        if isinstance(domain_id, float) and domain_id.is_integer():
+            domain_id = int(domain_id)
+        if isinstance(domain_id, bool) or not isinstance(domain_id, int):
+            raise ValueError(f"Cosmos3 domain_id must be an integer, got {domain_id!r}.")
+        resolved = domain_id
+    else:
+        if domain_name is not None and not isinstance(domain_name, str):
+            raise ValueError(f"Cosmos3 domain_name must be a string, got {domain_name!r}.")
+        if domain_name is None or not domain_name.strip():
+            raise ValueError(
+                "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
+            )
+        key = domain_name.strip().lower()
+        if key not in EMBODIMENT_TO_DOMAIN_ID:
+            raise ValueError(
+                f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "
+                f"{sorted(EMBODIMENT_TO_DOMAIN_ID)} or a numeric domain_id."
+            )
+        resolved = EMBODIMENT_TO_DOMAIN_ID[key]
+    if not 0 <= resolved < num_domains:
+        raise ValueError(f"Cosmos3 domain_id must be in [0, {num_domains}), got {resolved}.")
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +550,7 @@ def build_action_static_inputs(
     action_fps: float,
     action_start_offset: int,
     device,
+    state_rows: int = 0,
 ) -> dict[str, Any]:
     """Assemble the static transformer inputs for joint video+action generation.
 
@@ -562,7 +579,7 @@ def build_action_static_inputs(
     )
 
     curr = text["und_len"] + vision["num_vision_tokens"]
-    action_clean = set(action_condition_frame_indexes(mode, action_chunk_size))
+    action_clean = set(action_condition_frame_indexes(mode, action_chunk_size, state_rows))
     action_noisy = [a for a in range(action_chunk_size) if a not in action_clean]
     effective_action_fps = action_fps if config.enable_fps_modulation else None
     action_mrope_ids, _ = get_3d_mrope_ids_action_tokens(

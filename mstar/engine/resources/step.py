@@ -1,7 +1,13 @@
 
-from collections.abc import KeysView, Mapping, Sequence
+from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
+from itertools import combinations
 from typing import Any, ClassVar, NamedTuple
+
+# The graph walk on a piecewise region's step context: the region declares, plans and
+# commits its own step inside the enclosing forward's (see accelerator_graph_runner).
+PIECEWISE_WALK = "__piecewise__"
 
 
 class Segment(NamedTuple):
@@ -32,10 +38,23 @@ class BucketKey:
     num_tokens: int
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
+    # the keys of the resources this capture leaves running lean
+    # (`Resource.lean_capture`); empty for the plain bucket every step can replay
+    lean: frozenset[str] = frozenset()
 
     def __str__(self) -> str:
         key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
-        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+        lean = f",lean={'+'.join(sorted(self.lean))}" if self.lean else ""
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}{lean}]"
+
+
+def lean_subsets(keys: Sequence[str]) -> tuple[frozenset[str], ...]:
+    """The non-empty subsets of ``keys``, largest first, those of one size in the
+    order of ``keys``: the lean twins a step that leaves all of ``keys`` lean may
+    replay, in the order it tries them."""
+    return tuple(
+        frozenset(subset) for size in range(len(keys), 0, -1) for subset in combinations(keys, size)
+    )
 
 
 @dataclass(frozen=True)
@@ -45,6 +64,39 @@ class SlotLease:
     has no clean channel to plan/commit/release. see O."""
     slot: int
     bucket: BucketKey | None # None -> eagre
+
+
+class SettingValue(Enum):
+    UNSET = 0
+    SET = 1
+    PARTIAL = 2
+
+
+class PerReqSetting(NamedTuple):
+    """A step's flag that may hold for only some of its rows."""
+    value: SettingValue
+    # the rows it holds for; set iff ``value`` is PARTIAL
+    set_rids: frozenset[int] | None = None
+
+    @classmethod
+    def over(
+        cls, rids: Collection[int], holds: Callable[[int], bool],
+    ) -> "PerReqSetting":
+        set_rids = frozenset(rid for rid in rids if holds(rid))
+        if len(set_rids) == len(rids):
+            return ALL_SET
+        if not set_rids:
+            return NONE_SET
+        return cls(SettingValue.PARTIAL, set_rids)
+
+    def holds_for(self, rid: int) -> bool:
+        if self.value is SettingValue.PARTIAL:
+            return rid in self.set_rids
+        return self.value is SettingValue.SET
+
+
+ALL_SET = PerReqSetting(SettingValue.SET)
+NONE_SET = PerReqSetting(SettingValue.UNSET)
 
 
 @dataclass
@@ -58,6 +110,9 @@ class StepContext:
 
     # Preplan
     is_preplan: bool = False
+    # the prefix a resource's own plan laps record under, as the runner times
+    # the plan: res.pre_plan, res.plan (promoting a pre-plan) or res.plan_fresh
+    plan_phase: str = "res.plan"
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
@@ -80,6 +135,24 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # the node's `ResidentPlanner` when this step's capture reads the resident
+    # tables: a resource then stages nothing per row (see `resources/resident.py`)
+    resident: Any = None
+    # what that planner staged for this step
+    resident_plan: Any = None
+    # rid -> input tokens a chunked row runs after this step
+    chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
+    # the rows whose walk grows its state by those tokens, so a resource may
+    # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
+    # before reserving by ``chunk_tokens_after``.
+    reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
+    # the keys of the resources that run lean this step: its lease's
+    # (`BucketKey.lean`), or for an eager step those whose `lean_for` holds for
+    # every row. Set by the engine; a piecewise region's step takes its bucket's.
+    lean: frozenset[str] = frozenset()
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -100,6 +173,16 @@ class StepContext:
         if real is None:
             real = self._real_rids = frozenset(self.request_ids)
         return rid in real
+
+    def real_rows(self) -> frozenset | None:
+        """``request_ids`` as a set when the step has padding rows, else None
+        (no row is padding)."""
+        if self._padded_request_ids is None:
+            return None
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
 
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.
@@ -226,6 +309,8 @@ class FullAdmitOutcome(NamedTuple):
     failed_resource: str | None = None
     # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
     queued: bool = False
+    # dropped on its node: not ready until a rebuild from its token ids lands
+    rebuild: bool = False
 
     @property
     def ok(self) -> bool:
@@ -244,3 +329,4 @@ FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
 FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)
+FULL_ADMIT_REBUILD = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), rebuild=True)

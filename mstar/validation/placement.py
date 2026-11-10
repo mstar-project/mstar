@@ -1,17 +1,21 @@
 """Placement checks: walks and partitions, ``node_groups``, the worker graphs
-they divide into, and the parallel groups each worker is handed."""
+they divide into, the parallel groups each worker is handed, and the weights
+that pick a request's replica among them."""
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
-from mstar.distributed.base import ShardingConfig
+from mstar.conductor.routing import RoutingWeights
+from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
-# readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
+# readiness in a u64 mask.
 MAX_NODE_INPUTS = 64
 
 
@@ -26,6 +30,37 @@ def node_groups_problems(config: Mapping[str, Any]) -> list[str]:
         problem for i, group in enumerate(node_groups)
         if (problem := _node_group_entry_problem(i, group))
     ]
+
+
+# Far above any useful weight, and low enough that no replica's cost overflows to inf, where
+# inf - inf would make it NaN and fail every pick.
+_MAX_ROUTING_WEIGHT = 1e6
+
+
+def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
+    """``routing_weights``, the data-parallel replica pick's: one per term of
+    the cost, each a number from 0 to ``_MAX_ROUTING_WEIGHT``, since the cost
+    is a sum of weighted terms, and ``load`` above 0 when another term is, or
+    nothing would spread a hot prefix."""
+    weights = config.get("routing_weights")
+    if weights is None:
+        return []
+    if not isinstance(weights, Mapping):
+        return [f"routing_weights must be a mapping of {list(RoutingWeights._fields)}; got {weights!r}"]
+    problems = []
+    unknown = sorted(set(weights) - set(RoutingWeights._fields), key=str)
+    if unknown:
+        problems.append(f"routing_weights names {unknown}; it takes {list(RoutingWeights._fields)}")
+    for name, weight in weights.items():
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= _MAX_ROUTING_WEIGHT:
+            problems.append(
+                f"routing_weights.{name} must be a number from 0 to {_MAX_ROUTING_WEIGHT:g}; got {weight!r}"
+            )
+    if not problems and not weights.get("load", RoutingWeights._field_defaults["load"]) and any(
+        weights.get(name, default) for name, default in RoutingWeights._field_defaults.items() if name != "load"
+    ):
+        problems.append("routing_weights.load must be above 0 while another weight is")
+    return problems
 
 
 def _is_count(value: Any, least: int) -> bool:
@@ -46,7 +81,7 @@ def _node_group_entry_problem(i: int, group: Any) -> str | None:
             return f"node_groups[{i}]: {key} must be a list of names; got {names!r}"
     if not all(_is_count(rank, 0) for rank in group["ranks"]):
         return f"node_groups[{i}]: ranks must be integers >= 0; got {group['ranks']!r}"
-    for key in ("tp_size", "sp_size"):
+    for key in (f"{axis}_size" for axis in PARALLEL_AXES):
         if not _is_count(group.get(key, 1), 1):
             return f"node_groups[{i}]: {key} must be an integer >= 1; got {group[key]!r}"
     return None
@@ -67,6 +102,7 @@ def check_placement(model: Model, config: Mapping[str, Any]) -> list[str]:
         *_node_group_shapes(model, node_groups),
         *_walk_partitions(model, walk_graphs),
         *_node_placement(walk_graphs, node_groups),
+        *_chunked_streams(model, walk_graphs),
     ]
 
 
@@ -90,7 +126,65 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
+
+
+def _chunked_streams(
+    model: Model, walk_graphs: Mapping[str, GraphSection],
+) -> Iterator[str]:
+    """A chunked node's stream that its consumer would misread.
+
+    A ``per_chunk_outputs`` edge sends each chunk's piece as an item of its
+    own, so its consumer has to allow partial input. A gathered stream sends
+    every piece at once, which the consumer reads as one item only if the
+    connection joins them (``join_dim``) or it takes pieces anyway. A
+    consumer's ChunkPolicy counts items, so either mistake hands it the first
+    chunk as the whole input rather than failing.
+    """
+    from mstar.model.submodule_base import chunk_loop_name
+
+    connections = {
+        (conn.edge_name, conn.to_partition): conn
+        for conn in model.get_partition_topology().connections
+    }
+    for (node, walk), policy in model.chunking_policy_of().items():
+        if not policy.chunkable:
+            continue
+        loop = walk_graphs[walk].get_loops().get(chunk_loop_name(node, walk))
+        if loop is None:
+            continue
+        where = f"node {node!r} in walk {walk!r}"
+        per_chunk = {e.name: e for e in loop.section.outputs if e.name in policy.per_chunk_outputs}
+        for name in sorted(policy.per_chunk_outputs - per_chunk.keys()):
+            yield f"{where} names per-chunk output {name!r}, which is not one of its outputs"
+        for edge in per_chunk.values():
+            if not edge.is_streaming:
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but it is not a streaming edge; "
+                    "only a streaming consumer can take a prompt's chunks one at a time"
+                )
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but its consumer in partition "
+                    f"{conn.to_partition!r} does not allow partial input; set it "
+                    "(FixedChunkPolicy(allow_partial=True)), or gather the edge "
+                    "(accumulated_outputs) and join it (Connection.join_dim)"
+                )
+        for edge in loop.accumulated_outputs:
+            if not edge.is_streaming:
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and conn.join_dim is None \
+                    and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} gathers stream {edge.name!r}, whose consumer in partition "
+                    f"{conn.to_partition!r} would read each chunk's piece as an item of "
+                    "its own; join them (Connection.join_dim), or send it per chunk "
+                    "(per_chunk_outputs) into a consumer that allows partial input"
+                )
 
 
 def _describe(wg: WorkerGraph) -> str:
@@ -104,19 +198,37 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
     sharding = model.get_default_sharding_config()
     for i, group in enumerate(node_groups):
         names, ranks = group["node_names"], group["ranks"]
-        tp, sp = group.get("tp_size", 1), group.get("sp_size", 1)
-        if len(ranks) % (tp * sp):
+        sizes = node_group_axis_sizes(group)
+        instance = math.prod(sizes.values())
+        if len(ranks) % instance:
             yield (
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
-                f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
+                f"divisible by its instance size ({sizes}: {instance})."
             )
-        for size, axis, enabled in (
-            (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
-        ):
-            if size > 1 and any(node not in enabled for node in names):
+        blocks = [ranks[base:base + instance] for base in range(0, len(ranks), instance)]
+        if instance > 1 and any(block != sorted(block) for block in blocks):
+            # torch orders a process group by global rank, the mesh by this
+            # list: out of order, a gather would come back in another order
+            # than the one each rank split its work by
+            yield (
+                f"node_groups[{i}] (nodes {names}) lists its ranks {ranks} out of order; "
+                f"each lockstep instance's {instance} ranks must be ascending."
+            )
+        for axis, size in sizes.items():
+            enabled = getattr(sharding, f"{axis}_enabled_nodes")
+            unsupported = [node for node in names if node not in enabled]
+            if size > 1 and unsupported:
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
                     f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
+                )
+        cfg = sizes["cfg"]
+        for node in names:
+            branches = sharding.cfg_enabled_nodes.get(node)
+            if cfg > 1 and branches is not None and branches % cfg:
+                yield (
+                    f"node_groups[{i}] has cfg_size {cfg}, which does not divide the "
+                    f"{branches} guidance branches {node!r} runs."
                 )
 
 
@@ -143,7 +255,9 @@ def _walk_partitions(model: Model, walk_graphs: Mapping[str, GraphSection]) -> I
 
 def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[dict]) -> Iterator[str]:
     """A node of a walk in no node_group or in two (the later group silently
-    wins), and a node_group naming a walk the model does not define."""
+    wins), a node_group naming a walk the model does not define, and a rank no
+    walk runs on: the deployment starts a worker per rank ``node_groups`` names
+    (``deployment_workers``), and this one would have nothing to do."""
     for i, group in enumerate(node_groups):
         unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
         if unknown:
@@ -152,6 +266,7 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                 f"graph_walks {unknown}, which this model does not define "
                 f"(walks: {sorted(walk_graphs)})."
             )
+    used_ranks = set()
     for walk, graph in walk_graphs.items():
         for node in graph.get_nodes():
             groups = [
@@ -159,6 +274,7 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                 if node in group["node_names"]
                 and ("graph_walks" not in group or walk in group["graph_walks"])
             ]
+            used_ranks.update(rank for i in groups for rank in node_groups[i]["ranks"])
             if len(groups) != 1:
                 where = ", ".join(f"node_groups[{i}]" for i in groups) or "no node_groups entry"
                 yield (
@@ -166,6 +282,9 @@ def _node_placement(walk_graphs: Mapping[str, GraphSection], node_groups: list[d
                     f"{where}; place it in exactly one node_groups entry for that walk "
                     "(use graph_walks to give one node different ranks per walk)."
                 )
+    idle = sorted({rank for group in node_groups for rank in group["ranks"]} - used_ranks)
+    if idle:
+        yield f"node_groups names ranks {idle}, but no node of any graph walk runs on them."
 
 
 def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
@@ -184,11 +303,9 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
 
 def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    workers: the conductor picks one replica for every node_group on the same
+    lockstep instances (``ReplicaRouter``), so they share those instances."""
+    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
@@ -228,8 +345,8 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (one "
-                "node_group, or one instance on the same ranks); otherwise run it as "
+                "arrives once per pass and every worker graph on the same workers (node_groups "
+                "on the same ranks, instance for instance); otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )
@@ -275,8 +392,9 @@ def _sharding_groups(
     worker_graphs: Sequence[WorkerGraph], sharding_config: ShardingConfig,
 ) -> Iterator[str]:
     """v1: one sharding group per worker graph, with the worker graph's
-    tp_size, and no custom graph_walks on a group holding a streaming
-    consumer."""
+    tp_size, no custom graph_walks on a group holding a streaming consumer,
+    and no shard_dim signal on a node whose instance is wider than its TP
+    group: the fanout splits by instance rank, the weights by TP rank."""
     streaming_consumers: set[str] = set()
     node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
     for wg in worker_graphs:
@@ -311,21 +429,72 @@ def _sharding_groups(
                         f"and {key!r}). v1 requires one TP group per worker graph; split "
                         "the worker graph or merge the groups."
                     )
-                if wg.tp_size != group.tp_size and (id(wg), "tp") not in reported:
+                if wg.instance_size != group.tp_size and (id(wg), "tp") not in reported:
                     reported.add((id(wg), "tp"))
                     yield (
-                        f"{_describe(wg)} has tp_size {wg.tp_size}, but its sharding group "
-                        f"has tp_size {group.tp_size}. node_groups and sharding_config disagree."
+                        f"{_describe(wg)} has instance size {wg.instance_size}, but its sharding "
+                        f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
+
+    refused: set[str] = set()
+    for wg in worker_graphs:
+        if wg.instance_size == wg.tp_size:
+            continue
+        for name, node in sorted(wg.section.get_nodes().items()):
+            sharded = sorted(
+                signal for signal in node.input_names | {edge.name for edge in node.outputs}
+                if sharding_config.shard_dim.get(signal) is not None
+            )
+            if sharded and name not in refused:
+                refused.add(name)
+                yield (
+                    f"node {name!r} takes or emits {sharded}, which have a shard_dim, but "
+                    f"{_describe(wg)} spans {wg.axis_sizes}: a sharded signal is split over "
+                    "the whole lockstep instance, not the TP group. Drop their "
+                    "sharding_config.shard_dim entries, or set sp_size and cfg_size to 1."
+                )
+
+
+def _paged_kv_on_cfg_ranks(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+) -> Iterator[str]:
+    """A paged KV cache on a node with ``cfg_size > 1``: the pool's rank math
+    (prefix publishing, transfer slices) takes every instance rank for a head
+    shard, which a CFG rank isn't."""
+    for spec in specs:
+        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)):
+            continue
+        wg = next((
+            wg for wg in worker_graphs
+            if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
+        ), None)
+        if wg is not None:
+            yield (
+                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
+                f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
+                f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
+                "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+            )
+
+
+def _placement(groups, node: str) -> str:
+    """``node``'s ranks on each mesh axis on a worker, leaving out an axis of one rank."""
+    axes = ((axis, groups.axis_groups[axis].get(node)) for axis in PARALLEL_AXES)
+    return f"{node} on " + ", ".join(
+        f"{axis.upper()} ranks {group.group_members}" for axis, group in axes
+        if group is not None and group.world_size > 1
+    )
 
 
 def _worker_parallelism(
     worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
-    same groups the conductor hands it: at most one lockstep-parallel node per
-    worker, and every resource spec's nodes on one TP x SP shape and, on each
-    worker, in one parallel group. Over every node placed on the worker; the
+    same groups the conductor hands it: every lockstep-parallel node on a
+    worker in the same parallel groups (one lockstep instance), every
+    resource spec's nodes on one parallel shape and, on each worker, in one
+    parallel group, and no resource that journals resident moves under two
+    lockstep nodes of a worker. Over every node placed on the worker; the
     engine checked only nodes it built a submodule for, so a dummy run (no
     weights) skipped the resource checks."""
     ranks = sorted({rank for wg in worker_graphs for rank in wg.ranks})
@@ -334,19 +503,19 @@ def _worker_parallelism(
     # GlobalParallelConfig and init_dist number workers by their position
     # among the deployment's ranks, and parallel groups by rank
     misplaced = sorted({
-        rank for wg in worker_graphs for group in wg._tp_ranks + wg._sp_ranks
+        rank for wg in worker_graphs for groups in wg._axis_ranks.values() for group in groups
         for rank in group if rank >= len(ranks) or ranks[rank] != rank
     })
     if misplaced:
         yield (
-            f"the deployment uses ranks {ranks}; ranks {misplaced} are in tensor- or "
-            "sequence-parallel groups, which need every lower rank in use too."
+            f"the deployment uses ranks {ranks}; ranks {misplaced} are in parallel "
+            "groups, which need every lower rank in use too."
         )
         return
     worker_ids = [f"worker_{rank}" for rank in ranks]
     try:
         per_worker = GlobalParallelConfig(dict(enumerate(worker_graphs)), worker_ids).per_worker_config
-    except RuntimeError as e:
+    except ValueError as e:
         yield str(e)
         return
 
@@ -358,15 +527,18 @@ def _worker_parallelism(
         for rank, wid in zip(ranks, worker_ids, strict=True)
     }
     for wid, nodes in deployed.items():
+        groups = per_worker[wid]
         parallel_nodes = sorted(
-            node for node in nodes
-            if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            node for node in nodes if groups.get_instance_world_size_for_node(node) > 1
         )
-        if len(parallel_nodes) > 1:
+        # A worker leads or follows one instance, whose steps go out as one
+        # ordered stream from its rank 0, so its lockstep nodes share it.
+        if not groups.all_in_same_group(parallel_nodes):
+            placed = "; ".join(_placement(groups, node) for node in parallel_nodes)
             yield (
-                f"Multiple parallel nodes {parallel_nodes} found in worker {wid}; "
-                "current implementation requires at most one lockstep-parallel node "
-                "per worker."
+                f"Lockstep-parallel nodes on {wid} are not in the same parallel groups: "
+                f"{placed}. A worker's lockstep nodes must share one instance: the same "
+                "groups on every axis, of the same ranks in the same order."
             )
 
     all_nodes = set().union(*deployed.values())
@@ -377,12 +549,31 @@ def _worker_parallelism(
         if not any_worker.all_have_compatible_parallel_shape(spec.nodes):
             yield (
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
-                "must use the same TP x SP shape across replicas"
+                "must use the same parallel shape across replicas"
             )
+        shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
                 yield (
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
-                    f"on {wid} must all be in the same parallel (tp x sp) group"
+                    f"on {wid} must all be in the same parallel group"
                 )
+            lockstep = tuple(sorted(
+                node for node in local
+                if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            ))
+            if len(lockstep) > 1 and spec.resource_class.journals_resident_moves():
+                shared.setdefault(lockstep, []).append(wid)
+        # Rank 0's resident journal is per node, so a move on a shared pool reaches a
+        # follower only with one node's next step. Separate pools are safe: each
+        # node's moves ride on its own next step. Refused with offload off too, since
+        # prefix hits and page trails also ride a node's own head, until rank 0
+        # journals a shared pool's moves in one stream.
+        for lockstep, wids in shared.items():
+            yield (
+                f"Resource {spec.resource_key} is shared by lockstep-parallel nodes "
+                f"{list(lockstep)} on {', '.join(wids)}; the other ranks replay rank 0's moves on the pool "
+                "per node, so a shared pool can admit out of step. "
+                "Give each node a resource of its own, or place them on different workers."
+            )

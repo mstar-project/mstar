@@ -11,7 +11,6 @@ consumer can rely on it instead of re-deriving the policy's schedule.
 import pytest
 import torch
 
-from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import (
     FixedChunkPolicy,
     LeftContextChunkPolicy,
@@ -124,9 +123,9 @@ def test_returned_streaming_edge_keeps_its_chunk_info():
     buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
                           policy=FixedChunkPolicy(chunk_size=3))
     info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True)
-    edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True)
-    buffer.store_uningested_edge(StreamingEdge(edge, info))
-    assert buffer.pop_waiting_edge() == (edge, info)
+    edge = StreamingEdge("codec_tokens", "Codec", [7, 8, 9], info)
+    buffer.store_uningested_edge(edge)
+    assert buffer.pop_waiting_edge() == edge
     assert buffer.pop_waiting_edge() is None
 
 
@@ -152,11 +151,39 @@ def test_primed_stream_delivers_its_lead_as_first_window_context():
     assert [i for context, items in windows for i in items[context:]] == list(range(4, 13))
 
 
+@pytest.mark.parametrize("schedule,chunk,left_context,lead", [
+    ((1, 3, 8, 16), 25, 72, 0), ((1, 3, 8, 16), 25, 72, 72), ((4, 8, 16), 32, 1026, 0),
+    ((1, 2, 4), 8, 22, 0), ((1, 2, 4), 8, 22, 5), ((30,), 25, 25, 0), ((), 8, 5, 0), ((4,), 2, 0, 0),
+])
+def test_window_sizes_are_the_windows_a_stream_pops(schedule, chunk, left_context, lead):
+    """Capture buckets are sized from ``window_sizes``, so it must name every
+    window a stream pops before its terminal flush, and no other."""
+    policy = ScheduledLeftContextChunkPolicy(schedule=schedule, chunk=chunk, left_context=left_context)
+    buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker", policy=policy)
+    buffer.prime_context(lead)
+    popped = set()
+    for i in range(lead + 3 * (sum(schedule) + chunk + left_context)):
+        buffer.pre_read_register(f"t{i}")
+        buffer.put(f"t{i}", torch.tensor([i]))
+        while buffer.has_chunk_ready():
+            popped.add(buffer.pop_chunk().num_items)
+    # read off the policy mid-stream: the answer doesn't depend on its progress
+    assert policy.window_sizes(lead) == sorted(popped)
+
+
 def test_prime_is_bounded_and_only_for_context_policies():
-    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3)
+    # the first chunk may lead with more context than later ones carry (a
+    # stateful consumer warming up once, with no context after)
+    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=0)
+    policy.prime(4)
+    assert policy.window_size() == 5 and policy.next_chunk_size(5) == 5
+    policy.register_chunk(5)
+    assert policy.window_size() == 2
     with pytest.raises(ValueError):
-        policy.prime(4)
-    policy.prime(0)
+        policy.prime(1)   # only before the first chunk
+    with pytest.raises(ValueError):
+        ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(-1)
+    ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(0)
     with pytest.raises(NotImplementedError):
         FixedChunkPolicy(chunk_size=3).prime(1)
     FixedChunkPolicy(chunk_size=3).prime(0)

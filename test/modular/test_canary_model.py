@@ -20,7 +20,7 @@ SPECIALS = [
     "<|startofcontext|>", "<|itn|>", "<|noitn|>", "<|timestamp|>", "<|notimestamp|>", "<|diarize|>",
     "<|nodiarize|>", "<|emo:undefined|>", *(f"<|{lang}|>" for lang in LANGUAGES),
 ]
-PIECES = ["▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!"]
+PIECES = ["▁", "▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!"]
 
 
 @pytest.fixture
@@ -58,16 +58,17 @@ def test_refuses_a_mel_front_end_it_does_not_compute(snapshot):
 
 
 def test_prompt_tokens(snapshot):
-    """The tokens ``chat_template.jinja`` renders for a transcription (and a
-    translation), in its order."""
+    """The tokens NeMo's transcribe feeds the decoder for a transcription (and a
+    translation), in its order: SentencePiece's ``▁``, then the task tokens."""
     cfg = CanaryModelConfig.from_pretrained(snapshot)
     ids = cfg.special_ids
-    assert cfg.prompt_ids("en") == [ids[t] for t in (
+    assert cfg.prompt_ids("en") == [cfg.word_boundary_id] + [ids[t] for t in (
         "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>", "<|en|>", "<|en|>",
         "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
     )]
+    assert cfg.word_boundary_id == len(SPECIALS)  # the vocab's "▁", not an added token
     translate = cfg.prompt_ids("DE", "en", punctuation=False)
-    assert translate[3:6] == [ids["<|de|>"], ids["<|en|>"], ids["<|nopnc|>"]]
+    assert translate[4:7] == [ids["<|de|>"], ids["<|en|>"], ids["<|nopnc|>"]]
     # the output limit counts on it
     assert len(translate) == PROMPT_LENGTH
 
@@ -115,13 +116,11 @@ def test_graph_and_limits(snapshot):
     assert set(walks) == {"prefill", "decode"}
     assert model.nodes == ["audio_encoder", "decoder"]
     # the position table bounds prompt + transcript
-    assert model.get_max_output_tokens() == 64 - 9
+    assert model.get_max_output_tokens() == 64 - PROMPT_LENGTH
     assert model.get_max_output_tokens(max_output_tokens=10) == 10
-    assert model.get_max_output_tokens(max_output_tokens=None) == 64 - 9
+    assert model.get_max_output_tokens(max_output_tokens=None) == 64 - PROMPT_LENGTH
     # published, so the conductor refuses a larger request instead of cutting it short
-    assert model.get_max_output_tokens_limit() == 64 - 9
-    # the request's max_output_tokens caps the loop, not the graph's max_iters
-    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 10}
+    assert model.get_max_output_tokens_limit() == 64 - PROMPT_LENGTH
 
 
 def test_request_cap_must_fit_the_kv_pools(snapshot):
@@ -143,6 +142,7 @@ def test_detokenizes_pieces_and_byte_fallback(snapshot):
     ids = [vocab[t] for t in ("<|en|>", "▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!", "<|endoftext|>")]
     per_token = b"".join(model.postprocess(torch.tensor([i]), "text") for i in ids)
     assert per_token.decode("utf-8") == " hello café!"
+    assert b"".join(model.postprocess_inline(ids, "text", [None] * len(ids))) == per_token
 
 
 def test_decoder_weight_names():
@@ -241,6 +241,17 @@ class _FakeContext:
         self.kv[self._layer] = (k, v)
 
 
+class _LastRows:
+    """The attention resource's pick of a prefill row's last token, for one
+    row; keeps the hidden states it was handed."""
+
+    seen = None
+
+    def select_last_hidden(self, hidden):
+        self.seen = hidden
+        return hidden[-1:]
+
+
 class _FakeCross:
     """Cross-attention over the whole context, no mask."""
 
@@ -258,11 +269,15 @@ class _FakeCross:
 
 def test_decoder_matches_hf():
     """Prefill of a 9-token prompt over a clip's encoder output, then two
-    decode steps: the decoder's hidden states against HF's ``CanaryDecoder``
-    at every position, loaded through the serving loader."""
+    decode steps, through the decoder node's forward: the decoder's hidden
+    states against HF's ``CanaryDecoder`` at every prefill position, and the
+    logits it samples from at each step, loaded through the serving loader."""
+    from types import SimpleNamespace
+
     transformers = pytest.importorskip("transformers")
     modeling = pytest.importorskip("transformers.models.canary.modeling_canary")
-    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE
+    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, POS, SAMPLER
+    from mstar.model.canary.submodules import CanaryDecoderSubmodule
     from mstar.model.components.fastconformer import FastConformerConfig
     from mstar.model.loader import WHISPER_STACKED_PARAMS, load_hf_weights
     from mstar.model.utils import check_loaded
@@ -289,23 +304,35 @@ def test_decoder_matches_hf():
             module.bind_resources({ATTN: self_attn, KV_CACHE: self_attn, CROSS_ATTN: _FakeCross(context),
                                    CROSS_KV_CACHE: context})
 
+    node, last_rows = CanaryDecoderSubmodule(ours, config), _LastRows()
+
+    def run(walk, inputs, positions):
+        """One step as the engine runs it, with a sampler that hands back its logits."""
+        engine_inputs = SimpleNamespace(request_ids=["a"], resources={
+            POS: SimpleNamespace(pos_ids=lambda label: positions), ATTN: last_rows,
+            SAMPLER: SimpleNamespace(sample=lambda request_ids, logits: logits),
+        })
+        rows = [node.prepare_inputs(walk, None, inputs)]
+        return node.forward_batched(walk, engine_inputs, **node.preprocess(walk, engine_inputs, rows))
+
     torch.manual_seed(1)
     encoder_states = torch.randn(13, 32)
     tokens = torch.randint(0, 50, (9,))
     with torch.no_grad():
-        ours.write_cross_kv(encoder_states)
-        hidden = ours(ours.embed(tokens, torch.arange(9)), label="main")
+        out = run("prefill", {"text_inputs": [tokens], "encoder_states": [encoder_states]}, torch.arange(9))
         expected = reference(tokens[None], position_ids=torch.arange(9)[None],
                              encoder_hidden_states=encoder_states[None]).last_hidden_state[0]
-        assert torch.allclose(hidden, expected, atol=1e-4), (hidden - expected).abs().max()
+        assert torch.allclose(last_rows.seen, expected, atol=1e-4), (last_rows.seen - expected).abs().max()
+        assert torch.allclose(out.row_outputs["new_token"], ours.logits(expected[-1:]), atol=1e-3)
         for step in range(2):
             nxt = torch.randint(0, 50, (1,))
             tokens = torch.cat([tokens, nxt])
             position = tokens.numel() - 1
-            hidden = ours(ours.embed(nxt, torch.tensor([position])), label="main")
+            logits = run("decode", {"text_inputs": [nxt]}, torch.tensor([position])).row_outputs["new_token"]
             expected = reference(tokens[None], position_ids=torch.arange(position + 1)[None],
                                  encoder_hidden_states=encoder_states[None]).last_hidden_state[0, -1:]
-            assert torch.allclose(hidden, expected, atol=1e-4), (step, (hidden - expected).abs().max())
+            expected = ours.logits(expected)
+            assert torch.allclose(logits, expected, atol=1e-3), (step, (logits - expected).abs().max())
 
 
 def _tiny_node():
@@ -341,39 +368,46 @@ def test_prefill_reserves_each_clips_context_once():
     assert "encoder_states" not in node.preprocess("decode", None, decode)
 
 
-def test_batched_stop_check_agrees_with_the_per_request_one():
+@pytest.mark.parametrize("width", [1, 3])
+def test_batched_stop_check_agrees_with_the_per_request_one(width):
     """Rows come in the order the forward ran the requests, which needn't be
-    the order the worker asks in; EOS, ignore_eos and the token limit."""
+    the order the worker asks in; EOS, ignore_eos, a row at its token
+    limit, which the loop's cap ends rather than the check, and the
+    prefill's EOS, which ends the reply before the loop exists. Both read a
+    row's first element, also from a buffer wider than one token."""
     from types import SimpleNamespace
 
+    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.model.canary.config import SAMPLER
-    from mstar.model.submodule_base import HostRows
+    from mstar.model.submodule_base import END_PARTITION, HostRows
 
     node = _tiny_node()
 
-    def info(ignore_eos=False, decoded=0, max_tokens=100):
-        return SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
-                               dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens)
+    def info(ignore_eos=False, decoded=0, max_tokens=100, walk="decode"):
+        # the walk plan marks the prefill, the step before decode, FINAL_PREFILL
+        return SimpleNamespace(graph_walk=walk, resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
+                               dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens,
+                               step_metadata={FINAL_PREFILL: walk == "prefill"})
 
-    infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=9, max_tokens=10), "go": info()}
-    rows = ("go", "limit", "eos", "ignored")
-    tokens = torch.tensor([[7], [7], [3], [3]])
-    asked = ["eos", "ignored", "limit", "go"]
-    # called as the engine calls it, with the step's walk
-    batched = node.check_stop_batched(
-        asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}), step_walk="decode",
-    )
+    infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=9, max_tokens=10), "go": info(),
+             "prefill_eos": info(walk="prefill")}
+    rows = ("go", "limit", "eos", "ignored", "prefill_eos")
+    tokens = torch.tensor([[7], [7], [3], [3], [3]]).repeat(1, width)
+    asked = ["eos", "ignored", "limit", "go", "prefill_eos"]
+    batched = node.check_stop_batched(asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}))
     one_by_one = {rid: node.check_stop(rid, infos[rid], {"new_token": [tokens[rows.index(rid)]]}) for rid in asked}
     assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {
-        "eos": {"decode_loop"}, "limit": {"decode_loop"},
+        "eos": {"decode_loop"}, "prefill_eos": {END_PARTITION},
     }
 
 
 def test_decoder_node_caps_captures_and_names(snapshot):
-    """What the shared TokenStepNode gives the decoder node: prefill batches
-    capped, decode bounded by its captures, the sampled token fed back, and
-    the walk, loop and sampler names of Canary's graph."""
-    from mstar.model.canary.config import SAMPLER
+    """What the shared decoder gives Canary's node, as before the scaffold:
+    prefill batches capped, only decode captured on its ladder, the sampled
+    token fed back, the walk, loop and sampler names of Canary's graph, and
+    positions advanced on the resource the model declares, under its key."""
+    from mstar.model.canary.config import POS, SAMPLER
+    from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
     assert node.max_batch_size("prefill") == 32 and node.max_batch_size("decode") is None
@@ -382,5 +416,9 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"]
-    walks = CanaryModel(str(snapshot)).get_graph_walk_graphs()
+    model = CanaryModel(str(snapshot))
+    walks = model.get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
+    step = node.declare_step("decode", ["a"], [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1)])
+    # the resource key YAML overrides name
+    assert POS == "positions" and POS in step.steps and POS in {s.resource_key for s in model.get_node_resources()}

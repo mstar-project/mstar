@@ -25,14 +25,26 @@ Ceilings are PER-ENTITY and multiply across a node: with E entities
 (workers + the api-server data worker), /dev/shm demand can reach
 ``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx
 ``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin
-more than its own arena holds). Construction fails fast when one entity's
-ceiling already exceeds /dev/shm, and warns when it exceeds current free
-space or when the pin budget is an outsized share of physical RAM.
+more than its own arena holds). With neither ``MAX_SEGMENTS`` nor
+``SEGMENT_MB`` set, the API server sizes every arena of its deployment once,
+before any exists (``export_arena_plan``): /dev/shm's free space split among
+the deployment's arenas plus one share kept for spill files. Each entity
+measuring free space for itself would give the ones that start later less,
+since a first segment's pages are committed when it is created. An entity
+started without that plan falls back to its own measurement. Set by hand,
+construction fails fast when one entity's ceiling already exceeds /dev/shm.
+Either way it warns when the ceiling exceeds current free space or when the
+pin budget is an outsized share of physical RAM.
 
-Selection: ``create_tensor_communication_manager`` picks this manager for
-the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``
-(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file
-transport. See :doc:`environment_variables` for all knobs.
+An entity can also run without an arena of its own: when its first segment
+cannot be created (or /dev/shm is too small for a 16 MiB share), and on
+devices other than CPU and CUDA (``_arena_supported``), which use the file
+path until the arena is measured there. It then sends every tensor as a per-uuid file and
+still reads its peers' arenas, so it mixes with entities that have one.
+
+Selection: ``create_tensor_communication_manager`` builds this manager for
+the SHM protocol; the file transport it extends is its spill path. See
+:doc:`environment_variables` for the knobs.
 """
 
 from __future__ import annotations
@@ -54,17 +66,145 @@ from mstar.communication.tensors import (
     FutureAndPointers,
     Rid,
     SharedMemoryCommunicationManager,
+    _default_shm_dir,
     _deserialize_tensor,
     _nullcontext,
     _serialize_tensor,
+    _sweep_dead_namespaces,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.platforms import current_platform
 from mstar.utils.containers import ParallelList
 from mstar.utils.host_copy import HostCopier
+from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
 _CUDA_HOST_ALREADY_REGISTERED = 712
+_sizing_logged = False
+
+#: ``<segment MiB>x<max segments>`` for every arena of one deployment, ``0x0``
+#: for none; set by ``export_arena_plan`` and inherited by the processes the
+#: API server starts.
+ARENA_PLAN_ENV = "MSTAR_SHM_ARENA_PLAN"
+#: Without a plan an entity takes a quarter of the free space it finds: its
+#: arena and two others, plus the spill share.
+_UNPLANNED_ENTITIES = 3
+
+
+def _default_sizing(budget: int, entities: int) -> tuple[int, int] | None:
+    """(segment MiB, max segments) for each of ``entities`` arenas sharing
+    ``budget`` bytes, with one more share left for the files sends spill to:
+    256 MiB segments, 1 to 32 of them, or where a share is under 256 MiB, one
+    segment of the largest power-of-two MiB that fits. None where a share is
+    under 16 MiB: the entities send by files."""
+    share_mb = (budget >> 20) // (entities + 1)
+    if share_mb < 16:
+        return None
+    segment_mb = 256 if share_mb >= 256 else 1 << (share_mb.bit_length() - 1)
+    return segment_mb, min(32, share_mb // segment_mb)
+
+
+def _shm_space() -> tuple[int | None, int | None]:
+    """/dev/shm's total and free bytes, or Nones where it cannot be read."""
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return None, None
+    return st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
+
+
+def _sweep_orphan_segments() -> None:
+    """A SIGKILLed server never runs Drop, orphaning up to its full
+    arena in /dev/shm until reboot. Names embed the owning pid, so a
+    startup sweep can reclaim any segment whose owner is gone. Files we
+    cannot judge (foreign naming) or cannot remove (another user's)
+    are left with a debug note."""
+    try:
+        names = os.listdir("/dev/shm")
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("mstar_arena_"):
+            continue
+        parts = name.split(".")[0].rsplit("_", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue   # pre-uniquification or foreign naming: skip
+        if os.path.exists(f"/proc/{parts[1]}"):
+            continue   # owner alive
+        try:
+            os.unlink(f"/dev/shm/{name}")
+            logger.info("ARENA: swept orphaned segment %s "
+                        "(owner pid %s is gone)", name, parts[1])
+        except OSError as e:
+            logger.debug("ARENA: cannot sweep %s: %s", name, e)
+
+
+def export_arena_plan(worker_devices: list[str] | None) -> None:
+    """Size every arena of this deployment once, from /dev/shm's free space
+    before any of them exists, and hand the sizes to the processes the caller
+    starts (``ARENA_PLAN_ENV``). Called by the API server, which holds one
+    arena itself, for its workers on ``worker_devices``; None (no deployment
+    config) drops a plan an earlier server in this process left."""
+    os.environ.pop(ARENA_PLAN_ENV, None)
+    if worker_devices is not None:
+        # a dead run's segments and files count against the free space until
+        # they are gone, and a restart would size itself around them
+        _sweep_orphan_segments()
+        _sweep_dead_namespaces(_default_shm_dir(), "")
+    _, avail = _shm_space()
+    if worker_devices is None or avail is None:
+        return
+    entities = 1 + sum(map(_arena_supported, worker_devices))
+    sizes = _default_sizing(avail, entities) or (0, 0)
+    os.environ[ARENA_PLAN_ENV] = f"{sizes[0]}x{sizes[1]}"
+    logger.info(
+        "ARENA: /dev/shm has %d MiB free for %d arenas and their spill files; "
+        "each arena grows to %d segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS "
+        "and _SEGMENT_MB override)", avail >> 20, entities, sizes[1], sizes[0])
+
+
+def _arena_sizing() -> tuple[int, int, int | None, int | None]:
+    """Segment MiB, max segments, and /dev/shm's total and free bytes. Knobs
+    the user set are taken as given (the constructor fails fast if they do not
+    fit); with neither set the deployment's plan applies, and without one the
+    sizes come from /dev/shm's free space now. Either way a small or busy
+    tmpfs (a Kubernetes pod gets 64 MiB) runs a small arena, or none (0
+    segments of 0 MiB), and spills to files instead of refusing to start."""
+    global _sizing_logged
+    total, avail = _shm_space()
+    segment_env = os.environ.get("MSTAR_SHM_ARENA_SEGMENT_MB")
+    max_env = os.environ.get("MSTAR_SHM_ARENA_MAX_SEGMENTS")
+    if segment_env or max_env:
+        segment_mb, max_segments = int(segment_env or 256), int(max_env or 32)
+        if segment_mb < 1 or max_segments < 1:
+            raise ValueError("MSTAR_SHM_ARENA_SEGMENT_MB and _MAX_SEGMENTS "
+                             "must be at least 1")
+        return segment_mb, max_segments, total, avail
+    if plan := os.environ.get(ARENA_PLAN_ENV):
+        segment_mb, _, max_segments = plan.partition("x")
+        return int(segment_mb), int(max_segments), total, avail
+    if avail is None:
+        return 256, 32, total, avail
+    sizes = _default_sizing(avail, _UNPLANNED_ENTITIES)
+    if sizes is None:
+        return 0, 0, total, avail
+    segment_mb, max_segments = sizes
+    if not _sizing_logged:
+        _sizing_logged = True
+        logger.info(
+            "ARENA: /dev/shm has %d MiB free; each entity's arena grows "
+            "to %d segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and "
+            "_SEGMENT_MB override)", avail >> 20, max_segments, segment_mb)
+    return segment_mb, max_segments, total, avail
+
+
+def _arena_supported(device) -> bool:
+    """Whether an entity on ``device`` stages its sends in an arena: CPU, and
+    CUDA. ROCm (``_pin`` loads libcudart), XPU (no copy streams) and the rest
+    send by per-uuid files until the arena is ported and measured there."""
+    kind = torch.device(device).type
+    return kind == "cpu" or (kind == "cuda" and current_platform.is_cuda())
 
 
 class _Placements(NamedTuple):
@@ -214,8 +354,29 @@ def _pin(ptr: int, nbytes: int) -> bool:
     return ok
 
 
+def _gather(view, starts: list[int], nbytes: int, dst: np.ndarray, *,
+            words_max_bytes: int) -> None:
+    """``nbytes`` from each of ``starts`` in ``view``, back to back into ``dst``."""
+    if (
+        nbytes <= words_max_bytes and nbytes % 8 == 0 and len(view) % 8 == 0
+        and all(s % 8 == 0 for s in starts)
+    ):
+        words = np.frombuffer(view, dtype=np.int64)
+        w = nbytes // 8
+        at = np.asarray(starts, dtype=np.int64) // 8
+        np.take(words, (at[:, None] + np.arange(w)).ravel(), out=dst.view(np.int64))
+        return
+    seg = np.frombuffer(view, dtype=np.uint8)
+    for i, s in enumerate(starts):
+        dst[i * nbytes:(i + 1) * nbytes] = seg[s:s + nbytes]
+
+
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
-    """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
+    """Tensor transport via the Rust shared-memory arena (``mstar_rust``).
+
+    ``_arena`` is None when this entity has none of its own (see the module
+    docstring): every send then spills to a per-uuid file.
+    """
 
     _namespace_file_dirs = ("/dev/shm",)
 
@@ -246,13 +407,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
-        segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
-        max_segments = int(os.getenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "32"))
+        supported = _arena_supported(device)
+        segment_mb, max_segments, shm_total, shm_avail = (
+            _arena_sizing() if supported else (0, 0, None, None))
         self._full_timeout_s = float(
             os.getenv("MSTAR_SHM_ARENA_FULL_TIMEOUT_S", "30"))
         self._pin_segments = (
             os.getenv("MSTAR_SHM_ARENA_PIN", "1") == "1"
             and torch.cuda.is_available() and str(device) != "cpu"
+            and supported
         )
         # Pinned host memory is a system-wide resource (pages come out of the
         # OS's pageable pool), so it gets its own budget, distinct from the
@@ -262,6 +425,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # one-shot transfer doesn't amortize the registration cost.
         self._pin_budget = int(
             os.getenv("MSTAR_SHM_ARENA_PIN_MAX_MB", "4096")) << 20
+        # _read_many_from_arena's gather limits: the crossovers depend on the host
+        self._gather_item_bytes = int(
+            os.getenv("MSTAR_SHM_ARENA_GATHER_MAX_BYTES", "16384"))
+        self._gather_words_bytes = int(
+            os.getenv("MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES", "512"))
         self._pinned_bytes = 0
         self._pin_budget_warned = False
         self._segment_bytes = segment_mb << 20
@@ -307,12 +475,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # its own arena). Check the static tmpfs ceiling NOW instead of
         # surfacing as ENOSPC on a growth mid-run.
         per_entity_max = (segment_mb << 20) * max_segments
-        try:
-            st = os.statvfs("/dev/shm")
-            shm_total = st.f_frsize * st.f_blocks
-            shm_avail = st.f_frsize * st.f_bavail
-        except OSError:
-            shm_total = shm_avail = None
         self._shm_total = shm_total
         if shm_total is not None:
             if per_entity_max > shm_total:
@@ -352,13 +514,31 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # pid in the name drives the orphan sweep below.
         import secrets
 
-        self._sweep_orphans()
+        _sweep_orphan_segments()
         ns = self._shm_namespace
         base = (f"mstar_{ns}_arena_{my_entity_id}_{secrets.token_hex(4)}"
                 if ns else f"mstar_arena_{my_entity_id}_{os.getpid()}_"
                 f"{secrets.token_hex(4)}")
-        self._arena = SegmentedShmArena.create(
-            base, segment_mb << 20, max_segments)
+        self._arena = None
+        if not supported:
+            logger.info(
+                "ARENA: not used on %s (%s); this entity sends by per-uuid "
+                "files and reads its peers' arenas", device,
+                current_platform.name)
+        elif not segment_mb:
+            logger.warning(
+                "ARENA: /dev/shm has %s MiB free, too little for a 16 MiB "
+                "arena per entity and room for spill files; this entity sends "
+                "by per-uuid files",
+                "?" if shm_avail is None else shm_avail >> 20)
+        else:
+            try:
+                self._arena = SegmentedShmArena.create(
+                    base, segment_mb << 20, max_segments)
+            except (RuntimeError, OSError) as e:
+                logger.warning(
+                    "ARENA: cannot create this entity's first segment (%s); "
+                    "its sends spill to per-uuid files", e)
         # Guaranteed exit-time unlink: weakref.finalize runs at interpreter
         # shutdown even when the manager is still referenced (the worker
         # case — no explicit cleanup path runs there, so the Rust Drop
@@ -417,31 +597,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     # -- segments --------------------------------------------------------
 
-    def _sweep_orphans(self) -> None:
-        """A SIGKILLed server never runs Drop, orphaning up to its full
-        arena in /dev/shm until reboot. Names embed the owning pid, so a
-        startup sweep can reclaim any segment whose owner is gone. Files we
-        cannot judge (foreign naming) or cannot remove (another user's)
-        are left with a debug note."""
-        try:
-            names = os.listdir("/dev/shm")
-        except OSError:
-            return
-        for name in names:
-            if not name.startswith("mstar_arena_"):
-                continue
-            parts = name.split(".")[0].rsplit("_", 2)
-            if len(parts) != 3 or not parts[1].isdigit():
-                continue   # pre-uniquification or foreign naming: skip
-            if os.path.exists(f"/proc/{parts[1]}"):
-                continue   # owner alive
-            try:
-                os.unlink(f"/dev/shm/{name}")
-                logger.info("ARENA: swept orphaned segment %s "
-                            "(owner pid %s is gone)", name, parts[1])
-            except OSError as e:
-                logger.debug("ARENA: cannot sweep %s: %s", name, e)
-
     def _maybe_pin(self, ptr: int, nbytes: int) -> int:
         """Pin an own segment within budget; returns the bytes actually
         pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases
@@ -477,6 +632,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return 0
 
     def _sync_segments(self) -> None:
+        if self._arena is None:
+            return
         grew = False
         old_len = len(self._seg_views)
         while len(self._seg_views) < self._arena.num_segments:
@@ -511,9 +668,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         """Occupancy/fragmentation snapshot (named apart from the raw
         ``SegmentedShmArena.stats`` tuple). The fragmentation signature is
         `largest_free_block` collapsing while `free_bytes` stays high."""
-        total, free, largest = self._arena.stats()
+        arena = self._arena
+        total, free, largest = arena.stats() if arena is not None else (0, 0, 0)
         return {
-            "segments": self._arena.num_segments,
+            "segments": arena.num_segments if arena is not None else 0,
             "total_bytes": total,
             "free_bytes": free,
             "largest_free_block": largest,
@@ -623,7 +781,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         so the caller SPILLS this tensor to the per-uuid file transport —
         slower, never fails, exactly the old manager's saturation behavior.
         MSTAR_SHM_ARENA_SPILL=0 keeps strict backpressure for the full
-        timeout, then raises."""
+        timeout, then raises. Without an arena, every tensor spills."""
+        if self._arena is None:
+            return None
         grace = self._spill_after_s if self._spill else self._full_timeout_s
         deadline = time.monotonic() + grace
         warned = False
@@ -736,20 +896,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         queued = False
         try:
             if nbytes:
-                host = torch.frombuffer(
+                flat = torch.frombuffer(
                     self._seg_views[seg][off:off + nbytes],
                     dtype=torch.uint8,
-                ).view(t.dtype).reshape(t.shape)
+                )
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
                 if t.is_cuda:
-                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    flat.view(t.dtype).reshape(t.shape).copy_(
+                        t, non_blocking=self._d2h_stream is not None)
                     queued = True
+                elif t.device.type == "cpu":
+                    # A stored host copy: one memcpy, nothing for the stream
+                    # sync to wait on. numpy, not Tensor.copy_: torch splits a
+                    # CPU copy of more than 32K elements over its intra-op
+                    # OpenMP pool, whose threads then spin on the cores the
+                    # worker's own threads need.
+                    np.copyto(flat.numpy(),
+                              t.reshape(-1).view(torch.uint8).numpy())
                 else:
-                    # a stored host copy: a memcpy, nothing for the stream
-                    # sync to wait on
-                    host.copy_(t)
+                    flat.view(t.dtype).reshape(t.shape).copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:
@@ -847,21 +1014,28 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
+        return self._start_reads([(request_id, graph_edges)], graph_walk)
+
+    def start_read_tensors_multi(self, reads):
+        """One stream context, peer sweep, event and wake for every request's
+        reads, not one each."""
+        return self._start_reads(reads, None)
+
+    def _start_reads(self, requests, graph_walk):
         # Increment races are benign here: a torn count can only make
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
-            if not any(e.tensor_info for e in graph_edges):
+            if not any(e.tensor_info for _rid, edges in requests for e in edges):
                 # signal-only edges: no stream context to pay for, but the
                 # (time-gated) sweep of dead peers' segments still runs here
                 self._evict_dead_peers()
                 return []
-            return self._start_read_tensors(request_id, graph_edges,
-                                            graph_walk)
+            return self._start_read_tensors(requests, graph_walk)
         finally:
             self._reads_active -= 1
 
-    def _start_read_tensors(self, request_id, graph_edges, graph_walk):
+    def _start_read_tensors(self, requests, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
         stats = self.transfer_stats
@@ -872,48 +1046,69 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             if self._h2d_stream is not None
             else _nullcontext()
         )
+        # arena items are read and stored together after the loop; one met
+        # again before then takes the extra reference after the put
+        staged: list[tuple] = []
+        taken: dict[int, TensorPointerInfo] = {}
+        again: list[int] = []
+        t0 = time.perf_counter()
         with ctx:
-            for graph_edge in graph_edges:
-                if len(graph_edge.tensor_info) == 0:
-                    continue
-                rx_t0 = time.perf_counter()
-                fp = FutureAndPointers(
-                    future=None, graph_edges=[graph_edge], request_id=request_id,
+            for request_id, graph_edges in requests:
+                for graph_edge in graph_edges:
+                    if len(graph_edge.tensor_info) == 0:
+                        continue
+                    fp = FutureAndPointers(
+                        future=None, graph_edges=[graph_edge], request_id=request_id,
+                    )
+                    for info in graph_edge.tensor_info:
+                        if info.source_entity == self.my_entity_id:
+                            self._slice_existing_tensor(
+                                request_id=request_id, name=graph_edge.name,
+                                next_node=graph_edge.next_node,
+                                graph_walk=graph_walk, info=info,
+                            )
+                            self.tensor_store.increment_ref(info.uuid, 1)
+                            continue
+                        producer_uuid = info.uuid
+                        if self._take_cached_read(request_id, info, taken, again):
+                            continue
+                        if info.shm_segment is None:
+                            # Spilled at the producer (arena saturated): read the
+                            # per-uuid file, the old protocol's path.
+                            path = self._shm_path(info.source_entity, producer_uuid)
+                            with open(path, "rb") as f:
+                                f.seek(info.offset)
+                                data = f.read(info.nbytes)
+                            tensor = _deserialize_tensor(
+                                data, self.device, tensor_info=info)
+                            h2d_did_work = h2d_did_work or tensor.numel() > 0
+                            self.tensor_store.put_tensor(
+                                request_id, info.uuid, tensor, info)
+                            self.tensor_store.set_metadata(info.uuid, mem_registered=False)
+                            self.tensor_store.increment_ref(info.uuid, 2)
+                        else:
+                            staged.append((request_id, info))
+                            taken[info.uuid] = info
+                        if stats is not None:
+                            fp.count_read(info)
+                    reads.append(fp)
+            if staged:
+                infos = [info for _, info in staged]
+                uuids = [info.uuid for info in infos]
+                tensors = self._read_many_from_arena(infos)
+                h2d_did_work = h2d_did_work or any(t.numel() > 0 for t in tensors)
+                self.tensor_store.put_tensor_batch_multi(
+                    [rid for rid, _ in staged], uuids, tensors, infos,
                 )
-                for info in graph_edge.tensor_info:
-                    if info.source_entity == self.my_entity_id:
-                        self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
-                            next_node=graph_edge.next_node,
-                            graph_walk=graph_walk, info=info,
-                        )
-                        self.tensor_store.increment_ref(info.uuid, 1)
-                        continue
-                    producer_uuid = info.uuid
-                    if self._take_cached_read(request_id, info):
-                        continue
-                    if info.shm_segment is None:
-                        # Spilled at the producer (arena saturated): read the
-                        # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, producer_uuid)
-                        with open(path, "rb") as f:
-                            f.seek(info.offset)
-                            data = f.read(info.nbytes)
-                        tensor = _deserialize_tensor(
-                            data, self.device, tensor_info=info)
-                    else:
-                        tensor = self._read_from_arena(info)
-                    h2d_did_work = h2d_did_work or tensor.numel() > 0
-                    self.tensor_store.put_tensor(
-                        request_id, info.uuid, tensor, info)
-                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
-                    # +1 transit (released by get_ready_tensors), +1 usage
-                    # (released by _cleanup_consumed_inputs).
-                    self.tensor_store.increment_ref(info.uuid, 2)
-                    if stats is not None:
-                        fp.count_read(info)
-                fp.rx_time = time.perf_counter() - rx_t0
-                reads.append(fp)
+                # +1 transit (released by get_ready_tensors), +1 usage
+                # (released by _cleanup_consumed_inputs).
+                self.tensor_store.increment_ref_batch_uniform(uuids, 2)
+            if again:
+                self.tensor_store.increment_ref_batch_uniform(again, 1)
+        # profiling attributes the call's time to its reads evenly
+        rx = (time.perf_counter() - t0) / max(len(reads), 1)
+        for fp in reads:
+            fp.rx_time = rx
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
@@ -945,7 +1140,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # staticmethod target closing over ONLY the queue: a bound
                 # method would pin the whole manager (and its arena — so
                 # segments never unlink) for the daemon thread's lifetime.
-                threading.Thread(
+                Thread(
                     target=self._watch_wakes, args=(self._wake_q,),
                     daemon=True,
                     name=f"arena-h2d-wake-{self.my_entity_id}").start()
@@ -975,6 +1170,35 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     except Exception:  # noqa: BLE001
                         pass
 
+    # Small items of one shape, dtype and segment (a step's streamed tokens)
+    # are gathered on the host into one pinned buffer, copied once and split
+    # on the device: one copy call instead of a copy per item (~7 us each).
+    # The default limits were measured on an H200 host, reading k items of n
+    # bytes: the gather wins from k=2 up to n=16 KB and breaks even at 64 KB.
+    # Up to 512 B an index of 8-byte words is fastest; above it, one slice
+    # copy per item.
+    def _read_many_from_arena(self, infos: list[TensorPointerInfo]) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(infos)
+        if self.device != "cpu":
+            groups: dict[tuple, list[int]] = {}
+            for k, info in enumerate(infos):
+                if 0 < info.nbytes <= self._gather_item_bytes:
+                    key = (info.shm_segment, info.nbytes, info.dtype, tuple(info.dims))
+                    groups.setdefault(key, []).append(k)
+            for (segment, nbytes, dtype, dims), ks in groups.items():
+                if len(ks) < 2:
+                    continue
+                starts = [infos[k].shm_offset + infos[k].offset for k in ks]
+                # pinned, so the copy is a true async DMA; the caching host
+                # allocator holds the block until the copy is done
+                host = torch.empty(len(ks) * nbytes, dtype=torch.uint8, pin_memory=True)
+                _gather(self._peer_view(segment), starts, nbytes, host.numpy(),
+                        words_max_bytes=self._gather_words_bytes)
+                rows = host.to(self.device, non_blocking=True).view(dtype).reshape(len(ks), *dims)
+                for k, t in zip(ks, rows.unbind(0), strict=True):
+                    out[k] = t
+        return [t if t is not None else self._read_from_arena(i) for t, i in zip(out, infos, strict=True)]
+
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
         if info.nbytes == 0:
             t = torch.empty(
@@ -992,7 +1216,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)
         t = flat.view(info.dtype).reshape(info.dims)
-        return t.to(self.device, non_blocking=True)
+        # Async only when the h2d stream's event gates the ACK: with no copy
+        # stream (XPU) nothing would wait for the copy before the slot is freed.
+        return t.to(self.device, non_blocking=self._h2d_stream is not None)
 
     # -- reclaim ----------------------------------------------------------
 

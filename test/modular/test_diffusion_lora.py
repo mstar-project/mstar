@@ -18,8 +18,9 @@ sys.path.insert(0, ".")
 pytest.importorskip("diffusers")
 from diffusers import Flux2Transformer2DModel  # noqa: E402
 
+from mstar.engine.resources.lora.checkpoint import LoraFile, normalize_lora_state_dict  # noqa: E402
 from mstar.model.components.diffusion.image_io import image_grid_ids, text_ids  # noqa: E402
-from mstar.model.components.diffusion.lora import LoraSpec, merge_lora, normalize_lora_state_dict  # noqa: E402
+from mstar.model.components.diffusion.lora import merge_lora  # noqa: E402
 from mstar.model.components.diffusion.rope import MultiAxisRoPE  # noqa: E402
 from mstar.model.components.diffusion.weight_loading import load_native  # noqa: E402
 from mstar.model.flux2_klein.components.transformer import Flux2DiT  # noqa: E402
@@ -136,6 +137,9 @@ def test_bfl_layout_and_kohya_names_are_equivalent():
         "diffusion_model.img_in.lora_B.weight": b_in,
         "diffusion_model.final_layer.linear.lora_A.weight": a_out,
         "diffusion_model.final_layer.linear.lora_B.weight": b_out,
+        # a block's alpha was dropped, so the adapter merged at alpha = rank
+        "diffusion_model.double_blocks.0.img_attn.qkv.alpha": torch.tensor(RANK / 2),
+        "diffusion_model.single_blocks.0.linear1.alpha": torch.tensor(RANK * 2.0),
     }
     adapter = normalize_lora_state_dict(bfl, convert_keys=convert_bfl_lora_keys)
     expected_modules = {
@@ -147,6 +151,9 @@ def test_bfl_layout_and_kohya_names_are_equivalent():
     assert set(adapter.layers) == expected_modules
     assert torch.equal(adapter.layers["transformer_blocks.0.attn.to_k"][0], a_qkv)
     assert torch.equal(adapter.layers["transformer_blocks.0.attn.to_v"][1], b_qkv.chunk(3)[2])
+    assert [adapter.layers[m].alpha for m in ("transformer_blocks.0.attn.to_k", "transformer_blocks.1.attn.to_out.0",
+                                               "single_transformer_blocks.0.attn.to_qkv_mlp_proj")] == [
+        RANK / 2, RANK, RANK * 2]
     merge_lora(native, adapter, remap_transformer_key, _QKV_RULES_DIT)
     # reference: the converted (diffusers-naming) adapter applied to the diffusers module's weights
     with torch.no_grad():
@@ -166,11 +173,14 @@ def test_error_paths_and_spec_parsing():
     with pytest.raises(ValueError, match="missing lora_B"):
         normalize_lora_state_dict({"transformer.x_embedder.lora_A.weight": torch.zeros(2, 16)})
     with pytest.raises(ValueError, match="unrecognized"):
-        normalize_lora_state_dict({"transformer.x_embedder.weight": torch.zeros(2, 16)})
+        normalize_lora_state_dict({
+            "transformer.x_embedder.lora_A.weight": torch.zeros(2, 16),
+            "transformer.x_embedder.weight": torch.zeros(2, 16),
+        })
     adapter = normalize_lora_state_dict({
         "transformer.nowhere.lora_A.weight": torch.zeros(2, 16), "transformer.nowhere.lora_B.weight": torch.zeros(8, 2),
     })
     with pytest.raises(KeyError):
         merge_lora(native, adapter, remap_transformer_key, _QKV_RULES_DIT)
-    assert LoraSpec.parse("a.safetensors") == LoraSpec("a.safetensors", 1.0)
-    assert LoraSpec.parse({"path": "b.safetensors", "scale": 0.5}) == LoraSpec("b.safetensors", 0.5)
+    assert LoraFile.parse("a.safetensors") == LoraFile("a.safetensors", 1.0)
+    assert LoraFile.parse({"path": "b.safetensors", "scale": 0.5}) == LoraFile("b.safetensors", 0.5)

@@ -41,7 +41,8 @@ from pathlib import Path
 
 import torch
 
-from mstar.model.components.diffusion.lora import LoraSpec, apply_loras
+from mstar.engine.resources.lora.checkpoint import LoraFile
+from mstar.model.components.diffusion.lora import apply_loras
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, Qwen3HiddenStateEncoder
 from mstar.model.components.diffusion.qwen3.weight_loading import (
     QKV_RULES_LM,
@@ -170,12 +171,12 @@ _BFL_DOUBLE = {
 }
 _BFL_SINGLE = {"linear1": "attn.to_qkv_mlp_proj", "linear2": "attn.to_out"}
 _BFL_QKV = {"img_attn.qkv": ("to_q", "to_k", "to_v"), "txt_attn.qkv": ("add_q_proj", "add_k_proj", "add_v_proj")}
-_BLOCK_KEY = re.compile(r"^(double|single)_blocks\.(\d+)\.(.+)\.lora_([AB])\.weight$")
+_BLOCK_KEY = re.compile(r"^(double|single)_blocks\.(\d+)\.(.+)\.(lora_A\.weight|lora_B\.weight|alpha)$")
 
 
 def convert_bfl_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Rewrite FLUX.2's native (BFL / ai-toolkit) LoRA keys to diffusers module paths; the
-    fused ``qkv`` adapters split their B matrix into q/k/v (A is shared). Keys already in
+    fused ``qkv`` adapters split their B matrix into q/k/v (A and alpha are shared). Keys already in
     diffusers naming pass through."""
     out: dict[str, torch.Tensor] = {}
     for key, value in sd.items():
@@ -187,23 +188,23 @@ def convert_bfl_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
                     break
             out[key] = value
             continue
-        kind, idx, inner, ab = m.groups()
+        kind, idx, inner, suffix = m.groups()
         if kind == "single":
-            out[f"single_transformer_blocks.{idx}.{_BFL_SINGLE[inner]}.lora_{ab}.weight"] = value
+            out[f"single_transformer_blocks.{idx}.{_BFL_SINGLE[inner]}.{suffix}"] = value
             continue
         block = f"transformer_blocks.{idx}"
         if inner in _BFL_QKV:
             names = _BFL_QKV[inner]
-            parts = [value] * 3 if ab == "A" else list(value.chunk(3, dim=0))
+            parts = list(value.chunk(3, dim=0)) if suffix == "lora_B.weight" else [value] * 3
             for name, part in zip(names, parts, strict=True):
-                out[f"{block}.attn.{name}.lora_{ab}.weight"] = part
+                out[f"{block}.attn.{name}.{suffix}"] = part
         elif inner in _BFL_DOUBLE:
-            out[f"{block}.{_BFL_DOUBLE[inner]}.lora_{ab}.weight"] = value
+            out[f"{block}.{_BFL_DOUBLE[inner]}.{suffix}"] = value
         else:
             raise ValueError(f"unsupported FLUX.2 LoRA key {key!r}")
     return out
 
 
-def apply_transformer_loras(dit: Flux2DiT, specs: list[LoraSpec]) -> None:
+def apply_transformer_loras(dit: Flux2DiT, files: list[LoraFile]) -> None:
     """Fold the configured adapters into the transformer weights (static merge)."""
-    apply_loras(dit, specs, remap_transformer_key, _QKV_RULES_DIT, convert_keys=convert_bfl_lora_keys)
+    apply_loras(dit, files, remap_transformer_key, _QKV_RULES_DIT, convert_keys=convert_bfl_lora_keys)

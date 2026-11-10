@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from mstar.api_server.data_worker import copy_workers, encode_workers
+from mstar.utils.cpus import CpuPlan
 from mstar.utils.host_copy import MIN_SLICE_BYTES, HostCopier
 
 MB = 1 << 20
@@ -73,6 +73,6 @@ def test_the_slices_run_on_the_pool():
 def test_the_copy_width_is_one_encodes_share_of_the_cpus(cpus, width):
     """The data worker's copier is as wide as one of the encode pool's slots:
     the pool times the width stays within the CPUs."""
-    png_workers = min(8, cpus)
-    assert copy_workers(cpus, png_workers=png_workers) == width
-    assert width * encode_workers(cpus, png_workers=png_workers) <= cpus
+    plan = CpuPlan(frozenset(range(cpus)), cpus)
+    assert plan.copy_workers == width
+    assert width * plan.encode_workers <= cpus

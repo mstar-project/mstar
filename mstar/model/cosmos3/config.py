@@ -307,6 +307,12 @@ class Cosmos3Config:
     action_gen: bool = True
     max_action_dim: int = 64
     num_embodiment_domains: int = 32
+    # Action dims the served checkpoint takes as 1 - x: DROID's gripper (7) for
+    # the released DROID policies. Every action a request sends (a policy's
+    # robot_state, a forward-dynamics action) is mapped on the way in and every
+    # predicted action on the way out, so a client sends and reads the robot's
+    # own values (the same robot_state a pi0.5 DROID policy takes).
+    inverted_action_dims: tuple[int, ...] = ()
     sound_gen: bool = True
     sound_dim: int | None = 64
     sound_latent_fps: float = 25.0
@@ -362,9 +368,9 @@ class Cosmos3Config:
     # it to bf16 rounding. Costs the cache per live stream, freed when the
     # stream's last window is decoded or the request goes away: 1.33 GiB of
     # tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame
-    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16,
-    # or COSMOS3_VAE_DECODE_FP32). Sessions still store only latents. False
-    # re-decodes the context ahead of every window.
+    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16).
+    # Sessions still store only latents. False re-decodes the context ahead
+    # of every window.
     windowed_decode_warm_cache: bool = True
     # At most this many streams per decoder copy hold a warm cache (0: no cap).
     # A stream that starts while the cap is reached takes the stateless
@@ -414,9 +420,15 @@ class Cosmos3Config:
     # never evicted, and a second request on it is refused.
     session_store_size: int = 8
     # Idle sessions expire after this many seconds unless the request set
-    # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
+    # ``session_timeout_s`` (at most the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
+    # A generation step whose requests total more vision tokens than this runs
+    # request by request. Off by default: it is a per-GPU number. On an H100,
+    # two 832x480 Nano clips of 189 frames batched took 2.4x one's step time,
+    # and two 121-frame Edge clips were slower than serial too, so an H100
+    # deployment sets 16384 in its model_kwargs.
+    max_batched_vision_tokens: int | None = None
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
@@ -424,7 +436,7 @@ class Cosmos3Config:
     # Number of denoise model evaluations. The per-mode cookbook defaults are
     # t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4. ``num_inference_steps``
     # is the image default; ``num_inference_steps_video`` is the video default.
-    # A request may override either; the value is clamped to ``max_inference_steps``.
+    # A request may override either; a value above ``max_inference_steps`` is a 400.
     num_inference_steps: int = 50
     num_inference_steps_video: int = 35
     # Upper bound on the denoise loop's iteration count. The loop is built with
@@ -444,6 +456,19 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # The timestep interval [lo, hi] outside which an action request's step runs
+    # the conditional branch alone; None guides every step. A request's
+    # ``guidance_interval`` wins.
+    guidance_interval_action: tuple[float, float] | None = None
+    # Policy-request defaults a policy checkpoint ships in ``checkpoint.json``
+    # (its "policy" section): the chunk the reply carries, the observation fps
+    # and the embodiment, so a client sends only the observation, the prompt
+    # and the robot_state. None keeps the generic action defaults (16 rows,
+    # ``fps``, and a domain the request must name). The Nano DROID checkpoint's
+    # file is empty, so its yaml sets them.
+    policy_action_chunk_size: int | None = None
+    policy_conditioning_fps: float | None = None
+    policy_domain_name: str | None = None
     # Default output size (width, height) for image and video requests that
     # send no ``size``: Nano/Super serve 1024^2 images and the same square for
     # video unless the deployment says otherwise; Edge is 480p-native (the
@@ -512,31 +537,14 @@ class Cosmos3Config:
     # options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
     # Compile the cross-request denoise step (two or more requests in one
-    # forward) too, with the same mode: the video, image and sound steps; the
-    # action step (``denoise_step_action_batched``) runs eager. Eager, the
-    # norms, rotary and residuals cost about 80 ms of GPU per extra row at
+    # forward) too, with the same mode: the video, image, sound and action
+    # steps share one compiled layer stack. Eager, the norms, rotary and
+    # residuals cost about 80 ms of GPU per extra row at
     # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
     # with the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
-    # torch.compile the reasoner's captured decode step before the CUDA-graph
-    # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
-    # norms', rotary's and residuals' pointwise pieces; fused, the step runs
-    # at the weight-streaming floor (H100: 4.2 -> 2.05 ms/token). Env override
-    # COSMOS3_REASONER_COMPILE=0/1 for A/B.
-    compile_reasoner_decode: bool = True
-    # torch.compile the reasoner's eager prefill (text and vision prompts; the
-    # decode step has its own captured graph). The eager prefill of a ~300-token
-    # image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an
-    # H100, launch-bound), so the fusion would take a third of that. Off by
-    # default: with dynamic shapes (one compile for every prompt length) torch
-    # 2.11's inductor fails in its joint-graph noop pass ("'SymInt' object has
-    # no attribute 'size'"), and a static compile recompiles per prompt length
-    # until automatic dynamic shapes route it into the same failure. Env
-    # override COSMOS3_REASONER_PREFILL_COMPILE=0/1 for the A/B once fixed
-    # upstream; the padded prefill graph (like the DiT's) is the real answer.
-    compile_reasoner_prefill: bool = False
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
@@ -615,6 +623,11 @@ class Cosmos3Config:
     def serves_reasoner(self) -> bool:
         return self.reasoner is not None
 
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        """The reasoner's stop ids: its end of turn."""
+        return frozenset({self.reasoner.eos_token_id}) if self.reasoner is not None else frozenset()
+
     @classmethod
     def from_transformer_dict(cls, d: dict[str, Any]) -> "Cosmos3Config":
         """Build from a diffusers ``transformer/config.json`` dict alone.
@@ -662,6 +675,17 @@ class Cosmos3Config:
             for name, value in EDGE_RECIPE_DEFAULTS.items():
                 if getattr(cfg, name) == getattr(defaults, name):
                     setattr(cfg, name, value)
+
+        ckpt_path = root / "checkpoint.json"
+        if ckpt_path.exists():
+            with open(ckpt_path) as f:
+                policy = (json.load(f) or {}).get("policy") or {}
+            if policy.get("action_chunk_size") is not None:
+                cfg.policy_action_chunk_size = int(policy["action_chunk_size"])
+            if policy.get("conditioning_fps") is not None:
+                cfg.policy_conditioning_fps = float(policy["conditioning_fps"])
+            if policy.get("domain_name"):
+                cfg.policy_domain_name = str(policy["domain_name"])
 
         modular_path = root / "modular_model_index.json"
         if modular_path.exists():

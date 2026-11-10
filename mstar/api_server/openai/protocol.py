@@ -141,8 +141,19 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "mstar"
+    # a LoRA adapter's base model; None (and left out of the JSON) for the base itself
+    parent: str | None = None
 
 
 class ModelList(BaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
+
+
+class LoadLoraAdapterRequest(BaseModel):
+    lora_name: str
+    lora_path: str
+
+
+class UnloadLoraAdapterRequest(BaseModel):
+    lora_name: str

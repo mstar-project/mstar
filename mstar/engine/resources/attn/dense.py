@@ -7,9 +7,10 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, workspace_bytes
+from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
+from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
@@ -50,8 +51,6 @@ def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
     imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
     if _VARLEN_IMPORT_ERROR is not None:
         return _VARLEN_IMPORT_ERROR
-    if device is not None and torch.device(device).type != "cuda":
-        return None
     capability = current_platform.cuda_capability(device)
     if capability is not None and not _fa3_has_kernel(capability):
         return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
@@ -175,6 +174,9 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
+    # the gathered prefix is keyed on the stream's generation, which the KV's drop moves on
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,
@@ -209,11 +211,13 @@ class DenseAttentionManager(AttentionManager):
         if self._on_flashinfer:
             # One workspace for every wrapper, taken now rather than at the first
             # plan: it is scratch during `run` only (a plan writes the wrapper's
-            # own buffers), and the runs are serialized on the node's stream.
-            workspace = (
-                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda else None
+            # own buffers), and the runs are serialized on the node's stream. Off
+            # CUDA nothing runs, so it is empty.
+            buffer = (
+                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda
+                else torch.empty(0, dtype=torch.uint8)
             )
-            self._wrapper_kwargs.update(workspace_buffer=workspace, backend=flashinfer_backend)
+            self._wrapper_kwargs.update(workspace_buffer=Workspace(buffer, kv_cache), backend=flashinfer_backend)
             if self._on_cuda:
                 self._check_flashinfer_backend()
 
@@ -298,14 +302,14 @@ class DenseAttentionManager(AttentionManager):
         )
 
         self._current_plans = {
-            plan_label: self._build_plan(kv_out, step.causal, self._wrapper(plan_label, ctx.slot))
+            plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))
             for plan_label, kv_out in plan_outputs.items()
         }
 
-    def _build_plan(self, kv_out: KVPlanOutput, causal: bool, wrapper: PrefixedPrefillWrapper) -> DensePlan:
+    def _build_plan(self, kv_out: KVPlanOutput, causal: bool, slot_key: EagerSlotKey) -> DensePlan:
         """The per-segment gather layout plus the cumulative lengths one varlen
         kernel needs, in the packed order the KV plan defined."""
-        page_size = self._kv_config.page_size
+        page_size = self._kv_config.tokens_per_page
         segments: list[DenseSegment] = []
         cu_q = [0]
         cu_k = [0]
@@ -331,9 +335,11 @@ class DenseAttentionManager(AttentionManager):
             max_q = max(max_q, view.to_compute)
             max_k = max(max_k, view.length)
 
-        # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
-        # non-blocking (from pageable memory that copy would sync the stream),
-        # FlashInfer's plan reads them on the host.
+        # Fresh pinned host layouts per step: the FA3 wrapper H2Ds them non-blocking
+        # (from pageable memory that copy would sync the stream), FlashInfer's plan
+        # reads them on the host, and neither happens when the wrapper already
+        # holds this layout.
+        wrapper = self._wrapper(slot_key.label, slot_key.slot)
         pin = self._on_cuda
         wrapper.plan(
             torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),

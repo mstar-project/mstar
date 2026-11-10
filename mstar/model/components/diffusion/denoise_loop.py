@@ -9,15 +9,20 @@ leaves the model-specific parts to a handful of hooks:
   step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
   per-request schedule + seeded initial noise,    schedule_for(fwd_info, key)   -> FlowMatchSchedule
     drawn at ingest under PREFETCH_SEEDS
-  overshoot veto (async scheduling)               seed_latents(fwd_info, key, generator) -> [L, C]
-  equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
-  stacked preprocess / per-row outputs            num_tokens(key)               -> int
-  stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
+  equal-key request batching (can_batch)          seed_latents(fwd_info, key, generator) -> [L, C]
+  stacked preprocess / per-row outputs            request_inputs(fwd_info, inputs, key) -> {name: [..]}
+  per-key CUDA-graph buckets (Euler inside)       num_tokens(key)               -> int
+                                                  denoise(engine_inputs, key, latents, timestep,
+                                                          sigma, sigma_next, **cond) -> [B, L, C]
   ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> ((label, span), ...)
 
 Conventions the base fixes:
+
+* The loop ends on its iteration count: a model whose request picks its own
+  step count declares it as the loop's cap (``Model.get_loop_caps``), so the
+  loop completes after that iteration and the async worker never speculates
+  past it.
 
 * The loop-back edges are :attr:`~DenoiseLoopSubmodule.loop_back_names`
   (``latents`` plus whatever ``SOLVER_STATE`` a multi-step scheduler carries);
@@ -41,28 +46,43 @@ Conventions the base fixes:
   attend over a sub-span (a refiner over the image tokens alone, say) lists
   each span with its own label in :meth:`attention_segments` and threads
   :meth:`ragged_for` that label to those layers.
+* A step schedule (``step_dtypes``, a model's ``linear_dtype_steps``) is the
+  base's alone: a step's key is then a :class:`StepBucket` (:meth:`step_key`),
+  so rows batch and capture per dtype, the scheduler batches each dtype apart,
+  and ``denoise`` reads the step's dtype off :attr:`step_dtype` while the hooks
+  keep seeing the model's own key.
 """
 
 from __future__ import annotations
 
 import copy
-import logging
+import functools
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, NamedTuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.convenience import RaggedAttentionCallable
+from mstar.model.components.diffusion.attention import RaggedAttentionFn
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.unipc import (
+    LAST_SAMPLE,
+    MODEL_OUTPUTS,
+    SOLVER_STATE,
+    UniPCState,
+    initial_state,
+    unipc_step,
+)
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.threads import ThreadPool
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from mstar.model.components.quant_linear import StepDtypes
 
 
 class StepScalar(NamedTuple):
@@ -81,6 +101,15 @@ class StepScalar(NamedTuple):
     capture_fill: float = 1.0  # placeholder value for a graph capture's dummy rows
 
 
+@dataclass(frozen=True)
+class StepBucket:
+    """A step's key under a step schedule: the request's bucket and the dtype the step's linears run in. Two dtypes
+    share neither a forward nor a graph."""
+
+    bucket: Hashable
+    dtype: str
+
+
 class DenoiseLoopSubmodule(NodeSubmodule):
     """Base class for the ``dit`` node of an image/video flow model (see module docstring)."""
 
@@ -97,9 +126,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     MAIN_SPAN = "main"
 
     # Loop-back edges beyond LATENTS: solver state a multi-step scheduler carries
-    # between iterations, e.g. wan22's UniPC ("unipc_model_outputs",
-    # "unipc_last_sample"). :meth:`denoise` returns these alongside the new
-    # sample and :meth:`seed_loop_back` supplies iteration 0's values.
+    # between iterations, e.g. UniPC's (:class:`UniPCDenoiseLoopSubmodule`).
+    # :meth:`denoise` returns these alongside the new sample and
+    # :meth:`seed_loop_back` supplies iteration 0's values.
     SOLVER_STATE: tuple[str, ...] = ()
 
     # name -> where in the request's schedule this step's value comes from. A
@@ -128,6 +157,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
         replay_walks: Mapping[str, Sequence[str]] | None = None,
         max_uncaptured_layouts: int = 4,
+        step_dtypes: StepDtypes | None = None,
     ):
         super().__init__()
         self.loop_name = loop_name
@@ -147,10 +177,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
-        self._seed_pool: ThreadPoolExecutor | None = None
+        self._seed_pool: ThreadPool | None = None
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
-        self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
+        self._ragged_fns: dict[str, RaggedAttentionFn] = {}
+        # The dtype each step runs (``step_key``), and the one the step in ``denoise`` runs: None without a schedule.
+        self.step_dtypes = step_dtypes
+        self.step_dtype: str | None = None
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -206,14 +239,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if not self.PREFETCH_SEEDS:
             return
         state = self.request_state(request_id)
-        if "seed_draw" in state:
-            return  # a request arrives once per partition this worker serves
         # a copy: the worker updates the request's info as its walks advance
         info = copy.copy(request_info)
         bucket_key = self.bucket_key_for(info)
         if self._seed_pool is None:
             # a CPU randn is single-threaded and releases the GIL
-            self._seed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar-seed")
+            self._seed_pool = ThreadPool(max_workers=2, thread_name_prefix="mstar-seed")
         state.add("seed_draw", (bucket_key, self._seed_pool.submit(self._draw_seeds, info, bucket_key)))
 
     def _draw_seeds(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> dict[str, torch.Tensor]:
@@ -306,9 +337,27 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return entry
 
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
-        return int(fwd_info.dynamic_loop_iter_counts.get(self.loop_name, 0))
+        """The denoise iteration this step runs, from the engine's loop counter.
 
-    def _ragged(self) -> RaggedAttentionCallable | None:
+        A value carried on a loop-back edge would be the previous step's device
+        output, and reading it on the host waits for that step to finish, which
+        stalls the speculative preparation of this one. A missing counter raises:
+        read as 0, it would reseed from noise every iteration.
+        """
+        return int(fwd_info.dynamic_loop_iter_counts[self.loop_name])
+
+    def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> Hashable:
+        """What step ``step`` (default: ``fwd_info``'s) batches and captures on: ``bucket_key``, with the step's dtype
+        under a step schedule. ``prepare_inputs`` and ``cg_key_info`` both take it from here, so a step's rows and its
+        graph agree."""
+        if self.step_dtypes is None:
+            return bucket_key
+        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info) if step is None else step))
+
+    def _bucket_of(self, step_key: Hashable) -> Hashable:
+        return step_key.bucket if isinstance(step_key, StepBucket) else step_key
+
+    def _ragged(self) -> RaggedAttentionFn | None:
         """The attention callable for the ``"main"`` span, or None (SDPA)."""
         return self.ragged_for(self.MAIN_SPAN)
 
@@ -316,20 +365,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         super().bind_node_resources(resources)
         self._ragged_fns.clear()  # the memoized callables hold the old resource
 
-    def ragged_for(self, label: str) -> RaggedAttentionCallable | None:
+    def ragged_for(self, label: str) -> RaggedAttentionFn | None:
         """``(q, k, v) -> out`` over the segments declared under ``label``, or None
         when no ragged resource is bound (layers then fall back to SDPA).
 
-        One callable per label for the life of the binding: the compiled transformer
-        region guards on the identity of the callables it is handed, and a fresh one
-        per step would recompile it every step until dynamo gave up."""
+        The resource's ``run`` with the label bound, built once per label for the life
+        of the binding rather than per step."""
         if self.attn_resource_key is None:
             return None
         if label not in self._ragged_fns:
             resource = self.node_resources.get(self.attn_resource_key)
             if resource is None:
                 return None
-            self._ragged_fns[label] = RaggedAttentionCallable(resource, label)
+            self._ragged_fns[label] = functools.partial(resource.run, label=label)
         return self._ragged_fns[label]
 
     # --------------------------------------------------------- engine contract
@@ -337,29 +385,26 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs | None:
         # Keyed by the integer rid_handle, NOT by request_id. The handle is what
-        # the engine keys batches by and what it hands check_stop
+        # the engine keys batches by and what cleanup_request receives
         state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
-        # One schedule per (request, walk): a request whose walks run this node in
-        # successive stages (a draft loop, then a refinement loop) gets a fresh shape
-        # and schedule for each.
-        if state.get("schedule_walk") != graph_walk:
+        # One schedule per loop: a request whose walks run this node in successive
+        # stages (a draft loop, then a refinement loop) gets a fresh shape and
+        # schedule for each.
+        if k == 0 or state.get("schedule_walk") != graph_walk:
             bucket_key = self.bucket_key_for(fwd_info)
             schedule = self.schedule_for(fwd_info, bucket_key)
             state.add_all(
-                schedule=schedule, bucket_key=bucket_key, num_steps=schedule.num_steps, schedule_walk=graph_walk,
+                schedule=schedule, bucket_key=bucket_key, schedule_walk=graph_walk,
                 **self._step_scalar_sources(schedule, device),
             )
-        bucket_key, num_steps = state["bucket_key"], state["num_steps"]
-        if k >= num_steps:
-            # Async scheduling dispatched an iteration past this request's stop; None
-            # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            # debug, not info: one line per vetoed step per request (1.9k lines in a
-            # 36-minute served run), and it is the expected outcome of speculation.
-            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                         type(self).__name__, k, fwd_info.request_id, num_steps)
-            return None
+        bucket_key = state["bucket_key"]
+        if k >= state["schedule"].num_steps:
+            raise RuntimeError(
+                f"{type(self).__name__}: iteration {k} is past request {fwd_info.request_id}'s "
+                f"{state['schedule'].num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
+            )
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
@@ -369,7 +414,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             **self.request_inputs(fwd_info, inputs, bucket_key),
         }
         return NodeInputs(
-            tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
+            tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key),
+            resource_step_info=self.step_key(fwd_info, bucket_key),
         )
 
     def _step_scalar_sources(
@@ -446,6 +492,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         """One stacked step, as ``{loop-back edge: [B, ...]}``."""
         bucket_key = kwargs.pop("bucket_key")
+        if isinstance(bucket_key, StepBucket):
+            self.step_dtype, bucket_key = bucket_key.dtype, bucket_key.bucket
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
         scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
         out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
@@ -463,27 +511,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        # ``request_id`` is the engine's integer rid handle, the same key
-        # prepare_inputs stored under.
-        state = self.request_states.get(request_id)
-        if state is None or "num_steps" not in state:
-            logger.warning(
-                "%s: check_stop found no schedule for request %r (state=%s); the loop "
-                "will not be stopped by this pass",
-                type(self).__name__, request_id, "absent" if state is None else "no num_steps",
-            )
-            return set()
-        # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        k, num_steps = self.step_index(request_info), int(state["num_steps"])
-        stop = k + 1 >= num_steps
-        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
-        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
-        # counter, far too loud for a served default.
-        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
-                     request_id, k, num_steps, "STOP" if stop else "continue")
-        return {self.loop_name} if stop else set()
-
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:
         keys = set(keys)
@@ -495,11 +522,36 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         per_request_input_metadata=None,
         **kwargs,
     ):
-        del per_request_input_metadata, kwargs
+        del kwargs
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
-        keys = [self.bucket_key_for(info) for info in per_request_info.values() if info.step_metadata]
+        keys = [
+            self.step_key(info, self.bucket_key_for(info), self._step_of(rid, per_request_input_metadata))
+            for rid, info in per_request_info.items() if info.step_metadata
+        ]
         return self._uniform_key(keys) if keys else None
+
+    def _step_of(self, rid, per_request_input_metadata) -> int | None:
+        """The row's step from its input metadata, which the scheduler advances for a speculated step whose request
+        info still holds the step in flight's; None when it has none."""
+        if self.step_dtypes is None or not per_request_input_metadata:
+            return None
+        metadata = per_request_input_metadata.get(rid)
+        loops = metadata.dynamic_loop_iter_counts if metadata is not None else {}
+        return int(loops[self.loop_name]) if self.loop_name in loops else None
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        # a step mixing dtypes matches no capture and would run a row at a time
+        del graph_walk
+        return self.step_dtypes is not None
+
+    @staticmethod
+    def attention_step(segments: Sequence[Segment] | None = None) -> AttentionStep:
+        """A denoise step's self-attention: non-causal, and laid out by its bucket
+        alone (``fixed_layout``), since every row of a bucket, padding rows
+        included, carries the bucket key and so the bucket's spans. A subclass that
+        declares its own step builds its self-attentions here."""
+        return AttentionStep(segments=None if segments is None else tuple(segments), causal=False, fixed_layout=True)
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
@@ -512,11 +564,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         segments = [
             Segment(request_id=rid, label=label, span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
-            for label, span in self.attention_segments(inp.resource_step_info)
+            for label, span in self.attention_segments(self._bucket_of(inp.resource_step_info))
         ]
         return SubmoduleStep(
             segments=segments,
-            steps={self.attn_resource_key: AttentionStep(causal=False)},
+            steps={self.attn_resource_key: self.attention_step()},
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 
@@ -525,30 +577,97 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
-            tensors = dict(self.capture_request_inputs(bucket_key, device))
-            for name, scalar in self.STEP_SCALARS.items():
-                tensors[name] = torch.full(
-                    (1,), scalar.capture_fill, dtype=torch.float32, device=device,
-                )
-            single = NodeInputs(
-                tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
+            step_keys = (
+                [bucket_key] if self.step_dtypes is None
+                else [StepBucket(bucket_key, dtype) for dtype in self.step_dtypes.dtypes]
             )
-            configs.append(BatchedAcceleratorGraphConfig(
-                capture_graph_walk=walk,
-                replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
-                single_request_inputs=single,
-                additional_key_info=bucket_key,
-                # the model compiles its own transformer region; the graph records those kernels
-                compile=False,
-                capture_batch_sizes=list(self.capture_batch_sizes),
-                # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
-                caps_eager_batch_size=False,
-                # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
-                # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
-                # would otherwise be mistaken for the token axis
-                input_seq_dims={key: 0 for key in tensors},
-            ))
+            for step_key in step_keys:
+                tensors = dict(self.capture_request_inputs(bucket_key, device))
+                for name, scalar in self.STEP_SCALARS.items():
+                    tensors[name] = torch.full(
+                        (1,), scalar.capture_fill, dtype=torch.float32, device=device,
+                    )
+                single = NodeInputs(
+                    tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=step_key,
+                )
+                configs.append(BatchedAcceleratorGraphConfig(
+                    capture_graph_walk=walk,
+                    replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
+                    single_request_inputs=single,
+                    additional_key_info=step_key,
+                    # the model compiles its own transformer region; the graph records those kernels
+                    compile=False,
+                    capture_batch_sizes=list(self.capture_batch_sizes),
+                    # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
+                    caps_eager_batch_size=False,
+                    # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
+                    # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
+                    # would otherwise be mistaken for the token axis
+                    input_seq_dims={key: 0 for key in tensors},
+                ))
         return configs
+
+
+class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
+    """A denoise loop stepped by the scaffold's UniPC (``components/diffusion/unipc.py``).
+
+    The subclass predicts (:meth:`model_output`); the base carries the solver state
+    in ``SOLVER_STATE`` and steps each row from its own tables and the loop counter,
+    so rows at different steps share one forward. The solver is per row because the
+    order ramp is, and because it holds a host sigma, this path has no captured graph.
+    """
+
+    SOLVER_STATE = SOLVER_STATE
+    STEP_SCALARS = {"timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0)}
+
+    def model_output(
+        self, engine_inputs: ModelInputsFromEngine, bucket_key: Hashable, latents: torch.Tensor,
+        timestep: torch.Tensor, **cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """What the solver takes for a stacked batch, ``[B, ...]`` over the rows'
+        samples; ``latents`` and ``cond`` are stacked over the rows' tensors."""
+        raise NotImplementedError
+
+    def seed_loop_back(
+        self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
+    ) -> dict[str, torch.Tensor]:
+        latents = self.seed_latents(fwd_info, bucket_key, generator)
+        return {self.LATENTS: latents, **initial_state(latents)}
+
+    def _step_scalar_sources(
+        self, schedule: FlowMatchSchedule, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        # the solver reads its sigmas from the table, by the row's step index
+        return {
+            **super()._step_scalar_sources(schedule, device),
+            "sigmas": to_device_nonblocking(schedule.sigmas, device),
+        }
+
+    def denoise(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        bucket_key: Hashable,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        unipc_model_outputs: torch.Tensor,
+        unipc_last_sample: torch.Tensor,
+        **cond: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        output = self.model_output(engine_inputs, bucket_key, latents, timestep, **cond)
+        steps = []
+        for i, rid in enumerate(engine_inputs.request_ids):
+            info = engine_inputs.per_request_info[rid]
+            state = self.request_state(info.rid_handle)
+            steps.append(unipc_step(
+                output[i], latents[i],
+                UniPCState(model_outputs=unipc_model_outputs[i], last_sample=unipc_last_sample[i]),
+                state["schedule"].sigmas, state["sigmas"], self.step_index(info), state["schedule"].num_steps,
+            ))
+        return {
+            self.LATENTS: torch.stack([step.sample for step in steps]),
+            MODEL_OUTPUTS: torch.stack([step.model_outputs for step in steps]),
+            LAST_SAMPLE: torch.stack([step.last_sample for step in steps]),
+        }
 
 
 # The default names, for callers that only need those (the module's own graph

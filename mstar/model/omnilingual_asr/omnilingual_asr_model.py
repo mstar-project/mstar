@@ -31,13 +31,13 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.omnilingual_asr.audio import load_waveform, preprocess
 from mstar.model.omnilingual_asr.config import (
+    ENCODER_ATTN,
     ENCODER_NODE,
     MAX_AUDIO_SECONDS,
     SAMPLE_RATE,
@@ -120,8 +120,27 @@ class OmnilingualASRModel(Model):
     # -- graph -------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Not autoregressive: no KV cache, no sampler."""
-        return []
+        """Not autoregressive: no KV cache, no sampler. A half-precision encoder
+        attends through a varlen kernel over the step's packed rows; fp32 (the
+        reference's numerics) keeps the padded SDPA path."""
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            return []
+        from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+
+        return [
+            RaggedAttentionSpec(
+                resource_key=ENCODER_ATTN, nodes={ENCODER_NODE},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=self.config.num_heads,
+                    num_kv_heads=self.config.num_heads,
+                    head_dim=self.config.model_dim // self.config.num_heads,
+                    dtype=self.dtype,
+                    # one segment per request, and a captured step packs a
+                    # whole batch into one row
+                    max_segments_per_step=self.max_batch_size,
+                ),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         return {
@@ -144,6 +163,10 @@ class OmnilingualASRModel(Model):
         waveform = load_waveform(filepath)
         return TensorAndMetadata(data=waveform, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
+    def request_kwargs(self) -> frozenset[str]:
+        # argmax CTC: the transcription adapter's language, prompt and temperature are not read
+        return frozenset()
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -164,37 +187,18 @@ class OmnilingualASRModel(Model):
         waveform = audio[0].detach().to("cpu", torch.float32).reshape(-1)
         return {WAVEFORM: [preprocess(waveform)]}
 
-    # -- conductor state machine -------------------------------------------
+    # -- walk plan ---------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        del partition_name, model_kwargs
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=TRANSCRIBE_WALK,
-            is_prefill=True,
-        )
-        edge = GraphEdge(next_node=ENCODER_NODE, name=WAVEFORM)
-        edge.tensor_info = input_signals.get(WAVEFORM, [])
-        return ForwardPassArgs(full_metadata=metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info))
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """One walk transcribes the clip; when it returns, the request is done."""
-        del partition_name, persist_signals, incoming_connections
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One walk transcribes the clip."""
+        return [WalkStep(TRANSCRIBE_WALK)]
 
     # -- output ------------------------------------------------------------
 
@@ -238,6 +242,12 @@ class OmnilingualASRModel(Model):
             model = Wav2Vec2CTC(self.config)
         load_into(model, convert_state_dict(read_checkpoint(path), self.dtype, device))
         model.eval()
+        pos = model.encoder_frontend.pos_encoder
+        # cuDNN's grouped kernels for the positional conv are erratic once its
+        # groups are wide (1b and up): 0.8-40 ms for one 2048-channel clip by
+        # length, against ~1.3 ms per 1000 frames as per-group GEMMs. At 300m's
+        # 64-channel groups cuDNN is the faster (0.4-1.5 ms a step).
+        pos.unfolded = torch.device(device).type != "cpu" and pos.conv.in_channels // pos.conv.groups >= 80
         logger.info(
             "Loaded Omnilingual ASR CTC %s (%s, %s) from %s on %s",
             self.size,

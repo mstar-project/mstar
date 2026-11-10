@@ -19,14 +19,13 @@ import yaml
 from mstar.api_server.entrypoint import WarmupRequest
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.graph.base import TensorPointerInfo
 from mstar.model.fish_s2_pro.components.dac import apply_rotary_emb
 from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
 from mstar.model.fish_s2_pro.components.slow_ar import FishSlowAR, remap_slow_ar_weights
 from mstar.model.fish_s2_pro.config import (
     AR_SAMPLER,
+    CODEC_STATE,
     PROMPT_LAYOUT_KEY,
     FishDACConfig,
     FishFastARConfig,
@@ -140,7 +139,7 @@ def test_registry_and_deployment_config():
     assert not plain.files and not greedy.files
     model.process_prompt(plain.text, ["text"], ["audio"], **plain.model_kwargs)
     model.process_prompt(greedy.text, ["text"], ["audio"], **greedy.model_kwargs)
-    sampling = model.get_request_resource_configs({}, greedy.model_kwargs)
+    sampling = model.get_request_resource_configs([], [], greedy.model_kwargs)
     assert sampling[AR_SAMPLER].temperature == 0.0
     ((media,),) = [clone.files]
     assert media.modality == "audio" and media.path.startswith("hf://")
@@ -234,15 +233,6 @@ def _headerless_flac(path: Path, seconds: float, channels: int = 1, rate: int = 
     return str(path), torch.from_numpy(samples).float() / 32768
 
 
-@pytest.mark.parametrize("channels", [1, 2])
-def test_load_audio_decodes_a_clip_without_a_sample_count(tmp_path, channels):
-    path, samples = _headerless_flac(tmp_path / "piped.flac", 5, channels)
-    audio = tiny_model().load_audio(path, "cpu").data
-    # libsndfile cannot decode the last frame of such a FLAC (4096 samples from its own encoder)
-    assert 5 * 44_100 - 4096 <= audio.numel() <= 5 * 44_100
-    torch.testing.assert_close(audio, samples[: audio.numel()].mean(dim=1), atol=1e-6, rtol=0)
-
-
 @pytest.mark.parametrize("seconds, shown", [(45, r"30\.\d\d"), (0.3, r"0\.\d\d")])
 def test_load_audio_refuses_a_clip_without_a_sample_count_at_its_decoded_length(tmp_path, seconds, shown):
     path, _ = _headerless_flac(tmp_path / "piped.flac", seconds)
@@ -272,7 +262,6 @@ def test_config_reads_fish_field_names(tmp_path):
     assert (config.slow_ar.n_layer, config.slow_ar.n_local_heads, config.fast_ar.n_layer) == (36, 8, 4)
     assert config.eos_code == 4096 and config.semantic_head_size == 4097
     assert config.codec.hop_length == 2048 and config.codec.chunk_frames == 16
-    assert config.codec.left_context_frames == 8 * 127 + 10 and config.codec.exact_streaming
     assert config.vq_scale == pytest.approx(1 / math.sqrt(11))
 
 
@@ -442,36 +431,23 @@ def test_clone_prefill_splices_reference_frames_after_the_prefix():
         ar._build_prefill(ids, 2, 4, ref_codes)
 
 
-def test_check_stop_on_im_end_on_the_frame_limit_and_not_with_ignore_eos():
+def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
+    """<|im_end|> ends decode, and its frame stays out of the codec stream either
+    way, so the codec never reads it; under ``ignore_eos`` the row goes on. Other
+    frames neither stop nor withhold: the frame budget is the loop's cap."""
     ar = tiny_ar()
 
-    def info(ignore_eos=False):
-        return SimpleNamespace(
-            step_metadata={},
-            max_tokens=3,
+    def check(head, ignore_eos=False, walk="ar_decode"):
+        info = SimpleNamespace(
+            graph_walk=walk, max_tokens=3,  # a prefill row's check reads the budget (one token ends there)
             resource_configs={AR_SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         )
+        return ar.check_stop("r", info, {"new_token": [torch.tensor(head)]})
 
-    def step(rid, head, ignore_eos=False):
-        outputs = {"new_token": [torch.tensor([head])]}
-        ar.postprocess(rid, info(ignore_eos), outputs)
-        return ar.check_stop(rid, info(ignore_eos), outputs)
-
-    assert step("a", 4) == set()
-    # the <|im_end|> frame stays out of the codec stream, stopping or not
-    assert step("a", ar.eos_code) == StopCheck({"ar_decode_loop"}, ("codec_tokens",))
-    assert step("b", ar.eos_code, ignore_eos=True) == StopCheck(set(), ("codec_tokens",))
-    assert step("b", 1) == set()
-    assert step("b", 2) == {"ar_decode_loop"}
-
-    # speculation: step N+1's postprocess runs before step N's stop check
-    frames = [{"new_token": [torch.tensor([head])]} for head in (4, 5, 6)]
-    ar.postprocess("c", info(), frames[0])
-    assert ar.check_stop("c", info(), frames[0]) == set()
-    ar.postprocess("c", info(), frames[1])
-    ar.postprocess("c", info(), frames[2])
-    assert ar.check_stop("c", info(), frames[1]) == set()
-    assert ar.check_stop("c", info(), frames[2]) == {"ar_decode_loop"}
+    assert check(4, walk="ar_prefill") == set()
+    assert check(4) == set()
+    assert check(ar.eos_code) == StopCheck({"ar_decode_loop"}, withheld=("codec_tokens",))
+    assert check(ar.eos_code, ignore_eos=True) == StopCheck(set(), withheld=("codec_tokens",))
 
 
 def ar_info(ignore_eos=False, layout=None):
@@ -552,7 +528,13 @@ def test_preprocess_packs_the_tensors_the_per_row_device_copies_did():
     assert_same_tensor(packed["last_token_indices"], torch.tensor(seq_lens).cumsum(0) - 1)
     assert_same_tensor(packed["suppress_eos"], old_flags([True, True, True]))
 
-    (graph_config,) = ar.get_accelerator_graph_configs(torch.device("cpu"))
+    prefill_config, graph_config = ar.get_accelerator_graph_configs(torch.device("cpu"))
+    # Plain prefills replay packed captures; their padding rows suppress EOS.
+    assert prefill_config.capture_graph_walk == "ar_prefill"
+    # a voice clone's prefill is the same forward: it replays these captures too
+    assert prefill_config.replay_graph_walks == ["ar_prefill", "ar_prefill_clone"]
+    assert prefill_config.make_node_input(5).kwargs == {"suppress_eos": True}
+    assert graph_config.capture_graph_walk == "ar_decode"
     template = graph_config.single_request_inputs
     assert template.kwargs == {"suppress_eos": False} and not template.tensor_inputs
     padded = [decode_row(True), decode_row(False), *graph_config.get_node_inputs(2, 0)]
@@ -631,80 +613,40 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
 
 
 # ---------------------------------------------------------------------------
-# Conductor state machine and sampling
+# Walk plan and sampling
 # ---------------------------------------------------------------------------
 
 
-def pointers(*names):
-    return {
-        name: [
-            TensorPointerInfo(
-                dims=[1],
-                dtype=torch.long,
-                nbytes=8,
-                address=0,
-                stride=[1],
-                uuid=i,
-                source_session_id="host:0",
-                source_entity="api_server",
-            )
-        ]
-        for i, name in enumerate(names)
-    }
+_PLANS = {
+    "zero-shot": (["text"], {"prompt_layout": [0, 0]}, ["ar_prefill", "ar_decode"]),
+    "clone": (["text", "audio"], {"max_new_tokens": 7, "prompt_layout": [5, 21], "ref_clip_key": "k"},
+              ["ar_prefill_clone", "ar_decode"]),
+    # one frame allowed: the prefill samples it, so the request ends without a decode walk
+    "one frame": (["text"], {"max_new_tokens": 1, "prompt_layout": [0, 0]}, ["ar_prefill"]),
+}
 
 
-def test_partition_state_machine_routes_clones_through_the_ref_encoder():
+@pytest.mark.parametrize(("inputs", "kwargs", "walks"), _PLANS.values(), ids=_PLANS)
+def test_walk_plan_per_request_kind(inputs, kwargs, walks):
     model = tiny_model()
-    signals = pointers("prompt_ids", "audio_inputs")
-    clone_kwargs = {"max_new_tokens": 7, "prompt_layout": [5, 21], "ref_clip_key": "k"}
-    clone = model.get_initial_forward_pass_args("AR", ["text", "audio"], ["audio"], signals, clone_kwargs)
-    assert clone.full_metadata.graph_walk == "ar_prefill_clone" and clone.full_metadata.is_prefill
-    assert {(edge.name, edge.next_node) for edge in clone.inputs} == {
-        ("prompt_ids", "AR"),
-        ("audio_inputs", "RefEncoder"),
-    }
-    assert clone.step_metadata == {
-        "is_prefill": True,
-        "prompt_layout": [5, 21],
-        "ref_clip_key": "k",
-    }
-    plain = model.get_initial_forward_pass_args("AR", ["text"], ["audio"], signals, {"prompt_layout": [0, 0]})
-    assert plain.full_metadata.graph_walk == "ar_prefill"
-    assert all(edge.next_node == "AR" for edge in plain.inputs)
-    assert plain.step_metadata["prompt_layout"] == [0, 0] and "ref_clip_key" not in plain.step_metadata
-
-    meta = clone.full_metadata
-    decode = model.get_partition_forward_pass_args("AR", meta, pointers("ar_input_embeds"))
-    assert meta.graph_walk == "ar_decode" and not meta.is_prefill and not decode.request_done
-    assert decode.inputs[0].name == "ar_input_embeds" and decode.step_metadata["is_prefill"] is False
-    assert model.get_partition_forward_pass_args("AR", meta, {}).request_done
-
-    # one frame allowed: the prefill sampled it, so the request ends without a decode walk
-    single = model.get_initial_forward_pass_args(
-        "AR", ["text"], ["audio"], signals, {"max_new_tokens": 1, "prompt_layout": [0, 0]}
-    )
-    embeds = pointers("ar_input_embeds")
-    done = model.get_partition_forward_pass_args("AR", single.full_metadata, embeds)
-    assert done.request_done and done.unpersist_tensors == embeds["ar_input_embeds"]
+    plan = model.walk_plan("AR", inputs, ["audio"], {}, kwargs)
+    assert [step.walk for step in plan] == walks
+    # the layout (and a clone's clip key) ride the prefill, as host values
+    prompt = {key: kwargs[key] for key in ("prompt_layout", "ref_clip_key") if key in kwargs}
+    assert [dict(step.step_metadata) for step in plan] == [prompt, {}][: len(walks)]
+    assert [step.walk for step in model.walk_plan("Codec", inputs, ["audio"], {}, kwargs)] == ["codec_chunk"]
     assert model.get_graph_walk_graphs()["ar_decode"].max_iters == model.config.codec.max_frames
-
-    codec = model.get_initial_forward_pass_args("Codec", ["text"], ["audio"], {})
-    assert codec.full_metadata.graph_walk == "codec_chunk" and not codec.request_done
     with pytest.raises(ValueError, match="Unknown Fish S2-Pro partition"):
-        model.get_partition_forward_pass_args(
-            "Talker",
-            CurrentForwardConductorMetadata(
-                input_modalities=["text"], output_modalities=["audio"], graph_walk="x", is_prefill=False
-            ),
-            {},
-        )
+        model.walk_plan("Talker", inputs, ["audio"], {}, kwargs)
 
 
 def test_sampling_defaults_and_greedy():
     model = tiny_model()
-    default = model.get_request_resource_configs({})[AR_SAMPLER]
+    default = model.get_request_resource_configs([], [], {})[AR_SAMPLER]
     assert (default.temperature, default.top_p, default.top_k, default.repetition_penalty) == (0.8, 0.8, 30, 1.0)
-    greedy = model.get_request_resource_configs({}, {"do_sample": False, "temperature": 0.7, "top_k": 5})[AR_SAMPLER]
+    greedy = model.get_request_resource_configs(
+        [], [], {"do_sample": False, "temperature": 0.7, "top_k": 5},
+    )[AR_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.top_k == 5
 
 
@@ -713,5 +655,40 @@ def test_postprocess_emits_pcm16_bytes():
     out = model.postprocess(torch.tensor([0.0, 1.0, -1.0, 2.0]), "audio")
     assert list(torch.frombuffer(bytearray(out), dtype=torch.int16)) == [0, 32767, -32767, 32767]
     assert model.postprocess(torch.tensor([7, -3], dtype=torch.int16), "audio") == b"\x07\x00\xfd\xff"
-    with pytest.raises(ValueError, match="modality"):
+    with pytest.raises(ValueError, match="no 'text' output"):
         model.postprocess(torch.zeros(1), "text")
+
+
+def test_request_kwargs_are_the_keys_it_reads():
+    model = tiny_model()
+    declared = model.request_kwargs()
+    base = model.get_request_resource_configs([], [], {})[AR_SAMPLER]
+    sent = {"temperature": 0.3, "top_p": 0.5, "top_k": 7, "min_p": 0.2, "repetition_penalty": 1.3, "ignore_eos": True}
+    for key, value in sent.items():
+        assert key in declared
+        assert getattr(base, key) != value
+        assert getattr(model.get_request_resource_configs([], [], {key: value})[AR_SAMPLER], key) == value
+    assert model.get_request_resource_configs([], [], {"do_sample": False})[AR_SAMPLER].temperature == 0.0
+    assert model.get_max_output_tokens(max_output_tokens=9) == 9
+    assert declared == set(sent) | {"do_sample", "max_output_tokens", "ref_text"}
+
+
+def test_speech_adapter_forwards_a_sent_voice_and_speed_so_they_are_logged_as_ignored(tmp_path):
+    adapter = adapters.FishS2ProAdapter()
+    sent = adapter.speech_request(SpeechRequest(input="hi", voice="alloy", speed=1.2), tmp_path).model_kwargs
+    assert (sent["voice"], sent["speed"]) == ("alloy", 1.2)
+    unsent = adapter.speech_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+    assert "voice" not in unsent and "speed" not in unsent
+
+
+def test_the_shipped_request_cap_fits_the_codec_streams():
+    """A request keeps its codec stream until it ends, so the shipped yaml caps
+    requests at the pool and a cap past it (or a smaller pool) is refused."""
+    cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    model = tiny_model()
+    model.validate_config_yaml(cfg, str(CONFIG_PATH))
+    # a null override means the default pool, as apply_yaml_overrides reads it
+    model.validate_config_yaml({**cfg, "resources": {CODEC_STATE: {"max_slots": None}}}, str(CONFIG_PATH))
+    small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        model.validate_config_yaml(small, str(CONFIG_PATH))

@@ -121,6 +121,8 @@ SQUARE_COLOR = "What color is the square? Answer with one word."
 SENTENCE = "The train leaves tomorrow morning."
 SMALL = {"height": 256, "width": 256, "seed": 7}
 ROBOT_STATE = [round(-1 + 2 * i / 31, 6) for i in range(32)]
+# pi05_droid takes the raw DROID state: 7 joint positions and the gripper, here near DROID's mean pose
+DROID_JOINT_STATE = [0.02, 0.27, -0.02, -2.03, -0.03, 2.34, 0.08, 0.4]
 ANSWER_4 = Expect("text", contains_any=("4", "four"))
 ANSWER_RED = Expect("text", contains_any=("red",))
 SPEECH = Expect("audio", min_seconds=0.5)
@@ -212,7 +214,7 @@ def cosmos_policy():
 
 def waypoint_rollout(mouse, size):
     actions = [{"mouse": [mouse, 0], "buttons": [], "scroll": 0}] * 2
-    return generate("", "video_frame", {"num_steps": 2, "seed": 7, "actions": actions},
+    return generate("", "video_frame", {"seed": 7, "actions": actions},
                     lambda: ("seed.png", scene_png(*size)), streaming=True)
 
 
@@ -247,8 +249,7 @@ def vjepa2_ac_case(name, scale):
         Expect("float32", modality="video", count=8192 * 1408))  # predicted tokens x hidden size
 
 
-QWEN_TTS = dict(language="English", temperature=0, talker_temperature=0, subtalker_dosample=False,
-                do_sample=False, max_output_tokens=256)
+QWEN_TTS = dict(language="English", temperature=0, code_predictor_temperature=0, max_output_tokens=256)
 CHATTERBOX = ("pyloudnorm", "perth")
 
 MODELS: dict[str, ModelSpec] = {m.name: m for m in [
@@ -256,6 +257,8 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ModelSpec("qwen3_5_2b", "configs/qwen3_5_2b.yaml", lm_cases(), "llm", peak_vram_gb=16.4),
     ModelSpec("qwen3_5_4b", "configs/qwen3_5_4b.yaml", lm_cases(), "llm", peak_vram_gb=30.1),
     ModelSpec("qwen3_5_9b", "configs/qwen3_5_9b.yaml", lm_cases(), "llm", peak_vram_gb=39.6),
+    # ~60 GB of bf16 weights: one 141 GB GPU; peak VRAM not yet measured on an H200
+    ModelSpec("muse_glimmer", "configs/muse_glimmer.yaml", lm_cases(), "llm"),
     ModelSpec("bagel", "configs/bagel_single_gpu.yaml", (
         Case("text_to_text", "chat", chat(lambda: TWO_PLUS_TWO), ANSWER_4),
         Case("image_to_text", "chat", chat(vision_prompt), ANSWER_RED),
@@ -280,7 +283,7 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
     ModelSpec("qwen3tts_voicedesign", "configs/qwen3tts_voicedesign.yaml", (
         Case("voice_design", "speech", speech(instructions="A clear, friendly adult female voice.",
-                                              language="English", do_sample=False, subtalker_dosample=False), SPEECH),
+                                              language="English", temperature=0, code_predictor_temperature=0), SPEECH),
     ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
     ModelSpec("kokoro", "configs/kokoro.yaml", (
         Case("text_to_speech", "speech", speech(voice="af_heart", speed=1.0), SPEECH),
@@ -289,10 +292,10 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
         Case("text_to_speech", "speech", speech(voice="tara", temperature=0), SPEECH),
     ), "speech", gated=("canopylabs/orpheus-3b-0.1-ft",), peak_vram_gb=38.2),
     ModelSpec("chatterbox", "configs/chatterbox.yaml", (
-        Case("text_to_speech", "speech", speech(voice="default", do_sample=False), SPEECH),
+        Case("text_to_speech", "speech", speech(voice="default", temperature=0), SPEECH),
     ), "speech", requires=CHATTERBOX, peak_vram_gb=18.9),
     ModelSpec("chatterbox_multilingual", "configs/chatterbox_multilingual.yaml", (
-        Case("text_to_speech", "speech", speech(voice="default", language_id="en", do_sample=False), SPEECH),
+        Case("text_to_speech", "speech", speech(voice="default", language_id="en", temperature=0), SPEECH),
     ), "speech", requires=(*CHATTERBOX, "pykakasi", "spacy_pkuseg"), peak_vram_gb=18.9),
     ModelSpec("chatterbox_turbo", "configs/chatterbox_turbo.yaml", (
         Case("text_to_speech", "speech", speech(voice="default"), SPEECH),
@@ -361,8 +364,8 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "robotics", peak_vram_gb=15.5),
     ModelSpec("pi05_droid", "configs/pi05_droid.yaml", (
         Case("image_state_to_action", "generate", generate(
-            "Pick up the red block", "action", {"robot_state": ROBOT_STATE, "seed": 7},
-            lambda: ("scene.png", scene_png())),
+            "Pick up the red block", "action", {"robot_state": DROID_JOINT_STATE, "seed": 7},
+            lambda: [("exterior.png", scene_png()), ("wrist.png", scene_png())]),
             Expect("float32", modality="action", count=15 * 32)),  # action_horizon x action_dim
     ), "robotics", peak_vram_gb=18.9),
     ModelSpec("vjepa2", "configs/vjepa2.yaml", (

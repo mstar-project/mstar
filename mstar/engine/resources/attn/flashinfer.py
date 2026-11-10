@@ -1,6 +1,7 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -8,25 +9,33 @@ from mstar.engine.resources.attn.base import (
     AttentionManager,
     AttentionWrapper,
     EagerSlotKey,
-    WorkspacePool,
     captured_page_capacity,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
+    FmhaDecodeWrapper,
     check_flashinfer_head_dim,
+    fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import CapturedResidentStep
+
 
 class FlashInferManager(AttentionManager):
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,
@@ -38,6 +47,9 @@ class FlashInferManager(AttentionManager):
         max_rows_in_combined: Mapping[str, int | None] | None = None,
         decode_tensor_cores: bool = True,
         sliding_window: int | None = None,
+        decode_fmha: bool = False,
+        layers: tuple[int, ...] | None = None,
+        sm_scale: float | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -46,6 +58,16 @@ class FlashInferManager(AttentionManager):
         self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
         self._window_left = -1 if sliding_window is None else sliding_window - 1
+        # The index of the group of the pool's layers this reads (`PagedKVConfig.groups`): the
+        # group of the layers it declares, else the first, the layers no window is kept for.
+        groups = kv_config.groups
+        self._group_idx = next(g for g, group in enumerate(groups) if layers[0] in group.layers) if layers else 0
+        self._group = groups[self._group_idx]
+        # the layers it runs, where the pool's layers are in more than one group: the ones it
+        # declares, or the first group's
+        self._layers = None
+        if len(groups) > 1:
+            self._layers = frozenset(layers or self._group.layers)
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -64,17 +86,65 @@ class FlashInferManager(AttentionManager):
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
             head_dim=kv_config.head_dim,
-            page_size=kv_config.page_size,
-            max_num_pages=kv_config.max_num_pages,
+            page_size=self._group.page_size,
+            max_num_pages=kv_config.num_units,
             device=device,
-            backend=backend
+            backend=backend,
+            sm_scale=sm_scale,
         )
         self._decode_tensor_cores = decode_tensor_cores
+        self._decode_fmha = (
+            decode_fmha and dtype == torch.bfloat16 and sliding_window is None
+            and fmha_decode_applies(device)
+        )
+        self._sm_scale = sm_scale
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def resident_refusal(self) -> str | None:
+        if self._window_left >= 0:
+            return "a sliding window reads pages a resident row no longer holds"
+        return None
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # planned per label of its KV cache's plan, so its wrapper is under that stream's label
+        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        if wrapper is not None and wrapper.plans_in_graph and not stream.reads:
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.reads_tables = True
+            return
+        step.host_planned = True
+        if wrapper is not None and wrapper.supports_gather_resident and not stream.reads:
+            # the paged arrays come off the tables; the host plans the schedule alone
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.lengths_only.add(pool)
+
+    def _check_layer(self, layer_idx: int) -> None:
+        """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
+        since its plans address only that group's pages. Checked in Python, so at eager and
+        capture time only: warmup and capture raise a miswired layer at startup."""
+        if self._layers is not None and layer_idx not in self._layers:
+            raise ValueError(
+                f"layer {layer_idx} of KV {self._kv_cache_name!r} isn't one this attention runs "
+                f"({sorted(self._layers)})"
+            )
+
+    @torch.compiler.disable
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        self._check_layer(layer_idx)
+        self._default_layer_idx = layer_idx
+
+    def fingerprint(self) -> bytes:
+        if self._window_left == -1 and self._sm_scale is None:
+            return super().fingerprint()
+        # the window and scale shape every later layer's K/V
+        return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -101,16 +171,17 @@ class FlashInferManager(AttentionManager):
             return wrapper
 
         bucket = lease.bucket
-        buffer = self._workspaces.get(label, lease.slot)
+        workspace = self._workspaces.get(label, lease.slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
-            "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config),
+            "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
         }
         split = self._splits.get(bucket.graph_walk)
         if split is not None:
             # its own workspaces: both wrappers are planned for the one step
+            decode_workspace = self._workspaces.get(f"{label}.split_decode", lease.slot)
             wrapper = FlashInferMixedWrapper(
-                decode_workspace=self._workspaces.get(f"{label}.split_decode", lease.slot),
+                decode_workspace=decode_workspace,
                 prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
@@ -118,11 +189,12 @@ class FlashInferManager(AttentionManager):
                     self._max_rows_in_combined, num_rows,
                 ),
                 use_tensor_cores=self._decode_tensor_cores,
+                decode_wrapper=self._fmha_wrapper(decode_workspace, num_rows),
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
-            wrapper = FlashInferDecodeWrapper(
-                workspace_buffer=buffer,
+            wrapper = self._fmha_wrapper(workspace, num_rows) or FlashInferDecodeWrapper(
+                workspace_buffer=workspace,
                 batch_size=num_rows,
                 accelerator_graph=True,
                 use_tensor_cores=self._decode_tensor_cores,
@@ -130,7 +202,7 @@ class FlashInferManager(AttentionManager):
             )
         else:
             wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=buffer,
+                workspace_buffer=workspace,
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 accelerator_graph=True,
@@ -138,6 +210,25 @@ class FlashInferManager(AttentionManager):
             )
         self._cg_plan_states[key] = wrapper
         return wrapper
+
+    def _fmha_wrapper(self, workspace: Workspace, num_rows: int) -> FmhaDecodeWrapper | None:
+        """The fmha decode wrapper for a capture at ``num_rows``, or None to
+        stay on the paged decode kernel (not asked for, or none for this geometry)."""
+        if not self._decode_fmha:
+            return None
+        config = self._kv_config
+        wrapper = FmhaDecodeWrapper(
+            workspace_buffer=workspace,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim,
+            page_size=self._group.page_size,
+            batch_size=num_rows,
+            max_seq_len=config.max_seq_len,
+            device=self._device,
+            sm_scale=self._sm_scale,
+        )
+        return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int
@@ -176,6 +267,8 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+            return
         refuse_context_only(step, type(self).__name__)
         if self._window_left >= 0 and not step.causal:
             raise ValueError("sliding_window requires causal attention")
@@ -199,13 +292,15 @@ class FlashInferManager(AttentionManager):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
+        if self._group_idx:
+            plan_outputs = plan_outputs.groups[self._group_idx]
 
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
-        laps = PhaseLaps("res.pre_plan.attn." if ctx.is_preplan else "res.plan.attn.")
+        laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if lease is not None:
@@ -217,6 +312,11 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
+                wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+                laps.lap("schedule")
+                plan_states[label] = wrapper
+                continue
             kwargs = indptrs.to_kwargs_dict()
             laps.lap("wrapper")
             # TODO: cache the latest plan state
@@ -242,6 +342,9 @@ class FlashInferManager(AttentionManager):
         # decode wrappers never set one
         return getattr(self._current_plan_states[label], "_qo_indptr_buf", None)
 
+    # Eager as a whole, as AttentionManager.select_last_hidden explains. FlashInfer's
+    # own: a label planned as a decode has no query offsets, and a missing one is an error.
+    @torch.compiler.disable
     def select_last_hidden(
         self, hidden: torch.Tensor, label: str="main"
     ) -> torch.Tensor:
@@ -249,7 +352,13 @@ class FlashInferManager(AttentionManager):
         Select last token of the hidden vector per request, used for sampling
         from prefill.
         """
+        if label not in self._current_plan_states:
+            raise RuntimeError(f"FlashInfer: no plan for label {label!r} to select last tokens by")
         qo_indptr_buf = self.qo_indptr_buf(label)
+        if qo_indptr_buf is None:
+            # an eager step of one-token rows plans the decode wrapper, which
+            # keeps no qo_indptr: each row is its own last token
+            return hidden
         last_token_indices = (qo_indptr_buf[1:] - 1).long()
         return hidden.index_select(0, last_token_indices)
 
@@ -260,19 +369,29 @@ class FlashInferManager(AttentionManager):
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
     ) -> torch.Tensor:
-        # `k`/`v`/`layer_idx` are the dense backend's; here the K/V is already
-        # in the pages (the layer wrote it through the KV resource) and the
-        # planned wrapper carries the layout. Accepted and ignored so one
-        # layer body serves either backend — see `requires_kv_write`.
-        del k, v, layer_idx
+        # `k`/`v` are the dense backend's; here the K/V is already in the pages
+        # (the layer wrote it through the KV resource) and the planned wrapper
+        # carries the layout. Accepted and ignored so one layer body serves
+        # either backend — see `requires_kv_write`. `layer_idx` matters only over
+        # a pool of more than one group (`set_default_layer_idx`).
+        del k, v
         if label is None:
             label = self._default_label
-        return self._attend(q, label, kv_cache_layer)
+        return self._attend(q, label, kv_cache_layer, layer_idx)
 
     @torch.compiler.disable
     def _attend(
-        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
+        if self._layers is not None:
+            # an explicit layer over the cursor, checked as the cursor is
+            if layer_idx is not None:
+                self._check_layer(layer_idx)
+            elif self._default_layer_idx is None:
+                raise ValueError(
+                    f"KV {self._kv_cache_name!r} has more than one group, so its attention needs the "
+                    "layer it runs: set_layer_idx, or run(layer_idx=)"
+                )
         o = self._current_plan_states[label].run(q, kv_cache_layer)
         if o.dtype != q.dtype:
             o = o.to(q.dtype)

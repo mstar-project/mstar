@@ -3,7 +3,7 @@ node's edges carry."""
 import torch
 
 from mstar.communication.tensors import SharedMemoryCommunicationManager
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 class _NullCommunicator:
@@ -12,10 +12,11 @@ class _NullCommunicator:
 
 
 def _worker(tmp_path):
-    w = Worker.__new__(Worker)
-    w.tensor_manager = SharedMemoryCommunicationManager(
+    w = make_worker(
+        tensor_manager=SharedMemoryCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    ),
     )
     return w
 
@@ -26,11 +27,11 @@ def test_an_output_no_signal_carries_is_not_stored(tmp_path):
     memory for the rest of the request."""
     w = _worker(tmp_path)
     store = w.tensor_manager.tensor_store
-    before = set(store._tensors)
+    before = set(store.get_all_uuids(0))
     stored = w.tensor_manager.store_and_return_tensor_info_batch(
         [0], {0: {"h": [torch.zeros(2)], "unrouted": [torch.ones(3)]}}, ["h"],
     )
-    assert set(store._tensors) - before == set(stored.flat_uuids)
+    assert set(store.get_all_uuids(0)) - before == set(stored.flat_uuids)
     assert store.get_all_uuids(0) == stored.flat_uuids
 
 
@@ -52,7 +53,7 @@ def test_new_token_counts_dedup_per_rid_not_across_rids(tmp_path):
                   stored.flat_uuids[1]]
     signal_idxs = [0, 0, 0]
 
-    counts = w._count_new_tokens(
+    counts = w.executor._count_new_tokens(
         [0, 1, 2], flat_rids, flat_uuids, signals, signal_idxs,
     )
 

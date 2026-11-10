@@ -43,6 +43,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused, ParallelMLP
@@ -249,10 +250,16 @@ class Cosmos3PackedMoTAttention(nn.Module):
         q_dim = num_attention_heads * head_dim
         kv_dim = num_key_value_heads * head_dim
 
-        # Understanding pathway.
-        self.to_q = ColumnParallelLinear(comm_group, hidden_size, q_dim, bias=attention_bias)
-        self.to_k = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
-        self.to_v = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        # Understanding pathway. q, k and v are one GEMM: at decode widths the
+        # reasoner's step is latency-bound, and three narrow GEMMs cost more
+        # than one wide one. The loader stacks the checkpoint's to_q / to_k /
+        # to_v into it (``cosmos3.loader.TRANSFORMER_STACKED``).
+        self.to_qkv = QKVParallelLinear(
+            comm_group, hidden_size, head_dim, num_attention_heads, num_key_value_heads, bias=attention_bias,
+        )
+        # this rank's columns, as the fused layer shards (or replicates) heads
+        q_cols, kv_cols = self.to_qkv.num_heads * head_dim, self.to_qkv.num_kv_heads * head_dim
+        self._qkv_split = (q_cols, kv_cols, kv_cols)
         self.to_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         if qk_norm_for_text:
             self.norm_q = norm_cls(head_dim, eps=rms_norm_eps)
@@ -277,6 +284,12 @@ class Cosmos3PackedMoTAttention(nn.Module):
         self.to_add_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         self.norm_added_q = norm_cls(head_dim, eps=rms_norm_eps)
         self.norm_added_k = norm_cls(head_dim, eps=rms_norm_eps)
+
+    def _und_qkv(self, und_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The understanding pathway's q [N, H, D], raw k and v [N, Hkv, D]."""
+        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
+        q, k, v = self.to_qkv(und_seq).split(self._qkv_split, dim=-1)
+        return q.view(-1, H, D), k.view(-1, Hkv, D), v.view(-1, Hkv, D)
 
     @staticmethod
     def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -305,9 +318,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
 
-        q_und = self.to_q(und_seq).view(-1, H, D)
-        k_und = self.to_k(und_seq).view(-1, Hkv, D)
-        v_und = self.to_v(und_seq).view(-1, Hkv, D)
+        q_und, k_und, v_und = self._und_qkv(und_seq)
         q_gen = self.add_q_proj(gen_seq).view(-1, H, D)
         k_gen = self.add_k_proj(gen_seq).view(-1, Hkv, D)
         v_gen = self.add_v_proj(gen_seq).view(-1, Hkv, D)
@@ -371,11 +382,10 @@ class Cosmos3PackedMoTAttention(nn.Module):
         exactly what the fused reference concatenates. A reasoner (text
         decoding) prefill passes ``cache_gen_k=False`` and keeps the raw K.
         """
-        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
-        q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
-        k_raw = self.to_k(und_seq).view(-1, Hkv, D)
+        H, D = self.num_attention_heads, self.head_dim
+        q, k_raw, v = self._und_qkv(und_seq)
+        q = self.norm_q(q)
         k = self.norm_k(k_raw)
-        v = self.to_v(und_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
         k_gen = None
@@ -682,7 +692,8 @@ class Cosmos3OmniTransformer(nn.Module):
             latent = latent.reshape(latent_channel, t_actual, h_patches, p, w_patches, p)
             latent = torch.einsum("cthpwq->thwpqc", latent).reshape(-1, p * p * latent_channel)
             packed_latent.append(latent)
-        return torch.cat(packed_latent, dim=0), original_latent_shapes
+        # the denoise loop keeps its latents in fp32; the projection takes them in the model dtype
+        return torch.cat(packed_latent, dim=0).to(self.proj_in.weight.dtype), original_latent_shapes
 
     def _unpatchify_and_unpack_latents(
         self,
@@ -761,6 +772,8 @@ class Cosmos3OmniTransformer(nn.Module):
         in-projection + the action modality embedding, then scatter-add the
         timestep embedding to the noisy (predicted) action tokens only. Returns
         [T, hidden]."""
+        # the denoise loop keeps its action latents in fp32; the projection takes them in the model dtype
+        action_latents = action_latents.to(self.action_proj_in.fc.weight.dtype)
         packed = self.action_proj_in(action_latents, action_domain_id)[0]  # [T, hidden]
         packed = packed + self.action_modality_embed.to(packed.dtype)
         ts = action_timesteps * self.config.timestep_scale
@@ -1011,7 +1024,19 @@ class Cosmos3OmniTransformer(nn.Module):
         hidden states [N, hidden]; ``lm_head`` turns the rows the caller picks
         into logits.
         """
-        cos, sin = self._rotary(position_ids, embeds.device, embeds.dtype)
+        cos, sin = self.build_cos_sin(position_ids.to(embeds.device), embeds.dtype)
+        return self.text_layers(embeds, cos, sin, label)
+
+    def build_cos_sin(self, position_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """The understanding tower's rotary tables ([N, head_dim]) for [3, N]
+        mRoPE ids."""
+        return self._rotary(position_ids, position_ids.device, dtype)
+
+    def text_layers(
+        self, embeds: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, label: str,
+    ) -> torch.Tensor:
+        """`text_forward` past the rotary tables: the understanding tower's
+        layers and final norm over ``embeds``."""
         attend = self._und_attend
         attend.bind_step(label)
         x = embeds
@@ -1082,12 +1107,12 @@ class Cosmos3OmniTransformer(nn.Module):
         return gather_sequence(sp, gen_seq, seq_sizes)
 
     def gen_layers_batched(self, gen_seq, cos, sin):
-        """The generation layer stack and final norm over ``denoise_step_batched``'s
-        cross-request pack, against the attention it bound. Apart from that
-        method, so the submodule can compile it alone: only the pack's length
-        depends on the batch, so with that length dynamic one compile serves
-        every batch size and mix of resolutions, while the per-request parts
-        around it run eager."""
+        """The generation layer stack and final norm over the cross-request pack
+        of ``denoise_step_batched`` or ``denoise_step_action_batched``, against
+        the attention the step bound. Apart from those methods, so the submodule
+        can compile it alone: only the pack's length depends on the batch, so
+        with that length dynamic one compile serves every batch size and mix of
+        resolutions, while the per-request parts around it run eager."""
         attend = self._gen_attend
         sp = self.sp_group
         if sp.world_size == 1:
@@ -1480,8 +1505,8 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
-        gen_out = self.norm_moe_gen(all_gen)
+        self._gen_attend.bind_step(attn=attn, label=label)
+        gen_out = self.gen_layers_batched(all_gen, cos, sin)
 
         sizes = [g.shape[0] for g in gen_seqs]
         total = sum(sizes)

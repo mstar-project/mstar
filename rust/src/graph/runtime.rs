@@ -7,7 +7,7 @@ use crate::graph::shard::{FanoutDest, GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
-use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
+use crate::tensors::{SharedBookkeeping, StoredTensor, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
@@ -15,6 +15,9 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod postprocess;
+
+pub use postprocess::PostprocessOut;
 
 /// Python's `NestedLoopIndices`.
 #[pyclass]
@@ -163,6 +166,8 @@ pub struct GraphRuntime {
     node_owner: FxHashMap<(Sym, Sym), WgIndex>,
     /// Loop stops from this iteration's check_stop; cleared every iteration.
     pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
+    /// (node, walk) -> its declared stop rules (`set_stop_rules`).
+    stop_rules: FxHashMap<(Sym, Sym), Vec<StopRule>>,
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
@@ -175,6 +180,10 @@ pub struct GraphRuntime {
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
     combined_walk_of: FxHashMap<(Sym, Sym), Sym>,
+    /// Streamed signals whose consumer walk the producer decides
+    /// (`Connection.consumer_walk`): they keep INPUT_SIGNALS, whose request
+    /// info carries that walk; EDGE_ITEMS has no room for it.
+    walk_driven_signals: FxHashSet<String>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -186,6 +195,9 @@ pub struct GraphRuntime {
     /// handed back to Python one at a time. None where the worker built the
     /// pyzmq communicator, which has no shareable object.
     communicator: Option<Arc<RawZmqCommunicator>>,
+
+    /// A postprocess parked at a break (`begin_postprocess`).
+    postprocess: Option<postprocess::Postprocess>,
 }
 
  impl GraphRuntime {
@@ -327,7 +339,6 @@ pub struct GraphRuntime {
         is_first_tp_rank: bool,
         partition_name: &str,
         graph_walk: &str,
-        stream_tokens_consumed: &[(String, i64)],
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
@@ -340,7 +351,7 @@ pub struct GraphRuntime {
             && self
                 .interner
                 .get(partition_name)
-                .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
+                .and_then(|p| self.info(rid).map(|i| i.partition_done(p)))
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
@@ -362,7 +373,6 @@ pub struct GraphRuntime {
             partition_name,
             partition_done,
             graph_walk,
-            stream_tokens_consumed,
             stream_items_sent: stream_items,
             resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
@@ -547,10 +557,13 @@ pub struct GraphRuntime {
         Some(out)
     }
 
-    /// ``speculate_node`` for one walk and its sample rid.
+    /// ``speculate_node`` for one walk's rows. The first sets the targets; a
+    /// loop-back target stays only if some row can run another iteration.
     fn speculate_walk(
-        &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
+        &mut self, node_name: &str, graph_walk: &str, rids: &[u32],
+        strides: Option<&[u32]>,
     ) -> Vec<(String, String, bool, Option<String>, Vec<String>)> {
+        let Some(&sample_rid) = rids.first() else { return vec![] };
         let Some(wg) = self.owner_of(node_name, graph_walk) else {
             return vec![];
         };
@@ -570,6 +583,11 @@ pub struct GraphRuntime {
                     && self.async_checker.can_speculate(
                         g.node(source).name, g.node(sn.node).name,
                     )
+                    // unless every row's loop ends with this iteration
+                    && (!sn.is_new_loop_iter
+                        || rids.iter().enumerate().any(|(i, &r)| self.can_continue_loop(
+                            wg, r, sn, graph_walk, strides.map_or(1, |s| s[i]),
+                        )))
             })
             .map(|sn| self.spec_output(&g, graph_walk, &sn))
             .collect()
@@ -606,9 +624,11 @@ pub struct GraphRuntime {
     fn prep_spec(
         &mut self, input: SpecPrepArg, follower: bool,
     ) -> PyResult<SpecPrepOut> {
-        if input.rids.len() != input.streaming_edges_per_rid.len() {
+        if input.rids.len() != input.streaming_edges_per_rid.len()
+            || input.loop_strides.as_ref().is_some_and(|s| s.len() != input.rids.len())
+        {
             return Err(PyValueError::new_err(
-                "prep_spec_rids: rids and streaming_edges_per_rid must match",
+                "prep_spec_rids: rids, streaming_edges_per_rid and loop_strides must match",
             ));
         }
         let Some(wg) = self.owner_of(&input.spec_node_name, &input.graph_walk)
@@ -663,7 +683,8 @@ pub struct GraphRuntime {
 
             if !follower {
                 if let Some(ctx) = &loop_ctx {
-                    if !self.can_continue_loop(wg, rid, ctx, &input.graph_walk) {
+                    let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
+                    if !self.can_continue_loop(wg, rid, ctx, &input.graph_walk, stride) {
                         continue; // the loop has ended; nothing more to run
                     }
                 }
@@ -747,9 +768,9 @@ pub struct GraphRuntime {
     }
 
     /// False once this rid's loop has ended: a stop is already pending, or the
-    /// next iteration would be past the last.
+    /// iteration in flight, moving its count `stride` on, is the last.
     fn can_continue_loop(
-        &self, wg: WgIndex, rid: u32, ctx: &SpecNode, graph_walk: &str,
+        &self, wg: WgIndex, rid: u32, ctx: &SpecNode, graph_walk: &str, stride: u32,
     ) -> bool {
         if !ctx.is_new_loop_iter {
             return true;
@@ -765,7 +786,8 @@ pub struct GraphRuntime {
         let Some(state) = self.state(wg, rid) else {
             return false;
         };
-        state.loop_iter(lid) + 1 < state.loop_max_iters(lid) && !state.loop_finished(lid)
+        state.loop_iter(lid).saturating_add(stride) < state.loop_max_iters(lid)
+            && !state.loop_finished(lid)
     }
 
     /// One rid: ingest its chunks, check readiness, gather inputs. Returns
@@ -862,6 +884,21 @@ pub struct GraphRuntime {
         }
     }
 
+    /// `rid`'s iteration of loop `lp` in partition `p`, as
+    /// `get_dynamic_loop_iters` reports it (the last worker graph with the
+    /// loop wins); 0 when no live worker graph has it.
+    fn loop_count(&self, rid: u32, p: Sym, lp: Sym) -> u32 {
+        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else { return 0 };
+        let mut count = 0;
+        for &wg in &part.walk_worker_graphs {
+            let Some(state) = self.state(wg, rid) else { continue };
+            if let Some(&lid) = self.graphs[wg as usize].loop_by_name.get(&lp) {
+                count = state.loop_iter(lid);
+            }
+        }
+        count
+    }
+
     /// Whether this request's current walk actually contains the loop. A stop
     /// for one it does not is a model bug: logged by the caller and dropped.
     fn check_dyn_loop(&self, rid: u32, partition: &str, loop_name: &str) -> bool {
@@ -956,6 +993,14 @@ pub struct GraphRuntime {
                 info.loop_stop_times.insert(sym, stop);
             }
         }
+    }
+
+    /// The worker graph running `node` under `walk`, and its loop named `name`.
+    fn loop_of(&self, node: &str, walk: &str, name: &str) -> Option<(WgIndex, LoopId)> {
+        let wg = self.owner_of(node, walk)?;
+        let sym = self.interner.get(name)?;
+        let lid = *self.graphs[wg as usize].loop_by_name.get(&sym)?;
+        Some((wg, lid))
     }
 
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
@@ -1156,6 +1201,8 @@ pub struct SendPlan {
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, signal, modality, value): emitted inline, one frame per step.
     pub emit_inline: Vec<(u32, String, String, i64)>,
+    /// rid -> the log-prob its emits carry, inline or tensor.
+    pub logprobs: FxHashMap<u32, f64>,
     /// (rid, finished worker graph ids, is_first_tp_rank, the walk the rid
     /// ran -- its own, not a mixed step's combined label)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool, Option<Sym>)>,
@@ -1199,15 +1246,22 @@ pub struct RouteArg {
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none.
+    /// request; `inline_values` are in `rids` order, or empty for none. A
+    /// row whose value is None (it ran no forward) takes the tensor path.
     /// Both keys may be absent or None: a caller with no inline signal sends
     /// the plain route input.
     inline_signal: Option<String>,
-    inline_values: Vec<i64>,
+    inline_values: Vec<Option<i64>>,
+    /// The log-prob of the token row i sampled (None without one): it rides
+    /// with the row's client emits, inline or in a tensor emit's metadata.
+    /// Empty (or absent) when no row has one.
+    logprobs: Vec<Option<f64>>,
     /// Rows of several walks in one call: `rids[i]` ran `walks[rid_walk_idx[i]]`.
     /// None, every row ran `graph_walk`.
     walks: Option<Vec<String>>,
     rid_walk_idx: Option<Vec<u32>>,
+    /// `RouteInput.loop_strides`, in `rids` order; None is 1 each.
+    loop_strides: Option<Vec<u32>>,
 }
 
 /// An item of a mapping that may be missing or None.
@@ -1235,8 +1289,10 @@ impl<'py> FromPyObject<'py> for RouteArg {
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+            logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
+            loop_strides: optional_item(ob, "loop_strides")?,
         })
     }
 }
@@ -1280,25 +1336,13 @@ pub struct RouteOut {
     #[pyo3(get)] pub rids_needing_request_info: Vec<u32>,
 }
 
-/// `route_and_send_inline`'s result; see there.
-#[pyclass]
-#[derive(Default)]
-pub struct FusedRouteOut {
-    #[pyo3(get)] pub status: u8,
-    #[pyo3(get)] pub completion_id: u64,
-    #[pyo3(get)] pub sent_rids: Vec<u32>,
-    /// Wall time spent with the GIL released, for measuring the overlap.
-    #[pyo3(get)] pub nogil_ns: u64,
-    pub route: Option<RouteOut>,
-}
-
-#[pymethods]
-impl FusedRouteOut {
-    /// The parked route, for a status-2 caller to finish with send_outputs.
-    /// Taken, not cloned: it is read once.
-    fn take_route(&mut self) -> Option<RouteOut> {
-        self.route.take()
-    }
+/// One of a walk's declared stop checks (Python's `StopPolicy`): stop `lp`
+/// when its count plus one reaches the request's limit or, for an AR rule,
+/// when the row's token is in `eos` and the request does not ignore EOS.
+struct StopRule {
+    lp: Sym,
+    ar: bool,
+    eos: Vec<i64>,
 }
 
 /// Routing parked between complete_and_route_batch and send_outputs.
@@ -1337,6 +1381,8 @@ pub struct Completion {
     /// Per rid: (signal, modality, value) of the emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
     pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
+    /// Per rid: the log-prob its client emits carry (`RouteArg::logprobs`).
+    pub logprobs: FxHashMap<u32, f64>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1349,6 +1395,8 @@ pub struct SpecPrepArg {
     #[pyo3(item)] room_for_continuing: Option<u32>,
     #[pyo3(item)] streaming_edges: Vec<EdgeSpecArg>,
     #[pyo3(item)] streaming_edges_per_rid: Vec<usize>,
+    /// `SpeculationPrepInput.loop_strides`, one per rid; None is 1 each.
+    #[pyo3(item)] loop_strides: Option<Vec<u32>>,
 }
 
 /// `SpeculationPrepOutput`.
@@ -1605,14 +1653,23 @@ impl GraphRuntime {
             walk_to_local_wgs,
             node_owner,
             pending_loop_stops: FxHashSet::default(),
+            stop_rules: FxHashMap::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
             combined_walk_of,
+            walk_driven_signals: FxHashSet::default(),
+            postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
+    }
+
+    /// The streamed signals that stay off EDGE_ITEMS (see
+    /// `walk_driven_signals`). Set once, at construction.
+    fn set_walk_driven_signals(&mut self, signals: Vec<String>) {
+        self.walk_driven_signals = signals.into_iter().collect();
     }
 
     /// The three sets are node NAMES. A name this worker does not host is
@@ -1843,10 +1900,10 @@ impl GraphRuntime {
             .all(|&wg| self.state(wg, rid).is_none_or(|s| s.is_idle()))
     }
 
-    fn mark_stream_partition_done(&mut self, rid: u32, partition: &str) {
+    fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-            info.mark_stream_done(p);
+            info.mark_partition_done(p);
         }
     }
 
@@ -1950,6 +2007,58 @@ impl GraphRuntime {
 
     fn clear_pending_loop_stops(&mut self) {
         self.pending_loop_stops.clear();
+    }
+
+    /// `GraphRuntime.set_loop_caps`.
+    fn set_loop_caps(
+        &mut self, node_name: &str, rids: Vec<u32>, graph_walks: Vec<String>,
+        loop_names: Vec<String>, caps: Vec<u32>,
+    ) -> PyResult<()> {
+        let n = rids.len();
+        if graph_walks.len() != n || loop_names.len() != n || caps.len() != n {
+            return Err(PyValueError::new_err(
+                "set_loop_caps: rids, graph_walks, loop_names and caps differ in length",
+            ));
+        }
+        for i in 0..n {
+            if let Some((wg, lid)) = self.loop_of(node_name, &graph_walks[i], &loop_names[i]) {
+                if let Some(state) = self.state_mut(wg, rids[i]) {
+                    state.set_loop_cap(lid, caps[i]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.
+    fn loop_progress(
+        &self, node_name: &str, rids: Vec<u32>, graph_walks: Vec<String>,
+        loop_names: Vec<String>,
+    ) -> PyResult<(Vec<i64>, Vec<i64>)> {
+        let n = rids.len();
+        if graph_walks.len() != n || loop_names.len() != n {
+            return Err(PyValueError::new_err(
+                "loop_progress: rids, graph_walks and loop_names differ in length",
+            ));
+        }
+        let mut counts = Vec::with_capacity(n);
+        let mut caps = Vec::with_capacity(n);
+        for i in 0..n {
+            let found = self
+                .loop_of(node_name, &graph_walks[i], &loop_names[i])
+                .and_then(|(wg, lid)| Some((self.state(wg, rids[i])?, lid)));
+            match found {
+                Some((state, lid)) => {
+                    counts.push(i64::from(state.loop_iter(lid)));
+                    caps.push(i64::from(state.loop_max_iters(lid)));
+                }
+                None => {
+                    counts.push(-1);
+                    caps.push(-1);
+                }
+            }
+        }
+        Ok((counts, caps))
     }
 
     fn push_back_node(
@@ -2136,12 +2245,13 @@ impl GraphRuntime {
     /// Release the inputs the just-executed node consumed, dereferencing them
     /// in the bookkeeper the store shares.
     ///
-    /// Returns the ones that hit zero, with each one's `mem_registered` flag,
-    /// because the rest of their teardown -- the shm file, the arena slot,
-    /// the memory unregistration -- lives on the tensor manager, which is
-    /// Python. Dropping them here and saying nothing is what left a consumed
-    /// input's shm file sitting until the request was torn down: the Python
-    /// runtime dereferences through the manager and reclaims as it goes.
+    /// Returns the ones that hit zero and still need the tensor manager's
+    /// teardown -- the shm file, the arena slot, the memory unregistration,
+    /// which are Python's -- with each one's `mem_registered` flag. Dropping
+    /// those here and saying nothing is what left a consumed input's shm file
+    /// sitting until the request was torn down. The rest, when the store
+    /// keeps its tensors in the bookkeeper, are freed in this call (see
+    /// `Bookkeeping::drop_refs`).
     fn cleanup_consumed_inputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
     ) -> PyResult<(Vec<u64>, Vec<bool>)> {
@@ -2162,8 +2272,12 @@ impl GraphRuntime {
         if freed.is_empty() {
             return Ok((vec![], vec![]));
         }
-        let mut bk = self.bookkeeping.lock().unwrap();
-        Ok(bk.drop_refs(freed.into_iter().map(|u| (u, 1)), true))
+        let released = self
+            .bookkeeping
+            .lock()
+            .unwrap()
+            .drop_refs(freed.into_iter().map(|u| (u, 1)), true);
+        Ok(released.report())
     }
 
     // --------- Scheduling ----------
@@ -2343,21 +2457,31 @@ impl GraphRuntime {
 
     /// Which nodes could run next, after the current node's outputs land.
     ///
-    /// One sample rid per walk; returns every walk's targets for the caller to
-    /// pick, filtered for async eligibility per walk.
+    /// The step's rows grouped by walk, `walk_counts[i]` for walk `i` (None:
+    /// one per walk); returns every walk's targets for the caller to pick,
+    /// filtered for async eligibility per walk.
+    #[pyo3(signature = (node_name, graph_walks, rids, walk_counts = None, loop_strides = None))]
     fn speculate_node(
-        &mut self, node_name: &str, graph_walks: Vec<String>, sample_rids: Vec<u32>,
+        &mut self, node_name: &str, graph_walks: Vec<String>, rids: Vec<u32>,
+        walk_counts: Option<Vec<usize>>, loop_strides: Option<Vec<u32>>,
     ) -> PyResult<Vec<(String, String, bool, Option<String>, Vec<String>)>> {
-        if graph_walks.len() != sample_rids.len() {
+        let counts = walk_counts.unwrap_or_else(|| vec![1; graph_walks.len()]);
+        if counts.len() != graph_walks.len() || counts.iter().sum::<usize>() != rids.len() {
             return Err(PyValueError::new_err(
-                "speculate_node: graph_walks and sample_rids differ in length",
+                "speculate_node: walk_counts must give each walk's share of rids",
             ));
         }
-        Ok(graph_walks
-            .into_iter()
-            .zip(sample_rids)
-            .flat_map(|(walk, rid)| self.speculate_walk(node_name, &walk, rid))
-            .collect())
+        if loop_strides.as_ref().is_some_and(|s| s.len() != rids.len()) {
+            return Err(PyValueError::new_err("speculate_node: one loop stride per rid"));
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (walk, count) in graph_walks.into_iter().zip(counts) {
+            let strides = loop_strides.as_deref().map(|s| &s[start..start + count]);
+            out.extend(self.speculate_walk(node_name, &walk, &rids[start..start + count], strides));
+            start += count;
+        }
+        Ok(out)
     }
 
     /// The loop context of a target chosen elsewhere.
@@ -2399,8 +2523,9 @@ impl GraphRuntime {
     /// around the body measured no faster on the GPU.
     #[pyo3(signature = (
         spec_node_name, curr_node_name, graph_walk, rids,
-        room_for_continuing = None,
+        room_for_continuing = None, loop_strides = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn prep_spec_rows(
         &mut self,
         spec_node_name: String,
@@ -2408,6 +2533,7 @@ impl GraphRuntime {
         graph_walk: String,
         rids: Vec<u32>,
         room_for_continuing: Option<u32>,
+        loop_strides: Option<Vec<u32>>,
     ) -> PyResult<SpecRowsOut> {
         let n = rids.len();
         let arg = SpecPrepArg {
@@ -2418,6 +2544,7 @@ impl GraphRuntime {
             room_for_continuing,
             streaming_edges: Vec::new(),
             streaming_edges_per_rid: vec![0; n],
+            loop_strides,
         };
         let out = self.prep_spec(arg, false)?;
         Ok(SpecRowsOut {
@@ -2493,11 +2620,22 @@ impl GraphRuntime {
     fn complete_and_route_batch(
         &mut self, input: RouteArg,
     ) -> PyResult<RouteOut> {
+        // Tensors freed outright below, dropped when this returns -- after
+        // every bookkeeping guard, since it is declared before them. Under the
+        // native postprocess (`begin_postprocess` / `resume_postprocess_*`)
+        // that is inside `allow_threads`, where pyo3 defers the decrefs to its
+        // pool and drains it when the GIL comes back at the end of that call.
+        let mut freed_objects: Vec<StoredTensor> = Vec::new();
         let n_sig = input.output_signals.len();
         if input.rids.len() * n_sig != input.num_tensors.len() {
             return Err(PyValueError::new_err(
                 "complete_and_route_batch: num_tensors must be \
                  rids * output_signals",
+            ));
+        }
+        if input.loop_strides.as_ref().is_some_and(|s| s.len() != input.rids.len()) {
+            return Err(PyValueError::new_err(
+                "complete_and_route_batch: one loop stride per rid",
             ));
         }
         // Per walk: its worker graph, the node there, the graph, the walk, and
@@ -2571,8 +2709,15 @@ impl GraphRuntime {
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
+        let logprobs: FxHashMap<u32, f64> = input
+            .rids
+            .iter()
+            .zip(&input.logprobs)
+            .filter_map(|(&rid, &lp)| Some((rid, lp?)))
+            .collect();
 
         for (i, &rid) in input.rids.iter().enumerate() {
+            let inline_value = if inline_on { input.inline_values[i] } else { None };
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
@@ -2628,7 +2773,8 @@ impl GraphRuntime {
             };
             // Before complete(), which clears the flag.
             let was_speculative = state.is_in_flight(node);
-            let completed = state.complete(&g, node, &out_tensors);
+            let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
+            let completed = state.complete_strided(&g, node, &out_tensors, stride);
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             let transferred = completed.transferred;
@@ -2849,8 +2995,12 @@ impl GraphRuntime {
             }
 
             // Which rids will actually produce a frame carrying
-            // `per_request_info`: an INPUT_SIGNALS to a peer, or a
-            // WORKER_GRAPHS_DONE. EmitToClient does not carry it.
+            // `per_request_info`: an INPUT_SIGNALS to a peer with a
+            // non-streamed or walk-driven edge, or a WORKER_GRAPHS_DONE.
+            // EmitToClient does not carry it, and neither does any other
+            // streamed edge: the receiver reads the info only alongside a
+            // non-streamed one, or for a walk-driven one's consumer walk
+            // (`InputIngest._process_new_inputs`).
             //
             // `is_local` is the whole point. A node in a SIBLING worker graph
             // on this worker compiles to External (Orpheus streams new_token
@@ -2861,6 +3011,9 @@ impl GraphRuntime {
             // take_send_plan's own skip.
             let me_now = self.shard.me;
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
+                if e.streaming && !self.walk_driven_signals.contains(self.interner.name(e.name)) {
+                    continue;
+                }
                 let dest = match e.dest {
                     Dest::External(d) => d,
                     Dest::Local(d) if e.declined_local => self.g(wg).node(d).name,
@@ -2928,14 +3081,12 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let inline_edge = inline_on
+                let inline_edge = inline_value.is_some()
                     && matches!(e.dest, Dest::EmitToClient)
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                if inline_edge {
-                    emit_inline.insert(
-                        rid, (e.name, e.modality, input.inline_values[i]),
-                    );
+                if let (true, Some(value)) = (inline_edge, inline_value) {
+                    emit_inline.insert(rid, (e.name, e.modality, value));
                 }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
@@ -2971,10 +3122,11 @@ impl GraphRuntime {
             // this side cannot reach it.
             if !freed_inputs.is_empty() {
                 let mut bk = self.bookkeeping.lock().unwrap();
-                let (uuids, registered) =
+                let released =
                     bk.drop_refs(freed_inputs.into_iter().map(|u| (u, 1)), true);
-                out.freed_input_uuids.extend(uuids);
-                out.freed_input_registered.extend(registered);
+                out.freed_input_uuids.extend(released.uuids);
+                out.freed_input_registered.extend(released.registered);
+                freed_objects.extend(released.dropped);
             }
 
             // How many references each edge really represents. Python counts
@@ -2998,7 +3150,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
                         ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
@@ -3072,10 +3224,11 @@ impl GraphRuntime {
                         // tensor manager can tear it down, so it has to be
                         // reported -- otherwise it is held until the request
                         // ends.
-                        let (uuids, registered) =
+                        let released =
                             bk.drop_refs(std::iter::once((uuid, -delta)), true);
-                        out.freed_input_uuids.extend(uuids);
-                        out.freed_input_registered.extend(registered);
+                        out.freed_input_uuids.extend(released.uuids);
+                        out.freed_input_registered.extend(released.registered);
+                        freed_objects.extend(released.dropped);
                     }
                     Ok(())
                 };
@@ -3137,136 +3290,167 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
+                logprobs,
             },
         );
         Ok(out)
     }
 
-    /// `complete_and_route_batch` then `send_outputs`, in one crossing and
-    /// with the GIL released throughout, for a step whose every output stays
-    /// on the device and whose client copy rides inline (a device-loopback
-    /// decode step). Exactly the two calls the worker would make, with the
-    /// arguments its device-loopback branch builds: no tensors, and the
-    /// inline values read here from the stop check's host rows rather than
-    /// handed over as a list.
+    /// Declares (node, walk)'s stop rules, as `NodeSubmodule.get_stop_policies`
+    /// gives them, one column entry per rule.
+    fn set_stop_rules(
+        &mut self, node_name: &str, graph_walk: &str,
+        loops: Vec<String>, ar: Vec<bool>, eos: Vec<Vec<i64>>,
+    ) -> PyResult<()> {
+        if loops.len() != ar.len() || loops.len() != eos.len() {
+            return Err(PyValueError::new_err("set_stop_rules: columns differ in length"));
+        }
+        let key = (self.interner.intern(node_name), self.interner.intern(graph_walk));
+        let mut rules = Vec::with_capacity(loops.len());
+        for ((name, ar), eos) in loops.iter().zip(ar).zip(eos) {
+            rules.push(StopRule { lp: self.interner.intern(name), ar, eos });
+        }
+        self.stop_rules.insert(key, rules);
+        Ok(())
+    }
+
+    /// Each rid's limits for (node, walk)'s rules: `max_iters[k][i]` and
+    /// `ignore_eos[k][i]` are rule k's for `rids[i]`. Kept on the request, so
+    /// `remove_request` drops them with it.
+    fn set_stop_limits(
+        &mut self, node_name: &str, graph_walk: &str, rids: Vec<u32>,
+        max_iters: Vec<Vec<u32>>, ignore_eos: Vec<Vec<bool>>,
+    ) -> PyResult<()> {
+        if max_iters.len() != ignore_eos.len()
+            || max_iters.iter().any(|c| c.len() != rids.len())
+            || ignore_eos.iter().any(|c| c.len() != rids.len())
+        {
+            return Err(PyValueError::new_err("set_stop_limits: columns differ in length"));
+        }
+        let key = (self.interner.intern(node_name), self.interner.intern(graph_walk));
+        for (i, &rid) in rids.iter().enumerate() {
+            let limits: Vec<(u32, bool)> =
+                max_iters.iter().zip(&ignore_eos).map(|(m, e)| (m[i], e[i])).collect();
+            let Some(Some(info)) = self.requests.get_mut(rid as usize) else { continue };
+            match info.stop_limits.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = limits,
+                None => info.stop_limits.push((key, limits)),
+            }
+        }
+        Ok(())
+    }
+
+    /// (node, walk)'s declared stop rules over a step's rows, reading the
+    /// token column in place and each loop's count from the walk state.
     ///
-    /// The inline column is ``inline_rows`` scalars of ``inline_dtype`` at
-    /// ``inline_ptr`` with ``inline_stride`` elements between rows, row i
-    /// belonging to ``row_rids[i]``. The caller keeps the tensor alive and
-    /// landed for the call (it has waited on the step's completion event).
-    ///
-    /// Returns ``status``:
-    ///   0 -- nothing done (a rid has no row, or an unsupported dtype): take
-    ///        the general path, exactly as ``_inline_emit_values`` falling
-    ///        back does;
-    ///   1 -- routed and sent; ``sent_rids`` are send_outputs' return;
-    ///   2 -- routed, but the send needs Python-side payloads (a frame
-    ///        carries ``per_request_info``, a tensor to register, new-token
-    ///        counts, local streaming, freed inputs): ``route`` holds the
-    ///        RouteOut and the caller finishes with ``send_outputs``.
+    /// At a step's stop check its loop counts are the ones the step ran at:
+    /// they move when the step is routed, which comes after. Returns
+    /// `(stop_rids, stop_rules, missing)`: a stop per (rid, rule index), and
+    /// the rids with no limits for this walk yet, which the caller registers
+    /// with `set_stop_limits` and checks again. A rid with no token row is
+    /// skipped, as `check_stop` skips a request with no output.
     #[pyo3(signature = (
-        partition, graph_walk, node_name, output_signals, rids,
+        partition, node_name, graph_walk, rids,
+        token_ptr, token_rows, token_stride, token_dtype, row_rids,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn check_stops_inline(
+        &self,
+        partition: &str,
+        node_name: &str,
+        graph_walk: &str,
+        rids: Vec<u32>,
+        token_ptr: usize,
+        token_rows: usize,
+        token_stride: usize,
+        token_dtype: &str,
+        row_rids: Vec<u32>,
+    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)
+    }
+
+
+    /// Begin a step's postprocess (`PostprocessRequest`): check its stops,
+    /// route its outputs, send them, stopping where a phase needs Python
+    /// (`postprocess.rs`). `stop_rids[i]` stops
+    /// `stop_loops[i]` before any check (stream-terminated loops). The token
+    /// and inline columns are host views the caller keeps alive until the
+    /// step is done: `rows` integers of `dtype`, `stride` elements apart, row
+    /// i belonging to `row_rids[i]`; a null pointer is no column.
+    #[pyo3(signature = (
+        partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
+        stop_rids, stop_loops, runtime_stops,
+        token_ptr, token_rows, token_stride, token_dtype, row_rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        row_rids,
+        partition_done, python_send, loop_strides = None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn route_and_send_inline(
-        &mut self,
-        py: Python<'_>,
-        partition: String,
-        graph_walk: String,
-        node_name: String,
-        output_signals: Vec<String>,
-        rids: Vec<u32>,
-        inline_signal: String,
-        inline_ptr: usize,
-        inline_rows: usize,
-        inline_stride: usize,
-        inline_dtype: &str,
+    fn begin_postprocess(
+        &mut self, py: Python<'_>,
+        partition: String, node_name: String, graph_walk: String, output_signals: Vec<String>,
+        rids: Vec<u32>, walks: Option<Vec<String>>, rid_walk_idx: Option<Vec<u32>>,
+        stop_rids: Vec<u32>, stop_loops: Vec<Vec<String>>, runtime_stops: bool,
+        token_ptr: usize, token_rows: usize, token_stride: usize, token_dtype: &str,
         row_rids: Vec<u32>,
-    ) -> PyResult<FusedRouteOut> {
-        let itemsize = match inline_dtype {
-            "int64" | "int32" => if inline_dtype == "int64" { 8 } else { 4 },
-            _ => return Ok(FusedRouteOut::default()),
-        };
-        if inline_ptr == 0 || row_rids.len() > inline_rows {
-            return Ok(FusedRouteOut::default());
-        }
-        let t_nogil = std::time::Instant::now();
-        let outcome = py.detach(|| -> PyResult<FusedRouteOut> {
-            // The inline values in `rids` order: a slice when the rows are in
-            // the batch's order (the usual case), else looked up per rid.
-            let read = |row: usize| -> i64 {
-                // SAFETY: row < inline_rows, checked by the callers below;
-                // the caller holds the buffer for the duration of the call.
-                unsafe {
-                    let at = (inline_ptr as *const u8).add(row * inline_stride * itemsize);
-                    if itemsize == 8 {
-                        std::ptr::read_unaligned(at as *const i64)
-                    } else {
-                        i64::from(std::ptr::read_unaligned(at as *const i32))
-                    }
-                }
-            };
-            let n = rids.len();
-            let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
-            let values: Vec<i64> = if in_order {
-                (0..n).map(read).collect()
-            } else {
-                let row_of: FxHashMap<u32, usize> =
-                    row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-                let mut v = Vec::with_capacity(n);
-                for r in &rids {
-                    match row_of.get(r) {
-                        Some(&i) => v.push(read(i)),
-                        None => return Ok(FusedRouteOut::default()),
-                    }
-                }
-                v
-            };
-            let n_sig = output_signals.len();
-            let route = self.complete_and_route_batch(RouteArg {
-                partition,
-                graph_walk,
-                node_name,
-                output_signals,
-                rids,
-                tensors: Vec::new(),
-                num_tensors: vec![0; n * n_sig],
-                inline_signal: Some(inline_signal),
-                inline_values: values,
-                walks: None,
-                rid_walk_idx: None,
-            })?;
-            let completion_id = route.completion_id;
-            let needs_python = !route.register_uuids.is_empty()
-                || !route.new_token_output_idxs.is_empty()
-                || !route.local_streaming_signals.is_empty()
-                || !route.rids_needing_request_info.is_empty()
-                || !route.freed_input_uuids.is_empty();
-            if needs_python {
-                return Ok(FusedRouteOut {
-                    status: 2, completion_id, sent_rids: Vec::new(), nogil_ns: 0,
-                    route: Some(route),
-                });
-            }
-            // Nothing in the frames comes from Python: no rid carries
-            // per_request_info, so none completes a worker graph, and the
-            // count, consumption, profiling and publication payloads are all
-            // read only for those.
-            let (sent_rids, frames) = self.build_send_frames(
-                completion_id, vec![], vec![], vec![], vec![],
-                vec![], vec![], vec![], vec![], vec![], vec![], vec![],
-            )?;
-            self.dispatch_frames_nogil(frames)?;
-            Ok(FusedRouteOut {
-                status: 1, completion_id, sent_rids, nogil_ns: 0, route: None,
-            })
+        inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
+        inline_stride: usize, inline_dtype: &str,
+        partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        let inline = inline_signal.and_then(|signal| {
+            postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
+                .map(|col| (signal, col))
         });
-        let nogil_ns = t_nogil.elapsed().as_nanos() as u64;
-        let mut outcome = outcome?;
-        outcome.nogil_ns = nogil_ns;
-        Ok(outcome)
+        let pp = postprocess::Postprocess::new(
+            partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
+            stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
+            tokens, row_rids, inline, partition_done, python_send, loop_strides,
+        );
+        self.postprocess = None;
+        self.pp_run(py, pp)
+    }
+
+    /// Resume a step parked for its stops (STOPS): the loops each rid stops,
+    /// and the rows to drop (their stop check failed).
+    fn resume_postprocess_stops(
+        &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        self.pp_resume_stops(py, rids, loops, dropped)
+    }
+
+    /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
+    #[pyo3(signature = (tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new()))]
+    fn resume_postprocess_store(
+        &mut self, py: Python<'_>, tensors: Vec<u64>, num_tensors: Vec<usize>,
+        inline_signal: Option<String>, inline_values: Vec<Option<i64>>, logprobs: Vec<Option<f64>>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let stored = postprocess::Stored {
+            tensors, num_tensors, inline_signal, inline_values, logprobs,
+        };
+        self.pp_resume_store(py, stored)
+    }
+
+    /// Resume a step parked for its send's Python payloads (SEND), given as
+    /// `send_outputs` takes them.
+    #[pyo3(signature = (
+        info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
+        publish_rids, publications, skip_rids = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn resume_postprocess_send(
+        &mut self, py: Python<'_>,
+        info_rids: Vec<u32>, request_infos: Vec<Option<Vec<u8>>>,
+        ntc_rids: Vec<u32>, new_token_counts: Vec<FxHashMap<String, i64>>,
+        prof_rids: Vec<u32>, profiling: Vec<Option<Vec<u8>>>,
+        publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let args = postprocess::SendArgs {
+            info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
+            publish_rids, publications, skip_rids,
+        };
+        self.pp_resume_send(py, args)
     }
 
     /// Stop loops, record the pending stops, notify peers, and return the rids
@@ -3281,65 +3465,9 @@ impl GraphRuntime {
         rids: Vec<u32>,
         loop_names: Vec<Vec<String>>,
     ) -> PyResult<Vec<u32>> {
-        // One release for the whole batch; see send_outputs.
         // bookkeeping with the GIL held; the frames go out through send_frames
-        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
-        let out = (|| -> PyResult<Vec<u32>> {
-            if rids.len() != loop_names.len() {
-                return Err(PyValueError::new_err(
-                    "stop_loops_batched: rids and loop_names must be the same length",
-                ));
-            }
-            let Some(walk) = self.interner.get(graph_walk) else {
-                return Ok(Vec::new());
-            };
-            let mut stopped_rids = Vec::new();
-            for (rid, names) in rids.into_iter().zip(loop_names) {
-                let wanted: Vec<String> = names
-                    .into_iter()
-                    .filter(|n| self.check_dyn_loop(rid, partition, n))
-                    .collect();
-                if wanted.is_empty() {
-                    continue;
-                }
-                self.stop_loops_for_rid(rid, partition, &wanted, Some(last_node_run));
-                for name in &wanted {
-                    if let Some(l) = self.interner.get(name) {
-                        self.pending_loop_stops.insert((rid, walk, l));
-                    }
-                }
-                let mut per_worker: FxHashMap<Sym, Vec<String>> = FxHashMap::default();
-                for name in &wanted {
-                    for w in self.dyn_loop_workers(rid, partition, name) {
-                        per_worker.entry(w).or_default().push(name.clone());
-                    }
-                }
-                // Never to ourselves: this rank originated the stop and has
-                // already applied it. A self-send would land in apply_peer_loop_stops
-                // and stop the loops a second time.
-                let me = self.shard.me;
-                let request_id = self.rid_name(rid)?;
-                // Snapshotted BEFORE the sends: stop_loops_for_rid above already
-                // recorded this stop, and every peer must see the same context.
-                let stop_times = self.loop_stop_times_of(rid);
-                for (worker, names) in per_worker {
-                    if worker == me {
-                        continue;
-                    }
-                    let bytes = frames::StopLoops {
-                        request_id: &request_id,
-                        partition_name: partition,
-                        loop_names: &names,
-                        loop_stop_times: stop_times.clone(),
-                    }
-                    .encode(&self.interner);
-                    frames.push((self.interner.name(worker).to_string(), bytes));
-                }
-                stopped_rids.push(rid);
-            }
-            Ok(stopped_rids)
-        })();
-        let out = out?;
+        let (out, frames) =
+            self.stop_loops_frames(partition, graph_walk, last_node_run, rids, loop_names)?;
         self.send_frames(py, frames)?;
         Ok(out)
     }
@@ -3384,8 +3512,8 @@ impl GraphRuntime {
             let info = self.requests[rid as usize].as_mut().expect("checked");
             if stop.later_than(info.loop_stop_times.get(&sym), sym) {
                 newer.push(name.clone());
+                info.loop_stop_times.insert(sym, stop);
             }
-            info.loop_stop_times.insert(sym, stop);
         }
         if !newer.is_empty() {
             // No last_node_run and no fan-out: the originating rank took the
@@ -3412,8 +3540,7 @@ impl GraphRuntime {
     /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
-        ntc_rids, new_token_counts,
-        consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        ntc_rids, new_token_counts, prof_rids, profiling,
         publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -3427,8 +3554,6 @@ impl GraphRuntime {
         // Taken as dicts: PyO3 extracts them directly, so Python does not
         // have to flatten each one to a list of pairs.
         new_token_counts: Vec<FxHashMap<String, i64>>,
-        consumed_rids: Vec<u32>,
-        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
@@ -3458,8 +3583,7 @@ impl GraphRuntime {
         let t_body = std::time::Instant::now();
         let built = self.build_send_frames(
             completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
-            consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-            publish_rids, publications, skip_rids,
+            prof_rids, profiling, publish_rids, publications, skip_rids,
         );
         send_timing::record_body(t_body);
         let (out, frames) = built?;
@@ -3508,6 +3632,7 @@ impl GraphRuntime {
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             nested: c.nested.clone(),
+            logprobs: std::mem::take(&mut c.logprobs),
             ..Default::default()
         };
 
@@ -3657,11 +3782,6 @@ impl GraphRuntime {
         Ok(plan)
     }
 
-    fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
-        let Some(p) = self.interner.get(partition) else { return false };
-        self.info(rid).is_some_and(|i| i.stream_done(p))
-    }
-
     /// Parked routing awaiting a send. Non-zero between
     /// complete_and_route_batch and send_outputs; a number that only grows
     /// means sends are being abandoned.
@@ -3783,8 +3903,6 @@ impl GraphRuntime {
         request_infos: Vec<Option<Vec<u8>>>,
         ntc_rids: Vec<u32>,
         new_token_counts: Vec<FxHashMap<String, i64>>,
-        consumed_rids: Vec<u32>,
-        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
@@ -3799,11 +3917,6 @@ impl GraphRuntime {
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
                 .into_iter()
                 .zip(new_token_counts)
-                .map(|(r, m)| (r, m.into_iter().collect()))
-                .collect();
-            let stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)> = consumed_rids
-                .into_iter()
-                .zip(stream_tokens_consumed)
                 .map(|(r, m)| (r, m.into_iter().collect()))
                 .collect();
             let profiling: Vec<(u32, Option<Vec<u8>>)> =
@@ -3827,8 +3940,6 @@ impl GraphRuntime {
                 request_infos.into_iter().collect();
             let profiling: FxHashMap<u32, Option<Vec<u8>>> =
                 profiling.into_iter().collect();
-            let consumed: FxHashMap<u32, Vec<(String, i64)>> =
-                stream_tokens_consumed.into_iter().collect();
             let publications: FxHashMap<u32, Option<Vec<u8>>> =
                 publish_rids.into_iter().zip(publications).collect();
             let mut sent_rids = Vec::new();
@@ -3845,6 +3956,12 @@ impl GraphRuntime {
             // (rid, edge, worker, items): what each consumer will register, so
             // counted from the descriptors that go out, not the refs.
             let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
+            // A step's plain streamed edges (unsharded, one producer) go to
+            // each worker as one EDGE_ITEMS, not one INPUT_SIGNALS per
+            // request: the receiver then decodes, reads and routes the step's
+            // items once. Worker order kept as first seen.
+            let mut streamed: Vec<(Sym, frames::EdgeItems)> = Vec::new();
+            let mut streamed_at: FxHashMap<Sym, usize> = FxHashMap::default();
             {
                 // One acquisition for every descriptor lookup in the batch, not
                 // one per edge. Released before the sends -- holding it across
@@ -3856,6 +3973,22 @@ impl GraphRuntime {
                         stream_items.push((
                             w.rid, w.signal.clone(), w.worker, infos.len() as i64,
                         ));
+                        if w.shard_dim.is_none() && w.total_fanin == 1
+                            && !self.walk_driven_signals.contains(&w.signal)
+                        {
+                            let request_id = self.rids.name(w.rid).ok_or_else(|| {
+                                PyValueError::new_err(format!("unknown rid handle {}", w.rid))
+                            })?;
+                            let i = *streamed_at.entry(w.worker).or_insert_with(|| {
+                                streamed.push((w.worker, frames::EdgeItems::new(&partition)));
+                                streamed.len() - 1
+                            });
+                            if streamed[i].1.try_add(
+                                bk.strings(), request_id, &w.signal, &w.next_node, &infos,
+                            ) {
+                                continue;
+                            }
+                        }
                     }
                     let key = (w.rid, w.worker);
                     let edge = frames::OutEdge {
@@ -3899,6 +4032,11 @@ impl GraphRuntime {
                         .encode(bk.strings()),
                     ));
                 }
+                for (worker, items) in &streamed {
+                    if !items.is_empty() {
+                        frames_out.push((*worker, items.encode(bk.strings())));
+                    }
+                }
             }
             for (worker, bytes) in frames_out {
                 frames.push((self.interner.name(worker).to_string(), bytes));
@@ -3920,6 +4058,7 @@ impl GraphRuntime {
                         signal: &signal,
                         infos,
                         loop_indices,
+                        logprob: plan.logprobs.get(&rid).copied(),
                     }
                     .encode(&self.interner, bk.strings())
                 };
@@ -3944,6 +4083,8 @@ impl GraphRuntime {
                     let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
                     let mut values: Vec<i64> = Vec::with_capacity(items.len());
                     let mut loop_indices = Vec::with_capacity(items.len());
+                    let with_logprobs = !plan.logprobs.is_empty();
+                    let mut logprobs: Vec<Option<f64>> = Vec::new();
                     for (rid, value) in items {
                         let request_id = self.rid_name(rid)?;
                         let idx = nested.get(&rid).cloned();
@@ -3953,6 +4094,9 @@ impl GraphRuntime {
                         request_ids.push(request_id);
                         values.push(value);
                         loop_indices.push(idx);
+                        if with_logprobs {
+                            logprobs.push(plan.logprobs.get(&rid).copied());
+                        }
                     }
                     let bytes = frames::ResultTokens {
                         request_ids: &request_ids,
@@ -3960,6 +4104,7 @@ impl GraphRuntime {
                         loop_indices: &loop_indices,
                         signal: &signal,
                         modality: &modality,
+                        logprobs: &logprobs,
                     }
                     .encode(&self.interner);
                     frames.push(("api_server".to_string(), bytes));
@@ -3985,7 +4130,6 @@ impl GraphRuntime {
                     .unwrap_or_default();
                 let bytes = self.worker_graphs_done_frame(
                     rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
-                    consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
@@ -3998,6 +4142,7 @@ impl GraphRuntime {
         Ok((sent, frames))
     }
 }
+
 
 #[cfg(test)]
 mod tests {

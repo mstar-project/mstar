@@ -1,6 +1,6 @@
-"""Glm52Model contract on the resource-pools engine: registry, graph walks, the prefill ->
-decode transition, the node's resource declaration, the per-request sampling config, and
-the submodule's stop / preprocess guards.
+"""Glm52Model contract on the resource-pools engine: registry, graph walks, the node's
+resource declaration, the per-request sampling config, and the submodule's stop /
+preprocess guards.
 """
 import dataclasses
 import sys
@@ -31,10 +31,7 @@ def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
-from mstar.conductor.request_info import (  # noqa: E402
-    CurrentForwardConductorMetadata,
-    CurrentForwardPassInfo,
-)
+from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
     AttentionSpec,
     AttnBackend,
@@ -54,7 +51,7 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION  # noqa: E402
 
 
 def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
@@ -147,40 +144,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert attn.config.kv_cache == KV_RESOURCE
 
 
-# ── conductor state machine ──
-
-
-def test_glm52_initial_forward_pass_args_seed_prefill_from_the_prompt():
-    signals = {"text_inputs": ["PROMPT"]}
-    args = _make_model().get_initial_forward_pass_args(
-        "default", ["text"], ["text"], signals)
-    assert args.full_metadata.graph_walk == "prefill"
-    assert args.full_metadata.is_prefill is True
-    assert args.step_metadata == {"is_prefill": True}
-    (edge,) = args.inputs
-    assert (edge.next_node, edge.name) == ("LLM", "text_inputs")
-    assert edge.tensor_info == ["PROMPT"]
-    assert args.unpersist_tensors == ["PROMPT"]
-
-
-def test_glm52_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="prefill",
-        is_prefill=True,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={"new_token": []},
-    )
-
-    assert result.full_metadata.graph_walk == "decode"
-    assert result.step_metadata["is_prefill"] is False
-    assert result.request_done is False
+# ── walks ──
 
 
 def test_glm52_prefill_emits_only_the_new_token():
@@ -190,23 +154,6 @@ def test_glm52_prefill_emits_only_the_new_token():
     (edge,) = prefill.outputs
     assert edge.name == "new_token" and edge.next_node == EMIT_TO_CLIENT
     assert edge.persist is True
-
-
-def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
-    """Decode must be seeded from the emitted token, never from the prompt
-    signal, and must unpersist it so no per-request tensor outlives the
-    transition."""
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"],
-        graph_walk="prefill", is_prefill=True,
-    )
-    res = _make_model().get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].name == "text_inputs"
-    assert res.inputs[0].tensor_info == ["tok"]
-    assert res.unpersist_tensors == ["tok"]
 
 
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
@@ -220,28 +167,9 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     assert decode.max_iters < guard, (
         f"loop cap {decode.max_iters} can reach the batch-killing context "
         f"guard at {guard}")
-    # check_stop is the only thing enforcing the real per-request budget,
+    # get_loop_caps' loop cap is what enforces the real per-request budget,
     # because the decode edge carries no conductor_new_token.
     assert not any(e.conductor_new_token for e in decode.section.outputs)
-
-
-def test_glm52_decode_completion_marks_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
-    assert result.full_metadata.kwargs["decode_finished"] is True
 
 
 # ── per-request sampling config ──
@@ -250,19 +178,17 @@ def test_glm52_decode_completion_marks_done():
 def test_glm52_request_config_is_the_sampler_config():
     model = _make_model()
     cfg = model.config
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {SAMPLER_RESOURCE}
     sampling = configs[SAMPLER_RESOURCE]
     assert isinstance(sampling, SamplingReqConfig)
-    # the config's generation defaults, unless the request overrides them
-    assert sampling.temperature == cfg.temperature
-    assert sampling.top_p == cfg.top_p
-    assert sampling.repetition_penalty == cfg.repetition_penalty
-    assert sampling.ignore_eos is cfg.ignore_eos
+    # the checkpoint's generation defaults, unless the request overrides them
+    assert (sampling.temperature, sampling.top_p) == (1.0, 0.95)
+    assert (sampling.repetition_penalty, sampling.ignore_eos) == (1, False)
     over = model.get_request_resource_configs(
-        {}, {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
-    assert over.temperature == cfg.temperature
+    assert over.temperature == 1.0
 
 
 @pytest.mark.parametrize("kwargs, match", [
@@ -299,18 +225,16 @@ def test_glm52_config_sanity():
 
 
 def _make_submodule(config) -> Glm52LLMSubmodule:
-    # check_stop / preprocess only read self.config; skip nn.Module init.
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = config
-    sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
-    sub._index_stager = PinnedStager(torch.long)
-    return sub
+    # check_stop / preprocess read only the config and the stop declaration, not the weights
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    return Glm52LLMSubmodule(language_model, config)
 
 
-def _fwd_info(max_tokens=100, ignore_eos=False, iters=0) -> CurrentForwardPassInfo:
+def _fwd_info(max_tokens=100, ignore_eos=False, iters=0, walk="decode") -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0",
-        graph_walk="decode",
+        graph_walk=walk,
         fwd_index=0,
         random_seed=0,
         max_tokens=max_tokens,
@@ -332,41 +256,44 @@ def test_glm52_check_stop_continues_on_normal_token():
     assert sub.check_stop("r0", _fwd_info(), outputs) == set()
 
 
-def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
+def test_glm52_check_stop_ignore_eos_runs_to_the_loop_cap():
+    # the cap (``get_loop_caps``) ends the loop at max_tokens, not the stop check
     sub = _make_submodule(Glm52ModelConfig())
     outputs = {"new_token": [torch.tensor([154820])]}
     assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
-    # max_tokens counts every generated token, the prefill's included: 1 +
-    # iters+1. For max 8 the stop fires at decode iter 6 (8 total), not 7.
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
-    ) == set()
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs,
-    ) == {"decode_loop"}
+    assert sub.check_stop("r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs) == set()
 
 
 def test_glm52_check_stop_batched_agrees_with_check_stop():
     """One tolist for the batch, the same answer per request; a row the step has no token
-    for is skipped, as the per-request path skips a request without outputs."""
+    for is skipped, as the per-request path skips a request without outputs. A row at its
+    token budget goes on: the loop's cap ends it."""
     from mstar.model.submodule_base import HostRows
 
     sub = _make_submodule(Glm52ModelConfig())
     infos = {
         "eos": _fwd_info(), "mid": _fwd_info(), "budget": _fwd_info(max_tokens=8, iters=6),
-        "ignored": _fwd_info(ignore_eos=True), "ended": _fwd_info(), "absent": _fwd_info(),
+        "ignored": _fwd_info(ignore_eos=True), "prefill": _fwd_info(walk="prefill"),
+        "absent": _fwd_info(),
     }
-    sub.request_state("ended").add("ended_at_prefill", True)
-    rows = ("eos", "mid", "budget", "ignored", "ended")
-    tokens = torch.tensor([154827, 42, 42, 154820, 7])
+    rows = ("eos", "mid", "budget", "ignored", "prefill")
+    tokens = torch.tensor([154827, 42, 42, 154820, 154820])
     batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
     per_request = {
         rid: loops for rid, token in zip(rows, tokens, strict=True)
         if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
     }
-    assert batched == per_request == {
-        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
-    }
+    assert batched == per_request == {"eos": {"decode_loop"}, "prefill": {END_PARTITION}}
+
+
+@pytest.mark.parametrize(("token", "max_tokens", "ignore_eos", "ends"), [
+    (154820, 100, False, True), (154820, 100, True, False), (42, 1, False, True), (42, 2, False, False),
+])
+def test_glm52_prefill_ends_the_partition_on_a_stop_id_or_a_one_token_budget(token, max_tokens, ignore_eos, ends):
+    """The prefill walk has no loop to stop, and the loop's cap is at least 1."""
+    sub = _make_submodule(Glm52ModelConfig())
+    prefill = _fwd_info(max_tokens=max_tokens, ignore_eos=ignore_eos, walk="prefill")
+    assert sub.check_stop("r0", prefill, {"new_token": [torch.tensor([token])]}) == ({END_PARTITION} if ends else set())
 
 
 # ── submodule: graph configs ──
@@ -720,7 +647,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
 
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
-    from mstar.model.utils import ByteLevelDetokenizer
+    from mstar.model.utils import ByteLevelDetokenizer, fast_tokenizer_from_snapshot
 
     alphabet = pre_tokenizers.ByteLevel.alphabet()
     raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
@@ -734,7 +661,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
         "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
         "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
 
-    tok = Glm52Model._fast_tokenizer_fallback(str(tmp_path))
+    tok = fast_tokenizer_from_snapshot(str(tmp_path))
     assert len(tok) == raw.get_vocab_size()
     assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
     think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])

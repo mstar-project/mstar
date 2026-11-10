@@ -220,13 +220,16 @@ environment, and so does a variable that expands to nothing (``--api-key "$UNSET
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
 ``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`. The standalone Nemotron realtime server
-(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
-variable.
+:doc:`clients`.
 
 Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
+
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
@@ -242,11 +245,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Maximum sequence length (sizes the KV cache).
+     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
+       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
+       ``resources: <kv>:`` (see the resource overrides below).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
+       ``sp_size`` and ``cfg_size``. An ``ep_config`` block picks TP or EP for the
+       group's MoE experts. ``side_stream: true`` runs the group's node beside the
+       worker's main chain of steps (see below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -254,21 +261,35 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``routing_weights``
+     - *(optional)* The weights of the data-parallel replica pick (see below), one per
+       term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
+       the prompt predicted in its KV prefix cache. Each is a number from 0 to 1e6; ``load``
+       defaults to 1.0 and ``prefix`` to 8.0. Any other key, or ``load: 0`` while another
+       weight is above 0, fails loading. ``prefix: 0`` picks by load alone, and ``prefix: 1``
+       or less keeps a hit below one live request, so it only breaks ties. At data
+       parallelism, warmup copies run with ``prefix_cache=False``, so
+       they still spread but do not warm the prefill that starts from cached pages; a
+       warmup spec that sets ``prefix_cache`` keeps its own value.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+       whatever is free. A node that sets ``capture_cudnn_benchmark`` is held to the
+       share while its captures are sized, so its eager step must fit in it.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
-       kernels instead of time-slicing (the ASR ``*_split`` configs). NVIDIA only, and it
+       kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
+       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
-       message's included.
+       message's included, and of decoded audio samples a route appends
+       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
+       included).
        A live call's opening message past it is refused, and an append that would pass
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
@@ -286,32 +307,153 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``openpi``
+     - *(optional)* For a robot policy, a model that declares ``Model.robot_io`` and
+       ``Model.load_decoded_image`` (pi0.5 today). Serves openpi's policy WebSocket at ``/`` (see
+       :doc:`clients`), mapping an openpi observation onto the request, as openpi's
+       per-robot input and output transforms do. ``images``: the observation keys of the
+       cameras, in slot order. ``state``: the keys whose values are joined, in order,
+       into the robot state. ``action_dims``: how many leading action dims a reply keeps
+       (default all). ``metadata``: the frame sent on connect (default ``{}``). A block
+       the model can't serve (more cameras than ``num_cameras``, an unknown key) stops
+       the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       WebSocket routes; it applies to every route.
        Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
+   * - ``ws_max_message_mb``
+     - *(optional)* The largest WebSocket message the server reads, in MiB, on every
+       WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
+       closes its socket with ``1009`` before any handler sees it, so the client gets no
+       error frame. Raise it for clients that send big uncompressed frames, such as several
+       raw camera images in one openpi observation.
+   * - ``scheduling``
+     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
+       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
+       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
+       may go without running before it goes first, for every key its entry leaves unbounded.
+       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
+       a node, a walk or both, which replaces the model's list; the most specific entry for a
+       pair decides. An entry naming nothing the model runs, a negative priority, a
+       ``max_wait`` under 1, two entries for the same target or an unknown field fail
+       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
+       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
        chain on it merges ready rows of the other walks of its combined walk, so
-       decode steps take in new prompts as they arrive. Off (the default), a chain
+       decode steps take in new prompts, and their chunks, as they arrive. Off, a chain
        keeps to its own walk and yields to the others, and a step mixes walks only
-       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       when the scheduler builds one fresh. Defaults to on where the combined walk
+       has a token budget (``max_batch_tokens``), and off where it has none, since a
+       merged prompt then runs whole. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``max_batch_tokens``
+     - *(optional)* Per node, one token budget for every walk the model budgets, or a
+       mapping of walk -> budget; null turns a walk's chunking off. Overrides the
+       model's defaults. See *Chunked prefill budgets* below.
+   * - ``prefill_token_buckets``
+     - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
+       graph capture is taken at, in place of the model's. A name is a walk the
+       node runs, for its packed captures on that walk (the model's
+       ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
+       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of
+       one of its piecewise packed regions, for that region's ``total_tokens``
+       (BAGEL's ``vit_block_loop``, OmniVoice's ``backbone_layers``). A step
+       pads to the smallest rung that holds it, and a longer one runs eagerly.
+       A walk's ladder is a list, or a
+       mapping of min batch size -> list for a ladder per range of batch sizes:
+       ``{1: [...], 2: [...]}`` captures one request on the first and every larger
+       batch on the second (a larger batch size's ladder must reach at least as
+       far). A walk's ladder runs to the first rung that holds the most tokens a
+       step its capture replays runs: its token budget (``max_batch_tokens``; a walk
+       inside a combined walk runs under the combined walk's), or, for a combined
+       walk's steps, past it where the capture's widest batch of one-token decode
+       rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
+       that many. The rungs past it, which no step would reach, are dropped and
+       logged. A ladder is kept whole
+       where its steps run under no budget or may hold a prompt of a walk whose
+       chunking ``max_batch_tokens`` turned off, which runs whole, as is a
+       region's. A vision tower's ``vision_block_loop`` and an AuT encoder's
+       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
+       every other region keeps its own batch cap. A tower's attention resource is
+       sized from the model's own top rung, and a batch with more attention segments
+       than it holds is split into its requests, a request still over it running
+       eagerly, so a ladder past that rung replays its longer steps only with the
+       resource raised under ``resources``: ``vision_attn: {max_segments_per_step: N}``
+       for a vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N
+       frames or windows a step), and ``audio_attn: {max_segments_per_request: N}`` for
+       Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung adds captures,
+       graph memory and startup time. Loading fails, before any weights load, if the
+       setting is not a mapping of node -> name -> ladder, names a node in no node
+       group or a walk of the model that does not run the node (a node runs the walks
+       it is in and its combined walks), a ladder is not a non-empty list of distinct
+       positive ints, or a name that is no walk has a mapping. Warmup fails on a walk
+       whose steps replay another walk's capture, naming that walk, on a walk the node
+       captures by batch size alone (a ``decode`` capture), on a walk of a node whose
+       model captures no walk at all (a vision tower, an AuT encoder), naming its
+       regions, on a name that is neither a walk nor a region of the node or is both
+       (on a node whose model declares no region, every name that is no walk), and on a
+       region captured by batch size alone; a walk or region the node captures nothing
+       for at this deployment (a model that turns its captures off, such as GLM-5.2's prefill
+       with ``dsa_long_context`` and MTP) is logged and skipped. Loading also fails where a model
+       refuses a region whose buckets it uses elsewhere: CosyVoice3's
+       ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
+       key replaces ``model_kwargs.prefill_token_buckets``,
+       ``prefill_batched_token_buckets`` (GLM-5.2), ``backbone_token_buckets``
+       (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
+   * - ``can_override_mixed_max_tokens``
+     - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
+       of its own under the step's. See *Chunked prefill budgets* below.
+   * - ``speculate_mid_prefill``
+     - *(optional, default true)* Per node, ``true``/``false`` for every walk it chunks,
+       or a mapping of walk -> ``true``/``false``. On, a prompt mid-prefill takes its
+       next chunk in the step speculated during the current one, so a lone long prompt
+       pays no scheduling gap between chunks; other ready work still goes first after
+       every prompt step. Off, the next chunk waits for the current one to land. Naming
+       a node or walk the model does not chunk fails loading.
+   * - ``batch_builder``
+     - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
+       budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
+       a prompt mid-prefill takes the budget before a newer one, so it finishes first,
+       and prompts short enough for an equal share still go in whole. ``fair_share``
+       splits the budget max-min fair over every waiting prompt, so each advances every
+       step and all finish late together.
+   * - ``min_chunk_tokens``
+     - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
+       in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
+       chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
+       up to a page. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
+       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
-       long prompts take (a long-context prefill). A malformed or failing warmup
+       long prompts take (a long-context prefill). Each entry is sent as many
+       times at once as the most data-parallel replicas any of the model's worker
+       graphs is served by (the replicas the conductor picks from; a node group no
+       walk places adds none). The conductor's pick (least loaded, ties to the
+       replica picked longest ago) puts a group's copies on every one of its
+       replicas in whatever order they finish, so every replica warms. When some
+       worker graph has fewer replicas than that, such as one DiT instance beside a
+       replicated VAE, the entry first runs once alone, so that graph also warms its
+       one-request shape before the copies reach it together. A malformed or failing warmup
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
@@ -319,7 +461,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path of every TP and SP group:
+     - *(optional)* Small-message all-reduce path of every TP, SP and CFG group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
        any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
        up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
@@ -337,19 +479,29 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+     - *(optional)* Async scheduling for the parallel nodes: ``true``
+       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
+   * - ``preprocess_workers``
+     - *(optional)* Requests the data worker prepares at once, for a model that
+       declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
+       beside the API server's intra-op threads (``preprocess_torch_threads``),
+       at most 8; ``1`` prepares inline. It must be a positive integer, for any
+       model: the server refuses to start on another value. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
-       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``kv_chain_lazy_steps``, ``kv_pinned_indptrs``,
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_threads``, ``step_thread_core``, ``idle_hold``,
+       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
+       ``step_threads`` takes ``threaded``, the default, or ``serial``, ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
+       ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
+       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
+       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
-       fails at startup. For example ``knobs: {kv_plan_cache: 1,
-       ingraph_decode_rope: true}``, or ``knobs: {pre_plan: false}``
+       fails at startup. For example ``knobs: {kv_chain_lazy_steps: 4,
+       kv_pinned_indptrs: true}``, or ``knobs: {pre_plan: false}``
        (``whisper_large_v3_turbo.yaml``).
 
 Node names are model-specific — they are the node names appearing in the model's graph
@@ -367,15 +519,24 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
-       max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
+       max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
+                                    # flashinfer_backend
+     sampler:
+       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
+argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
+whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
+:doc:`adding_models`), so a deployment that never samples greedily can save their capture
+memory and time this way.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
@@ -385,7 +546,10 @@ travels with its other ``model_kwargs`` (a top-level field on ``/v1/chat/complet
 ``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
-ranks. Loading fails otherwise.
+ranks. Loading fails otherwise. A cache that keeps
+a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
+``prefix_cache`` goes off (logged at info), and a serving config that sets
+``prefix_cache: true`` on it is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
@@ -404,6 +568,115 @@ It doesn't replace the cap. With a host pool and the prefix cache on, a cached p
 copied to the host once no request holds it, and a later request whose prefix the device
 evicted copies it back from there. So the host pool should hold more pages than the device's
 prefix cache.
+
+**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
+budget per step, and a longer prompt is split across steps. Each model sets its own
+budgets:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Model
+     - Node
+     - Chunked walks
+     - Default budget
+   * - Qwen3.5
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed``)
+     - 2048
+   * - Qwen3-Omni
+     - ``Thinker``
+     - ``prefill_text``, ``prefill_audio``, ``prefill_vision`` (in ``thinker_mixed``)
+     - 1024
+   * - BAGEL
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed_text``)
+     - 1024
+   * - Orpheus
+     - ``LLM``
+     - ``prefill`` (in ``mixed``)
+     - 512
+
+A deployment can override them per node, either with one budget for every walk
+the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
+that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
+budget if that is smaller. When less than that is left of a step's budget, the prompt waits
+for the next step rather than running the step over its budget. Under ``fifo`` the first
+prompt in line, started or not, keeps that much of each step from the other prompts, so a
+stream of short ones cannot hold it off.
+
+A node whose resources keep state only on a grid of tokens counted from where a chunk starts
+(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each
+chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
+default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
+up to a page, a budget under a page fails loading, and one under three pages logs a warning:
+a step can then leave up to a page, less one token, of its budget unused.
+
+Most chunked walks run inside a combined walk, which batches a node's prompts and its
+decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
+BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
+walk's budget, so that is the one to set, by naming the node or the combined walk:
+
+.. code-block:: yaml
+
+   max_batch_tokens:
+     LLM: 512                    # every budgeted walk of LLM, its combined walk's too
+     Thinker:
+       thinker_mixed: 1024       # the budget of a Thinker step
+
+A walk inside a combined walk takes a budget of its own only on a node listed in
+``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps
+that walk's rows within each step, under the step's budget, and null keeps its prompts
+whole:
+
+.. code-block:: yaml
+
+   can_override_mixed_max_tokens: {Thinker: true}
+   max_batch_tokens:
+     Thinker:
+       prefill_vision: 512       # vision rows take at most 512 of a step's tokens
+       prefill_audio: null       # audio prompts run whole
+
+Loading fails if a node is not in any node group, if a walk is one the model never runs, if
+the model sets no budget for that walk, or if the walk is inside a combined walk and its
+node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
+
+Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
+ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
+degree above one runs its prefills whole, whatever the model and these budgets say, and
+logs a warning at load.
+
+**Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
+(``cfg_size * sp_size * tp_size`` ranks each, or one rank) runs each request on one of them, its
+replica. The conductor picks it per request, at ingest, as the replica with the lowest
+cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
+groups that pick together, for each request with a partition on them that is not done at
+ingest), plus the price of what the conductor predicts about the request there. Ties go
+to the replica picked longest ago, so requests that never overlap still take turns. Every
+term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
+replica, take one pick together.
+
+Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
+KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``
+times minus the share of the request's prompt positions (every label's, keyed or not)
+the replica's caches are predicted to hold, all the caches on the replica together. At
+the default weights a prompt held whole is worth up to 8 live requests: a request
+follows its prefix to a busier replica, and a hot prefix spreads once its replica runs
+about 8 times its hit share more requests than another. The term is a share rather than
+a token count so that one weight fits models whose prefill and decode costs differ.
+
+The prediction runs the worker's own prefix index and page ownership (``PrefixIndex``,
+``PageArena``) per replica, with no storage, and takes a request's steps at dispatch: its
+lease of the matched pages, its own pages, evicting on a shortfall, the index entries of
+its whole pages, and the page of an image or other item that ends inside one, cached up
+to the item's end. Its end releases its pages; a request that ends before a pass of it
+comes back (aborted while queued, say) also takes back the entries only it made. Workers send
+nothing for it, so it does not see admit timing, decode growth, preemption or a reply's
+tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
+With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it,
+replicas above one rank, where the cache stays off: ``prefix_cache_tp`` on a pool with
+replicas fails at startup, or a keyed node whose recurrent state pool keeps no snapshots,
+``prefix_slots: 0``) the pick is the replica with the fewest live requests.
 
 **Single GPU.** Everything on rank 0:
 
@@ -440,7 +713,27 @@ other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of it
 before it spawns the workers, run every worker as its client so their kernels overlap,
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
-driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
+driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+
+**A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
+group runs that node's steps on a lane of their own instead of the worker's main chain:
+they take no turn on it, run on a second CUDA stream beside its steps, and whatever
+comes ready meanwhile batches into the next one. It applies to the walks the node's
+submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
+``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. Startup fails with a
+``ValueError`` naming the field where the lane can't apply: a TP, SP or CFG node, a node
+alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn't the node's alone, is part of a
+combined walk, or has output spans or a stop check. Without the field the node runs on
+the chain:
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
+     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
@@ -450,7 +743,7 @@ prefill, decode, and image generation on three GPUs:
    node_groups:
      - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
      - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
-     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
 
 Because placement is config-only, the *same* model code runs single-GPU or fully
 disaggregated. ``configs/`` ships several layouts per model (``*_single_gpu``,
@@ -470,6 +763,34 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+**Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
+that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
+classifier-free-guidance branches, each rank running its share of them and the noise
+predictions gathered every step. Each needs the model to declare the node SP- or
+CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+The axes compose: a group's ``ranks`` form lockstep instances of
+``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
+each instance's ranks listed in ascending order, and the conductor routes each request to
+one whole instance:
+
+.. code-block:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
+     # one guidance branch per pair of ranks, each branch's tokens split over its pair
+     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
+
+Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same
+groups on every axis, each declared parallel on those axes by the model. The ranks then run
+every node's steps in one order. The conductor refuses lockstep nodes on one worker in
+different groups, and two lockstep nodes on one worker that share a paged KV cache:
+rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
+per node, riding on one node's next step, so two nodes on one pool could admit out of step on
+a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
+different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
@@ -518,20 +839,43 @@ model_kwargs
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
 baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID variant fixes the action horizon:
+Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune (whose
+``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
+DROID robot's normalization stats:
 
 .. code-block:: yaml
 
    model: "pi05"
    max_seq_len: 2048
    model_kwargs:
-     action_horizon: 15
+     model_path_hf: "lerobot/pi05_droid"
+     num_cameras: 2
+     norm_stats:  # openpi's DROID quantiles, 8 dims each
+       state: {q01: [...], q99: [...]}
+       actions: {q01: [...], q99: [...]}
    node_groups:
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
 
+With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
+actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
+of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
+[-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
+``max_state_dim``, 32 when it sets none); anything else is a 400.
+
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`.
+client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
+sampling knob means.
+Give each request its own ``seed`` for independent
+samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
+with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
+most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
+with none of ``min_p``, the windowed penalty, ``min_tokens``, ``top_p_first`` or processed
+log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
+text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
+reads the first row's seed for the whole batch and folds each row's batch position into
+its random stream, so there the same seed and settings sample the same tokens only in the
+same batch, such as a request sent alone.
 
 Restarts and the compile cache
 ------------------------------
@@ -569,6 +913,76 @@ upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which 
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
+
+.. _host-idle:
+
+Host idle states
+----------------
+
+A decode step hands work between a worker's main, GPU and plan threads several
+times, and every step's tokens go from the API server's message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the ``powersave`` governor, so a small model's step is mostly
+host time spent waking CPUs. Two knobs deal with it:
+
+- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
+  one hardware thread of each, and the API server a core of its own. ``siblings``
+  puts a worker's three threads on one core's hardware threads (two cores of an L2
+  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
+  and logs one line saying why for this host, since neither layout has beaten no pin
+  on every host it was measured on (table below). ``off`` never pins, a number names
+  the first worker's core. Under a job's mask too small for every GPU the container
+  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
+  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+  on different cores.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
+  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
+  containers hide, and it logs what it got.
+
+Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
+to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Host
+     - no pin
+     - ``always`` (three cores)
+     - ``siblings``
+     - every core held out of idle
+   * - 2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs)
+     - 548 / 3939
+     - 526 / 3851
+     - 808 / 5670
+     - c=1: no pin 906, three cores 935, ``siblings`` 753
+   * - 2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs)
+     - 371 / 2688
+     - not measured
+     - 527 / 3635 (two cores of a cluster)
+     - 636 / 4251, no pin
+   * - H100 VM without deep idle states (a handoff 22 µs)
+     - 529 (c=1) / 6520 (c=16)
+     - not measured
+     - 419 / 5526 (an earlier ``auto``, the same layout)
+     - not measured
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+     - 634 / 3617
+     - not measured
+     - 506 / 3103 (an earlier ``auto``, the same layout)
+     - not measured
+
+The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
+With the cores held awake, ``siblings`` loses to no pin and three separate cores are
+level with it, so ``auto`` names the hold first when it is set.
+
+Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
+at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
+at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
+leave it ``off``.
+
+Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
 
 .. _tensor-transport:
 
@@ -753,6 +1167,10 @@ second old:
   ``node_names`` of the config's ``node_groups``), running requests with a pass on that
   node that the conductor dispatched and has not heard back from. The conductor sees
   whole passes, so a node running a request's decode loop counts it once for the loop.
+- ``mstar_routing_predicted_saving_total{model_name, term}``: counter, per term of the
+  data-parallel replica cost, the saving predicted on the replica each request went to,
+  in request-equivalents. For ``prefix``, each request adds the share of its prompt
+  predicted cached there.
 - ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server
   received the last status message, or since metrics were enabled before the first one.
   More than a few seconds means the conductor stopped reporting.
@@ -760,7 +1178,7 @@ second old:
 The engine workers also send the conductor their own metrics every second, which it
 adds to its status message, so these can be up to two seconds old. ``component`` is the
 graph node; a node with replicas on several workers shows their sum, and the ranks of a
-tensor or sequence parallel instance count once (the instance's first rank reports).
+TP, SP or CFG instance count once (the instance's first rank reports).
 The histograms and counters count from the first request after the warmup requests, as
 the API server's do (the gauges show the current state), so read them with ``rate()``
 or ``increase()``.
@@ -774,6 +1192,10 @@ or ``increase()``.
 - ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
   names. Some may also be in use by running requests; the cache frees the others when a
   request needs the room.
+- ``mstar_rebuild_host_bytes_used{model_name, component}``,
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
   thread, or from the end of the previous step if that was later, to the end of its
@@ -816,9 +1238,10 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
-Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
-report the same series. A tensor already on the reader (one it made, or one it read once
+``SHM`` (the arena on CUDA and CPU, and the tensors it spills to files; other
+accelerators send every tensor as a file until the arena is measured there), ``TCP``
+or ``RDMA``. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers

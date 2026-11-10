@@ -24,10 +24,10 @@ from test_request_id_reuse import TEXT, _api_server, _PreprocessWorker, _routes,
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState, ResultQueue
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
-from mstar.model.base import Model
-from mstar.streaming.topology import PartitionTopology
+from mstar.communication.event import EventWakeup
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone
 
 # ── the data worker ─────────────────────────────────────────────────────────
@@ -87,21 +87,14 @@ class _TensorManager:
         pass
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, postprocess_raises=False, prompt_raises=False):
         self.postprocess_raises = postprocess_raises
         self.prompt_raises = prompt_raises
 
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
     def process_prompt(self, *args, **kwargs):
         if self.prompt_raises:
             raise ValueError("bad prompt")
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         if self.postprocess_raises:
@@ -114,8 +107,8 @@ def _thread(model, tensor_manager):
     wt = PreprocessWorkerThread(
         in_queue=queue.Queue(),
         result_tensor_queue=queue.Queue(),
-        out_queue=queue.Queue(),
-        profile_queue=queue.Queue(),
+        out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
         reads_done_queue=queue.Queue(),

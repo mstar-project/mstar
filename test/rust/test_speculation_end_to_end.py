@@ -1,5 +1,5 @@
-"""Speculation over a real graph runtime, Python and Rust, on the paths the
-parity tests in ``test_spec_rows`` do not reach.
+"""Speculation over the real graph runtime, on the paths the parity tests in
+``test_spec_rows`` do not reach.
 
 * A decode loop that consumes a stream, run under random speculation outcomes
   (kept, refused, a row dropped). Every item a producer sends must reach the
@@ -15,20 +15,18 @@ import logging
 import random
 from types import SimpleNamespace
 
-import pytest
 import test_spec_rows as T
 import torch
 
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection
+from mstar.worker.executing_batch import build_executing_batch
 from mstar.worker.spec_rows import DeferredRowInputs
-from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import PendingBatch
+from mstar.worker.step_executor import PendingBatch
 
 CODES, CTX = "codes", "ctx"
 
@@ -66,9 +64,13 @@ def _loop(extra_input: str, streaming: bool) -> Loop:
     return Loop(name=T.LOOP, section=node, max_iters=1 << 20, outputs=[])
 
 
-def _worker(kind: str, section: Loop):
-    def runtime(kind, *_a, **_k):
-        common = dict(
+def _worker(section: Loop, connections=()):
+    def runtime(*_a, **_k):
+        from mstar.communication.tensor_store import RustTensorBookkeeping
+        from mstar.graph.runtime import rust as rust_runtime
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(
+            bookkeeping=book,
             my_worker_id=T.ME,
             my_worker_graphs=[WorkerGraph(
                 section=section, graph_walks={T.WALK}, ranks=[0], worker_graph_id=T.WG,
@@ -77,50 +79,32 @@ def _worker(kind: str, section: Loop):
             all_wg_ids_to_nodes={T.WG: {T.NODE}}, node_to_partition={T.NODE: T.PART},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         )
-        if kind == "python":
-            tm = _TM(T.PythonTensorBookkeeping())
-            return PythonGraphRuntime(**common, tensor_manager=tm, communicator=None), tm
-        from mstar.communication.tensor_store import RustTensorBookkeeping
-        from mstar.graph.runtime import rust as rust_runtime
-        book = RustTensorBookkeeping()
-        return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _TM(book)
+        return rt, _TM(book)
 
     shared, T._runtime = T._runtime, runtime
     try:
-        w = T._worker(kind)
+        w = T._worker(connections=connections, walks={T.WALK: section} if connections else None)
     finally:
         T._runtime = shared
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        release_cached_prefix=lambda batch: None,
-        order_split_rows=lambda node, walk, rids, walks: rids,
-    ))
     return w
 
 
 # --- a stream through speculation ----------------------------------------------
 
-def _values(w, edge) -> list[int]:
-    return [
-        int(v) for info in edge.tensor_info
-        for v in w.tensor_manager.get_tensor(info.uuid).flatten().tolist()
-    ]
+def _values(w, uuids) -> list[int]:
+    return [int(v) for u in uuids for v in w.tensor_manager.get_tensor(u).flatten().tolist()]
 
 
-def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
+def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
     """Drive the loop until every row's stream ends. Returns, per row, the
     items sent, the items executed steps consumed, the items still held by
     its buffer, and how often a step reported its stream final."""
     rng = random.Random(seed)
     section = _loop(CODES, streaming=True)
-    w = _worker(kind, section)
-    w.streams = StreamBufferManager(
-        w.request_state, w.tensor_manager,
-        [Connection(
-            from_partition="LLM", to_partition=T.PART, edge_name=CODES,
-            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=chunk),
-        )],
-        {T.WALK: section},
-    )
+    w = _worker(section, [Connection(
+        from_partition="LLM", to_partition=T.PART, edge_name=CODES,
+        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=chunk),
+    )])
     rids = T._admit(w, n_rids)
     for r in rids:
         w.streams.add_request(r, SimpleNamespace(partition_name=T.PART, stream_lead_items={}))
@@ -134,9 +118,14 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
     def produce():
         for r in sorted(alive):
             for _ in range(min(rng.randint(0, 2), n_items - sent[r])):
-                uid = f"{r}-{sent[r]}"
-                sbuf[r].pre_read_register(uid)
-                sbuf[r].put(uid, torch.tensor([float(sent[r])]))
+                # stored with the one reference its stream destination
+                # holds, which the buffer takes over, as the worker does
+                (info,) = w.tensor_manager.store_and_return_tensor_info(
+                    r, {CODES: [torch.tensor([float(sent[r])])]},
+                )[CODES]
+                w.tensor_manager.tensor_store.increment_ref(info.uuid, 1)
+                sbuf[r].pre_read_register(info.uuid)
+                sbuf[r].put(info.uuid, info.uuid)
                 sent[r] += 1
             if sent[r] == n_items and not sbuf[r].producer_done:
                 sbuf[r].signal_done(n_items)
@@ -161,9 +150,9 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
         """The rest of the row's stream, as its buffer still holds it."""
         vals = []
         while (se := w.streams.pop_edge(sbuf[r], CODES, r)) is not None:
-            vals += _values(w, se.edge)
+            vals += _values(w, se.uuids)
         sbuf[r]._update_buffer()  # items short of a chunk
-        left[r] = vals + [int(v) for t in sbuf[r]._buffer for v in t.flatten().tolist()]
+        left[r] = vals + _values(w, sbuf[r]._buffer)
 
     def retire(r):
         # No loop-back output means its loop ended: stop polling it.
@@ -174,7 +163,7 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
 
     def plain_step():
         """Poll every buffer, then run whichever rows are ready."""
-        w._poll_stream_buffers()
+        w.ingest.poll_stream_buffers()
         popped = w._graph_runtime.pop_rids(T.NODE, T.WALK, sorted(alive))
         if not len(popped.wg_ids.keys):
             return None
@@ -183,9 +172,9 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
             request_to_worker_graph=dict(zip(popped.wg_ids.keys, popped.wg_ids.values, strict=True)),
             input_edges=popped.input_edges, output_signals=list(popped.output_signals),
         )
-        w._set_in_flight_flag(batch, True)
+        w.executor._set_in_flight(batch, True)
         return PendingBatch(
-            batch=batch, node_batch=w._build_executing_batch(batch), node_name=T.NODE,
+            batch=batch, node_batch=build_executing_batch(w.speculator._services, batch), node_name=T.NODE,
             partition=T.PART, graph_walk=T.WALK, future=None,
         )
 
@@ -199,12 +188,12 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
             if pending is not None:
                 record(pending.node_batch)
             continue
-        target = w._choose_spec_target(pending.batch)
-        spec = w._try_speculate_next(pending, target) if target else None
+        target = w.speculator._choose_spec_target(pending.batch)
+        spec = w.speculator._try_speculate_next(pending, target) if target else None
         outcome = rng.choice(["keep", "keep", "refuse", "drop"]) if spec else "none"
         if outcome in ("keep", "drop"):
             missing = (rng.choice(sorted(spec.continuing_rids)),) if outcome == "drop" else ()
-            w._thread_outputs_to_speculative(spec, T._rows_only(pending, missing))
+            w.speculator.thread_outputs(spec, T._rows_only(pending, missing))
             pending = T._advance(w, pending, spec)
             for r in missing:
                 retire(r)
@@ -215,8 +204,8 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
                 pending = None
         else:
             if spec is not None:
-                w._settle_speculation(spec, success=False)
-            w._clear_in_flight_flag(pending.batch)
+                w.speculator.settle(spec, success=False)
+            w.executor.clear_in_flight(pending.batch)
             T._route(w, pending)
             pending = None
     for r in alive:
@@ -224,11 +213,10 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
     return rids, sent, seen, left, finals, alive
 
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_a_stream_reaches_executed_steps_once_and_in_order(kind, caplog):
+def test_a_stream_reaches_executed_steps_once_and_in_order(caplog):
     caplog.set_level(logging.ERROR)
     for seed in range(40):
-        rids, sent, seen, left, finals, alive = _run_stream(kind, seed)
+        rids, sent, seen, left, finals, alive = _run_stream(seed)
         for r in rids:
             assert seen[r] + left[r] == list(range(sent[r])), (
                 f"seed {seed}: rid {r} consumed {seen[r]}, its buffer holds {left[r]}"
@@ -253,9 +241,8 @@ class _NoCalls:
         raise AssertionError(f"the GPU thread called the graph runtime: {name}")
 
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(kind, monkeypatch):
-    w = T._worker(kind, mixed=True)
+def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(monkeypatch):
+    w = T._worker(mixed=True)
     w.scheduler.label_for = lambda node, request_walks: (
         (T.MIXED, request_walks) if len(set(request_walks.values())) > 1
         else (next(iter(request_walks.values())), {})
@@ -276,8 +263,8 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(kind, monkeypatch):
     }
     assert T._view(rows) == T._view(general)
     outputs = T._rows_only(pending)
-    w._thread_outputs_to_speculative(general, outputs)
-    w._thread_outputs_to_speculative(rows, outputs)
+    w.speculator.thread_outputs(general, outputs)
+    w.speculator.thread_outputs(rows, outputs)
     assert T._view(rows) == T._view(general)
 
     batch, rt = rows.scheduled_batch, w._graph_runtime
@@ -288,18 +275,18 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(kind, monkeypatch):
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: [T.SIG] if walk == T.WALK else [],
     )
-    w._device_loopback = {}
-    expected = w._loopback_rids(engine, batch)
-    w._device_loopback = {}
-    w._graph_runtime = _NoCalls(rt)
-    assert w._loopback_rids(engine, batch) == expected
+    body = w.executor._body
+    body._device_loopback = {}
+    expected = body._loopback_rids(engine, batch)
+    body._device_loopback = {}
+    body._graph_runtime = _NoCalls(rt)
+    assert body._loopback_rids(engine, batch) == expected
 
 
 # --- a loop-external input -------------------------------------------------------
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_a_loop_external_input_falls_back_to_rows_and_persists(kind, monkeypatch):
-    w = _worker(kind, _loop(CTX, streaming=False))
+def test_a_loop_external_input_falls_back_to_rows_and_persists(monkeypatch):
+    w = _worker(_loop(CTX, streaming=False))
     rids = T._admit(w, 3)
     block = ColumnarEdgeSpecs.empty()
     for r in rids:
@@ -313,8 +300,8 @@ def test_a_loop_external_input_falls_back_to_rows_and_persists(kind, monkeypatch
         assert not isinstance(rows.node_batch.per_request_input_tensors, DeferredRowInputs)
         assert T._view(rows) == T._view(general)
         outputs = T._rows_only(pending)
-        w._thread_outputs_to_speculative(general, outputs)
-        w._thread_outputs_to_speculative(rows, outputs)
+        w.speculator.thread_outputs(general, outputs)
+        w.speculator.thread_outputs(rows, outputs)
         assert T._view(rows) == T._view(general)
         inputs = rows.node_batch.per_request_input_tensors
         assert {r: [float(t) for t in inputs[r][CTX]] for r in rids} == {

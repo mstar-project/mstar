@@ -8,7 +8,7 @@ consumer then used to emit an empty final chunk and end its partition, and
 the real last item came after as a second final chunk.
 
 These run the whole chain through the real code: a producer graph runtime
-(both of them) routes and sends a streamed item, the conductor processes the
+routes and sends a streamed item, the conductor processes the
 WORKER_GRAPHS_DONE and sends ``producer_done``, and a consumer worker takes
 the two messages in a chosen order. Only transport reads are stubbed.
 """
@@ -16,65 +16,41 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from rust_runtime import Inboxes, build_runtime
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
-from mstar.communication.tensors import TensorCommunicationManager
+from mstar.communication.edge_items import row_infos
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.wire import decode
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.model.base import ForwardPassArgs, WorkerGraph
+from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    EdgeItems,
     InputSignals,
     WorkerGraphsDone,
     WorkerMessageType,
 )
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 PRODUCER = "worker_0"
 CONSUMER = "worker_1"
 EDGE = "new_token"
 RID = "r1"
-
-
-class _StubTensorManager:
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-    set_persist = TensorCommunicationManager.set_persist
-    dereference = TensorCommunicationManager.dereference
-    dereference_batch = TensorCommunicationManager.dereference_batch
-    dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
-    cleanup_collectable = TensorCommunicationManager.cleanup_collectable
-    stamps_shm_placement = False
-
-    def __init__(self, bookkeeping):
-        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
-
-    def increment_ref(self, uuid, n=1):
-        self.tensor_store.increment_ref(uuid, n=n)
-
-    def refresh_shm_placement(self, edges):
-        pass
-
-    def _cleanup_by_uuid(self, uuid, registered=None):
-        if self.tensor_store.check_uuid_presence(uuid):
-            self.tensor_store.remove_tensor(uuid)
-        elif registered is None:
-            self.tensor_store.bookkeeping.forget_tensor(uuid)
 
 
 class _Capture:
@@ -96,7 +72,7 @@ class _Producer:
     """``LLM`` on worker_0 streams ``new_token`` into ``snac_decoder`` on
     worker_1, each in its own walk and partition, as Orpheus splits them."""
 
-    def __init__(self, kind, tmp_path):
+    def __init__(self, tmp_path, walk_driven_signals=frozenset()):
         llm = WorkerGraph(
             section=GraphNode(
                 name="LLM", input_names={"text_inputs"},
@@ -105,39 +81,18 @@ class _Producer:
             ),
             graph_walks={"decode"}, ranks=[0], worker_graph_id=0,
         )
-        common = dict(
+        self.inboxes = Inboxes(PRODUCER, tmp_path, peers=("conductor", "api_server", CONSUMER))
+        self.rt = build_runtime(
+            inboxes=self.inboxes,
             my_worker_id=PRODUCER, my_worker_graphs=[llm],
             all_wg_ids_to_graph_walks={0: {"decode"}, 1: {"snac_chunk"}},
             all_wg_ids_to_dyn_loops={0: set(), 1: set()},
             all_wg_ids_to_nodes={0: {"LLM"}, 1: {"snac_decoder"}},
             node_to_partition={"LLM": "LLM", "snac_decoder": "SNAC"},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+            walk_driven_signals=walk_driven_signals,
         )
-        self.kind = kind
-        if kind == "python":
-            self.book = PythonTensorBookkeeping()
-            self.capture = _Capture()
-            self.rt = PythonGraphRuntime(
-                tensor_manager=_StubTensorManager(self.book),
-                communicator=self.capture, **common,
-            )
-        else:
-            pytest.importorskip("mstar_rust")
-            from mstar_rust import ZmqCommunicator
-
-            from mstar.communication.tensor_store import RustTensorBookkeeping
-            from mstar.graph.runtime.rust import RustGraphRuntime
-
-            self.book = RustTensorBookkeeping()
-            comm = ZmqCommunicator(PRODUCER, str(tmp_path))
-            self.inboxes = {
-                peer: ZmqCommunicator(peer, str(tmp_path))
-                for peer in ("conductor", "api_server", CONSUMER)
-            }
-            self.rt = RustGraphRuntime(
-                bookkeeping=self.book,
-                communicator=SimpleNamespace(_inner=comm), **common,
-            )
+        self.book = self.rt.tensor_store.bookkeeping
         self.rid = self.rt.add_request(
             request_id=RID, partition="LLM", graph_walk="decode",
             partition_worker_graph_ids=[0],
@@ -158,6 +113,7 @@ class _Producer:
             output_signals=[EDGE], wg_ids=ParallelList([self.rid], [0]),
             tensors=[uuid], num_tensors=[1],
         ))
+        self.route = out
         fwd = CurrentForwardPassInfo(
             request_id=RID, graph_walk="decode", fwd_index=0, random_seed=0,
             max_tokens=8, partition_name="LLM",
@@ -165,16 +121,7 @@ class _Producer:
         self.rt.send_outputs(SendInput(
             out.completion_id, ParallelList([self.rid], [fwd]), ParallelList([], []),
         ))
-        return self._take()
-
-    def _take(self):
-        if self.kind == "python":
-            got, self.capture.messages = self.capture.messages, []
-        else:
-            got = [
-                (peer, m) for peer in ("conductor", CONSUMER)
-                for m in _collect(self.inboxes[peer])
-            ]
+        got = self.inboxes.take()
         to_consumer = [m.body for d, m in got if d == CONSUMER]
         to_conductor = [m.body for d, m in got if d == "conductor"]
         assert len(to_consumer) == 1 and len(to_conductor) == 1
@@ -182,37 +129,14 @@ class _Producer:
         return to_consumer[0], to_conductor[0]
 
 
-def _collect(box):
-    out = []
-    first = box.recv_timeout(1000)
-    if first is None:
-        return out
-    out.append(decode(first))
-    while (more := box.recv_timeout(50)) is not None:
-        out.append(decode(more))
-    return out
-
-
-class _EndsLLM:
-    """The LLM partition ends on its ``passes``-th pass."""
-
-    def __init__(self, passes):
-        self.left = passes
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata,
-                                        persist_signals, incoming_connections=None):
-        assert partition_name == "LLM"
-        self.left -= 1
-        return ForwardPassArgs(
-            full_metadata=partition_metadata, inputs=[], unpersist_tensors=[],
-            request_done=self.left == 0,
-        )
-
-
 def _conductor(passes=1):
+    """The LLM partition's plan ends on its ``passes``-th pass."""
     c = object.__new__(Conductor)
-    c.model = _EndsLLM(passes)
     c.producer_triggered_partitions = set()
+    c._walk_inputs = {"decode": (), "snac_chunk": ()}
+    c._walk_persists = dict.fromkeys(c._walk_inputs, frozenset())
+    c._repeating_walks = frozenset({"snac_chunk"})
+    c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}, 1: {"snac_chunk"}}
@@ -221,22 +145,20 @@ def _conductor(passes=1):
     def next_pass(request_id, pname, walk):
         c.requests[request_id].partition_states[pname].current_worker_graph_ids = {0}
     c._set_partition_worker_graph_ids = next_pass
-    meta = CurrentForwardConductorMetadata
     req = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [PRODUCER], 1: [CONSUMER]},
         all_worker_graph_ids={0, 1}, max_output_tokens=10_000, random_seed=0,
         resource_configs={},
         partition_states={
-            "LLM": PartitionState("LLM", meta(graph_walk="decode", is_prefill=False),
-                                  current_worker_graph_ids={0}),
-            "SNAC": PartitionState("SNAC", meta(graph_walk="snac_chunk", is_prefill=False),
-                                   current_worker_graph_ids={1}),
+            "LLM": PartitionState("LLM", "decode", current_worker_graph_ids={0},
+                                  plan=[WalkStep("decode")] * passes),
+            "SNAC": PartitionState("SNAC", "snac_chunk", current_worker_graph_ids={1},
+                                   plan=[WalkStep("snac_chunk")]),
         },
         partition_definitions={
             "LLM": PartitionDefinition(name="LLM", graph_walks={"decode"}),
-            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"},
-                                        producer_partitions=["LLM"]),
+            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"}),
         },
         streaming_connections={("LLM", "SNAC", EDGE): StreamingConnectionState(
             from_partition="LLM", to_partition="SNAC", edge_name=EDGE,
@@ -262,36 +184,44 @@ def _conduct(c, wgds) -> InputSignals:
 
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
     buf = StreamBuffer(1, EDGE, "LLM", policy)
-    w.worker_id = CONSUMER
-    w._draining_rids = set()
-    w.enable_nvtx = False
-    w._rid = lambda rid: 1
-    w.request_state = SimpleNamespace(per_request_info={
+    request_state = SimpleNamespace(per_request_info={
         1: SimpleNamespace(stream_buffers={EDGE: buf}, ended_streams=set()),
     })
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
-    w.tensor_manager = SimpleNamespace(
+    tensor_manager = SimpleNamespace(
         start_read_tensors=lambda *a, **k: [],
+        start_read_tensors_multi=lambda reads: [],
         get_tensor=lambda uuid: torch.tensor([uuid]),
         dereference_batch_uniform=lambda ids: None,
-        store_and_return_tensor_info=lambda rid, d, **k: {
-            name: [object()] for name in d
-        },
+        increment_ref_batch_uniform=lambda ids: None,
     )
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.streams.consumer_node = {EDGE: "snac_decoder"}
-    w.streams._partition = {EDGE: "SNAC"}
+    streams = StreamBufferManager(request_state, tensor_manager, [])
+    streams.consumer_node = {EDGE: "snac_decoder"}
+    streams._partition = {EDGE: "SNAC"}
+    w = make_worker(
+        worker_id=CONSUMER,
+        request_state=request_state,
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
+        tensor_manager=tensor_manager,
+        graph_runtime=SimpleNamespace(get_rid_handle=lambda wire: 1),
+        streams=streams,
+    )
     return w, buf
 
 
 def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
-    w._process_new_inputs(descriptor)
-    for edge in descriptor.inputs:
+    if isinstance(descriptor, EdgeItems):
+        w.ingest._process_edge_items(descriptor)
+        edges = [
+            GraphEdge(next_node=row.next_node, name=row.signal,
+                      tensor_info=row_infos(descriptor, row), is_streaming=True)
+            for row in stream_rows(descriptor)
+        ]
+    else:
+        w.ingest._process_new_inputs(descriptor)
+        edges = descriptor.inputs
+    for edge in edges:
         w.streams.route_tensor(1, edge)
 
 
@@ -306,18 +236,30 @@ def _chunks(w, buf):
     return out
 
 
-@pytest.fixture(params=["python", "rust"])
-def kind(request):
-    return request.param
+@pytest.mark.parametrize("walk_driven", [False, True])
+def test_a_walk_driven_stream_keeps_input_signals(tmp_path, walk_driven):
+    """A stream whose consumer walk the producer decides goes to its peer as
+    INPUT_SIGNALS with its request info, which carries that walk; any other
+    plain stream rides EDGE_ITEMS."""
+    producer = _Producer(
+        tmp_path, walk_driven_signals=frozenset({EDGE}) if walk_driven else frozenset(),
+    )
+    to_consumer, _ = producer.step(1)
+    assert isinstance(to_consumer, InputSignals if walk_driven else EdgeItems)
+    if walk_driven:
+        # the row asks for its forward-pass info, which carries the walk
+        needs = producer.route.rids_needing_request_info
+        assert needs is None or producer.rid in needs
+        assert to_consumer.request_info is not None
 
 
-def test_done_before_the_last_item_waits_for_it(kind, tmp_path):
-    producer = _Producer(kind, tmp_path)
+def test_done_before_the_last_item_waits_for_it(tmp_path):
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 
     w, buf = _consumer(FixedChunkPolicy(25))
-    w._process_new_inputs(done)
+    w.ingest._process_new_inputs(done)
     assert _chunks(w, buf) == [], "ended the stream before its last item arrived"
 
     _deliver(w, descriptor)
@@ -325,16 +267,16 @@ def test_done_before_the_last_item_waits_for_it(kind, tmp_path):
     assert _chunks(w, buf) == []
 
 
-def test_done_before_the_last_of_several_passes(kind, tmp_path):
+def test_done_before_the_last_of_several_passes(tmp_path):
     """The count spans every pass's report, not just the one that ended it."""
-    producer = _Producer(kind, tmp_path)
+    producer = _Producer(tmp_path)
     first, wgd1 = producer.step(uuid=11)
     second, wgd2 = producer.step(uuid=12)
     done = _conduct(_conductor(passes=2), [wgd1, wgd2])
 
     w, buf = _consumer(FixedChunkPolicy(1))
     _deliver(w, first)
-    w._process_new_inputs(done)
+    w.ingest._process_new_inputs(done)
     assert _chunks(w, buf) == [(1, False)]
     _deliver(w, second)
     assert _chunks(w, buf) == [(1, True)]
@@ -342,12 +284,12 @@ def test_done_before_the_last_of_several_passes(kind, tmp_path):
 
 
 @pytest.mark.parametrize("flush", ["one_per_tick", "all_at_once"])
-def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
+def test_a_send_backlog_that_drains_after_done(tmp_path, flush):
     """With non-blocking sends and a per-peer backlog (#217), descriptors for a
     backed-up consumer wait on the producer while its completions reach an idle
     conductor at once. Every pass's descriptor then lands after
     ``producer_done``, in order, and the stream ends with the last one."""
-    producer = _Producer(kind, tmp_path)
+    producer = _Producer(tmp_path)
     backlog, wgds = [], []
     for uuid in (11, 12, 13):
         descriptor, wgd = producer.step(uuid=uuid)
@@ -357,7 +299,7 @@ def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
 
     if flush == "one_per_tick":
         w, buf = _consumer(FixedChunkPolicy(1))
-        w._process_new_inputs(done)
+        w.ingest._process_new_inputs(done)
         assert _chunks(w, buf) == [], "ended the stream before its backlog drained"
         _deliver(w, backlog[0])
         assert _chunks(w, buf) == [(1, False)]
@@ -367,7 +309,7 @@ def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
         assert _chunks(w, buf) == [(1, True)]
     else:
         w, buf = _consumer(FixedChunkPolicy(25))
-        w._process_new_inputs(done)
+        w.ingest._process_new_inputs(done)
         assert _chunks(w, buf) == [], "ended the stream before its backlog drained"
         for descriptor in backlog:
             _deliver(w, descriptor)
@@ -376,15 +318,15 @@ def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
     assert done.producer_done_items == {EDGE: 3}
 
 
-def test_items_before_done_end_the_stream_as_before(kind, tmp_path):
-    producer = _Producer(kind, tmp_path)
+def test_items_before_done_end_the_stream_as_before(tmp_path):
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 
     w, buf = _consumer(FixedChunkPolicy(25))
     _deliver(w, descriptor)
     assert _chunks(w, buf) == []
-    w._process_new_inputs(done)
+    w.ingest._process_new_inputs(done)
     assert _chunks(w, buf) == [(1, True)]
     assert _chunks(w, buf) == []
 
@@ -394,19 +336,19 @@ def test_a_stream_that_sent_nothing_ends_at_once():
         request_id=RID, worker_graph_ids=[0], is_first_tp_rank=True, partition_name="LLM",
     )])
     w, buf = _consumer(FixedChunkPolicy(25))
-    w._process_new_inputs(done)
+    w.ingest._process_new_inputs(done)
     assert _chunks(w, buf) == [(0, True)]
 
 
 def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
     """Qwen3-Omni's Thinker to Talker: empty chunks keep the consumer going
     after the producer ends, and one must not stand in for the last item."""
-    producer = _Producer("python", tmp_path)
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 
     w, buf = _consumer(FixedChunkPolicy(1, continue_after_done=True))
-    w._process_new_inputs(done)
+    w.ingest._process_new_inputs(done)
     assert w.streams.pop_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
     _deliver(w, descriptor)
     se = w.streams.pop_edge(buf, EDGE, 1)

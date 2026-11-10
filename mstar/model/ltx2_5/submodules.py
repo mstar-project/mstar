@@ -28,14 +28,12 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import (
-    AttentionStep,
     RaggedCrossAttentionStep,
     Segment,
     SlotLease,
     SubmoduleStep,
     cross_label,
 )
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
@@ -341,15 +339,15 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self._attends = None  # the memoized callables hold the old resources
 
     def attends(self) -> LTX2Attends:
-        """The six attentions' callables, built once per resource binding: a compiled
-        region guards on their identity (see ``DenoiseLoopSubmodule.ragged_for``)."""
+        """The six attentions' callables, built once per resource binding rather than
+        per step."""
         if self._attends is None:
             def on(key, label):
                 resource = self.node_resources.get(key) if self.use_ragged_attention else None
                 if resource is None:
                     return sdpa_attention
                 # every row has the bucket's spans, so [B, L, H, D] packs per request
-                return functools.partial(joint_attention, ragged=RaggedAttentionCallable(resource, label))
+                return functools.partial(joint_attention, ragged=functools.partial(resource.run, label=label))
             self._attends = LTX2Attends(
                 video_self=on(VIDEO_ATTN, VIDEO_SPAN),
                 audio_self=on(AUDIO_ATTN, AUDIO_SPAN),
@@ -379,8 +377,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
         return SubmoduleStep(
             steps={
-                VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
-                AUDIO_ATTN: AttentionStep(segments=tuple(audio), causal=False),
+                VIDEO_ATTN: self.attention_step(video),
+                AUDIO_ATTN: self.attention_step(audio),
                 VIDEO_XATTN: RaggedCrossAttentionStep(
                     segments=tuple(video_shard + text), pairs=VIDEO_XATTN_PAIRS,
                 ),
@@ -520,7 +518,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         # shapes cover 1088x1920 (dynamo would unroll the tile loop of ``vae.decode`` into one
         # enormous graph).
         if compile_decode:
-            # before the warm-up: dynamo guards on requires_grad (see KleinVaeDecoderSubmodule)
+            # before the warm-up: dynamo guards on requires_grad (see decode_utils.WarmedDecode)
             vae.requires_grad_(False)
             vae.decoder = _WarmedDecoder(vae.decoder)
             self.warmup(warmup_shapes)

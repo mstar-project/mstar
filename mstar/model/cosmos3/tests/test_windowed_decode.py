@@ -19,6 +19,7 @@ from diffusers import AutoencoderKLWan  # noqa: E402
 
 from mstar.model.components.wan_vae import is_channels_last  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
+from mstar.model.cosmos3 import submodules as cosmos3_submodules  # noqa: E402
 from mstar.model.cosmos3.config import Cosmos3Config  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
     Cosmos3VAEDecoderARSubmodule,
@@ -163,7 +164,7 @@ def test_a_failed_window_drops_the_cache(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae)
     _run(sub, "r", windows[:1], 77, num_windows=3)
     st = sub.request_state("r")
-    decoder, calls = sub._step._decoder, []
+    decoder, calls = sub._stream.step._decoder, []
 
     def fail_third(x, **kw):
         calls.append(x.shape[2])
@@ -171,11 +172,11 @@ def test_a_failed_window_drops_the_cache(monkeypatch, vae) -> None:
             raise RuntimeError("injected")
         return decoder(x, **kw)
 
-    sub._step._decoder = fail_third
+    sub._stream.step._decoder = fail_third
     with pytest.raises(RuntimeError, match="injected"):
         _run(sub, "r", windows[1:2], 77, num_windows=3)
     assert "ar_feat_cache" not in st and st["ar_chunks"] == 1
-    sub._step._decoder = decoder
+    sub._stream.step._decoder = decoder
     retried = _run(sub, "r", windows[1:2], 77, num_windows=3)
     assert "ar_feat_cache" in st
     ref = _run(_decoder(monkeypatch, vae, warm=False), "r", windows, 77)
@@ -236,8 +237,8 @@ def test_channels_last_decoder(monkeypatch) -> None:
 
 def _record_calls(sub) -> list:
     calls = []
-    decoder = sub._step._decoder
-    sub._step._decoder = lambda x, **kw: calls.append(x.shape[2]) or decoder(x, **kw)
+    decoder = sub._stream.step._decoder
+    sub._stream.step._decoder = lambda x, **kw: calls.append(x.shape[2]) or decoder(x, **kw)
     return calls
 
 
@@ -280,7 +281,7 @@ def test_resumed_first_window_is_not_grouped(monkeypatch, vae) -> None:
 def test_warm_cache_switch_off_keeps_no_cache(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae, warm=False)
     _run(sub, "r", _windows(_stream(14))[:1], 53, num_windows=2)
-    assert "ar_feat_cache" not in sub.request_state("r") and sub._step is None
+    assert "ar_feat_cache" not in sub.request_state("r") and sub._stream is None
 
 
 def _warm(sub) -> set:
@@ -361,7 +362,7 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     assert seen and not any(seen)
     with torch.no_grad():
         ref = vae.decode(sub._vae_input(stream)).sample
-    assert torch.equal(video, (ref / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+    assert torch.equal(video, (ref.float() / 2 + 0.5).clamp(0, 1).mul(255).round().to(torch.uint8))
 
 
 def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
@@ -377,7 +378,7 @@ def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
     fast_vae.load_state_dict(ref_vae.state_dict())
     cfg = Cosmos3Config()
     assert cfg.vae_decode_fast
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     fast = Cosmos3VAEDecoderSubmodule(fast_vae, cfg, fast=cfg.vae_decode_fast)
     assert is_channels_last(fast_vae)
     got = fast._decode_pixels(stream)

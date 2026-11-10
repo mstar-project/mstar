@@ -29,6 +29,10 @@ class RaggedAttnBackend(Enum):
     FLASHINFER = "flashinfer"
     # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
     DENSE = "dense"
+    # torch's cuDNN SDPA over equal-length segments, FlashInfer for any other
+    # layout; self-attention only, and refused at build where cuDNN can't run
+    # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
+    CUDNN = "cudnn"
 
 
 @dataclass(frozen=True)
@@ -68,12 +72,26 @@ class RaggedAttentionConfig:
     # span, not a request — a request carrying several images contributes
     # several.
     max_segments_per_request: int = 1
+    # For a resource whose captured region replays a whole step as one row
+    # (`one_row_per_step`): every segment of the step, every request's, that
+    # one replay's plan holds, in place of the per-request ceiling.
+    max_segments_per_step: int | None = None
     # Only for a runner that buckets by batch size alone; elsewhere the
     # bucket's own token count is the ceiling and this stays None.
     max_tokens_per_request: int | None = None
 
     backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
-    flashinfer_backend: str = "auto"
+    # None: under AUTO a self-attention runs the `ragged_attention` kernel
+    # table's pick, and FlashInfer's own "auto" where no table applies. A name,
+    # "auto" included, runs that FlashInfer backend and reads no table.
+    flashinfer_backend: str | None = None
+
+    # Whether a compiled caller keeps the attention in its graph, as the
+    # ``mstar::ragged_attention`` op, rather than breaking there per layer. For
+    # a compiled, uncaptured region whose fusions around attention pay; off by
+    # default, since tracing a whole transformer as one graph per capture
+    # bucket costs startup time and capture memory (Z-Image: +2.6 GiB).
+    compile_op: bool = False
 
     # Activation dtype of the q / k / v the node hands the kernel (and of its
     # output). A cacheless attention doesn't need to adhere to the dtype of its
@@ -86,9 +104,11 @@ class RaggedAttentionConfig:
     # replicated stream, or a cross-attention from the rank's query shard.
     shard_over_sp: bool = True
 
-    # Each label's FlashInfer workspace, per slot; None takes
-    # MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV
-    # partials (tens of MB), so a resource with many labels can declare less.
+    # Where each label's FlashInfer workspace starts, per slot; None takes
+    # MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that
+    # asks for more grows it. FA3 plans don't use it; FA2 spends it on split-KV
+    # partials, which a captured plan sizes from its bucket's tokens and segment
+    # ceiling, so a resource with many labels can declare less.
     workspace_mb: int | None = None
 
     def __post_init__(self):
@@ -112,6 +132,8 @@ class RaggedAttentionConfig:
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
     def max_segments_for(self, bs: int) -> int:
+        if self.max_segments_per_step is not None:
+            return self.max_segments_per_step
         return bs * self.max_segments_per_request
 
     def max_tokens_for(self, bs: int) -> int | None:
@@ -131,20 +153,31 @@ class _RaggedSpecBase(NodeResourceSpec):
         backend: str | RaggedAttnBackend | None = None,
         flashinfer_backend: str | None = None,
         max_segments_per_request: int | None = None,
+        max_segments_per_step: int | None = None,
         max_tokens_per_request: int | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the model's —
         an image that cannot build FA3 pins FA2 here.
 
-        The two ceilings are here rather than on the model because they size
-        CUDA-graph buckets, which is a deployment's memory/coverage trade.
+        The ceilings are here rather than on the model because they size
+        CUDA-graph buckets, which is a deployment's memory/coverage trade. A
+        resource sized per step (``max_segments_per_step``) never reads the
+        per-request segment ceiling, so an override of that is refused.
         """
+        per_step = self.config.max_segments_per_step if max_segments_per_step is None else max_segments_per_step
+        if max_segments_per_request is not None and per_step is not None:
+            raise ValueError(
+                f"resource {self.resource_key!r} is sized per step: set max_segments_per_step, "
+                "not max_segments_per_request"
+            )
         if backend is not None:
             self.config.backend = RaggedAttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
         if max_segments_per_request is not None:
             self.config.max_segments_per_request = max_segments_per_request
+        if max_segments_per_step is not None:
+            self.config.max_segments_per_step = max_segments_per_step
         if max_tokens_per_request is not None:
             self.config.max_tokens_per_request = max_tokens_per_request
 
@@ -164,7 +197,7 @@ class RaggedAttentionSpec(_RaggedSpecBase):
 class RaggedCrossAttentionSpec(_RaggedSpecBase):
     """Cacheless cross-attention between two spans of each request: a forward's
     ``(q_label, kv_label)`` pairs (``RaggedCrossAttentionStep``), each run through
-    ``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``.
+    ``resource.run(q, k, v, label=cross_label(q_label, kv_label))``.
 
     Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:
     a model with both declares one of each per head geometry.

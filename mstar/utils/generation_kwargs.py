@@ -1,4 +1,4 @@
-"""The client-facing generation knobs, checked once where every endpoint submits.
+"""The client-facing generation knobs, sampling and output geometry, checked once where every endpoint submits.
 
 One meaning per knob on every model: ``null`` is the
 same as leaving the key out, a value is coerced to the knob's type only when it
@@ -40,12 +40,24 @@ def offset_seed(seed: int, i: int) -> int:
 
 
 # knob -> (rule text, predicate); the sampling ones are the sampler's own
-_REAL_RULES = {**REAL_KNOB_RULES}
+_REAL_RULES = {
+    **REAL_KNOB_RULES,
+    "fps": ("> 0", lambda v: v > 0),
+    "guidance_scale": ("of any sign", lambda v: True),
+    "speed": ("> 0", lambda v: v > 0),
+}
 _INT_RULES = {
     **INT_KNOB_RULES,
     "max_output_tokens": (">= 1", lambda v: v >= 1),
+    "num_inference_steps": (">= 1", lambda v: v >= 1),
+    "num_step": (">= 1", lambda v: v >= 1),
+    "rollout_horizon": (">= 0", lambda v: v >= 0),
+    "num_frames": (">= 1", lambda v: v >= 1),
+    "height": (">= 1", lambda v: v >= 1),
+    "width": (">= 1", lambda v: v >= 1),
 }
-_BOOL_KNOBS = (*BOOL_KNOBS, "do_sample")
+# enable_thinking: what a chat template reads; "false" is truthy there
+_BOOL_KNOBS = (*BOOL_KNOBS, "do_sample", "return_token_ids", "enable_thinking")
 
 # other names for max_output_tokens, in precedence order after it
 MAX_OUTPUT_TOKENS_ALIASES = ("max_new_tokens", "max_completion_tokens", "max_tokens")

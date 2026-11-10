@@ -1,5 +1,16 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
+# Captured text-prefill and mixed-step ladders (see docs/serving.rst): the
+# powers of two to 2048, and on text prefill 1152-1792 too, so a prompt a
+# little past 1024 tokens doesn't pad to 2048 (on a mixed step every (rows,
+# tokens) pair is one more compile against Dynamo's recompile limit). The LLM's
+# 2048-token step budget caps both walks: a mixed step's decode rows (128 at
+# most) leave its prompts at least min_chunk_tokens (128) of it, so no step
+# passes 2048 and Qwen3.5's 2176 slack rung would never replay here.
+prefill_token_buckets:
+  LLM:
+    prefill_text: [32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048]
+    mixed: [32, 64, 128, 256, 512, 1024, 2048]
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
@@ -9,13 +20,15 @@ resources:
   gdn_state:
     max_slots: 129
     # GDN state snapshots at page boundaries for the prefix cache, kept across requests and
-    # evicted oldest first. A prefill keeps up to two, and each takes a request slot's memory.
+    # evicted oldest first, replies before prompts. A prefill keeps up to two, plus one per
+    # chunk the step budget cuts (each earlier one evicted first), and each takes a request
+    # slot's memory.
     prefix_slots: 128
     # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
 
-# The vision encoder compiles on its first image shape and recompiles dynamic
-# on the second (~1.5 s each); these two sizes (64 and 608 image tokens) take
-# both compiles before the server binds.
+# The vision regions compile at start-up; these two sizes (64 and 608 image
+# tokens) warm two of the captured block loop's buckets and the LLM's vision
+# prefill before the server binds.
 warmup_requests:
   - text: What is in this image?
     files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]

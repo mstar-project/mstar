@@ -17,7 +17,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
@@ -26,6 +25,7 @@ from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextM
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
+from mstar.testing_utils.resource import StubResource
 
 
 def _batch(**kwargs) -> ExecutingBatch:
@@ -38,12 +38,8 @@ def _batch(**kwargs) -> ExecutingBatch:
     return ExecutingBatch(**kwargs)
 
 
-class _GreedySampler(Resource):
+class _GreedySampler(StubResource):
     """Argmax in place of the Triton sampler; the Resource hooks are no-ops."""
-
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
 
     def sample(self, request_ids, logits, **kwargs):
         return logits.argmax(-1)
@@ -240,6 +236,31 @@ class TestEngineCpu:
         # the step already scheduled when the stop lands still fits
         _run(engine, "decode", {"r": token})
         assert _context(sub, "r") == limit
+        engine.remove_request("r")
+
+    def test_a_reply_at_the_most_tokens_the_window_holds_gets_them_all(self):
+        """The conductor takes a max_tokens up to the window's room after the prompt (the
+        last token is never stored), and the loop's cap ends the reply there: the window's
+        own stop fires on that token, not one before it."""
+        engine, sub, cfg = _build_engine(seed=2)
+        limit = cfg.index_topk
+        _add(engine, "r")
+        prompt = torch.arange(limit - 5, dtype=torch.long)
+        max_tokens = limit - len(prompt) + 1
+        token = _run(engine, "prefill", {"r": prompt})["r"]
+        emitted = 1
+        for i in range(limit):
+            token = _run(engine, "decode", {"r": token})["r"]
+            emitted += 1
+            info = _info("r", "decode", max_tokens=max_tokens)
+            info.dynamic_loop_iter_counts["decode_loop"] = i
+            batch = _batch(
+                node_name="LLM", per_request_info={"r": info},
+                step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
+            )
+            if engine.check_stop_for_batch(batch, {"r": {"new_token": [token]}}).get("r"):
+                break
+        assert emitted == max_tokens == 6 and _context(sub, "r") == limit
         engine.remove_request("r")
 
     def test_forward_runs_outside_the_engine_autocast(self):

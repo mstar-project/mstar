@@ -3,7 +3,8 @@ are rejected when it starts, not served wrongly later.
 
 ``validate_deployment`` refuses: a walk in no partition or in two, a
 partition naming an undefined walk, a node placed by no node_group or by two
-for one walk, a node_group naming an undefined walk, and the stream-driven
+for one walk, a node_group naming an undefined walk, a rank no walk runs on,
+and the stream-driven
 shapes the runtime and conductor can't account for: a self-triggered consumer
 (every input streamed) sharing its worker graph with another top-level entity,
 and a consumer walk across worker graphs, unless its consumers are gated and
@@ -19,11 +20,10 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from rust_runtime import Inboxes, build_runtime
 from test_graph_runtime import (
-    StubTensorManager,
     _fwd_info,
     _ingest,
-    _RecordingCommunicator,
     _sharding_config,
     _store_outputs,
 )
@@ -33,26 +33,26 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
-from mstar.validation import DeploymentError, validate_deployment
+from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class _ToyModel(Model):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
+class _ToyModel(StubModel):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
+        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -64,25 +64,8 @@ class _ToyModel(Model):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
-
-    def get_node_resources(self):
-        return []
-
-    def get_initial_forward_pass_args(self, *a, **k):
-        raise NotImplementedError
-
-    def get_partition_forward_pass_args(self, *a, **k):
-        raise NotImplementedError
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
+                              sp_enabled_nodes=self._sp_enabled_nodes)
 
 
 def _config(tmp_path, node_groups) -> str:
@@ -165,6 +148,30 @@ def test_node_in_no_node_group_is_rejected(tmp_path):
         _validate(_ToyModel(_prefill_decode), cfg)
 
 
+def test_a_rank_no_walk_runs_on_is_rejected(tmp_path):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [1, 2]},
+    ])
+    with pytest.raises(ValueError, match=r"names ranks \[1, 2\], but no node of any graph walk runs on them"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+    # a group whose walks don't hold its node
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
+        {"node_names": ["other"], "ranks": [1], "graph_walks": ["decode"]},
+    ])
+    with pytest.raises(ValueError, match=r"node_groups names ranks \[1\]"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+
+
+def test_a_left_over_group_on_a_rank_a_walk_uses_is_accepted(tmp_path, monkeypatch):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [0]},
+    ])
+    assert _start_conductor(_ToyModel(_prefill_decode), cfg, tmp_path, monkeypatch)._sorted_ranks == [0]
+
+
 def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
     cfg = _config(tmp_path, [
         {"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]},
@@ -202,9 +209,8 @@ def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=No
     return _ToyModel(
         walks,
         partitions=lambda: [
-            PartitionDefinition(name="P", graph_walks={"gen"}, initial_walk="gen"),
-            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})},
-                                initial_walk="chunk", producer_partitions=["P"]),
+            PartitionDefinition(name="P", graph_walks={"gen"}),
+            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})}),
         ],
         topology=lambda: PartitionTopology(partitions=["P", "C"], connections=[
             Connection(from_partition="P", to_partition="C", edge_name="codes",
@@ -267,8 +273,8 @@ def test_self_triggered_consumer_loop_sharing_its_worker_graph_is_rejected(tmp_p
 
 
 class _ChunkWalkRuntime:
-    """The Python graph runtime of worker_0, hosting the 'chunk' walk's worker
-    graphs, driven the way the worker drives it."""
+    """The graph runtime of worker_0, hosting the 'chunk' walk's worker graphs,
+    driven the way the worker drives it."""
 
     def __init__(self, node_groups, tmp_path):
         wgs = _stream_model(_gated_vocoder_then_post).get_worker_graphs(_config(tmp_path, node_groups))
@@ -277,15 +283,15 @@ class _ChunkWalkRuntime:
         self.wgs = [wg for wg in wgs if "chunk" in wg.graph_walks]
         self.wg_of = {node: wg.worker_graph_id for wg in self.wgs for node in wg.section.get_nodes()}
         ids = [wg.worker_graph_id for wg in self.wgs]
-        self.rt = PythonGraphRuntime(
+        self.inboxes = Inboxes("worker_0", tmp_path)
+        self.rt = build_runtime(
+            inboxes=self.inboxes,
             my_worker_id="worker_0", my_worker_graphs=self.wgs,
             all_wg_ids_to_graph_walks={i: {"chunk"} for i in ids},
             all_wg_ids_to_dyn_loops={i: set() for i in ids},
             all_wg_ids_to_nodes={wg.worker_graph_id: set(wg.section.get_nodes()) for wg in self.wgs},
             node_to_partition={"vocoder": "C", "post": "C"}, sharding_config=_sharding_config(),
-            tensor_manager=StubTensorManager(),
         )
-        self.rt._communicator = _RecordingCommunicator()
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
@@ -306,23 +312,22 @@ class _ChunkWalkRuntime:
         """Run one step of ``node``; returns the worker graphs it completed."""
         rt, rid = self.rt, self.rid
         sig = rt.get_output_signals(node, "chunk")
-        uuids = _store_outputs(rt._tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
+        uuids = _store_outputs(rt.tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
         assert rt.pop_rids(node, "chunk", [rid], check_ready=True) is not None, f"{node} not ready"
         out = rt.complete_and_route_batch(RouteInput(
             partition="C", graph_walk="chunk", node_name=node, output_signals=sig,
             wg_ids=ParallelList([rid], [self.wg_of[node]]),
             tensors=[u for s in sig for u in uuids[s]], num_tensors=[1] * len(sig),
         ))
-        done = rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids
+        earlier = len(self.reports())
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
             per_request_info=ParallelList([rid], [_fwd_info("chunk", "C")]),
         ))
-        return done
+        return [wg for wgs, _ in self.reports()[earlier:] for wg in wgs]
 
     def reports(self):
-        return [(m.body.worker_graph_ids, m.body.partition_done)
-                for e, m in self.rt._communicator.sent if e == "conductor"]
+        return [(body.worker_graph_ids, body.partition_done) for body in self.inboxes.bodies("conductor")]
 
 
 def test_gated_consumer_sharing_its_worker_graph_runs_once_per_pass(tmp_path):
@@ -352,7 +357,7 @@ def test_colocated_successor_reports_the_final_stream(tmp_path):
     assert voc != post
     w.trigger()
     w.feed_chunk()
-    w.rt.mark_stream_partition_done(w.rid, "C")  # the vocoder step popped the final chunk
+    w.rt.mark_partition_done(w.rid, "C")  # the vocoder step popped the final chunk
     assert w.run("vocoder") == [voc]
     assert w.run("post") == [post]
     assert w.reports() == [([voc], True), ([post], True)]
@@ -370,9 +375,12 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
-    # each node_group picks its own replica, so a request can split across them
-    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
-], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_dp_replicas"])
+    # one TP instance on the same ranks shares the flag too
+    (_gated_vocoder_then_post, _TP2, _TP2, True),
+    # node_groups on the same ranks, replica for replica, pick one replica together
+    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, True),
+], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
+     "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [
         {"node_names": ["producer"], "ranks": [0]},
@@ -389,24 +397,6 @@ def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted,
         r"2 worker graphs \[\['vocoder'\], \['post'\]\] on ranks"
     )):
         _start_conductor(model, cfg, tmp_path, monkeypatch)
-
-
-def test_colocated_tp_consumer_walk_passes_the_stream_check_but_not_one_lockstep_node(tmp_path):
-    """One TP instance on the same ranks shares the final-stream flag, but two
-    TP node_groups on one worker are two lockstep nodes there, which every
-    worker refused at startup and the conductor now refuses first."""
-    cfg = _config(tmp_path, [
-        {"node_names": ["producer"], "ranks": [0]},
-        {"node_names": ["vocoder"], **_TP2},
-        {"node_names": ["post"], **_TP2},
-    ])
-    with pytest.raises(DeploymentError) as refusal:
-        _validate(_stream_model(_gated_vocoder_then_post, tp_enabled_nodes=["vocoder", "post"]), cfg)
-    assert refusal.value.problems == [
-        f"Multiple parallel nodes ['post', 'vocoder'] found in worker worker_{rank}; current "
-        "implementation requires at most one lockstep-parallel node per worker."
-        for rank in (1, 2)
-    ]
 
 
 def test_consumer_loop_spanning_worker_graphs_is_rejected(tmp_path):
@@ -576,29 +566,16 @@ def test_loop_member_feeding_a_successor_in_its_worker_graph_is_rejected(tmp_pat
 class _LoopWorker:
     """worker_0 hosting walk 'w' as one worker graph, driven as the worker drives it."""
 
-    def __init__(self, runtime, tmp_path):
+    def __init__(self, tmp_path):
         model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=True)})
         wg, = model.get_worker_graphs(_config(tmp_path, [{"node_names": ["step", "post"], "ranks": [0]}]))
         wg.worker_graph_id = 0
-        args = dict(
+        self.rt = build_runtime(
             my_worker_id="worker_0", my_worker_graphs=[wg],
             all_wg_ids_to_graph_walks={0: {"w"}}, all_wg_ids_to_dyn_loops={0: set()},
             all_wg_ids_to_nodes={0: {"step", "post"}},
             node_to_partition={"step": "default", "post": "default"}, sharding_config=_sharding_config(),
         )
-        self.runtime = runtime
-        if runtime == "python":
-            tm = StubTensorManager()
-            # the manager's real signature: the accumulated cache holds its uuids
-            tm.increment_ref = lambda uuid, n=1: tm.tensor_store.increment_ref(uuid, n=n)
-            self.rt = PythonGraphRuntime(tensor_manager=tm, **args)
-            self.rt._communicator = _RecordingCommunicator()
-        else:
-            pytest.importorskip("mstar_rust")
-            from mstar.communication.tensor_store import RustTensorBookkeeping
-            from mstar.graph.runtime.rust import RustGraphRuntime
-            self.book = RustTensorBookkeeping()
-            self.rt = RustGraphRuntime(bookkeeping=self.book, **args)
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
@@ -607,19 +584,6 @@ class _LoopWorker:
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
 
-    def _put(self, sig):
-        if self.runtime == "python":
-            return _store_outputs(self.rt._tensor_store, self.minter, self.rid, {s: [torch.ones(1)] for s in sig})
-        uuids = {}
-        for s in sig:
-            u = self.minter.mint()
-            self.book.put_tensor(u, TensorPointerInfo(
-                dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=(1,), uuid=u,
-                source_session_id="s", source_entity="worker_0"))
-            self.book.increment_ref(u, 1)  # the safety hold
-            uuids[s] = [u]
-        return uuids
-
     def step_once(self):
         """Run the first ready node; returns (node, reported_done) or None."""
         node = next((n for n in ("post", "step") if self.rt.pop_rids(n, "w", [self.rid], check_ready=True)), None)
@@ -627,28 +591,20 @@ class _LoopWorker:
             return None
         rt, rid = self.rt, self.rid
         sig = rt.get_output_signals(node, "w")
-        uuids = self._put(sig)
+        uuids = _store_outputs(rt.tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
         out = rt.complete_and_route_batch(RouteInput(
             partition="default", graph_walk="w", node_name=node, output_signals=sig,
             wg_ids=ParallelList([rid], [0]), tensors=[u for s in sig for u in uuids[s]],
             num_tensors=[1] * len(sig),
         ))
-        if self.runtime == "rust":
-            plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
-        done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
-        rt.send_outputs(SendInput(
-            completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
-            per_request_info=ParallelList([rid], [_fwd_info("w")]),
-        ))
-        return node, done
+        plan = rt._rust.take_send_plan(out.completion_id)
+        return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
 
 
-@pytest.mark.parametrize("runtime", ["python", "rust"])
-def test_accumulated_outputs_feed_the_successor_once_after_the_loop(runtime, tmp_path):
-    """The shape the refusal points to passes startup, and in both runtimes
-    runs ``step`` ITERS times, then ``post`` once, reporting done once."""
-    w = _LoopWorker(runtime, tmp_path)
+def test_accumulated_outputs_feed_the_successor_once_after_the_loop(tmp_path):
+    """The graph the refusal points to passes startup, and runs ``step`` ITERS
+    times, then ``post`` once, reporting done once."""
+    w = _LoopWorker(tmp_path)
     trace = []
     while len(trace) < 4 * ITERS and (r := w.step_once()):
         trace.append(r)
@@ -744,8 +700,11 @@ def _z_image(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _higgs(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig, audio_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    config = HiggsAudioModelConfig()
+    pad = config.audio_in_token_idx
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
@@ -765,9 +724,18 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3.config import H3Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3Config())
+    return model
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     config = Qwen3_5Config(
@@ -778,7 +746,60 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
     )
-    return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
+    return _bare(
+        Qwen3_5DenseModel, config=config, vision_config=None,
+        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+    )
+
+
+def _muse_configs(text_cls, max_positions):
+    """Small Muse text and vision shapes: the resource rules read the layer
+    and head counts, not their sizes."""
+    from mstar.model.muse.config import (
+        FULL_ATTENTION,
+        SLIDING_ATTENTION,
+        WINDOW_ATTENTION,
+        MuseGlimmerVisionConfig,
+    )
+    text = text_cls(
+        num_hidden_layers=4, hidden_size=256, intermediate_size=512, num_attention_heads=8,
+        num_key_value_heads=2, head_dim=64, vocab_size=1024,
+        layer_types=[SLIDING_ATTENTION] * 3 + [FULL_ATTENTION], layer_rope_theta=[5e5] * 3 + [0.0],
+        sliding_window=1024, max_position_embeddings=max_positions, rms_norm_eps=1e-5,
+        post_norm_eps=1e-5, image_token_id=0,
+    )
+    vision = MuseGlimmerVisionConfig(
+        hidden_size=64, intermediate_size=128, num_attention_heads=2, num_hidden_layers=2,
+        patch_size=14, patch_temporal=2, merge_size=2, pos_emb_height=32, pos_emb_width=32,
+        layer_types=[WINDOW_ATTENTION, FULL_ATTENTION], out_hidden_size=256,
+        projector_hidden_size=256, text_hidden_size=256,
+    )
+    return text, vision
+
+
+def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.muse.config import MuseGlimmerConfig
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+    config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
+    return _bare(
+        MuseGlimmerModel, config=config, vision_config=vision_config,
+        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+    )
+
+
+def _ripple(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ripple.config import RippleConfig
+    from mstar.model.ripple.ripple_model import RippleModel
+    config = RippleConfig(
+        vocab_size=100352, hidden_size=5120, intermediate_size=40960, num_hidden_layers=80,
+        num_attention_heads=80, num_key_value_heads=8, head_dim=128,
+        layer_types=(("sliding_attention",) * 4 + ("full_attention",)) * 16,
+        sliding_window=1024, max_position_embeddings=2097152, rope_theta=10000.0, rms_norm_eps=1e-6,
+        embed_scale=71.55, ffn_clamp_threshold=20.0, stop_token_ids=(100265, 100257),
+    )
+    return _bare(RippleModel, config=config)
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
@@ -801,20 +822,40 @@ _QWEN3_TTS_VARIANTS = {
 
 def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
-    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, codec_dtype
     kind, size = _QWEN3_TTS_VARIANTS[name]
-    return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
+    return _bare(
+        Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size),
+        # get_node_resources sizes the codec state pool in this dtype
+        codec_dtype=codec_dtype(model_kwargs.get("codec_dtype", "float32")),
+    )
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
-    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
-    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
+    config = Qwen3ASRModelConfig()
+    pad = config.audio_token_id
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
+
+
+def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
+    # __init__ reads only config.json and the tokenizer; the config defaults are the published geometry
+    import transformers
+
+    from mstar.model.voxcpm2 import voxcpm2_model
+    from mstar.model.voxcpm2.config import VoxCPM2Config
+    monkeypatch.setattr(voxcpm2_model, "_resolve_metadata", lambda repo_id, cache_dir: str(tmp_path))
+    monkeypatch.setattr(VoxCPM2Config, "from_pretrained", classmethod(lambda cls, path: cls()))
+    monkeypatch.setattr(transformers.LlamaTokenizerFast, "from_pretrained",
+                        classmethod(lambda cls, path: types.SimpleNamespace(get_vocab=dict)))
+    return _constructed(name, model_kwargs)
 
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _canary(name, model_kwargs, tmp_path, monkeypatch):
@@ -863,12 +904,16 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
+    "H3Model": _minimax_h3,
+    "MuseGlimmerModel": _muse_glimmer,
+    "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
     "Qwen3ASRModel": _qwen3_asr,
+    "VoxCPM2Model": _voxcpm2,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel
@@ -900,3 +945,5 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
+    # the workers the API server places from the config are the ones the walks run on
+    assert conductor._sorted_ranks == sorted({rank for wg in conductor.worker_graphs.values() for rank in wg.ranks})

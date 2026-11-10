@@ -9,8 +9,9 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.utils.device import DeviceCapability
-from mstar.worker.worker import Worker
+from mstar.worker.host_copies import HostCopies
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:1", "xpu:1"])
@@ -40,9 +41,7 @@ def test_engine_load_binds_capability_to_loaded_device(device, capability_source
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_type):
-    worker = object.__new__(Worker)
-    worker.device = torch.device(device_type, 1)
-    worker._d2h_stream = None
+    device = torch.device(device_type, 1)
     side = MagicMock()
     runtime = SimpleNamespace(
         is_available=lambda: True,
@@ -51,41 +50,44 @@ def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_ty
         stream=Mock(),
     )
     monkeypatch.setattr(torch, device_type, runtime)
-    worker.device_capability = DeviceCapability(worker.device)
+    copies = HostCopies(device=device, device_capability=DeviceCapability(device))
     make_stream = Mock(return_value=side)
     monkeypatch.setattr(torch, "Stream", make_stream)
     tensor = SimpleNamespace(
-        device=worker.device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
+        device=device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
     )
     monkeypatch.setattr(torch, "is_tensor", lambda value: value is tensor)
     cpu_tensor = Mock()
-    worker._get_pinned_d2h_buffer = Mock(return_value=cpu_tensor)
+    copies._get_pinned_d2h_buffer = Mock(return_value=cpu_tensor)
     host_value = object()
     outputs = BatchedModelOutput(
         per_rid_outputs={7: {"token": [tensor, host_value], "metadata": "keep"}},
     )
     event = object()
 
-    copied, host_rows = worker._prematerialize_for_check_stop(outputs, event)
+    copied, host_rows = copies.prematerialize_for_check_stop(outputs, event)
 
-    make_stream.assert_called_once_with(device=worker.device)
+    make_stream.assert_called_once_with(device=device)
     side.wait_event.assert_called_once_with(event)
+    # nothing is copied until the stop check reads a name
+    side.__enter__.assert_not_called()
+    assert copied[7]["token"] == [cpu_tensor, host_value]
+    assert copied[7]["metadata"] == "keep"
     side.__enter__.assert_called_once_with()
     side.__exit__.assert_called_once()
     runtime.Stream.assert_not_called()
     runtime.stream.assert_not_called()
     cpu_tensor.copy_.assert_called_once_with(tensor, non_blocking=True)
     side.synchronize.assert_called_once_with()
-    assert copied == {7: {"token": [cpu_tensor, host_value], "metadata": "keep"}}
     assert host_rows is None
     assert outputs.per_rid_outputs[7]["token"][0] is tensor
 
 
 def test_cpu_output_copy_needs_no_accelerator_runtime():
-    worker = object.__new__(Worker)
-    worker.device = torch.device("cpu")
+    device = torch.device("cpu")
+    copies = HostCopies(device=device, device_capability=DeviceCapability(device))
     outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [torch.tensor([3])]}})
-    copied, host_rows = worker._prematerialize_for_check_stop(outputs, None)
+    copied, host_rows = copies.prematerialize_for_check_stop(outputs, None)
     assert copied is outputs.per_rid_outputs
     assert host_rows is None
 
@@ -96,14 +98,14 @@ def test_cpu_output_copy_needs_no_accelerator_runtime():
      ("cuda", True, True), ("xpu", True, True)],
 )
 def test_engine_compile_checks_its_own_device(monkeypatch, device_type, available, compiled):
-    engine = object.__new__(Engine)
-    engine._device = torch.device(device_type)
-    engine._device_capability = SimpleNamespace(
-        is_available=available and device_type != "cpu",
-    )
     submodule = SimpleNamespace(forward=Mock(), forward_batched=Mock())
-    engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
-    engine._item_encoders = set()
+    engine = make_engine(
+        _device=torch.device(device_type),
+        _device_capability=SimpleNamespace(
+            is_available=available and device_type != "cpu",
+        ),
+        _submodules={"node": make_mgmt(submodule=submodule)},
+    )
     compile_fn = Mock(side_effect=lambda fn, **kwargs: fn)
     monkeypatch.setattr(torch, "compile", compile_fn)
 

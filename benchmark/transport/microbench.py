@@ -44,7 +44,8 @@ SENDER, RECEIVER = "worker_0", "worker_1"
 
 #: control: the bytes ride in a control message (serialize, send, deserialize).
 #: tcp / rdma: M*'s Mooncake path (register, descriptor, read, ack, cleanup).
-#: shm / arena: M*'s same-host paths (per-uuid file, Rust arena).
+#: shm / arena: same host; the per-uuid file protocol on its own (the arena's
+#: spill path) and the Rust arena, which is M*'s SHM transport.
 #: tcp-pool / rdma-pool: Mooncake reads from a buffer registered once, copied
 #: into (or, with --pool-mode zerocopy, produced in) per send. Not an M* path
 #: today; the contrast with tcp shows what per-tensor registration costs.
@@ -170,18 +171,11 @@ def unavailable_reason(path: str, args) -> str | None:
 # -- the control mesh ----------------------------------------------------------
 
 def make_comm(my_id: str, args):
-    """M*'s communicator (Rust or pyzmq, as ``make_communicator`` picks), with
-    each side's endpoint taken from the arguments so the two can be on
-    different machines."""
-    from mstar.communication.communicator import CommProtocol, ZMQCommunicator
-    base = ZMQCommunicator
-    if os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper() != "0":
-        try:
-            from mstar.communication.rust_communicator import RustZMQCommunicator, _RustZmq
-            if _RustZmq is not None:
-                base = RustZMQCommunicator
-        except ImportError:
-            pass
+    """M*'s communicator, with each side's endpoint taken from the arguments
+    so the two can be on different machines."""
+    from mstar.communication.communicator import CommProtocol
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+
     endpoints = {
         SENDER: f"tcp://{args.sender_host}:{args.port}",
         RECEIVER: f"tcp://{args.receiver_host}:{args.port + 1}",
@@ -189,7 +183,7 @@ def make_comm(my_id: str, args):
         "conductor": f"tcp://{args.sender_host}:{args.port + 2}",
     }
 
-    class BenchCommunicator(base):
+    class BenchCommunicator(RustZMQCommunicator):
         def _endpoint(self, entity_id: str) -> str:
             return endpoints[entity_id]
 
@@ -216,8 +210,13 @@ def make_manager(path: str, my_id: str, device: str, comm, args):
     from mstar.communication.communicator import CommProtocol
     from mstar.communication.tensors import create_tensor_communication_manager
     host = args.sender_host if my_id == SENDER else args.receiver_host
-    if path in ("shm", "arena"):
-        os.environ["MSTAR_SHM_ARENA"] = "1" if path == "arena" else "0"
+    if path == "shm":
+        from mstar.communication.tensors import SharedMemoryCommunicationManager
+        return SharedMemoryCommunicationManager(
+            my_entity_id=my_id, hostname=host, device=device, communicator=comm,
+            shm_dir=args.shm_dir,
+        )
+    if path == "arena":
         return create_tensor_communication_manager(
             protocol=CommProtocol.SHM, my_entity_id=my_id, hostname=host,
             device=device, communicator=comm, shm_dir=args.shm_dir,
@@ -527,9 +526,15 @@ class Sender:
             acked = msg.body.successful_tensors
             t0 = time.perf_counter()
             mgr.dereference_batch(list(acked), list(acked.values()))
-            mgr.cleanup_request(msg.body.request_id)
-            if timed[0]:
-                res.add_phase("cleanup", time.perf_counter() - t0)
+            # an ack covers whatever reads finished together, so it names uuids, not a request
+            for uuid in acked:
+                if uuid in rid_of:
+                    mgr.cleanup_request(rid_of[uuid])
+            if timed[0] and acked:
+                # one sample per read, so the counts line up with the other phases
+                per_read = (time.perf_counter() - t0) / len(acked)
+                for _ in acked:
+                    res.add_phase("cleanup", per_read)
             for uuid in acked:
                 if uuid in slot_of:
                     free.append(slot_of.pop(uuid))
@@ -782,7 +787,7 @@ class Receiver:
             del tensor
             self._send(WorkerMessage(
                 message_type=WorkerMessageType.TENSOR_RECEIVED,
-                body=TensorReceived(request_id="control", successful_tensors={msg["seq"]: 1},
+                body=TensorReceived(successful_tensors={msg["seq"]: 1},
                                     failed_tensor_ids=[]),
             ))
         elif kind == "pool":

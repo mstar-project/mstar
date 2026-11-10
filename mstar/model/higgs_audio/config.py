@@ -11,13 +11,9 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Resource label constants (LLM node)
-# ---------------------------------------------------------------------------
-KV_CACHE = "kv_cache"
+# the LLM's attention resource; its KV, position and sampler keys are
+# `mstar.model.keys`', as the shared decoder reads them
 ATTN = "attn"
-ROPE = "rope"
-SAMPLER = "sampler"
 
 
 @dataclass

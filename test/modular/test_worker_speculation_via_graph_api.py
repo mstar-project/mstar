@@ -2,7 +2,7 @@
 
 These tests do not spin up a worker — instead they exercise the
 ``ingest_for_speculation`` API in the exact shape that
-``Worker._try_speculate_next`` relies on: one call taking the producer's whole
+``Speculator._try_speculate_next`` relies on: one call taking the producer's whole
 output list plus its node name, returning the nodes that became ready.
 
   - Per-rid wgios (deep-copied from the same graph) maintain independent
@@ -60,8 +60,8 @@ def _ar_loop_graph(max_iters: int = 5):
 
 
 def _per_rid_wgios(num_rids: int) -> list[WorkerGraphIO]:
-    """Mirror ``WorkerGraphQueues.add_request`` — deepcopy the section per rid
-    so each gets independent state."""
+    """One WorkerGraphIO per rid, each over its own deepcopy of the section,
+    so no two rids share state."""
     section_template = _ar_loop_graph()
     return [WorkerGraphIO(deepcopy(section_template)) for _ in range(num_rids)]
 

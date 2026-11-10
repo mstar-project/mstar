@@ -44,6 +44,13 @@ COMPONENT_IN_FLIGHT = Family(
     "dispatched and whose completion it has not received yet.",
     ("component",),
 )
+ROUTING_PREDICTED_SAVING = Family(
+    "mstar_routing_predicted_saving_total", COUNTER,
+    "Per term of the data-parallel replica cost, the saving the mirrors "
+    "predicted on the replica each request was sent to, in request-equivalents: "
+    "for prefix, the share of the request's prompt predicted cached there.",
+    ("term",),
+)
 REQUEST_QUEUE_SECONDS = Family(
     "mstar_request_queue_seconds", HISTOGRAM,
     "Successful requests: the conductor taking the request in to admitting it "
@@ -106,6 +113,17 @@ COMPONENT_PENDING_STEPS = Family(
     "schedule the node.",
     ("component",),
 )
+REBUILD_HOST_BYTES_USED = Family(
+    "mstar_rebuild_host_bytes_used", GAUGE,
+    "Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "
+    "request dropped from the KV cache is rebuilt from.",
+    ("component",),
+)
+REBUILD_HOST_BYTES_TOTAL = Family(
+    "mstar_rebuild_host_bytes_total", GAUGE,
+    "Bytes of a worker's rebuild host pool (the serving config's rebuild_host_mb).",
+    ("component",),
+)
 
 #: ``src`` / ``dst`` of a tensor edge into or out of the graph: the data
 #: worker (a thread of the API server) sends the request's inputs and reads
@@ -145,6 +163,7 @@ WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
         KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
         PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+        REBUILD_HOST_BYTES_USED, REBUILD_HOST_BYTES_TOTAL,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )
 }
@@ -152,5 +171,5 @@ WORKER_FAMILIES: dict[str, Family] = {
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
-    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT)
+    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, ROUTING_PREDICTED_SAVING)
 } | WORKER_FAMILIES

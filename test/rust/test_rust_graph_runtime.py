@@ -186,11 +186,11 @@ def test_removing_twice_is_idempotent(runtime):
 
 # --- per-request state -------------------------------------------------------
 
-def test_set_walk_and_stream_done_reach_the_request(runtime):
+def test_set_walk_and_partition_done_reach_the_request(runtime):
     rid = _admit(runtime)
     runtime.set_walk(rid, "default", "other_walk")
-    runtime.mark_stream_partition_done(rid, "default")
-    # No getter for stream-done on the ABC; not raising is the assertion, and
+    runtime.mark_partition_done(rid, "default")
+    # No getter for partition_done on the ABC; not raising is the assertion, and
     # the walk change is observable.
     assert runtime is not None
 
@@ -539,7 +539,7 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
 def test_pop_of_an_unknown_node_raises(runtime):
     """Not None: nothing in the deployment runs this pair, and returning None
     would have the scheduler read a structural error as "not ready yet" and
-    retry the row forever. PythonGraphRuntime has always raised here."""
+    retry the row forever."""
     with pytest.raises(RuntimeError):
         runtime.pop_rids("nope", WALK, [])
 
@@ -868,10 +868,9 @@ def test_a_peer_stop_applies_only_when_newer(runtime):
     kept = runtime._loop_stop_times(rid)["ar_loop"]
     assert kept.wg_fwd_pass_idx == 3
 
-    # An older observation is recorded but must not re-stop a loop that has
-    # since restarted.
+    # An older observation is dropped, not recorded over the newer one.
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
-    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 1
+    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 3
 
 
 def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):
@@ -1020,7 +1019,8 @@ def test_an_inline_emit_is_not_staged_for_the_client():
     assert rt.pop_rids("dec", WALK, [rid]) is not None
 
 
-def test_inline_values_must_cover_every_rid_or_are_ignored():
+@pytest.mark.parametrize("inline_values", [[], [None]])
+def test_a_row_with_no_inline_value_takes_the_tensor_path(inline_values):
     rt = _client_loop_runtime()
     rid = _admit(rt)
     _reach_dec(rt, rid, 200)
@@ -1030,10 +1030,31 @@ def test_inline_values_must_cover_every_rid_or_are_ignored():
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=[],
+        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=inline_values,
     ))
-    assert 201 in out.register_uuids, "no values, so the tensor path"
+    assert 201 in out.register_uuids, "no value, so the tensor path"
     rt.send_outputs(_send_input(rid, out.completion_id))
+
+
+def test_inline_values_route_per_row():
+    """A row with a value rides inline while a row with None takes the tensor
+    path in the same step, rather than the step taking one path for all."""
+    rt = _client_loop_runtime()
+    rids = [_admit(rt, "r1"), _admit(rt, "r2")]
+    rt._communicator = _Recorder()
+    for rid, uuid in zip(rids, (210, 211), strict=True):
+        _reach_dec(rt, rid, uuid)
+    bk = rt._bookkeeping_for_test
+    for uuid in (212, 213):
+        bk.put_tensor(uuid, _tensor_info(uuid))
+        bk.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList(rids, [WG_ID, WG_ID]),
+        tensors=[212, 213], num_tensors=[1, 1], inline_signal="token", inline_values=[7, None],
+    ))
+    assert 212 not in out.register_uuids, "r1's value rides inline"
+    assert 213 in out.register_uuids, "r2 has none, so the tensor path"
 
 
 def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():

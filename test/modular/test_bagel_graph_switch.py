@@ -1,4 +1,5 @@
 
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from torch import nn
 
 from mstar.model.bagel import bagel_model
 from mstar.model.bagel.config import load_bagel_config
-from mstar.model.bagel.submodules import LLMSubmodule
+from mstar.model.bagel.submodules import DENOISE_WALKS, LLMSubmodule
 
 
 @pytest.fixture
@@ -100,10 +101,10 @@ def test_enabled_capture_keeps_existing_recipes(monkeypatch, device_type):
     assert [config.capture_batch_sizes for config in configs] == [
         None, None, [1, 2, 4, 8, 16, 32, 64],
     ]
-    assert configs[2].capture_token_lengths == [128, 256, 512, 1024, 2048]
+    assert configs[2].capture_token_lengths == {1: [128, 256, 512, 1024, 2048]}
 
 
-@pytest.mark.parametrize("graph_walk", ["image_gen", "image_gen_cfg"])
+@pytest.mark.parametrize("graph_walk", sorted(DENOISE_WALKS))
 def test_image_generation_uses_the_single_request_forward(graph_walk):
     module = LLMSubmodule.__new__(LLMSubmodule)
     nn.Module.__init__(module)
@@ -119,7 +120,6 @@ def test_model_graph_switch_gates_optional_vit_capture(
 ):
     monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH", str(int(vit_enabled)))
     monkeypatch.setenv("MSTAR_VIT_BATCHING", str(int(batching)))
-    monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "1024,512")
     monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "4,1,2")
     model = model_factory(accelerator_graph=enabled)
     model.vit_model = nn.Identity()
@@ -136,5 +136,14 @@ def test_model_graph_switch_gates_optional_vit_capture(
     assert bool(configs) is (enabled and vit_enabled)
     if configs:
         config = next(iter(configs.values()))
-        assert config.total_tokens == [512, 1024]
         assert config.capture_batch_sizes == ([1, 2, 4] if batching else [1])
+
+
+def test_image_output_is_quantized_by_truncation_and_encoded_per_request():
+    model = bagel_model.BagelModel.__new__(bagel_model.BagelModel)
+    image = torch.full((1, 3, 8, 8), 0.5)  # the decoder's [0, 1] pixels
+    assert model.postprocess(image, "image", {"output_format": "jpeg"}).startswith(b"\xff\xd8")
+    from PIL import Image
+
+    png = Image.open(io.BytesIO(model.postprocess(image, "image")))
+    assert png.format == "PNG" and png.getpixel((0, 0)) == (127, 127, 127)  # trunc(0.5 * 255)

@@ -18,6 +18,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
+from mstar.model.components.decoder_layer import run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -31,6 +32,7 @@ from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
     compute_inv_freq,
+    compute_text_cos_sin,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -255,6 +257,12 @@ class Qwen3_5LanguageModel(nn.Module):
             target_dtype=dtype,
         )
 
+    def build_text_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin for text rows' ``[tokens]`` 1D positions (`compute_text_cos_sin`)."""
+        return compute_text_cos_sin(positions, self.inv_freq, target_dtype=dtype)
+
     def forward(
         self, query_sequence: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -263,31 +271,13 @@ class Qwen3_5LanguageModel(nn.Module):
         # bind the label once per resource kind, advance the index per layer
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)
-        return self._forward_fused_residual(query_sequence)
+        return run_layers(self.layers, query_sequence, self.norm, self._set_cursor, self.comm_group)
 
-    def _forward_fused_residual(self, hidden: torch.Tensor) -> torch.Tensor:
-        """``DecoderLayer.forward`` with residual adds deferred into the next
-        norm, which also reduces the TP partial sums."""
-        cg = self.comm_group if self.comm_group.world_size > 1 else None
-        residual = None
-        for i, layer in enumerate(self.layers):
-            getattr(layer.self_attn, self._cursor_attr[i]).set_layer_idx(
-                self._resource_idx[i]
-            )
-            if residual is None:
-                residual = hidden
-                h = layer.input_layernorm(hidden)
-            else:
-                h, residual = layer.input_layernorm.forward_residual(
-                    hidden, residual, cg,
-                )
-            h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(
-                h, residual, cg,
-            )
-            hidden = layer.mlp(h)
-        normed, _ = self.norm.forward_residual(hidden, residual, cg)
-        return normed
+    @torch.compiler.disable
+    def _set_cursor(self, i: int, mixer: nn.Module) -> None:
+        """Move layer ``i``'s cursor (``attend`` or ``mix``) to the layer's index
+        in its resource."""
+        getattr(mixer, self._cursor_attr[i]).set_layer_idx(self._resource_idx[i])
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -307,13 +297,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             gather_output=True,
         )
         if config.tie_word_embeddings:
+            # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    def checkpoint_rules(self):
+        """How the checkpoint's text tower lands here (the MTP head and the vision tower
+        dropped), for its weight loader and for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper)
+
+    # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
+
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.model.embed_tokens.weight.dtype
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
-        self, input_ids: torch.Tensor, *, label: str,
+        self, input_embeds: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(
-            self.model.embed_tokens(input_ids), label=label, cos_sin=cos_sin,
-        )
+        """``(tokens, hidden)`` in, the stack's normed output out."""
+        return self.model(input_embeds, label=label, cos_sin=cos_sin)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

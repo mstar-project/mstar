@@ -2,14 +2,16 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-# Resource names shared by the text components and the LLM node.
-KV_CACHE = "kv_cache"
+from mstar.model import keys
+
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
+# one attention resource per window over the one cache: the sliding layers
+# and the global (NoPE) layers plan different FlashInfer kernels
 LOCAL_ATTN = "local_attn"
 GLOBAL_ATTN = "global_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
-
-PREFILL_WALKS = ("prefill", "prefill_image")
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
 
 
 @dataclass
@@ -43,6 +45,10 @@ class CommandAPlusTextConfig:
         """Width of the shared MLP, derived from the expert dimensions."""
         return self.intermediate_size * self.num_shared_experts
 
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id})
+
 
     @classmethod
     def from_dict(cls, data: dict) -> "CommandAPlusTextConfig":
@@ -72,6 +78,9 @@ class CommandAPlusTextConfig:
             raise ValueError("rope_parameters must be default RoPE with the same rope_theta")
         if not set(data["layer_types"]) <= {"sliding_attention", "full_attention"}:
             raise ValueError(f"Unsupported layer_types: {sorted(set(data['layer_types']))}")
+        for kind in ("sliding_attention", "full_attention"):
+            if kind not in data["layer_types"]:
+                raise ValueError(f"layer_types must include {kind} layers; Command A+ interleaves both")
         return cls(**{name: data[name] for name in cls.__dataclass_fields__})
 
 

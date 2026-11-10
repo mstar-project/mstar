@@ -30,6 +30,9 @@ class DSAConfig:
     # attend densely while no row sees more than topk keys (there, the same computation): such
     # a step plans no sparse attention
     dense_below_topk: bool = False
+    # the indexer's key width: an INDEX_PLANES row is one key wide, or with kpool > 1 three
+    # (key, gate, the key of the pool ending there)
+    index_head_dim: int | None = None
 
 
 @dataclass
@@ -48,4 +51,7 @@ class DSASpec(NodeResourceSpec):
 
 @dataclass(frozen=True)
 class DSAStep(ResourceStep):
-    pass
+    # a decode step whose rows may sit before the positions the host planned (an MTP verify
+    # block the device places after its last accepted rows, ``DSAManager.move_rows``): a
+    # captured plan is made for the longest each row can be
+    mtp_trims: bool = False

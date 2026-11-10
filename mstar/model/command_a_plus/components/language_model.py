@@ -147,6 +147,14 @@ class CommandAPlusAttention(ParallelAttention):
 class CommandAPlusDecoderLayer(nn.Module):
     """Parallel residual block: x + Attention(LN(x)) + MoE(LN(x))."""
 
+    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these as slices of its GEMMs
+    lora_unservable = dict.fromkeys(
+        ("self_attn.qkv_proj", "self_attn.o_proj",
+         "mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"),
+        "fused into the decoder layer's GEMMs at load on CUDA (fuse_weights); refused on every "
+        "device so the spec does not depend on it",
+    )
+
     def __init__(
         self,
         config: CommandAPlusTextConfig,
@@ -261,7 +269,7 @@ class CommandAPlusDecoderLayer(nn.Module):
 class CommandAPlusLanguageModel(nn.Module):
     """Text backbone over packed token embeddings, returning final hidden states.
 
-    As in Orpheus, the node's preprocessing calls ``embed_tokens`` separately.
+    The node embeds the ids itself (``embed``), splicing image rows in, so
     ``forward`` takes ``[total_step_tokens, hidden_size]``; resource plans carry
     request boundaries, positions and cached history. The causal-LM wrapper
     provides tied output logits and checkpoint loading.
@@ -302,12 +310,8 @@ class CommandAPlusLanguageModel(nn.Module):
             # A replicated table makes the lookup a plain gather. The sharded
             # lookup all-reduces rows that are zero on every other rank, so the
             # result is bit-identical.
-            shard = self.embed_tokens.weight.data
-            self._replicated_embedding = torch.empty(
-                (shard.shape[0] * group.world_size, shard.shape[1]), dtype=shard.dtype, device=shard.device,
-            )
-            torch.distributed.all_gather_into_tensor(
-                self._replicated_embedding, shard.contiguous(), group=group.device_group,
+            self._replicated_embedding = group.all_gather(
+                self.embed_tokens.weight.data.contiguous(), dim=0,
             )
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -352,6 +356,11 @@ class CommandAPlusForCausalLM(nn.Module):
         self.model = CommandAPlusLanguageModel(config, comm_group)
         self.logit_scale = config.logit_scale
 
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed(input_ids)
+
     def forward(
         self,
         query_sequence: torch.Tensor,
@@ -360,7 +369,7 @@ class CommandAPlusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence, label=label)
 
-    def compute_logits(
+    def logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:

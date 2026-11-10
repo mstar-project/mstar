@@ -44,7 +44,7 @@ def _tokens(config: OrpheusModelConfig, frames: int, seed: int = 0, eos: bool = 
     codes = torch.randint(0, 4096, (frames, TPF), generator=generator)
     tokens = (codes + 4096 * torch.arange(TPF) + config.custom_token_base_id + 10).flatten()
     if eos:
-        tokens = torch.cat([tokens, torch.tensor([config.stop_token_id])])
+        tokens = torch.cat([tokens, torch.tensor([*config.stop_token_ids])])
     return tokens
 
 
@@ -80,18 +80,23 @@ def _stream_batched(
             keys.append(submodule.cg_key_info(
                 "snac_chunk", {rid: fwd_infos[rid] for rid in rids}, per_request_input_metadata=meta,
             ))
-            engine_inputs = ModelInputsFromEngine(
-                request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=False,
-            )
-            items = [
-                submodule.prepare_inputs(
+            prepared = {
+                rid: submodule.prepare_inputs(
                     "snac_chunk", fwd_infos[rid],
                     # as the worker routes it: an empty chunk carries no tensor
                     {"new_token": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
                     input_metadata=meta[rid], is_final_stream_chunk=chunks[rid].is_final,
                 )
                 for rid in rids
-            ]
+            }
+            # as the engine does: a declined chunk runs no forward
+            rids = [rid for rid in rids if prepared[rid] is not None]
+            if not rids:
+                continue
+            items = [prepared[rid] for rid in rids]
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=False,
+            )
             assert submodule.can_batch(None, items)
             packed = submodule.preprocess("snac_chunk", engine_inputs, items)
             with torch.no_grad():
@@ -215,6 +220,34 @@ def test_mixed_batches_match_each_requests_whole_decode(fake, config):
     assert None in keys and any(isinstance(key, int) for key in keys)
 
 
+def test_windows_past_the_left_reach_share_the_widest_window(fake, config):
+    # A stream's first two windows start inside the decoder's left reach and
+    # keep their own sizes; every later one (ramp, steady, final flush) is
+    # padded on the left to the widest window, so they batch in one step.
+    _, keys = _stream_batched(fake, {"r": _tokens(config, 40, eos=True)})
+    assert keys[:2] == [4, 6]
+    assert set(keys[2:]) == {max(config.snac_window_frames())}
+
+
+def test_snac_24khz_left_reach_is_under_the_padding_bound():
+    """Frames ``SNAC_LEFT_REACH_FRAMES`` or more into a window decode the same
+    audio with frames prepended: the receptive field is the architecture's, so
+    the tiny decoder of the same geometry, with random weights, shows it."""
+    from mstar.model.orpheus.config import SNAC_LEFT_REACH_FRAMES
+
+    model = _tiny_snac()
+    frames, pad = 9, 5
+    generator = torch.Generator().manual_seed(1)
+    window = [torch.randint(0, 4096, (1, k * (frames + pad)), generator=generator) for k in (1, 2, 4)]
+    with torch.no_grad():
+        audio = model.decode([c[:, k * pad:] for c, k in zip(window, (1, 2, 4), strict=True)])
+        padded = model.decode(window)
+    own = audio[..., SNAC_LEFT_REACH_FRAMES * HOP:]
+    torch.testing.assert_close(padded[..., (pad + SNAC_LEFT_REACH_FRAMES) * HOP:], own,
+                               rtol=0, atol=1e-5 * float(own.abs().max()))
+    assert not torch.allclose(padded[..., (pad + 2) * HOP:(pad + 3) * HOP], audio[..., 2 * HOP:3 * HOP])
+
+
 GEOMETRIES = {
     "default": {},
     "no ramp": dict(snac_chunk_schedule=(4,)),
@@ -260,7 +293,7 @@ def test_no_window_size_falls_back_to_eager(overrides):
 def test_model_kwargs_override_the_window(monkeypatch):
     from mstar.model.orpheus import orpheus_model
 
-    monkeypatch.setattr(orpheus_model, "_resolve_local_hf_snapshot", lambda repo_id, cache_dir=None: repo_id)
+    monkeypatch.setattr(orpheus_model, "_resolve_local_hf_snapshot", lambda repo_id, **kw: repo_id)
     monkeypatch.setattr(orpheus_model.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: None)
     model = OrpheusModel(
         "unused", snac_chunk_schedule=[2], snac_chunk_frames=8,
@@ -322,13 +355,14 @@ def test_no_context_geometry_captures_only_decodable_windows():
 
 def test_no_context_stream_cut_at_a_chunk_boundary_ends_cleanly():
     """No context and no EOS (the token limit hit on a chunk boundary): the
-    buffer drains to empty, so the final flush carries no tokens at all."""
+    buffer drains to empty, so the final flush carries no tokens at all and
+    is declined: no forward, no empty audio chunk."""
     config = OrpheusModelConfig(snac_chunk_schedule=(4,), snac_left_context_frames=0,
                                 snac_right_context_frames=0)
     submodule = SNACDecoderSubmodule(_NeighbourDecoder(), config)
     tokens = _tokens(config, 8)
     chunks = _stream(submodule, tokens)
-    assert chunks[-1].numel() == 0
+    assert all(chunk.numel() for chunk in chunks)
     assert sum(chunk.numel() for chunk in chunks) == 8 * HOP
 
 

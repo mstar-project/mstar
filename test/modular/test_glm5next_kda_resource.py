@@ -60,7 +60,8 @@ class _Stepper:
     def open(self, spans: dict[str, int], walk: str):
         segments = tuple(Segment(rid, "main", n) for rid, n in spans.items())
         for rid in spans:
-            self.pool.ingest_request(rid)
+            if rid not in self.pool._slots:  # once per request, as the worker does (#725)
+                self.pool.ingest_request(rid)
         ctx = StepContext(request_ids=tuple(spans), graph_walk=walk, slot=0, capture=False)
         pool_step = RecurrentStep(segments=segments)
         assert self.pool.admit(pool_step, ctx).ok

@@ -213,7 +213,6 @@ def _rollout(
         input_modalities=("image",),
         output_modalities=("video_frame",),
         request_id=request_id,
-        num_steps=num_steps,
         actions=_actions(num_steps),
         seed=rng_seed,
     )
@@ -347,7 +346,8 @@ def _dit_schedule(log_text: str, request_ids: set[str]) -> list[tuple[str, ...]]
             continue
         if not isinstance(batch, (list, tuple)):
             continue
-        filtered = tuple(rid for rid in batch if rid in request_ids)
+        base_ids = tuple(str(rid).split("#", 1)[0] for rid in batch)
+        filtered = tuple(rid for rid in base_ids if rid in request_ids)
         if filtered:
             scheduled.append(filtered)
     return scheduled
@@ -371,51 +371,28 @@ def _interleaving_failure(log_text: str, request_ids: tuple[str, ...]) -> str | 
     )
 
 
-_OVERSHOOT_MARKER = "skipping async-overshoot rollout step"
-
-
-def _vetoed_overshoots(log_text: str, request_ids: set[str]) -> dict[str, int]:
-    """Per rid, the async-overshoot iterations ``prepare_inputs`` vetoed.
-
-    The worker logs ``Executing:`` before ``prepare_inputs`` runs, so the
-    schedule counts one iteration per request that never reached the GPU.
-    """
-    counts = {rid: 0 for rid in request_ids}
-    for line in log_text.splitlines():
-        if _OVERSHOOT_MARKER not in line:
-            continue
-        for rid in request_ids:
-            if f"(request {rid} runs" in line:
-                counts[rid] += 1
-    return counts
-
-
 def _execution_count_failure(
     log_text: str,
     request_ids: tuple[str, ...],
     num_steps: int,
 ) -> str | None:
-    """Every request ran its DiT step exactly ``num_steps`` times: scheduled
-    executions minus the vetoed overshoot iterations."""
+    """Every request ran its DiT step exactly ``num_steps`` times."""
     scheduled = _dit_schedule(log_text, set(request_ids))
-    vetoed = _vetoed_overshoots(log_text, set(request_ids))
-    counts = {
-        rid: sum(1 for batch in scheduled if rid in batch) - vetoed[rid]
-        for rid in request_ids
-    }
+    counts = {rid: sum(1 for batch in scheduled if rid in batch) for rid in request_ids}
     if all(count == num_steps for count in counts.values()):
         return None
-    return (
-        f"expected {num_steps} DiT rollout forwards per request; got {counts} "
-        f"(vetoed overshoots {vetoed})"
-    )
+    return f"expected {num_steps} DiT rollout forwards per request; got {counts}"
 
 
 _CLEANUP_MARKER = "Request cleanup complete:"
 
 
 def _cleaned_request_ids(log_text: str) -> set[str]:
-    return {line.split(_CLEANUP_MARKER, 1)[1].strip() for line in log_text.splitlines() if _CLEANUP_MARKER in line}
+    # The server logs the internal id, the client's id plus a "#<n>" suffix.
+    return {
+        line.split(_CLEANUP_MARKER, 1)[1].strip().split("#", 1)[0]
+        for line in log_text.splitlines() if _CLEANUP_MARKER in line
+    }
 
 
 def _read_log_since(log_path: Path, offset: int) -> str:

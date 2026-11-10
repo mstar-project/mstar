@@ -2,7 +2,7 @@
 
 Failures arrive in two waves: ``prepare_inputs`` / ``postprocess`` raise inside
 ``exec_and_postprocess`` and are handled by the main loop, then
-``check_stop_for_batch`` runs later, inside ``_postprocess_batch``, and can add
+``check_stop_for_batch`` runs later, inside ``StepExecutor.postprocess``, and can add
 more. Both waves have to be reported, and neither twice — which means the first
 wave has to be cleared off the batch once it has been handled.
 """
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import Worker
+from mstar.worker.step_executor import StepExecutor
 
 
 def _pending(rids, failed):
@@ -29,14 +29,15 @@ def _pending(rids, failed):
             per_request_info={rid: object() for rid in rids},
             failed_requests=dict(failed),
             final_stream_rids=set(rids),
-            stream_partition_done_rids=set(rids),
+            cached_rids=set(rids),
+            partition_done_rids=set(rids),
         ),
     )
 
 
 def _drop(pending, outputs, failed):
-    # unbound: _drop_failed_rids touches nothing on self
-    Worker._drop_failed_rids(None, pending, outputs, failed)
+    # unbound: drop_failed_rids touches nothing on self
+    StepExecutor.drop_failed_rids(None, pending, outputs, failed)
 
 
 def test_a_handled_failure_leaves_the_batch():
@@ -50,12 +51,13 @@ def test_a_handled_failure_leaves_the_batch():
     assert "r0" not in pending.batch.request_to_worker_graph
     assert "r0" not in pending.node_batch.per_request_info
     assert pending.node_batch.final_stream_rids == {"r1"}
-    assert pending.node_batch.stream_partition_done_rids == {"r1"}
+    assert pending.node_batch.cached_rids == {"r1"}
+    assert pending.node_batch.partition_done_rids == {"r1"}
 
 
 def test_a_handled_failure_is_cleared_so_it_is_not_reported_again():
     """The regression: ``failed_requests`` kept the rid, so the later
-    ``_postprocess_batch`` block re-reported it to the conductor."""
+    ``StepExecutor.postprocess`` block re-reported it to the conductor."""
     pending = _pending(["r0", "r1"], {"r0": "boom"})
 
     _drop(pending, {}, dict(pending.node_batch.failed_requests))

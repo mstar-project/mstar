@@ -30,10 +30,6 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -52,12 +48,24 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import (
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    RobotIO,
+    Span,
+    TensorAndMetadata,
+    WalkStep,
+)
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+from mstar.model.media_limits import read_image
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
+from mstar.model.pi05.components.flow_matching import discretize_state
+from mstar.model.pi05.components.normalization import Pi05NormStats, load_norm_stats
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+from mstar.model.pi05.components.tokenization import Pi05Tokenizer, pi05_prompt
 from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
@@ -76,6 +84,25 @@ _PALIGEMMA_PREFIX = "paligemma_with_expert.paligemma.model."
 _GEMMA_EXPERT_PREFIX = "paligemma_with_expert.gemma_expert.model."
 _PALIGEMMA_LM_HEAD = "paligemma_with_expert.paligemma.lm_head.weight"
 _GEMMA_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
+# Checkpoints saved from a lerobot PI05Policy (lerobot/pi05_droid) put every key
+# under "model." and also store PaliGemma's input embedding, which is tied to
+# the lm_head above.
+_POLICY_KEY_PREFIX = "model."
+_PALIGEMMA_EMBED_TOKENS = _PALIGEMMA_PREFIX + "language_model.embed_tokens.weight"
+
+
+def _strip_policy_prefix(flat: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Key a policy-saved checkpoint like lerobot/pi05_base, which has no prefix.
+
+    The embedding copy is dropped because ``_lerobot_remap`` already loads
+    ``embed_tokens`` from the lm_head, and the two are the same tensor.
+    """
+    if not flat or not all(k.startswith(_POLICY_KEY_PREFIX) for k in flat):
+        return flat
+    out = {k.removeprefix(_POLICY_KEY_PREFIX): v for k, v in flat.items()}
+    if _PALIGEMMA_LM_HEAD in out:
+        out.pop(_PALIGEMMA_EMBED_TOKENS, None)
+    return out
 
 
 class _Pi05LLMWeightContainer(nn.Module):
@@ -134,6 +161,15 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
                 )
 
 
+def _flat(value):
+    """Leaves of a nested list/tuple."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flat(item)
+    else:
+        yield value
+
+
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
@@ -160,6 +196,7 @@ class Pi05Model(Model):
         self._yaml_config_overrides: dict = dict(kwargs)
 
         self.config: Pi05Config = self._load_config()
+        self.norm_stats: Pi05NormStats | None = load_norm_stats(self.config.norm_stats)
         self.tokenizer: Pi05Tokenizer | None = self._load_tokenizer()
 
         self._repo_dir: Path | None = None
@@ -183,9 +220,11 @@ class Pi05Model(Model):
         if self.skip_weight_loading:
             cfg = Pi05Config()
         else:
-            try:
-                from huggingface_hub import hf_hub_download
+            # The checkpoint's config.json sets the action horizon (chunk_size), so a
+            # deployment that cannot read it must not fall back to the default 50 steps.
+            from huggingface_hub import hf_hub_download
 
+            try:
                 config_path = hf_hub_download(
                     repo_id=self.model_path_hf,
                     filename="config.json",
@@ -194,10 +233,7 @@ class Pi05Model(Model):
                 with open(config_path) as f:
                     cfg = load_pi05_config(json.load(f))
             except Exception as exc:
-                logger.warning(
-                    "Could not load Pi0.5 config from HF (%s); using defaults.", exc
-                )
-                cfg = Pi05Config()
+                raise RuntimeError(f"could not read the config.json of {self.model_path_hf}: {exc}") from exc
 
         # Overlay yaml-driven overrides (e.g. action_horizon for DROID).
         # Applied last so they win over both HF config.json and Pi05Config
@@ -256,27 +292,26 @@ class Pi05Model(Model):
         # case a future release adds them) and fall back to the canonical
         # PaliGemma repo. ``use_fast=True`` is required so we don't need
         # the slow sentencepiece+protobuf path.
+        errors = []
         for repo in (self.model_path_hf, "google/paligemma-3b-pt-224"):
             try:
                 hf_tok = AutoTokenizer.from_pretrained(
                     repo, cache_dir=self.cache_dir, use_fast=True
                 )
-                if repo != self.model_path_hf:
-                    logger.info(
-                        "Pi0.5 tokenizer loaded from fallback repo %s "
-                        "(model repo %s has no tokenizer files)",
-                        repo,
-                        self.model_path_hf,
-                    )
-                return Pi05Tokenizer(hf_tok, self.config)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not load Pi0.5 tokenizer from %s (%s); trying next.",
+                errors.append(f"{repo}: {exc}")
+                continue
+            if repo != self.model_path_hf:
+                logger.info(
+                    "Pi0.5 tokenizer loaded from fallback repo %s "
+                    "(model repo %s has no tokenizer files)",
                     repo,
-                    exc,
+                    self.model_path_hf,
                 )
-        logger.warning("All Pi0.5 tokenizer sources failed; proceeding without one.")
-        return None
+            return Pi05Tokenizer(hf_tok, self.config)
+        # Without a tokenizer every request would fail at ingest, so refuse to start.
+        # google/paligemma-3b-pt-224 is gated: the HF token needs its license accepted.
+        raise ValueError("Pi0.5 found no tokenizer:\n" + "\n".join(errors))
 
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
@@ -292,10 +327,10 @@ class Pi05Model(Model):
     def _ensure_lerobot_flat(self) -> dict[str, torch.Tensor]:
         """Lazily load ``model.safetensors`` from the lerobot snapshot.
 
-        Pi0.5 (lerobot/pi05_base) ships as a single ~14 GB safetensors
-        blob (not a sharded HF index), so we load it once into CPU memory
-        and cache it. Both ``get_submodule`` calls (vit_encoder + LLM)
-        consume the same dict.
+        lerobot's Pi0.5 checkpoints (pi05_base, pi05_droid) ship as a single
+        14-17 GB safetensors blob (not a sharded HF index), so we load it once
+        into CPU memory and cache it. Both ``get_submodule`` calls
+        (vit_encoder + LLM) consume the same dict.
         """
         if self._lerobot_flat is not None:
             return self._lerobot_flat
@@ -309,7 +344,7 @@ class Pi05Model(Model):
                 "safetensors blob in the lerobot/pi05_base snapshot."
             )
         logger.info("Loading Pi0.5 weights from %s", safetensors_path)
-        self._lerobot_flat = load_file(str(safetensors_path), device="cpu")
+        self._lerobot_flat = _strip_policy_prefix(load_file(str(safetensors_path), device="cpu"))
         return self._lerobot_flat
 
     def _lerobot_remap(self, name: str) -> str | None:
@@ -498,20 +533,20 @@ class Pi05Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
-        Pi0.5's production preprocessor (lerobot's
-        ``Pi05PrepareStateTokenizerProcessorStep``) builds a prompt of the
-        form::
+        openpi's PaligemmaTokenizer (and lerobot's
+        ``Pi05PrepareStateTokenizerProcessorStep``) put the state into the
+        prompt as text::
 
-            "Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "
+            "Task: <text>, State: <bin0> <bin1> ...;\\nAction: "
 
-        where each ``<bin_i>`` is the integer index (0–255) obtained by
-        digitizing the normalized state into 256 bins. The PaliGemma
-        tokenizer then encodes the whole string. We mirror that exactly
-        here so the resulting ``text_inputs`` stream matches the production
-        format.
+        with one bin per state value (see :func:`discretize_state`), and the
+        PaliGemma tokenizer encodes the whole string. With ``norm_stats``
+        configured, ``robot_state`` is the raw state and is normalized first,
+        as openpi's policy does; without, it is binned as given.
         """
+        robot_state = self._robot_state(kwargs.get("robot_state"))
         if self.tokenizer is None:
-            # Tokenizer-less fallback used by structural unit tests.
+            # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
                 return {
                     "text_inputs": [
@@ -520,113 +555,104 @@ class Pi05Model(Model):
                 }
             return {}
 
-        cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
-
-        robot_state = kwargs.get("robot_state")
+        state_bins = None
         if robot_state is not None:
-            if not isinstance(robot_state, torch.Tensor):
-                robot_state = torch.tensor(robot_state, dtype=torch.float32)
-            from mstar.model.pi05.components.flow_matching import discretize_state
-
-            bins = discretize_state(
-                robot_state.to(torch.float32),
-                num_bins=self.config.state_token_bins,
-            ).tolist()
-            state_str = " ".join(str(b) for b in bins)
-            full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
-        else:
-            full_prompt = cleaned
-
-        text_ids = self.tokenizer.encode_prompt(full_prompt)
+            state = robot_state
+            if self.norm_stats is not None:
+                state = self.norm_stats.normalize_state(state)
+            state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
+        text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
         cfg = self.config
-        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
-        images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        # the ViT drops the tokens of the camera slots a request leaves empty
+        images = len(kwargs.get("tensors", {}).get("image_inputs", ()))
+        if not images:
+            raise ValueError("a pi0.5 request needs at least one camera image")
+        image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
-                Span("rows", self.PREFILL_WALK, images, images, "img_emb"),
+                Span("rows", self.PREFILL_WALK, image_rows, image_rows, "img_emb"),
                 Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
         return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
 
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
+        normalizes uint8 on the GPU, so the API server skips a float pass per
+        camera and stages a quarter of the bytes for the worker."""
+        return self.load_decoded_image(read_image(filepath, rgb=True), device)
+
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        return TensorAndMetadata(image.to(device))
+
+    def robot_io(self) -> RobotIO:
+        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim)
+
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
 
+    def _robot_state(self, raw) -> torch.Tensor | None:
+        """The client's ``robot_state`` as a float64 vector of at most ``state_dim``
+        finite values; anything else is a ``ValueError``. A value outside [-1, 1]
+        (after ``norm_stats``, when configured) bins as openpi's (``discretize_state``)."""
+        if raw is None:
+            return None
+        limit = self.config.state_dim
+        if isinstance(raw, torch.Tensor):
+            state = raw.to(torch.float64)
+        else:
+            if isinstance(raw, (str, bytes)) or any(isinstance(v, (bool, str, bytes)) for v in _flat(raw)):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}")
+            try:
+                state = torch.tensor(raw, dtype=torch.float64)
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}") from None
+        if state.dim() != 1 or not 1 <= state.numel() <= limit:
+            raise ValueError(
+                f"robot_state must be a list of 1 to {limit} numbers; got shape {tuple(state.shape)}"
+            )
+        if not torch.isfinite(state).all():
+            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
+            raise ValueError("robot_state must be finite; it holds NaN or inf")
+        return state
+
+    def request_kwargs(self) -> frozenset[str]:
+        # flow steps and the rest come from the deployment YAML, not the request
+        return frozenset({"robot_state"})
+
+    def max_input_files(self) -> dict[str, int]:
+        # one image per camera slot the SigLIP capture holds
+        return {"image": self.config.num_cameras}
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
-            return output.detach().to(torch.float32).cpu().numpy().tobytes()
+            actions = output.detach().cpu()
+            if self.norm_stats is not None:
+                actions = self.norm_stats.unnormalize_actions(actions)
+            return actions.to(torch.float32).numpy().tobytes()
         raise ValueError(f"Unsupported modality for Pi0.5: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
-            is_prefill=True,
-            kwargs={},
-        )
-
-        inputs = []
-        if "image_inputs" in input_signals:
-            edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            edge.tensor_info = input_signals["image_inputs"]
-            inputs.append(edge)
-        if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
-            edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The prefill over the camera images and the prompt, then the action
+        flow, whose first iteration the LLM submodule seeds (Gaussian noise and
+        timestep 0)."""
+        # The prefill's LLM waits on the images' embeddings, so a request without
+        # them could never finish. process_prompt always emits the prompt's tokens.
+        if not input_signals.get("image_inputs"):
+            raise ValueError("Pi0.5 requires camera images (image_inputs)")
+        return [WalkStep(self.PREFILL_WALK), WalkStep(self.ACTION_GEN_WALK)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

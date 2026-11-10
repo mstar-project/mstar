@@ -104,7 +104,15 @@ class OrpheusForCausalLM(nn.Module):
             output_size=config.vocab_size,
             bias=False,
             gather_output=True,
+            # Orpheus only ever emits ``<custom_token_*>`` ids (SNAC codes and
+            # the speech/turn markers), about 18% of the head
+            output_start=config.custom_token_base_id,
         )
+
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -115,14 +123,22 @@ class OrpheusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, label=label)
 
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden)
+
+    def checkpoint_rules(self):
+        """How the HF Llama checkpoint lands here (and where LoRA adapters land):
+        separate q/k/v and gate/up into the fused projections."""
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS))
+
     def load_weights(self, weights) -> set[str]:
         """Load HF Llama-style weights into the fused parameters; tie the
         head to the embedding when the checkpoint does and stores no head
         (``save_pretrained`` drops a tied ``lm_head.weight``); raise on
         anything left unloaded."""
-        from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
-
-        loaded = load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+        loaded = self.checkpoint_rules().load(self, weights)
         if "lm_head.weight" not in loaded and "model.embed_tokens.weight" in loaded:
             if not self.config.tie_word_embeddings:
                 raise RuntimeError("Orpheus checkpoint has no lm_head.weight and does not tie embeddings")

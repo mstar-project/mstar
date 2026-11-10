@@ -20,7 +20,7 @@ import types
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -35,10 +35,11 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -48,6 +49,7 @@ class _DataWorker:
     reports each request's preprocess-finish time once asked to."""
 
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.inputs = []
         self.aborted = []
         self.chunks = queue.Queue()
@@ -101,10 +103,11 @@ class _DataWorker:
         pass
 
 
-class _Conductor:
+class _Conductor(StandInSocket):
     """The API server's socket to the conductor."""
 
     def __init__(self):
+        super().__init__()
         self.inbox = queue.Queue()
 
     def get_all_new_messages(self):
@@ -482,6 +485,7 @@ def test_a_served_request_is_not_a_refusal(served):
 
 
 def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
+    pytest.importorskip("prometheus_client")
     from mstar.api_server import auth
 
     server = make_test_api_server(preprocess_worker=_DataWorker())
@@ -728,23 +732,20 @@ class _StubTensorManager:
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
-    class _Model:
+    class _Model(StubModel):
         def process_prompt(self, *args, **kwargs):
             return None
-
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["default"])
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
-    facade.profile_queue = queue.Queue()
+    facade.profile_queue = ResultQueue(EventWakeup())
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
@@ -1028,7 +1029,7 @@ def test_transfer_snapshots_render_as_prometheus_client_would():
 SLOW_PROMPT_S = 0.03
 
 
-class _MediaModel:
+class _MediaModel(StubModel):
     """Decodes images with the base model's real loader and WAVs with the
     stdlib (CI has neither soundfile nor torchcodec); takes one image per
     request. The prompt text can slow, hold or fail its prompt processing."""
@@ -1039,9 +1040,6 @@ class _MediaModel:
 
     def max_input_files(self):
         return {"image": 1}
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def load_image(self, filepath, device):
         from mstar.model.base import Model
@@ -1075,14 +1073,16 @@ class _RealDataWorker:
     stand-in transport and conductor, and the API server's message thread."""
 
     def __init__(self, tmp_path, *, metrics, enable_prof=False):
-        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 
         self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
         facade = self.facade = PreprocessWorker.__new__(PreprocessWorker)
         for name in ("request_input_queue", "result_tensor_input_queue", "cleanup_request_queue",
-                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
-                     "output_queue", "profile_queue"):
+                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
             setattr(facade, name, queue.Queue())
+        facade.results_wakeup = EventWakeup()
+        facade.output_queue = ResultQueue(facade.results_wakeup)
+        facade.profile_queue = ResultQueue(facade.results_wakeup)
         facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
         facade.worker_metrics_requested = threading.Event()
         facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
@@ -1331,6 +1331,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+    # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     return str(cfg)
 
 
@@ -1356,6 +1358,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1394,8 +1397,12 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context",
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
+    monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
     entrypoint.main(["--config", cfg, "--enable-metrics"])
@@ -1409,6 +1416,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1433,7 +1441,8 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "model_config": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 
@@ -1469,7 +1478,11 @@ def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeyp
 
 
 def test_enable_metrics_with_the_rust_frontend_starts(monkeypatch, tmp_path):
+    from mstar.api_server import rust_frontend
+
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    # main() resolves the binary before loading anything; CI builds none.
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     assert _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
 
 

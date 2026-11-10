@@ -21,12 +21,11 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.dsa import paged as dsa
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import ATTN, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -236,7 +235,8 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _engine(long_context: bool, window: int = 8192, seed: int = 0):
+def _engine(long_context: bool, window: int = 8192, seed: int = 0, pages: int | None = None):
+    """``pages``: a pool of that many 8-token pages (the sink among them)."""
     torch.manual_seed(seed)
     cfg = Glm5NextModelConfig.reduced_long_context(max_seq_len=1024)
     cfg = dataclasses.replace(cfg, dsa_long_context=long_context, prefill_window_tokens=window)
@@ -250,9 +250,13 @@ def _engine(long_context: bool, window: int = 8192, seed: int = 0):
     process_weights_after_loading(lm, torch.device("cpu"))
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
+    specs = model.get_node_resources()
+    if pages is not None:
+        next(s for s in specs if s.resource_key == KV_CACHE).config.apply_yaml_overrides(
+            page_size=8, max_num_pages=pages)
     engine = Engine(None)
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -370,8 +374,6 @@ def test_one_token_prompts_prefill_eager_in_long_mode():
 @pytest.mark.parametrize("change, page_size, match", [
     ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
     ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
-    ({"prefill_graphs": True, "prefill_token_buckets": [128, 2 * sparse_mla.MAX_ROWS]}, None,
-     "prefill buckets"),
 ])
 def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
     sub = object.__new__(Glm5NextLLMSubmodule)
@@ -385,6 +387,19 @@ def test_long_context_refuses_pools_per_page_off_a_power_of_two():
     cfg = Glm5NextModelConfig.reduced_long_context()
     with pytest.raises(ValueError, match="power of two"):
         cfg.check_long_context(page_size=cfg.index_kpool * 3)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"dsa_long_context": "false"},
+    {"dsa_long_context": True, "dsa_shard_prefill": "false", "max_seq_len": 512},
+    {"dsa_long_context": True, "prefill_window_tokens": 2.5, "max_seq_len": 512},
+    {"dsa_long_context": True, "prefill_window_tokens": True, "max_seq_len": 512},
+    {"dsa_long_context": True, "max_seq_len": 512.9},
+])
+def test_long_context_refuses_a_knob_it_would_misread(kwargs):
+    """A string switch or a fractional count would otherwise load as something else."""
+    with pytest.raises(ValueError, match="must be"):
+        Glm5NextModel("x", config_variant="reduced", **kwargs)
 
 
 @pytest.mark.parametrize("key", ["max_seq_len", "prefill_window_tokens", "dsa_shard_prefill"])
@@ -416,12 +431,61 @@ def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, versio
         cfg.check_long_context()
 
 
-def test_a_non_bf16_cache_captures_nothing_in_long_mode():
-    """The DSA kernels take a bf16 cache; the torch paths sync with the host, so no capture."""
+def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the node refuses it when it binds rather than serving slow."""
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = Glm5NextModelConfig.reduced_long_context()
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    sub.node_resources = {ATTN: types.SimpleNamespace(uses_kernel=True),
-                          KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
-    assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
-    assert sub._prefill_captured is False
+    cache = types.SimpleNamespace(dtype=torch.float16, device=torch.device("cuda"))
+    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=128),
+                               layer_view=lambda *a: cache)
+    with pytest.raises(ValueError, match="bf16"):
+        sub.bind_node_resources({KV_CACHE: kv})
+
+
+def test_the_engine_plans_the_declared_dsa_step():
+    """A long prompt's prefill: the engine planned the DSA step its submodule declares, and the
+    layers read that plan, with nothing from preprocess."""
+    from mstar.model.glm5_next.config import DSA
+
+    engine, sub, _ = _engine(long_context=True)
+    ar = types.SimpleNamespace(input_ids=torch.tensor([1, 2]), input_seq_len=2)
+    assert DSA in sub.declare_step("prefill", ["a"], [ar]).keys()
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    _step(engine, "prefill", {"a": torch.randint(0, 250, (100,))})
+    assert engine._resources[DSA].current().host_pos == list(range(100))
+
+
+def _admits(engine, rid, token, it) -> bool:
+    """Whether one decode step of ``rid`` alone admits."""
+    info = CurrentForwardPassInfo(
+        request_id=f"wire-{rid}", rid_handle=rid, graph_walk="decode", fwd_index=0, random_seed=0,
+        max_tokens=4096, resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
+        dynamic_loop_iter_counts={"decode_loop": it})
+    batch = ExecutingBatch(
+        node_name="LLM", per_request_info={rid: info},
+        per_request_input_tensors={rid: {"text_inputs": [torch.tensor([token])]}},
+        per_request_input_metadata={rid: InputMetadata(dynamic_loop_iter_counts={"decode_loop": it})},
+        step_context=StepContext(request_ids=(rid,), graph_walk="decode", slot=0, capture=False),
+    )
+    engine.prepare_inputs(batch)
+    engine.exec_and_postprocess(batch)
+    engine.finalize_batch(batch)
+    return batch.admit_error is None
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "aux planes rule out cpu_offload_pages, so a full pool has no victim: once the live "
+    "contexts outgrow it, every decoding request waits on pages none of them frees; follow-up"))
+def test_a_full_pool_still_lets_a_decoding_request_finish():
+    """Two requests that together outgrow the pool: one must still decode on, or neither ever
+    frees its pages (the long-context yamls admit 64 requests to about one window's pages)."""
+    engine, _, _ = _engine(long_context=True, pages=8)  # 7 request pages beside the sink
+    for rid in "ab":
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    tokens = _step(engine, "prefill", {rid: torch.randint(0, 250, (20,)) for rid in "ab"})
+    live, it = set("ab"), 0
+    while live and it < 40:  # each takes a page every 8 tokens until none is left
+        live = {rid for rid in sorted(live) if _admits(engine, rid, tokens[rid], it)}
+        it += 1
+    assert any(_admits(engine, rid, tokens[rid], it) for rid in "ab")

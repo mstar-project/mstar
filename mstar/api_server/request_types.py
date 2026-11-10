@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -7,6 +8,10 @@ from mstar.model.multimodal import PromptPart
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
 
 
 @dataclass
@@ -16,6 +21,12 @@ class ResultChunk:
     modality: str  # "text" | "image" | "audio" | "video" | "video_frame"
     data: bytes  # raw payload (text encoded as utf-8)
     metadata: dict = field(default_factory=dict)
+    # --log-stats only: when the output tensor was read (None for a value
+    # sent inline), and the seconds spent postprocessing it
+    # (``Model.postprocess``, or its share of the step's
+    # ``postprocess_inline`` call for a value sent inline)
+    read_time: float | None = None
+    postprocess_s: float = 0.0
 
 
 @dataclass
@@ -39,6 +50,9 @@ class ResultTokens:
     signal: str
     modality: str
     metadata: dict = field(default_factory=dict)
+    # per request, its sampled token's log-prob or None; None when no
+    # request of the step asked
+    logprobs: list[float | None] | None = None
 
 
 @dataclass
@@ -79,11 +93,22 @@ class ConductorStatus:
     metrics: list[MetricSnapshot]
 
 
+@dataclass
+class LoraAdapterResult:
+    """The conductor's answer to a LoRA adapter load or unload, once every worker hosting
+    the pool has acknowledged it: ``error_message`` is None on success, else ``status``
+    is the HTTP status the API server answers with."""
+    op_id: str
+    error_message: str | None = None
+    status: int = 200
+
+
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
 # tries branches in order and takes the first whose required fields are all
 # present, so a body must lack a required field of every branch before it.
 APIServerMessageBody = (
-    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | None
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
+    | LoraAdapterResult | None
 )
 
 
@@ -91,7 +116,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "setup_done"
+    # | "conductor_status" | "lora_adapter_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 
@@ -131,8 +156,16 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    # what the prompt's prefix-cache key chains hang from: the root of the LoRA adapter
+    # the API server selected (``ServedModels.select``), empty for the base model. Set
+    # in process, never from the client's kwargs.
+    prefix_root: bytes = b""
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
+    # Inputs the API server already holds decoded, by modality and in order,
+    # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
+    # each goes to ``Model.load_decoded_<modality>``, with no file between.
+    raw_inputs: dict[str, list["torch.Tensor"]] | None = None
 
 
 @dataclass
@@ -149,7 +182,11 @@ class ClientAppend:
     file_streams: dict[str, list[str | None]] | None = None
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
+    # per ClientAudio stream, decoded mono float32 samples at its declared
+    # rate: a route that decodes the client's codec itself appends without a file
+    samples: "dict[str, np.ndarray] | None" = None
     # Answers the append as late, with an error naming why; called from the
-    # preprocess thread when the model routes items to a stream the client
-    # already ended. None: nobody to answer.
+    # preprocess thread when the model routes items to a stream that has
+    # ended (by the client, or with its consuming partition). None: nobody
+    # to answer.
     on_late: Callable[[str], None] | None = field(default=None, compare=False)

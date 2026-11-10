@@ -7,7 +7,7 @@ ends, after later steps have rewritten the buffer, so every iteration was sent
 with the last one's values (V-JEPA2-AC rollouts came back with four equal
 steps).
 
-Drives the real ``Worker._postprocess_batch`` with the SHM transport on CPU.
+Drives the real ``StepExecutor.postprocess`` with the SHM transport on CPU.
 The graph runtime is a stub that holds each iteration's output and registers
 them all on the last one, as a loop's accumulated edge to the client does, and
 the stop check hands out one reused host buffer, as the pinned ring does on a
@@ -23,11 +23,11 @@ from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 STEPS, RID, NODE, WALK = 4, 7, "rollout_predictor", "rollout"
 
@@ -39,9 +39,17 @@ class _Communicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
 
-class _AccumulatingRuntime:
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
+
+class _AccumulatingRuntime(PhasedPostprocess):
     """Holds every iteration's output and registers all of them on the last."""
+
+    supports_inline_emit = False
 
     def __init__(self):
         self.held: list[int] = []
@@ -77,28 +85,24 @@ def _manager(tmp_path, entity_id):
 
 
 def _worker(tmp_path):
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._phase_period = 0
-    w.enable_nvtx = w.enable_prof = False
-    w.device = torch.device("cpu")
-    w._last_active = {}
-    w._innermost_loop_by_node = {}
-    w._graph_runtime = _AccumulatingRuntime()
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.tensor_manager = _manager(tmp_path, "worker_0")
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        check_stop_for_batch=lambda batch, outputs, **kwargs: {},
-        after_output_copy=lambda batch: None,
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
-        materialize_publish=lambda batch, rids: None,
-    ))
-    w.request_state = SimpleNamespace(
+    request_state = SimpleNamespace(
         per_request_info={},
         buffer_publish_info=lambda *args: None,
         get_fwd_info=lambda rid, partition: None,
         get_pending_publish_info=lambda rid, partition: {},
+    )
+    tensor_manager = _manager(tmp_path, "worker_0")
+    w = make_worker(
+        graph_runtime=_AccumulatingRuntime(),
+        tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+            check_stop_for_batch=lambda batch, outputs, **kwargs: {},
+            after_output_copy=lambda batch: None,
+            step_finished=lambda batch, outputs, **kwargs: None,
+            materialize_publish=lambda batch, rids: None,
+        )),
+        request_state=request_state,
+        streams=StreamBufferManager(request_state, tensor_manager, []),
     )
     reused = torch.empty(1, 4)
 
@@ -106,8 +110,7 @@ def _worker(tmp_path):
         reused.copy_(outputs.per_rid_outputs[RID]["pred"][0])
         return {RID: {"pred": [reused]}}, None
 
-    w._prematerialize_for_check_stop = stop_check_copies
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.executor._host_copies.prematerialize_for_check_stop = stop_check_copies
     return w
 
 
@@ -125,14 +128,17 @@ def _step(w, value):
         speculative_new_iter=False,
     )
     outputs = BatchedModelOutput(per_rid_outputs={RID: {"pred": [torch.full((1, 4), value)]}})
-    Worker._postprocess_batch(w, pending, outputs)
+    w.executor.postprocess(pending, outputs)
 
 
 def test_accumulated_outputs_are_sent_with_their_own_values(tmp_path):
     w = _worker(tmp_path)
     for step in range(STEPS):
         _step(w, float(step))
-        assert not w.tensor_manager.tensor_store._tensors_cpu, "a step left host copies behind"
+        store = w.tensor_manager.tensor_store
+        assert all(store.get_cpu_tensor(u) is None for u in w._graph_runtime.held), (
+            "a step left host copies behind"
+        )
 
     uuids = w._graph_runtime.held
     infos = [w.tensor_manager.tensor_store.get_info(uuid) for uuid in uuids]

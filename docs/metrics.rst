@@ -235,6 +235,14 @@ From the conductor's status message, sent every second while metrics are on.
    conductor dispatched and has not heard back from. The conductor sees whole passes,
    so a node running a request's decode loop counts it once for the loop.
 
+``mstar_routing_predicted_saving_total{model_name, term}``
+   Counter, up to a second old. Per term of the data-parallel replica cost (see
+   "Data-parallel routing" in :doc:`serving`), the saving predicted on the replica each
+   request was sent to, in request-equivalents, unweighted. For ``prefix``, each request
+   adds the share of its prompt predicted cached there, so its rate over the request rate
+   is a mean of per-request shares, not the token ratio the workers' prefix-cache counters
+   give.
+
 ``mstar_conductor_status_age_seconds{model_name}``
    Gauge, seconds, computed at scrape time. Time since the API server received the
    conductor's last status message, or since metrics were enabled if none arrived yet.
@@ -246,7 +254,7 @@ Engine workers
 
 From the workers' numbers, forwarded in the conductor's status message, so up to two
 seconds old. A node with replicas on several workers shows their sum. The ranks of a
-tensor or sequence parallel instance count once: the instance's first rank reports.
+TP, SP or CFG instance count once: the instance's first rank reports.
 
 ``mstar_kv_pages_used{model_name, component, resource}``
    Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
@@ -260,6 +268,15 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 ``mstar_kv_pages_cached{model_name, component, resource}``
    Gauge. Pages the prefix cache names. Running requests may also hold some of them;
    the cache frees the others when a request needs the room.
+
+``mstar_rebuild_host_bytes_used{model_name, component}``
+   Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids, which a
+   request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
+   keeps no ids, so its request is never dropped. One pool serves every node of a worker
+   that declares a rebuild policy, and shows under each.
+
+``mstar_rebuild_host_bytes_total{model_name, component}``
+   Gauge. Bytes of the rebuild host pool, the serving config's ``rebuild_host_mb``.
 
 ``mstar_step_seconds{model_name, component, graph_walk}``
    Histogram, seconds, engine steps that ran a forward. From when the worker hands the
@@ -297,8 +314,7 @@ producer. Workers report through the conductor (up to two seconds old); the API 
 adds what its data worker read since metrics were enabled, which the data worker
 publishes once a second. ``src`` is the node that produced the tensors, ``dst``
 the node that reads them, and ``api_server`` stands for the request's inputs (as
-``src``) and its results (as ``dst``). The Python and Rust runtimes report the same
-series.
+``src``) and its results (as ``dst``).
 
 ``mstar_transfer_bytes_total{model_name, src, dst, transport}``
    Counter, bytes. Tensor bytes read over the edge.

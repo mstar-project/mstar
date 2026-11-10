@@ -11,10 +11,16 @@ Two stubs that exist purely so test imports survive on local macOS dev:
    minimal stub so the import succeeds; tests that exercise the kernels
    themselves still need a real GPU.
 
-And one autouse fixture that clears the cached platform around every test.
+And two autouse fixtures: one clears the cached platform around every test, and one
+keeps a test marked ``gpu_exclusive`` from sharing the GPU with any other test of the
+session (``_gpu_neighbours``).
 """
+import fcntl
+import os
 import sys
+import tempfile
 import types
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -59,6 +65,55 @@ if "triton" not in sys.modules:
     sys.modules["triton.language"] = triton.language
 
 
+# --- Dynamo counts ------------------------------------------------------------
+
+class DynamoCounts(NamedTuple):
+    compiles: int  # frames Dynamo compiled, recompiles and empty graphs included
+    graph_calls: int  # compiled graphs one call runs once everything is compiled
+    traced: frozenset[int]  # data_ptrs of the tensors the compiled graphs take
+
+
+@pytest.fixture
+def dynamo_counts():
+    """``count(fn, *args) -> DynamoCounts`` for ``torch.compile(fn,
+    dynamic=False)`` called twice on ``args``, the second time under the capture
+    stance (``fail_on_recompile``), as the graph runner warms a bucket and then
+    captures it: a frame Dynamo calls back into on a warm call fails it. A graph
+    count would miss a frame that only guards on an int before a graph break: it
+    compiles an empty graph per value."""
+    from torch._dynamo.callback import callback_handler
+
+    def count(fn, *args) -> DynamoCounts:
+        compiles, calls, traced = [0], [0], set()
+
+        def on_start(*_args):
+            compiles[0] += 1
+
+        def backend(gm, example_inputs):
+            traced.update(t.data_ptr() for t in example_inputs if isinstance(t, torch.Tensor))
+
+            def run(*inputs):
+                calls[0] += 1
+                return gm.forward(*inputs)
+            return run
+
+        torch._dynamo.reset()
+        callback_handler.register_start_callback(on_start)
+        try:
+            compiled = torch.compile(fn, backend=backend, dynamic=False)
+            with torch.no_grad():
+                compiled(*args)
+                calls[0] = 0
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    compiled(*args)
+        finally:
+            callback_handler.remove_start_callback(on_start)
+            torch._dynamo.reset()
+        return DynamoCounts(compiles[0], calls[0], frozenset(traced))
+
+    return count
+
+
 # --- torch flag proxies ------------------------------------------------------
 
 @pytest.fixture
@@ -88,3 +143,71 @@ def _fresh_platform():
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()
+
+
+# --- tests that read device-wide GPU memory ----------------------------------
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "gpu_exclusive: reads device-wide GPU memory, so no other test of the session runs beside it",
+    )
+
+
+@pytest.fixture(scope="session")
+def _gpu_locks():
+    """A gate and a lock that every process of this test session opens (xdist's workers
+    name the session alike), or None with no GPU visible."""
+    if not torch.cuda.is_available():
+        yield None
+        return
+    session = os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"pid{os.getpid()}"
+    base = os.path.join(tempfile.gettempdir(), f"mstar_gpu_tests_{session}")
+    gate, lock = (os.open(f"{base}.{name}", os.O_RDWR | os.O_CREAT, 0o600) for name in ("gate", "lock"))
+    try:
+        yield gate, lock
+    finally:
+        os.close(gate)
+        os.close(lock)
+
+
+@pytest.fixture(autouse=True)
+def _gpu_neighbours(request, _gpu_locks):
+    """With a GPU visible, a test marked ``gpu_exclusive`` holds the session's lock
+    exclusively and every other test holds it shared, so the first runs with nothing
+    of the session beside it on the GPU: device-wide free memory counts every other
+    xdist worker's allocations. A test that holds the gate exclusively stops new ones
+    from starting while it waits out those running."""
+    if _gpu_locks is None:
+        yield
+        return
+    gate, lock = _gpu_locks
+    if request.node.get_closest_marker("gpu_exclusive") is not None:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        return
+    fcntl.flock(gate, fcntl.LOCK_SH)
+    fcntl.flock(lock, fcntl.LOCK_SH)
+    fcntl.flock(gate, fcntl.LOCK_UN)
+    try:
+        yield
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+# --- host GPUs -----------------------------------------------------------------
+
+@pytest.fixture
+def no_host_gpus(monkeypatch, tmp_path):
+    """Make ``nvidia-smi`` fail, as on a host with no GPU. For tests whose eval jobs start
+    only fake servers, which would otherwise wait on another process's GPU memory."""
+    bin_dir = tmp_path / "no_host_gpus"
+    bin_dir.mkdir()
+    (bin_dir / "nvidia-smi").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")

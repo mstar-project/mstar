@@ -69,13 +69,13 @@ def _write(kv: KVManager, rid: str, n: int, ingest: bool = True, **step_kw) -> N
 
 def _read(
     kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0, sink=frozenset(),
-    pad_name: str = "pad", preplan: bool = False,
+    pad_name: str = "pad", preplan: bool = False, **step_kw,
 ):
     """A captured read-only step over ``rids`` plus ``pad`` padding rows. A
     pre-plan is promoted by the step's own plan before the commit, as the
     worker's GPU thread does."""
     padded = rids + tuple(f"{pad_name}{i}" for i in range(pad))
-    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink)
+    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink, **step_kw)
     bucket = BucketKey(graph_walk="decode", bs=len(padded), num_tokens=len(padded))
 
     def ctx(is_preplan: bool) -> StepContext:
@@ -115,8 +115,8 @@ def test_an_identical_read_only_step_reuses_the_plan(kv):
     assert _lengths(first)[:2] == [6, 9]
     assert _read(kv, ("a", "b")) is first
     # its slot's static buffers already hold it: not staged again
-    assert kv._staged_outputs[(0, "main")] is first["main"]
-    assert kv._current_plan_states["main"] is kv._static_plan_state(0, "main")
+    assert kv._staged_outputs[0, ("main", 0)] is first["main"]
+    assert kv._current_plan_states["main", 0] is kv._static_plan_state(0, ("main", 0), 4)
 
 
 def test_the_padding_rows_reset_after_a_replay_keeps_the_plan(kv):
@@ -170,18 +170,18 @@ def test_a_step_with_sink_rows_plans_its_own_views(kv):
     assert sunk is not first and _lengths(sunk)[:2] == [6, 0]
     # the plain step still reuses its plan, staged again over the sink step's
     assert _read(kv, ("a", "b")) is first
-    assert kv._staged_outputs[(0, "main")] is first["main"]
+    assert kv._staged_outputs[0, ("main", 0)] is first["main"]
 
 
 def test_each_slot_keeps_a_plan_of_its_own(kv):
     """One entry per slot, as the staged outputs: the same step on another
     slot builds and stages its own plan once, then reuses it there."""
     first = _read(kv, ("a", "b"), slot=0)
-    assert (1, "main") not in kv._staged_outputs
+    assert (1, ("main", 0)) not in kv._staged_outputs
     other = _read(kv, ("a", "b"), slot=1)
     assert other is not first
-    assert kv._staged_outputs[(1, "main")] is other["main"]
-    assert kv._current_plan_states["main"] is kv._static_plan_state(1, "main")
+    assert kv._staged_outputs[1, ("main", 0)] is other["main"]
+    assert kv._current_plan_states["main", 0] is kv._static_plan_state(1, ("main", 0), 4)
     assert _read(kv, ("a", "b"), slot=1) is other
     assert _read(kv, ("a", "b"), slot=0) is first
 
@@ -203,7 +203,7 @@ def test_a_preplanned_read_only_step_reuses_the_plan(kv):
     first = _read(kv, ("a", "b"), preplan=True)
     again = _read(kv, ("a", "b"), preplan=True)
     assert again is first
-    assert kv._current_plan_states["main"] is kv._static_plan_state(0, "main")
+    assert kv._current_plan_states["main", 0] is kv._static_plan_state(0, ("main", 0), 4)
     # a plan made inline and one made ahead are the same entry
     assert _read(kv, ("a", "b")) is first
 
@@ -240,16 +240,16 @@ def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
 
 def test_a_plan_built_across_a_touch_of_its_rows_is_not_reused(kv, monkeypatch):
     """A pre-plan builds on the plan thread while the main thread can tear a
-    request down: the entry keeps the epochs from before the views."""
-    build = kv._sequence_views
+    request down: the entry keeps the epoch from before the build."""
+    build = kv._plan_label
 
     def touched(*args, **kwargs):
         kv._touch_plan_cache("b")
         return build(*args, **kwargs)
 
-    monkeypatch.setattr(kv, "_sequence_views", touched)
+    monkeypatch.setattr(kv, "_plan_label", touched)
     first = _read(kv, ("a", "b"))
-    monkeypatch.setattr(kv, "_sequence_views", build)
+    monkeypatch.setattr(kv, "_plan_label", build)
     assert _read(kv, ("a", "b")) is not first
 
 
@@ -267,14 +267,27 @@ def test_an_eager_write_step_is_not_staged_and_write_target_addresses_it():
     )
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
-    assert (0, "main") not in kv._staged_outputs
-    assert kv._current_plan_states["main"] is not kv._static_plan_state(0, "main")
+    assert (0, ("main", 0)) not in kv._staged_outputs
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0), 8)
     layer, pages, slots, n = kv.write_target(layer_idx=0, label="main")
     assert n == 6 and layer.data_ptr() == kv.kv_cache.tensor[0].data_ptr()
     stream = kv._streams["a"]["main"]
     assert pages[:n].tolist() == [stream.page_indices[i // PAGE] for i in range(6)]
     assert slots[:n].tolist() == [i % PAGE for i in range(6)]
     kv.commit(step, ctx)
+
+
+def test_a_reused_read_only_eager_write_plan_is_not_staged(kv):
+    """The reuse keeps ``eager_write`` out of the slot's static buffers, as the
+    plan it reuses did."""
+    first = _read(kv, ("a", "b"), eager_write=True)
+    assert _read(kv, ("a", "b"), eager_write=True) is first
+    assert (0, ("main", 0)) not in kv._staged_outputs
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0), 4)
+    # nor is a plan the slot staged for the same rows reused for one
+    staged = _read(kv, ("a", "b"))
+    assert _read(kv, ("a", "b"), eager_write=True) is not staged
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0), 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="offload needs pinned host memory")

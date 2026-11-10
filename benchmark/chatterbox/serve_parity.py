@@ -29,7 +29,7 @@ import soundfile as sf
 def synthesize(url: str, text: str, seed: int, voice: str, extra: dict) -> tuple[np.ndarray, int, float]:
     payload = {
         "model": "chatterbox", "input": text, "voice": voice, "response_format": "wav",
-        "stream": False, "seed": seed, "do_sample": False, **extra,
+        "stream": False, "seed": seed, "temperature": 0, **extra,
     }
     t0 = time.perf_counter()
     resp = requests.post(f"{url}/v1/audio/speech", json=payload, timeout=600)

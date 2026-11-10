@@ -1,9 +1,12 @@
 """``compile_mode`` on a capture config: checked when the config is built, and
-turned into ``torch.compile``'s arguments by ``accelerator_graph_runner.compile_kwargs``."""
+turned into ``torch.compile``'s arguments by ``accelerator_graph_runner.compile_kwargs``;
+and how many cache entries a forward compiled with them takes per bucket."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, ".")
 
@@ -13,6 +16,9 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseBatchedConfig,
 )
 from mstar.engine.accelerator_graph_runner import compile_kwargs
+from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+from mstar.engine.resources.attn.xpu import XPUPagedAttentionManager
 from mstar.model.submodule_base import NodeInputs
 
 
@@ -66,11 +72,11 @@ def test_configs_carry_the_field():
 
 @pytest.fixture
 def fresh_deterministic_check():
-    from mstar.engine import accelerator_graph_runner
+    from mstar.platforms import compile as platform_compile
 
-    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    platform_compile._has_deterministic_mode.cache_clear()
     yield
-    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    platform_compile._has_deterministic_mode.cache_clear()
 
 
 @pytest.mark.parametrize("build", [_batched, _piecewise])
@@ -90,11 +96,90 @@ def test_a_torch_without_the_deterministic_mode_says_so(monkeypatch, caplog, fre
 
     import torch._inductor.config as inductor_config
 
-    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+    from mstar.platforms.compile import deterministic_inductor_options
 
     if hasattr(inductor_config, "deterministic"):
         monkeypatch.delattr(inductor_config, "deterministic")
-    with caplog.at_level(logging.WARNING, logger="mstar.engine.accelerator_graph_runner"):
+    with caplog.at_level(logging.WARNING, logger="mstar.platforms.compile"):
         assert deterministic_inductor_options() == {}
         assert compile_kwargs("deterministic") == {"fullgraph": False, "dynamic": False}
     assert caplog.text.count("has no Inductor deterministic mode") == 1
+
+
+@pytest.mark.parametrize("manager_cls, plans_attr, plan", [
+    (FlashInferManager, "_current_plan_states", lambda qo: SimpleNamespace(_qo_indptr_buf=qo)),
+    (FlashInferMLAManager, "_current_plan_states", lambda qo: SimpleNamespace(_qo_indptr_buf=qo)),
+    (XPUPagedAttentionManager, "_current_plans", lambda qo: SimpleNamespace(cu_q=qo)),
+])
+def test_select_last_hidden_compiles_no_frame_per_prefill_bucket(manager_cls, plans_attr, plan):
+    """Captured forwards compile with static shapes, so a frame holding both a
+    bucket's token count and its row count takes one cache entry per pair.
+    Three token counts by three row counts must fit in three entries per frame."""
+    manager = manager_cls.__new__(manager_cls)
+    head = torch.nn.Linear(8, 4)
+
+    def forward(hidden):
+        return head(manager.select_last_hidden(hidden))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(forward, backend="eager", **compile_kwargs("default"))
+    try:
+        with torch._dynamo.config.patch(recompile_limit=3, fail_on_recompile_limit_hit=True), torch.no_grad():
+            for tokens in (16, 32, 64):
+                for rows in (1, 2, 4):
+                    qo = torch.arange(rows + 1, dtype=torch.int32) * (tokens // rows)
+                    setattr(manager, plans_attr, {"main": plan(qo)})
+                    hidden = torch.randn(tokens, 8)
+                    assert torch.equal(compiled(hidden), head(hidden[qo[1:].long() - 1]))
+    finally:
+        torch._dynamo.reset()
+
+
+def test_inductor_options_are_checked_at_build():
+    with pytest.raises(ValueError, match="no Inductor config entry"):
+        BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+            inductor_options={"no_such_option": True},
+        )
+    with pytest.raises(ValueError, match="CUDA graphs"):
+        BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+            inductor_options={"triton.cudagraphs": True},
+        )
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=NodeInputs(input_seq_len=1),
+        inductor_options={"max_autotune_gemm_backends": "ATEN"},
+    )
+    assert config.inductor_options == {"max_autotune_gemm_backends": "ATEN"}
+
+
+def test_inductor_options_go_over_the_modes_own():
+    # torch.compile takes a mode or options, not both: the mode becomes its option set
+    from torch._inductor import list_mode_options
+
+    pinned = {"max_autotune_gemm_backends": "ATEN"}
+    kwargs = compile_kwargs("max-autotune-no-cudagraphs", pinned)
+    assert "mode" not in kwargs
+    assert kwargs["options"] == {**list_mode_options("max-autotune-no-cudagraphs"), **pinned}
+    # without options the mode passes through untouched
+    assert compile_kwargs("max-autotune-no-cudagraphs", None) == compile_kwargs("max-autotune-no-cudagraphs")
+    assert compile_kwargs("default", pinned)["options"] == pinned
+
+
+@pytest.mark.parametrize("level", ["0", "1", "2"])
+def test_inductor_options_go_over_the_compile_level(monkeypatch, level):
+    from torch._inductor import list_mode_options
+
+    from mstar.engine import accelerator_graph_runner as runner
+
+    monkeypatch.setenv("MSTAR_COMPILE_LEVEL", level)
+    runner.compile_level.cache_clear()
+    try:
+        plain = compile_kwargs(None)
+        kwargs = compile_kwargs(None, {"max_autotune_gemm_backends": "ATEN"})
+    finally:
+        runner.compile_level.cache_clear()
+    want = dict(list_mode_options(plain["mode"])) if "mode" in plain else {}
+    want.update(plain.get("options", {}))
+    want["max_autotune_gemm_backends"] = "ATEN"
+    assert "mode" not in kwargs and kwargs["options"] == want

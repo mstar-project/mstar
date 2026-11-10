@@ -32,7 +32,7 @@ from run_parity import DEVICE, drive, frame_stats, fwd_info, same, stats  # noqa
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
-from mstar.model.lingbot_world.submodules import first_frame_mask  # noqa: E402
+from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, first_frame_mask  # noqa: E402
 
 
 def timed_rollout(sub, text, image, cond, poses, intr, md, rid, seed=42):
@@ -50,7 +50,8 @@ def timed_rollout(sub, text, image, cond, poses, intr, md, rid, seed=42):
     latents, pixels, chunk_ms, dit_ms = [], [], [], []
     encode = submodules.encode_condition_chunk
     submodules.encode_condition_chunk = lambda vae, image, cache, first, n, cfg: cond[:, first:first + n]
-    for _ in range(md["num_chunks"]):
+    for k in range(md["num_latent_frames"] // sub.config.chunk_size):
+        info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = k
         events.clear()
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
@@ -92,7 +93,7 @@ def main():
     poses, intr = tensors["camera_poses"][0], tensors["intrinsics"][0]
     lat_f = poses.shape[0]
     _, _, lat_h, lat_w = ref_in["vae_latent"].shape
-    md = {"is_prefill": False, "guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
+    md = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
     n_tok = ref_in["context"].shape[0]
     text = torch.zeros(1, cfg.text_len, cfg.text_dim, dtype=ref_in["context"].dtype)
     text[0, :n_tok] = ref_in["context"]
@@ -125,9 +126,7 @@ def main():
         vae = model._load_vae().to(DEVICE)
         if not vae_dtype_fp32:
             vae = vae.to(torch.bfloat16)
-        if channels_last:
-            wan_vae.to_channels_last(vae)
-        sub.vae, sub._decode_step = vae, wan_vae.DecoderStep(vae, compile=False)
+        sub.vae, sub._decoder = vae, wan_vae.FastDecoder(vae, channels_last=channels_last, compile=False)
         st = sub.request_state(20)
         st.add("feat_cache", wan_vae.new_feat_cache(vae))
         times, outs = [], []

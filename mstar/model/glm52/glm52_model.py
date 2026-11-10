@@ -2,13 +2,15 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 
 from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -29,7 +31,12 @@ from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
@@ -42,9 +49,16 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
+from mstar.model.utils import (
+    ByteIdDetokenizer,
+    ByteLevelDetokenizer,
+    TextOutput,
+    capture_ladder,
+    load_snapshot_tokenizer,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +70,27 @@ _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
     "prefill_last_layer_rows")
+# The quantized checkpoint formats GLM-5.2's loader reads itself: fp8 block-scale
+# (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
+QUANT_METHODS = ("fp8",)
+
+# what zai-org/GLM-5.2's generation_config.json declares, for a checkpoint whose file is not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
+
+    DECODE_LOOP = "decode_loop"
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
     # read only by process_prompt's template, and kept off the conductor's wire,
     # which cannot carry every number a tool schema may hold (2**64)
     PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
@@ -91,8 +116,16 @@ class Glm52Model(Model):
         if long_only and not kwargs.get("dsa_long_context", False):
             # they size and split the long-context path only; without it they would be dropped
             raise ValueError(f"{long_only} apply only with dsa_long_context")
+        for key in ("dsa_long_context", "dsa_shard_prefill"):
+            # bool("false") is True
+            if key in kwargs and not isinstance(kwargs[key], bool):
+                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+        for key in ("max_seq_len", "prefill_chunk_tokens"):
+            # int() would take True as 1 and 2.5 as 2
+            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
@@ -118,15 +151,17 @@ class Glm52Model(Model):
                 raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
             self.config.kernels = kwargs["kernels"]
         if "graph_compile" in kwargs:
-            self.config.graph_compile = bool(kwargs["graph_compile"])
-        for key in ("prefill_token_buckets", "prefill_batched_token_buckets",
-                    "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
+            # bool("false") is True
+            if not isinstance(kwargs["graph_compile"], bool):
+                raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
+            self.config.graph_compile = kwargs["graph_compile"]
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         if "mtp_num_draft_tokens" in kwargs:
-            k = int(kwargs["mtp_num_draft_tokens"])
-            if k < 0:
-                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            k = kwargs["mtp_num_draft_tokens"]
+            if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+                raise ValueError(f"mtp_num_draft_tokens must be an integer, 0 (off) or more, got {k!r}")
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
             self._check_mtp(kwargs)
@@ -134,6 +169,8 @@ class Glm52Model(Model):
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     def _check_mtp(self, kwargs: dict) -> None:
         if self._config_variant in ("reduced", "reduced_fp8"):
@@ -151,6 +188,12 @@ class Glm52Model(Model):
                 "mtp_num_draft_tokens needs the checkpoint's own trunk depth; "
                 "with num_hidden_layers set, trunk layers would load as the MTP layer"
             )
+        if self.config.max_prompt_tokens < 1:
+            # two verify blocks of k + 1 rows stay free under the context limit
+            raise ValueError(
+                f"mtp_num_draft_tokens={self.config.mtp_num_draft_tokens} leaves no room for a "
+                f"prompt in the {self.context_limit()}-token context"
+            )
 
     def _checkpoint_config(self) -> Glm52ModelConfig:
         """A local checkpoint's config.json geometry, else the official one."""
@@ -167,42 +210,8 @@ class Glm52Model(Model):
         # Lazy: weights AND tokenizer load on demand so the conductor process
         # never touches the 750 GB checkpoint or HF IO in dummy/byte mode.
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            tokenizer_source = str(
-                resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_source, cache_dir=self.cache_dir,
-                )
-            except ValueError:
-                # The checkpoint's tokenizer_config declares transformers-5's
-                # TokenizersBackend class, which transformers 4.x cannot
-                # construct — but the underlying tokenizer.json is
-                # version-independent, so building a fast tokenizer straight
-                # from it encodes identically.
-                self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
+            self._tokenizer = load_snapshot_tokenizer(self.model_path_hf, self.cache_dir)
         return self._tokenizer
-
-    @staticmethod
-    def _fast_tokenizer_fallback(source: str):
-        from transformers import PreTrainedTokenizerFast
-
-        snap = Path(source)
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(snap / "tokenizer.json"))
-        template = snap / "chat_template.jinja"
-        if template.is_file():
-            tokenizer.chat_template = template.read_text()
-        # built from tokenizer.json alone, the tokenizer has no special tokens, so the
-        # detokenizer would print <|user|> and the other turn markers into replies
-        config = snap / "tokenizer_config.json"
-        if config.is_file():
-            cfg = json.loads(config.read_text())
-            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
-            tokenizer.add_special_tokens(
-                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
-        return tokenizer
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -265,9 +274,12 @@ class Glm52Model(Model):
                 resource_key=POS_RESOURCE, nodes=nodes,
                 config=self.config.position_config(),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
         if self.config.dsa_long_context:
@@ -276,7 +288,8 @@ class Glm52Model(Model):
                 resource_key=DSA_RESOURCE, nodes=nodes,
                 config=DSAConfig(
                     kv_cache=KV_RESOURCE, topk=self.config.index_topk,
-                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True),
+                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True,
+                    index_head_dim=self.config.index_head_dim),
             ))
         return specs
 
@@ -320,11 +333,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget lives in check_stop,
-            # which sees the request's real max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -332,73 +342,21 @@ class Glm52Model(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -415,9 +373,10 @@ class Glm52Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
+        # read here, in the data worker: a bad knob is the client's 400 before any work
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
         if self.config.mtp_num_draft_tokens > 0:
             # refused here as a 400; prepare_inputs would refuse it as a 500
-            sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
                     f"MTP drafting is greedy only (temperature={sampling.temperature}, "
@@ -453,25 +412,22 @@ class Glm52Model(Model):
         )
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default; dropped, a request got neither
-        for k, cast in (("top_k", int), ("min_p", float)):
-            if model_kwargs.get(k) is not None:
-                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # greedy by default under MTP, so a request that names no temperature serves
             # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     def context_limit(self) -> int:
         """The bound the submodule's preprocess holds every context to:
@@ -489,11 +445,6 @@ class Glm52Model(Model):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else budget
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer: the
-        # whole window is max_iters, and the conductor refuses a cap past it
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
@@ -588,7 +539,7 @@ class Glm52Model(Model):
             )
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
@@ -599,7 +550,7 @@ class Glm52Model(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            load_weights(language_model, source, device=device)
+            load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS)
             return
 
         with open(index_file) as f:
@@ -615,35 +566,17 @@ class Glm52Model(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         language_model.load_weights(weights)
 
     def _resolve_checkpoint(self) -> str | None:
-        path = getattr(self, "model_path_hf", None)
-        if not path:
-            return None
-        if Path(path).exists():
-            return str(path)
-        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
+        return resolve_checkpoint(self.model_path_hf, self.cache_dir)
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        from mstar.utils.fp8_block import Fp8BlockQuantConfig
-
         if self.config.quantization_config is not None:
             return
-        config_json = Path(source) / "config.json"
-        if not config_json.is_file():
-            return
-        try:
-            with open(config_json) as f:
-                raw = json.load(f)
-        except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
-            logger.warning("Glm52Model: could not read %s: %s", config_json, e)
-            return
-        quant = Fp8BlockQuantConfig.from_hf_config_dict(
-            raw.get("quantization_config"),
-        )
+        quant = read_fp8_block_quant_config(source)
         if quant is not None:
             self.config.quantization_config = quant
             logger.info(

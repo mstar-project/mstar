@@ -68,6 +68,7 @@ def _stub_transfer(monkeypatch):
 def _make_model() -> WhisperModel:
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig()  # large-v3 dims
+    model.sampling_defaults = {}
     return model
 
 
@@ -124,7 +125,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
-            request_id=f"r{i}", model_kwargs={}, client_request_id=None, client_input=None))
+            request_id=f"r{i}", model_kwargs={}, client_request_id=None, input_open=False))
 
     running: list[str] = []
     refused = peak = finished = 0

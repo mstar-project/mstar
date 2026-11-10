@@ -320,7 +320,7 @@ def resolve_index_names(
 ) -> dict[str, tuple[str, ...]]:
     """Classify every checkpoint name through the real pipeline stages."""
     # The real dispatcher's rule matcher — not a reimplementation.
-    from mstar.model.loader.base import _apply_stacked
+    from mstar.model.loader.base import apply_stacked
 
     names = list(index_names)
     name_set = set(names)
@@ -373,7 +373,7 @@ def resolve_index_names(
         if mapped is None:
             out["unmapped"].append(f"{raw} (remapper dropped)")
             continue
-        target, _shard = _apply_stacked(mapped, rules)
+        target, _shard = apply_stacked(mapped, rules)
         out["absorbed" if absorbed else "loaded"].append(f"{raw} -> {target}")
 
     return {kind: tuple(v) for kind, v in out.items()}

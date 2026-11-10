@@ -1,9 +1,8 @@
 """CPU tests for the DiT scaffold's ``DenoiseLoopSubmodule`` with a toy model.
 
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
-index from the engine's loop counter, the async-overshoot veto, equal-shape batching,
-stacked preprocess and per-row outputs, the stop boundary, the CUDA-graph bucket key
-and the ragged-attention step declaration.
+index from the engine's loop counter, equal-shape batching, stacked preprocess and
+per-row outputs, the CUDA-graph bucket key and the ragged-attention step declaration.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.resources.convenience import RaggedAttentionCallable  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
@@ -101,7 +99,7 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     assert not torch.equal(a.tensor_inputs[LATENTS], c.tensor_inputs[LATENTS])
     assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
     state = sub.request_state(_handle("r0"))
-    assert state["num_steps"] == 4 and state["schedule"].num_steps == 4
+    assert state["schedule"].num_steps == 4
     # step scalars come off the device-resident schedule
     assert torch.equal(a.tensor_inputs["sigma"], state["sigmas"][0:1])
     assert torch.equal(a.tensor_inputs["timestep"], state["timesteps"][0:1])
@@ -125,18 +123,11 @@ def test_missing_loop_back_latents_past_iteration_zero_raises():
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
 
 
-def test_overshoot_iteration_is_vetoed():
+def test_a_step_without_the_loop_counter_raises():
+    """Read as 0, it would reseed from noise every iteration and run to max_iters."""
     sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
-    assert sub.prepare_inputs(WALK, _info("r0", 2, steps=2), _inputs(torch.ones(8, 4))) is None
-
-
-@pytest.mark.parametrize("steps,k,expect", [(1, 0, True), (4, 2, False), (4, 3, True), (4, 4, True)])
-def test_check_stop_boundary(steps, k, expect):
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=steps), _inputs())
-    assert (LOOP in sub.check_stop(_handle("r0"), _info("r0", k, steps=steps), {})) is expect
-    assert sub.check_stop(_handle("unknown"), _info("unknown", k), {}) == set()
+    with pytest.raises(KeyError, match=LOOP):
+        sub.prepare_inputs(WALK, dataclasses.replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
 
 
 def test_can_batch_only_equal_shapes():
@@ -188,6 +179,8 @@ def test_cg_key_info_and_declare_step_agree():
     assert step.cg_key_info == (8, 3)
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 11), ("b", "main", 11)]
     assert set(step.steps) == {"dit_attn"} and step.steps["dit_attn"].causal is False
+    # every row of a bucket spans its tokens, so the bucket's layout is fixed
+    assert step.steps["dit_attn"].fixed_layout is True
     assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
 
 
@@ -204,7 +197,6 @@ def test_accelerator_graph_configs_one_bucket_per_shape():
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
     assert cfg.input_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
     assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
-
 
 
 def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
@@ -398,25 +390,22 @@ def test_a_step_scalar_too_short_for_its_offset_says_so():
 def test_ragged_for_binds_the_label():
     class Resource:
         def run(self, q, k, v, label=None):
-            return label
+            return self, label
 
     sub = TwoSpanDenoise(attn_resource_key="dit_attn")
     resource = Resource()
     sub.bind_node_resources({"dit_attn": resource})
     image = sub.ragged_for("image")
-    assert isinstance(image, RaggedAttentionCallable)
-    assert image.attn is resource and image.label == "image"
-    assert image(None, None, None) == "image"
-    assert sub._ragged()(None, None, None) == "main"
-    # one callable object per label, so a compiled region's identity guards hold across steps
+    assert image(None, None, None) == (resource, "image")
+    assert sub._ragged()(None, None, None) == (resource, "main")
+    # built once per label for the binding, not per step
     assert sub.ragged_for("image") is image and sub._ragged() is sub._ragged()
     # a rebinding starts over: a callable holding the old resource would attend
     # through a plan nothing writes to any more
     new_resource = Resource()
     sub.bind_node_resources({"dit_attn": new_resource})
-    assert sub.ragged_for("image") is not image
-    assert sub.ragged_for("image").attn is new_resource
-    assert sub.ragged_for("main")(None, None, None) == "main"
+    assert sub.ragged_for("image")(None, None, None) == (new_resource, "image")
+    assert sub.ragged_for("main")(None, None, None) == (new_resource, "main")
     assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
     unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
     assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA
@@ -442,25 +431,6 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     assert sub.cg_key_info(
         WALK, {"a": _info("a", 0)}, per_request_input_metadata={"a": object()},
     ) == (8, 3)
-
-
-def test_check_stop_finds_the_schedule_under_the_engines_key():
-    """The loop's state must be keyed by the integer rid_handle, because that is
-    what the engine hands check_stop. Keyed by request_id instead, check_stop
-    missed, returned "do not stop", and the loop ran forever -- which hung every
-    served request on both klein and Z-Image."""
-    sub = ToyDenoise()
-    info = _info("r0", 0, steps=4)
-    sub.prepare_inputs(WALK, info, _inputs())
-
-    # the engine calls check_stop with batch.request_ids, i.e. the handle
-    assert info.rid_handle in sub.request_states
-    assert sub.check_stop(info.rid_handle, _info("r0", 3, steps=4), {}) == {LOOP}
-    assert sub.check_stop(info.rid_handle, _info("r0", 2, steps=4), {}) == set()
-
-    # the wire string is NOT the key: a lookup by it finds nothing, and the
-    # scaffold warns rather than silently declining to stop
-    assert info.request_id not in sub.request_states
 
 
 class ToyRefine(ToyDenoise):
@@ -500,15 +470,8 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
     )
     out = sub.prepare_inputs("refine", refine, _inputs())
     state = sub.request_state(_handle("rs"))
-    assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
+    assert state["schedule"].num_steps == 2 and state["bucket_key"] == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
-    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
-
-
-def dataclasses_replace(info, **changes):
-    import dataclasses
-
-    return dataclasses.replace(info, **changes)
 
 
 class PrefetchingToy(ToyDenoise):
@@ -555,7 +518,6 @@ def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
 def test_seeds_are_drawn_once_per_request_and_only_when_asked():
     sub = PrefetchingToy()
     _added(sub, "p3").result()
-    sub.on_request_added(_handle("p3"), _info("p3", 0))  # its second partition on this worker
     assert sub.drawn_on == ["mstar-seed_0"]
     plain = ToyDenoise()
     plain.on_request_added(_handle("p4"), _info("p4", 0))

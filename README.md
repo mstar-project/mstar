@@ -67,10 +67,11 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 ```
 
 The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
-and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`.
+and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`,
+then build the [Rust extension](#rust-extension).
 Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
 
-To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
+To enable flash-attn support (recommended for BAGEL),
 ```bash
 # torch 2.10 built for CUDA 13.x (cu13); on a cu12 torch, build from source (docs/installation.rst)
 uv pip install \
@@ -117,6 +118,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
+| [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) *(Beta)* | Vision-language model | text, image → text (sliding-window and NoPE attention layers 3:1) | `/v1/chat/completions`, `/generate` |
 | [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
@@ -160,14 +162,12 @@ single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four 
 primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
 `StreamingGraphEdge` — express every model family above. See the [paper](https://arxiv.org/abs/2606.12688) for the full design.
 
-### Optional: Rust ZMQ transport
+### Rust extension
 
-The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rust/)) instead of
-pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
-Note what AUTO-by-default means: on any machine where the extension is built, the whole
-mesh switches to the Rust transport with no configuration change — each process logs its
-choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it
-with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the graph runtime is
+Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
+process logs it at startup (`control mesh transport: rust <version> from <path>`).
+From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
 The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
 LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and

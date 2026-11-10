@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.resident_hooks import ResidentHooks
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
@@ -16,8 +19,11 @@ if TYPE_CHECKING:
     # import out of module exec
     from mstar.engine.accelerator_graph_config import (
         AcceleratorGraphConfig,
+        AcceleratorGraphConfigType,
         PiecewiseAcceleratorGraphConfig,
+        PiecewiseConfigType,
     )
+    from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -60,6 +66,9 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # the dtype this resource's nodes compute in (their autocast dtype); None when they
+    # disagree or run outside autocast
+    compute_dtype: torch.dtype | None = None
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
     # this resource's local nodes
@@ -73,6 +82,18 @@ class EngineResourceInfo:
     max_rows_in_combined: "Mapping[str, int | None]" = field(
         default_factory=dict
     )
+    # the prefix caches this engine opens (`opening_prefix_caches`), decided
+    # before any resource is built, for one that sizes itself by its own
+    prefix_caches: frozenset[str] = frozenset()
+
+    @property
+    def head_shards(self) -> int:
+        """How many ways the node's ranks split its attention heads, which each
+        builder sizes head counts by: its TP × SP ranks (CFG ranks run whole
+        branches, every head). A ragged resource declaring
+        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        group = self.joint_comm_group
+        return 1 if group is None else group.tp_group.world_size * group.sp_group.world_size
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -95,6 +116,21 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class Residency(IntEnum):
+    """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
+    from its ids. Ordered by how far the state is from the device."""
+    RESIDENT = 0
+    ON_HOST = 1
+    DROPPED = 2
+
+
+class Rebuild(NamedTuple):
+    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
+    The last id is the one the next decode step reads."""
+    walk: str
+    ids: Sequence[int]
+
+
 class KeyedWalks(NamedTuple):
     """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
@@ -102,7 +138,7 @@ class KeyedWalks(NamedTuple):
     growth: tuple[str, ...] = ()
 
 
-class Resource(ABC):
+class Resource(ResidentHooks, ABC):
     @classmethod
     @abstractmethod
     def build(
@@ -116,16 +152,53 @@ class Resource(ABC):
     def can_capture(self) -> bool:
         return True
 
+    # this resource's key among the engine's resources, set by `build_resource`
+    resource_key: str | None = None
+
+    # Whether this resource's kernels can be left out of a step whose rows all allow
+    # it (``lean_for``). The engine then captures a lean twin of each bucket whose
+    # step drives the resource and whose kind it accepts (``lean_captures``), keyed
+    # by ``BucketKey.lean``, and names the resource in ``StepContext.lean`` for a
+    # step that runs it lean, eager steps included; the resource checks that at plan.
+    # Each rank makes the choice from its own state, so the resource's lean and
+    # plain kernels must issue the same collectives.
+    lean_capture: bool = False
+
+    def lean_for(self, request_ids) -> bool:
+        """Whether every one of ``request_ids`` lets this ``lean_capture`` resource
+        run lean. Read from state every rank of a lockstep instance sets alike (its
+        ingests), on the thread that leases the step's graph."""
+        return False
+
+    def lean_captures(
+        self, config_type: AcceleratorGraphConfigType | PiecewiseConfigType,
+    ) -> bool:
+        """Whether a capture of ``config_type`` gets this resource's lean twin."""
+        return True
+
+    def outside_step(self) -> AbstractContextManager[None]:
+        """Run a ``lean_capture`` resource's callers outside any planned step (a
+        compile's warm-up) on this thread, as in a step that runs it lean."""
+        return nullcontext()
+
+    # Whether this resource's step on a node is the node's own segments
+    # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
+    # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
+    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
+    # node's tokens).
+    steps_from_segments: bool = False
+
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened."""
-        return False
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
+        """Open whatever this resource keeps across requests, under ``root``. The
+        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""
+        return
 
     def close_prefix_cache(self) -> None:
-        """Undo `enable_prefix_cache`. Called before any request."""
+        """Keep nothing across requests. The engine calls it, before any
+        request, on every other resource."""
         return
 
     def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
@@ -147,6 +220,12 @@ class Resource(ABC):
         """The longest prefix up to ``prefix`` this resource can serve, for a
         resource that holds only some lengths."""
         return prefix
+
+    @property
+    def chunk_alignment(self) -> int:
+        """Tokens a cut prefill chunk is a multiple of, so that each chunk starts on a
+        position this resource can keep state at (`Engine.chunk_alignment`). 1 cuts anywhere."""
+        return 1
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -203,6 +282,17 @@ class Resource(ABC):
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
 
+    @classmethod
+    def journals_resident_moves(cls) -> bool:
+        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
+        instance outside the step that uses it (eviction, prefix leases, page trails). They
+        replay each decision with the next step of the node it was journaled under, so
+        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
+        the class a spec's ``resource_class`` names, so the hooks live there, not only on
+        a subclass its ``build`` returns."""
+        return any(getattr(cls, hook) is not getattr(Resource, hook)
+                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
@@ -215,9 +305,8 @@ class Resource(ABC):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
-        """Must be idempotent: the conductor sends one NewRequest per partition,
-        so a worker serving several partitions of a request ingests it once
-        for each, possibly after a node has already run a step for it."""
+        """Open the request's state. The worker calls this once per request, on
+        its first NewRequest, though one comes per partition it serves."""
         return
 
     def ingest_capture_row(self, rid: str):
@@ -292,6 +381,11 @@ class Resource(ABC):
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
         return
+
+    def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """Row-addressed tensors of the step just run, copied to the host with
+        the stop buffers. Read right after the forward and not cloned."""
+        return {}
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
@@ -409,12 +503,34 @@ class Resource(ABC):
     def supports_eviction(self):
         return False
 
-    def is_offloaded(self, rid: str) -> bool:
-        return False
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
+    def residency(self, rid: str) -> Residency:
+        return Residency.RESIDENT
 
     def offload(self, rid: str) -> int:
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
+
+    def check_drop(self, rid: str, tokens: int) -> None:
+        """Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""
+        return
+
+    def drop(self, rid: str, tokens: int) -> int:
+        """Discard the request's state that can be recomputed from the ``tokens``
+        token ids its rebuild writes, and keep the rest. Returns what was reclaimed."""
+        return 0
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
+        return
+
+    def land_rebuild(self, rid: str) -> None:
+        """The dropped request's rebuild has run its last chunk."""
+        return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
@@ -460,6 +576,16 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def seal_capture_buffers(self) -> None:
+        """Every bucket on the device has been sized and none captured yet: from here on,
+        what a captured graph reads keeps its address. Called once, by the engine."""
+        # A no-op is safe for a resource that never reallocates what a graph reads once it
+        # is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first
+        # plan during sizing). The one kind a plan grows is a FlashInfer workspace:
+        # `AttentionResource` seals the pools they come from, and the dense backend's own,
+        # outside a pool, is never captured.
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
@@ -488,6 +614,10 @@ class AttentionResource(Resource):
 
     _default_label: str = "main"
     _default_layer_idx: int | None = None
+    # FlashInfer's float workspaces, on a resource that plans FlashInfer. Kept here so the
+    # seal is too: a workspace grows at a plan that overflows it, which past capture would
+    # free memory a graph reads.
+    _workspaces: WorkspacePool | None = None
 
     @property
     def default_label(self) -> str:
@@ -505,6 +635,10 @@ class AttentionResource(Resource):
         self._default_label = "main"
         self._default_layer_idx = None
 
+    def seal_capture_buffers(self) -> None:
+        if self._workspaces is not None:
+            self._workspaces.seal()
+
 
 class PublishedInfo(ABC):
     @abstractmethod
@@ -518,4 +652,6 @@ class PublishedInfo(ABC):
 
 
 def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
-    return spec.resource_class.build(spec, info)
+    resource = spec.resource_class.build(spec, info)
+    resource.resource_key = spec.resource_key
+    return resource

@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, DIT_ATTN, Flux2KleinConfig  # noqa: E402
@@ -33,19 +34,15 @@ CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs" / "flux2_klein
 
 
 class _StubTokenizer:
-    """Byte-level stand-in with the chat-template + max_length padding contract."""
+    """Byte-level stand-in with the chat-template + truncation contract."""
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
         assert not tokenize and add_generation_prompt and not enable_thinking
         return f"<u>{messages[0]['content']}<a>"
 
-    def __call__(self, text, return_tensors="pt", padding="max_length", truncation=True, max_length=512):
+    def __call__(self, text, return_tensors="pt", truncation=True, max_length=512):
         ids = list(text.encode("utf-8"))[:max_length]
-        pad = max_length - len(ids)
-        return {
-            "input_ids": torch.tensor([ids + [0] * pad]),
-            "attention_mask": torch.tensor([[1] * len(ids) + [0] * pad]),
-        }
+        return {"input_ids": torch.tensor([ids]), "attention_mask": torch.tensor([[1] * len(ids)])}
 
 
 def _make_model(**kwargs) -> Flux2KleinModel:
@@ -74,7 +71,7 @@ def test_graph_walks_and_nodes():
     assert model.nodes == ["dit", "text_encoder", "vae_decoder", "vae_encoder"]
 
     text = walks[ENCODE_TEXT_WALK]
-    assert isinstance(text, GraphNode) and text.input_names == {"text_inputs", "text_mask"}
+    assert isinstance(text, GraphNode) and text.input_names == {"text_inputs"}
     (embeds,) = text.outputs
     assert embeds.name == "text_embeds" and embeds.persist and embeds.next_node == EMPTY_DESTINATION
 
@@ -130,20 +127,15 @@ def test_dummy_mode_returns_no_submodules():
 # ----------------------------------------------------------------------
 
 
-def test_process_prompt_tokenizes_with_chat_template_to_fixed_length():
+def test_process_prompt_tokenizes_with_chat_template_unpadded():
     model = _make_model()
-    out = model.process_prompt("a cat", ["text"], ["image"])
-    ids, mask = out["text_inputs"][0], out["text_mask"][0]
-    assert ids.shape == (512,) and mask.shape == (512,) and ids.dtype == torch.long
-    n = int(mask.sum())
-    assert bytes(ids[:n].tolist()) == b"<u>a cat<a>"
-    assert int(mask[n:].sum()) == 0
+    (ids,) = model.process_prompt("a cat", ["text"], ["image"])["text_inputs"]
+    assert ids.dtype == torch.long and bytes(ids.tolist()) == b"<u>a cat<a>"
 
 
 @pytest.mark.parametrize("kwargs,message", [
     ({"height": 1000}, "multiple of 16"),
     ({"width": 0}, "multiple of 16"),
-    ({"num_inference_steps": 0}, "num_inference_steps"),
 ])
 def test_process_prompt_rejects_bad_geometry(kwargs, message):
     with pytest.raises(ValueError, match=message):
@@ -163,74 +155,59 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
 
 
-def test_steps_are_clamped_to_the_loop_ceiling():
+def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        "default", ["text"], ["image"], _text_signals(), model_kwargs={"num_inference_steps": 10_000},
-    )
-    assert args.step_metadata["num_inference_steps"] == model.config.max_denoise_steps
+    ceiling = model.config.max_denoise_steps
+    assert model.get_loop_caps(num_inference_steps=8) == {DENOISE_LOOP: 8}
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model
+    # read off the graph, so the test also checks the loop's max_iters is the ceiling
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": ceiling}) == {DENOISE_LOOP: ceiling}
+    with pytest.raises(ValueError, match=f"at most {ceiling}"):
+        conductor._loop_caps({"num_inference_steps": ceiling + 1})
+
+
+@pytest.mark.parametrize("requested", [3, 50])
+def test_the_loop_cap_is_the_schedules_step_count(requested):
+    """The DiT indexes its schedule by the loop counter, so the loop must end on
+    the step count the schedule is built from."""
+    model = _make_model()
+    plan = model.walk_plan("default", ["text"], ["image"], _text_signals(), {"num_inference_steps": requested})
+    steps = plan[0].step_metadata["num_inference_steps"]
+    assert steps == requested
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP: steps}
 
 
 # ----------------------------------------------------------------------
-# Walk schedule (state machine)
+# Walk plan
 # ----------------------------------------------------------------------
 
 
 def _text_signals():
-    return {"text_inputs": [_tensor_info("t", [512])], "text_mask": [_tensor_info("m", [512])]}
+    return {"text_inputs": [_tensor_info("t", [11])]}
 
 
-def _step(model, metadata, persist):
-    return model.get_partition_forward_pass_args("default", metadata, persist)
-
-
-def test_t2i_schedule_encode_text_then_image_gen_then_done():
+@pytest.mark.parametrize("refs, kwargs, walks, size, grids", [
+    ([], {"height": 768, "width": 1024}, [ENCODE_TEXT_WALK, IMAGE_GEN_WALK], (768, 1024), []),
+    # an edit encodes its references first; the size defaults to the first, and each gets a grid
+    ([[3, 512, 768], [3, 256, 256]], {}, [ENCODE_TEXT_WALK, ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK],
+     (512, 768), [[32, 48], [16, 16]]),
+], ids=["t2i", "edit"])
+def test_plan_walks_and_request_metadata(refs, kwargs, walks, size, grids):
     model = _make_model()
-    args = model.get_initial_forward_pass_args("default", ["text"], ["image"], _text_signals(),
-                                               model_kwargs={"height": 768, "width": 1024, "num_inference_steps": 4})
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.is_prefill
-    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
-    assert args.step_metadata["height"] == 768 and args.step_metadata["width"] == 1024
-    assert args.step_metadata["ref_grids"] == []
-    targets = {(e.next_node, e.name) for e in args.inputs}
-    assert targets == {("text_encoder", "text_inputs"), ("text_encoder", "text_mask")}
-
-    persist = {"text_embeds": [_tensor_info("e", [1, 512, 7680])]}
-    nxt = _step(model, md, persist)
-    assert nxt.full_metadata.graph_walk == IMAGE_GEN_WALK and not nxt.full_metadata.is_prefill
-    assert not nxt.request_done
-    by_name = {e.name: e for e in nxt.inputs}
-    assert set(by_name) == {"text_embeds", "latents"}
-    assert by_name["text_embeds"].tensor_info == persist["text_embeds"]
-    assert by_name["latents"].tensor_info == []  # seeded by the dit at iteration 0
-    assert persist["text_embeds"][0].uuid in {i.uuid for i in nxt.unpersist_tensors}
-
-    done = _step(model, nxt.full_metadata, {})
-    assert done.request_done and done.inputs == []
-
-
-def test_edit_schedule_inserts_encode_image_and_defaults_size_to_the_reference():
-    model = _make_model()
-    refs = [_tensor_info("i0", [3, 512, 768]), _tensor_info("i1", [3, 256, 256])]
-    signals = {**_text_signals(), "image_inputs": refs}
-    args = model.get_initial_forward_pass_args("default", ["image", "image", "text"], ["image"], signals)
-    md = args.full_metadata
-    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK]
-    # output size defaults to the first reference image; ref grids follow every image
-    assert (args.step_metadata["height"], args.step_metadata["width"]) == (512, 768)
-    assert args.step_metadata["ref_grids"] == [[32, 48], [16, 16]]
-
-    nxt = _step(model, md, {"image_inputs": signals["image_inputs"]})
-    assert nxt.full_metadata.graph_walk == ENCODE_IMAGE_WALK and nxt.full_metadata.is_prefill
-    assert [(e.next_node, e.name) for e in nxt.inputs] == [("vae_encoder", "image_inputs")]
-
-    persist = {"text_embeds": [_tensor_info("e", [1, 512, 7680])],
-               "ref_latents": [_tensor_info("r", [1, 1792, 128])]}
-    nxt = _step(model, nxt.full_metadata, persist)
-    assert nxt.full_metadata.graph_walk == IMAGE_EDIT_WALK
-    assert {e.name for e in nxt.inputs} == {"text_embeds", "ref_latents", "latents"}
-    assert _step(model, nxt.full_metadata, {}).request_done
+    signals = {**_text_signals(), "image_inputs": [_tensor_info(f"i{k}", dims) for k, dims in enumerate(refs)]}
+    plan = model.walk_plan("default", ["image"] * len(refs) + ["text"], ["image"], signals, kwargs)
+    assert [step.walk for step in plan] == walks and not any(step.bind for step in plan)
+    assert all(step.step_metadata == plan[0].step_metadata for step in plan)
+    # text_len is the token count, which picks the text encoder's (captured) masked path
+    assert plan[0].step_metadata == {
+        "height": size[0], "width": size[1], "num_inference_steps": 4, "ref_grids": grids, "text_len": 11,
+    }
 
 
 def test_shape_key_from_step_metadata_and_capture_buckets():
@@ -319,7 +296,7 @@ def test_tokenize_matches_the_pipeline_recipe_with_the_real_tokenizer():
     model.set_config(Flux2KleinConfig())
     model.tokenizer = None  # load the real one from the snapshot
     prompt = "A cat holding a sign that says hello world"
-    ids, mask = model.tokenize(prompt)
+    ids = model.tokenize(prompt)
     tok = transformers.AutoTokenizer.from_pretrained(str(snapshot / "tokenizer"))
     text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
                                    add_generation_prompt=True, enable_thinking=False)
@@ -327,8 +304,10 @@ def test_tokenize_matches_the_pipeline_recipe_with_the_real_tokenizer():
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n")
     assert text == expected
     ref = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512)
-    assert torch.equal(ids, ref["input_ids"][0]) and torch.equal(mask, ref["attention_mask"][0])
-    assert int(mask.sum()) == 21 and ids[int(mask.sum()):].unique().tolist() == [151643]
+    n = int(ref["attention_mask"][0].sum())
+    assert n == 21 and torch.equal(ids, ref["input_ids"][0][:n])
+    # the text encoder node pads with the config's pad id: the pipeline's padding
+    assert ref["input_ids"][0][n:].unique().tolist() == [model.config.text_encoder.pad_token_id]
 
 
 def test_load_image_resamples_before_rgb_conversion(tmp_path):
@@ -447,14 +426,15 @@ def test_vae_compile_knob_reaches_the_decoder_node():
 
     vae = FakeVae()
     plain = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig())
-    assert plain._decode_one == vae.decode and plain._decode_batch_sizes == ()  # parity path: eager, any batch
+    # parity path: eager, any batch
+    assert plain._vae_decode._decode_one == vae.decode and plain._vae_decode._batch_sizes == ()
     compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
-    assert compiled._decode_one != vae.decode and compiled._decode_batch_sizes == (1, 2, 4, 8)
+    assert compiled._vae_decode._decode_one != vae.decode and compiled._vae_decode._batch_sizes == (1, 2, 4, 8)
     assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
 
 
 def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(monkeypatch):
-    import mstar.model.flux2_klein.submodules as subs
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.components.diffusion.decode_utils import decode_in_chunks
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
@@ -477,12 +457,11 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     vae = RecordingVae()
     node = KleinVaeDecoderSubmodule(
         vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-        decode_batch_sizes=(1, 2, 4, 8),
     )
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
     assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
     vae.shapes.clear()
-    out = node._decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
+    out = node._vae_decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
     assert [s[0] for s in vae.shapes] == [4, 2, 1] and out.shape[0] == 7
     assert torch.equal(out[:, 0, 0, 0], torch.arange(7.0))  # rows stay in order
     # eager path: no warmup, any batch in one call
@@ -493,12 +472,45 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     assert eager.shapes == [(5, 1, 1, 1)]
 
 
-def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch():
-    from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
+@pytest.mark.parametrize("max_batch_size, encoder, vae", [(4, [1, 2, 4], (1, 2, 4)), (6, [1, 2, 4, 6], (1, 2, 4, 6)),
+                                                        (16, [1, 2, 4, 8, 16], (1, 2, 4, 8))])
+def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_batch_size, encoder, vae):
+    """Powers of two plus the max batch itself, so a full batch never falls off the
+    largest graph; the VAE stops at its compile cap and splits larger batches."""
+    import mstar.model.components.diffusion.decode_utils as subs
+    from mstar.model.components.diffusion.qwen3.submodule import Qwen3TextEncoderSubmodule
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
-    assert VAE_DECODE_BATCH_SIZES == (1, 2, 4, 8)
-    small = _make_model(max_batch_size=4, capture_batch_sizes=[1, 2, 3, 4])
-    assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
+    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: None)  # no inductor on CPU tests
+
+    config = Flux2KleinConfig()
+    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
+                                     capture_walk=ENCODE_TEXT_WALK)
+    [graph] = text.get_accelerator_graph_configs(torch.device("cpu"))
+    assert graph.capture_batch_sizes == encoder
+    # a VAE with a weight, whose device the decoder warms on
+    vae_module = torch.nn.Linear(1, 1)
+    decoder = KleinVaeDecoderSubmodule(vae_module, config, max_batch_size=max_batch_size, compile_decode=True)
+    assert decoder._vae_decode._batch_sizes == vae
+
+
+def test_the_text_encoder_refuses_a_row_without_its_prompt_length():
+    """Whether a batch replays the captured encoder is read from each row's ``text_len``
+    step metadata; a model that never sets it must fail, not run eager on every batch."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.qwen3.submodule import TEXT_LEN, Qwen3TextEncoderSubmodule
+
+    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
+                                     capture_walk=ENCODE_TEXT_WALK)
+
+    def row(**step_metadata):
+        return CurrentForwardPassInfo(request_id="r", graph_walk=ENCODE_TEXT_WALK, fwd_index=0, random_seed=0,
+                                      max_tokens=0, step_metadata=step_metadata)
+
+    assert text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**{TEXT_LEN: 7})}) is True
+    for metadata in ({}, {"num_inference_steps": 4}):
+        with pytest.raises(ValueError, match=TEXT_LEN):
+            text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**metadata)})
 
 
 def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, torch_flag):
@@ -532,6 +544,82 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, tor
 
     assert _make_model().compile_eager_rounding is True
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
+
+
+def test_the_recompile_limit_reaches_torch_compile_only_where_it_exists(monkeypatch):
+    """``torch.compile`` takes ``recompile_limit`` from 2.12. CI's 2.10 and the H200 boxes' 2.11 raised a
+    TypeError on the keyword, which took klein, Z-Image and LTX-2.5 down at load. Without a limit nothing is
+    passed; with one, it is passed where it exists and raises the process-wide limit where it doesn't."""
+    import torch._dynamo.config as dynamo_config
+
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+
+    calls = []
+
+    def old_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False):
+        calls.append({"fullgraph": fullgraph, "dynamic": dynamic})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", old_compile)
+    module = torch.nn.Linear(2, 2)
+    compile_transformer_forward(module)
+    assert calls[-1] == {"fullgraph": False, "dynamic": False}
+    before = dynamo_config.recompile_limit
+    # torch's own patch() restores by assignment. pytest's monkeypatch restores a module entry that is not in
+    # __dict__ by deleting it, which torch's config module turns into a hidden key for the rest of the session.
+    with dynamo_config.patch(recompile_limit=8):
+        compile_transformer_forward(module, recompile_limit=96)
+        assert dynamo_config.recompile_limit == 96
+        compile_transformer_forward(module, recompile_limit=10)
+        assert dynamo_config.recompile_limit == 96, "the process-wide limit never falls"
+    assert dynamo_config.recompile_limit == before
+
+    def new_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False, recompile_limit=None):
+        calls.append({"recompile_limit": recompile_limit})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", new_compile)
+    compile_transformer_forward(module, recompile_limit=96)
+    assert calls[-1]["recompile_limit"] == 96
+    compile_transformer_forward(module)
+    assert calls[-1]["recompile_limit"] is None
+
+
+def test_the_dit_recompile_limit_holds_on_an_executor_thread_started_after_warmup(monkeypatch):
+    """The worker's executor threads start after warmup and run ``apply_dynamo_config``. Before torch 2.12
+    that set the process-wide limit back to ``MSTAR_RECOMPILE_LIMIT``, so a shape first served there ran
+    uncompiled once the DiT held that many entries."""
+    import functools
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch._dynamo.config as dynamo_config
+
+    from mstar.engine import apply_dynamo_config
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+
+    compiles, real_compile = [], torch.compile
+
+    @functools.wraps(real_compile)  # keeps torch.compile's signature, which decides whether the keyword is passed
+    def counting_compile(fn, **kw):
+        return real_compile(fn, backend=lambda gm, _: compiles.append(1) or gm, **kw)
+
+    monkeypatch.setattr(torch, "compile", counting_compile)
+    monkeypatch.setenv("MSTAR_RECOMPILE_LIMIT", "8")
+    module = torch.nn.Linear(2, 2)
+    # the compiled frame is Dynamo's shared wrap_inline wrapper: no other test's cache entries count
+    torch._dynamo.reset()
+    try:
+        with dynamo_config.patch(recompile_limit=8):  # restores by assignment (see the test above)
+            compile_transformer_forward(module, eager_rounding=False, recompile_limit=10)
+            for rows in range(1, 9):  # warmup fills the mstar limit
+                module(torch.randn(rows, 2))
+            with ThreadPoolExecutor(1, initializer=apply_dynamo_config) as serving:
+                serving.submit(module, torch.randn(9, 2)).result()
+        assert len(compiles) == 9
+    finally:
+        torch._dynamo.reset()
 
 
 def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch, torch_flag):
@@ -570,46 +658,6 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(Flux2KleinConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040), [])
-
-
-def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
-    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
-    import mstar.model.flux2_klein.submodules as subs
-    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
-
-    class RecordingVae(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1))
-            self.eager, self.compiled = [], []
-
-        @property
-        def dtype(self):
-            return self.weight.dtype
-
-        def decode(self, x):
-            self.eager.append(tuple(x.shape))
-            return x
-
-    def fake_compile(vae):
-        def compiled(x):
-            vae.compiled.append(tuple(x.shape))
-            return x
-        return compiled
-
-    monkeypatch.setattr(subs, "compile_vae_decode", fake_compile)
-    config = Flux2KleinConfig()
-    vae = RecordingVae()
-    node = KleinVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-                                    decode_batch_sizes=(1, 2))
-    lc, (ph, pw) = config.vae.latent_channels, config.vae.patch_size
-    assert len(vae.compiled) == 2 and vae.eager == []
-    vae.compiled.clear()
-    node._decode(torch.zeros(3, lc, 64 * ph, 64 * pw))  # warmed grid: compiled chunks of 2 + 1
-    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
-    node._decode(torch.zeros(2, lc, 48 * ph, 64 * pw))  # unwarmed grid: eager, no compile
-    assert vae.eager == [(2, lc, 48 * ph, 64 * pw)] and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():

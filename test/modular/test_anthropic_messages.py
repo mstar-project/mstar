@@ -14,6 +14,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 
 class _Chunk:
@@ -32,9 +33,11 @@ class _StubAPI:
     in batches; a reader that stops early aborts the request."""
 
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name):
         self.model_name = model_name
+        self.served_models = ServedModels.of(model_name, None)
         self.model = types.SimpleNamespace()
         self.upload_dir = "/nonexistent"
         self.last_submit = None
@@ -298,6 +301,43 @@ def test_a_model_without_the_api_is_an_anthropic_404(client_and_stub):
     assert r.status_code == 404 and r.json()["error"]["type"] == "not_found_error"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.served_models = ServedModels(base=["glm52"], digests={"sql": b"\x01" * 32})
+    stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
+    r = client.post("/v1/messages", json=_body(model="sql", stream=stream))
+    assert stub.last_submit["model_kwargs"]["lora_adapter"] == "sql"
+    message = _events(r.text)[0]["message"] if stream else r.json()
+    assert message["model"] == "sql"
+    r = client.post("/v1/messages", json=_body(model="nope"))
+    assert r.status_code == 400 and "unknown LoRA adapter" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "1e400"])
+def test_a_number_json_does_not_have_is_an_anthropic_400(client_and_stub, number):
+    client, stub = client_and_stub
+    body = json.dumps(_body(tools=[WEATHER])).replace('"type": "integer"', f'"type": "integer", "maximum": {number}')
+    r = client.post("/v1/messages", content=body, headers={"content-type": "application/json"})
+    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
+    assert "not JSON" in r.json()["error"]["message"] and stub.last_submit is None
+
+
+def test_a_body_nested_past_the_decoders_depth_is_an_anthropic_400(client_and_stub):
+    client, stub = client_and_stub
+    r = client.post("/v1/messages", content="[" * 100_000, headers={"content-type": "application/json"})
+    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
+    assert "nests too deeply" in r.json()["error"]["message"] and stub.last_submit is None
+
+
+@pytest.mark.xfail(strict=True, reason="stop_sequences has no cap, and the event loop matches every stop on "
+                   "each token (10,000 of 100 chars: ~14 ms a token, which every request waits out); follow-up")
+def test_a_stop_sequence_list_past_a_cap_is_a_400(client_and_stub):
+    client, stub = client_and_stub
+    r = client.post("/v1/messages", json=_body(stop_sequences=[f"stop {i}" for i in range(10_000)]))
+    assert r.status_code == 400 and stub.last_submit is None
+
+
 def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9), stop=True)
@@ -405,6 +445,21 @@ def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_
     r = client.post("/v1/messages/count_tokens", json=body)
     assert r.status_code == 200, r.text
     assert r.json() == {"input_tokens": out.new_input_tensors["text_inputs"][0].numel()}
+
+
+@pytest.mark.xfail(strict=True, reason="count_tokens runs process_prompt, which refuses a prompt past the "
+                   "context limit as a 400 instead of counting it; follow-up")
+def test_count_tokens_counts_a_prompt_past_the_context_limit(client_and_stub):
+    """A client counts to learn whether a conversation still fits, so the count is the answer."""
+    from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
+
+    client, stub = client_and_stub
+    stub.model_name = "glm5_next"
+    stub.model = Glm5NextModel(model_path_hf="", tokenizer_mode="byte")
+    text = "x" * (stub.model.config.context_limit + 1)
+    r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": text}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["input_tokens"] >= len(text)
 
 
 def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):

@@ -1,7 +1,7 @@
 """The Python pieces of the columnar speculation: the lazily built loop-back
 inputs, the loop-counter snapshots, the request state's batch lookup of
 forward-pass infos, and the engine's wrapped infos. The whole path against the
-per-row one, on both runtimes, is in ``test/rust/test_spec_rows.py``."""
+per-row one is in ``test/rust/test_spec_rows.py``."""
 import sys
 from pathlib import Path
 

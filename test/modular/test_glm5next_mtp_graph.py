@@ -8,6 +8,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import SamplingReqConfig, StepRunner
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
@@ -54,7 +55,7 @@ def _config(k, long_context=False):
         intermediate_size=512, moe_intermediate_size=256, n_routed_experts=16,
         num_experts_per_tok=4, eos_token_ids=(1,), pad_token_id=0,
         quantization_config=Fp8BlockQuantConfig(), moe_quant_kernel="auto",
-        prefill_graphs=True, prefill_token_buckets=[256], prefill_capture_batch_sizes=[2, 4],
+        prefill_graphs=True, prefill_capture_batch_sizes=[2, 4],
         mtp_num_draft_tokens=k,
     )
 
@@ -124,14 +125,19 @@ class _Engine:
             info = EngineResourceInfo(device=DEV, dependencies={
                 key: by_key[key] for key in spec.depends_on()})
             self.resources[spec.resource_key] = build_resource(spec, info)
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
-        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,
             joint_comm_group=trivial, num_slots=2,
+            # the serving config's prefill_token_buckets, as the engine hands it over
+            token_ladders={"prefill": [256]},
         )
         self.cg.warmup_and_capture(None)
 
@@ -369,7 +375,8 @@ def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
         pages = -(-n // page)
         cache = torch.zeros(pages, page, latent + rope, device=DEV, dtype=torch.bfloat16)
         cache.view(-1, latent + rope)[:n] = torch.cat([ckv, kpe], -1)[rows]
-        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+        # main's wrappers take a pool's Workspace (#1142), not a raw buffer
+        workspace = WorkspacePool(torch.device(DEV), size_mb=128).get("main")
         wrapper = FlashInferMLAWrapper(
             workspace, num_qo_heads=heads, kv_lora_rank=latent, qk_rope_head_dim=rope,
             page_size=page, sm_scale=192 ** -0.5, device=DEV)

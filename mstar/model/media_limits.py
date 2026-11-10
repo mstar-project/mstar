@@ -3,17 +3,34 @@
 A compressed image or video can be tiny on the wire and enormous once decoded
 (a flat PNG compresses about 1000:1, a still video far more), so the loaders
 check what a file will decode to, not how big it is. A refusal is a
-``ValueError``, which the data worker answers with a 400.
+``ValueError``, which the data worker answers with a 400, as is a file its
+decoder can't read (:func:`decoding_upload`).
 
 The pixel and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
 against what the request's earlier files used.
 """
+import errno
 import os
+import struct
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 import torch
+
+from mstar.utils import cpus
+
+
+def video_decode_threads() -> int:
+    """FFmpeg threads for one video decode. torchcodec decodes single-threaded
+    by default, which dominates a long clip's request latency; frame threading
+    is bit-identical. Bounded by 8 and by the CPUs the process's plan leaves
+    unpinned, as ``CpuPlan.png_threads`` is. The bound is per decode:
+    concurrent decodes each start this many threads. Not tied to torch's
+    intra-op pool: FFmpeg's threads are its own, and that pool is kept small
+    for fork-join ops a decode doesn't run."""
+    return min(8, cpus.plan().left)
+
 
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
@@ -30,6 +47,8 @@ DEFAULT_MAX_AUDIO_SECONDS = 60 * 60
 IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
 # a loader that decodes with Pillow also reads the other image types the API accepts
 PILLOW_IMAGE_FORMATS = IMAGE_FORMATS + ("BMP", "TIFF")
+# what Pillow's lazy EXIF parse raises on a malformed block; the image is then read as stored
+_MALFORMED_EXIF = (SyntaxError, struct.error, ValueError, TypeError)
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -154,6 +173,52 @@ def check_file_counts(counts: dict[str, int], model_limits: dict[str, int]) -> N
             )
 
 
+def ffmpeg_unavailable() -> str | None:
+    """Why torchcodec can't decode in this process, or None if it can."""
+    try:
+        import torchcodec
+        import torchcodec.decoders  # noqa: F401
+    except (ImportError, RuntimeError, OSError) as exc:
+        # torchcodec 0.9 and earlier raise here when FFmpeg is missing
+        return f"it failed to load: {exc}"
+    # 0.16 imports without FFmpeg and fails only at decode (0.8 has no
+    # ffmpeg_major_version, and has already raised above)
+    if getattr(torchcodec, "ffmpeg_major_version", 0) is None:
+        return "it found no FFmpeg shared libraries"
+    return None
+
+
+class UndecodableMediaError(ValueError):
+    """A request file its decoder refused: the client's error, a 400."""
+
+
+def _out_of_memory(exc: BaseException) -> bool:
+    # torch's CPU allocator raises a plain RuntimeError; it and FFmpeg put
+    # ENOMEM's text in the message
+    return isinstance(exc, torch.OutOfMemoryError) or os.strerror(errno.ENOMEM) in str(exc)
+
+
+@contextmanager
+def decoding_upload(filepath: str, what: str, *, ffmpeg: bool = False):
+    """Around a loader's decode call: the decoder refusing ``filepath`` is the
+    client's error, raised as :class:`UndecodableMediaError`.
+
+    Decoders raise RuntimeError (torchvision, torchcodec, libsndfile) or
+    OSError (Pillow) for a file they can't read, but also for the server's own
+    faults, which are re-raised: a failed allocation, an upload our cleanup
+    removed and, with ``ffmpeg``, a torchcodec that has no FFmpeg.
+    """
+    try:
+        yield
+    except (RuntimeError, OSError) as exc:
+        if _out_of_memory(exc) or not os.path.exists(filepath) or (ffmpeg and ffmpeg_unavailable()):
+            raise
+        # the decoder's message can name the server path
+        raise UndecodableMediaError(
+            f"could not decode {what}: the file is corrupt or truncated, or not a format this server reads"
+        ) from exc
+
+
 # libsndfile reports 2**63 - 1 frames for a FLAC whose STREAMINFO has no sample
 # count (a stream written to a pipe); anything this large is "unknown"
 UNKNOWN_FRAMES = 1 << 62
@@ -258,6 +323,23 @@ def charge_decoded_audio(audio: torch.Tensor, sample_rate: int) -> None:
     _charge_request("audio", audio.numel() / sample_rate)
 
 
+def charge_decoded_image(image: torch.Tensor) -> None:
+    """Hold an image that arrived decoded (``[C, H, W]``) to the cap a file's
+    header is held to, and charge the request its pixels."""
+    height, width = image.shape[-2:]
+    limit = max_image_pixels()
+    if width * height > limit:
+        raise ValueError(f"image is {width}x{height} ({width * height} pixels); the limit is {limit} pixels")
+    _charge_request("image", width * height)
+
+
+#: Which modalities a request may send as ``raw_inputs`` (tensors instead of files),
+#: each with its size check: the check refuses an input over the limit (for images,
+#: MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request's total, as reading a
+#: file's header does. The model then loads each with ``Model.load_decoded_<modality>``.
+RAW_INPUT_CHARGES = {"image": charge_decoded_image}
+
+
 def sound_file_seconds(frames: int, rate: int) -> float | None:
     """The length a libsndfile header declares, or None when it declares none
     (a sample count of 0 or libsndfile's "unknown" value)."""
@@ -321,16 +403,17 @@ def check_image_size(filepath: str, formats: tuple[str, ...] = IMAGE_FORMATS) ->
     Reads the header only. The decoders allocate what the header declares, so
     it cannot understate the decode.
     """
-    fmt, animated, _, _ = _check_image_header(filepath, formats)
+    fmt, animated, _, _, _ = _check_image_header(filepath, formats)
     return fmt, animated
 
 
-def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool]:
-    """:func:`check_image_size`, plus Pillow's mode and whether the file
-    carries transparency (an alpha channel or a tRNS or GIF transparent color)."""
+def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool, int]:
+    """:func:`check_image_size`, plus Pillow's mode, whether the file
+    carries transparency (an alpha channel or a tRNS or GIF transparent color)
+    and a static WebP's EXIF orientation (1, upright, for any other file)."""
     import warnings
 
-    from PIL import Image, UnidentifiedImageError
+    from PIL import ExifTags, Image, UnidentifiedImageError
 
     limit = max_image_pixels()
     try:
@@ -342,6 +425,12 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
                 animated = bool(getattr(image, "is_animated", False))
                 mode = image.mode
                 transparent = bool(image.has_transparency_data)
+                orientation = 1
+                if fmt == "WEBP" and not animated:
+                    try:
+                        orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
+                    except _MALFORMED_EXIF:
+                        pass
     except Image.DecompressionBombError:
         raise ValueError(f"image is too large to decode; the limit is {limit} pixels") from None
     except (UnidentifiedImageError, OSError, SyntaxError):
@@ -350,7 +439,22 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
     if width * height > limit:
         raise ValueError(f"image is {width}x{height} ({width * height} pixels); the limit is {limit} pixels")
     _charge_request("image", width * height)
-    return fmt, animated, mode, transparent
+    return fmt, animated, mode, transparent, orientation
+
+
+@contextmanager
+def open_upright_image(filepath: str, formats: tuple[str, ...] | None = None):
+    """The image opened with Pillow and turned upright by its EXIF orientation,
+    as transformers' and diffusers' ``load_image`` do. A malformed EXIF block
+    leaves it as stored."""
+    from PIL import Image, ImageOps
+
+    with Image.open(filepath, formats=formats) as image:
+        try:
+            upright = ImageOps.exif_transpose(image)
+        except _MALFORMED_EXIF:
+            upright = image
+        yield upright
 
 
 def _on_white(image: torch.Tensor) -> torch.Tensor:
@@ -360,7 +464,8 @@ def _on_white(image: torch.Tensor) -> torch.Tensor:
 
 
 def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
-    """A request image as uint8 ``[C, H, W]``, refused first if it is too large.
+    """A request image as uint8 ``[C, H, W]``, refused first if it is too large
+    and then if it does not decode.
 
     ``rgb`` forces three channels, with any transparency composited on white
     as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
@@ -368,18 +473,19 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
     channels are kept, as ``torchvision.io.decode_image`` does. A GIF or an
     animated WebP is read with Pillow, as its first frame in RGB: torchvision's
     GIF decoder is not safe on untrusted files before torchvision 0.28, and its
-    WebP decoder refuses animation.
+    WebP decoder refuses animation and ignores EXIF, so a WebP stored rotated
+    is read with Pillow too. The image is turned upright by its EXIF
+    orientation (see :func:`open_upright_image`).
     """
     import torchvision
 
-    fmt, animated, pil_mode, transparent = _check_image_header(filepath, IMAGE_FORMATS)
+    fmt, animated, pil_mode, transparent, orientation = _check_image_header(filepath, IMAGE_FORMATS)
     # torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it
     trns_color = rgb and transparent and pil_mode in ("L", "RGB")
-    if fmt == "GIF" or (fmt == "WEBP" and animated) or trns_color:
+    if fmt == "GIF" or (fmt == "WEBP" and (animated or orientation != 1)) or trns_color:
         import numpy as np
-        from PIL import Image
 
-        with Image.open(filepath) as image:
+        with decoding_upload(filepath, "the image"), open_upright_image(filepath) as image:
             array = np.array(image.convert("RGBA"))
         return _on_white(torch.from_numpy(array).permute(2, 0, 1))
     if not rgb:
@@ -388,7 +494,8 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
         # only a file with transparency is read with alpha: a CMYK JPEG's
         # four channels are not RGBA
         mode = torchvision.io.ImageReadMode.RGB_ALPHA if transparent else torchvision.io.ImageReadMode.RGB
-    image = torchvision.io.decode_image(filepath, mode=mode)
+    with decoding_upload(filepath, "the image"):
+        image = torchvision.io.decode_image(filepath, mode=mode, apply_exif_orientation=True)
     if image.dtype == torch.uint16:
         # a 16-bit PNG: its high byte, as Pillow reads a 16-bit RGB PNG
         image = (image.to(torch.int32) >> 8).to(torch.uint8)

@@ -346,17 +346,31 @@ def test_wav_reader_takes_float_and_24_bit_files(tmp_path, monkeypatch):
     decoded, rate = audio.decode_file(str(path))
     assert rate == 8000 and torch.equal(decoded, torch.from_numpy(ints.astype(np.float32) / 8388608.0))
     path.write_bytes(b"not a wav file at all")
-    with pytest.raises(ValueError, match="cannot decode"):
+    # nothing here can read it, which is the server's error, not the file's
+    with pytest.raises(ImportError):
         audio.decode_file(str(path))
 
 
+def _ffmpeg_refuses(monkeypatch, message="Invalid data found when processing input"):
+    """A torchcodec with FFmpeg that cannot read the file either."""
+    def refuse(path, *args, **kwargs):
+        raise RuntimeError(message.format(path=path))
+
+    decoders = types.ModuleType("torchcodec.decoders")
+    decoders.AudioDecoder = refuse
+    package = types.ModuleType("torchcodec")
+    package.decoders, package.ffmpeg_major_version = decoders, 7
+    monkeypatch.setitem(sys.modules, "torchcodec", package)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+
+
 def test_malformed_wav_headers_are_value_errors_without_the_path(tmp_path, monkeypatch):
-    """A ValueError is a 400 at the data worker; anything else (the old
-    ZeroDivisionError on 0 channels) is a 500. The message reaches the client,
-    so it must not name the server's upload path."""
+    """A malformed header is a ValueError from the WAV reader, so FFmpeg gets
+    the file next (the old ZeroDivisionError on 0 channels escaped as a 500),
+    and its refusal is a 400. The message reaches the client, so it must not
+    name the server's upload path."""
     monkeypatch.setitem(sys.modules, "soundfile", None)
-    monkeypatch.setitem(sys.modules, "torchcodec", None)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    _ffmpeg_refuses(monkeypatch)
     cases = {
         "zero_channels": _riff(1, 0, 16000, 16, b"\x00\x00" * 800),
         "four_bit": _riff(1, 1, 16000, 4, b"\x00" * 800),
@@ -366,29 +380,27 @@ def test_malformed_wav_headers_are_value_errors_without_the_path(tmp_path, monke
     for name, data in cases.items():
         path = tmp_path / f"{name}.wav"
         path.write_bytes(data)
-        with pytest.raises(ValueError, match="cannot decode") as err:
+        with pytest.raises(ValueError, match="could not decode") as err:
             audio.load_waveform(str(path))
         assert str(tmp_path) not in str(err.value), err.value
 
 
 def test_a_decoder_quoting_the_path_with_repr_does_not_leak_it(tmp_path, monkeypatch):
     """soundfile formats the path with repr(), so a tab or backslash in the
-    upload name reaches the message escaped, not as the plain path."""
+    upload name would reach a message escaped, not as the plain path."""
     def _read(path, **_):
         raise RuntimeError(f"Error opening {path!r}: Format not recognised.")
 
     monkeypatch.setitem(sys.modules, "soundfile", types.SimpleNamespace(read=_read, SoundFile=_read))
-    monkeypatch.setitem(sys.modules, "torchcodec", None)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    _ffmpeg_refuses(monkeypatch, "Could not open input file {path!r}")
     for name in ("tab\there.mp3", "back\\slash.mp3", "caf\u00e9\nnew.mp3"):
         path = tmp_path / name
         path.write_bytes(b"not audio at all")
-        with pytest.raises(ValueError, match="cannot decode") as err:
+        with pytest.raises(ValueError, match="could not decode") as err:
             audio.load_waveform(str(path))
         message = str(err.value)
         assert str(tmp_path) not in message, message
         assert repr(str(tmp_path))[1:-1] not in message, message
-        assert "<upload>" in message
 
 
 # --------------------------------------------------------------------------
@@ -482,6 +494,22 @@ def test_frame_lengths_follow_the_conv_arithmetic():
         real = Wav2Vec2CTC(ctc_config("300m", "v2"))
     # 1 s -> 49 frames, 40 s -> 1999; 400 samples is the shortest clip with a frame
     assert real.frame_lengths([16000, 640000, 400, 399]) == [49, 1999, 1, 0]
+
+
+def test_unfolded_positional_conv_matches_the_grouped_conv():
+    """A wide-group deployment runs the positional conv as per-group GEMMs (in
+    chunks of frames): the same values as the grouped conv, padding masked."""
+    from mstar.model.omnilingual_asr.components.wav2vec2 import PositionEncoder
+
+    torch.manual_seed(0)
+    pos = PositionEncoder(model_dim=32, kernel_size=8, num_groups=4).double()
+    x = torch.randn(3, 37, 32, dtype=torch.float64)
+    mask = torch.arange(37)[None, :] < torch.tensor([37, 20, 5])[:, None]
+    ref = pos(x, mask)
+    pos.unfolded = True
+    torch.testing.assert_close(pos(x, mask), ref)
+    pos.UNFOLD_CHUNK_ELEMS = 3 * 32 * 8 * 5  # five frames a chunk
+    torch.testing.assert_close(pos(x, mask), ref)
 
 
 def test_padded_batch_matches_single_runs_and_needs_the_mask():
@@ -596,11 +624,6 @@ def test_graph_is_one_stateless_node(tiny_model):
     node = walks[TRANSCRIBE_WALK]
     assert node.name == ENCODER_NODE and node.input_names == {WAVEFORM}
     assert [(e.name, e.output_modality) for e in node.outputs] == [(TOKEN_IDS, "text")]
-    fwd = tiny_model.get_initial_forward_pass_args("default", ["audio"], ["text"], {WAVEFORM: []})
-    assert fwd.full_metadata.graph_walk == TRANSCRIBE_WALK and not fwd.request_done
-    assert [e.name for e in fwd.inputs] == [WAVEFORM]
-    done = tiny_model.get_partition_forward_pass_args("default", fwd.full_metadata, {})
-    assert done.request_done
     assert tiny_model.get_autocast_dtype() == torch.float32
 
 
@@ -677,6 +700,52 @@ def test_node_batches_and_matches_single_requests(tiny_model):
     for i, w in enumerate(short_waves):
         assert torch.equal(split[f"r{i}"], _run_node(sub, [w])["r0"])
     assert sub.max_batch_size(TRANSCRIBE_WALK) == 4
+
+
+def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypatch):
+    """With the packed encoder bound, a step whose frames fit `max_batch_seconds`
+    encodes in one packed call: leased while its rows fit the attention
+    resource's segment ceiling (a YAML override may set it below
+    `max_batch_size`), planned whole otherwise. One over the budget plans and
+    leases nothing and encodes padded per sub-batch."""
+    from mstar.model.omnilingual_asr.config import ENCODER_ATTN
+    from mstar.model.omnilingual_asr.submodules import ENCODER_LOOP, OmniASRCTCSubmodule
+
+    sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
+    small = OmniASRCTCSubmodule(sub.model, max_batch_size=4, max_batch_seconds=0.5)  # 8000 samples
+    small.node_resources = {ENCODER_ATTN: types.SimpleNamespace(max_segments_per_step=2)}
+    packed_calls = []
+    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, attn, ei: packed_calls.append(len(waves)) or [
+        torch.zeros(n, dtype=torch.long) for n in small.model.frame_lengths([w.shape[0] for w in waves])
+    ])
+    torch.manual_seed(6)
+    lease = small.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[ENCODER_LOOP].can_lease
+
+    def step(lengths):
+        waves = [audio.preprocess(torch.randn(n)) for n in lengths]
+        rids = [f"r{i}" for i in range(len(waves))]
+        inputs = [
+            small.prepare_inputs(TRANSCRIBE_WALK, types.SimpleNamespace(request_id=r), {WAVEFORM: [w]})
+            for r, w in zip(rids, waves, strict=True)
+        ]
+        declared = small.declare_step(TRANSCRIBE_WALK, rids, inputs)
+        engine_inputs = types.SimpleNamespace(request_ids=rids, resources={ENCODER_ATTN: object()})
+        pre = small.preprocess(TRANSCRIBE_WALK, engine_inputs, inputs)
+        with torch.no_grad():
+            out = small.forward_batched(TRANSCRIBE_WALK, engine_inputs, **pre)
+        return waves, inputs, declared, out
+
+    _, inputs, declared, _ = step((1000, 2000))
+    assert lease(inputs) and declared is not None and len(declared.segments) == 2
+    _, inputs, declared, _ = step((1000, 2000, 3000))
+    assert not lease(inputs) and declared is not None and len(declared.segments) == 3
+    assert packed_calls == [2, 3]
+
+    waves, inputs, declared, out = step((6000, 1000, 5000, 2000))
+    assert not lease(inputs) and declared is None
+    assert packed_calls == [2, 3]
+    for i, w in enumerate(waves):
+        assert torch.equal(out[f"r{i}"][TOKEN_IDS][0], _run_node(sub, [w])["r0"])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

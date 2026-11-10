@@ -35,14 +35,21 @@ def test_an_unknown_moe_kernel_is_refused(kernel):
         Glm5NextSparseMoeBlock(cfg)
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml",
-                                  "glm5_next_tp8_longctx.yaml"])
-def test_shipped_configs_admit_one_request_per_kda_slot(name):
-    # past the slots a prefill waits in the worker, and its wait broke the decode
-    # speculation chain every other step
-    from pathlib import Path
+@pytest.mark.parametrize("k", [-1, -3])
+def test_a_negative_draft_count_is_refused(k):
+    # -1 would size the cache at zero rows and fail building the graph; -3 would serve unnoticed
+    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
+        Glm5NextModel("x", tokenizer_mode="byte", mtp_num_draft_tokens=k)
 
-    import yaml
 
-    cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
-    assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
+@pytest.mark.parametrize("kwargs", [
+    {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
+    {"prefill_capture_batch_sizes": []}, {"prefill_graphs": "false"}, {"mtp_num_draft_tokens": True},
+    {"mtp_num_draft_tokens": 2.5}, {"mtp_num_draft_tokens": 1023},
+])
+def test_a_bad_serving_knob_is_refused_at_load(kwargs):
+    """As GLM-5.2 refuses them. Each loaded before: bad batch sizes went into capture and an
+    empty list meant the default, ``"false"`` captured the prefill, True and 2.5 drafted 1
+    and 2, and k=1023 left no room for a prompt."""
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        Glm5NextModel("x", tokenizer_mode="byte", **kwargs)

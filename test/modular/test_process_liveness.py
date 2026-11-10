@@ -16,11 +16,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
+from test_outbox_communicator import _Peer
 
 from mstar.api_server.entrypoint import DeadConductorError, PendingRequest
 from mstar.api_server.request_types import APIServerMessage
+from mstar.communication.communicator import OutboxCommunicator
+from mstar.communication.event import EventWakeup
 from mstar.conductor.conductor import (
     Conductor,
     DeadWorkerError,
@@ -94,7 +97,7 @@ def _conductor(procs, inbox=()):
     c.sent = []
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
-        get_all_new_messages=_inbox(inbox),
+        get_all_new_messages=_inbox(inbox), flush=lambda: False,
     )
     c.worker_ids = [f"worker_{i}" for i in range(len(procs))]
     c._worker_processes = list(procs)
@@ -189,6 +192,20 @@ def test_dead_worker_fails_every_waiting_client_with_503():
     for body in failed.values():
         assert body.status == 503
         assert "worker_1 (pid 12) exited with signal SIGSEGV" in body.error_message
+
+
+def test_a_dead_workers_failures_reach_a_full_api_server_before_the_exit():
+    """The conductor's sends queue for a full peer; the exit must not drop the
+    clients' 503s that are still queued."""
+    c = _conductor([_Proc(12, alive=False, exitcode=-11)])
+    c.requests = {"r": _request_data(["worker_0"])}
+    peer = _Peer(full={"api_server": 3})
+    c.communicator = OutboxCommunicator(peer)
+
+    with pytest.raises(DeadWorkerError):
+        c._poll_worker_liveness()
+
+    assert [(entity, m.body.request_id) for entity, m in peer.delivered] == [("api_server", "r")]
 
 
 def test_orphaned_worker_leaves_gracefully_then_hard(monkeypatch):
@@ -286,12 +303,13 @@ def test_stopping_data_worker_drops_tracked_requests():
     ``in_flight_requests``. Tracking teardown off the output-metadata dict
     misses exactly that request and leaks its signals into /dev/shm.
     """
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
-    for name in ("in_queue", "out_queue", "result_tensor_queue", "cleanup_request_queue",
+    for name in ("in_queue", "result_tensor_queue", "cleanup_request_queue",
                  "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
         setattr(wt, name, queue.Queue())
+    wt.out_queue, wt.profile_queue = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     wt.stop_event = threading.Event()
     wt.stop_event.set()
     wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
@@ -327,9 +345,10 @@ def _api_server(conductor_proc, inbox=()):
     server = make_test_api_server(
         conductor_proc=conductor_proc,
         _liveness_interval_s=0.0,
-        communicator=SimpleNamespace(get_all_new_messages=_inbox(inbox)),
+        communicator=StandInSocket(_inbox(inbox)),
         preprocess_worker=SimpleNamespace(
-            get_profile_updates=lambda: [], get_result_chunks=lambda: []
+            get_profile_updates=lambda: [], get_result_chunks=lambda: [],
+            results_wakeup=EventWakeup(),
         ),
     )
     server.started = []
@@ -362,6 +381,54 @@ def test_message_loop_runs_while_the_conductor_lives():
     server.running = False
     thread.join(timeout=5)
     assert not thread.is_alive()
+    assert server.fatal_error is None
+
+
+def test_a_failed_message_wait_releases_pending_requests_and_stops_the_server():
+    """The one error the transport raises from the idle wait, a closed wakeup
+    fd, never recovers, so it ends the loop as a dead conductor does: pending
+    requests get a 503 now rather than at their timeout, and the server stops."""
+    stopped = []
+    server = _api_server(_Proc(5))
+    server.on_fatal = lambda: stopped.append(True)
+    waiting = _pending_request()
+    server.pending_requests = {"r1": waiting}
+
+    waits = []
+
+    def poll(timeout_ms):
+        waits.append(timeout_ms)
+        if len(waits) > 1:  # a loop that retried: stop it
+            server.running = False
+            return False
+        raise RuntimeError("a registered wakeup fd is closed/invalid")
+    server.communicator.poll_for_messages = poll
+    server._process_messages()
+
+    assert len(waits) == 1
+    assert waiting.event.is_set() and waiting.error_status == 503
+    assert "wakeup fd is closed" in waiting.error
+    assert stopped == [True]
+    assert server.fatal_error is not None
+
+
+def test_failing_passes_log_one_traceback(caplog):
+    """A pass that keeps failing (a message it can't route) logs its traceback
+    once, not once a pass, and the loop goes on."""
+    server = _api_server(_Proc(5))
+    passes = []
+
+    def messages():
+        passes.append(True)
+        if len(passes) > 3:
+            server.running = False
+            return []
+        raise RuntimeError("a message it can't route")
+    server.communicator.get_all_new_messages = messages
+    server._process_messages()
+
+    assert len(passes) == 4
+    assert sum(r.exc_info is not None for r in caplog.records) == 1
     assert server.fatal_error is None
 
 
@@ -453,6 +520,8 @@ def test_dynamo_worker_exits_nonzero_when_conductor_dies():
                           return_value=(server, conductor, "whisper_large")),
         mock.patch.object(dynamo_worker, "serve"),
         mock.patch("mstar.api_server.entrypoint._shutdown_conductor_process"),
+        # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+        mock.patch("mstar.utils.logging_config.log_off_thread"),
         pytest.raises(SystemExit) as exc,
     ):
         dynamo_worker.main(argv)

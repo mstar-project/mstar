@@ -47,7 +47,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     RowParallelLinear,
 )
-from mstar.model.loader import LLAMA_STACKED_PARAMS
+from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
 
 # ---------------------------------------------------------------------------
 # Backbone
@@ -307,10 +307,12 @@ class T3Model(nn.Module):
             emb = emb + self.text_pos_emb(text_positions)
         return emb
 
-    def embed_speech(self, ids: torch.Tensor, speech_positions: torch.Tensor) -> torch.Tensor:
+    def embed_speech(self, ids: torch.Tensor, speech_position: int) -> torch.Tensor:
+        """Speech tokens that all sit at one speech position. The position row
+        is a view of the table, so no position index is staged on the device."""
         emb = self.speech_emb(ids)
         if self.speech_pos_emb is not None:
-            emb = emb + self.speech_pos_emb(speech_positions)
+            emb = emb + self.speech_pos_emb.weight[speech_position]
         return emb
 
     def build_prefill_embeds(
@@ -331,7 +333,7 @@ class T3Model(nn.Module):
         if self.text_pos_emb is not None:
             text = text + self.text_pos_emb(torch.arange(text_ids.shape[0], device=device))
         bos = torch.full((1,), self.config.start_speech_token, dtype=torch.long, device=device)
-        speech = self.embed_speech(bos, torch.zeros(1, dtype=torch.long, device=device))
+        speech = self.embed_speech(bos, 0)
         parts = [cond_emb.to(text.dtype), text, speech]
         if self.config.duplicate_bos_in_prefill:
             parts.append(speech)
@@ -353,20 +355,24 @@ class T3Model(nn.Module):
 
     # -- weights ------------------------------------------------------------
 
+    def checkpoint_rules(self) -> CheckpointRules:
+        """How the reference checkpoint lands here (after GPT-2's fused projections are
+        split, ``_split_gpt2_projections``), and where LoRA adapters land."""
+        remap = _remap_gpt2_name if self.config.backbone.is_gpt2 else _remap_llama_name
+        return CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=remap)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream the reference checkpoint (``t3_cfg.safetensors`` or
         ``t3_turbo_v1.safetensors``) into this module, exactly."""
         if self.config.backbone.is_gpt2:
             weights = _split_gpt2_projections(weights)
-            remapper = _remap_gpt2_name
-        else:
-            remapper = _remap_llama_name
+        rules = self.checkpoint_rules()
         return load_component(
             self,
             weights,
             component=f"T3 ({self.config.backbone.kind})",
-            name_remapper=remapper,
-            stacked_params=LLAMA_STACKED_PARAMS,
+            name_remapper=rules.remap,
+            stacked_params=list(rules.stacked_params),
         )
 
 

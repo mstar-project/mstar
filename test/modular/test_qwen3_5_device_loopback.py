@@ -27,7 +27,7 @@ class _Sampler:
 
 
 def _sub(sampler):
-    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub = LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset()))
     sub.node_resources = {SAMPLER: sampler}
     return sub
 
@@ -75,10 +75,10 @@ def _stub_model(sub, seen):
         seen["n"] = len(inputs)
         return torch.zeros(3, len(inputs))
 
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
+    )
     sub._position_ids_3d = _position_ids_3d
 
 
@@ -92,7 +92,7 @@ def test_preprocess_mixes_routed_rows_into_the_sampler_tokens():
         _prepare(sub, "decode", {}),
     ]
     engine_inputs = SimpleNamespace(
-        resources={SAMPLER: sampler}, request_ids=["r1", "r2", "r3", "pad1"],
+        resources={SAMPLER: sampler}, request_ids=["r1", "r2", "r3", "pad1"], captured=False,
     )
     _stub_model(sub, {})
     out = LLMSubmodule.preprocess(sub, "decode", engine_inputs, rows)
@@ -104,7 +104,7 @@ def test_preprocess_reads_the_step_tokens_off_the_sampler():
     sub = _sub(sampler)
     rows = [_prepare(sub, "decode", {}) for _ in range(4)]
     engine_inputs = SimpleNamespace(
-        resources={SAMPLER: sampler}, request_ids=["r1", "r2", "pad1", "pad2"],
+        resources={SAMPLER: sampler}, request_ids=["r1", "r2", "pad1", "pad2"], captured=False,
     )
     seen = {}
     _stub_model(sub, seen)
@@ -131,72 +131,67 @@ def test_the_loop_back_decode_row_is_uniform(monkeypatch):
     assert LLMSubmodule.uniform_row_inputs(sub, "decode", has_loopback=True) is None
 
 
-def test_in_graph_rope_knob_drops_only_the_staged_tables(monkeypatch):
+def test_captured_decode_drops_only_the_staged_tables():
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sub = _sub(sampler)
     rows = [_prepare(sub, "decode", {}) for _ in range(2)]
-    leased = SimpleNamespace(
-        resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
-        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object(), graph_walk="decode")),
+    # every row routed: each request's first decode step, or the knob off
+    routed = [_prepare(sub, "decode", {"text_inputs": [torch.tensor([t])]}, has_loopback=False) for t in (5, 6)]
+    leased = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["r1", "r2"], captured=True)
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
     )
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
     sub._position_ids_3d = lambda inputs: torch.zeros(3, len(inputs))
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
-    out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
-    assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
     out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" not in out
-    eager = SimpleNamespace(
-        resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
-        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=None, graph_walk="decode")),
-    )
+    out = LLMSubmodule.preprocess(sub, "decode", leased, routed)
+    assert out["input_ids"].tolist() == [5, 6] and "cos_3d" not in out
+    eager = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["r1", "r2"], captured=False)
     out = LLMSubmodule.preprocess(sub, "decode", eager, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
 
 
-def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
-    """A capture hands the region the slot's static input_ids and rotary
-    tables. The ids are always the static ones; with the rope knob on, the
-    forward builds the tables from the planned positions instead. The
-    capture's own context carries the piecewise walk, not "decode"."""
+def test_forward_in_graph_rope_reads_planned_positions_at_capture():
+    """A capture hands the forward the slot's static input_ids and rotary
+    tables. The ids are always the static ones; the forward builds the tables
+    from the planned positions instead."""
     from mstar.model.qwen3_5.config import ATTN, ROPE
 
     calls = {}
 
-    class _Embed:
-        weight = torch.zeros(1)
+    def build_text_cos_sin(pos, dtype):
+        calls["built"] = pos
+        return pos, pos
 
-        def __call__(self, ids):
+    class _Decoder:
+        """The decoder contract: embed, the stack, logits."""
+
+        embed_dtype = torch.float32
+        model = SimpleNamespace(build_text_cos_sin=build_text_cos_sin)
+
+        def embed(self, ids):
             calls["ids"] = ids.tolist()
             return ids.float()
-
-    class _Inner:
-        embed_tokens = _Embed()
 
         def __call__(self, embeds, label, cos_sin):
             calls["cos"] = cos_sin[0]
             return embeds
 
-        def build_cos_sin(self, pos, dtype):
-            calls["built"] = pos
-            return pos, pos
+        def logits(self, hidden):
+            return hidden
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sampler.sample = lambda rids, logits: ("sampled", list(rids))
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
-    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
+    sub.model = _Decoder()
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
-    def run(lease):
+    def run(captured):
         calls.clear()
         engine_inputs = SimpleNamespace(
-            resources={SAMPLER: sampler, ATTN: object()}, request_ids=["r1", "r2"],
-            step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=lease, graph_walk="__piecewise__")),
+            resources={SAMPLER: sampler, ATTN: object()}, request_ids=["r1", "r2"], captured=captured,
         )
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
@@ -204,14 +199,10 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
         assert out == ("sampled", ["r1", "r2"])
         return dict(calls)
 
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
-    c = run(object())
-    assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
-    c = run(object())
-    assert c["ids"] == [9, 9] and c["built"].tolist() == [[10, 20]] * 3 and c["cos"] is not static_cos
-    # no lease (an eager step): the knob does not apply, the inputs are used
-    c = run(None)
+    c = run(True)
+    assert c["ids"] == [9, 9] and c["built"].tolist() == [10, 20] and c["cos"] is not static_cos
+    # no lease (an eager step): the inputs are used
+    c = run(False)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
 
 
@@ -222,20 +213,13 @@ def test_sampler_keeps_slot_masters_only_for_a_node_that_reads_them(monkeypatch)
     from mstar.engine.resources.sampler.resource import SamplerResource
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    res = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     assert res._keep_last_token is False
     assert res.has_slot_masters is False
     res.enable_device_loopback_reader()
     assert res._keep_last_token is True
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    off = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    off = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     off.enable_device_loopback_reader()
     assert off._keep_last_token is False
-
-
-def test_the_loop_back_read_is_declared_per_submodule():
-    from mstar.model.submodule_base import NodeSubmodule
-
-    assert LLMSubmodule.reads_device_loopback is True
-    assert NodeSubmodule.reads_device_loopback is False

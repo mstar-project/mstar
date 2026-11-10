@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import Resource, StepRunner
+from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
+from mstar.testing_utils.resource import StubResource
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the host pool pins its memory"
@@ -185,7 +186,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     first = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens
     held = list(kv._streams["r1"]["main"].lease)
-    owners = [kv._arena.num_owners[page] for page in held]
+    owners = [kv._arena.owners(page) for page in held]
 
     # nothing left for the unmatched tail
     kv.ingest_request("hog", KVReqConfig())
@@ -201,7 +202,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     assert kv._streams["r1"]["main"].page_indices[:len(held)] == held, (
         "the refused admit gave up the pages it had converted"
     )
-    assert [kv._arena.num_owners[page] for page in held] == owners, (
+    assert [kv._arena.owners(page) for page in held] == owners, (
         "the second probe took a second reference"
     )
 
@@ -212,11 +213,11 @@ def test_remove_gives_back_a_lease_admit_never_took():
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100))
     leased = list(kv._streams["r1"]["main"].lease)
-    owners = [kv._arena.num_owners[page] for page in leased]
+    owners = [kv._arena.owners(page) for page in leased]
 
     kv.remove_request("r1")
 
-    assert [kv._arena.num_owners[page] for page in leased] == [
+    assert [kv._arena.owners(page) for page in leased] == [
         count - 1 for count in owners
     ], "an unconsumed lease was not given back"
     kv.assert_pages_conserved()
@@ -287,7 +288,7 @@ def test_a_converted_stream_offloaded_before_its_commit_gives_its_pages_back_onc
     assert kv.offload("r1") > 0, "the refused request did not move to the host"
     kv.remove_request("r1")
 
-    assert [kv._arena.num_owners[page] for page in leased] == [1] * len(leased), (
+    assert [kv._arena.owners(page) for page in leased] == [1] * len(leased), (
         "the converted pages were given back once with the stream and again as a "
         "lease, out from under the index"
     )
@@ -368,7 +369,7 @@ def test_a_lease_taken_after_a_refused_batch_admit_is_still_converted():
     )
     tail = set(stream.page_indices[len(leased):])
     assert all(
-        page in tail or kv._arena.num_owners[page] == 0 for page in reserved
+        page in tail or kv._arena.owners(page) == 0 for page in reserved
     ), "a page the refused admit reserved is held by a stream that no longer names it"
     kv.assert_pages_conserved()
 
@@ -418,15 +419,11 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
 # ── the length every resource agreed to ─────────────────────────────────
 
 
-class _Holding(Resource):
+class _Holding(StubResource):
     """A resource that holds a prefix of its own, shorter than the cache's."""
 
     def __init__(self, matched: int):
         self._matched = matched
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return CachedPrefix("main", self._matched, self._matched)
@@ -450,7 +447,7 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
     assert kv._streams["r1"]["main"].lease == leased[:1], (
         "the lease still covers pages the step will now recompute"
     )
-    assert all(kv._arena.num_owners[page] == 1 for page in leased[1:]), (
+    assert all(kv._arena.owners(page) == 1 for page in leased[1:]), (
         "the pages past the agreed length are held by a lease nobody will convert"
     )
     kv.assert_pages_conserved()

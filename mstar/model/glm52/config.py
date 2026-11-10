@@ -80,7 +80,7 @@ class Glm52ModelConfig:
     # MTP speculative decoding: draft k tokens per step with the layer-78 module; 0 (off)
     # neither builds nor loads it.
     mtp_num_draft_tokens: int = 0
-    # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
+    # Engine half of DSA (opt-in; the long-context override in docs/models.rst). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
     # the exact DSA computation. On: the guard checks max_seq_len instead, and
     # every row past index_topk, prefill rows included, attends its indexer's
@@ -126,10 +126,6 @@ class Glm52ModelConfig:
     # None: a request that names no max_tokens may run to the end of the window,
     # as in vLLM; the submodule caps each request at what its prompt leaves.
     max_output_tokens: int | None = None
-    temperature: float = 1.0
-    top_p: float = 0.95
-    repetition_penalty: float = 1.0
-    ignore_eos: bool = False
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
@@ -141,20 +137,16 @@ class Glm52ModelConfig:
     # alone outsize a device at TP8 on the real 753B checkpoint.
     moe_fp8_resident: bool = True
     # "auto": the tuned kernels, each picking per GPU from its module's table: the fused fp8
-    # MoE with its decode chain and router kernel, the MLA latent prep in two kernels, each
-    # TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at prefill on
-    # the sampled rows only. "reference": the numerics anchor, all of those op by op, served
-    # eager. The MoE prefill kernels keep the runner's bits and run under both.
+    # MoE with its prefill and decode kernels and router kernel, the MLA latent prep in two
+    # kernels, each TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at
+    # prefill on the sampled rows only. "reference": the numerics anchor, all of those op by op
+    # (the routed experts in a per-expert loop), served eager.
     kernels: str = "auto"
     # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
     # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
     # would otherwise fail every capture and serve eager.
     graph_compile: bool = True
 
-    prefill_token_buckets: list[int] | None = None
-    # Token buckets for the prefill batch sizes above 1; None captures them at
-    # prefill_token_buckets too.
-    prefill_batched_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent
@@ -312,7 +304,6 @@ class Glm52ModelConfig:
             max_seq_len=512,
             eos_token_ids=(250, 251, 252),
             pad_token_id=250,
-            prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
 

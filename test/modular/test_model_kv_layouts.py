@@ -10,7 +10,8 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
-from mstar.model.base import LabelLayout
+from mstar.engine.resources.kv.manager import SpanCursor
+from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
 NOT_EOS = 42
@@ -31,35 +32,6 @@ def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict
     return max_iters
 
 
-def _orpheus():
-    from mstar.model.orpheus.config import OrpheusModelConfig
-    from mstar.model.orpheus.orpheus_model import OrpheusModel
-
-    model = object.__new__(OrpheusModel)
-    model.config = OrpheusModelConfig()
-    model.tokenizer = lambda text, return_tensors=None: SimpleNamespace(
-        input_ids=torch.tensor([[ord(c) for c in text]], dtype=torch.long),
-    )
-    return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
-
-    model = _orpheus()
-    llm = OrpheusLLMSubmodule(
-        language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=None), lm_head=None), config=model.config,
-    )
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 def _bagel():
     from test_multimodal_ordering import _StubTokenizer
 
@@ -76,21 +48,8 @@ def _bagel():
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
     model.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
     model._has_cfg_parallel = model._has_llm_disaggregation = False
+    model.sampling_defaults = {"temperature": 0.0, "top_k": 0, "top_p": 1.0}
     return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_bagel_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_bagel_guidance_sink import _llm
-
-    llm = _llm()
-
-    cap = _bagel().get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
 
 
 _BAGEL_RUNS = {
@@ -118,24 +77,24 @@ def _pointer(tensor: torch.Tensor):
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     from mstar.conductor.request_info import DEFAULT_PARTITION
-    from mstar.model.bagel.submodules import IMAGE_SENTINELS, VAEEncoderSubmodule, vit_patches, vit_preprocess
+    from mstar.model.bagel.submodules import (
+        DENOISE_WALKS,
+        IMAGE_SENTINELS,
+        VAEEncoderSubmodule,
+        vit_patches,
+        vit_preprocess,
+    )
 
     cfg = model.config
-    images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
+    images = [torch.rand(3, 480, 640) for modality in input_modalities if modality == "image"]
     out = model.process_prompt(prompt, input_modalities, output_modalities, tensors={"image_inputs": images}, **kwargs)
-    tensors = {"text_inputs": out.new_input_tensors.get("text_inputs", []),
-               "image_inputs": out.new_input_tensors.get("image_inputs", images)}
+    tensors = out.new_input_tensors
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
-    fwd = model.get_initial_forward_pass_args(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
-    metadata = fwd.full_metadata
-    by_uuid = {id(t): t for by_name in tensors.values() for t in by_name}
-    later = []
-    while not model.get_partition_forward_pass_args(DEFAULT_PARTITION, metadata, {}).request_done:
-        if not metadata.is_prefill:
-            later.append(metadata.graph_walk)
-            if metadata.graph_walk in ("image_gen", "image_gen_cfg"):
-                break
-    config = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, kwargs)["kv"]
+    # what the data worker folds into model_kwargs from process_prompt
+    stamped = {key: value for key, value in out.metadata.items() if key != "kv_layout"}
+    request_kwargs = {**kwargs, **stamped}
+    plan = model.walk_plan(DEFAULT_PARTITION, input_modalities, output_modalities, signals, request_kwargs)
+    config = model.get_request_resource_configs(input_modalities, output_modalities, request_kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
     config.apply_conductor_config(
         kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
@@ -145,27 +104,32 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
         SimpleNamespace(posterior_noise=lambda *args, **kw: None), None, None, None, latent_patch_size=1,
         latent_channel=16, latent_downsample=cfg.latent_downsample, max_latent_size=cfg.max_latent_size,
     )
-    preprocess = metadata.kwargs["image_preprocess"]
+    params = plan[0].step_metadata
+    preprocess = params["image_preprocess"]
+    latents = (params["height"] // cfg.latent_downsample) * (params["width"] // cfg.latent_downsample)
     walks = []
-    for walk, info in metadata.kwargs["prefill_schedule"]:
-        tensor = by_uuid[info.uuid]
-        if walk == "prefill_text":
-            walks.append((walk, tensor.numel()))
-        elif walk == "prefill_vit":
+    for step in plan:
+        if step.walk == "decode":
+            walks += [(step.walk, 1)] * cap
+            continue
+        if step.walk in DENOISE_WALKS:
+            # the first denoise phase; what follows it reuses the same rows
+            walks += [(step.walk, latents + IMAGE_SENTINELS)] * 3
+            break
+        (tensor,) = tensors[next(iter(step.bind.values()))]
+        if step.walk == "prefill_text":
+            walks.append((step.walk, tensor.numel()))
+        elif step.walk == "prefill_vit":
             patches = vit_patches(
                 *tensor.shape[-2:], vit_preprocess(preprocess), cfg.vit_config.patch_size,
                 cfg.vit_max_num_patch_per_side,
             )
-            walks.append((walk, patches + IMAGE_SENTINELS))
+            walks.append((step.walk, patches + IMAGE_SENTINELS))
         else:
             info = SimpleNamespace(step_metadata={"image_preprocess": preprocess}, random_seed=0)
-            encoded = vae.prepare_inputs(walk, info, {"image_inputs": [tensor]})
-            walks.append((walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
-    height, width = metadata.kwargs["height"], metadata.kwargs["width"]
-    latents = (height // cfg.latent_downsample) * (width // cfg.latent_downsample)
-    for walk in later:
-        walks += [(walk, 1)] * cap if walk == "decode" else [(walk, latents + IMAGE_SENTINELS)] * 3
-    return config, metadata.kwargs["requires_cfg"], walks
+            encoded = vae.prepare_inputs(step.walk, info, {"image_inputs": [tensor]})
+            walks.append((step.walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
+    return config, params["requires_cfg"], walks
 
 
 class _BagelPool:
@@ -219,7 +183,7 @@ def _bagel_checks(monkeypatch):
         manager_mod, "KVTransferManager", lambda *a, **kw: SimpleNamespace(remove_request=lambda rid: None),
     )
     model = _bagel()
-    model.config.num_timesteps = 3
+    model.config.num_timesteps, model.config.timestep_shift = 3, 3.0
     return model
 
 
@@ -239,28 +203,79 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
     assert all(peak == footprint for peak, footprint in held.values()), f"(peak, footprint) by label: {held}"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_chatterbox_model import _make_model
+_BAGEL_STEPS = {
+    **{name: _BAGEL_RUNS[name] for name in ("understanding an image", "text to image, think", "an edit")},
+    "understanding two adjacent images": (["image", "image", "text"], ["text"], {}, "What is this?"),
+}
 
-    from mstar.model.chatterbox.submodules import SPEECH_TOKENS, T3Submodule
 
-    model = _make_model()
-    t3 = T3Submodule(None, model.config, builtin_voice=None)
-    outputs = {SPEECH_TOKENS: [torch.tensor([model.config.t3.stop_speech_token + 1])]}
-    t3.request_state("r").add_all(generated=0, requires_cfg=False)
-    t3.postprocess("r", None, outputs)
+@pytest.mark.parametrize(
+    ("input_modalities", "output_modalities", "kwargs", "prompt"), _BAGEL_STEPS.values(), ids=_BAGEL_STEPS,
+)
+def test_bagel_runs_a_walk_for_each_span_of_its_layout(
+    input_modalities, output_modalities, kwargs, prompt, _bagel_checks,
+):
+    config, _, walks = _bagel_request(_bagel_checks, prompt, input_modalities, output_modalities, kwargs)
+    spans = config.kv_layout["main"].spans
+    cursor = SpanCursor(spans)
 
-    def check_stop(request_id, request_info, outputs):
-        t3.postprocess(request_id, request_info, outputs)
-        return t3.check_stop(request_id, request_info, outputs)
+    for walk, rows in walks[:len(spans)]:
+        assert [span.length for span in cursor.next_step(walk)] == [rows], (
+            "the lookup of a walk would sum other slots than the walk writes, and drop the layout"
+        )
+        cursor.done += 1
 
-    cap = model.get_loop_caps(max_new_tokens=max_tokens)["decode_loop"]
 
-    assert cap == _stops_after(
-        check_stop, "decode_loop", "decode", model.config.t3.max_speech_tokens, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen", "fish_s2_pro"])
+def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
+    """The prefill emits the first of max_output_tokens, so the decode loop's
+    cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
+    ends at the prefill."""
+    if model_name == "fish_s2_pro":
+        from test_fish_s2_pro_model import tiny_ar, tiny_model
+
+        caps = tiny_model().get_loop_caps(max_output_tokens=max_tokens)
+        assert caps[tiny_ar().token_stop.loop] == max(1, max_tokens - 1)
+        return
+    if model_name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
+
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+    else:
+        from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+
+        model = object.__new__(CanaryQwenModel)
+    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
+
+
+def _first_token_at_prefill(model_name):
+    """(model, decode loop) for a model whose prefill samples the reply's first token."""
+    if model_name == "whisper":
+        return _whisper(), "decode_loop"
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    cls, loop = {
+        "higgs_audio": (HiggsAudioModel, "decode_loop"),
+        "orpheus": (OrpheusModel, "decode_loop"),
+        "qwen3_5": (Qwen3_5DenseModel, "decode_loop"),
+        "qwen3_omni": (Qwen3OmniModel, "thinker_decode_loop"),
+    }[model_name]
+    return object.__new__(cls), loop
+
+
+@pytest.mark.parametrize("max_tokens", [2, 3, 64])
+@pytest.mark.parametrize("model_name", ["higgs_audio", "orpheus", "qwen3_5", "qwen3_omni", "whisper"])
+def test_the_prefills_token_and_the_decode_cap_add_up_to_max_output_tokens(model_name, max_tokens):
+    """The decode loop's cap alone ends it (``TokenStop``), one token a step,
+    after the prefill's."""
+    model, loop = _first_token_at_prefill(model_name)
+
+    assert 1 + model.get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
 
 
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
@@ -289,7 +304,7 @@ def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
 
-    opened = model.get_request_resource_configs({}, {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
+    opened = model.get_request_resource_configs([], [], {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
     assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
 
 
@@ -304,39 +319,6 @@ class _Cosmos3Tokenizer:
         return 2
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
-    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
-
-    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.submodules import REASONER_DECODE_LOOP, Cosmos3ReasonerSubmodule
-
-    reasoner = SimpleNamespace(eos_token_id=None)
-
-    def check_stop(request_id, request_info, outputs):
-        return Cosmos3ReasonerSubmodule.check_stop(reasoner, request_id, request_info, outputs)
-
-    cap = Cosmos3Model.get_loop_caps(object.__new__(Cosmos3Model), max_output_tokens=max_tokens)[REASONER_DECODE_LOOP]
-
-    assert cap == _stops_after(
-        check_stop, REASONER_DECODE_LOOP, "reasoner_decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end the reasoner's decode on different iterations"
-
-
 _COSMOS3_COMMITS = {
     "text to image": ("a fox in the snow", ["image"], {}),
     "text to image without guidance": ("a fox in the snow", ["image"], {"guidance_scale": 1.0}),
@@ -344,26 +326,54 @@ _COSMOS3_COMMITS = {
     "kv windows": ("a fox in the snow", ["video"], {"window_mode": "kv", "num_frames": 121}),
     "kv windows without context": ("a fox", ["video"], {"window_mode": "kv", "num_frames": 121, "context_frames": 0}),
 }
+_COSMOS3_LOOPS = {
+    **_COSMOS3_COMMITS,
+    "chained windows": ("a fox in the snow", ["video"], {"window_mode": "chained", "num_frames": 121}),
+    "three steps": ("a fox in the snow", ["image"], {"num_inference_steps": 3}),
+    "one step": ("a fox in the snow", ["video"], {"num_frames": 33, "num_inference_steps": 1}),
+}
 
 
-@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
-def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
+def _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs):
+    """A Cosmos3 request through ``process_prompt``, its plan and the DiT's prefill."""
     from test_cosmos3_edge_model import _model
 
-    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL, Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
 
     model = _model(tmp_path, enable_windowed_video=True)
     model.tokenizer = _Cosmos3Tokenizer()
     dit = Cosmos3DiTSubmodule(None, model.config, scheduler=None)
     dit.get_device = lambda: torch.device("cpu")
-    dit._new_scheduler = lambda *args, **kw: SimpleNamespace(timesteps=torch.arange(4))
+    dit._new_scheduler = lambda steps, *args, **kw: SimpleNamespace(timesteps=torch.arange(steps))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    args = model.get_initial_forward_pass_args("default", ["text"], outputs, {"text_inputs": []}, kwargs)
-    walk = args.full_metadata.graph_walk
-    info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=args.step_metadata)
-    dit.prepare_inputs(walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
+    plan = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)
+    info = CurrentForwardPassInfo(request_id="r", graph_walk=plan[0].walk, fwd_index=0, random_seed=0, max_tokens=1,
+                                  rid_handle="r", step_metadata=dict(plan[0].step_metadata))
+    dit.prepare_inputs(plan[0].walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
+    return model, dit, output, plan
+
+
+@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_LOOPS.values(), ids=_COSMOS3_LOOPS)
+def test_cosmos3_caps_its_denoise_loop_at_the_iterations_its_dit_runs(tmp_path, prompt, outputs, kwargs):
+    """The cap alone ends the denoise loop: one iteration per scheduler step,
+    every window's for a windowed request, plus a commit per kv window."""
+    from mstar.model.cosmos3.submodules import DENOISE_LOOP_FOR_WALK, IMAGE_GEN_LOOP
+
+    model, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+
+    state = dit.request_states["r"]
+    iters = state["ar_total_iters"] if "ar_schedule" in state else len(state["scheduler"].timesteps)
+    loop = DENOISE_LOOP_FOR_WALK.get(plan[1].walk, IMAGE_GEN_LOOP)
+    assert model.get_loop_caps(**kwargs, **output.metadata)[loop] == iters
+
+
+@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
+def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
+    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
+
+    _, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+    walk = plan[0].walk
 
     state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]
     for label, static in ((COND_LABEL, state["cond"]), (UNCOND_LABEL, state["uncond"])):
@@ -382,25 +392,6 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert [span.scratch for span in laid_out.spans[1:]] == [plan.units * per_unit for plan in schedule.windows()]
         assert laid_out.scratch == 0, f"{label}'s denoise is counted on top of its last window"
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_fish_s2_pro_model import tiny_ar, tiny_model
-
-    ar = tiny_ar()
-    outputs = {"new_token": [torch.tensor([4])]}
-    ar.request_state("r").add("generated_frames", 0)
-    ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
-    ar.check_stop("r", prefill, outputs)
-
-    cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-
-    assert cap == _stops_after(
-        ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("clone", [False, True])
@@ -425,134 +416,132 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
 
 
-def _higgs():
+@pytest.mark.parametrize("thinking", [False, True])
+def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
+    """The reference's prompt as one row, each piece tokenized on its own:
+    the instruction, the clip's pads where its embeddings go (one per row the
+    encoder keeps of each 4 s chunk), and the turn close. The layout's one
+    span is that row, on a walk of the graph."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal import MEDIA_LAYOUT
+    from mstar.model.multimodal_decoder import MediaIntake
 
     model = object.__new__(HiggsAudioModel)
-    model.config = HiggsAudioModelConfig()
+    model.config = cfg = HiggsAudioModelConfig()
     model.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens=False: [ord(c) for c in text])
     model.feature_extractor = lambda chunks, **kwargs: {
         "input_features": torch.zeros(len(chunks), 128, 3000),
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
-    return model
+    pad = cfg.audio_in_token_idx
+    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    # two whole chunks of 50 rows and a 1.5 s one of 19
+    clip = torch.zeros(int(9.5 * cfg.sampling_rate))
+
+    out = model.process_prompt(
+        "say it", ["text", "audio"], ["text"], {"audio_inputs": [clip]}, enable_thinking=thinking,
+    )
+
+    enc = model.tokenizer.encode
+    before = enc("<|im_start|>user\n") + enc("say it") + enc("<|audio_bos|>")
+    after = enc("<|audio_eos|>") + enc("<|im_end|>\n<|im_start|>assistant\n")
+    if not thinking:
+        after += enc("<think>\n\n</think>\n\n")
+    [ids] = out.new_input_tensors["text_inputs"]
+    assert ids.tolist() == before + [pad] * 119 + after
+    layout = out.metadata[MEDIA_LAYOUT]
+    assert (layout["offset"], layout["tokens"], layout["output"]) == ([len(before)], [119], ["audio_embeds"])
+    # each chunk's mel frames, which the encoder reads on the host
+    assert layout["grid"] == [[400, 400, 150]]
+    [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
+    assert span.walk in model.get_graph_walk_graphs()
+    # the layout's walk is the one the request runs
+    signals = {k: list(v) for k, v in out.new_input_tensors.items()}
+    assert model.walk_plan("main", ["text", "audio"], ["text"], signals, out.metadata)[0].walk == span.walk
+    # every prompt carries the clip: no text walk, mixed step or prefix keys
+    assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
+    assert model.kv_labels()[KV_CACHE]["main"].keys is None
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+def _text_only_qwen3_5(tmp_path, monkeypatch):
+    """A checkpoint with no ``vision_config``, whose tokenizer still has the pad tokens."""
+    from mstar.model.qwen3_5 import qwen3_5_model
 
-    model = _higgs()
-    llm = HiggsAudioLLMSubmodule(None, model.config)
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    (tmp_path / "config.json").write_text("{}")
+    pads = {"<|image_pad|>": 5, "<|video_pad|>": 6}
+    tokenizer = SimpleNamespace(eos_token_id=None, unk_token_id=0, convert_tokens_to_ids=lambda t: pads.get(t, 0))
+    monkeypatch.setattr(qwen3_5_model.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer)
+    monkeypatch.setattr(qwen3_5_model.Qwen3_5Config, "from_hf", lambda _: SimpleNamespace(max_position_embeddings=64))
+    return qwen3_5_model.Qwen3_5DenseModel(str(tmp_path))
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
+def test_a_text_only_qwen3_5_takes_no_media(tmp_path, monkeypatch):
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
 
-    llm = SimpleNamespace(config=SimpleNamespace(stop_token_ids=()))
-
-    def check_stop(request_id, request_info, outputs):
-        return LLMSubmodule.check_stop(llm, request_id, request_info, outputs)
-
-    cap = Qwen3_5DenseModel.get_loop_caps(object.__new__(Qwen3_5DenseModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    assert not model.media and not model.encoders, "a media walk needs a vision_encoder node, which startup refuses"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+def test_a_text_only_qwen3_5_lays_out_a_text_prompt(tmp_path, monkeypatch):
+    from mstar.model.keys import KV_CACHE
 
-    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    llm = object.__new__(Glm52LLMSubmodule)
-    llm.config, llm.request_states = model.config, {}
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
 
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
+    layout = model.kv_layout({"offset": [], "tokens": [], "output": [], "grid": []}, 7)
 
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    assert layout[KV_CACHE]["main"] == LabelLayout(
+        spans=(Span("ids", "prefill_text", 7, 7, "text_inputs"),), growth=(("decode_loop", 1),),
+    ), "a text-only checkpoint lays out a text prompt as a vision checkpoint does"
 
 
 def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_tokens):
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
-    from mstar.model.qwen3_omni.config import THINKER_SAMPLER
-    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-
-    cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), max_output_tokens=max_tokens)
-
-    assert cap["thinker_decode_loop"] == _stops_after(
-        lambda *args: ThinkerSubmodule.check_stop(_omni_submodule(), *args), "thinker_decode_loop", "thinker_decode",
-        2048, {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-        resource_configs={THINKER_SAMPLER: SamplingReqConfig(ignore_eos=True)},
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
-def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
-    pytest.importorskip("flashinfer")
+@pytest.mark.parametrize("talker_max_tokens", [2, 3, 64])
+def test_qwen3_omni_talker_cap_alone_gives_the_frame_budget(talker_max_tokens):
+    """talker_last_prefill streams the first frame and each decode iteration
+    one more. The loop's cap ends decode, and the stop check looks only for
+    codec_eos."""
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
 
     cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), talker_max_output_tokens=talker_max_tokens)
 
-    assert cap["talker_decode_loop"] == _stops_after(
+    assert 1 + cap["talker_decode_loop"] == talker_max_tokens
+    assert _stops_after(
         lambda *args: TalkerSubmodule.check_stop(_omni_submodule(), *args), "talker_decode_loop", "talker_decode",
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
-    ), "the cap and the stop check end decode on different iterations"
+    ) == 2048, "the stop check ended decode on a frame that is not codec_eos"
+
+
+def test_qwen3_omni_talker_last_prefill_stops_no_loop():
+    """The last prefill's frame comes before talker_decode_loop exists, so a
+    stop there would name a loop its walk doesn't have."""
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+
+    info = ForwardPassInfoWrapper(
+        info=CurrentForwardPassInfo(
+            request_id="r", graph_walk="talker_last_prefill", fwd_index=0, random_seed=0,
+            max_tokens=2048, step_metadata={"talker_max_tokens": 2},
+        ),
+        metadata=InputMetadata(),
+    )
+
+    assert not TalkerSubmodule.check_stop(_omni_submodule(), "r", info, {"layer0_codes": [torch.tensor([NOT_EOS])]})
 
 
 def _tiny_qwen3_tts_talker():
-    from test_qwen3_tts_model import _tiny_model_config
+    from test_qwen3_tts_model import _code_predictor, _tiny_model_config
 
-    from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
+    from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.submodules import TalkerSubmodule
 
     config = _tiny_model_config()
-    return TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_tts_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_qwen3_tts_model import _make_model
-
-    talker = _tiny_qwen3_tts_talker()
-    outputs = {"new_token": [torch.tensor(NOT_EOS)]}
-    talker.request_state("r").add_all(generated_frames=0)
-    talker.postprocess("r", None, outputs)
-
-    def check_stop(request_id, request_info, outputs):
-        talker.postprocess(request_id, request_info, outputs)
-        return talker.check_stop(request_id, request_info, outputs)
-
-    cap = _make_model().get_loop_caps(max_output_tokens=max_tokens)["talker_decode_loop"]
-
-    assert cap == _stops_after(
-        check_stop, "talker_decode_loop", "talker_decode", 2048, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    return TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
 
 
 LONG_TEXT = "one two three four five six seven eight nine ten eleven twelve"
@@ -604,18 +593,38 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 40])
-def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
-    from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
+@pytest.mark.parametrize("kind", ["masked", "ac"])
+def test_vjepa2_s_plan_is_the_routed_walk_and_needs_the_video(kind):
+    from mstar.graph.base import TensorPointerInfo
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
 
+    m = _vjepa2(kind)
+    frames = {"video_frames": [TensorPointerInfo(
+        dims=[1], dtype="float32", nbytes=0, address=0, stride=[], uuid=0, source_session_id="", source_entity="",
+    )]}
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {"rollout_horizon": 4})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO and step.step_metadata == {"video_shape": (1,)} and not step.bind
+    # every walk starts at the encoder: without frames the request could never finish
+    with pytest.raises(ValueError, match="video_frames"):
+        m.walk_plan("default", ["video"], ["video"], {}, {})
+
+
+@pytest.mark.parametrize("horizon", [2, 5, 16])
+def test_vjepa2_s_cap_alone_ends_the_rollout_at_its_horizon(horizon):
+    """No stop check ends the rollout, so its cap is every frame a request gets
+    (past the loop's max_iters the conductor refuses it). Each iteration reads the
+    next action, so a trajectory shorter than the cap is refused before the loop
+    could read past it."""
     model = _vjepa2()
-    kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
-
-    assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
-        VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",
-        64, {}, max_tokens=1, step_metadata=step_metadata,
-    ), "the cap and the stop check end the rollout on different iterations"
+    cap = model.get_loop_caps(rollout_horizon=horizon)[model.ROLLOUT_LOOP_NAME]
+    assert cap == horizon
+    trajectory = torch.zeros(cap, 7)
+    model.process_prompt(None, [], ["video"], {}, rollout_horizon=horizon, actions=trajectory, states=trajectory)
+    with pytest.raises(ValueError, match="trajectory length"):
+        short = trajectory[:-1]
+        model.process_prompt(None, [], ["video"], {}, rollout_horizon=horizon, actions=short, states=short)
 
 
 @pytest.mark.parametrize("extrinsics", [False, True])
@@ -642,6 +651,61 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
 
 
+
+def _token_decoder(name: str):
+    """A token decoder model (one whose LLM node is a ``TokenStepNode``) whose
+    ``get_loop_caps`` reads nothing but its config."""
+    if name == "whisper":
+        return _whisper()
+    if name == "bagel":
+        return _bagel()
+    if name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
+
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+        return model
+    if name == "glm52":
+        from mstar.model.glm52.glm52_model import Glm52Model
+
+        return Glm52Model(model_path_hf="", tokenizer_mode="byte")
+    if name == "cosmos3":
+        from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+        return object.__new__(Cosmos3Model)
+    if name == "qwen3_asr":
+        from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+        from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+
+        model = object.__new__(Qwen3ASRModel)
+        model.config = Qwen3ASRModelConfig()
+        return model
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    classes = {"canary_qwen": CanaryQwenModel, "command_a_plus": CommandAPlusModel, "higgs": HiggsAudioModel,
+               "orpheus": OrpheusModel, "qwen3_5": Qwen3_5DenseModel}
+    return object.__new__(classes[name])
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "bagel", "canary", "canary_qwen", "command_a_plus", "cosmos3", "glm52", "higgs", "orpheus", "qwen3_5",
+        "qwen3_asr", "whisper",
+    ],
+)
+@pytest.mark.parametrize("max_tokens", [2, 64])
+def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
+    """The prefill samples the first token and the decode loop's cap runs the
+    rest: the stop check counts no budget of its own, so the cap alone must
+    leave max_tokens tokens (a budget of 1 ends at the prefill)."""
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max_tokens
+
+
 def _whisper():
     from mstar.model.components.audio_features import LogMelSpectrogram
     from mstar.model.whisper.config import WhisperModelConfig
@@ -649,26 +713,12 @@ def _whisper():
 
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig(lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360})
+    model.sampling_defaults = {}
     model.log_mel = LogMelSpectrogram(
         num_mel_bins=model.config.num_mel_bins, sampling_rate=model.config.sampling_rate,
         n_fft=model.config.n_fft, hop_length=model.config.hop_length, chunk_length=model.config.chunk_length,
     )
     return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 1000])
-def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.whisper.config import SAMPLER
-    from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-
-    model = _whisper()
-    bound = model.get_max_output_tokens(max_output_tokens=max_tokens)
-
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
-        WhisperDecoderSubmodule(None, model.config).check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=bound,
-        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("language", ["en", None], ids=["forced", "detected"])

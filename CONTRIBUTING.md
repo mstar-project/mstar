@@ -16,11 +16,26 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 1. Fork and create a branch.
 2. Make a focused change.
 3. Run `ruff check .` (CI enforces it).
-4. Open a PR against `main`. It runs CI and gets a review before merging.
+4. Open a PR against `main`. It runs CI and gets a review before merging. To merge, add it to the
+   merge queue ("Merge when ready"): the queue runs CI on your PR merged with `main` and with every
+   PR queued ahead of it, and lands it only if that passes, so two PRs that are each green alone
+   can't break `main` together.
+
+### HTTP routes and OpenAI adapters
+
+The Python HTTP frontend is being retired in favor of the Rust one (`rust/server/`). A new route, request field, response format or model OpenAI adapter goes into both in the same PR, with a test in `test/rust/` comparing the two; see invariant 15 in [AGENTS.md](AGENTS.md).
+
+### Documentation
+
+During the Mintlify migration, `docs/*.rst` remains the canonical source. If a guide
+has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the
+same PR, including model, resource, installation, and environment-variable changes.
+See [the Mintlify contributor guide](docs/mintlify/CONTRIBUTING.md) for preview and
+validation commands. The generated Python API reference remains on Sphinx.
 
 ### Automated review
 
-A bot posts an advisory review when someone comments `/review` on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review` on their own PR, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Comment `/review` again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
+A bot posts an advisory review when someone asks for one with a `/review` command on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review light` on their own PR for a light review, and someone with write access can do so on any PR, or comment `/review` (or `/review nogpu`) on a PR whose author has write access for the nogpu mode, which also reports P3 improvements and design questions. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Comment the same command again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 
@@ -142,7 +157,7 @@ selected. Within the selected directories:
   `pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=...)`;
 - a module that imports an optional package at module level calls
   `pytest.importorskip("<module>")` with the import name (`flashinfer`,
-  `misaki`, `qwen_tts`, `mstar_rust`, ...) before that import;
+  `misaki`, `qwen_tts`, ...) before that import;
 - a single test that needs one makes the same call at its top, and a
   real-weights test skips when the checkpoint isn't cached;
 - a test that is broken on `main` gets `@pytest.mark.skip(reason=...)` in its
@@ -161,9 +176,9 @@ selected. Within the selected directories:
 
 Run the new file with CI's installation before opening the PR. Check ARM
 compatibility before extending the Mac exclusion list. CI prints the slowest
-tests and retains JUnit reports for seven days. Making
-**CPU Core** a required merge check is a separate repository ruleset or branch
-protection setting.
+tests and retains JUnit reports for seven days. Which checks
+must pass before a PR merges, in the queue or not, is set in `main`'s branch protection rule;
+every required check has to run on the `merge_group` event too.
 
 The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
 and recent operations to a failure; rerun one with the node id pytest prints.

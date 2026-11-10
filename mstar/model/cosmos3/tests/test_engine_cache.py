@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
 from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.plan import group_by_plan_label
-from mstar.model.cosmos3.submodules import ATTN, KV_CACHE
+from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, LATENT_DTYPE
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
@@ -359,7 +359,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
         if spec.resource_key == KV_CACHE:
             spec.apply_yaml_overrides(max_num_pages=max_num_pages)
 
-    groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+    groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
     specs_by_key = {spec.resource_key: spec for spec in specs}
     resources = {
@@ -377,7 +377,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
         )
         for spec in specs
     }
-    overrides = model.get_request_resource_configs(partition_fwd_args={})
+    overrides = model.get_request_resource_configs([], [], {})
     runner = StepRunner(resources)
     for rid in rids:
         runner.ingest_request(rid, overrides)
@@ -506,7 +506,8 @@ def _scenario(num_frames):
     )
     lat_t = 1 if num_frames == 1 else 1 + (num_frames - 1) // mpipe.vae_scale_temporal
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    # the served loop state's dtype, so the engine path and the fused pipeline step the same latents
+    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     lat_fused = mpipe(
         prompt=PROMPT, negative_prompt="", num_frames=num_frames, height=H, width=W,
         num_inference_steps=STEPS, guidance_scale=GS, latents=init.clone(), decode=False,
@@ -681,15 +682,18 @@ def _check_compile_vae(num_frames, tag):
     vae, config = model._build_vae(ctx["device"]), model.config
     walk = "video_gen" if num_frames > 1 else "image_gen"
     out_key = "video_output" if num_frames > 1 else "image_output"
-    had = os.environ.pop("COSMOS3_COMPILE_VAE", None)
+    had = os.environ.get("COSMOS3_COMPILE_VAE")
     try:
+        # Compile is on by default, so the eager arm turns it off explicitly.
+        os.environ["COSMOS3_COMPILE_VAE"] = "0"
         eager = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
+        assert not eager._decode_compiled
         img_eager = eager.forward(walk, None, latents=lat.clone())[out_key][0]
         os.environ["COSMOS3_COMPILE_VAE"] = "1"
         compiled = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
         img_comp = compiled.forward(walk, None, latents=lat.clone())[out_key][0]
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (skipped {tag} compile-VAE parity: VAE/compile unavailable: {exc})")
+    except ImportError as exc:
+        print(f"  (skipped {tag} compile-VAE parity: VAE unavailable: {exc})")
         return
     finally:
         if had is None:
@@ -791,7 +795,7 @@ def test_cross_request_batch_matches_individual() -> None:
         conds.append(c)
         unconds.append(u)
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     shape = (1, 48, 1, H // 16, W // 16)
 
     def _dec(lat):
@@ -988,7 +992,7 @@ def test_windowed_kv_engine_release_and_psnr() -> None:
         ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
     )
 
-    page_size = kv.config.page_size
+    page_size = kv.config.tokens_per_page
     frame_tokens = ctx["md"]["total_latent_units"] * 64  # 64 tokens/unit at 256p
     for label, ids in (("main", ctx["cond"]), ("uncond", ctx["uncond"])):
         stream = kv._streams["r0"][label]
@@ -1089,7 +1093,7 @@ def _run_accelerator_graph_denoise(ctx):
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     groups = JointGroups(
-        tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(),
+        tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial(),
     )
     # The runner's autocast scope is the engine's: none for a node that pins
     # its own precision (the DiT forwards run native bf16), else the model's.

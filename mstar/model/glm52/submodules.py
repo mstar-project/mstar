@@ -18,7 +18,6 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -30,6 +29,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.model.glm52.config import (
@@ -47,13 +47,15 @@ from mstar.model.submodule_base import (
     HostRows,
     ModelInputsFromEngine,
     NodeInputs,
+    TokenStop,
 )
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
-_VERDICT_TIMEOUT_S = 120.0
+# How long a read waits for a verify step's verdict before the process exits
+_VERDICT_DEADLINE_S = 300.0
 
 
 class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
@@ -65,8 +67,8 @@ class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
         self.max_row_tokens = max_row_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths
-                if distribute_tokens(n, bs)[0] <= self.max_row_tokens]
+        return [n for n in super().get_total_tokens(bs)
+                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
@@ -78,8 +80,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # an MTP decode step is one captured graph; the uncaptured fallback runs eager
-        self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
         # dsa_long_context: handles whose prefill starts past a cached prefix; their step runs
         # eager (_cg_key), since a bucket's capture scores only its own rows
         self._prefix_hits: set[int] = set()
@@ -93,13 +93,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_checked: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
-        # the step's per-step indices, in one pinned H2D
-        self._index_stager = PinnedStager(torch.long)
         # Per request, in its request_state: "token_budget", under MTP, max_tokens capped at
         # the context limit less two verify blocks (prompt-aware, set by the prefill's
-        # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:
-        # the prefill walk has no loop to stop, so the first decode step stops decode_loop and
-        # emits nothing.
+        # preprocess, read by check_stop).
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.eos_token_ids),
+            sampler=SAMPLER_RESOURCE, prefill_walks=frozenset({"prefill"}),
+        )
         # Each request's seed slot (the MTP state that drafts d1, and d1) in the device seed
         # buffers; slot 0 is the sink that padding and capture rows write.
         self._mtp_slot: dict[str, int] = {}
@@ -133,6 +133,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # a decoder layer's frames are traced once per layer kind: dense, MoE, and the last one
+    # on the sampled rows
+    compiled_entries_per_shape = 3
     # an MTP row costs k+1 tokens, so the decode capture pads less coarsely
     MTP_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
 
@@ -177,13 +180,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             raise ValueError(f"prefill_chunk_tokens={cfg.prefill_chunk_tokens} must be >= 1")
         kv = resources[KV_RESOURCE].config
         # the manager holds one page back as its sink
-        if (kv.max_num_pages - 1) * kv.page_size < cfg.max_seq_len:
-            logger.warning("%s: %d usable pages of %d hold less than max_seq_len=%d: a "
+        if (kv.max_num_pages - 1) * kv.tokens_per_page < cfg.max_seq_len:
+            logger.warning("%s: %d usable pages of %d tokens hold less than max_seq_len=%d: a "
                            "request that long waits for pages until it times out", KV_RESOURCE,
-                           kv.max_num_pages - 1, kv.page_size, cfg.max_seq_len)
-        if kv.page_size & (kv.page_size - 1):
+                           kv.max_num_pages - 1, kv.tokens_per_page, cfg.max_seq_len)
+        if kv.tokens_per_page & (kv.tokens_per_page - 1):
             # flashinfer's page-table transform takes power-of-two pages
-            raise ValueError(f"{KV_RESOURCE} page_size={kv.page_size} must be a power of two")
+            raise ValueError(f"{KV_RESOURCE} page_size={kv.tokens_per_page} must be a power of two")
 
     def declare_step(
         self,
@@ -288,9 +291,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     @property
     def disable_torch_compile(self) -> bool:
-        # graph_compile covers the uncaptured steps too, which the engine compiles; under
+        # graph_compile covers the uncaptured steps too, which the engine compiles. An MTP
+        # decode step is one captured graph, and its uncaptured fallback runs eager; under
         # dsa_long_context those run eager, and the frame would key on each prompt's length
-        return (getattr(self, "_mtp_uncompiled", False) or self.config.dsa_long_context
+        return (self.config.mtp_num_draft_tokens > 0 or self.config.dsa_long_context
                 or not self.config.graph_compile)
 
     def to(self, *args, **kwargs):
@@ -319,27 +323,22 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         if self._moe_capture_blocked(tp_world_size):
             return []
-        prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        batched = self.config.prefill_batched_token_buckets
+        prefill_buckets = list(self.PREFILL_TOKEN_BUCKETS)
         if self.config.dsa_long_context:
             # a captured prefill plans dense attention, which a step past
-            # prefill_chunk_tokens leaves unplanned (declare_step)
-            chunk = self.config.prefill_chunk_tokens
-            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > chunk})
+            # prefill_chunk_tokens leaves unplanned (declare_step), and its sparse attention in
+            # one plan, which FlashInfer takes up to sparse_mla.MAX_ROWS rows
+            cap = min(self.config.prefill_chunk_tokens, sparse_mla.MAX_ROWS)
+            past = [n for n in prefill_buckets if n > cap]
             if past:
-                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass prefill_chunk_tokens="
-                               "%d and run eager, in row chunks", past, chunk)
-                prefill_buckets = [n for n in prefill_buckets if n <= chunk]
-                batched = [n for n in batched or () if n <= chunk]
-        groups = [(prefill_buckets, prefill_batch_sizes)]
-        if batched:
-            # one request's buckets and a batch's apart, so each can be fine or coarse
-            groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
-                      (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
+                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass %d tokens "
+                               "(prefill_chunk_tokens or sparse_mla.MAX_ROWS) and run eager",
+                               past, cap)
+                prefill_buckets = [n for n in prefill_buckets if n <= cap]
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -351,44 +350,23 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *(
-                _PackedPrefillConfig(
-                    max_row_tokens=self._context_limit(),
-                    capture_graph_walk="prefill",
-                    capture_token_lengths=list(buckets),
-                    make_node_input=lambda n: ARNodeInputs(
-                        input_ids=torch.zeros(n, dtype=torch.long, device=device),
-                        input_seq_len=n,
-                    ),
-                    capture_batch_sizes=list(sizes),
-                    **flags,
-                )
-                for buckets, sizes in groups if buckets and sizes
+            *([_PackedPrefillConfig(
+                max_row_tokens=self._context_limit(),
+                capture_graph_walk="prefill",
+                capture_token_lengths=prefill_buckets,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n,
+                ),
+                capture_batch_sizes=list(prefill_batch_sizes),
+                **flags,
+            )] if prefill_buckets else []
             ),
         ]
         if self.config.dsa_long_context and self.mtp_k:
             # MTP's prefill over DSA stays eager
             configs = [c for c in configs if c.capture_graph_walk == "decode"]
-        self._fit_recompile_limit(configs)
         return configs
-
-    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """The recompile limit these captures take: a decoder layer's frames hold an entry per
-        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
-        the shapes past the limit capture uncompiled."""
-        tokens = {
-            n for config in configs
-            for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
-            for n in config.get_total_tokens(bs)
-        }
-        need = 3 * len(tokens) + 16  # and the engine's compiled fallback
-        if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
-                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
-        self._recompile_limit = need
-
-    def dynamo_recompile_limit(self) -> int | None:
-        return getattr(self, "_recompile_limit", None)
 
     # ── per-step contract ──
 
@@ -508,30 +486,29 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 fields["mtp_seq"] = [self._mtp_stage_seq(engine_inputs)]
         out = {}
         if fields:
-            staged = self._index_stager.to_device(
-                [v for values in fields.values() for v in values], device)
+            staged = to_device_nonblocking(
+                [v for values in fields.values() for v in values], device, dtype=torch.long)
             out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
-        if long_context:
-            # the DSA resource stages the step's rows off the KV plan; the forward opens them
-            # (_dsa_use)
-            out.update(engine_inputs.resources[DSA_RESOURCE].step_inputs(
-                engine_inputs.step.ctx, engine_inputs.captured))
         return out
 
     def _dsa(self) -> DSAManager | None:
         return self.node_resources.get(DSA_RESOURCE) if self.config.dsa_long_context else None
 
-    def _dsa_ctx(self, kwargs: dict) -> DSAContext | None:
-        """The forward's DSA context, from its preprocess inputs."""
+    def _dsa_plan(self) -> DSAContext | None:
+        """The step's DSA plan (the step declares DSAStep), or None without the resource."""
         dsa = self._dsa()
-        return dsa.context(kwargs) if dsa is not None else None
+        return dsa.current() if dsa is not None else None
 
-    def _dsa_use(self, dsa_ctx: DSAContext | None):
-        """Open ``dsa_ctx`` on the DSA resource for the layers a block runs (None: dense)."""
+    def _dsa_rows(self, c0: int, c1: int):
+        """The step's rows ``[c0, c1)`` alone for the layers a block runs."""
+        return self._dsa().rows(c0, c1)
+
+    def _dsa_dense(self):
+        """No DSA for the layers a block runs: they attend densely."""
         dsa = self._dsa()
-        return dsa.use(dsa_ctx) if dsa is not None else contextlib.nullcontext()
+        return dsa.dense() if dsa is not None else contextlib.nullcontext()
 
     def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
         """The step's positions as the position resource planned them, in the KV plan's
@@ -542,11 +519,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: DSAContext | None = None,
         rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        with self._dsa_use(dsa_ctx):
-            return self.language_model.model(input_ids, position_ids, rows=rows)
+        return self.language_model.model(input_ids, position_ids, rows=rows)
 
     @torch.compiler.disable
     def _last_row_index(
@@ -582,13 +557,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         position_ids = self._positions(engine_inputs, input_ids.shape[0])
         if self._long_prefill(graph_walk, input_ids, dsa_ctx):
             last = [input_ids.shape[0] - 1]
             return {"logits": [self.lm_head(
-                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last))]}
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx)
+                self._prefill_rows_chunked(input_ids, position_ids, last))]}
+        hidden = self._hidden(input_ids, position_ids)
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def _long_prefill(self, graph_walk: str, input_ids: torch.Tensor, dsa_ctx) -> bool:
@@ -598,8 +573,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 and input_ids.shape[0] > self.config.prefill_chunk_tokens)
 
     def _prefill_rows_chunked(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor,
-        dsa_ctx: DSAContext, rows: list[int],
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor, rows: list[int],
     ) -> torch.Tensor:
         """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
         ``prefill_chunk_tokens``, run over row chunks in turn: each writes its keys and latents
@@ -608,9 +582,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
-            with kv.token_window(c0, c1):
-                hidden = self._hidden(
-                    input_ids[c0:c1], position_ids[c0:c1], dsa_ctx.rows(c0, c1))
+            with kv.token_window(c0, c1), self._dsa_rows(c0, c1):
+                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1])
             want = [r - c0 for r in rows if c0 <= r < c1]
             if want:
                 picked.append(hidden[want])
@@ -630,8 +603,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # a verify step plans a block of rows per request around its one input token
             position_ids = self._positions(engine_inputs, input_ids.shape[0] * self.mtp_block)
             return self._mtp_decode(
-                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"],
-                self._dsa_ctx(kwargs))
+                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"])
         position_ids = self._positions(engine_inputs, input_ids.shape[0])
         if self.mtp_k > 0 and graph_walk == "prefill":
             return self._mtp_prefill(engine_inputs, input_ids, position_ids, kwargs)
@@ -656,17 +628,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         if self._long_prefill(graph_walk, input_ids, dsa_ctx):
             last = [r0 + n - 1 for r0, n, _ in dsa_ctx.spans]
             return self._sample(engine_inputs, self.lm_head(
-                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last)))
+                self._prefill_rows_chunked(input_ids, position_ids, last)))
         rows = None
         if graph_walk == "prefill" and self.config.tuned_kernels:
             # the last layer's FFN on the rows it samples only: they take the small-batch MoE
             # path, so the first token's numerics move (the reference runs every row)
             rows = self._last_row_index(engine_inputs, kwargs)
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx, rows=rows)
+        hidden = self._hidden(input_ids, position_ids, rows=rows)
         if graph_walk == "prefill" and rows is None:
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
         logits = self.lm_head(hidden)  # (bs, vocab)
@@ -701,11 +673,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         row (each request's last row pairs with its sampled token): it fills the MTP plane and
         seeds the first decode step."""
         lm = self.language_model
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         if self._long_prefill("prefill", input_ids, dsa_ctx):
             return self._mtp_prefill_chunked(engine_inputs, input_ids, position_ids, kwargs,
                                              dsa_ctx)
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx)
+        hidden = self._hidden(input_ids, position_ids)
         last = self._last_row_index(engine_inputs, kwargs)
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(hidden.index_select(0, last)))
         # roll, not a shifted copy into empty memory: a captured bucket's tail is padding,
@@ -713,8 +685,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, new_tokens.to(nxt.dtype))
         # the MTP plane pairs the trunk's post-final-norm state, as the reference does
-        with self._dsa_use(dsa_ctx):
-            h_head, _ = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
+        h_head, _ = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
         self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last), new_tokens)
         return {
             rid: {"new_token": [new_tokens[i : i + 1]]}
@@ -734,17 +705,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         normed = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
-            sub = dsa_ctx.rows(c0, c1)
-            with kv.token_window(c0, c1):
-                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1], sub)
-                with self._dsa_use(sub):
-                    lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), hidden, position_ids[c0:c1] + 1)
+            with kv.token_window(c0, c1), self._dsa_rows(c0, c1):
+                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1])
+                lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), hidden, position_ids[c0:c1] + 1)
             want = [r - c0 for r in last if c0 <= r < c1]
             if want:
                 normed.append(hidden[want])
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(torch.cat(normed)))
         rows = torch.tensor(last, device=input_ids.device)
-        with kv.token_rows(rows), self._dsa_use(dsa_ctx.pick(last)):
+        with kv.token_rows(rows), self._dsa().pick(last):
             h_head, _ = lm.mtp(
                 lm.model.embed_tokens(new_tokens), torch.cat(normed),
                 position_ids.index_select(0, rows) + 1)
@@ -757,7 +726,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _mtp_decode(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         position_ids: torch.Tensor, mtp_slots: torch.Tensor, mtp_seq: torch.Tensor,
-        dsa_ctx: DSAContext | None = None,
     ) -> dict[str, NameToTensorList]:
         """One verify step. Drafts: d1 from the seed, each later one an MTP pass whose query
         sits at its row of this step's block. Verify: the trunk over [last | drafts], the
@@ -772,16 +740,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         h, d1 = self._mtp_read_seed(mtp_slots)
         drafts = [d1]
         rows: dict[str, torch.Tensor] = {}
-        for row in range(k - 1):
-            h_head, _ = lm.mtp.forward_block_row(
-                embed(drafts[-1]), h, positions[:, row] + 1, row, block, rows)
-            drafts.append(self._draft_tokens(h_head, drafts[-1]))
-            # the next pass's hnorm reads this pass's post-norm output, as d1's read the
-            # trunk's post-final-norm state: the reference chains it so (vLLM #45895)
-            h = h_head
+        with self._dsa_dense():  # the draft passes attend densely
+            for row in range(k - 1):
+                h_head, _ = lm.mtp.forward_block_row(
+                    embed(drafts[-1]), h, positions[:, row] + 1, row, block, rows)
+                drafts.append(self._draft_tokens(h_head, drafts[-1]))
+                # the next pass's hnorm reads this pass's post-norm output, as d1's read the
+                # trunk's post-final-norm state: the reference chains it so (vLLM #45895)
+                h = h_head
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
-        hidden = self._hidden(ids, position_ids, dsa_ctx)
+        hidden = self._hidden(ids, position_ids)
         target = self.lm_head(hidden).argmax(-1).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         # every rank keeps rank 0's verdict: each trims its KV and seeds its next step by it, so
@@ -789,8 +758,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
         self._stage_verdict(engine_inputs, verdict, mtp_seq)
-        with self._dsa_use(dsa_ctx):
-            h_head, _ = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
+        h_head, _ = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
         at = torch.arange(n, device=accepted.device) * block + accepted
         next_input = target.view(-1).index_select(0, at)
         self._mtp_seed(mtp_slots, h_head.index_select(0, at), next_input)
@@ -878,22 +846,27 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         to stage them (a step's requests share its number and mailbox)."""
         pending = [self._mtp_pending[rid] for rid in request_ids]
         seq, key, _ = pending[0]
-        assert all(p[:2] == (seq, key) for p in pending), pending
+        if any(p[:2] != (seq, key) for p in pending):
+            raise SystemExit(f"one MTP verdict read spans several steps: {pending}")
         # read once, then kept: a later step may reuse the mailbox before a second read
         cached = [self._mtp_verdict.get(rid) for rid in request_ids]
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        deadline = time.monotonic() + _VERDICT_TIMEOUT_S
+        # A step that failed after it was numbered never stages its verdict. Failing this rank's
+        # batch alone would leave the other ranks in its collective, so a missed deadline exits
+        # the process: the instance goes down where everyone sees it, rather than hanging.
+        deadline = time.monotonic() + _VERDICT_DEADLINE_S
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                raise RuntimeError(
+                raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it was read")
             if time.monotonic() > deadline:
-                raise RuntimeError(f"MTP verdict of step {seq} never arrived")
+                raise SystemExit(
+                    f"MTP step {seq} never staged its verdict in {_VERDICT_DEADLINE_S:.0f} s")
             time.sleep(0)
         table = verdicts[: max(p[2] for p in pending) + 1].tolist()
         block = self.mtp_block
@@ -989,70 +962,41 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # an MTP verify step's forward returned the next input (the token after the
         # accepted drafts); new_token is the host's cut of the verdict
         outputs.setdefault("text_inputs", outputs["new_token"])
-        if self.request_state(request_id).get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        if not self.mtp_k:
+            return super().check_stop(request_id, request_info, outputs)
         tokens = outputs["new_token"][0].reshape(-1).tolist() if "new_token" in outputs else None
-        return self._stops(request_id, request_info, tokens)
+        return self._mtp_stops(request_id, request_info, tokens)
 
     def check_stop_batched(
         self,
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
-        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist`` of the step's tokens."""
-        tokens = host_rows.buffers.get("new_token")
-        if self.mtp_k > 0 or not torch.is_tensor(tokens) or tokens.dim() == 0:
+        if self.mtp_k:
             # an MTP verify step emits several tokens a row, which check_stop counts
             return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
-            loops = self._stops(rid, request_infos[rid], [values[i]])
-            if loops:
-                stops[rid] = loops
-        return stops
+        return super().check_stop_batched(request_ids, request_infos, host_rows)
 
-    def _stops(
+    def _mtp_stops(
         self, request_id: str, request_info: CurrentForwardPassInfo, tokens: list[int] | None,
     ) -> set[str]:
-        """The loops the step's new ``tokens`` stop; None when the step emitted none."""
-        state = self.request_state(request_id)
-        if state.get("ended_at_prefill"):
-            return {"decode_loop"}
+        """``token_stop`` for an MTP step, whose row carries every token it emitted (None:
+        none). Those count toward the budget here: a plain step's budget is the loop's cap,
+        but a verify step emits up to k+1 tokens per iteration."""
         if tokens is None:
             return set()
-        ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
-        # under MTP the prompt-aware cap from the prefill's preprocess, else the request's own
-        budget = state.get("token_budget", request_info.max_tokens)
-        # in-step truncation (MTP) leaves a stop id only as the LAST element
-        is_eos = tokens[-1] in self.config.eos_token_ids
-        if self.mtp_k > 0:
-            # a verify step emits several tokens: count them, not the loop's iterations
-            generated = self._mtp_checked.get(request_id, 0) + len(tokens)
-            self._mtp_checked[request_id] = generated
-        else:
-            # max_tokens counts the token the prefill emits, so the total is
-            # 1 + (iters + 1) decode tokens
-            generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
-        if (not ignore_eos and is_eos) or generated >= budget:
-            return {"decode_loop"}
+        # the prompt-aware cap from the prefill's preprocess, else the request's own
+        budget = self.request_state(request_id).get("token_budget", request_info.max_tokens)
+        generated = self._mtp_checked.get(request_id, 0) + len(tokens)
+        self._mtp_checked[request_id] = generated
+        # in-step truncation leaves a stop id only as the LAST element
+        if generated >= budget or self._token_stops(request_id, tokens[-1], request_info):
+            return self._stop_names(request_info)
         return set()

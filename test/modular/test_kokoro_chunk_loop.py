@@ -32,6 +32,7 @@ from mstar.model.kokoro.config import (  # noqa: E402
 )
 from mstar.model.kokoro.submodules import KokoroSynthSubmodule  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 
 def _tiny_config() -> KokoroModelConfig:
@@ -60,16 +61,13 @@ def _submodule() -> KokoroSynthSubmodule:
     config = _tiny_config()
     torch.manual_seed(0)
     model = KokoroTTS(config).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     return KokoroSynthSubmodule(model, config)
 
 
 def _engine(submodule: KokoroSynthSubmodule) -> Engine:
-    engine = Engine.__new__(Engine)
-    engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}})()}
-    engine._enable_nvtx = False
-    engine._loopback_steps = {}
-    return engine
+    return make_engine(_submodules={SYNTH_NODE: make_mgmt(submodule)})
 
 
 def _prompt_tensors(lengths: list[int], seed: int) -> dict[str, list[torch.Tensor]]:

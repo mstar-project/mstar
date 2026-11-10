@@ -1,7 +1,6 @@
 """GLM-5.3-Flash (glm5_next) architecture + generation config."""
 
 import dataclasses
-import functools
 from dataclasses import dataclass, field
 
 from mstar.engine.resources.kv.config import AuxPlanes
@@ -57,18 +56,6 @@ def build_mlp_layer_types(
 def build_indexer_types(num_hidden_layers: int) -> tuple[str, ...]:
     """Every MLA layer runs its own full indexer; none are shared."""
     return tuple("full" for _ in range(num_hidden_layers))
-
-
-@functools.cache
-def _flashinfer_before(version: str) -> bool:
-    """True only for an installed FlashInfer older than ``version``."""
-    try:
-        import flashinfer
-        from packaging.version import Version
-    except ImportError:
-        return False
-    installed = getattr(flashinfer, "__version__", None)
-    return installed is not None and Version(installed) < Version(version)
 
 
 @dataclass
@@ -186,10 +173,6 @@ class Glm5NextModelConfig:
     # None: a request that names no max_tokens may run to the end of the window,
     # as in vLLM; check_stop ends each request where its prompt leaves no room.
     max_output_tokens: int | None = None
-    temperature: float = 1.0
-    top_p: float = 0.95
-    repetition_penalty: float = 1.0
-    ignore_eos: bool = False
 
     # --- quantization / serving knobs ---
     # the checkpoint's fp8 e4m3 [128, 128] block scales (``weight_scale_inv``), from config.json
@@ -201,9 +184,8 @@ class Glm5NextModelConfig:
     moe_quant_kernel: str = "reference"
 
     # Capture the prefill per (rows, token bucket); off keeps it eager. The
-    # two lists override the submodule's default buckets.
+    # list overrides the submodule's default batch sizes.
     prefill_graphs: bool = False
-    prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # the latent width, kv_lora_rank + qk_rope_head_dim (0 here)
@@ -323,12 +305,8 @@ class Glm5NextModelConfig:
     def mla_cache_kpe(self) -> int:
         """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
         a 64-wide slot to mask rows a query must not see: rejected draft rows, or
-        under dsa_long_context the sparse plan's padding. FlashInfer plans a cache
-        without the slot from 0.6.18, so an older one gets it too (zeros):
-        otherwise MLA would run the uncapturable fallback."""
-        if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
-            return 64
-        return 0
+        under dsa_long_context the sparse plan's padding."""
+        return 64 if self.mtp_num_draft_tokens > 0 else 0
 
     @property
     def context_limit(self) -> int:
@@ -615,7 +593,6 @@ class Glm5NextModelConfig:
             max_seq_len=512,
             eos_token_ids=(250, 251, 252),
             pad_token_id=250,
-            prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
 

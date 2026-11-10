@@ -11,11 +11,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput  # noqa: E402
 from mstar.communication.codec import default_codec  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.communication.event import EventWakeup  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
 
@@ -76,10 +77,34 @@ def test_a_queued_message_that_fails_to_send_is_dropped_not_retried():
     assert [msg for _, msg in peer.delivered] == ["first", "last"]
 
 
-class _Model:
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
+def test_a_peer_that_stays_behind_is_reported_with_its_depth(monkeypatch, caplog):
+    """Nothing bounds the outbox, so a peer that stays behind is logged, every
+    BEHIND_WARN_S, and one that catches up starts its clock again when it
+    falls behind later."""
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    peer = _Peer(full={"worker_0": 10**6, "worker_1": 2})
+    out = OutboxCommunicator(peer)
+    for i in range(3):
+        out.send("worker_0", i)
+    out.send("worker_1", "x")
+    with caplog.at_level("WARNING", logger="mstar.communication.communicator"):
+        out.flush()                                 # worker_1 still behind
+        now[0] += out.BEHIND_WARN_S - 1
+        out.flush()                                 # worker_1 catches up
+        peer.full["worker_1"] = 10**6
+        out.send("worker_1", "y")                   # and falls behind again
+        out.flush()
+        assert not caplog.records
+        now[0] += 1
+        out.flush()
+        now[0] += 1
+        out.flush()                                 # reported once per interval
+    (record,) = caplog.records
+    assert record.args[0] == "worker_0" and record.args[2] == 3
 
+
+class _Model(StubModel):
     def process_prompt(self, *args, **kwargs):
         return {"text_inputs": [torch.tensor([1, 2, 3])]}
 
@@ -116,9 +141,10 @@ def _request(request_id, **model_kwargs):
 
 def _thread(peer, tensor_manager=None):
     queues = {name: queue.Queue() for name in (
-        "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
+        "in_queue", "result_tensor_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
+    queues["out_queue"], queues["profile_queue"] = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     out = OutboxCommunicator(peer)
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(), communicator=out,
@@ -216,9 +242,9 @@ def test_a_release_that_cannot_be_sent_does_not_lose_the_request_taken_with_it()
     ]
 
 
-def _factory(monkeypatch, choice, *, has_try_send):
-    """``make_communicator`` over a fake ``mstar_rust`` build, with each
-    transport's constructor returning its name."""
+def _factory(monkeypatch, *, version=None, has_try_send=True):
+    """``make_communicator`` over a fake ``mstar_rust`` build, with the Rust
+    communicator's constructor returning ``"rust"``."""
     import sys
     from types import SimpleNamespace
 
@@ -231,37 +257,41 @@ def _factory(monkeypatch, choice, *, has_try_send):
 
     if has_try_send:
         _Zmq.try_send = lambda self, peer_id, data: True
-    version = communicator.EXPECTED_MSTAR_RUST_VERSION if has_try_send else "0.1.0"
     monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(
-        ZmqCommunicator=_Zmq, __version__=version, __file__="mstar_rust.so"))
+        ZmqCommunicator=_Zmq, __version__=version or communicator.EXPECTED_MSTAR_RUST_VERSION,
+        __file__="mstar_rust.so"))
     monkeypatch.setattr(rust_communicator, "RustZMQCommunicator", lambda *args, **kwargs: "rust")
-    monkeypatch.setattr(communicator, "ZMQCommunicator", lambda *args, **kwargs: "pyzmq")
-    monkeypatch.setenv("MSTAR_RUST_ZMQ", choice)
     return communicator.make_communicator
 
 
-@pytest.mark.parametrize("choice", ["AUTO", "1"])
-def test_a_rust_build_without_try_send_still_carries_the_other_senders(monkeypatch, choice):
-    """Only the outbox needs try_send: the conductor's and the workers'
-    communicators stay Rust, which a worker's Rust graph runtime requires."""
-    make = _factory(monkeypatch, choice, has_try_send=False)
+def test_the_expected_build_carries_every_sender(monkeypatch):
+    make = _factory(monkeypatch)
     assert make("conductor", []) == "rust"
+    outbox = make("api_server_preprocess_worker", [], nonblocking_send=True)
+    assert isinstance(outbox, OutboxCommunicator) and outbox._inner == "rust"
 
 
-def test_a_rust_build_without_try_send_puts_the_outbox_on_pyzmq_under_auto(monkeypatch, caplog):
-    make = _factory(monkeypatch, "AUTO", has_try_send=False)
-    with caplog.at_level("WARNING"):
-        assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "pyzmq"
-    assert "try_send" in caplog.text
+def test_a_build_of_another_version_is_refused(monkeypatch):
+    """A stale build left in an env after an upgrade fails the process at
+    startup: there is no other transport to carry the mesh."""
+    make = _factory(monkeypatch, version="0.1.0")
+    with pytest.raises(RuntimeError, match="0.1.0 at .* does not match the expected"):
+        make("conductor", [])
 
 
-def test_a_rust_build_without_try_send_fails_the_outbox_when_rust_is_required(monkeypatch):
-    make = _factory(monkeypatch, "1", has_try_send=False)
-    with pytest.raises(RuntimeError, match="rebuild"):
+def test_a_build_without_try_send_fails_the_outbox(monkeypatch):
+    """Only the outbox needs try_send, so the other senders still start."""
+    make = _factory(monkeypatch, has_try_send=False)
+    assert make("worker_0", []) == "rust"
+    with pytest.raises(RuntimeError, match="predates ZmqCommunicator.try_send"):
         make("api_server_preprocess_worker", [], nonblocking_send=True)
 
 
-@pytest.mark.parametrize("choice", ["AUTO", "1"])
-def test_a_rust_build_with_try_send_carries_the_outbox(monkeypatch, choice):
-    make = _factory(monkeypatch, choice, has_try_send=True)
-    assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "rust"
+def test_a_missing_extension_says_how_to_build_it(monkeypatch):
+    import sys
+
+    from mstar.communication.communicator import make_communicator
+
+    monkeypatch.setitem(sys.modules, "mstar_rust", None)
+    with pytest.raises(ImportError, match="maturin develop --release -m rust/Cargo.toml"):
+        make_communicator("conductor", [])

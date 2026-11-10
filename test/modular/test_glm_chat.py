@@ -322,6 +322,19 @@ def test_adapter_refuses_what_it_cannot_honour(body, tmp_path):
         adapters.get_adapter("glm52").chat_to_request(_chat(**body), tmp_path)
 
 
+@pytest.mark.parametrize("model", ["glm52", "glm5_next"])
+def test_a_refused_image_leaves_no_upload(model, tmp_path):
+    """The chat route cleans up only what it submits; a text model refuses an image after
+    it was decoded to disk."""
+    png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4"
+           "DwABBAEAwS2OUAAAAABJRU5ErkJggg==")
+    messages = [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                             {"type": "image_url", "image_url": {"url": png}}]}]
+    with pytest.raises(ValueError, match="text only"):
+        adapters.get_adapter(model).chat_to_request(_chat(messages=messages), tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
 TIME = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
 
 

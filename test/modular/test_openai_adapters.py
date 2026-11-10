@@ -13,6 +13,7 @@ from mstar.api_server.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ImageGenerationRequest,
     SpeechRequest,
+    VideoGenerationRequest,
 )
 
 
@@ -38,6 +39,14 @@ def test_bagel_chat_decodes_image_input(tmp_path):
     assert "image" in sa.file_paths
     assert Path(sa.file_paths["image"][0]).read_bytes() == raw
     assert "image" in sa.input_modalities and "text" in sa.input_modalities
+
+
+@pytest.mark.parametrize("ptype", ["image_url", "video_url", "audio_url"])
+def test_an_untyped_attachment_takes_its_part_s_modality(tmp_path, ptype):
+    """An application/octet-stream data URL (or object-store URL) was modality "unknown", a 400."""
+    url = "data:application/octet-stream;base64," + base64.b64encode(b"\x89PNG").decode()
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": [{"type": ptype, ptype: {"url": url}}]}])
+    assert adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).input_modalities == [ptype[:-4]]
 
 
 def test_a_chat_request_keeps_each_message_role(tmp_path):
@@ -107,7 +116,12 @@ def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
     # Long inputs are sentence-chunked by the speech handler; short ones are not.
     assert adapters.Qwen3TTSAdapter.speech_chunk_min_chars == 600
     assert adapters.Qwen3TTSAdapter.speech_chunk_max_chars == 400
-    assert adapters.OrpheusAdapter.speech_chunk_min_chars is None
+
+
+def test_omnivoice_speech_maps_instructions_onto_instruct(tmp_path):
+    req = SpeechRequest(input="hello", instructions="a calm female voice")
+    mk = adapters.OmniVoiceAdapter().speech_to_request(req, tmp_path).model_kwargs
+    assert mk["instruct"] == "a calm female voice" and "instructions" not in mk
 
 
 def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path, monkeypatch):
@@ -149,6 +163,20 @@ def test_extra_body_non_standard_knobs_pass_through(tmp_path):
     )
     mk = adapters.Qwen3OmniAdapter().chat_to_request(req, tmp_path).model_kwargs
     assert mk["talker_top_k"] == 50 and mk["talker_repetition_penalty"] == 1.05
+
+
+@pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
+@pytest.mark.parametrize(("fields", "want"), [
+    ({"chat_template_kwargs": {"enable_thinking": False}}, {"enable_thinking": False}),
+    # every key, as Muse Glimmer reads reasoning_strength and current_date; a flat key wins
+    ({"chat_template_kwargs": {"reasoning_strength": "low", "current_date": "2026-11-08"},
+      "reasoning_strength": "high"},
+     {"reasoning_strength": "high", "current_date": "2026-11-08"}),
+], ids=["false", "every-key"])
+def test_a_thinking_chat_reads_the_template_kwargs_flat(adapter, fields, want, tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert mk == want
 
 
 def test_text_chat_maps_text_and_sampling(tmp_path):
@@ -216,15 +244,37 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 
 
 @pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize(("fields", "error"), [
+    ({"n": 2}, "n=2"), ({"stop": "."}, "stop sequences"), ({"stop": ["END"]}, "stop sequences"),
+    ({"logprobs": True}, "logprobs"), ({"presence_penalty": 1.5}, "presence_penalty"),
+    ({"best_of": 3}, "best_of"), ({"response_format": {"type": "json_object"}}, "response_format"),
+], ids=lambda f: str(f) if isinstance(f, dict) else "")
+def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapter, fields, error):
+    """Every chat adapter returns one choice of plain sampled text, ended at a
+    stop token; dropping any of these was a 200."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    with pytest.raises(ValueError, match=f"^{error}"):
+        adapter().chat_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
+    {"n": 1}, {"n": None}, {"stop": None}, {"stop": []},
     {"tools": []}, {"tools": None}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tool_choice": None},
     {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
     {"function_call": None},
     {"tools": [_NAMED], "tool_choice": "none"}, {"functions": [_FUNCTION], "function_call": "none"},
+    {"logprobs": False}, {"presence_penalty": 0}, {"best_of": 1}, {"response_format": {"type": "text"}},
+    # request bookkeeping (LiveKit sends stream_options on every call)
+    {"stream_options": {"include_usage": True}, "user": "u1", "store": False, "metadata": {"k": "v"},
+     "service_tier": "auto", "parallel_tool_calls": True},
 ], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
 def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
+    """And are dropped, so the server does not log them as ignored."""
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
-    assert adapter().chat_to_request(req, tmp_path).text == "hi", "a client's default tool fields refused a plain chat"
+    sa = adapter().chat_to_request(req, tmp_path)
+    assert sa.text == "hi", "a client's default tool fields refused a plain chat"
+    assert set(fields).isdisjoint(sa.model_kwargs)
 
 
 def test_qwen3_chat_audio_url_input(tmp_path):
@@ -253,6 +303,16 @@ def test_bagel_image_edit(tmp_path):
     assert sa.model_kwargs == {"cfg_img_scale": 2.0}
 
 
+@pytest.mark.parametrize("audio", ["false", 0])
+def test_ltx2_5_refuses_an_audio_toggle_that_is_not_a_boolean(tmp_path, audio):
+    req = VideoGenerationRequest(prompt="a cat", audio=audio)
+    with pytest.raises(ValueError, match="audio must be true or false"):
+        adapters.LTX25Adapter().video_to_request(req, tmp_path)
+    # null is unset: the default, sound
+    req = VideoGenerationRequest(prompt="a cat", audio=None)
+    assert adapters.LTX25Adapter().video_to_request(req, tmp_path).output_modalities == ["video", "audio"]
+
+
 def test_registry():
     assert {"bagel", "qwen3_omni", "orpheus"} <= set(adapters.ADAPTER_REGISTRY)
     assert adapters.get_adapter("pi05") is None
@@ -261,13 +321,15 @@ def test_registry():
 
 @pytest.mark.parametrize("adapter", [
     adapters.OrpheusAdapter(), adapters.Qwen3OmniAdapter(), adapters.Qwen3TTSAdapter(),
-    adapters.ChatterboxAdapter(),
+    adapters.ChatterboxAdapter(), adapters.KokoroAdapter(), adapters.OmniVoiceAdapter(), adapters.FishS2ProAdapter(),
+    adapters.CosyVoice3Adapter(), adapters.VoxCPM2Adapter(),
 ])
-def test_speech_without_a_speed_control_forwards_only_a_sent_speed(adapter, tmp_path):
-    """A sent ``speed`` reaches model_kwargs, so the server logs it as ignored; the 1.0 default does not."""
-    sent = adapter.speech_to_request(SpeechRequest(input="hi", speed=1.2), tmp_path)
+def test_every_speech_adapter_forwards_only_a_sent_speed(adapter, tmp_path):
+    """A sent ``speed`` reaches model_kwargs, for the model to read or log as ignored; the 1.0 default does not."""
+    sent = adapter.speech_request(SpeechRequest(input="hi", voice="v", speed=1.2), tmp_path)
     assert sent.model_kwargs["speed"] == 1.2
-    assert "speed" not in adapter.speech_to_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+    unsent = adapter.speech_request(SpeechRequest(input="hi", voice="v"), tmp_path)
+    assert "speed" not in unsent.model_kwargs
 
 
 @pytest.mark.parametrize("body", [
