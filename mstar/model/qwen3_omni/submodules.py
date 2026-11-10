@@ -65,6 +65,7 @@ from mstar.model.qwen3_omni.components.rope import (
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniTalkerModel
 from mstar.model.qwen3_omni.components.vision import Qwen3OmniVisionTower
 from mstar.model.qwen3_omni.config import (
+    AUDIO_ATTN,
     AUDIO_TOKENS,
     CODE_PRED_SAMPLER,
     TALKER_KV,
@@ -137,6 +138,12 @@ class AudioEncoderSubmodule(AuTEncoderSubmodule):
     def __init__(self, audio_encoder: AuTEncoder, config: Qwen3OmniModelConfig):
         super().__init__(audio_encoder, array=AUDIO_TOKENS)
         self.config = config
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.audio = handles[AUDIO_TOKENS]
+
+    def max_segments_per_request(self) -> int:
+        return kernel_setting(self.audio, AUDIO_ATTN, "max_segments_per_request")
 
     def prepare_inputs(
         self,

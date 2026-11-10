@@ -149,13 +149,17 @@ class AuTEncoderSubmodule(NodeSubmodule):
         )
         return {AUT_ENCODE: self._encode_region}
 
+    def max_segments_per_request(self) -> int:
+        """The ceiling on windows per row of the attention resource under ``attn_key``."""
+        return self.node_resources[self.attn_key].max_segments_per_request
+
     def _fits_replay(self, inputs: list[NodeInputs]) -> bool:
         """Whether a step's windows fit a replay's attention plan: the resource
         holds ``max_segments_per_request`` a row, and the replay pads to at
         least as many rows as the step has. Read from the resource, so a YAML
         override holds."""
         windows = sum(len(self.encoder.config.window_lengths(inp.input_seq_len)) for inp in inputs)
-        return windows <= len(inputs) * self.node_resources[self.attn_key].max_segments_per_request
+        return windows <= len(inputs) * self.max_segments_per_request()
 
     def _capture_encode(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         """The captured region: reads the runner's buffer, never rebinds."""
