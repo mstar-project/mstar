@@ -1211,8 +1211,10 @@ class KVManager(AttentionResource):
         stream.lease = Lease(end, groups, starts=starts) if end else None
         kept.update(starts)
         windows = [page for group in lease.groups[1:] for page in group] + lease.starts
-        self._unshare(stream, [page for page in windows if page not in kept])
-        self._release(rid, stream, [page for page in lease.pages() if page not in kept])
+        self._release(
+            rid, stream, [page for page in lease.pages() if page not in kept],
+            windows=[page for page in windows if page not in kept],
+        )
         self._recount(rid)
         return end
 
@@ -1400,8 +1402,7 @@ class KVManager(AttentionResource):
             if lease is None:
                 lease = Lease(0, [[] for _ in self._groups])
             self._adopt(rid, stream, lease.groups, lease.end)
-            self._unshare(stream, lease.starts)
-            self._release(rid, stream, lease.starts)
+            self._release(rid, stream, lease.starts, windows=lease.starts)
         else:
             self._release_lease(rid, stream)
         stream.chain = None
@@ -2016,8 +2017,10 @@ class KVManager(AttentionResource):
         with `page_indices`."""
         lease, stream.lease = stream.lease, None
         if lease is not None:
-            self._unshare(stream, [page for group in lease.groups[1:] for page in group] + lease.starts)
-            self._release(rid, stream, lease.pages(), refund)
+            self._release(
+                rid, stream, lease.pages(), refund,
+                windows=[page for group in lease.groups[1:] for page in group] + lease.starts,
+            )
 
     def _release_hold(self, rid: str, stream: CacheStream) -> None:
         hold, stream.hold = stream.hold, None
@@ -2145,9 +2148,8 @@ class KVManager(AttentionResource):
                     pages = stream.pages()
                     drop = self._arena.any_sealed(pages)
                     if drop:
-                        self._unshare(stream, held_pages(stream.later))
                         # before the reset, which clears the lists ``pages`` may alias
-                        self._release(rid, stream, pages)
+                        self._release(rid, stream, pages, windows=held_pages(stream.later))
                     stream.reset(freed=drop)
                     stream.forget_chain()
                     self._recount(rid)
@@ -2379,8 +2381,7 @@ class KVManager(AttentionResource):
                     )
                     if stream.lease is not None:
                         self._image_ends.append((segment.request_id, stream))
-                    self._unshare(stream, lease.starts)
-                    self._release(segment.request_id, stream, lease.starts)
+                    self._release(segment.request_id, stream, lease.starts, windows=lease.starts)
                     stream.converted = True
                     self._recount(segment.request_id)
                 if report:
@@ -3563,10 +3564,8 @@ class KVManager(AttentionResource):
         part.released += k * page_size
         part.generation += 1
         # A window's pages only cycle: its allotment keeps room for the pages that replace these, which for a page
-        # another stream still holds is the room `_shared` kept for it (`_unshare`).
-        if group:
-            self._unshare(stream, freed)
-        self._release(rid, stream, freed)
+        # another stream still holds is the room `_shared` kept for it (`_release`).
+        self._release(rid, stream, freed, windows=freed if group else ())
         self._recount(rid)
         return k * page_size
 
@@ -4357,9 +4356,8 @@ class KVManager(AttentionResource):
                 pages = stream.pages()
                 drop = free or self._arena.any_sealed(pages)
                 if drop:
-                    self._unshare(stream, held_pages(stream.later))
                     # before the reset, which clears the lists ``pages`` may alias
-                    self._release(rid, stream, pages)
+                    self._release(rid, stream, pages, windows=held_pages(stream.later))
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
                 stream.forget_chain()
@@ -4395,7 +4393,7 @@ class KVManager(AttentionResource):
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
                     self._release_hold(rid, stream)
-                    self._unshare(stream, held_pages(stream.later))
+                    self._unshare(held_pages(stream.later))
                     self._arena.release(stream.pages())
                     stream.free_lists()
             if self._cpu_pool is not None:
@@ -5417,20 +5415,29 @@ class KVManager(AttentionResource):
         self._arena.retain(pages)
         return pages
 
-    def _release(self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True) -> None:
+    def _release(
+        self, rid: str, stream: CacheStream, pages: list[int], refund: bool = True, windows: Collection[int] = (),
+    ) -> None:
         """Release ``pages`` of ``stream``, which the caller takes off the stream before it recounts.
 
         A page not in ``stream.lent`` shrinks the allotment by one when its release leaves
         the page neither free nor evictable, and always when ``refund`` is False. Otherwise
         the allotment keeps the page for the walk that writes it again. The caller recounts.
+
+        ``windows`` are the window pages among ``pages``. They give back the room `_shared` kept for the ones
+        another stream still holds (`_unshare`), and none shrinks the allotment, since a window's pages only cycle:
+        the page is still held, or only the index holds it, as a leaf that can be evicted, and a page replaces it.
         """
+        self._unshare(windows)
         self._arena.release(pages)
         allotment = self._allotments.get(rid)
         if allotment is not None:
             evictable = () if self._index is None else self._index.evictable()
             gone = sum(
                 1 for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
-                if page not in stream.lent and (not refund or (owners and page not in evictable))
+                if page not in stream.lent and page not in windows and (
+                    not refund or (owners and page not in evictable)
+                )
             )
             allotment.pages = max(0, allotment.pages - gone)
         if stream.lent:
@@ -5447,15 +5454,13 @@ class KVManager(AttentionResource):
         if self._counts and self._index is not None and pages:
             self._shared += sum(holders > 0 for holders in self._holders(pages))
 
-    def _unshare(self, stream: CacheStream, pages: list[int]) -> None:
-        """Before ``stream`` releases its window pages ``pages``, give back the room `_shared` kept for each one another
-        stream still holds. That room now covers the page that replaces it, so the page is marked lent, and `_release`
-        leaves the allotment room for it. Reads who holds what and nothing else. Under the lock."""
+    def _unshare(self, pages: Collection[int]) -> None:
+        """Before a stream releases its window pages ``pages``, give back the room `_shared` kept for each one another
+        stream still holds. That room now covers the page that replaces it. Reads who holds what and nothing else.
+        Under the lock."""
         if not self._counts or self._index is None or not pages:
             return
-        held = [page for page, holders in zip(pages, self._holders(pages), strict=True) if holders > 1]
-        self._shared -= len(held)
-        stream.lent.update(held)
+        self._shared -= sum(holders > 1 for holders in self._holders(list(pages)))
 
     def _recount(self, *rids: str) -> None:
         """Bring each of ``rids``' share of `_unused` up to date after its pages or its allotment change.

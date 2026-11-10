@@ -503,7 +503,7 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
 # Each rank's own order of c's lease (L), a's commit that rolls the shared pages out of a's window (R), c's admit
 # that converts the lease (C) and c's next step once converted (G): rank 0's, then the follower's.
 @pytest.mark.parametrize("order", ["LR/RL", "RL/LR", "CR/RC", "RC/CR", "GR/RG", "RG/GR"])
-def test_ranks_count_a_shared_window_page_alike_whether_a_lease_or_its_payers_release_lands_first(order):
+def test_ranks_count_a_shared_window_page_alike_whichever_of_its_holders_events_lands_first(order):
     """c leases a hit whose window pages a holds, and a's commit that rolls those pages out of a's window lands
     before or after c's lease, c's admit, or c's next step, in one order on rank 0 and in the other on a follower.
     Every rank ends up counting the same pages lent, the same allotments and the same room."""
