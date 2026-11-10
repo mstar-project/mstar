@@ -213,17 +213,12 @@ def test_bad_env_value_is_an_error(monkeypatch, value):
         VideoBudget()
 
 
-@pytest.mark.parametrize("name, value, match", [
-    ("MSTAR_MAX_IMAGE_PIXELS", "lots", "MSTAR_MAX_IMAGE_PIXELS"),
-    ("MSTAR_MAX_VIDEO_BYTES", "lots", "MSTAR_MAX_VIDEO_BYTES"),
-    # the cap it set was silently replaced by MSTAR_MAX_VIDEO_BYTES's default
-    ("MSTAR_MAX_VIDEO_PIXELS", "1000000", "MSTAR_MAX_VIDEO_BYTES"),
-])
-def test_bad_env_value_stops_the_data_worker_at_startup(monkeypatch, name, value, match):
+@pytest.mark.parametrize("name", ["MSTAR_MAX_IMAGE_PIXELS", "MSTAR_MAX_VIDEO_BYTES"])
+def test_bad_env_value_stops_the_data_worker_at_startup(monkeypatch, name):
     from mstar.api_server.data_worker import PreprocessWorker
 
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=match):
+    monkeypatch.setenv(name, "lots")
+    with pytest.raises(ValueError, match=name):
         PreprocessWorker(model=None)
 
 

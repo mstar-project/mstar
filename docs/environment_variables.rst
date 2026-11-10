@@ -490,9 +490,7 @@ so attaching more files does not multiply them.
        copy (about 13.6 s when the clip's header gives no frame count and it
        decodes every frame); and over about 259 s on Qwen3.5, which decodes
        2 uint8 frames a second. It bounds the decode, not what the model's
-       preprocessing makes of the frames afterwards. It replaces
-       ``MSTAR_MAX_VIDEO_PIXELS``: with that set, the data worker does not
-       start.
+       preprocessing makes of the frames afterwards.
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``
      - Images, audio clips and videos one request may attach, together (see

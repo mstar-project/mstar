@@ -101,12 +101,6 @@ def check_media_limits() -> None:
     """
     from PIL import Image
 
-    if os.environ.get("MSTAR_MAX_VIDEO_PIXELS"):
-        # its cap would otherwise be replaced by MSTAR_MAX_VIDEO_BYTES's default without a word
-        raise ValueError(
-            "MSTAR_MAX_VIDEO_PIXELS is no longer read; set MSTAR_MAX_VIDEO_BYTES "
-            "(3 bytes a decoded pixel) instead"
-        )
     limit = max_image_pixels()
     max_video_bytes()
     max_media_files()
