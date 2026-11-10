@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import NamedTuple
 
 sys.path.insert(0, ".")
 
@@ -30,6 +31,8 @@ from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
+from mstar.utils.device import DeviceCapability
+from mstar.worker.host_copies import HostCopies
 
 DECODES, MAX_TOKENS = 4, 64
 
@@ -106,7 +109,16 @@ def _info(rid: str, walk: str, decode_iter: int) -> CurrentForwardPassInfo:
     )
 
 
-def _step(engine: Engine, walk: str, inputs: dict[str, torch.Tensor], decode_iter: int = 0) -> dict:
+class Run(NamedTuple):
+    # each request's emitted tokens
+    tokens: dict[str, list[int]]
+    # the prompt tokens its prefill ran; the rest of its prompt came from the cache
+    prefilled: dict[str, int]
+
+
+def _step(engine: Engine, walk: str, inputs: dict[str, torch.Tensor], decode_iter: int = 0,
+          ran: dict[str, int] | None = None) -> dict:
+    """One step, as the worker runs it; ``ran`` receives the tokens it ran of each request."""
     rids = list(inputs)
     batch = _batch(
         node_name="LLM", per_request_info={rid: _info(rid, walk, decode_iter) for rid in rids},
@@ -115,22 +127,30 @@ def _step(engine: Engine, walk: str, inputs: dict[str, torch.Tensor], decode_ite
     )
     engine.prepare_inputs(batch)
     assert not batch.failed_requests, batch.failed_requests
+    if ran is not None:
+        ran.update({rid: inp.input_seq_len for rid, inp in zip(batch.prepared_rids, batch.inputs, strict=True)})
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
-    engine.check_stop_for_batch(batch, outputs)
+    # the worker's postprocess: the stop check's host rows key what the step sampled
+    cpu = torch.device("cpu")
+    host, host_rows = HostCopies(cpu, DeviceCapability.of(cpu)).prematerialize_for_check_stop(
+        outputs, None, request_ids=batch.request_ids)
+    engine.step_finished(batch, host, host_rows=host_rows)
+    engine.check_stop_for_batch(batch, host, host_rows=host_rows)
     return outputs.per_rid_outputs
 
 
-def _generate(engine: Engine, inputs: dict[str, torch.Tensor]) -> dict[str, list[int]]:
-    """Prefill ``inputs`` in one step, then decode them together: each request's emitted tokens."""
-    out = _step(engine, "prefill", inputs)
+def _generate(engine: Engine, inputs: dict[str, torch.Tensor], decodes: int = DECODES) -> Run:
+    """Prefill ``inputs`` in one step, then decode them together."""
+    prefilled: dict[str, int] = {}
+    out = _step(engine, "prefill", inputs, ran=prefilled)
     seqs = {rid: out[rid]["new_token"][0].reshape(-1).tolist() for rid in inputs}
-    for i in range(DECODES):
+    for i in range(decodes):
         out = _step(engine, "decode", {rid: out[rid]["text_inputs"][0].reshape(-1) for rid in inputs}, i)
         for rid in inputs:
             seqs[rid] += out[rid]["new_token"][0].reshape(-1).tolist()
-    return seqs
+    return Run(seqs, prefilled)
 
 
 SHARED = "".join(f"line {i}: the quick brown fox jumps over the lazy dog. " for i in range(6))[:270]
@@ -148,10 +168,9 @@ def test_a_prompt_past_a_cached_prefix_decodes_as_a_cold_run(k):
     b = _request(model, warm, "b", b_text)
     c = _request(model, warm, "c", "an unrelated prompt that shares nothing with the others.")
     page = warm._resources[KV_CACHE].config.tokens_per_page
-    hits_before = warm._resources[KV_CACHE].prefix_tokens.get("LLM", (0, 0))[1]
     got = _generate(warm, {"b": b, "c": c})
-    hit = warm._resources[KV_CACHE].prefix_tokens["LLM"][1] - hits_before
-    assert hit == len(SHARED) // page * page, f"b skipped {hit} tokens"
+    # what ran, not the KV cache's own hit count: the KDA pool cuts that to its snapshot
+    assert got.prefilled == {"b": len(b) - len(SHARED) // page * page, "c": len(c)}
     assert warm_sub.request_state("b").get("context", 0) >= len(b)
 
     cold_model = _model(k)
@@ -160,4 +179,4 @@ def test_a_prompt_past_a_cached_prefix_decodes_as_a_cold_run(k):
         "b": _request(cold_model, cold, "b", b_text),
         "c": _request(cold_model, cold, "c", "an unrelated prompt that shares nothing with the others."),
     })
-    assert got == ref, "a prefix hit changed the greedy output"
+    assert got.tokens == ref.tokens, "a prefix hit changed the greedy output"
