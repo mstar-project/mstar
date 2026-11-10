@@ -590,6 +590,16 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
   ``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``,
   ``penalize_prompt`` and ``ignore_eos``. ``min_p`` above 0 is refused, since neither
   checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.
+- Chat renders each message in its role (``system``, ``developer`` as ``system``, ``user``,
+  ``assistant`` with its ``tool_calls``, ``tool``; another role is a 400) through the
+  checkpoint's chat template, and splits the reply into ``reasoning_content``, ``content``
+  and ``tool_calls`` (``finish_reason: "tool_calls"``). A request may set ``tools``
+  (function tools) and ``tool_choice``: ``auto`` (the default) or ``none``, which leaves
+  the tools out of the prompt; ``required`` or a named function needs constrained decoding
+  and is a 400. A call to a function the request did not offer stays text.
+  ``enable_thinking``, ``reasoning_effort`` and ``clear_thinking`` reach the template, flat
+  in the body or under ``chat_template_kwargs``, which drops any other key. GLM-5.3-Flash
+  always reasons, so ``enable_thinking: false`` is a 400 there.
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
