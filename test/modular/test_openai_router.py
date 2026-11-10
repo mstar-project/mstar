@@ -863,6 +863,25 @@ def test_images_edits_takes_every_reference_image_in_order(client_and_stub):
     assert [Path(p).read_bytes() for p in stub.last_submit["file_paths"]["image"]] == uploads
 
 
+def test_a_failed_upload_write_leaves_no_upload(client_and_stub, monkeypatch):
+    """The images are written one by one; a write failing past the first must take the earlier ones with it."""
+    client, stub = client_and_stub
+    stub.model_name = "flux2_klein"
+    real_write, writes = Path.write_bytes, []
+
+    def write_bytes(self, data):
+        writes.append(self)
+        if len(writes) == 2:
+            raise OSError("disk full")
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    resp = client.post("/v1/images/edits", files=[("image[]", b"\x89PNGone"), ("image[]", b"\x89PNGtwo")],
+                       data={"prompt": "x"})
+    assert resp.status_code == 500 and len(writes) == 2
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the

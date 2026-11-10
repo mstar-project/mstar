@@ -89,12 +89,10 @@ async def create_image_edit(
     upload_dir = Path(api.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     image_paths = []
-    for data, filename in images:
-        path = upload_dir / f"{uuid4().hex}{os.path.splitext(filename or '')[1] or '.png'}"
-        path.write_bytes(data)
-        image_paths.append(path)
-
     try:
+        for data, filename in images:
+            image_paths.append(upload_dir / f"{uuid4().hex}{os.path.splitext(filename or '')[1] or '.png'}")
+            image_paths[-1].write_bytes(data)  # listed first: a partial write is removed too
         args = adapter.image_edit_to_request(prompt, [str(p) for p in image_paths], model_kwargs)
     except Exception as exc:
         for path in image_paths:
