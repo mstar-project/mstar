@@ -104,10 +104,10 @@ class RequestLifecycle:
         return True
 
     def takes_input(self, wire_rid: str) -> bool:
-        """Whether this rank still takes NEW_REQUEST and INPUT_SIGNALS for a
-        request: until it sends READS_DONE, draining or not, since a step rank 0
-        committed may wait on one that arrives behind the forwarded drain. After
-        READS_DONE the producer may free what it sent."""
+        """Whether this rank still reads the inputs of NEW_REQUEST and INPUT_SIGNALS
+        for a request: until it sends READS_DONE, draining or not, since a step
+        rank 0 committed may wait on one that arrives behind the forwarded drain.
+        After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
 
     def _follows(self, rid: int) -> bool:

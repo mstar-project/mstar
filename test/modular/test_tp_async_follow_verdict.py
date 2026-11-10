@@ -16,11 +16,12 @@ forward) and then hangs in the collective. So:
   decision: builds the head from N's real outputs, or goes serial on the
   marker; N's verdict — ``admit_error`` / ``failed_requests`` on its
   ``ExecutingBatch``, written by the GPU thread before N's future resolves —
-  drops a head without building it (the verdicts on which the leader clears
-  its own speculation before threading), unless the prefix cache is open,
-  where the leader pre-planned the head and the follower builds it too;
-* a step whose forward raised is closed (``Lockstep.close_follow_step``): its head
-  is dropped, queued or arriving.
+  turns a head into a step of moves alone without building it (the verdicts
+  on which the leader clears its own speculation before threading), unless
+  the prefix cache is open, where the leader pre-planned the head and the
+  follower builds it too;
+* a step whose forward raised is closed (``Lockstep.close_follow_step``): a head from it,
+  queued or arriving later, becomes a step of moves alone.
 
 Drives a real ``Worker`` and its real ``Lockstep``, which holds the FIFO.
 ``Speculator.follow`` is stubbed per test — its own build logic
@@ -38,10 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from test_loop_turns import NODE as LOOP_NODE  # noqa: E402
 from test_loop_turns import _looping_worker, _Runtime, _scheduler, _StopLoopError  # noqa: E402
 
+from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.testing_utils.worker import bound, make_scheduler, make_worker, tp_sharding  # noqa: E402
-from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation, WorkerMessageType  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MoveKind,
+    OffloadDelta,
+    RemoveRequest,
+    ScheduleTPNode,
+    TPNoSpeculation,
+    WorkerMessageType,
+)
 from mstar.worker import speculation as speculation_mod  # noqa: E402
 from mstar.worker import step_pipeline as pipeline_mod  # noqa: E402
 from mstar.worker.lockstep import (  # noqa: E402
@@ -58,12 +67,19 @@ WALK = "decode"
 class _FakeEngineManager:
     def __init__(self, cache_open: bool = False):
         self.cache_open = cache_open
+        self.applied = []
 
     def get_engine(self, node_name):
         return types.SimpleNamespace(
             check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None,
-            prefix_cache_open=lambda node: self.cache_open,
+            prefix_cache_open=lambda node: self.cache_open, apply_resident_delta=self._apply,
+            residency=lambda node, rid: Residency.RESIDENT,
         )
+
+    def _apply(self, delta, rebuilding, caught_up):
+        while (move := delta.pop_left()) is not None:
+            self.applied.append((move.rid, move.kind))
+        return True
 
 
 class _Communicator:
@@ -269,6 +285,7 @@ def _tp_loop(monkeypatch, forward_raises=()):
     runtime = _Runtime()
     loop_sched, state = _scheduler(runtime, StepOrder.TURNS)
     engine = loop_sched.engine_manager.get_engine(LOOP_NODE)
+    engine.owes_moves = lambda: False  # the journal holds no moves, so no step with no rows goes out
     sched = make_scheduler(
         engine_manager=types.SimpleNamespace(get_engine=lambda name: engine),
         parallel_leader_nodes={LOOP_NODE}, parallel_nodes={LOOP_NODE},
@@ -480,20 +497,27 @@ def test_nospec_marker_is_recorded_and_never_queued():
     assert s.lockstep.follow_head() is None
 
 
-def test_head_for_a_closed_step_is_dropped_on_arrival():
+def test_a_head_for_a_closed_step_is_queued_as_a_step_of_moves_alone():
+    """Rank 0 made the head's moves, and stamps the removals it makes next with the head's seq, before it
+    learns the step failed."""
     s = _stub()
     s.lockstep.close_follow_step(_pending(4))
     s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
-    assert s.lockstep.follow_head() is None
+
+    head = s.lockstep.follow_head()
+    assert head.spec_seq == 5 and not head.request_ids and not head.speculative, "the follower skipped rank 0's step"
 
 
-def test_close_drops_an_already_queued_head_for_that_step_only():
+def test_close_turns_an_already_queued_head_for_that_step_alone_into_a_step_of_moves():
     s = _stub()
     other = _head(["r9"], seq=9, from_seq=8)
     s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     s.lockstep.enqueue_follow(other)
     s.lockstep.close_follow_step(_pending(4))
+    head = s.lockstep.pop_follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
     assert s.lockstep.follow_head() is other
+    assert s.lockstep.pending_follow_count("r0") == 0, "the voided head's rows still hold the drain"
 
 
 def test_plain_and_unrelated_speculative_messages_queue_normally():
@@ -516,11 +540,26 @@ def test_flag_off_ignores_markers_and_queues_heads_verbatim():
     assert s.lockstep.follow_head() is h
 
 
-def test_empty_schedule_message_is_dropped_not_queued():
-    """Defensive: the serial path indexes request_ids[0]."""
+def test_a_step_with_no_rows_or_moves_is_queued_and_consumed():
+    """When a request leaves before its victims are dropped, its victims run on, and rank 0's flush still sends a
+    step with no rows and no moves. Rank 0 stamps its next removal with that step's seq, so this rank consumes the
+    step too."""
     s = _stub()
     s.lockstep.enqueue_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
-    assert s.lockstep.follow_head() is None
+    assert s.scheduler._try_schedule_tp_follow() is None
+    removal = RemoveRequest(request_id="gone", after_tp_seq=3)
+    assert removal.after_tp_seq <= s.lockstep.last_consumed_seq, (
+        "the removal waits until this rank admits the next step"
+    )
+
+
+def test_a_message_of_moves_alone_is_queued():
+    s = _stub()
+    moves = ScheduleTPNode(NODE, WALK, [], spec_seq=3)
+    moves.resident_delta.add(MoveKind.DROP, "r0", count=2, node=NODE)
+    s.lockstep.enqueue_follow(moves)
+
+    assert list(s.lockstep._follow_fifo) == [moves], "rank 0 ran a step this rank skips"
 
 
 def test_nospec_store_is_bounded():
@@ -608,8 +647,9 @@ def test_await_drops_the_head_on_allocation_failure_without_building():
     out = _output()
     pending = _pending(4, _future(s, out), admit_error="kv cache: out of pages")
     assert _await(s, pending) == (out, None)
-    assert s.lockstep.follow_head() is None
-    assert s.build_results, "head must be dropped, not built"
+    head = s.lockstep.follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
+    assert s.build_results, "the head was built"
 
 
 def test_await_drops_the_head_on_failed_rids_without_building():
@@ -622,8 +662,9 @@ def test_await_drops_the_head_on_failed_rids_without_building():
     out = _output()
     pending = _pending(4, _future(s, out), failed_requests=["r0"])
     assert _await(s, pending) == (out, None)
-    assert s.lockstep.follow_head() is None
-    assert s.build_results, "head must be dropped, not built"
+    head = s.lockstep.follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
+    assert s.build_results, "the head was built"
 
 
 def test_await_has_no_verdict_to_apply_while_N_still_runs():
@@ -692,9 +733,9 @@ def test_await_treats_a_later_head_at_the_front_the_same_way():
 
 
 def test_a_forward_that_raised_is_the_steps_verdict_and_voids_its_head():
-    """N's forward raised: every row of N fails and the head built on N is
-    dropped, as the leader drops it on the same verdict, instead of the raise
-    reaching the loop's handler."""
+    """N's forward raised: every row of N fails and the head built on N becomes
+    a step of moves alone, as the leader drops it on the same verdict, instead
+    of the raise reaching the loop's handler."""
     s = _stub()
     s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
 
@@ -705,10 +746,51 @@ def test_a_forward_that_raised_is_the_steps_verdict_and_voids_its_head():
     outputs, spec = _await(s, p)
     assert spec is None and not outputs.per_rid_outputs
     assert set(p.node_batch.failed_requests) == {"r0"}
-    assert s.lockstep.follow_head() is None
+    head = s.lockstep.follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
 
 
 def test_await_never_returns_without_a_decision_once_N_finished():
     s = _stub()   # nothing ever arrives
     with pytest.raises(TimeoutError):
         _await(s, _pending(4, _future(s, _output())))
+
+
+def _head_with_moves(seq, from_seq):
+    """A head carrying a reservation rank 0 made while N ran."""
+    head = _head(["r0"], seq=seq, from_seq=from_seq)
+    head.resident_delta = OffloadDelta.new()
+    head.resident_delta.add(MoveKind.RESERVE, "r9", "kv", 3)
+    return head
+
+
+def test_a_head_a_follower_drops_unbuilt_counts_as_consumed_only_once_its_moves_land():
+    """With the cache off, a failed request voids the head, and the follower drops the head without building
+    it."""
+    s = _stub(cache_open=False)
+    s.build_results = [object()]
+    s.lockstep.enqueue_follow(_head_with_moves(seq=5, from_seq=4))
+    out = _output()
+    assert _await(s, _pending(4, _future(s, out), failed_requests=["r0"])) == (out, None)
+    assert s.build_results, "the head was built"
+    head = s.lockstep.follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
+    assert s.lockstep.settle_delta(caught_up=True)
+    assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the dropped head's moves were lost"
+
+
+def test_with_the_prefix_cache_open_a_follower_takes_a_voided_heads_moves_before_it_builds_the_head():
+    """With the cache open, N's verdict voids the head, and the follower builds the head and then unwinds it.
+    The head's moves land at the settle before the build, whether the build goes ahead or not, and its pop
+    doesn't take them again."""
+    s = _stub(cache_open=True)
+    s.lockstep.enqueue_follow(_head_with_moves(seq=5, from_seq=4))
+    pending = _pending(4, failed_requests=["r0"])
+    pending.node_batch.commit_done = types.SimpleNamespace(is_set=lambda: True)
+    pending.batch.request_to_worker_graph = {}   # nothing to continue, so nothing is built
+    bound(s.scheduler, runtime=types.SimpleNamespace(get_rid_handle=lambda wire_rid: wire_rid))
+
+    assert speculation_mod.Speculator.follow(s.speculator, pending) is None
+    assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the build ran ahead of the head's moves"
+    s.lockstep.pop_follow_head()
+    assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the pop applied the head's moves twice"

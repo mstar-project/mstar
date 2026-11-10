@@ -959,11 +959,19 @@ class Speculator:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.lockstep.settle_delta(
-            # Of the steps before the head, only N may still index a page of the head's hit
-            caught_up=pending.node_batch.commit_done.is_set(),
-        ):
-            return None
+        # Of the steps before the head, only N may still index a page of the head's hit, or hold pages back
+        committed = pending.node_batch.commit_done
+        caught_up = committed.is_set()
+        while not self.lockstep.settle_delta(caught_up):
+            if not self.lockstep.awaits_commit(pending.node_batch.request_ids):
+                return None
+            if caught_up:
+                raise SystemExit(
+                    f"TP ranks diverged: rank 0's moves still wait on step seq {pending.tp_seq} after it committed here"
+                )
+            # every exit of N's step releases its commit
+            committed.wait()
+            caught_up = True
 
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
@@ -973,17 +981,21 @@ class Speculator:
         # rows whose input read failed here: built without, as on the serial path
         unread = self.lockstep.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
-        in_batch = batch_N.request_to_worker_graph
+        in_batch, held = batch_N.request_to_worker_graph, batch_N.incomplete_node_rids
+        # rebuild rows, which the graph runtime holds no node of, so they are never popped. A rebuild whose chunk ran
+        # in N is one of N's rows mid-prefill, which rank 0 stamps a rebuild row from its log too.
+        rebuild = self.lockstep.follow_rebuilds(
+            head.node_name, [r for r in head_rids if r not in in_batch or r in held],
+        )
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
         in_n = [r for r in head_rids if r in in_batch]
         # N's rows mid-prefill loop back on nothing of N's: as on the leader,
         # their next chunk is cut from the input held since their first. N's
         # chunks came from the leader, so every rank splits these out alike.
-        held = batch_N.incomplete_node_rids
         mid_prefill = {r for r in in_n if r in held} if held else set()
         continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
-        fresh = [r for r in head_rids if r not in in_batch and r not in unread]
+        fresh = [r for r in head_rids if r not in in_batch and r not in unread and r not in rebuild]
         if not in_n:
             return None
         spec_walk = head.walks[head_walk_idx[in_n[0]]] if head.walks else head.graph_walk
@@ -1074,7 +1086,7 @@ class Speculator:
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
-            elif rid in unread:
+            elif rid in unread or rid in rebuild:
                 per_request_inputs[rid] = {}
             elif rid in mid_prefill:
                 new_request_to_worker_graph[rid] = in_batch[rid]
@@ -1083,7 +1095,7 @@ class Speculator:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
                 per_request_inputs[rid] = fresh_inputs[rid]
         request_walks = {r: head.walks[w] for r, w in head_walk_idx.items()} if head.walks else None
-        if unread:
+        if unread or rebuild:
             # In with no inputs, as on the serial path: the step has rank 0's
             # rows until its read check takes these out. An unread row not in
             # N is no continuing row, so voiding the speculation
@@ -1092,8 +1104,8 @@ class Speculator:
             # so ``unread_rows`` keeps it out of the pop: rank 0 checks each
             # step taking the input until one runs (``Lockstep.consume_reads``),
             # and that step's check takes the row out on every rank.
-            new_request_to_worker_graph, _ = self.lockstep.with_unread_rows(
-                head, head_rids, unread, new_request_to_worker_graph, request_walks or {},
+            new_request_to_worker_graph, _ = self.lockstep.with_unpopped_rows(
+                head, head_rids, unread | rebuild, new_request_to_worker_graph, request_walks or {},
             )
 
         # Committed: the serial path must not see the head any more.
@@ -1114,6 +1126,7 @@ class Speculator:
             request_walks=request_walks,
             chunk_ranges=chunk_ranges,
             incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
+            rebuild_rids=rebuild,
         )
         # N's rows, as on the leader: N's settle readies them, not a cleared speculation
         speculation.continuing_rids.update(mid_prefill)

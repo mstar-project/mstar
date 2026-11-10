@@ -46,11 +46,12 @@ def _raise(err):
     raise err
 
 
-@pytest.mark.parametrize("raises_in", ["runtime_add", "stop_limits", "engine_add", "input_read"])
+@pytest.mark.parametrize("raises_in", ["runtime_add", "stop_limits", "rebuild_room", "engine_add", "input_read"])
 def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
-    """Registration that raises (before or after the request has a handle), an
-    engine that refuses the request, or a read that raises as it starts (a CUDA
-    OOM in the H2D copy, say): the request fails, alone."""
+    """Registration that raises (before or after the request has a handle), a
+    pinned allocation for the request's rebuild log, an engine that refuses the
+    request, or a read that raises as it starts (a CUDA OOM in the H2D copy,
+    say): the request fails, alone."""
     registered, processed, reads, sent = [], [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     handles = {}
@@ -87,6 +88,8 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
             ),
         ),
     )
+    if raises_in == "rebuild_room":
+        w.ingest._set_rebuildable = lambda rid, configs: _raise(RuntimeError("CUDA error: out of memory"))
     assert w.lifecycle.park(parked)
     w.ingest._dispatch = processed.extend
     body = SimpleNamespace(
@@ -104,7 +107,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     else:
         assert not sent and list(failed) == [5]
         error = failed[5]
-    assert registered == ([5] if raises_in in ("engine_add", "input_read") else [])
+    assert registered == ([5] if raises_in in ("rebuild_room", "engine_add", "input_read") else [])
     assert reads == ([5] if raises_in == "input_read" else [])  # the read itself raised
     assert error.startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)

@@ -8,8 +8,8 @@ import hashlib
 import io
 import json
 import os
-import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,7 +17,10 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
+sys.path.insert(0, str(REPO_ROOT / ".claude/skills/live-pr-test/scripts"))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 
 
 class TestEras(unittest.TestCase):
@@ -57,9 +60,9 @@ class TestEras(unittest.TestCase):
                        "/volumes/v2": {"attachment": None}}
             return replies.get(path, tpl)
 
-        saved = {k: GPU["cmd_launch"].__globals__[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
-        self.addCleanup(GPU["cmd_launch"].__globals__.update, saved)
-        GPU["cmd_launch"].__globals__.update(
+        saved = {k: GPU[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
+        self.addCleanup(GPU.update, saved)
+        GPU.update(
             eras=eras, STATE=state, LEDGER=state / "instances.json", find_offer=lambda cfg, offer: {
                 "id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0, "region": "x",
                 "storage": True})
@@ -124,7 +127,7 @@ class TestEras(unittest.TestCase):
                                             "so the next volume or a cold box would never launch")
 
     def test_a_create_whose_answer_was_lost_is_not_sent_again(self):
-        posts, globs = [], GPU["eras"].__globals__
+        posts, globs = [], GPU
         self.addCleanup(globs.update, {"_eras_org": globs["_eras_org"]})
         globs["_eras_org"] = "org"
 
@@ -154,7 +157,7 @@ class TestEras(unittest.TestCase):
                      {"id": "i-9", "name": "live-pr-7-t", "status": "active"}]
             return {"items": items if path == "/instances" else [], "next_page_token": None}
 
-        globs = GPU["terminate"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "STATE", "LEDGER")})
         globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
         e = {"provider": "eras", "instance_id": None, "name": "live-pr-7-t", "launched_at": 0, "usd_per_hour": 1.0,
@@ -166,7 +169,7 @@ class TestEras(unittest.TestCase):
         self.assertEqual(GPU["ledger"](), {})
 
     def test_extend_cant_outrun_a_deadline_fixed_at_launch(self):
-        globs = GPU["cmd_extend"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("STATE", "LEDGER")})
         state = Path(tempfile.mkdtemp())
         globs.update(STATE=state, LEDGER=state / "instances.json")
@@ -187,7 +190,7 @@ class TestEras(unittest.TestCase):
         self.assertGreater(GPU["ledger"]()["runpod:i"]["deadline"], soon)
 
     def test_max_running_counts_this_tools_live_instances_on_every_page(self):
-        globs = GPU["running"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {"eras": globs["eras"]})
         globs["eras"] = lambda *a, params=None, **k: (
             {"items": [{"id": "i1", "name": "live-pr-4-8-1", "status": "active"},
@@ -209,12 +212,17 @@ class TestEras(unittest.TestCase):
                 return {"id": "new"}
             return {"items": [{"id": "k2", "fingerprint": fingerprint}]} if params.get("page_token") \
                 else {"items": [{"id": "k1", "fingerprint": "other"}], "next_page_token": "p2"}
-        globs = GPU["eras_ssh_key_id"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {"eras": globs["eras"]})
         globs["eras"] = eras
         self.assertEqual(GPU["eras_ssh_key_id"](f"ssh-ed25519 {key} me", "live-pr-1"), "k2",
                          "a key on a later page would be registered again on every launch")
         self.assertEqual(posts, [])
+
+    def test_an_error_is_cut_at_whole_lines(self):
+        text = "x" * 300 + "\n" + "y" * 300 + "\nlast line\n"
+        self.assertEqual(GPU["tail_lines"](text, 400), "y" * 300 + "\nlast line",
+                         "a provider's error would be cut mid-word")
 
     def test_a_launch_past_the_caps_registers_nothing(self):
         calls = self.eras_launch(max_running=0)
