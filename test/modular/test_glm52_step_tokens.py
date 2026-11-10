@@ -45,15 +45,30 @@ def test_long_context_bind_refuses_an_empty_prefill_window():
         _submodule(cfg).bind_node_resources({})
 
 
-def test_long_context_captures_no_prefill_bucket_past_the_chunk():
+@pytest.mark.parametrize("serving_ladder, captured", [
+    ({}, [32, 64]),  # the model's own ladder
+    ({"prefill": [32, 128]}, [32]),  # the serving config's
+])
+def test_no_ladder_captures_a_prefill_bucket_past_the_window(serving_ladder, captured):
+    """A prefill step past prefill_window_tokens plans no dense attention and runs eager in
+    windows, so the engine must capture no bucket that large, wherever its ladder came from."""
+    import types
+
     import torch
 
-    chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_window_tokens=chunk)
-    sub = _submodule(cfg)
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    sub = Glm52LLMSubmodule(language_model, Glm52ModelConfig(
+        dsa_long_context=True, mla_absorb=True, max_seq_len=262144, prefill_window_tokens=64))
     sub._moe_capture_blocked = lambda tp_world_size: False
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for ladder in c.capture_token_lengths.values() for n in ladder]
-    assert prefill and max(prefill) <= chunk
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=sub, resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=types.SimpleNamespace(world_size=1), num_slots=1,
+        token_ladders=serving_ladder, step_tokens=lambda walk, rows: None)
+    got = sorted({spec.bucket.num_tokens for spec in runner._get_slot_specs()
+                  if spec.bucket.graph_walk == "prefill" and spec.bucket.bs == 1})
+    assert got == captured
 
