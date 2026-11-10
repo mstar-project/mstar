@@ -33,12 +33,14 @@ use crate::protocol::{
     ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest, VideoGenerationRequest,
 };
 
+mod asr;
 mod chat;
 mod images;
 mod messages;
 mod speech;
 mod video;
 
+pub use asr::*;
 pub use chat::*;
 pub use images::*;
 pub use messages::flatten_messages;
@@ -74,6 +76,8 @@ pub struct SubmitArgs {
     pub model_kwargs: Map<String, Value>,
     /// A chat's parts, in order; empty on every other path.
     pub parts: Vec<Part>,
+    /// End the result stream with a `usage` chunk (set by the chat handler).
+    pub report_usage: bool,
 }
 
 impl Default for SubmitArgs {
@@ -81,6 +85,7 @@ impl Default for SubmitArgs {
         Self {
             text: None,
             tokens: None,
+            report_usage: false,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
@@ -181,6 +186,40 @@ pub trait OpenAIAdapter: Send + Sync {
 
     fn supports_videos(&self) -> bool {
         false
+    }
+
+    fn supports_transcriptions(&self) -> bool {
+        false
+    }
+
+    /// The class attributes that steer `/v1/audio/transcriptions`.
+    fn transcription_policy(&self) -> crate::transcription::TranscriptionPolicy {
+        crate::transcription::TranscriptionPolicy::DEFAULT
+    }
+
+    fn transcription_to_request(&self, req: &crate::transcription::TranscriptionRequest, audio_path: &str) -> Result<SubmitArgs, String> {
+        let _ = (req, audio_path);
+        Err("audio/transcriptions is not supported by this model".to_string())
+    }
+
+    /// The structured view of a model's raw text stream: plain text unless
+    /// the stream carries control tokens (language, timestamps) to lift.
+    fn parse_transcript(&self, text: &str, req: &crate::transcription::TranscriptionRequest) -> crate::transcription::Transcript {
+        let _ = req;
+        crate::transcription::Transcript::text(py_strip(text))
+    }
+
+    /// The finished transcript's text as the client gets it; not applied to
+    /// partial text, which only grows.
+    fn final_text(&self, text: String) -> String {
+        text
+    }
+
+    /// The client-facing text of the raw stream so far; it must only grow as
+    /// the stream does, so a model with control tokens holds back a tail that
+    /// may still turn out to be one.
+    fn stream_text(&self, raw: &str) -> String {
+        raw.to_string()
     }
 
     /// The adapter's `speech_chunk_*` attributes.
@@ -291,6 +330,13 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("Wan22Adapter", &Wan22),
     ("LTX25Adapter", &LTX25),
     ("MiniMaxH3Adapter", &MiniMaxH3),
+    ("WhisperAdapter", &Whisper),
+    ("Qwen3ASRAdapter", &Qwen3ASR),
+    ("CanaryAdapter", &Canary),
+    ("CanaryQwenAdapter", &CanaryQwen),
+    ("TransducerAdapter", &Transducer),
+    ("HiggsAudioAdapter", &HiggsAudio),
+    ("OmnilingualASRAdapter", &OmnilingualASR),
 ];
 
 /// The adapter for a Python class name; `None` for a class with no port here.
@@ -326,7 +372,10 @@ pub(crate) fn py_value_repr(v: &Value) -> String {
 /// Python's `repr(float)`: the shortest round-trip digits, positional for a
 /// decimal exponent in -4..16 (with at least one fractional digit) and
 /// scientific with a two-digit exponent otherwise.
-fn py_float_repr(x: f64) -> String {
+pub(crate) fn py_float_repr(x: f64) -> String {
+    if !x.is_finite() {
+        return if x.is_nan() { "nan" } else if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
     if x == 0.0 {
         return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }

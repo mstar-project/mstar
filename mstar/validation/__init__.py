@@ -13,6 +13,7 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
+from mstar.model.multimodal import SUPPORTED_MODALITIES
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
@@ -83,6 +84,14 @@ def validate_deployment(
         problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
+    unpausable = config.get("unpausable_outputs", [])
+    if not isinstance(unpausable, list) or not all(
+        isinstance(output, str) and output in SUPPORTED_MODALITIES for output in unpausable
+    ):
+        problems.append(
+            f"unpausable_outputs must be a list of output modalities from {sorted(SUPPORTED_MODALITIES)}, "
+            f"got {unpausable!r}"
+        )
     if (workers := config.get("preprocess_workers")) is not None:
         try:
             positive_int("preprocess_workers", workers)

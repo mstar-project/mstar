@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import replace
 from typing import Any
 
-from mstar.engine.resources.admission import Admission
+from mstar.engine.resources.admission import Admission, Refusal
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -140,7 +141,7 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
-        # (step key, ready) of the last pre_admit whose stage is still up
+        # (step key, ready, step) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
 
     def resolve_cached_prefix(
@@ -204,7 +205,7 @@ class StepRunner:
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].release_cached_prefix(rid, node_name, graph_walk)
 
-    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, ...]]:
         return {
             key: self._resources[key].page_trail()
             for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
@@ -353,9 +354,10 @@ class StepRunner:
     def ingest_request(
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        arrival: int | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource. All or
-        nothing: a resource that raises leaves the request on none of them."""
+        """open state on all resources; `overrides` are per-resource, and ``arrival`` is the conductor's number
+        for the request. All or nothing: a resource that raises leaves the request on none of them."""
         for i, key in enumerate(self._order):
             try:
                 self._resources[key].ingest_request(
@@ -371,6 +373,8 @@ class StepRunner:
                             "rolling back request %s on resource %s failed", rid, done,
                         )
                 raise
+        if arrival is not None:
+            self._admission.set_arrival(rid, arrival)
 
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
@@ -428,13 +432,9 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
-        if not self._admission.admitted(rid, node_name):
-            waits = self._admission.admit(
-                rid, node_name, graph_walk, published,
-                self._sweep(self._node_ask_order, self._ask_order, node_name),
-            )
-            if waits is not None:
-                return waits
+        waits = self.admit_request(rid, node_name, graph_walk, published)
+        if waits is not None:
+            return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -451,6 +451,27 @@ class StepRunner:
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def admit_request(
+        self, rid: str, node_name: str, graph_walk: str,
+        published: Mapping[str, PublishedInfo] | None = None,
+    ) -> FullAdmitOutcome | None:
+        """None once ``rid`` is admitted on ``node_name``, else `FULL_ADMIT_QUEUED` while it waits, or why
+        it can never be admitted."""
+        if self._admission.admitted(rid, node_name):
+            return None
+        return self._admission.admit(
+            rid, node_name, graph_walk, published, self._sweep(self._node_ask_order, self._ask_order, node_name),
+        )
+
+    def readmit(self, rid: str, node_name: str) -> None:
+        self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name))
+
+    def newer_than(self, rid: str) -> list[str] | None:
+        return self._admission.newer_than(rid)
+
+    def refusals(self) -> list[Refusal]:
+        return self._admission.refusals()
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
@@ -509,7 +530,11 @@ class StepRunner:
         return self._staged is not None
 
     def clear_preplan(self) -> None:
-        """Drop the staged pre-plan on every resource, and the record of it."""
+        """Drop the staged pre-plan on every resource, and the record of it. The staged step won't run, so
+        what its pre-admit took goes back as a refused admit's does."""
+        if self._pre_admitted is not None:
+            step = self._pre_admitted[2]
+            self._unwind(step, self._preplan_keys_for(step))
         self._staged = None
         self._pre_admitted = None
         for key in self._order:
@@ -531,6 +556,8 @@ class StepRunner:
         if pre is not None and staged_key is not None and pre[0] == staged_key:
             covered = self._preplan_keys_for(step)
             ready = pre[1]
+            # this admit owns the stage's reservations now, so a refusal below unwinds them once
+            self._pre_admitted = None
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -619,7 +646,9 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                logger.warning(
+                # exec admits the step again and reports a failure that holds there. A lockstep KV pool refuses
+                # any pre-admit that would evict.
+                logger.debug(
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
@@ -628,7 +657,8 @@ class StepRunner:
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
-        self._pre_admitted = (self._step_key(step), ready)
+        # with a copy of the context, since the batch can drop rows from its own before the stage is thrown away
+        self._pre_admitted = (self._step_key(step), ready, replace(step, _ctx=replace(step.ctx)))
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:

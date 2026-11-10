@@ -1,0 +1,49 @@
+name: Review bot monitor
+
+# A daily report on the PRs merged with the review bot's approval. Reviews nothing and runs no
+# model: every step reads GitHub and git and writes the status issue (bot.py, monitor). Its
+# first scheduled run creates that issue and the skip-ai-review label. The status issue has one
+# writer: this job, serialized by its concurrency group.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: review-monitor
+
+env:
+  PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
+
+jobs:
+  monitor:
+    name: Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # The status issue (its body and its comments) and the skip-ai-review label.
+      issues: write
+      pull-requests: read
+      # A failed check on a merge commit whose parent passed.
+      checks: read
+    steps:
+      # Main's history, for reverts and blame; blobs on demand, so it stays light.
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # No ref: a scheduled run's event has no repository, and it checks out the default branch.
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Report on the status issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          APPROVALS: ${{ vars.REVIEW_APPROVALS }}
+        run: python3 .github/review/bot.py monitor
