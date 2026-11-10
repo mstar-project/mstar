@@ -546,7 +546,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         lm = self.language_model
         hidden = self._hidden(input_ids, position_ids)
         last = self._last_row_index(engine_inputs, kwargs)
-        new_tokens = self._sample_tokens(engine_inputs, self.lm_head(hidden.index_select(0, last)))
+        new_tokens = engine_inputs.resources[SAMPLER_RESOURCE].sample(self.lm_head(hidden.index_select(0, last)))
         # roll, not a shifted copy into empty memory: a captured bucket's tail is padding,
         # and every row must hold a valid id for the embedding
         nxt = torch.roll(input_ids, -1)
@@ -633,13 +633,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _broadcast(self, t: torch.Tensor) -> torch.Tensor:
         """Rank 0's copy: every rank must keep the same tail."""
         return self.lm_head.comm_group.broadcast(t, src=0)
-
-    # Keyed by request id, so outside dynamo (as _sample).
-    @torch.compiler.disable
-    def _sample_tokens(
-        self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return engine_inputs.resources[SAMPLER_RESOURCE].sample(logits)
 
     # ── MTP host side: the verdict mailbox ──
 
