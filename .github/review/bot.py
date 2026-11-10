@@ -82,8 +82,9 @@ FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s
 # author_association values: the team, and the team plus anyone with a merged PR (see the workflow's header).
 TEAM = ("OWNER", "MEMBER", "COLLABORATOR")
 CONTRIBUTORS = (*TEAM, "CONTRIBUTOR")
-# The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
-# comment), and what the model returns.
+# The improvement run, every other day: the days of evidence it reads (its cadence, so issues don't repeat it), how
+# much a reader needs (PRs read, and comments kept per PR; characters of a comment), and what the model returns.
+IMPROVE_DAYS = 2
 IMPROVE_ITEMS = 30
 IMPROVE_TEXT = 800
 IMPROVE_SCHEMA = {
@@ -1175,19 +1176,14 @@ def monitor(out, repo, approvals=""):
     ensure_label(repo, "skip-ai-review")  # after the report: a failed write here must not cost the day's report
 
 
-# ---------------------------------------------------------------- improve (a weekly job)
+# ---------------------------------------------------------------- improve (every other day)
 
 def scrub(text):
-    """Comment or model text for the weekly improvement run: `safe` and clipped, with names and links taken out,
+    """Comment or model text for the improvement run: `safe` and clipped, with names and links taken out,
     which `safe` only makes inert."""
     text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![a-z0-9])www\.[^\s`]+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
     return safe(text)[:IMPROVE_TEXT]
-
-
-def monday(now):
-    """The date this week started, which names its issue."""
-    return (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%d")
 
 
 def pr_evidence(repo, pr, since):
@@ -1224,9 +1220,10 @@ def pr_evidence(repo, pr, since):
 
 
 def improve_inputs(out, repo, key_set):
-    """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR
-    with a review summary or a stopped review of the bot's in the last three weeks and anything from the last
-    7 days, and status.json, the status issue's signals. `run` stays false without an API key, or with nothing
+    """The evidence for the improvement run (review-improve.yml), in improve-evidence/: one file per PR with a
+    review summary or a stopped review of the bot's in the last three weeks (where to look: a reply can come long
+    after a review) and anything from the last IMPROVE_DAYS days (the evidence), and status.json, the status
+    issue's signals. `run` stays false without an API key, or with nothing
     to read."""
     out["run"] = "false"
     if key_set != "true":
@@ -1234,7 +1231,7 @@ def improve_inputs(out, repo, key_set):
         return
     now = utcnow()
     stamp = "%Y-%m-%dT%H:%M:%SZ"
-    since = (now - datetime.timedelta(days=7)).strftime(stamp)
+    since = (now - datetime.timedelta(days=IMPROVE_DAYS)).strftime(stamp)
     newest_first = dict.fromkeys(
         int(c["issue_url"].rsplit("/", 1)[1])
         for c in reversed(api_list(f"repos/{repo}/issues/comments"
@@ -1255,7 +1252,7 @@ def improve_inputs(out, repo, key_set):
     if status:
         files["status.json"] = status[-IMPROVE_ITEMS:]
     if not files:
-        print("::notice::The bot did nothing this week; no improvement run.")
+        print(f"::notice::The bot did nothing in the last {IMPROVE_DAYS} days; no improvement run.")
         return
     Path("improve-evidence").mkdir()
     for name, value in files.items():
@@ -1264,16 +1261,16 @@ def improve_inputs(out, repo, key_set):
 
 
 def improve_post(out, repo, output=""):
-    """Open the week's issue from the improvement run's structured output, redacted, on stdin. Evidence links
-    stay inside this repository (no `..`, which would climb out of it) and go through redirect.github.com, which
-    keeps them off the PRs' timelines. An empty list opens nothing; a run that returned no list fails. Never
-    touches code, PRs or the bot."""
+    """Open the run's issue, named by the days its evidence covers, from the improvement run's structured output,
+    redacted, on stdin. Evidence links stay inside this repository (no `..`, which would climb out of it) and go
+    through redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
+    returned no list fails. Never touches code, PRs or the bot."""
     try:
         items = json.loads(output)["improvements"]
     except (ValueError, KeyError, TypeError):
         sys.exit("The improvement run returned no list, so no issue was opened.")
     if not items:
-        print("::notice::Nothing worth raising this week; no issue opened.")
+        print("::notice::Nothing worth raising this time; no issue opened.")
         return
     link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
     parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
@@ -1282,7 +1279,9 @@ def improve_post(out, repo, output=""):
                  if m and ".." not in urllib.parse.unquote(m[1])]
         parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
                                 f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
-    body = json.dumps({"title": f"Review bot: what to improve, week of {monday(utcnow())}",
+    now = utcnow()
+    days = f"{now - datetime.timedelta(days=IMPROVE_DAYS):%Y-%m-%d} to {now:%Y-%m-%d}"
+    body = json.dumps({"title": f"Review bot: what to improve, {days}",
                        "body": redact("\n\n".join(parts)) + "\n"})
     gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body)
 
