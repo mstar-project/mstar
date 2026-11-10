@@ -14,7 +14,8 @@
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
-//!       streaming, accepts_chunks}, `prompt_parts` present for a chat only
+//!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
+//!       chat only, `report_usage` only when set
 //!                        | {t:"abort", rid, sub}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
@@ -37,6 +38,10 @@
 //! `chunks` is many submissions' non-error chunks as parallel lists, in
 //! order: one message per pass of the API server's message thread rather than
 //! one per request.
+//!
+//! A submission with `report_usage` ends with a `chunk` of modality `usage`
+//! before its `done`: `metadata` holds `prompt_tokens`, `completion_tokens`
+//! and `finish_reason`.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -104,6 +109,9 @@ struct SubmitMsg<'a> {
     #[serde(skip_serializing_if = "no_parts")]
     prompt_parts: &'a [Part],
     streaming: bool,
+    /// `submit_request`'s `report_usage`; left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    report_usage: bool,
 }
 
 fn no_parts(parts: &&[Part]) -> bool {
@@ -324,6 +332,7 @@ impl Bridge {
             model_kwargs: &args.model_kwargs,
             prompt_parts: &args.parts,
             streaming,
+            report_usage: args.report_usage,
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         if self.mbox.send("bridge", &payload).is_err() {
@@ -510,6 +519,10 @@ mod tests {
     use serde_json::json;
 
     fn encoded(parts: &[Part]) -> Value {
+        encoded_with(parts, false)
+    }
+
+    fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
         let msg = SubmitMsg {
@@ -526,6 +539,7 @@ mod tests {
             model_kwargs: &model_kwargs,
             prompt_parts: parts,
             streaming: true,
+            report_usage,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
     }
@@ -536,6 +550,12 @@ mod tests {
             encoded(&[]).get("prompt_parts").is_none(),
             "every non-chat submit gained a key the bridge did not have before"
         );
+    }
+
+    #[test]
+    fn only_a_submit_that_reports_usage_carries_the_key() {
+        assert_eq!(encoded_with(&[], true)["report_usage"], json!(true));
+        assert!(encoded(&[]).get("report_usage").is_none());
     }
 
     #[test]

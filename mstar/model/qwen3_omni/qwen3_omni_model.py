@@ -306,12 +306,13 @@ class Qwen3OmniModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
     def _lora_spec(self) -> LoraSpec:
-        """Per-request adapters on the Thinker: its attention, any dense MLP layers and
-        the LM head (one row per request: the last token's). The routed experts and the
-        router take none (packed expert tensors, run by the fused-MoE kernel), so an
-        adapter touching them is refused with that reason; so is one touching the
-        Talker or the encoders, which are other nodes. Modules are named as the full
-        model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
+        """Per-request adapters on the Thinker: its attention, any dense MLP layers, the
+        LM head (one row per request: the last token's), and the routed experts when the
+        YAML's ``targets:`` names them (``experts_gate_up_proj`` / ``experts_down_proj``,
+        opt-in). The router takes none, so an adapter touching it is refused with that
+        reason; so is one touching the Talker or the encoders, which are other nodes.
+        Modules are named as the full model's checkpoint names them (``thinker.*``) or as
+        the Thinker alone does."""
         from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
         return module_lora_spec(
@@ -1095,7 +1096,7 @@ class Qwen3OmniModel(Model):
         # So writing the parts out in request order and tokenizing once lets
         # the placement be read back off the ids, with no boundary
         # re-tokenized. The walks re-emit the sentinels themselves
-        # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
+        # (``ThinkerSubmodule._audio_row``, ``_wrap_vision_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
         #
@@ -1198,6 +1199,10 @@ class Qwen3OmniModel(Model):
         for k, step in enumerate(_thinker_steps(plan)):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
         return split_spans(out, self.MEDIA_SPANS, kv_layout)
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
+        return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
