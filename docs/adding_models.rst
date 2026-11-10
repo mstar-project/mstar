@@ -2786,7 +2786,12 @@ Splitting is declared in four places:
   a deployment's trade between the exchanges' cost and the split layers' saving. A captured step
   decides from its bucket's size, not its prompt's, so capture and replay split alike. Declare
   the spec over every node of the attention resources that depend on it: a resource spanning
-  nodes the shard doesn't cover is refused.
+  nodes the shard doesn't cover is refused. ``exchanges=False`` declares that no op on the node
+  mixes the label's units, so nothing exchanges them: the node needs no attention, and a rank may
+  get none of them (fewer units than ranks still splits). MiniMax-H3's video decoder splits each
+  request's clips this way, reading ``shard.split_range(label)`` for its range and gathering the
+  decoded clips with ``shard.gather`` (``mstar/model/minimax_h3/submodules.py``); such a shard
+  is refused beside an attention that takes split steps.
 - **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
   (at one rank its plan is a constant); the attention resources refuse a step without one, so a
   forgotten branch fails on one GPU. ``SubmoduleStep`` fills its segments and its
@@ -2796,7 +2801,8 @@ Splitting is declared in four places:
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,
   and on SP ranks each breaks the graph once. Everything between them runs on this rank's tokens.
-  LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``); Cosmos3
+  LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``), Wan2.2 and
+  MiniMax-H3 inside their DiT's forward; Cosmos3
   brackets the generation layer stack after its whole-sequence prologue
   (``mstar/model/cosmos3/components/transformer.py``).
 - The attention is reached through the resource: a paged attention through ``AttentionCallable``
@@ -2811,7 +2817,8 @@ Every resource of a splitting node must support split steps (``Resource.supports
 the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
 sampler); recurrent state doesn't, so a splitting node can't own any. The engine and the conductor
 also refuse, before a worker starts: a node on SP ranks that neither declares a ``SeqShardSpec``
-nor places its pools by position; a shard with no attention that can take split tokens; a
+nor places its pools by position; a shard with no attention that can take split tokens (unless
+``exchanges=False``); a
 pool stored by position (``context_parallel``) on a node that splits its steps, not yet supported; a
 head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged
 ``sp_exchange`` whose heads don't divide by ``tp * sp``; a ragged cross-attention under a shard on

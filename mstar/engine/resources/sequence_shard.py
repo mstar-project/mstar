@@ -63,6 +63,10 @@ class SeqShardSpec(NodeResourceSpec):
     at least ``max(sp, min_tokens)``, and every listed label has at least ``sp`` tokens (a row,
     for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override.
 
+    ``exchanges=False`` declares that no op on the node mixes a listed label's units (a video
+    decoder's independent clips): nothing exchanges them, so the node needs no attention, and a
+    rank may get an empty range (fewer units than ranks still splits; ``gather`` takes it).
+
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
     SP rank it plans copied at no cost."""
@@ -71,6 +75,7 @@ class SeqShardSpec(NodeResourceSpec):
     axis: int
     walks: Collection[str] | None = None
     min_tokens: int = field(default=0, kw_only=True)
+    exchanges: bool = field(default=True, kw_only=True)
 
     def __post_init__(self):
         super().__post_init__()
@@ -174,7 +179,7 @@ class SequenceShard(Resource):
 
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
-        group: CommGroup,
+        group: CommGroup, exchanges: bool = True,
     ):
         self.labels = labels
         self.axis = axis
@@ -182,6 +187,9 @@ class SequenceShard(Resource):
         self.walks = walks
         self.min_tokens = min_tokens
         self.group = group
+        # whether a resource exchanges the split labels' units, so each rank needs some
+        # (`SeqShardSpec.exchanges`)
+        self.exchanges = exchanges
         # fixed at bind, so a compiled frame at one SP rank traces the bracket straight through
         self.can_split = group.world_size > 1
         self._current: SeqShardPlan | None = None
@@ -197,7 +205,7 @@ class SequenceShard(Resource):
         joint = info.joint_comm_group
         group = joint.sp_group if joint is not None else CommGroup.trivial()
         walks = None if spec.walks is None else frozenset(spec.walks)
-        return cls(spec.labels, spec.axis, walks, spec.min_tokens, group)
+        return cls(spec.labels, spec.axis, walks, spec.min_tokens, group, exchanges=spec.exchanges)
 
     @property
     def supports_preplan(self):
@@ -297,7 +305,9 @@ class SequenceShard(Resource):
                     "a packed capture needs one listed label and axis 0"
                 )
             spans.setdefault(self.labels[0], []).append(pad)
-        if sum(map(sum, spans.values())) < max(sp, self.min_tokens):
+        # an exchange needs every rank to hold tokens; a split nothing exchanges takes empty ranges
+        least = sp if self.exchanges else 1
+        if sum(map(sum, spans.values())) < max(least, self.min_tokens):
             return COPIED
         for label, label_spans in spans.items():
             if self.axis == 1 and len(set(label_spans)) > 1:
@@ -305,7 +315,7 @@ class SequenceShard(Resource):
                     f"sequence shard on axis 1 splits each row of {label!r} alike, so its rows must be "
                     f"one length; this step's are {label_spans}"
                 )
-            if (min(label_spans) if self.axis == 1 else sum(label_spans)) < sp:
+            if (min(label_spans) if self.axis == 1 else sum(label_spans)) < least:
                 return COPIED
         ranges = {label: self._range(label_spans, ctx.capture) for label, label_spans in spans.items()}
         for sources, plan_label in step.combined_labels.items():
@@ -508,10 +518,16 @@ def sequence_parallel_refusals(
             "KV by position (context_parallel on its paged KV pools)"
         ]
     refusals = []
-    if not any(spec.attends_split_steps for spec in specs):
+    attends = any(spec.attends_split_steps for spec in specs)
+    if shard.exchanges and not attends:
         refusals.append(
             f"node {node!r} splits tokens (SeqShardSpec {shard.resource_key!r}) but declares no attention that "
             "can take them: a paged AttentionSpec, or a RaggedAttentionSpec with sp_exchange"
+        )
+    if not shard.exchanges and attends:
+        refusals.append(
+            f"node {node!r} declares SeqShardSpec {shard.resource_key!r} with exchanges=False, which can hand a "
+            "rank no tokens, beside an attention that exchanges split tokens"
         )
     for spec in specs:
         refusals += spec.split_step_refusals(node, shard, tp, sp)

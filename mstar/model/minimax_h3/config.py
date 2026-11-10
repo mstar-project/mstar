@@ -27,6 +27,10 @@ DENOISE_LOOP = "denoise_loop"
 # Resource keys: the DiT's attention over the packed sequence, the token refiner's over
 # the prompt.
 DIT_ATTN = "dit_attn"
+# on SP ranks, splits the dit's packed rows over them
+DIT_SHARD = "dit_shard"
+# on SP ranks, splits the video decoder's clips over them
+VAE_SHARD = "vae_shard"
 REFINER_ATTN = "refiner_attn"
 
 # Per-row modality tags. They index the AdaLN tables, so the values are a checkpoint
