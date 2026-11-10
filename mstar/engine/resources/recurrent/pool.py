@@ -954,10 +954,14 @@ class RecurrentStatePool(Resource):
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Above one rank, give back the lease a step that will not run took for its walk. At one
-        rank preparing the step again reuses it, as the KV cache's does."""
+        rank preparing the step again reuses it, as the KV cache's does. A lease stays where a
+        refused admit left the hit's pages on the KV stream: the retry starts past them on every
+        rank, from this snapshot."""
         if self._world_size == 1 or self._kv is None:
             return
         label = self._kv.keyed_label(rid, node_name, graph_walk)
+        if label is None or self._kv.prefix_converted(rid, label):
+            return
         with self._lock:
             lease = self._leases.get(rid)
             if lease is not None and lease.label == label:

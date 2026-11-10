@@ -612,3 +612,40 @@ def test_a_row_measured_past_pages_no_snapshot_ends_on_waits_holding_nothing(_gd
 
     _agree(ranks, "b")
     assert leader.snapshot("b", PAGE) == follower.snapshot("b", PAGE)
+
+
+def test_a_refused_steps_lease_waits_with_its_row_on_every_rank(_gdn_ranks):
+    """A step refused at admit keeps its hit on every rank: the KV pages are its stream's by
+    then. Measured again for the retry and left out, the row gives nothing back on rank 0, and
+    the step that takes it runs on from the restored snapshot on every rank."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+        for i in range(node.pool.num_free_slots):
+            node.prefill(f"x{i}", _tokens(9, seed=30 + i))
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=16)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert _follow(follower, _send(leader, "b", chunks[0], engines[leader]))
+    for node in ranks:
+        # no slot is free, so the pool refuses the step once the KV cache has taken the hit;
+        # the engine then drops the prepared input, and the retry probes again
+        step = node.declare({"b": b[chunks[0].start:chunks[0].end]}, _prepare(engines[node], "b", chunks[0]))
+        assert not node.runner.admit(step).ok
+        engines[node]._chunking.release("b", NODE)
+    held = _held(follower)
+    assert _held(leader) == held
+
+    assert engines[leader].input_sequence_len(NODE, WALK, None, {}, rid="b").cached_prefix == 2 * PAGE
+    engines[leader].give_back_cached_prefix(NODE, "b", WALK)
+
+    assert _held(leader) == held, "rank 0 gave back a hit the other ranks hold"
+    for node in ranks:
+        node.pool.remove_request("x0")
+    assert _chunks(engines[leader], "b", len(b)) == chunks
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+    _agree(ranks, "b")
+    for node in ranks:
+        assert node.kv.stored_len("b") == len(b), "b's cached pages are in its stream twice"
