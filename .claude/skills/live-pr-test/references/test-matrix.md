@@ -87,6 +87,7 @@ Save outputs for every functional check that produces them, so they can be revie
 - For a PR that changes a numerical path, put the reference, PR and main outputs for the same prompt and seed next to each other. Include a main-vs-main pair from two server processes as the noise floor (benchmarking skill: "Output-equivalence checks need a same-code control").
 - When the metrics can't tell whether a media output is right, the row says "needs human review". List the files and what to listen or look for in `media/README.md`.
 - **Streaming and duplex:** record what a person would hear and see. For a duplex conversation, one stereo file with the input on the left channel and the model's output on the right, on one timeline from the session's start, so overlaps, barge-ins and gaps are audible; add the timed transcript of both sides as `<name>.txt`. For streamed audio or video, save the stream as received (chunk boundaries and all), not a re-synthesis.
+- **Keep it small enough to publish:** a few representative files per suite and arm, at most about 100 MB per run. Video as H.264 MP4 at 480p or less (`ffmpeg -vf scale=-2:480 -c:v libx264 -crf 28 -c:a aac`), audio as MP3 or Opus unless the check is about bit-exactness (then keep the WAV and say so). Link files from `report.md` by their path under `media/`, relative, so they resolve wherever the directory is published.
 
 ## Hardware sizing
 

@@ -366,7 +366,8 @@ Booleans stay strict: ``"false"`` is not a boolean, and ``true`` is not a number
 is the same as leaving the knob out: the model's default applies, which is the
 checkpoint's own ``generation_config.json`` value where it ships one. BAGEL and Orpheus
 are the exception: their files are the backbone's chat presets, so only their
-``do_sample: false`` is read and the models' own defaults stay. Multi-stage models
+``do_sample: false`` is read and the models' own defaults stay. MiniCPM-o keeps
+upstream ``chat``'s defaults over its file. Multi-stage models
 take a stage prefix (``talker_temperature``, ``code_predictor_top_k``) with the same
 rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
 of Qwen3-TTS), and a prefixed one wins over it for its stage.

@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 
 TEXT = "text"
 VIDEO = "video"
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,11 @@ def messages_from_parts(
     if default_system is not None and not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": default_system})
     return messages
+
+
+# What GLM-5.2's and GLM-5.3's chat templates read of ``chat_template_kwargs``; other keys
+# are dropped, as some would collide with apply_chat_template's own arguments.
+GLM_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
 
 
 def render_chat_template(

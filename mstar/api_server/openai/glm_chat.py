@@ -19,10 +19,6 @@ THINK_START, THINK_END = "<think>", "</think>"
 CALL_START, CALL_END = "<tool_call>", "</tool_call>"
 _ARG = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
 
-# what the templates read; others are dropped, as some would collide with
-# apply_chat_template's own arguments
-TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
-
 
 def template_messages(messages) -> list[dict]:
     """The messages as the templates read them: a call's ``arguments`` as the

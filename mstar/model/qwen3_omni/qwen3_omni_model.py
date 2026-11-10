@@ -550,9 +550,18 @@ class Qwen3OmniModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # the Talker's KV is built from the Thinker's states, which no ids recompute
-        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                         loop="thinker_decode_loop")}
+        # Audio, images and video are rebuilt from host copies of the encoders' outputs, one embedding per slot, and
+        # for vision one more per deepstack layer. A prompt with a video keys only its leading text, so it's rebuilt
+        # only with the prefix cache off for the request or the server. The Talker's KV is built from the Thinker's
+        # states, which no rebuild recomputes.
+        vision = self.config.vision
+        return {"Thinker": RebuildPolicy(
+            walks=frozenset({"prefill_text", "prefill_audio", "prefill_vision"}), ids_input="text_inputs",
+            sample_output="new_token", loop="thinker_decode_loop", copy_width={
+                "prefill_audio": self.config.thinker_text.hidden_size,
+                "prefill_vision": vision.out_hidden_size * (1 + len(vision.deepstack_visual_indexes)),
+            },
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -1189,6 +1198,10 @@ class Qwen3OmniModel(Model):
         for k, step in enumerate(_thinker_steps(plan)):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
         return split_spans(out, self.MEDIA_SPANS, kv_layout)
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
+        return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.

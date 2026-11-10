@@ -46,6 +46,7 @@ from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
+    USAGE,
     APIServerMessage,
     ClientAppend,
     PreprocessInput,
@@ -60,7 +61,7 @@ from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora
 from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
 from mstar.model.base import declared_resources
 from mstar.model.media_limits import RAW_INPUT_CHARGES
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import SUPPORTED_MODALITIES, PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.metrics import (
@@ -88,9 +89,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({
-    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
-})
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
@@ -337,6 +335,14 @@ class PendingRequest:
     # APIServer.relay_chunks_to), and the tag it knows the request by.
     sink: "ChunkSink | None" = None
     sink_tag: Any = None
+    # submit_request's report_usage, and what usage_chunk reports: the text
+    # tokens of the chunks so far, whether one was a stop token, and
+    # request_complete's counts
+    report_usage: bool = False
+    completion_tokens: int = 0
+    stopped: bool = False
+    prompt_tokens: int | None = None
+    max_output_tokens: int | None = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -369,6 +375,22 @@ class _SinkBatch(NamedTuple):
 def _set_events(wakes: list) -> None:
     for wake in wakes:
         wake.set()
+
+
+def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
+    """The chunk that ends a successful request submitted with ``report_usage``.
+    Its ``finish_reason`` is ``length`` when the reply used all of the
+    ``max_output_tokens`` the conductor resolved for it without sampling a stop
+    token, and ``stop`` otherwise. A stop token in the last allowed slot is
+    ``stop``, as OpenAI and vLLM report it. Only a model that declares
+    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
+    cap = req.max_output_tokens
+    at_cap = cap is not None and req.completion_tokens >= cap
+    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
+        "prompt_tokens": req.prompt_tokens or 0,
+        "completion_tokens": req.completion_tokens,
+        "finish_reason": "length" if at_cap and not req.stopped else "stop",
+    })
 
 
 def notify_many(reqs) -> None:
@@ -787,6 +809,7 @@ class APIServer:
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
+        report_usage: bool = False,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -821,6 +844,9 @@ class APIServer:
         in place of that modality's files (images, as RGB uint8 ``[3, H, W]``):
         the model loads them with ``Model.load_decoded_<modality>``, so nothing
         is written or decoded.
+
+        ``report_usage`` ends a successful request's chunks with a ``usage``
+        chunk (:func:`usage_chunk`).
         """
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
@@ -882,6 +908,7 @@ class APIServer:
                 request_id=request_id,
                 open_streams=open_streams,
                 input_bytes=input_bytes,
+                report_usage=report_usage,
             )
         if self.metrics is not None:
             mark_submitted()
@@ -897,6 +924,7 @@ class APIServer:
             prompt_parts=prompt_parts,
             prefix_root=prefix_root,
             ends=ending,
+            streaming=streaming,
             raw_inputs=raw_inputs,
         ))
 
@@ -1279,6 +1307,8 @@ class APIServer:
                                 # late, not rejected
                                 req.open_streams = frozenset()
                                 req.output_chunk_counts = message.body.output_chunk_counts
+                                req.prompt_tokens = message.body.prompt_tokens
+                                req.max_output_tokens = message.body.max_output_tokens
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
@@ -1355,6 +1385,8 @@ class APIServer:
                         if result_chunk.read_time is not None:
                             req.profile.timing.last_output_read_time = result_chunk.read_time
                         req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
+                        req.completion_tokens += result_chunk.num_tokens
+                        req.stopped |= result_chunk.stopped
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1620,17 +1652,16 @@ class APIServer:
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
                     # in-band as the final chunk, once.
-                    if (
-                        not errored
-                        and finished_req is not None
-                        and finished_req.error is not None
-                    ):
-                        tail.append(ResultChunk(
-                            request_id=request_id,
-                            modality="error",
-                            data=str(finished_req.error).encode("utf-8"),
-                            metadata={"status": finished_req.error_status},
-                        ))
+                    if not errored and finished_req is not None:
+                        if finished_req.error is not None:
+                            tail.append(ResultChunk(
+                                request_id=request_id,
+                                modality="error",
+                                data=str(finished_req.error).encode("utf-8"),
+                                metadata={"status": finished_req.error_status},
+                            ))
+                        elif finished_req.report_usage:
+                            tail.append(usage_chunk(request_id, finished_req))
                     if tail:
                         yield tail
                     finished = True
@@ -1826,6 +1857,8 @@ class APIServer:
         # Profiling (incl. the optional file write) runs outside the lock; the
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
+        if req.report_usage:
+            return [*req.chunks, usage_chunk(request_id, req)]
         return list(req.chunks)
 
     def _record_end(self, req: PendingRequest, outcome: str) -> None:
