@@ -154,7 +154,7 @@ fn silero() -> Option<&'static Mutex<Session>> {
     SILERO
         .get_or_init(|| {
             let Some(path) = facts().get("silero").and_then(Value::as_str) else {
-                eprintln!("WARNING: server_vad is unavailable: no Silero VAD weights (set MSTAR_SILERO_VAD_PATH or install mstar[vad])");
+                eprintln!("WARNING: server_vad is unavailable: no Silero VAD weights (set MSTAR_SILERO_VAD_PATH or install mstar-ai[vad])");
                 return None;
             };
             let mut s = match session(path) {
