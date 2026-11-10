@@ -28,7 +28,7 @@ def thread(priority, resolved=False, outdated=False, login="mstar-review", comme
 
 class TestReviewSummary(unittest.TestCase):
     def test_an_open_p1_makes_the_status_red(self):
-        text = render(review(), threads(thread("P1"), thread("P2")), "0123456789", "light", [])
+        text = render(review(), threads(thread("P1"), thread("P2", comment_id=8)), "0123456789", "light", [])
         self.assertIn("\n🔴 **1 P1, 1 P2** on `0123456`, light review", text)
 
     def test_an_untagged_bot_thread_counts_as_a_p2(self):
@@ -69,7 +69,7 @@ class TestReviewSummary(unittest.TestCase):
                 self.assertEqual(first["live_test"]["untestable"], expected)
                 self.assertEqual(over_gpu_cap(first, "4")["live_test"]["untestable"], expected, "the note piles up")
                 again = over_gpu_cap({**review(), "live_test": {"run": "targeted", "gpus": 1, "untestable": ""}}, "4")
-                self.assertEqual(carried(again, first, False)["live_test"]["untestable"], expected,
+                self.assertEqual(carried(again, first, False, [])["live_test"]["untestable"], expected,
                                  "a pass on a smaller box would approve what it couldn't run")
 
     def test_an_earlier_finding_this_run_left_out_stays_open(self):
@@ -78,20 +78,21 @@ class TestReviewSummary(unittest.TestCase):
                    {"priority": "P2", "claim": "typo", "location": "b.py:2", "detail": "d"}]
         pages = threads(thread("P1", outdated=True, comment_id=8))
         r = carried(review(prior=[{"ref": "b.py:2", "priority": "P2", "status": "open", "why": "unchanged"}]),
-                    {"outside_diff": earlier}, False)
+                    {"outside_diff": earlier}, False, pages)
         self.assertEqual([f[:2] for f in open_findings(r, pages, [])],
                          [("inline 8", "P1"), ("outside the diff, a.py:1", "P1"), ("outside the diff, b.py:2", "P2")],
                          "a rebase, or a re-review leaving a finding out, would clear it unjudged")
         state = read_state(render(r, pages, "0123456789", "nogpu", []))
         self.assertEqual(len(state["outside_diff"]), 2, "the finding would be gone at the next re-review")
         judged = [{"ref": "a.py:1", "priority": "P1", "status": "fixed", "why": "guard added"}]
-        self.assertEqual(carried(review(prior=judged), {"outside_diff": earlier}, False)["outside_diff"], [earlier[1]])
+        self.assertEqual(carried(review(prior=judged), {"outside_diff": earlier}, False, [])["outside_diff"],
+                         [earlier[1]])
         reopened = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "open", "why": "no fix"}]),
-                           {"outside_diff": [{**earlier[0], "fixed_in": 12}]}, False)
+                           {"outside_diff": [{**earlier[0], "fixed_in": 12}]}, False, [])
         self.assertEqual([f[:2] for f in open_findings(reopened, [], [12])], [("outside the diff, a.py:1", "P1")],
                          "a stale fixed_in would hide a finding this run judged still open, and the status go green")
         above = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "fixed_above", "fixed_in": 12,
-                                       "why": "guard added"}]), {"outside_diff": [earlier[0]]}, False)
+                                       "why": "guard added"}]), {"outside_diff": [earlier[0]]}, False, [])
         self.assertEqual(read_state(render(above, [], "0123456789", "nogpu", []))["outside_diff"][0]["location"],
                          "a.py:1", "a finding fixed in a PR that isn't stacked would be gone from the next re-review")
         self.assertEqual(render(above, [], "0123456789", "nogpu", [12]).count("Fixed in #12 above"), 2,
@@ -101,24 +102,25 @@ class TestReviewSummary(unittest.TestCase):
         carried = SUMMARY["carried"]
         earlier = {"outside_diff": [], "risk": {"level": "medium", "reason": "new lifecycle state"},
                    "questions": [{"location": "a.py:1", "text": "Should this be a resource?"}]}
-        r = carried(review(), earlier, False)
+        r = carried(review(), earlier, False, [])
         self.assertEqual(r["risk"]["level"], "medium", "a small fix commit could rate a medium PR low and approve it")
         self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
         self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
-        self.assertEqual(carried(review(), earlier, True)["questions"], earlier["questions"],
+        self.assertEqual(carried(review(), earlier, True, [])["questions"], earlier["questions"],
                          "a comment about anything else would drop every question")
         answered = {**review(), "answered_questions": ["Should this be a resource?"]}
-        self.assertEqual(carried(answered, earlier, True)["questions"], [], "a person's answer would change nothing")
-        self.assertEqual(carried(answered, earlier, False)["questions"], earlier["questions"],
+        self.assertEqual(carried(answered, earlier, True, [])["questions"], [],
+                         "a person's answer would change nothing")
+        self.assertEqual(carried(answered, earlier, False, [])["questions"], earlier["questions"],
                          "the model could say a question was answered when nobody commented")
-        self.assertEqual(carried(review(), earlier, True)["risk"]["level"], "low",
+        self.assertEqual(carried(review(), earlier, True, [])["risk"]["level"], "low",
                          "a maintainer's answer would leave the earlier risk standing")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}
-        floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False)
+        floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False, [])
         self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")
         self.assertEqual(read_state(render(floored, [], "0123456789", "full", []))["risk"]["look_at"], [decision])
         kept = {"live_test": {"run": "full", "untestable": "AMD kernels"}}
-        left_out = carried(review(), kept, True)
+        left_out = carried(review(), kept, True, [])
         self.assertEqual(left_out["live_test"], {"untestable": "AMD kernels"},
                          "a re-review or a person's answer would lift it, and the bot approve what its GPUs can't run")
         for mode in ("light", "full"):
@@ -126,9 +128,9 @@ class TestReviewSummary(unittest.TestCase):
                              left_out["live_test"],
                              "a light re-review, or a full one that gave no live_test, would lose it for the next")
         ran = {"live_test": {"run": "targeted", "reason": "r", "untestable": ""}}
-        self.assertEqual(carried({**review(), **ran}, kept, False)["live_test"]["run"], "targeted")
+        self.assertEqual(carried({**review(), **ran}, kept, False, [])["live_test"]["run"], "targeted")
         for older in ({}, {"live_test": None}, {"live_test": {"run": "full", "reason": "r"}}):
-            self.assertNotIn("live_test", carried(review(), older, False), "a state from before the field")
+            self.assertNotIn("live_test", carried(review(), older, False, []), "a state from before the field")
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

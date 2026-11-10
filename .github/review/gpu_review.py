@@ -488,8 +488,8 @@ def for_approval(review, pages):
     unchanged = {**{str(first.get("databaseId", "")): "none of this thread's lines changed: a person decides, or "
                                                        "change one of those lines"
                     for first, _, _, outdated in render_summary.bot_threads(pages) if not outdated},
-                 **{location: "no commit since the last review is known to have touched its file: a person decides, "
-                              "or change that file" for location in review.get("untouched") or ()}}
+                 **{f["location"]: "no commit since the last review is known to have touched its file: a person "
+                                   "decides, or change that file" for f in review.get("untouched") or ()}}
     return {**review, "prior_findings": [
         {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
         if f["status"] in render_summary.CLEARS and f["ref"] in unchanged else f

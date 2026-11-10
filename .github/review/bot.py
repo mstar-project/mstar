@@ -591,18 +591,17 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
 
 
 def untouched(earlier):
-    """The locations of the earlier review's findings outside the diff (`earlier`, what render_summary.carried
-    carried over) whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
+    """The earlier review's findings outside the diff (`earlier`, what render_summary.carried carries over)
+    whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
     (rereview_inputs; not interdiff's dropped part, which holds the old patches as written, unnumbered). With
     neither (no last-review.json, or a /review continue) every one counts as untouched, since that is unknown. Such a
     finding has no thread to show its lines changed, so the approval reads a re-review's `fixed` or `moot` on it as
-    `disputed` (gpu_review.for_approval)."""
+    `disputed` (gpu_review.for_approval), and the saved state keeps it (render_summary.render)."""
     since = next((Path(p) for p in ("since.diff", "interdiff.diff") if Path(p).exists()), None)
     # As bytes: the diff holds what the commits hold, which needn't be UTF-8, and a CR in a line isn't its end.
     text = since.read_bytes().decode("utf-8", "replace") if since else ""
     touched = touched_files(text.partition(DROPPED)[0])
-    return [f["location"] for f in (earlier or {}).get("outside_diff", [])
-            if f["location"].partition(":")[0] not in touched]
+    return [f for f in (earlier or {}).get("outside_diff", []) if f["location"].partition(":")[0] not in touched]
 
 
 GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)')
@@ -856,7 +855,9 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
         earlier, answered = earlier_review(repo, pr)
-        review = redact_fields(render_summary.carried(review, earlier, answered, pages), exact)
+        # And the earlier findings outside the diff whose file nothing since touched, for the approval and the state.
+        review = redact_fields({**render_summary.carried(review, earlier, answered, pages),
+                                "untouched": untouched(earlier)}, exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
@@ -868,9 +869,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         sys.exit(1)
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
-    # they are still there, unchanged; and the earlier findings outside the diff whose file nothing since touched.
-    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted},
-              "untouched": untouched(earlier)}
+    # they are still there, unchanged.
+    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted}}
     out["result"] = json.dumps(redact_fields(result, exact))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "

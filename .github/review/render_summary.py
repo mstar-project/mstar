@@ -274,7 +274,7 @@ def over_gpu_cap(review, max_gpus):
     return review
 
 
-def carried(review, earlier, answered, pages=()):
+def carried(review, earlier, answered, pages):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
@@ -355,8 +355,10 @@ def open_findings(review, pages, stacked):
     later review judged still open. A thread someone resolved stays open: only a later review that judged
     it fixed, fixed above or moot clears it. A bot thread someone edited counts as an open P0, whatever a
     later review judged, since the text the review read isn't the bot's. A finding a PR stacked above fixes
-    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the
-    PR's review threads (GraphQL)."""
+    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). Each finding (a thread, an
+    earlier finding's ref, a place outside the diff) counts once, at the most severe of the open rows that name it:
+    its thread's tag, a verdict on it, the items at that place. `pages` are the pages of the PR's review threads
+    (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
@@ -365,22 +367,24 @@ def open_findings(review, pages, stacked):
     def what(ref, text):
         return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
 
-    found, counted = [], {f["location"] for f in review["outside_diff"]}
+    rows = []  # (the finding it names, where, priority, what)
     for first, priority, text, _ in bot_threads(pages):
         ref = str(first.get("databaseId", ""))
         edited = first.get("lastEditedAt")
         if ref in cleared and not edited:
             continue
         where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
-        found.append((where, "P0", EDITED) if edited
-                     else (where, priority, what(ref, text.strip().split("\n")[0])))
-        counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
-              for f in review["outside_diff"] if not f.get("fixed_in")]
-    # Judged still open, with no thread or outside_diff item here to count it by.
-    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
-              if f["status"] in STILL_OPEN and f["ref"] not in counted]
-    return found
+        rows.append((ref, where, "P0", EDITED) if edited
+                    else (ref, where, priority, what(ref, text.strip().split("\n")[0])))
+    rows += [(f["location"], f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+             for f in review["outside_diff"] if not f.get("fixed_in")]
+    rows += [(f["ref"], f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+             if f["status"] in STILL_OPEN]
+    found = {}  # the first row's place and text, at the most severe priority
+    for key, where, priority, text in rows:
+        was = found.get(key, (where, priority, text))
+        found[key] = (was[0], min(was[1], priority), was[2])
+    return list(found.values())
 
 
 def status(review, pages, head, mode, stacked):
@@ -506,7 +510,13 @@ def render(review, pages, head, mode, stacked, salvaged=False):
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
     risk = raw.get("risk")
-    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
+    # An earlier finding outside the diff that a re-review cleared though nothing touched its file (`untouched`,
+    # bot.untouched) stays in the state, at its priority, so the next review still has it: the approval doesn't
+    # accept that clear (gpu_review.for_approval).
+    priority = {f["ref"]: f["priority"] for f in raw.get("prior_findings", [])}
+    kept = [{**f, "priority": min(f["priority"], priority.get(f["location"], f["priority"]))}
+            for f in raw.get("untouched") or () if f["location"] not in {o["location"] for o in raw["outside_diff"]}]
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": [*raw["outside_diff"], *kept],
              "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
              "latent": raw.get("latent", []),
              "questions": raw["questions"],
