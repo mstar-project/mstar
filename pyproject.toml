@@ -373,6 +373,17 @@ lingbot_world = [
     "transformers",
 ]
 
+qwen_image21 = [
+    # AutoencoderKLQwenImage21 (serving) and QwenImage21Transformer2DModel (the parity oracle) are
+    # diffusers >= 0.41; transformers loads the Qwen3-VL processor (Qwen3VLProcessor, from 4.57).
+    "diffusers>=0.41",
+    "flashinfer-python==0.7.2",
+    "huggingface-hub",
+    "Pillow>=12.3.0",
+    "safetensors",
+    "transformers>=4.57",
+]
+
 flux2_klein = [
     # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
     # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
@@ -443,7 +454,7 @@ all = [
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
     "av>=19",
-    "diffusers>=0.39",
+    "diffusers>=0.41",  # Qwen-Image-2.1's VAE (see the [qwen_image21] extra)
     "fa3-fwd",
     "einops",
     "flashinfer-python==0.7.2",

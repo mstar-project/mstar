@@ -1,0 +1,20 @@
+model: "qwen_image21_turbo"
+
+# Qwen-Image-2.1-Turbo (8 fixed sigmas) on one GPU: the 7B DiT (~14 GB bf16), Qwen3-VL-8B (~17 GB) and the VAE.
+# The DiT's prefix (prompt and reference images) sits in its paged KV cache, 512 KB a token
+# (32 layers x 32 heads x 128 dims x K/V x bf16), and each denoise step's target is scratch
+# beside it: a 1024^2 text-to-image request holds ~4.2k tokens (2.1 GB), a 1024^2 edit with
+# one reference ~8.3k. max_seq_len bounds one request (intake refuses past it, a 400).
+max_seq_len: 65536
+
+model_kwargs:
+  # the KV pool: 512 pages of 128 tokens, 32 GB; and the most one request may hold
+  max_num_pages: 512
+  max_seq_len: 65536
+  max_batch_size: 4
+
+node_groups:
+  - node_names: [text_encoder, vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]

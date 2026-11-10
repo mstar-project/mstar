@@ -8,6 +8,7 @@ bidirectional, then the target alone. Their prefix K/V and target velocities mus
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -27,17 +28,20 @@ from mstar.model.qwen_image21.components.transformer import (  # noqa: E402
     image_positions,
     text_positions,
 )
-from mstar.model.qwen_image21.config import QwenImage21TransformerConfig  # noqa: E402
-from mstar.model.qwen_image21.tests.paged_stub import PagedAttendStub, Row  # noqa: E402
-from mstar.model.qwen_image21.weight_loader import load_transformer  # noqa: E402
-
-CFG = QwenImage21TransformerConfig(
-    in_channels=8, out_channels=8, num_layers=3, attention_head_dim=16, num_attention_heads=4, context_in_dim=24,
-    mlp_ratio=3, axes_dims_rope=(4, 6, 6),
+from mstar.model.qwen_image21.tests.paged_stub import (  # noqa: E402
+    CFG,
+    IMAGE_PAD_ID,
+    LAYOUT,
+    SCALE,
+    STEPS,
+    TARGET,
+    PagedAttendStub,
+    Row,
+    dit_node,
+    dit_request,
+    drive,
 )
-# text, (h, w) image, text, (h, w) image, text; then the target grid
-LAYOUT = (5, (4, 6), 3, (6, 4), 7)
-TARGET = (4, 4)
+from mstar.model.qwen_image21.weight_loader import load_transformer  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -101,12 +105,12 @@ def _ours(model, vl, refs, target, timesteps):
     vl_row, position, image = 0, 0, 0
     for part in LAYOUT:
         if isinstance(part, int):
-            hidden = model.embed_text(vl[0, vl_row:vl_row + part])
+            hidden = model.txt_in(vl[0, vl_row:vl_row + part])
             positions = text_positions(position, part)
             vl_row, position, causal = vl_row + part, position + part, True
         else:
             h, w = part
-            hidden = model.embed_image(refs[image])
+            hidden = model.img_in(refs[image])
             positions = image_positions(position, h, w)
             vl_row, position, image, causal = vl_row + h * w // TOKENS_PER_SLOT, position + max(h, w), image + 1, False
         model.prefix(hidden, positions, attend.step([Row(stream, hidden.shape[0])], causal=causal, commit=True))
@@ -149,3 +153,50 @@ def test_span_prefix_and_target_match_the_block_causal_reference(dtype, processo
     for ours_t, cached_t, dense_t in zip(got, expected, dense, strict=True):
         _close(ours_t, cached_t, bound)
         _close(ours_t, dense_t, bound)
+
+
+# ----------------------------------------------------------------------
+# the dit node: its walks, declared steps and CFG, against the pipeline's loop
+# ----------------------------------------------------------------------
+
+@torch.no_grad()
+def test_dit_node_matches_the_pipeline_with_cfg():
+    """The model's plan for a 2-reference edit under CFG, run through the dit node (prefix walks,
+    the fork, the two-label tail and the two-label denoise), equals the pipeline's loop: its cached
+    prefix per branch, ``neg + s * (pos - neg)``, the scheduler's step. (Cache hits and batching
+    against this run: ``test_model.py``.)"""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    from mstar.model.components.diffusion.flow_match import calculate_shift
+    from mstar.model.qwen_image21.submodules import DitKey
+
+    dtype = torch.bfloat16
+    ref, ours = _models(dtype, QwenImage21AttnProcessor)
+    pos, neg, pos_vl, neg_vl, refs = dit_request(dtype)
+    sub, attend, plan, embeds, latents_in = dit_node(ours, dtype)
+    got = drive(sub, attend, "a", plan, embeds, latents_in)
+
+    # the pipeline: every branch prefills its own cache on step 0
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        base_image_seq_len=256, base_shift=0.5, max_image_seq_len=8192, max_shift=0.9, shift=1.0,
+        shift_terminal=0.02, use_dynamic_shifting=True,
+    )
+    n = TARGET[0] * TARGET[1]
+    scheduler.set_timesteps(sigmas=np.linspace(1.0, 1 / STEPS, STEPS), mu=calculate_shift(n, 256, 8192, 0.5, 0.9))
+    scheduler.set_begin_index(0)
+    generator = torch.Generator().manual_seed(5)
+    latents = sub.seed_latents(None, DitKey(*TARGET), generator)[None]
+    caches = {name: QwenImage21KVCache(CFG.num_layers) for name in ("pos", "neg")}
+    shapes = [[*((1, h, w) for h, w in LAYOUT[1::2]), (1, *TARGET)]]
+    for i, t in enumerate(scheduler.timesteps):
+        preds = {}
+        for name, ids, vl in (("pos", pos, pos_vl), ("neg", neg, neg_vl)):
+            mask = torch.cat([ids == IMAGE_PAD_ID, torch.ones(n // 4, dtype=torch.bool)])[None]
+            preds[name] = ref(
+                hidden_states=torch.cat([*refs, latents[0]])[None], encoder_hidden_states=vl[None],
+                timestep=t.expand(1).to(dtype) / 1000, img_shapes=shapes, img_mask=mask, kv_cache=caches[name],
+                kv_cache_mode="extract" if i == 0 else "cached", return_dict=False,
+            )[0][:, -n:]
+        noise = preds["neg"] + SCALE * (preds["pos"] - preds["neg"])
+        latents = scheduler.step(noise, t, latents, return_dict=False)[0]
+    torch.testing.assert_close(got, latents[0], rtol=0, atol=0)

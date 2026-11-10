@@ -1785,6 +1785,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
     "qwen_image_edit": DiffusionImageAdapter(),
+    "qwen_image21": DiffusionImageAdapter(),
+    "qwen_image21_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
     "glm5_next": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's

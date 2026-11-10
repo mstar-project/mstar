@@ -255,15 +255,9 @@ class QwenImage21Transformer(nn.Module):
         zero = torch.zeros(1, dtype=self.dtype, device=self.img_in.weight.device)
         self.prefix_modulation = self.modulation(self.time_text_embed(zero, self.dtype))[0]
 
-    def embed_text(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.txt_in(hidden)
-
-    def embed_image(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.img_in(latents)
-
     def prefix(self, hidden: torch.Tensor, positions: torch.Tensor, attend: Attend) -> None:
-        """One step's prefix tokens ``hidden [N, dim]`` (embedded) at ``positions [N, 3]``: every
-        block writes its K/V through ``attend``. The step's causality is the attention's."""
+        """One step's prefix tokens ``hidden [N, dim]`` (``txt_in`` / ``img_in`` applied) at ``positions
+        [N, 3]``: every block writes its K/V through ``attend``. The step's causality is the attention's."""
         rope = self.pos_embed(positions)
         blocks = self.transformer_blocks
         for i, block in enumerate(blocks):
