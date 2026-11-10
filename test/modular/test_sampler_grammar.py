@@ -1,6 +1,6 @@
 """Grammar-constrained sampling (``structured_outputs``): a constrained row's
 draws follow its grammar on the eager and graph sampler, a free row beside it
-is untouched, ``after`` starts the grammar at a token, and the request field is
+is untouched, ``after`` starts the grammar at a text, and the request field is
 checked where the conductor builds the sampler config."""
 
 import json
@@ -132,23 +132,22 @@ def test_a_replay_commits_the_draw_of_the_graph_it_replays():
     assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
 
 
-def test_after_starts_the_grammar_at_its_token():
+def test_after_starts_the_grammar_once_the_reply_holds_its_text():
+    """``after`` may span tokens: the reply is free text until it holds it."""
     res = _resource(graph=False)
-    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"], "after": "</think>"})))
-    think = VOCAB.index(b"</think>")
-    gen = torch.Generator().manual_seed(1)
+    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"], "after": "</think>x"})))
+    x, think = VOCAB.index(b"x"), VOCAB.index(b"</think>")
+    favoured = [x, think, x, x, x, x]  # free text, the two tokens of the trigger, then the grammar's
     drawn = []
-    for i in range(6):
+    for token in favoured:
         ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=None)
         step = SamplerStep(apply_penalty=False)
         res.plan(step, ctx)
-        logits = torch.randn(1, V, generator=gen)
-        logits[0, think] = 100.0 if i == 2 else -100.0  # the model ends its reasoning at the third draw
-        logits[0, len(VOCAB):] += 50.0  # and would draw past the vocabulary if it could
+        logits = torch.zeros(1, V)
+        logits[0, token] = 1.0
         drawn.append(res.sample([0], logits).item())
         res.commit(step, ctx)
-    assert all(t >= len(VOCAB) for t in drawn[:2]), "the grammar applied before </think>"
-    assert drawn[2] == think and _text(drawn[3:5]) == "ab" and drawn[5] == EOS
+    assert drawn[:3] == [x, think, x] and _text(drawn[3:5]) == "ab" and drawn[5] == EOS
 
 
 @pytest.mark.parametrize("value, error", [

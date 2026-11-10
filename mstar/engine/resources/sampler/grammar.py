@@ -45,8 +45,8 @@ def _xgr():
 class GrammarRequest:
     """A request's constraint: ``kind`` (one of ``GRAMMAR_KINDS``) and its text
     (a JSON schema as JSON, a regex, an EBNF grammar, a choice list as JSON).
-    ``after`` names one token whose draw starts the constraint; until then the
-    request draws freely."""
+    With ``after``, the request draws freely until its output holds that text,
+    and the grammar holds from there: a structural tag with that one trigger."""
     kind: str
     value: str
     after: str | None = None
@@ -54,23 +54,41 @@ class GrammarRequest:
     def _regex(self) -> str:
         return "|".join(_regex_escape(c) for c in json.loads(self.value))
 
+    def _content(self):
+        xgr = _xgr()
+        if self.kind == "json":
+            return xgr.Grammar.from_json_schema(self.value)
+        if self.kind == "json_object":
+            return xgr.Grammar.builtin_json_grammar()
+        if self.kind in ("regex", "choice"):
+            return xgr.Grammar.from_regex(self.value if self.kind == "regex" else self._regex())
+        return xgr.Grammar.from_ebnf(self.value)
+
+    def _structural_tag(self, content) -> str:
+        """Free text without ``after``, then, if the reply goes on, ``after`` and
+        ``content``: a reply that ends before the trigger is not held to it."""
+        constrained = {"type": "sequence", "elements": [
+            {"type": "const_string", "value": self.after}, {"type": "grammar", "grammar": str(content)},
+        ]}
+        return json.dumps({"type": "structural_tag", "format": {"type": "sequence", "elements": [
+            {"type": "any_text", "excludes": [self.after]}, {"type": "optional", "content": constrained},
+        ]}})
+
     def grammar(self):
         """The xgrammar ``Grammar``; tokenizer-free, so it checks the request
         anywhere. ``ValueError`` names what is unsupported."""
-        xgr = _xgr()
         try:
-            if self.kind == "json":
-                return xgr.Grammar.from_json_schema(self.value)
-            if self.kind == "json_object":
-                return xgr.Grammar.builtin_json_grammar()
-            if self.kind in ("regex", "choice"):
-                return xgr.Grammar.from_regex(self.value if self.kind == "regex" else self._regex())
-            return xgr.Grammar.from_ebnf(self.value)
+            content = self._content()
+            if self.after is None:
+                return content
+            return _xgr().Grammar.from_structural_tag(self._structural_tag(content))
         except (RuntimeError, ValueError) as e:
             raise ValueError(f"structured_outputs {self.kind}: {e}") from e
 
     def compile(self, compiler):
         """Compiled against ``compiler``'s vocabulary, through the calls its cache keys by text."""
+        if self.after is not None:
+            return compiler.compile_structural_tag(self._structural_tag(self._content()))
         if self.kind == "json":
             return compiler.compile_json_schema(self.value)
         if self.kind == "json_object":
@@ -142,13 +160,12 @@ def response_format_request(response_format: Any) -> dict | None:
 class _Row:
     """One request's matcher, compiled in the background: the first step that
     needs it waits for the compile (usually done by then: the prefill runs first)."""
-    __slots__ = ("_compiled", "_matcher", "after_id", "active")
+    __slots__ = ("_compiled", "_matcher", "active")
 
-    def __init__(self, compiled: Future, after_id: int | None):
+    def __init__(self, compiled: Future):
         self._compiled = compiled
         self._matcher = None
-        self.after_id = after_id
-        self.active = after_id is None
+        self.active = True
 
     @property
     def matcher(self):
@@ -159,7 +176,7 @@ class _Row:
                 # checked tokenizer-free at the conductor already; a compile that
                 # still fails leaves the row free rather than failing its batch
                 logger.exception("structured_outputs grammar failed to compile; the row draws freely")
-                self.active, self.after_id = False, -1
+                self.active = False
                 raise
         return self._matcher
 
@@ -173,17 +190,13 @@ class _Row:
             return False
 
     def accept(self, token: int) -> None:
-        if not self.active:
-            self.active = token == self.after_id
-            return
         if not self.constrained:
             return
         if not self.matcher.accept_token(token):
-            # the mask allowed it, so this is a row the mask did not cover (a
-            # draw before the row was constrained); its output is not checked
+            # the mask allowed it, so this is a row the mask did not cover; its
+            # output is not checked
             logger.warning("grammar refused token %d; the row's constraint is off from here", token)
             self.active = False
-            self.after_id = -1
 
 
 class GrammarRows:
@@ -217,7 +230,6 @@ class GrammarRows:
         # Rows, not handles: a request removed meanwhile leaves its row here, and its
         # last draw never reaches the next request given its handle.
         self._pending: list[tuple[list[_Row], torch.Tensor, Any]] = []
-        self._token_ids: dict[bytes, int] | None = None
         self._shifts = torch.arange(32, dtype=torch.int32, device=device)
 
     def __contains__(self, rid) -> bool:
@@ -227,8 +239,7 @@ class GrammarRows:
         return bool(self._rows) and any(r in self._rows for r in rids)
 
     def add(self, rid, request: GrammarRequest) -> None:
-        after_id = None if request.after is None else self._single_token(request.after)
-        self._rows[rid] = _Row(self._compile_pool.submit(request.compile, self._compiler), after_id)
+        self._rows[rid] = _Row(self._compile_pool.submit(request.compile, self._compiler))
 
     def remove(self, rid) -> None:
         self._rows.pop(rid, None)
@@ -239,16 +250,6 @@ class GrammarRows:
             row = self._rows.pop(rid, None)
             if row is not None:
                 logger.error("structured_outputs dropped for request %r: %s", rid, why)
-
-    def _single_token(self, text: str) -> int:
-        if self._token_ids is None:
-            self._token_ids = {}
-            for i, tok in enumerate(self.info.decoded_vocab):
-                self._token_ids.setdefault(bytes(tok), i)
-        token = self._token_ids.get(text.encode())
-        if token is None:
-            raise ValueError(f"structured_outputs after={text!r} is not one token of this model")
-        return token
 
     def note_draws(self, rids, tokens: torch.Tensor, kept) -> None:
         """Queue the copy of this step's drawn tokens for its constrained rows

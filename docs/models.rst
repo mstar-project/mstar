@@ -741,8 +741,8 @@ deployment's YAML (on the text sampler of a model with several), a request may c
 reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``schema``), or
 ``structured_outputs`` in ``model_kwargs`` / ``extra_body`` with exactly one of ``json`` (a
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar``
-(EBNF), as vLLM takes it. ``"after": "</think>"`` starts the constraint once the model draws
-that one token, so a reasoning model thinks freely first. An unsupported schema is a 400, and
+(EBNF), as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds
+that text, so a reasoning model thinks freely first. An unsupported schema is a 400, and
 so is a request on a deployment without ``enable_grammar``. The captured sampler then applies
 a bitmask every step, and a step holding a constrained row waits for its rows' last draws to
 reach the host before it launches. Not served with it yet: speculative decoding (a node whose
