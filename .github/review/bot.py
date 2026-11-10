@@ -53,9 +53,8 @@ LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]
 # Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
 # `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
 # `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
-# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
-# PR's live test run on an AMD box too (vendors_of), and those it covers (covered_by_amd) stop
-# counting once it passed there.
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD box runs only for
+# the AMD words it can cover (covered AMD words, covered_by_amd), which stop counting once it passed there.
 AMD_MODEL = r"mi\d{3}[ax]?"
 AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
 UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
@@ -63,7 +62,7 @@ UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU
 AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
 AMD_RENTED = re.compile(r"\bMI3[0-5]\d?X\b", re.IGNORECASE)  # the AMD GPUs an AMD box can be (gpu.py SUPPORTED)
 # The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
-# for a PR that names AMD hardware.
+# for a PR that names covered AMD words.
 VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")

@@ -486,7 +486,7 @@ def fit_user_data(lt, box, secret_length):
         paths[1].write_text(b)
         files = [str(f) for f in (box / "brief.md", *paths, lt / "run.json", BOX_COMMON)]
         text = gpu_py.cloud_config(str(BOX), files, key or None)
-        return len(text.encode()) <= gpu_py.USER_DATA_MAX
+        return len(text.encode()) <= gpu_py.USER_DATA_MAX - 64  # margin: the stand-in key compresses a bit differently
 
     nb, nr = len(body), len(report)
     while not fits(cut(body, nb), cut(report, nr)):
@@ -1009,6 +1009,16 @@ def write_gallery(pr, sha, lt, vendors, site):
 WORST_FIRST = ("fail", "partial", "none", "unavailable", "pass")
 
 
+def held_to_partial(result, results):
+    """`result` with a `pass` a session wrote before END_BY stopped it (the box script leaves `timed_out` in
+    `results`) made a `partial`: what it never ran can't pass. For the comment and the kept result.json alike."""
+    if isinstance(result, dict) and result.get("verdict") == "pass" and (results / "timed_out").exists():
+        summary = " ".join(str(result.get("summary", "")).split())
+        summary = f"{summary} The session ran out of time after writing pass.".strip()
+        return {**result, "verdict": "partial", "summary": summary}
+    return result
+
+
 def render_comment(sha, lt, vendors, media_url=""):
     """lt/comment.md for the PR and lt/verdict, a section per vendor's box (its verdict, its summary and its
     report, or why it couldn't run), links to the gallery's copies once `media_url` says it is published; the
@@ -1024,6 +1034,7 @@ def render_comment(sha, lt, vendors, media_url=""):
         results = lt / vendor / "results"
         report = (results / "report.md").read_text() if (results / "report.md").exists() else ""
         result = json.loads((results / "result.json").read_text()) if (results / "result.json").exists() else {}
+        result = held_to_partial(result, results)
 
         def link(m, vendor=vendor):  # links to the gallery's media point at its copy; images show inline
             bang, text, raw = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
@@ -1044,8 +1055,6 @@ def render_comment(sha, lt, vendors, media_url=""):
         if verdict == "none" and (lt / vendor / "unavailable.md").is_file():  # why it couldn't run, redacted
             verdict, report = "unavailable", render_summary.inert((lt / vendor / "unavailable.md").read_text())
         summary = " ".join(str(result.get("summary", "")).split())  # on one line: it can't open a fence over the report
-        if verdict == "pass" and (results / "timed_out").exists():  # stopped at END_BY: what it never ran can't pass
-            verdict, summary = "partial", f"{summary} The session ran out of time after writing pass.".strip()
         title = f"**Live test of `{sha[:7]}` on {bot.VENDORS[vendor]}: {verdict}.** {render_summary.inert(summary)}"
         room = (60000 - len(head) - len(media) - 100) // len(vendors) - len(title)
         report, cut = (report, "") if len(report) <= room else \
@@ -1150,6 +1159,7 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
                 fields = bot.redact_fields(fields if isinstance(fields, dict) else {}, exact)
             except (ValueError, RecursionError):
                 fields = {}
+            fields = held_to_partial(fields, box / "results")
             result.write_text(json.dumps(fields))
         err = box / "results/claude.err"
         if err.is_file() and fields.get("verdict") not in ("pass", "partial", "fail"):

@@ -228,6 +228,8 @@ class TestCarry(unittest.TestCase):
         self.assertEqual(self.vendors, "nvidia,amd", "an AMD change could only ever be approved by a person")
         self.assertEqual(bot.vendors_of(["mi300a", "mi210"]), ["nvidia"], "a box no pass there can clear")
         self.assertEqual(bot.vendors_of(["mi300a", "mi300x"]), ["nvidia", "amd"])
+        rented, supported = bot.AMD_RENTED, gpu_review.gpu_py.SUPPORTED["amd"]
+        self.assertEqual((rented.pattern, rented.flags), (supported.pattern, supported.flags), "bot.py's copy drifted")
         for untestable, outputs in (("AMD MI300X kernels", full("targeted", "failed")),
                                     ("AMD kernels; the Intel XPU path", {"run": "targeted", "checks": "correctness"})):
             with self.subTest(untestable):
@@ -554,6 +556,13 @@ class TestComment(unittest.TestCase):
                 (results / "result.json").write_text(text)
                 gpu_review.redact({}, temp)
                 self.assertEqual(json.loads((results / "result.json").read_text()).get("verdict"), verdict)
+        with tempfile.TemporaryDirectory() as temp:  # stopped at END_BY: the artifact says what the comment does
+            results = Path(temp, "lt/nvidia/results")
+            results.mkdir(parents=True)
+            (results / "timed_out").touch()
+            (results / "result.json").write_text('{"verdict": "pass", "summary": "ok"}')
+            gpu_review.redact({}, temp)
+            self.assertEqual(json.loads((results / "result.json").read_text())["verdict"], "partial")
 
     def test_a_box_with_no_verdict_keeps_the_redacted_tail_of_its_sessions_stderr(self):
         for verdict, kept, err in (("unavailable", True, "x" * 9000 + "\n"), ("pass", False, ""),
