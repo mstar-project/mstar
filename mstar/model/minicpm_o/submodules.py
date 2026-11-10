@@ -833,10 +833,12 @@ class Token2WavSubmodule(NodeSubmodule):
             # stream's one chunk is final and empty. It still runs, voicing nothing,
             # as the empty step below does.
             return NodeInputs(tensor_inputs={"codes": torch.zeros(1, 0, dtype=torch.int32)}, kwargs={"last": True})
-        # A host sync, which serializes this node's async pipeline. It is needed either
-        # way: a window's length decides its capture and its cache writes. Filtering
-        # the stop code on the device would need check_stop to filter outputs (an
-        # engine change), and would still leave the length on the device.
+        # A window whose codes all came inline is already a CPU tensor, so this copies
+        # nothing. A window holding a stored item (a row that ran no forward on its
+        # step) is on the device, and this is a host sync. The codes are needed on the
+        # host either way: a window's length decides its capture and its cache writes.
+        # Filtering the stop code on the device would need check_stop to filter outputs
+        # (an engine change), and would still leave the length on the device.
         codes = inputs["tts_code"][0].reshape(-1).to("cpu", torch.int32)
         # The TTS's stop code is streamed before its stop is seen. It is not speech, and
         # it ends the speech: the window holding it is the last, as upstream's stream
