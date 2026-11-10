@@ -184,15 +184,3 @@ def test_a_rows_first_error_is_the_one_reported():
     assert lifecycle.take_failures() == {1: "Error in worker: request too long"}, (
         "the client would get the step's generic error instead of its own"
     )
-
-
-def test_a_teardown_that_raised_keeps_its_request_out_and_is_not_retried():
-    lifecycle = _lifecycle(1)
-    lifecycle.remove(1, RemoveRequest(request_id="r1", source=MessageSource.CONDUCTOR), -1)
-    assert lifecycle.removes_ready(set(), -1) == [1]
-    lifecycle.removed(1, "r1")
-
-    lifecycle.teardown_failed(1)
-
-    assert 1 in lifecycle.failed_rids, "a half torn-down request would be scheduled again"
-    assert lifecycle.removes_ready(set(), -1) == [], "the teardown would raise again every pass"

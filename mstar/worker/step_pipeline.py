@@ -916,9 +916,13 @@ class StepPipeline:
             self.ingest.drop_for_removed(message)
         try:
             self._release_request(rid, wire_rid, laps)
-        except BaseException:
-            self.lifecycle.teardown_failed(rid)
-            raise
+        except Exception as exc:
+            # The release may have leaked or corrupted pages that every later
+            # request shares, so failing the step in flight would not contain
+            # it. Stop, and the conductor's dead-worker check fails the rest.
+            raise SystemExit(
+                f"Worker {self.worker_id}: teardown of request {wire_rid} raised ({exc!r})"
+            ) from exc
 
     def _release_request(self, rid: int, wire_rid: str, laps: PhaseLaps) -> None:
         freed = self.engine_manager.remove_request(rid)

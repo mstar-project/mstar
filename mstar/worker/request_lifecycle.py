@@ -195,13 +195,6 @@ class RequestLifecycle:
         self._removed.add(wire_rid)
         return self._parked.pop(wire_rid, ())
 
-    def teardown_failed(self, rid: int) -> None:
-        """A teardown that raised after ``removed``: the request's state is
-        partly gone, so it takes no more work. It is not retried, since it would
-        likely raise again every pass, and its handle is never freed (that is
-        the teardown's last step), so no later request inherits the mark."""
-        self.failed_rids.add(rid)
-
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
