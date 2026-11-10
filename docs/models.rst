@@ -584,8 +584,9 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
-  so ``max_tokens`` above 2048 is a 400 rather than being shortened; under MTP, a
-  ``max_tokens`` past the room the prompt leaves is refused too.
+  unless ``dsa_long_context`` serves up to ``max_seq_len``. A ``max_tokens`` past the window
+  is a 400 rather than being shortened; under MTP, a ``max_tokens`` past the room the
+  prompt leaves is refused too.
 
 Muse Glimmer (``muse_glimmer``)
 -------------------------------
