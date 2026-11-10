@@ -402,10 +402,12 @@ class StepAudio2Model(Model):
         ids = processor.tokenize(pieces, lambda text: self.tokenizer(text, add_special_tokens=False)["input_ids"])
         result: NameToTensorList = {"text_inputs": [torch.tensor(ids, dtype=torch.long)]}
         metadata: dict[str, Any] = {}
+        frames = [m.shape[-1] for m in mels]
+        # refuses a literal <audio_patch> (or <audio_start>) in the text, which would shift
+        # the splice
+        processor.audio_positions(ids, [audio_tokens(n) for n in frames])
         if mels:
-            frames = [m.shape[-1] for m in mels]
-            request_layout(frames)  # refuses a clip too short to encode, here rather than on the worker
-            processor.audio_positions(ids, [audio_tokens(n) for n in frames])
+            request_layout(frames)  # refuses a clip the tower cannot lay out, here rather than on the worker
             # bf16 is what the tower casts them to before its convolutions, so the cast is exact
             result[AUDIO_MELS] = [torch.cat(mels, dim=-1).to(torch.bfloat16)]
             metadata[AUDIO_MEL_FRAMES] = frames

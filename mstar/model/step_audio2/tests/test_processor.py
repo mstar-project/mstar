@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from mstar.model.step_audio2 import processor
-from mstar.model.step_audio2.config import AUDIO_PATCH, AUDIO_START, EOT, audio_tokens
+from mstar.model.step_audio2.config import AUDIO_END, AUDIO_PATCH, AUDIO_START, EOT, audio_tokens
 
 CKPT = Path(os.environ.get("STEPAUDIO2_CKPT", "/workspace/stepaudio2-ref/hf/Step-Audio-2-mini"))
 ORACLE = Path(os.environ.get("STEPAUDIO2_ORACLE", "/workspace/stepaudio2-ref/oracle/rec"))
@@ -62,6 +62,30 @@ def test_audio_cuts_into_25_second_windows_with_a_placeholder_run_each():
     assert [m.shape for m in mels] == [(128, 2502), (128, 2 * 100 + 2)]
     runs = [p for p in pieces if isinstance(p, str) and p.startswith("<audio_start>")]
     assert [r.count("<audio_patch>") for r in runs] == [audio_tokens(2502), audio_tokens(202)]
+
+
+@pytest.mark.parametrize("seconds", [25.005, 50.005, 25.0045])
+def test_a_window_with_no_rows_renders_its_empty_run_and_is_not_encoded(seconds):
+    """The last window of an audio just over a multiple of 25 s has 3 or 4 mel frames and
+    no rows (``compute_token_num``); the reference still renders its run, empty."""
+    audio = torch.randn(int(16000 * seconds))
+    pieces, mels = processor.render([{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], lambda _: audio)
+    windows = -(-audio.shape[0] // processor.WINDOW_SAMPLES)
+    runs = [p for p in pieces if isinstance(p, str) and p.startswith("<audio_start>")]
+    assert len(runs) == windows and runs[-1] == "<audio_start><audio_end>"
+    assert [m.shape[-1] for m in mels] == [2502] * (windows - 1)
+    with pytest.raises(ValueError, match="too short"):
+        processor.render([{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], lambda _: audio[:50])
+
+
+def test_audio_positions_skip_an_empty_run_and_refuse_a_stray_placeholder():
+    ids = [1, AUDIO_START, AUDIO_PATCH, AUDIO_END, AUDIO_START, AUDIO_END, EOT]
+    assert processor.audio_positions(ids, [1]) == [2]
+    # an <audio_patch> written in the text would shift every row of the splice after it
+    with pytest.raises(ValueError, match="cannot be written"):
+        processor.audio_positions([AUDIO_PATCH, *ids], [1])
+    with pytest.raises(ValueError, match="cannot be written"):
+        processor.audio_positions([1, AUDIO_PATCH, EOT], [])
 
 
 def test_audio_positions_follow_each_audio_start():
