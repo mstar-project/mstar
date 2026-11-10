@@ -1176,6 +1176,8 @@ def _offload_engine(resources, planner):
         _resources=resources,
         _submodules={"n": make_mgmt(resources=resources, resident=planner)},
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
     return engine
 
@@ -1314,6 +1316,8 @@ def test_an_offload_another_node_causes_gives_the_slot_up():
         },
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
         _resource_planners=dict.fromkeys(owned, planner),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
 
     # a step of m's over n's two short rows, crossing a page: the pool refuses

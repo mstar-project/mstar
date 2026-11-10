@@ -209,7 +209,10 @@ class _Engine(Engine):
         self.resource = _Resource()
         self._resources = {"kv": self.resource}
         self._submodules["node"] = make_mgmt(resources={"kv": self.resource})
-        self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
+        self._runner = SimpleNamespace(
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
+            readmit=lambda *args: None,
+        )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )

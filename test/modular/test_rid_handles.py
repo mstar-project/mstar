@@ -20,6 +20,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import REMOVED_RID
+from mstar.worker.preemption import Preempted
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -176,6 +177,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     a, b = t.handle("req-a"), t.handle("req-b")
     w._rebuilds._kept = {"n": {a: None, b: None}}
     w._rebuilds._cursors[("n", a)] = None
+    w.preemption._preempted[a] = Preempted()
     w.streams._rids.add(a)
     w.scheduler.admission.held_until[a] = float("inf")
 
@@ -189,7 +191,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert b in w.request_state.per_request_info
     assert a not in w.scheduler.admission.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
-    assert not w._rebuilds._cursors, "the next request would run this one's rebuild"
+    assert not (w._rebuilds._cursors or w.preemption._preempted), (
+        "the next request would run this one's rebuild, or be counted as preempted"
+    )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a

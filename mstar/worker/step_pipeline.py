@@ -31,6 +31,7 @@ from mstar.worker.input_ingest import InputIngest
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation, Speculator
@@ -72,7 +73,7 @@ class StepPipeline:
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
         lifecycle: RequestLifecycle, lockstep: Lockstep, admission: Admission,
         scheduler: MicroScheduler, executor: StepExecutor, ingest: InputIngest,
-        speculator: Speculator, *, metrics: WorkerMetrics | None = None,
+        speculator: Speculator, preemption: Preemption, *, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None, launch_wait_s: float = 0.0,
         enable_nvtx: bool = False,
     ):
@@ -98,6 +99,7 @@ class StepPipeline:
         self.executor = executor
         self.ingest = ingest
         self.speculator = speculator
+        self.preemption = preemption
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
         self._launch_wait_s = launch_wait_s
@@ -282,6 +284,7 @@ class StepPipeline:
         # scan or a step's admit (``Admission``), which failed them then.
         self._report_failures()
         self._apply_drains(self.in_flight_rids)
+        self.preemption.make_room()
         laps.lap("teardown")
 
     def _preamble(self, laps: PhaseLaps) -> None:
@@ -703,6 +706,8 @@ class StepPipeline:
         self._teardown(self.in_flight_rids.union(referenced_rids))
         node, walk = batch.node_name, batch.graph_walk
         batch_ids = set(batch.request_to_worker_graph)
+        if not self.lockstep.follows(node) and self.preemption.preempt(node_batch):
+            return
         self.admission.relieve(
             batch, node_batch, self.lifecycle.arrivals,
             last_in_line=partial(self.scheduler.last_in_line, node, walk),
@@ -950,6 +955,7 @@ class StepPipeline:
         self.admission.clear(rid)
         self.lockstep.clear(rid, wire_rid)
         self._rebuilds.remove_request(rid)
+        self.preemption.remove_request(rid)
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on

@@ -17,6 +17,8 @@ from enum import Enum
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AllocationFailed, Residency
+from mstar.model.submodule_base import chunk_loop_name
+from mstar.worker.rebuild import Prefilling
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.scheduled_batch import ScheduledBatch
 from mstar.worker.services import WorkerLayout, WorkerServices
@@ -50,6 +52,8 @@ class Admission:
         self._rebuilds = services.rebuilds
         self._combined_walk_of = layout.combined_walk_of
         self._follows = layout.followed_nodes
+        # node -> the walks whose prefill runs as a chunk Loop there
+        self._chunk_loop_walks = layout.chunk_loops.walks_by_node
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # node -> rids waiting for capacity there, which readiness answers
@@ -89,7 +93,9 @@ class Admission:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            engine.prepare_rebuild(node_name, rid, self._rebuilds.start(rid, node_name))
+            rebuild = self._rebuilds.start(rid, node_name, self.prefilling(node_name, rid, fwd_info.graph_walk))
+            if rebuild is not None:
+                engine.prepare_rebuild(node_name, rid, rebuild)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
@@ -101,6 +107,16 @@ class Admission:
             })
             return False
         return outcome.ok and outcome.ready
+
+    def prefilling(self, node_name: str, rid: int, graph_walk: str) -> Prefilling | None:
+        """Where ``rid``'s prompt stands while it is mid-prefill in ``graph_walk`` on ``node_name``, read off its
+        chunk Loop as `MicroScheduler._chunk_loop_progress` reads it, else None."""
+        if graph_walk not in self._chunk_loop_walks.get(node_name, ()):
+            return None
+        (done,), (total,) = self._runtime.loop_progress(
+            node_name, [rid], [graph_walk], [chunk_loop_name(node_name, graph_walk)],
+        )
+        return Prefilling(graph_walk, done, total) if 0 < done < total else None
 
     def let_rows_back(self) -> None:
         """Before a scan: drop the holds that have run out, and unpark the
@@ -121,7 +137,8 @@ class Admission:
 
         for engine in {*map(self._engine_manager.get_engine, self.parked)}:
             for node_name, rid in engine.admit_waiting(published_of):
-                self.parked[node_name].discard(rid)
+                # a request asked again on each node of its pool may have parked on only one of them
+                self.parked.get(node_name, set()).discard(rid)
 
     def clear(self, rid: int) -> None:
         """Forget ``rid``; called from its teardown."""
@@ -337,7 +354,7 @@ class Admission:
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
             return
-        # Nothing could be evicted, so the batch has to get smaller or it will
+        # Nothing could be evicted or dropped, so the batch has to get smaller or it will
         # refuse identically for ever. Hold the one request the admit named,
         # not the whole batch, so the retry is immediate. When other rows
         # wait to run, the batch also gets a limit, or they refill it to the
@@ -357,20 +374,25 @@ class Admission:
                 batch.node_name, batch.graph_walk,
                 len(batch_ids) // 2 if fit is None else fit,
             )
-        key = (batch.node_name, batch.graph_walk)
-        now = time.monotonic()
-        last, unlogged = self._hold_logged.get(key, (None, 0))
-        if last is not None and now - last < _HOLD_LOG_INTERVAL:
-            self._hold_logged[key] = (last, unlogged + 1)
-            return
-        self._hold_logged[key] = (now, 0)
-        logger.warning(
+        self.log_throttled(
+            self._hold_logged, (batch.node_name, batch.graph_walk),
             "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
             "requests so the retry is smaller (%d earlier holds not logged)",
             batch.node_name, batch.graph_walk,
             blamed if len(shed) == 1 else f"all {len(shed)}",
-            len(batch_ids), unlogged,
+            len(batch_ids),
         )
+
+    def log_throttled(self, logged: dict, key, message: str, *args) -> None:
+        """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since
+        as its last argument."""
+        now = time.monotonic()
+        last, unlogged = logged.get(key, (None, 0))
+        if last is not None and now - last < _HOLD_LOG_INTERVAL:
+            logged[key] = (last, unlogged + 1)
+            return
+        logged[key] = (now, 0)
+        logger.warning(message, *args, unlogged)
 
     def _evict(
         self, node_name: str, batch_ids: set[int], arrivals: Iterable[int],
