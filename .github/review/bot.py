@@ -856,7 +856,7 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
         earlier, answered = earlier_review(repo, pr)
-        review = redact_fields(render_summary.carried(review, earlier, answered), exact)
+        review = redact_fields(render_summary.carried(review, earlier, answered, pages), exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
