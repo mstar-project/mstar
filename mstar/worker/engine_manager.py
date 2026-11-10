@@ -448,6 +448,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
+            tensor_streams=inline_streams.tensor_streams,
         )
         engine.load_model(
             submodules,

@@ -18,12 +18,7 @@ class _Engine:
 
 
 def _body(inline_emit=True):
-    from mstar.worker.engine_manager import InlineStreams
-
-    return make_worker(
-        graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit),
-        engine_manager=SimpleNamespace(inline_streams=InlineStreams(frozenset(), {})),
-    ).executor._body
+    return make_worker(graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit)).executor._body
 
 
 def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
@@ -41,19 +36,18 @@ def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
 
 def test_a_signal_that_also_streams_as_a_tensor_is_not_kept_on_the_device():
     """A stream that keeps its tensors (one the node does not send inline, or a
-    lockstep node's) needs the step to store them, so its signal does not make
-    the step rows-only, whatever the node keeps on the device."""
-    from mstar.worker.engine_manager import InlineStreams
+    lockstep node's) needs the step to store them, so the engine does not count
+    its signal as kept on the device, and the step does not run rows-only."""
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = _Engine({("TTS", "tts_decode"): frozenset({"tts_code"})})
-    body = _body()
-    body.engine_manager = SimpleNamespace(inline_streams=InlineStreams(
-        frozenset(), {("TTS", "tts_decode"): frozenset({"tts_code"})},
-    ))
-    assert not body.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
-    body = _body()
-    body.engine_manager = SimpleNamespace(inline_streams=InlineStreams(frozenset({("TTS", "tts_code")}), {}))
-    assert body.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
+    sub = SimpleNamespace(device_loopback_signals=lambda walk: frozenset({"tts_code"}))
+    streamed = make_engine(
+        _submodules={"TTS": make_mgmt(sub)}, _tensor_streams={("TTS", "tts_decode"): frozenset({"tts_code"})},
+    )
+    assert streamed.device_loopback_signals("TTS", "tts_decode") == frozenset()
+    assert not _body().all_on_device(streamed, "TTS", "tts_decode", ["tts_code"])
+    inline = make_engine(_submodules={"TTS": make_mgmt(sub)})
+    assert _body().all_on_device(inline, "TTS", "tts_decode", ["tts_code"])
 
 
 def test_no_rows_only_step_on_a_runtime_without_inline_emit():

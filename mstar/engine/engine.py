@@ -609,6 +609,7 @@ class Engine:
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
         side_stream_nodes: Collection[str] = (),
+        tensor_streams: Mapping[tuple[str, str], frozenset[str]] | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
@@ -617,6 +618,8 @@ class Engine:
         self._device_capability = device_capability
         # nodes whose steps run beside the worker's chain (``EngineManager.build``)
         self._side_stream_nodes = frozenset(side_stream_nodes)
+        # (node, walk) -> its streamed signals that go as tensors (``InlineStreams``)
+        self._tensor_streams = dict(tensor_streams or {})
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -1520,11 +1523,15 @@ class Engine:
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
         """The node's loop-back signals it keeps on the device this walk, so
-        the worker routes them without a tensor (see the submodule hook)."""
+        the worker routes them without a tensor (see the submodule hook). Not
+        one that also streams as a tensor, whose stream needs the tensor
+        stored (``InlineStreams.tensor_streams``)."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None:
             return frozenset()
-        return mgmt.submodule.device_loopback_signals(graph_walk)
+        kept = mgmt.submodule.device_loopback_signals(graph_walk)
+        streamed = self._tensor_streams.get((node_name, graph_walk))
+        return kept - streamed if streamed else kept
 
     def after_output_copy(self, batch: ExecutingBatch) -> None:
         if batch.committed is not None:

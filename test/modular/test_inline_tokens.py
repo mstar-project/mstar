@@ -316,11 +316,7 @@ class _Batch:
 
 
 def _executor(runtime=_Runtime()):
-    from mstar.worker.engine_manager import InlineStreams
-
-    return make_worker(
-        graph_runtime=runtime, engine_manager=SimpleNamespace(inline_streams=InlineStreams(frozenset(), {})),
-    ).executor
+    return make_worker(graph_runtime=runtime).executor
 
 
 def test_inline_values_follow_the_batch_order_off_the_host_rows():
