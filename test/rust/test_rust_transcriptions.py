@@ -29,6 +29,7 @@ sf = pytest.importorskip("soundfile")
 
 from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
+from test_rust_release import _leave, _until
 
 from mstar.api_server import entrypoint
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
@@ -164,7 +165,7 @@ def _rust(model: str, stub: _ASRStub):
     thread.start()
     try:
         assert _wait_healthy(port)
-        yield port
+        yield port, bridge
     finally:
         bridge.stop()
         proc.terminate()
@@ -181,7 +182,7 @@ def stacks():
             key = (model, None if request_kwargs is None else tuple(sorted(request_kwargs)), cap)
             if key not in _STACKS:
                 stub = _ASRStub(model, Path(tempfile.mkdtemp(prefix="mstar_asr_up_")), request_kwargs, cap)
-                _STACKS[key] = (stub, exits.enter_context(_rust(model, stub)))
+                _STACKS[key] = (stub, exits.enter_context(_rust(model, stub))[0])
             return _STACKS[key]
         yield get
         _STACKS.clear()
@@ -422,6 +423,36 @@ def test_a_model_without_the_route_is_a_404_alike(stacks, monkeypatch):
     (py, _), (rust, _) = _both(stacks, monkeypatch, "kokoro", [])
     assert py[0] == 404
     assert rust == py
+
+
+class _HoldingASRStub(_ASRStub):
+    """Each window sends its script's chunks, then holds until it is aborted."""
+
+    async def iter_result_chunks(self, request_id):
+        for c in self._chunks.get(request_id, []):
+            yield c
+        while request_id not in self.released:
+            await asyncio.sleep(0.005)
+
+
+@pytest.mark.parametrize("audio", ["one-window", "windows"])
+@pytest.mark.parametrize("when", ["before", "mid"])
+def test_a_stream_whose_client_leaves_releases_its_windows_and_upload(audio, when):
+    """Every window still on the engine is aborted, and the upload, its windows
+    and the bridge's planner for them are gone."""
+    stub = _HoldingASRStub("whisper_large", Path(tempfile.mkdtemp(prefix="mstar_asr_up_")))
+    stub.script = _hello if when == "mid" else (lambda record, i: [])
+    file = ("speech.wav", SHORT if audio == "one-window" else LONG)
+    body, ctype = _multipart([("stream", "true")], file)
+    with _rust("whisper_large", stub) as (port, bridge):
+        if when == "mid":
+            _leave(port, "/v1/audio/transcriptions", body, ctype, read=b"hello")
+        else:
+            _leave(port, "/v1/audio/transcriptions", body, ctype, once=lambda: stub.submits)
+        _until(lambda: sorted(stub.released) == sorted(stub._chunks), what="every window's abort")
+        _until(lambda: not bridge._keys and not bridge._planners, what="the bridge to forget the upload")
+        assert _empty(stub.upload_dir), "the upload or its windows were left"
+    assert len(stub.submits) == (1 if audio == "one-window" else 3)
 
 
 # ── the other ASR adapters ───────────────────────────────────────────────────
