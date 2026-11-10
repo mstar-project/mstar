@@ -1144,10 +1144,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
-        but their spans, derives no host write from its inputs, and every real
-        row has the span of the template row. Then the step a pre-plan declared
-        over the bucket's template rows is the step the forward would declare,
-        and the engine runs it instead of declaring and admitting a second time."""
+        but their spans, and every real row has the span of the template row.
+        Then the step a pre-plan declared over the bucket's template rows is the
+        step the forward would declare, and the engine runs it instead of
+        declaring and admitting a second time, as it does for a pre-plan over the
+        prepared rows. A node holding host fields can't return True here, which
+        `Engine._check_host_fields` checks at load."""
         del graph_walk
         return False
 

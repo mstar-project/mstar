@@ -386,10 +386,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         """One causal step over the packed batch, the same span in both LMs, and
         each row's progress written at commit.
 
-        The writes come from the draw in the row's inputs, so they rely on exec
-        declaring the step again over the prepared rows. A pre-plan declares over
-        the template rows, and exec runs that step only for a walk that is
-        `step_is_input_free`, which this node's aren't. The template carries no
+        The writes come from the draw in the row's inputs. The template carries no
         ``rng``, so a capture's rows and a replay's padding rows write nothing.
         """
         del graph_walk, slot_lease, piecewise_leases, kwargs
