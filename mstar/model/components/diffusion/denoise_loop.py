@@ -333,12 +333,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def model_output(
         self, engine_inputs: ModelInputsFromEngine, key: StepKey, latents: torch.Tensor,
         timestep: torch.Tensor, **cond: torch.Tensor,
-    ) -> torch.Tensor | Mapping[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """The model's prediction for a stacked batch of rows, ``[R, ...]`` over the rows' samples (a velocity for
         the Euler step, what the solver takes for UniPC). Under guidance the rows are each request's local branches
         (``key.branches``), with ``latents``, ``timestep`` and the shared inputs repeated per branch and each branch's
-        inputs mapped onto its row. A model that steps two streams returns ``{loop-back edge: prediction}``, and the
-        guidance combine applies to each."""
+        inputs mapped onto its row."""
         raise NotImplementedError
 
     def denoise(
@@ -371,7 +370,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def guided_output(
         self, engine_inputs: ModelInputsFromEngine, key: StepKey, latents: torch.Tensor, timestep: torch.Tensor,
         **inputs: torch.Tensor,
-    ) -> torch.Tensor | Mapping[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """:meth:`model_output` under the model's ``GUIDANCE``: this rank's branches as rows, request-major, then
         the predictions gathered over the cfg group and combined. Unguided, branch 0 alone."""
         guidance = self.GUIDANCE
@@ -390,13 +389,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         )
         if not key.guided:
             return pred
-
-        def combine(p: torch.Tensor) -> torch.Tensor:
-            # [B * local, ...] -> [B, local, ...] -> every branch, gathered over the group in branch order
-            p = self.cfg_group.all_gather(p.reshape(-1, local, *p.shape[1:]).contiguous(), dim=1)
-            return guidance.combine(p.unbind(1), scale.reshape(-1, *[1] * (p.ndim - 2)))
-
-        return combine(pred) if isinstance(pred, torch.Tensor) else {name: combine(p) for name, p in pred.items()}
+        # [B * local, ...] -> [B, local, ...] -> every branch, gathered over the group in branch order
+        pred = self.cfg_group.all_gather(pred.reshape(-1, local, *pred.shape[1:]).contiguous(), dim=1)
+        return guidance.combine(pred.unbind(1), scale.reshape(-1, *[1] * (pred.ndim - 2)))
 
     # --------------------------------------------------------------- helpers
     def layout(self, key: StepKey, device: torch.device) -> Any:
