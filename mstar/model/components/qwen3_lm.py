@@ -1,7 +1,8 @@
 """Dense Qwen3 causal language model from the shared components.
 
 Qwen3 = Llama-style pre-norm decoder with GQA, per-head QK RMSNorm, SwiGLU
-MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Several
+MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Qwen2 is the same
+decoder with q/k/v biases and no QK norm (``attention_bias=True, qk_norm=False``). Several
 audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
@@ -95,7 +96,8 @@ class Qwen3Attention(ParallelAttention):
         super().bind_state(handles)
         declared = None if self.state is None else self.state.array.positions
         self._theta = None if declared is None else _plain_theta(declared.rope, self.head_dim)
-        self._fuse = self._theta is not None
+        # the kernel norms q and k, so a decoder without QK norm (Qwen2) rotates through the array
+        self._fuse = self._theta is not None and self.q_norm is not None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # The state op is a graph break. Called from a helper method, the op makes Dynamo compile that helper as one
@@ -133,6 +135,9 @@ class Qwen3LMConfig:
     rope_theta: float = 1_000_000.0
     max_position_embeddings: int = 32768
     tie_word_embeddings: bool = False
+    # Qwen2: biases on q/k/v and no per-head QK norm
+    attention_bias: bool = False
+    qk_norm: bool = True
 
     @classmethod
     def from_hf(cls, hf: dict) -> "Qwen3LMConfig":
@@ -172,7 +177,8 @@ class Qwen3DenseLM(nn.Module):
                     num_heads=config.num_attention_heads,
                     num_kv_heads=config.num_key_value_heads,
                     head_dim=config.head_dim,
-                    qk_norm=True,
+                    qkv_bias=config.attention_bias,
+                    qk_norm=config.qk_norm,
                     rms_norm_eps=config.rms_norm_eps,
                     rope_theta=config.rope_theta,
                     input_hidden_size=config.hidden_size,
