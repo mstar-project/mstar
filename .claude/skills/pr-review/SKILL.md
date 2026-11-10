@@ -215,8 +215,10 @@ Phase B, the comparison with the code, is in the abstraction-fit pass.
 
 Start by reading the change (all modes): the whole diff and the code around it: callers, callees,
 and the counterpart across every boundary the change crosses (Python/Rust, sender/receiver, rank 0/
-rank N, conductor/engine, API server/worker). Check the diff against every `AGENTS.md` invariant
-that applies to the layers it touches. Try to disprove each candidate finding before keeping it.
+rank N, conductor/engine, API server/worker). A change to what an HTTP route accepts or returns
+(`mstar/api_server/`, an `OpenAIAdapter`, an `ADAPTER_REGISTRY` entry) has a counterpart in
+`rust/server/`: one that isn't there, or a new `NOT_PORTED` entry, breaks invariant 15. Check the
+diff against every `AGENTS.md` invariant that applies to the layers it touches. Try to disprove each candidate finding before keeping it.
 
 ### 4.1 Behaviour (all modes)
 

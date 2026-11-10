@@ -239,7 +239,8 @@ def test_the_graph_runtime_never_sees_a_rebuild_row(site):
     speculation = Speculation(scheduled_batch=batch, node_batch=None, consumed_edges=set(), continuing_rids=set(),
                               partition="p", is_new_iter=False, is_same_node=False)
     if site == "push back":
-        refused = SimpleNamespace(request_ids=[R, A], cached_rids=set(), admit_error=AllocationFailed(
+        refused = SimpleNamespace(request_ids=[R, A], cached_rids=set(), no_forward_rids=set(),
+                                  admit_error=AllocationFailed(
             message="out of pages", pages_short=1, label="main", request_id=A,
         ))
         w.admission.requeue(batch, refused)
@@ -261,7 +262,7 @@ def test_a_terminal_refusal_of_a_rebuild_row_fails_only_its_request():
     batch = ScheduledBatch(NODE, PREFILL, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
 
     w.admission.requeue(batch, SimpleNamespace(
-        request_ids=[R, A], cached_rids=set(),
+        request_ids=[R, A], cached_rids=set(), no_forward_rids=set(),
         admit_error=SimpleNamespace(terminal=True, request_ids=(R,), message="too long"),
     ))
 

@@ -21,6 +21,10 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
    PR queued ahead of it, and lands it only if that passes, so two PRs that are each green alone
    can't break `main` together.
 
+### HTTP routes and OpenAI adapters
+
+The Python HTTP frontend is being retired in favor of the Rust one (`rust/server/`). A new route, request field, response format or model OpenAI adapter goes into both in the same PR, with a test in `test/rust/` comparing the two; see invariant 15 in [AGENTS.md](AGENTS.md).
+
 ### Documentation
 
 During the Mintlify migration, `docs/*.rst` remains the canonical source. If a guide

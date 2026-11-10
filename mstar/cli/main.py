@@ -76,6 +76,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "minimax_h3": "minimax_h3.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
     "muse_glimmer": "muse_glimmer.yaml",
+    # bf16 on four 80 GB GPUs; ripple_65b_tp2.yaml for two 141 GB ones
+    "ripple_65b": "ripple_65b_tp4.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
@@ -150,7 +152,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer", "ripple_65b"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -158,8 +160,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
     if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
+    if model in ("flux2_klein", "flux2_klein_9b"):  # Z-Image is text-to-image only
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
-        lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
     if model == "ltx2_5":
         lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
         lines.append("                          output_modalities=(\"video\", \"audio\"),")
@@ -216,11 +218,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
-                 "muse_glimmer"):
+                 "muse_glimmer", "ripple_65b"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni", "muse_glimmer"):
+        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):

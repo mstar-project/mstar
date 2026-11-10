@@ -19,7 +19,6 @@ torch = pytest.importorskip("torch")
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
-    Resource,
     ResourceStep,
     Segment,
     StepContext,
@@ -31,6 +30,7 @@ from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans, _refuse_unroutable_withholds  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
@@ -40,15 +40,11 @@ NODE, WALK = "vocoder", "synth"
 WIDTH = 12  # every row is padded to this, as a captured graph would be
 
 
-class _Recorder(Resource):
+class _Recorder(StubResource):
     """Records the lifecycle calls the step drives."""
 
     def __init__(self):
         self.calls: list[str] = []
-
-    @classmethod
-    def build(cls, spec, device, comm_group, **engine_kwargs):
-        raise NotImplementedError
 
     def admit(self, step, ctx):
         self.calls.append("admit")

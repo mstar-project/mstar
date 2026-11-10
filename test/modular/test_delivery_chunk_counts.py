@@ -23,7 +23,7 @@ from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
 from mstar.communication.event import EventWakeup
 from mstar.conductor.conductor import Conductor, RequestData
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
+from mstar.conductor.request_info import PartitionState
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
@@ -141,10 +141,7 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [WORKER], 1: [WORKER]}, all_worker_graph_ids={0, 1},
         max_output_tokens=64, random_seed=0, resource_configs={},
-        partition_states={"default": PartitionState(
-            partition_name="default",
-            metadata=CurrentForwardConductorMetadata(graph_walk=PREFILL, is_prefill=True),
-        )},
+        partition_states={"default": PartitionState(partition_name="default", graph_walk=PREFILL)},
     )
     conductor.requests = {"r1": request}
     for body in reports:
@@ -273,6 +270,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
+    server.reads_turns = False
     server.running = True
     server._liveness_interval_s = 3600.0
     server._conductor_exited = lambda: None
@@ -316,10 +314,7 @@ def test_every_rank_reports_the_chunks_it_sent():
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: ["worker_0", "worker_1"]}, all_worker_graph_ids={0},
         max_output_tokens=64, random_seed=0, resource_configs={},
-        partition_states={"default": PartitionState(
-            partition_name="default",
-            metadata=CurrentForwardConductorMetadata(graph_walk=DECODE, is_prefill=False),
-        )},
+        partition_states={"default": PartitionState(partition_name="default", graph_walk=DECODE)},
     )
     conductor.requests = {"r1": request}
     for first, names in [(True, ["sharded", "replicated"]), (False, ["sharded"])]:
