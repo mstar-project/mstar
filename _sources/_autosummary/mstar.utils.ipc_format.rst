@@ -30,6 +30,7 @@ mstar.utils.ipc\_format
       LoraAdapterAck
       MessageBody
       MessageSource
+      Move
       NewRequest
       NewRequestConductor
       OffloadDelta

@@ -758,6 +758,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.cursor"><code class="docutils literal notranslate"><span class="pre">Rebuilds.cursor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.cursors"><code class="docutils literal notranslate"><span class="pre">Rebuilds.cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.fill"><code class="docutils literal notranslate"><span class="pre">Rebuilds.fill()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.forget"><code class="docutils literal notranslate"><span class="pre">Rebuilds.forget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.ingest_request"><code class="docutils literal notranslate"><span class="pre">Rebuilds.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.keep_prompts"><code class="docutils literal notranslate"><span class="pre">Rebuilds.keep_prompts()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.keep_samples"><code class="docutils literal notranslate"><span class="pre">Rebuilds.keep_samples()</span></code></a></li>
@@ -816,7 +817,7 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.rebuild.RebuildCursor" title="mstar.worker.rebuild.RebuildCursor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RebuildCursor</span></code></a>(walk, total, length[, ids, ...])</p></td>
 <td><p>A rebuild under way: the walk its rows run, the tokens it writes (<code class="docutils literal notranslate"><span class="pre">total</span></code>) of an input <code class="docutils literal notranslate"><span class="pre">length</span></code> long, and the end of its chunks that have landed, 0 before the first.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.rebuild.Rebuilds" title="mstar.worker.rebuild.Rebuilds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Rebuilds</span></code></a>(policies, graphs[, pool])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.rebuild.Rebuilds" title="mstar.worker.rebuild.Rebuilds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Rebuilds</span></code></a>(policies, graphs[, pool, followed])</p></td>
 <td><p>The kept ids of each request on the nodes that declare a <cite>RebuildPolicy</cite>, checked against the graph when the worker starts, and the rebuilds under way.</p></td>
 </tr>
 </tbody>
@@ -983,7 +984,7 @@ input the engine keeps for the prompt, up to where the prompt stood.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.rebuild.Rebuilds">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.rebuild.</span></span><span class="sig-name descname"><span class="pre">Rebuilds</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">policies</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graphs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.rebuild.</span></span><span class="sig-name descname"><span class="pre">Rebuilds</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">policies</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graphs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">followed</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>The kept ids of each request on the nodes that declare a <cite>RebuildPolicy</cite>, checked against the
 graph when the worker starts, and the rebuilds under way.</p>
@@ -993,6 +994,7 @@ graph when the worker starts, and the rebuilds under way.</p>
 <li><p><strong>policies</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.model.rebuild.html#mstar.model.rebuild.RebuildPolicy" title="mstar.model.rebuild.RebuildPolicy"><em>RebuildPolicy</em></a><em>]</em>)</p></li>
 <li><p><strong>graphs</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphSection" title="mstar.graph.base.GraphSection"><em>GraphSection</em></a><em>]</em>)</p></li>
 <li><p><strong>pool</strong> (<a class="reference internal" href="mstar.worker.host_pool.html#mstar.worker.host_pool.HostPool" title="mstar.worker.host_pool.HostPool"><em>HostPool</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>followed</strong> (<em>Collection</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1063,6 +1065,23 @@ chunk of a prompt’s rebuild from the input the engine keeps for the prompt.</p
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.rebuild.Rebuilds.forget">
+<span class="sig-name descname"><span class="pre">forget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds.forget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds.forget" title="Link to this definition">#</a></dt>
+<dd><p>Give back the ids <code class="docutils literal notranslate"><span class="pre">rid</span></code> keeps on <code class="docutils literal notranslate"><span class="pre">node</span></code>, and keep none from here on.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.rebuild.Rebuilds.ingest_request">
 <span class="sig-name descname"><span class="pre">ingest_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">writes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layouts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unpausable</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds.ingest_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds.ingest_request" title="Link to this definition">#</a></dt>
 <dd><p>For each paged KV cache in <code class="docutils literal notranslate"><span class="pre">writes</span></code>, whether a drop here can free <code class="docutils literal notranslate"><span class="pre">rid</span></code>’s pages there: one
@@ -1088,16 +1107,23 @@ is False.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.rebuild.Rebuilds.keep_prompts">
-<span class="sig-name descname"><span class="pre">keep_prompts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_batch</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds.keep_prompts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds.keep_prompts" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">keep_prompts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_batch</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mid_prefill</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/rebuild.html#Rebuilds.keep_prompts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.rebuild.Rebuilds.keep_prompts" title="Link to this definition">#</a></dt>
 <dd><p>Copy a row’s prompt to the host once the step that read the prompt completes, when the row is in the
-policy’s walk, a drop here can free its request’s pages, and the request keeps no ids yet. A row the pool can’t
-hold keeps none.</p>
+policy’s walk, a drop here can free its request’s pages, and the request keeps no ids yet. Returns the rows
+whose prompt the pool couldn’t hold at their last chunk, which keep no ids from then on. A row <code class="docutils literal notranslate"><span class="pre">mid_prefill</span></code>
+can still keep its prompt at a later chunk that reads it.</p>
+<p>On a node this rank follows, a prompt the pool can’t hold is copied outside the pool. Each rank gives a slice
+back at its own teardown, so a follower’s pool can be fuller than rank 0’s when rank 0 keeps a request’s ids.
+The follower gives back the ids of a request rank 0 kept none for at <cite>forget</cite>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>node_batch</strong> (<em>ExecutingBatch</em>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_batch</strong> (<em>ExecutingBatch</em>)</p></li>
+<li><p><strong>mid_prefill</strong> (<em>Collection</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p>None</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1378,6 +1404,7 @@ loop grows the KV in. A disaggregated decode node can’t run the prefill walk i
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.cursor"><code class="docutils literal notranslate"><span class="pre">Rebuilds.cursor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.cursors"><code class="docutils literal notranslate"><span class="pre">Rebuilds.cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.fill"><code class="docutils literal notranslate"><span class="pre">Rebuilds.fill()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.forget"><code class="docutils literal notranslate"><span class="pre">Rebuilds.forget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.ingest_request"><code class="docutils literal notranslate"><span class="pre">Rebuilds.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.keep_prompts"><code class="docutils literal notranslate"><span class="pre">Rebuilds.keep_prompts()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.rebuild.Rebuilds.keep_samples"><code class="docutils literal notranslate"><span class="pre">Rebuilds.keep_samples()</span></code></a></li>

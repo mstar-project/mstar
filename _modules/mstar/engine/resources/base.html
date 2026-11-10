@@ -1150,6 +1150,17 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="CachedLease">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.CachedLease">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CachedLease</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its ``pages``, and the</span>
+<span class="sd">    ones it ``lent``, which another request holds and so take no room."""</span>
+    <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">lent</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span></div>
+
+
+
 <div class="viewcode-block" id="Residency">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Residency">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Residency</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
@@ -1178,6 +1189,24 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    writes are keyed, and the growth walks whose sampled ids extend the keys."""</span>
     <span class="n">writes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">growth</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="MoveKind">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.MoveKind">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">MoveKind</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""</span>
+    <span class="n">OFFLOAD</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">RELOAD</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">RESERVE</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">UNRESERVE</span> <span class="o">=</span> <span class="mi">3</span>
+    <span class="n">EARMARK</span> <span class="o">=</span> <span class="mi">4</span>
+    <span class="n">DROP</span> <span class="o">=</span> <span class="mi">5</span>
+    <span class="n">LAND</span> <span class="o">=</span> <span class="mi">6</span>
+    <span class="n">GUARANTEE</span> <span class="o">=</span> <span class="mi">7</span>
+    <span class="n">ALLOT</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="n">WAIT</span> <span class="o">=</span> <span class="mi">9</span>
+    <span class="n">FORGET</span> <span class="o">=</span> <span class="mi">10</span></div>
 
 
 
@@ -1353,18 +1382,18 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Resource.lease_cached_prefix">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.lease_cached_prefix">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">lease_cached_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">lease_cached_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CachedLease</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""On rank 0 of a TP node, lease the request's cached prefix as its step is sent and</span>
-<span class="sd">        return the pages, or None."""</span>
+<span class="sd">        return the lease, or None."""</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
 <div class="viewcode-block" id="Resource.adopt_cached_prefix">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.adopt_cached_prefix">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">adopt_cached_prefix</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">caught_up</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">CachedLease</span><span class="p">,</span> <span class="n">caught_up</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and</span>
+<span class="w">        </span><span class="sd">"""On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and</span>
 <span class="sd">        raises if it still lacks them once ``caught_up``."""</span>
         <span class="k">return</span> <span class="kc">True</span></div>
 
@@ -1378,9 +1407,10 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Resource.page_trail">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.page_trail">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">page_trail</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""How many page allocations this resource has made and a hash of their pages in</span>
-<span class="sd">        order, for a TP follower to check against rank 0's. None where it keeps no trail."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">page_trail</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""What a TP follower checks against rank 0's before each step, such as how many page</span>
+<span class="sd">        allocations this resource has made and a hash of their pages in order. None where it</span>
+<span class="sd">        keeps no trail."""</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 

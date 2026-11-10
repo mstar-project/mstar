@@ -749,6 +749,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CGSlotSpec.slot"><code class="docutils literal notranslate"><span class="pre">CGSlotSpec.slot</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease"><code class="docutils literal notranslate"><span class="pre">CachedLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease.lent"><code class="docutils literal notranslate"><span class="pre">CachedLease.lent</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease.pages"><code class="docutils literal notranslate"><span class="pre">CachedLease.pages</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix"><code class="docutils literal notranslate"><span class="pre">CachedPrefix</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix.label"><code class="docutils literal notranslate"><span class="pre">CachedPrefix.label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix.position"><code class="docutils literal notranslate"><span class="pre">CachedPrefix.position</span></code></a></li>
@@ -773,6 +778,20 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks"><code class="docutils literal notranslate"><span class="pre">KeyedWalks</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks.growth"><code class="docutils literal notranslate"><span class="pre">KeyedWalks.growth</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks.writes"><code class="docutils literal notranslate"><span class="pre">KeyedWalks.writes</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind"><code class="docutils literal notranslate"><span class="pre">MoveKind</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.ALLOT"><code class="docutils literal notranslate"><span class="pre">MoveKind.ALLOT</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.DROP"><code class="docutils literal notranslate"><span class="pre">MoveKind.DROP</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.EARMARK"><code class="docutils literal notranslate"><span class="pre">MoveKind.EARMARK</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.FORGET"><code class="docutils literal notranslate"><span class="pre">MoveKind.FORGET</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.GUARANTEE"><code class="docutils literal notranslate"><span class="pre">MoveKind.GUARANTEE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.LAND"><code class="docutils literal notranslate"><span class="pre">MoveKind.LAND</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.OFFLOAD"><code class="docutils literal notranslate"><span class="pre">MoveKind.OFFLOAD</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.RELOAD"><code class="docutils literal notranslate"><span class="pre">MoveKind.RELOAD</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.RESERVE"><code class="docutils literal notranslate"><span class="pre">MoveKind.RESERVE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.UNRESERVE"><code class="docutils literal notranslate"><span class="pre">MoveKind.UNRESERVE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.WAIT"><code class="docutils literal notranslate"><span class="pre">MoveKind.WAIT</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.PublishedInfo"><code class="docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -896,14 +915,20 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.CGSlotSpec" title="mstar.engine.resources.base.CGSlotSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CGSlotSpec</span></code></a>(bucket, slot, config[, config_idx])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CachedPrefix</span></code></a>(label, tokens, position)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.CachedLease" title="mstar.engine.resources.base.CachedLease"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CachedLease</span></code></a>(pages, lent)</p></td>
+<td><p>Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its <code class="docutils literal notranslate"><span class="pre">pages</span></code>, and the ones it <code class="docutils literal notranslate"><span class="pre">lent</span></code>, which another request holds and so take no room.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.CachedPrefix" title="mstar.engine.resources.base.CachedPrefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CachedPrefix</span></code></a>(label, tokens, position)</p></td>
 <td><p>How much of a walk's input a resource already holds for <code class="docutils literal notranslate"><span class="pre">label</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.EngineResourceInfo" title="mstar.engine.resources.base.EngineResourceInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EngineResourceInfo</span></code></a>(device[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.EngineResourceInfo" title="mstar.engine.resources.base.EngineResourceInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EngineResourceInfo</span></code></a>(device[, ...])</p></td>
 <td><p>What the engine has to offer a resource at build time.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.KeyedWalks" title="mstar.engine.resources.base.KeyedWalks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KeyedWalks</span></code></a>(writes[, growth])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.KeyedWalks" title="mstar.engine.resources.base.KeyedWalks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KeyedWalks</span></code></a>(writes[, growth])</p></td>
 <td><p>A keyed label's walks, as a resource's prefix cache takes them: the walks whose writes are keyed, and the growth walks whose sampled ids extend the keys.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.MoveKind" title="mstar.engine.resources.base.MoveKind"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MoveKind</span></code></a>(*values)</p></td>
+<td><p>A kind of move that rank 0 of a TP node makes on a request and each TP follower replays.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a>()</p></td>
 <td><p></p></td>
@@ -1059,6 +1084,32 @@ what a captured graph reads keeps its address. Called once, by the engine.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.CGSlotSpec.slot">
 <span class="sig-name descname"><span class="pre">slot</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.CGSlotSpec.slot" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.CachedLease">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">CachedLease</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lent</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#CachedLease"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.CachedLease" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Rank 0’s lease of a stream’s cached prefix, which a TP follower takes as given: its <code class="docutils literal notranslate"><span class="pre">pages</span></code>, and the
+ones it <code class="docutils literal notranslate"><span class="pre">lent</span></code>, which another request holds and so take no room.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>lent</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.CachedLease.lent">
+<span class="sig-name descname"><span class="pre">lent</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.base.CachedLease.lent" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.CachedLease.pages">
+<span class="sig-name descname"><span class="pre">pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.base.CachedLease.pages" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1226,6 +1277,68 @@ writes are keyed, and the growth walks whose sampled ids extend the keys.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">MoveKind</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#MoveKind"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.MoveKind" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.IntEnum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">IntEnum</span></code></a></p>
+<p>A kind of move that rank 0 of a TP node makes on a request and each TP follower replays.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.ALLOT">
+<span class="sig-name descname"><span class="pre">ALLOT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.ALLOT" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.DROP">
+<span class="sig-name descname"><span class="pre">DROP</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">5</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.DROP" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.EARMARK">
+<span class="sig-name descname"><span class="pre">EARMARK</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">4</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.EARMARK" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.FORGET">
+<span class="sig-name descname"><span class="pre">FORGET</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">10</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.FORGET" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.GUARANTEE">
+<span class="sig-name descname"><span class="pre">GUARANTEE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">7</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.GUARANTEE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.LAND">
+<span class="sig-name descname"><span class="pre">LAND</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">6</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.LAND" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.OFFLOAD">
+<span class="sig-name descname"><span class="pre">OFFLOAD</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.OFFLOAD" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.RELOAD">
+<span class="sig-name descname"><span class="pre">RELOAD</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.RELOAD" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.RESERVE">
+<span class="sig-name descname"><span class="pre">RESERVE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.RESERVE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.UNRESERVE">
+<span class="sig-name descname"><span class="pre">UNRESERVE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.UNRESERVE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.MoveKind.WAIT">
+<span class="sig-name descname"><span class="pre">WAIT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">9</span></span><a class="headerlink" href="#mstar.engine.resources.base.MoveKind.WAIT" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.PublishedInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">PublishedInfo</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#PublishedInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.PublishedInfo" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
@@ -1352,8 +1465,8 @@ Returns whether the retrieve has completed.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.adopt_cached_prefix">
-<span class="sig-name descname"><span class="pre">adopt_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caught_up</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.adopt_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.adopt_cached_prefix" title="Link to this definition">#</a></dt>
-<dd><p>On a TP follower, lease <code class="docutils literal notranslate"><span class="pre">pages</span></code> as rank 0 did. False until this rank holds them too, and
+<span class="sig-name descname"><span class="pre">adopt_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lease</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caught_up</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.adopt_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.adopt_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>On a TP follower, take rank 0’s <code class="docutils literal notranslate"><span class="pre">lease</span></code>. False until this rank holds its pages too, and
 raises if it still lacks them once <code class="docutils literal notranslate"><span class="pre">caught_up</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1361,7 +1474,7 @@ raises if it still lacks them once <code class="docutils literal notranslate"><s
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>lease</strong> (<a class="reference internal" href="#mstar.engine.resources.base.CachedLease" title="mstar.engine.resources.base.CachedLease"><em>CachedLease</em></a>)</p></li>
 <li><p><strong>caught_up</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
@@ -1849,7 +1962,7 @@ ingests), on the thread that leases the step’s graph.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.lease_cached_prefix">
 <span class="sig-name descname"><span class="pre">lease_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.lease_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.lease_cached_prefix" title="Link to this definition">#</a></dt>
 <dd><p>On rank 0 of a TP node, lease the request’s cached prefix as its step is sent and
-return the pages, or None.</p>
+return the lease, or None.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1859,7 +1972,7 @@ return the pages, or None.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>] | None</p>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.base.CachedLease" title="mstar.engine.resources.base.CachedLease"><em>CachedLease</em></a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1893,11 +2006,12 @@ compile’s warm-up) on this thread, as in a step that runs it lean.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.page_trail">
 <span class="sig-name descname"><span class="pre">page_trail</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.page_trail"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.page_trail" title="Link to this definition">#</a></dt>
-<dd><p>How many page allocations this resource has made and a hash of their pages in
-order, for a TP follower to check against rank 0’s. None where it keeps no trail.</p>
+<dd><p>What a TP follower checks against rank 0’s before each step, such as how many page
+allocations this resource has made and a hash of their pages in order. None where it
+keeps no trail.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>] | None</p>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, …] | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2363,6 +2477,11 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CGSlotSpec.slot"><code class="docutils literal notranslate"><span class="pre">CGSlotSpec.slot</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease"><code class="docutils literal notranslate"><span class="pre">CachedLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease.lent"><code class="docutils literal notranslate"><span class="pre">CachedLease.lent</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedLease.pages"><code class="docutils literal notranslate"><span class="pre">CachedLease.pages</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix"><code class="docutils literal notranslate"><span class="pre">CachedPrefix</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix.label"><code class="docutils literal notranslate"><span class="pre">CachedPrefix.label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.CachedPrefix.position"><code class="docutils literal notranslate"><span class="pre">CachedPrefix.position</span></code></a></li>
@@ -2387,6 +2506,20 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks"><code class="docutils literal notranslate"><span class="pre">KeyedWalks</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks.growth"><code class="docutils literal notranslate"><span class="pre">KeyedWalks.growth</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.KeyedWalks.writes"><code class="docutils literal notranslate"><span class="pre">KeyedWalks.writes</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind"><code class="docutils literal notranslate"><span class="pre">MoveKind</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.ALLOT"><code class="docutils literal notranslate"><span class="pre">MoveKind.ALLOT</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.DROP"><code class="docutils literal notranslate"><span class="pre">MoveKind.DROP</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.EARMARK"><code class="docutils literal notranslate"><span class="pre">MoveKind.EARMARK</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.FORGET"><code class="docutils literal notranslate"><span class="pre">MoveKind.FORGET</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.GUARANTEE"><code class="docutils literal notranslate"><span class="pre">MoveKind.GUARANTEE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.LAND"><code class="docutils literal notranslate"><span class="pre">MoveKind.LAND</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.OFFLOAD"><code class="docutils literal notranslate"><span class="pre">MoveKind.OFFLOAD</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.RELOAD"><code class="docutils literal notranslate"><span class="pre">MoveKind.RELOAD</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.RESERVE"><code class="docutils literal notranslate"><span class="pre">MoveKind.RESERVE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.UNRESERVE"><code class="docutils literal notranslate"><span class="pre">MoveKind.UNRESERVE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.MoveKind.WAIT"><code class="docutils literal notranslate"><span class="pre">MoveKind.WAIT</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.PublishedInfo"><code class="docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
