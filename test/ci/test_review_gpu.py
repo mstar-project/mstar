@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import tracemalloc
 import types
 import unittest
@@ -360,6 +361,8 @@ class TestStart(unittest.TestCase):
         self.assertIn("ERAS_RUN_SECRET_ID", (out / "nvidia/unavailable.md").read_text())
         out, launched = self.start({"eras": {"run_secret_id": "s"}})
         self.assertEqual([x[1] for x in launched], ["eras:l1"])
+        self.assertLess(json.loads((out / "run.json").read_text())["end_by"], time.time() + 4 * 3600 - 10 * 60,
+                        "the session would run into the box's deadline and its results go with the box")
         self.assertNotIn(self.INJECTED, (out / "nvidia/brief.md").read_text(),
                          "model text from an untrusted PR would be instructions to a root shell")
         self.assertEqual(json.loads((out / "findings.json").read_text())["focus"],

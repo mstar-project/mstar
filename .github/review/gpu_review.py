@@ -366,6 +366,9 @@ def boxes(lt):
     return [lt / v for v in bot.VENDORS if (lt / v).is_dir()]
 
 
+SESSION_MARGIN = 15 * 60  # seconds a box's session stops before the box's deadline
+
+
 def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, vendors="nvidia", since="",
           forced="", asked="", asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
@@ -390,8 +393,11 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     (lt / "findings.json").write_text(json.dumps(findings, indent=1))
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     (lt / "pr-body.md").write_text(f"# {pull['title']}\n\n{pull['body'] or ''}\n")
+    # end_by: when the box's session stops, SESSION_MARGIN before the box's deadline (a quarter of a short run),
+    # so its results are collected before the box goes
+    end_by = int(time.time() + hours * 3600 - min(SESSION_MARGIN, hours * 3600 / 4))
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
-                                             "model": MODEL, "turns": turns, "claude": CLAUDE}))
+                                             "model": MODEL, "turns": turns, "claude": CLAUDE, "end_by": end_by}))
     cfg = gpu_py.load_config()
     found = {}  # vendor -> (the offers that can start now, the listing, what was left out and why)
     for vendor in vendors:
