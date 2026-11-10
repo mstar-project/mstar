@@ -56,11 +56,14 @@ NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
 # `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
 # Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
-# PR's live test run on an AMD box too (vendors_of), and stop counting once it passed there.
-AMD = r"(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|mi\d{3}[ax]?"
+# PR's live test run on an AMD box too (vendors_of), and those it covers (covered_by_amd) stop counting once it
+# passed there.
+AMD_MODEL = r"mi\d{3}[ax]?"
+AMD = rf"(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"
 UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
                                  r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
 AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+AMD_RENTED = gpu_py.SUPPORTED["amd"]  # the AMD GPUs an AMD box can be
 # The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
 # for a PR that names AMD hardware.
 VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
@@ -216,14 +219,21 @@ FILLER = re.compile(r"\b(?:a|an|the|and|or|of|on|for|in|its|kernels?|code|paths?
                     re.IGNORECASE)
 
 
+def covered_by_amd(word):
+    """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
+    `is_amd`), or a model gpu.py rents (MI300X and up; an MI250 stays untestable)."""
+    return bool(AMD_HARDWARE.fullmatch(word)) and (not re.fullmatch(AMD_MODEL, word, re.IGNORECASE)
+                                                   or bool(AMD_RENTED.search(word)))
+
+
 def beyond_vendors(text, vendors):
     """The review's `untestable` text (model text) without what a run on `vendors` covers: with AMD among them, its
-    AMD hardware words, and a clause (between `;` and `,`) they leave saying nothing (FILLER)."""
+    AMD hardware words (covered_by_amd), and a clause (between `;` and `,`) they leave saying nothing (FILLER)."""
     if "amd" not in vendors or not text:
         return text or ""
     kept = []
     for clause in re.split(r"[;,]", text):
-        rest = UNTESTABLE_HARDWARE.sub(lambda m: "" if AMD_HARDWARE.fullmatch(m[0]) else m[0], clause)
+        rest = UNTESTABLE_HARDWARE.sub(lambda m: "" if covered_by_amd(m[0]) else m[0], clause)
         rest = " ".join(rest.split())
         if FILLER.sub("", rest):
             kept.append(rest)
@@ -642,7 +652,7 @@ def untestable(pull, changes, review, vendors):
     names and changed lines, but what the run on `vendors` covers (AMD, when it ran on an AMD box: the rule
     then also needs its verdict, which is a pass only when every box passed). A diff GitHub won't give is a
     reason too."""
-    named = [w for w in hardware_named(pull, changes) if "amd" not in vendors or not AMD_HARDWARE.fullmatch(w)]
+    named = [w for w in hardware_named(pull, changes) if "amd" not in vendors or not covered_by_amd(w)]
     needs = [x for x in (beyond_vendors((review.get("live_test") or {}).get("untestable"), vendors),
                          ", ".join(named)) if x]
     unread = [f["filename"] for f in changes if f.get("changes") and not f.get("patch")]

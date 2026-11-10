@@ -687,7 +687,11 @@ class TestApprove(unittest.TestCase):
                 ("both, the review naming AMD and Intel", {"vendors": "nvidia,amd",
                                                            "untestable": "AMD kernels; the Intel XPU path"}, False),
                 ("both, a TPU line too", {"vendors": "nvidia,amd", "files": [
-                    *rocm, {"filename": "docs/x.rst", "changes": 1, "patch": "@@ -1 +1 @@\n+TPU"}]}, False)):
+                    *rocm, {"filename": "docs/x.rst", "changes": 1, "patch": "@@ -1 +1 @@\n+TPU"}]}, False),
+                ("both, an MI300X line", {"vendors": "nvidia,amd", "files": [
+                    *rocm, {"filename": "docs/x.rst", "changes": 1, "patch": "@@ -1 +1 @@\n+MI300X"}]}, True),
+                ("both, an MI250 line", {"vendors": "nvidia,amd", "files": [
+                    *rocm, {"filename": "docs/x.rst", "changes": 1, "patch": "@@ -1 +1 @@\n+MI250"}]}, False)):
             with self.subTest(name):
                 text, _, writes = self.approve({"value": "on"}, **{"files": rocm, **kwargs})
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved,
@@ -697,7 +701,8 @@ class TestApprove(unittest.TestCase):
         for text, kept in (("AMD MI300X kernels on two nodes (16 GPUs)", "two nodes (16 GPUs)"),
                            ("the ROCm path needs the aiter weights from a gated repo",
                             "aiter weights from a gated repo"),
-                           ("MI250 (gfx90a) kernels", "(gfx90a) kernels"), ("AMD MI300X kernels; ROCm code", "")):
+                           ("MI250 (gfx90a) kernels", "MI250 (gfx90a) kernels"),
+                           ("AMD MI300X kernels; ROCm code", "")):
             with self.subTest(text):
                 left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
                 self.assertIn(kept, left, "what the AMD box can't run either would stop counting")
