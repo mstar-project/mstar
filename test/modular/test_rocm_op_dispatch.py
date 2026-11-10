@@ -29,7 +29,6 @@ _ROCM_BACKENDS = (
 _DISPATCHES = (
     norm_ops._rmsnorm,
     norm_ops._fused_add_rmsnorm,
-    norm_ops.run_fused_add_rms_norm,
     rope_ops._rope,
     sampler_utils._top_p_sampling_from_probs,
     sampler_utils._top_k_top_p_sampling_from_probs,
@@ -161,33 +160,6 @@ def test_fused_add_rms_norm_is_flashinfers_in_place_kernel(stack, platform, gemm
     [(name, args, _)] = rec.calls
     assert name == ("norm.gemma_fused_add_rmsnorm" if gemma else "norm.fused_add_rmsnorm")
     assert args[0] is h and args[1] is r and args[2] is w and args[3] == 1e-5
-
-
-@pytest.mark.parametrize("gemma", [False, True])
-def test_nvidia_forward_residual_calls_flashinfer_directly(stack, monkeypatch, gemma):
-    """NVIDIA keeps the direct in-place call, outside any op."""
-    rec = stack(CudaPlatform(), rocm_fork=False)
-
-    def op(*args):
-        raise AssertionError("NVIDIA went through mstar::fused_add_rms_norm")
-
-    monkeypatch.setattr(torch.ops.mstar, "fused_add_rms_norm", op)
-    h, r, w = torch.ones(2, 8), torch.ones(2, 8), torch.ones(8)
-    norm_ops.run_fused_add_rms_norm(h, r, w, 1e-5, gemma)
-    [(name, args, _)] = rec.calls
-    assert name == ("norm.gemma_fused_add_rmsnorm" if gemma else "norm.fused_add_rmsnorm")
-    assert args[0] is h and args[1] is r
-
-
-def test_amd_forward_residual_goes_through_the_op(stack, monkeypatch):
-    stack(RocmPlatform())
-    calls = []
-    monkeypatch.setattr(
-        torch.ops.mstar, "fused_add_rms_norm", lambda *args: calls.append(args),
-    )
-    h, r, w = torch.ones(2, 8), torch.ones(2, 8), torch.ones(8)
-    norm_ops.run_fused_add_rms_norm(h, r, w, 1e-5, True)
-    assert calls == [(h, r, w, 1e-5, True)]
 
 
 def test_fused_add_rms_norm_fallback_follows_flashinfer_numerics():
