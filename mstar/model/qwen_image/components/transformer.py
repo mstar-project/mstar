@@ -16,7 +16,9 @@ and the real ``[txt | img]`` as the reference attends it. RoPE follows ``QwenEmb
 (``scale_rope``): the target at frame 0 and reference ``i`` at frame ``i``, heights and widths
 centred, text from ``max(h/2, w/2)`` over every image. The rotation is the reference's
 complex product itself: its rounding is the device's complex multiply (fused multiply-adds on
-CUDA), which no one real-arithmetic formula reproduces on every device.
+CUDA), which no one real-arithmetic formula reproduces on every device. Under ``torch.compile``
+inductor runs that product as an aten fallback outside its fused kernels, which a compile on/off
+comparison has to account for.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
