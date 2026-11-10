@@ -563,6 +563,7 @@ class APIServer:
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
+        self.served_models.refuse_unserved(model)
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         connections = model.get_partition_topology().client_connections() if model is not None else []
@@ -594,6 +595,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
+            served_models=self.served_models,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker

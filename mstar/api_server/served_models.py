@@ -113,3 +113,32 @@ class ServedModels:
             digest = self.check(adapter)
         kwargs = {**(model_kwargs or {}), LORA_ADAPTER_KWARG: adapter, LORA_DIGEST_KWARG: digest}
         return Selected(kwargs, adapter_prefix_root(digest))
+
+    def model_chose(self, chosen: str | None, model_kwargs: dict, root: bytes) -> Selected:
+        """``select``'s answer for a request whose ``process_prompt`` runs it on ``chosen``
+        (``ProcessPromptOutput.lora_adapter``; None for the base model). ``model_kwargs``
+        and ``root`` are what ``select`` settled from the request itself, which the same
+        adapter keeps. A request that named another is a ``ValueError``, as is an adapter
+        that is not selectable now (a runtime unload)."""
+        named = model_kwargs.get(LORA_ADAPTER_KWARG)
+        if chosen == named:
+            return Selected(model_kwargs, root)
+        if named is not None:
+            raise ValueError(
+                f"the request names LoRA adapter {named!r}, but the model runs this prompt "
+                f"under {chosen!r}"
+            )
+        digest = self.check(chosen)
+        kwargs = {**model_kwargs, LORA_ADAPTER_KWARG: chosen, LORA_DIGEST_KWARG: digest}
+        return Selected(kwargs, adapter_prefix_root(digest))
+
+    def refuse_unserved(self, model) -> None:
+        """Refuse, at startup, a deployment that does not serve every adapter ``model``'s
+        ``process_prompt`` may run a prompt on (``Model.prompt_lora_adapters``)."""
+        missing = sorted(model.prompt_lora_adapters() - self._digests.keys()) if model is not None else []
+        if missing:
+            raise ValueError(
+                f"{type(model).__name__} runs some prompts on LoRA adapters {missing}, which "
+                "this deployment does not serve: name each, with its path, in the serving "
+                "config's `resources: lora: adapters:` block"
+            )
