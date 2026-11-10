@@ -35,16 +35,17 @@ class GuidanceCombine(Protocol):
     """``(predictions in branch order, {scale name: [B, 1, ...] at the predictions' rank}) -> prediction``.
 
     ``scales`` names the request knobs it reads, the one place they are declared: the base stages each per step
-    under its name and hands it here. Two scales (text and image guidance, say) are two names. A combine is an
-    object that carries them, as :class:`Cfg` does; a custom one subclasses it or declares its own."""
+    under its name and hands their values here. Two scales (text and image guidance, say) are two names. A combine
+    is an object that carries them, as :class:`Cfg` does: one with a single knob of another name subclasses
+    :class:`Cfg` with its own ``scales``, and one with more knobs declares its ``scales`` and ``__call__``."""
 
     scales: tuple[str, ...]
 
-    def __call__(self, preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor: ...
+    def __call__(self, preds: Sequence[torch.Tensor], values: Mapping[str, torch.Tensor]) -> torch.Tensor: ...
 
 
 class Cfg:
-    """Classifier-free guidance, ``u + s (c - u)`` with ``s`` the ``guidance_scale``.
+    """Classifier-free guidance, ``u + s (c - u)`` with ``s`` its one scale (``guidance_scale``).
 
     The references multiply the difference by a Python float, which rounds the product once in the
     prediction's dtype. ``s`` is an fp32 tensor here, so the product is taken in fp32 and cast back
@@ -52,17 +53,18 @@ class Cfg:
 
     scales = (GUIDANCE_SCALE,)
 
-    def __call__(self, preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def __call__(self, preds: Sequence[torch.Tensor], values: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        (scale,) = self.scales
         cond, uncond = preds
-        return uncond + (scales[GUIDANCE_SCALE] * (cond - uncond).float()).to(cond.dtype)
+        return uncond + (values[scale] * (cond - uncond).float()).to(cond.dtype)
 
 
 class CfgRenorm(Cfg):
     """:class:`Cfg`, rescaled per token to the conditional prediction's norm over the last dim
     (Qwen-Image's ``comb * |cond| / |comb|``)."""
 
-    def __call__(self, preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        comb = super().__call__(preds, scales)
+    def __call__(self, preds: Sequence[torch.Tensor], values: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        comb = super().__call__(preds, values)
         return comb * (preds[0].norm(dim=-1, keepdim=True) / comb.norm(dim=-1, keepdim=True))
 
 
@@ -99,8 +101,8 @@ class Guidance(NamedTuple):
         """The request knobs ``combine`` reads (its ``scales``)."""
         return self.combine.scales
 
-    def active(self, scales: Mapping) -> bool:
-        """Whether guidance is on at these scales (a request's ``step_metadata``, or one step's fill): one of them
-        above 1. Every place that acts on it (the text encoder skipping the negative prompt, intake, the step
+    def active(self, values: Mapping) -> bool:
+        """Whether guidance is on at these values (a request's ``step_metadata``, or one step's fill): one of its
+        scales above 1. Every place that acts on it (the text encoder skipping the negative prompt, intake, the step
         key) asks here."""
-        return any(float(scales[name]) > 1.0 for name in self.scales)
+        return any(float(values[name]) > 1.0 for name in self.scales)

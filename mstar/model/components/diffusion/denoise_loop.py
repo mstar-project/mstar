@@ -390,7 +390,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         guidance = self.GUIDANCE
         if guidance is None:
             return self.model_output(engine_inputs, key, latents, timestep, **inputs)
-        scales = {name: inputs.pop(name) for name in guidance.scales}
+        values = {name: inputs.pop(name) for name in guidance.scales}
         named = {edge for branch in guidance.branches for edge in branch.values()}
         shared = {name: tensor for name, tensor in inputs.items() if name not in named}
         rows = [
@@ -406,7 +406,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # [B * local, ...] -> [B, local, ...] -> every branch, gathered over the group in branch order
         pred = self.cfg_group.all_gather(pred.reshape(-1, local, *pred.shape[1:]).contiguous(), dim=1)
         rank = [1] * (pred.ndim - 2)
-        return guidance.combine(pred.unbind(1), {name: s.reshape(-1, *rank) for name, s in scales.items()})
+        return guidance.combine(pred.unbind(1), {name: s.reshape(-1, *rank) for name, s in values.items()})
 
     # --------------------------------------------------------------- helpers
     def layout(self, key: StepKey, device: torch.device) -> Any:

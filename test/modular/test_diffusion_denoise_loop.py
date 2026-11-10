@@ -28,7 +28,7 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     FlowMatchSchedule,
     euler_step,
 )
-from mstar.model.components.diffusion.guidance import Guidance, cfg, cfg_renorm  # noqa: E402
+from mstar.model.components.diffusion.guidance import Cfg, Guidance, cfg, cfg_renorm  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
 
 LOOP = "denoise_loop"
@@ -736,11 +736,8 @@ def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_constructi
 def _renamed_scale(name):
     """GuidedToy with its one scale knob named ``name``."""
 
-    class RenamedCfg:
+    class RenamedCfg(Cfg):
         scales = (name,)
-
-        def __call__(self, preds, scales):
-            return cfg(preds, {"guidance_scale": scales[name]})
 
     class Renamed(GuidedToy):
         GUIDANCE = GuidedToy.GUIDANCE._replace(combine=RenamedCfg())
@@ -755,12 +752,20 @@ def test_a_guidance_scale_that_shadows_a_staged_input_is_refused_at_construction
 
 
 def test_a_guidance_scale_named_like_a_schedule_source_stages_beside_it():
+    """A renamed scale stages apart from the schedule's source, and ``Cfg`` combines with the scale it names."""
     sub = _renamed_scale("sigmas")()
     info = _info("a", 0)
     info.step_metadata["sigmas"] = 3.0
-    staged = sub.prepare_inputs(WALK, info, _guided_inputs(2.0, 1.0)).tensor_inputs
-    assert torch.equal(staged["sigmas"], torch.tensor([3.0]))
-    assert torch.equal(staged["sigma"], sub.request_state(_handle("a"))["schedule"].sigmas[:1])
+    row = sub.prepare_inputs(WALK, info, _guided_inputs(2.0, 1.0))
+    assert torch.equal(row.tensor_inputs["sigmas"], torch.tensor([3.0]))
+    assert torch.equal(row.tensor_inputs["sigma"], sub.request_state(_handle("a"))["schedule"].sigmas[:1])
+    engine_inputs = ModelInputsFromEngine(request_ids=["a"], per_request_info={})
+    kwargs = sub.preprocess(WALK, engine_inputs, [row])
+    key = kwargs.pop("step_key")
+    for name in ("sigma", "sigma_next", LATENTS):
+        kwargs.pop(name)
+    pred = sub.guided_output(engine_inputs, key, torch.zeros(1, 8, 4), kwargs.pop("timestep"), **kwargs)
+    assert torch.equal(pred, torch.full((1, 8, 4), 1.0 + 3.0 * (2.0 - 1.0)))
 
 
 def test_guided_capture_buckets_stage_the_scale_and_both_keys():

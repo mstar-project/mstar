@@ -3333,12 +3333,13 @@ ranks, gathers their predictions and combines them with the request's scales, ea
 scalar, so rows at different scales share a forward. ``combine`` receives them as
 ``{name: tensor}`` and names the knobs it reads in its own ``scales`` (``cfg``:
 ``guidance_scale``), so they are declared once: a combine is an object with its ``scales``
-and a ``__call__``, as ``guidance.Cfg`` is, and a model with other knobs subclasses it or
-writes its own. ``Guidance.active`` is the one rule for whether guidance is on: for a request, which the text encoder also asks before it encodes
-a negative prompt, and for each step, at the scales ``Guidance.at(step_metadata, step)``
-gives it. That field is the request's per-step fill (default: its knobs at every step); a
-model with guidance on an interval of steps declares its own, and its other steps run
-branch 0 alone.
+and a ``__call__``, as ``guidance.Cfg`` is. A model whose one knob has another name
+subclasses ``Cfg`` with its own ``scales``; one with more knobs declares its ``scales``
+and ``__call__``. ``Guidance.active`` is the one rule for whether guidance is on: for a
+request, which the text encoder also asks before it encodes a negative prompt, and for
+each step, at the scales ``Guidance.at(step_metadata, step)`` gives it. That field is the
+request's per-step fill (default: its knobs at every step); a model with guidance on an
+interval of steps declares its own, and its other steps run branch 0 alone.
 
 A multi-step scheduler that carries solver state between iterations names it in
 ``SOLVER_STATE``; those become loop-back edges alongside ``latents``, seeded by
