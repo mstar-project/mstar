@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.biased_attention import dense_bias_attention
 from mstar.model.components.fastconformer_kernels import (
     add_layer_norm,
     bias_relu_mask_,
@@ -299,7 +298,7 @@ class RelPositionAttention(nn.Module):
         if mask is not None:
             bias.masked_fill_(~mask, torch.finfo(bias.dtype).min)
         q, k, v = (q + self.bias_u).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        out = dense_bias_attention(q, k, v, bias)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
     def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
