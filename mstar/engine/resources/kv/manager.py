@@ -1811,6 +1811,9 @@ class KVManager(AttentionResource):
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
+            # the aux planes a page holds beside its KV (DSA's index keys)
+            *([sorted((name, aux.num_layers, aux.width) for name, aux in self.config.aux_planes.items())]
+              if self.config.aux_planes else []),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
