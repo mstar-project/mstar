@@ -129,10 +129,10 @@ def test_align_op_uses_torchs_hip_runtime():
 
 @pytest.mark.parametrize("dims", [THINKER, TALKER], ids=["thinker", "talker"])
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64, 256, 1024])
-def test_triton_backend_matches_reference(dims, num_tokens):
+def test_triton_backend_matches_reference(dims, num_tokens, monkeypatch):
     from mstar.utils.fused_moe.backend import TritonFusedMoE
     from mstar.utils.fused_moe.kernels import get_default_config
-    from mstar.utils.fused_moe.runner import fused_experts
+    from mstar.utils.fused_moe import runner
 
     x, w1, w2, weights, ids = _inputs(dims, num_tokens)
     ref = _reference(x, w1, w2, weights, ids)
@@ -140,7 +140,8 @@ def test_triton_backend_matches_reference(dims, num_tokens):
     _assert_matches(backend(x, w1, w2, weights, ids), ref)
     e, inter, hidden, top_k = dims
     default = get_default_config(M=num_tokens, E=e, N=2 * inter, K=hidden, top_k=top_k)
-    _assert_matches(fused_experts(x, w1, w2, weights, ids, config=(default, default)), ref)
+    monkeypatch.setattr(runner, "get_config", lambda **_: (default, default))
+    _assert_matches(runner.fused_experts(x, w1, w2, weights, ids), ref)
 
 
 @pytest.mark.parametrize("dims", [THINKER, TALKER], ids=["thinker", "talker"])
@@ -189,17 +190,18 @@ def test_qwen3_omni_tables_load_here():
         assert _table_entry(dims) is not None, (name, dims)
 
 
-def test_every_shipped_config_matches_reference():
+def test_every_shipped_config_matches_reference(monkeypatch):
     """A tuned entry with a bad compiler-option combination compiles and runs
     but computes garbage (kpack=2 with 16-wide K tiles did on gfx942)."""
-    from mstar.utils.fused_moe.runner import fused_experts
+    from mstar.utils.fused_moe import runner
 
     entries = _shipped_tables()
     if not entries:
         pytest.skip(f"no tuned table for {torch.cuda.get_device_name()}")
     for dims, m, cfg in entries:
         x, w1, w2, weights, ids = _inputs(dims, m)
-        out = fused_experts(x, w1, w2, weights, ids, config=cfg)
+        monkeypatch.setattr(runner, "get_config", lambda **_: cfg)
+        out = runner.fused_experts(x, w1, w2, weights, ids)
         try:
             _assert_matches(out, _reference(x, w1, w2, weights, ids))
         except AssertionError as e:
