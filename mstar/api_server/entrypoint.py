@@ -1805,7 +1805,8 @@ class APIServer:
         self, request_id: str, raw_request: Request | None = None
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
-        return its chunks. Disconnecting or timing out releases engine state."""
+        return its chunks. Disconnecting, timing out, or cancelling the wait
+        releases the submission."""
         start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
@@ -1821,28 +1822,34 @@ class APIServer:
                 req.wake = wake
                 req.wake_on_finish = True
         checked = start
-        while True:
-            # Cleared before the read: a notification that lands after this
-            # point stays set and the wait below returns at once.
-            wake.clear()
-            with self.request_lock:
-                req = self.pending_requests.get(key)
-                done = req.event.is_set() if req else True
-            if done:
-                break
-            now = time.monotonic()
-            if now - start > self.timeout_seconds:
-                self.abort_submission(key, outcome="timeout")
-                raise HTTPException(status_code=500, detail="Request timed out")
-            if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
-                checked = now
-                if await raw_request.is_disconnected():
-                    self.abort_submission(key)
-                    return []
-            try:
-                await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while True:
+                # Cleared before the read: a notification that lands after this
+                # point stays set and the wait below returns at once.
+                wake.clear()
+                with self.request_lock:
+                    req = self.pending_requests.get(key)
+                    done = req.event.is_set() if req else True
+                if done:
+                    break
+                now = time.monotonic()
+                if now - start > self.timeout_seconds:
+                    self.abort_submission(key, outcome="timeout")
+                    raise HTTPException(status_code=500, detail="Request timed out")
+                if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
+                    checked = now
+                    if await raw_request.is_disconnected():
+                        self.abort_submission(key)
+                        return []
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            # Release this submission even if it finished during cancellation;
+            # a newer submission under the same public id must stay untouched.
+            self.release_submission(key)
+            raise
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
@@ -3124,7 +3131,7 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--enable-metrics", action="store_true",
-        help="Serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
         "--rust-frontend", action="store_true",

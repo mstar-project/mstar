@@ -44,6 +44,9 @@ class DSAManager(Resource):
                              f"declares {planes.width}")
         if spec.config.sm_scale is None:
             raise ValueError("DSA attends at DSAConfig.sm_scale: declare it")
+        if spec.config.rope_slot_masks and not kv_config.qk_rope_head_dim:
+            raise ValueError(f"DSAConfig.rope_slot_masks masks entries in {spec.config.kv_cache}'s "
+                             "rope slot, and its rows have none (qk_rope_head_dim 0)")
         page, kpool = kv_config.tokens_per_page, spec.config.kpool
         if page % kpool:
             # a pool's key sits in its last token's row: pools must not straddle pages
@@ -149,6 +152,12 @@ class DSAManager(Resource):
     def plan(self, step: DSAStep, ctx: StepContext) -> dict[str, DSAContext]:
         """Each label's rows from the KV plan (``ctx.plan_results``), the plan the layers read
         until the next. A pre-plan is kept and the next call promotes it."""
+        if step.rows_may_move and not self.config.rope_slot_masks:
+            # with a real rope key in the slot, a padded entry would score instead of masking
+            raise ValueError("DSAStep(rows_may_move=True) pads a captured plan with entries "
+                             "masked in the cache's rope slot: declare "
+                             "DSAConfig(rope_slot_masks=True), for a cache whose rope slot "
+                             "holds no key and queries that fill it with ones")
         if self._preplanned is not None and not ctx.is_preplan:
             self._current, self._preplanned = dict(self._preplanned), None
             return self._current
@@ -299,9 +308,9 @@ class DSAManager(Resource):
         if not ctx.captured:
             ctx.host_pos = pos.tolist()
             return
-        if not self.kpe:
-            raise ValueError("a captured step's spare entries are masked in the rope slot, "
-                             "and this cache has none")
+        if not self.config.rope_slot_masks:
+            raise ValueError("a captured step's spare entries are masked in the rope slot: "
+                             "declare DSAConfig(rope_slot_masks=True)")
         slot, row = kv.spare_row()
         row[:, self.kv_lora_rank:].fill_(pad_kpe)
         ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
