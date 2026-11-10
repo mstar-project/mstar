@@ -840,7 +840,10 @@ class TestEras(unittest.TestCase):
         printed = io.StringIO()
         with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed), \
                 unittest.mock.patch.object(gpu_review.time, "sleep"):
-            step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py *": ""}, runner_temp=str(temp))
+            def pull(argv, stdin):  # the box's log as it ended
+                Path(argv[-1], "progress.log").write_text(logs[-1])
+                return ""
+            step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
         shown = [line for line in printed.getvalue().splitlines() if line.startswith('"09:')]
         self.assertEqual(shown, ['"09:00 plan written, about 40 min"', '"09:01 bootstrap done"',
                                  '"09:02 env [REDACTED]"', '"09:03 report"'],
@@ -853,7 +856,7 @@ class TestEras(unittest.TestCase):
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
     def test_a_progress_read_survives_a_shrunk_log_a_bad_count_and_an_endless_line(self):
-        def show(log, seen, count=None, final=False, caps=True):
+        def show(log, seen, count=None, caps=True):
             """show_progress on a box whose progress.log is `log` (its line count `count`, default wc's), with
             `head`'s caps kept or not; what it printed and the count it returned."""
             def ssh(argv, stdin):
@@ -863,7 +866,7 @@ class TestEras(unittest.TestCase):
                 return f"{log.count(chr(10)) if count is None else count} progress.log\n" + body
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
-                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen, final)),
+                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen)),
                               {"gpu.py ssh": ssh})
             return printed.getvalue().splitlines(), out["n"]
 
@@ -875,11 +878,20 @@ class TestEras(unittest.TestCase):
         self.assertEqual((len(lines), n), (1, 1), "one line past the cap would stall the progress for good")
         self.assertEqual(show(long + "\n09:02 c\n", 1), (['"09:02 c"'], 2))
         self.assertEqual(show(long, 0), ([], 0), "a long line still being written would be shown at every poll")
-        self.assertEqual(len(show(long, 0, final=True)[0]), 1, "the last line would be lost when the box ends")
         many = "".join(f"09:00 line {i}\n" for i in range(5000))
         self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
-        self.assertEqual(show(many[:3000] + "09:59 end", 0, final=True)[1], many[:3000].count("\n") + 1,
-                         "the final read would stop at 50 lines and lose the rest of the log")
+
+        def rest(log, seen):
+            path = Path(tempfile.mkdtemp(), "progress.log")
+            path.write_text(log)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                gpu_review.show_rest(path, seen)
+            return printed.getvalue().splitlines()
+        self.assertEqual(len(rest(many[:10000] + long, 0)), many[:10000].count("\n") + 1,
+                         "once the box ends, what the polls didn't print would be lost, the last line too")
+        self.assertEqual(rest("09:00 a\n09:01 b\n09:02 c", 2), ['"09:02 c"'], "a line would be printed twice")
+        self.assertEqual(len(rest(many * 2, 0)), gpu_review.PROGRESS_REST)
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",

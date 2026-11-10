@@ -409,14 +409,20 @@ def box_cost(path):
 PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
-def show_progress(key, seen, final=False):
-    """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the
-    job's log; the new count. Whole lines, at most 50 a read; the `final` read reads on until nothing new comes
-    (20 reads at most), the last line too. A line longer than the read's cap counts as one, cut, once wc counts
-    it. Each is redacted with the exact secret the redact step holds and the credential patterns, then cut and
-    quoted, since the session wrote them. A file that got shorter is read once more, from its start. The box caps
-    the read (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails,
-    times out or gives no line count changes nothing."""
+def print_progress(lines):
+    """Print the box session's progress lines to the job's log, each redacted (the Eras key, the only exact secret
+    this box could hold, and the credential patterns), then cut and quoted, since the session wrote them."""
+    exact = [os.environ.get("ERAS_API_KEY", "")]
+    for line in lines:
+        print(bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
+
+
+def show_progress(key, seen):
+    """Print the lines the box's session added to progress.log since the `seen` lines already printed
+    (print_progress); the new count. Whole lines, at most 50 a poll; a line longer than the read's cap counts as
+    one, cut, once wc counts it. A file that got shorter is read once more, from its start. The box caps the read
+    (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails, times out
+    or gives no line count changes nothing. What is left when the box is done, show_rest prints."""
     log = f"{ERAS_OUT}/progress.log"
 
     def read(start):  # (the file's line count, what follows line `start`), or None
@@ -428,36 +434,43 @@ def show_progress(key, seen, final=False):
             return None
         return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
 
-    for _ in range(20 if final else 1):
-        got = read(seen)
-        if got and got[0] < seen:  # rewritten shorter
-            seen, got = 0, read(0)
-        if got is None:
-            return seen
-        total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
-        # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
-        # ssh call captured, which isn't streamed: the PR's author is trusted.
-        lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
-        # The last piece is a line still being written, or nothing. It is shown on the final read (it ends the
-        # file, so nothing follows it), and when it is one line past the cap that wc already counts (so a line
-        # still being written isn't shown at every poll).
-        tail = lines.pop()
-        whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
-        unended = bool(tail) and final and not whole and len(lines) < 50
-        lines = [*lines, *([tail] if tail and (whole or unended) else [])][:50]
-        for line in lines:
-            print(bot.log_value(bot.redact(line, exact=[os.environ.get("ERAS_API_KEY", "")])[:300]), flush=True)
-        seen += len(lines)
-        if not lines or unended:
-            break
-    return seen
+    got = read(seen)
+    if got and got[0] < seen:  # rewritten shorter
+        seen, got = 0, read(0)
+    if got is None:
+        return seen
+    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+    # ssh call captured, which isn't streamed: the PR's author is trusted.
+    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+    # The last piece is a line still being written, or nothing: shown only when it is one line past the cap that
+    # wc already counts (so a line still being written isn't shown at every poll).
+    tail = lines.pop()
+    whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
+    lines = [*lines, *([tail] if tail and whole else [])][:50]
+    print_progress(lines)
+    return seen + len(lines)
+
+
+PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+
+
+def show_rest(path, seen):
+    """Once the box's results are back: the lines of its progress.log (`path`) the polls didn't print, the last one
+    too, at most PROGRESS_REST (print_progress); from its start if it got shorter than `seen`."""
+    if not path.is_file():
+        return
+    lines = path.read_text(errors="replace").split("\n")
+    if not lines[-1]:
+        lines.pop()
+    print_progress(lines[seen if seen <= len(lines) else 0:][:PROGRESS_REST])
 
 
 def wait(out, runner_temp):
     """Until the box's session finishes, printing its new progress lines at every poll (show_progress); then copy
-    its results back and let the box go. Exits 3, with `unavailable` set, when the box left no results (Eras
-    refused the Pod, say): the status, which carries the platform's failure code and message, goes in the
-    comment."""
+    its results back, print the progress lines left (show_rest) and let the box go. Exits 3, with `unavailable`
+    set, when the box left no results (Eras refused the Pod, say): the status, which carries the platform's
+    failure code and message, goes in the comment."""
     lt = Path(runner_temp, "lt")
     key, e = instance(lt)
     cfg = gpu_py.load_config()
@@ -477,13 +490,14 @@ def wait(out, runner_temp):
         # the Pod is gone, and its results with it, or the session is done
         done = state.startswith("run ") or state in ("ended", "releasing") \
             or bool(host) and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0
-        seen = show_progress(key, seen, final=done)
+        seen = show_progress(key, seen)
         if done:
             break
         time.sleep(60)
     results = lt / "results"
     results.mkdir(exist_ok=True)
     gpu("pull", key, f"{ERAS_OUT}/.", str(results), check=False, timeout=1800)
+    show_rest(results / "progress.log", seen)
     gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
     print("collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))
