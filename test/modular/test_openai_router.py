@@ -852,6 +852,17 @@ def test_images_edits_takes_the_openai_image_list_name(client_and_stub):
     assert resp.status_code == 200 and "image" in stub.last_submit["file_paths"]
 
 
+def test_images_edits_takes_every_reference_image_in_order(client_and_stub):
+    """A multi-reference model gets every upload; how many it takes is its own to refuse."""
+    client, stub = client_and_stub
+    stub.model_name = "flux2_klein"
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    uploads = [b"\x89PNGone", b"\x89PNGtwo", b"\x89PNGthree"]
+    resp = client.post("/v1/images/edits", files=[("image[]", u) for u in uploads], data={"prompt": "x"})
+    assert resp.status_code == 200, resp.text
+    assert [Path(p).read_bytes() for p in stub.last_submit["file_paths"]["image"]] == uploads
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the

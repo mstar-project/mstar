@@ -171,7 +171,7 @@ class _EveryRoute:
     def video_to_request(self, req, upload_dir):
         return self._args(req, "video")
 
-    def image_edit_to_request(self, prompt, image_path, model_kwargs):
+    def image_edit_to_request(self, prompt, image_paths, model_kwargs):
         return SubmitArgs(text=prompt, input_modalities=["text", "image"], model_kwargs=dict(model_kwargs))
 
 

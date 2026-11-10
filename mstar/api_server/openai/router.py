@@ -309,8 +309,9 @@ async def images_edits(request: Request):
         return err
     try:
         form = await request.form()
-        # One image, edited whole: a mask or a second image would be dropped. ``image[]``
-        # is how OpenAI clients name the image list.
+        # Every image, in upload order: the adapter and the model say how many they take. A
+        # mask would be dropped, as would any other upload. ``image[]`` is how OpenAI clients
+        # name the image list.
         images = []
         for key, value in form.multi_items():
             if not hasattr(value, "filename"):
@@ -318,17 +319,14 @@ async def images_edits(request: Request):
             if key not in ("image", "image[]"):
                 return _error(400, f"images/edits does not take a {key!r} upload; the whole image is edited")
             images.append(value)
-        if len(images) > 1:
-            return _error(400, f"images/edits takes one image, got {len(images)}")
-        image = images[0] if images else None
-        if image is None:
+        if not images:
             return _error(400, "images/edits requires an 'image' file upload")
         n = form.get("n")
         check_inline_result(form.get("response_format"), int(n) if n else None)
         limit = max_body_bytes()
-        if (getattr(image, "size", None) or 0) > limit:
+        if any((getattr(image, "size", None) or 0) > limit for image in images):
             return _error(413, f"images/edits accepts files up to {limit // 2**20} MiB (MSTAR_MAX_BODY_MB)")
-        image_bytes = await image.read()
+        uploads = [(await image.read(), getattr(image, "filename", None)) for image in images]
         prompt = form.get("prompt") or ""
         known = {"image", "image[]", "prompt", "model", "n", "size", "response_format"}
         extra: dict = {}
@@ -346,8 +344,7 @@ async def images_edits(request: Request):
             model_name,
             adapter,
             prompt=prompt,
-            image_bytes=image_bytes,
-            image_filename=getattr(image, "filename", None),
+            images=uploads,
             model_kwargs=extra,
             requested_model=form.get("model"),
             raw_request=request,

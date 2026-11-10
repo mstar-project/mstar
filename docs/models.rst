@@ -2344,8 +2344,8 @@ Serve on one GPU and generate::
 
 The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``seed``,
 ``n``; ``num_inference_steps`` through ``extra_body``) and ``POST /v1/images/edits``
-(multipart ``image`` + ``prompt``; up to four reference images are concatenated as
-conditioning tokens, in order).
+(multipart ``image`` + ``prompt``, one ``image[]`` per reference; up to four reference images
+are concatenated as conditioning tokens, in order).
 
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 

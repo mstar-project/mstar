@@ -528,8 +528,9 @@ Endpoints and model coverage:
      - Text-to-image.
    * - ``POST /v1/images/edits``
      - ``bagel``
-     - Image editing (image + prompt → image). One ``image`` (or ``image[]``), edited
-       whole: a ``mask``, a second image and ``n`` > 1 are refused.
+     - Image editing (images + prompt → image). Every ``image`` (or ``image[]``) upload, in
+       order, edited whole: a ``mask`` and ``n`` > 1 are refused, and so are more images
+       than the model takes (one for BAGEL; a multi-reference model says its own limit).
 
 Image and video results come back inline as ``b64_json``; ``response_format: "url"`` is
 refused (there is no media store to serve one from).

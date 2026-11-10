@@ -229,7 +229,7 @@ Endpoints and model coverage:
 | `WS /v1/realtime` | `nemotron_duplex` (full-duplex models) | A spoken conversation in OpenAI's GA Realtime events: microphone audio in, each agent reply out as one response (audio and its transcript). The model decides when to speak; see below. |
 | `WS /v1/realtime?intent=transcription` | models whose adapter can continue a hypothesis | Streaming speech-to-text: `input_audio_buffer.append` chunks in, `conversation.item.input_audio_transcription.delta` (append-only) and `mstar.transcription.partial` (whole current hypothesis) out; `commit` finishes the utterance. `input_audio_format` is `"pcm16"` (PCM16 at 16 kHz, the default; OpenAI reads it as 24 kHz, so an OpenAI client at 24 kHz declares `{"type": "audio/pcm", "rate": 24000}`), `"g711_ulaw"`, `"g711_alaw"` or a GA format object at the rates a conversation takes (below). Audio is resampled to 16 kHz. Turn detection is null (client commits), `server_vad` or `semantic_vad`; see below. |
 | `POST /v1/images/generations` | `bagel` | Text-to-image. |
-| `POST /v1/images/edits` | `bagel` | Image editing (image + prompt → image). One `image` (or `image[]`), edited whole: a `mask`, a second image and `n` > 1 are refused. |
+| `POST /v1/images/edits` | `bagel` | Image editing (images + prompt → image). Every `image` (or `image[]`) upload, in order, edited whole: a `mask` and `n` > 1 are refused, and so are more images than the model takes (one for BAGEL; a multi-reference model says its own limit). |
 
 Image and video results come back inline as `b64_json`; `response_format: "url"` is refused (there is no media store to serve one from).
 

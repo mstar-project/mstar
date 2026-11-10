@@ -1385,9 +1385,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
     let known = ["model"];
-    let mut image_bytes: Option<Vec<u8>> = None;
-    let mut image_filename: Option<String> = None;
-    let mut images = 0;
+    // every image, in upload order, with its filename
+    let mut images: Vec<(Vec<u8>, Option<String>)> = Vec::new();
     let mut requested_model: Option<String> = None;
     let mut prompt = String::new();
     let mut n: Option<String> = None;
@@ -1408,17 +1407,17 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         // A field read failure (body-limit overrun, mid-upload disconnect,
         // non-UTF-8 text) must surface as a 400, not be flattened to an empty
         // value — otherwise a truncated upload becomes a misleading error.
-        // One image, edited whole: a mask or a second image would be dropped.
-        // `image[]` is how OpenAI clients name the image list.
+        // Every image: the adapter and the model say how many they take. A mask
+        // would be dropped, as would any other upload. `image[]` is how OpenAI
+        // clients name the image list.
         if has_file && name != "image" && name != "image[]" {
             let msg = format!("images/edits does not take a '{name}' upload; the whole image is edited");
             return error(400, &msg, "invalid_request_error");
         }
         if name == "image" || name == "image[]" {
-            images += 1;
-            image_filename = field.file_name().map(str::to_string);
+            let filename = field.file_name().map(str::to_string);
             match field.bytes().await {
-                Ok(b) => image_bytes = Some(b.to_vec()),
+                Ok(b) => images.push((b.to_vec(), filename)),
                 Err(e) => {
                     let (status, msg) = multipart_failure(&e, e.to_string());
                     return error(status, &msg, "invalid_request_error");
@@ -1463,13 +1462,9 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     }
 
-    if images > 1 {
-        return error(400, &format!("images/edits takes one image, got {images}"), "invalid_request_error");
+    if images.is_empty() || images.iter().any(|(b, _)| b.is_empty()) {
+        return error(400, "images/edits requires an 'image' file upload", "invalid_request_error");
     }
-    let image_bytes = match image_bytes {
-        Some(b) if !b.is_empty() => b,
-        _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
-    };
     let n = match n.filter(|v| !v.is_empty()).map(|v| v.trim().parse::<i64>()) {
         None => None,
         Some(Ok(n)) => Some(n),
@@ -1478,24 +1473,36 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     if let Err(e) = check_inline_result(response_format.as_deref(), n) {
         return error(400, &e, "invalid_request_error");
     }
-    // Persist the uploaded image so the data-worker's loader can read it by path.
+    // Persist the uploaded images so the data-worker's loader can read them by path.
     if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
-    let ext = image_filename
-        .as_deref()
-        .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
-        .unwrap_or_else(|| ".png".to_string());
-    let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    let path = image_path.clone();
-    if let Err(e) = blocking(move || std::fs::write(&path, &image_bytes)).await {
+    let image_paths: Vec<PathBuf> = images
+        .iter()
+        .map(|(_, filename)| {
+            let ext = filename
+                .as_deref()
+                .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
+                .unwrap_or_else(|| ".png".to_string());
+            st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext))
+        })
+        .collect();
+    let remove_all = |paths: &[PathBuf]| {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    let writes: Vec<(PathBuf, Vec<u8>)> = image_paths.iter().cloned().zip(images.into_iter().map(|(b, _)| b)).collect();
+    if let Err(e) = blocking(move || writes.iter().try_for_each(|(path, bytes)| std::fs::write(path, bytes))).await {
+        remove_all(&image_paths);
         return error(500, &e.to_string(), "server_error");
     }
 
-    let mut args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
+    let paths: Vec<String> = image_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let mut args = match adapter.image_edit_to_request(&prompt, &paths, extra) {
         Ok(a) => a,
         Err(e) => {
-            let _ = std::fs::remove_file(&image_path);
+            remove_all(&image_paths);
             return error(400, &e, "invalid_request_error");
         }
     };

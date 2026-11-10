@@ -228,8 +228,10 @@ pub trait OpenAIAdapter: Send + Sync {
         Err("video generation is not supported by this model".to_string())
     }
 
-    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
-        let _ = (prompt, image_path, extra_kwargs);
+    /// An `images/edits` request's submission: the prompt and every uploaded image, in
+    /// upload order. How many images an edit takes is the adapter's or the model's to refuse.
+    fn image_edit_to_request(&self, prompt: &str, image_paths: &[String], extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        let _ = (prompt, image_paths, extra_kwargs);
         Err("image editing is not supported by this model".to_string())
     }
 

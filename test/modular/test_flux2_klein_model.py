@@ -262,8 +262,8 @@ def test_diffusion_image_adapter_maps_size_seed_and_edits(tmp_path):
     with pytest.raises(ValueError, match="WxH"):
         adapter.image_to_request(ImageGenerationRequest(prompt="x", size="big"), tmp_path)
 
-    edit = adapter.image_edit_to_request("make it neon", "/tmp/in.png", {"seed": 5, "size": "1024x1024"})
-    assert edit.file_paths == {"image": ["/tmp/in.png"]}
+    edit = adapter.image_edit_to_request("make it neon", ["/tmp/a.png", "/tmp/b.png"], {"seed": 5, "size": "1024x1024"})
+    assert edit.file_paths == {"image": ["/tmp/a.png", "/tmp/b.png"]}  # every reference, in upload order
     assert edit.input_modalities == ["image", "text"] and edit.output_modalities == ["image"]
     assert edit.model_kwargs == {"seed": 5, "width": 1024, "height": 1024}
 

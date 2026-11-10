@@ -288,7 +288,8 @@ class RequestBridge:
             # route feeds it from a form field).
             if req.seed is not None:
                 extra.setdefault("seed", req.seed)
-            submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
+            # one reference: this request body names a single input_reference
+            submits = [self.adapter.image_edit_to_request(req.prompt, [path], extra)]
         else:
             # OpenAI ``n``: n engine requests submitted up front, image i
             # seeded seed + i — the native create_images contract, so image 0

@@ -46,15 +46,15 @@ pub(super) fn sized_image(req: &ImageGenerationRequest) -> Result<SubmitArgs, St
     })
 }
 
-/// `BagelAdapter.image_edit_to_request` (and `DiffusionImageAdapter`'s).
-pub(super) fn sized_image_edit(prompt: &str, image_path: &str, mut extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+/// `DiffusionImageAdapter.image_edit_to_request` (and `BagelAdapter`'s, after its one-image check).
+pub(super) fn sized_image_edit(prompt: &str, image_paths: &[String], mut extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
     // a form field that parsed as JSON (e.g. "512") is still the size text
     let size = extra_kwargs
         .remove("size")
         .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
     size_kwargs(&mut extra_kwargs, size.as_deref(), "1024x1024")?;
     let mut file_paths = BTreeMap::new();
-    file_paths.insert("image".to_string(), vec![image_path.to_string()]);
+    file_paths.insert("image".to_string(), image_paths.to_vec());
     Ok(SubmitArgs {
         text: Some(prompt.to_string()),
         file_paths,
@@ -82,8 +82,12 @@ impl OpenAIAdapter for Bagel {
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         sized_image(req)
     }
-    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
-        sized_image_edit(prompt, image_path, extra_kwargs)
+    fn image_edit_to_request(&self, prompt: &str, image_paths: &[String], extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        // BAGEL edits one image: a second would be dropped
+        if image_paths.len() != 1 {
+            return Err(format!("images/edits takes one image, got {}", image_paths.len()));
+        }
+        sized_image_edit(prompt, image_paths, extra_kwargs)
     }
 }
 
@@ -97,7 +101,8 @@ impl OpenAIAdapter for DiffusionImage {
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         sized_image(req)
     }
-    fn image_edit_to_request(&self, prompt: &str, image_path: &str, extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
-        sized_image_edit(prompt, image_path, extra_kwargs)
+    fn image_edit_to_request(&self, prompt: &str, image_paths: &[String], extra_kwargs: Map<String, Value>) -> Result<SubmitArgs, String> {
+        // every reference image: the model refuses more than it takes
+        sized_image_edit(prompt, image_paths, extra_kwargs)
     }
 }
