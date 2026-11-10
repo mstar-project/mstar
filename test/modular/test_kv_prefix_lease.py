@@ -579,21 +579,27 @@ class _Capping(StubResource):
         return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
 
 
-@pytest.mark.parametrize(("other", "gone", "served", "held"), [
-    (_Holding(0), None, 0, False),
+@pytest.mark.parametrize(("other", "gone", "served", "holder", "shared"), [
+    (_Holding(0), None, 0, None, 0),
     # the lease ends at 96 and holds the window of tokens 72-96, but the index still holds 56-80's
-    (_Holding(80), None, 80, False),
-    # and a still holds 72-96's, so the cut gives back the room kept for b's holding them too (`_shared`)
-    (_Holding(80), None, 80, True),
+    (_Holding(80), None, 80, None, 0),
+    # and a still holds 72-96's, so the cut gives back the room kept for b's holding them, but the page of 72-80,
+    # which it takes again, keeps room for b's second hold (`_shared`)
+    (_Holding(80), None, 80, "a", 1),
+    # c holds 56-80's, which the cut takes again, so the pool keeps room for each of b's holds on them
+    (_Holding(80), None, 80, "c", 3),
     # the window page of tokens 64-72 is gone, so the cache serves 64, and the cap is asked again at 64
-    (_Capping(80), 8, 64, False),
-], ids=["declined", "shorter", "shorter_while_held", "capped"])
-def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served, held):
+    (_Capping(80), 8, 64, None, 0),
+], ids=["declined", "shorter", "shorter_while_held", "shorter_beside_a_holder", "capped"])
+def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served, holder, shared):
+    """``shared`` is `_shared` once the cut has taken the pages the index holds there."""
     kv = _window_manager()
     tokens = list(range(100))
     _write(kv, "a", tokens)
-    if not held:
+    if holder != "a":
         kv.remove_request("a")
+    if holder == "c":
+        _write(kv, "c", tokens[:80] + [9999])
     if gone is not None:
         rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
         kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, gone)], 1, gone)))
@@ -603,6 +609,7 @@ def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(othe
 
     matched = runner.resolve_cached_prefix("b", NODE, WALK, inputs)
     runner.apply_cached_prefix("b", NODE, WALK, inputs, matched)
+    assert kv._shared == shared
     _grow(kv, "b", 100 - matched.tokens)
 
     assert matched.tokens == served

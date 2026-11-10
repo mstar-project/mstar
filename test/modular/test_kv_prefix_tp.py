@@ -221,18 +221,29 @@ def test_ranks_cut_a_window_lease_alike_when_one_index_has_dropped_a_page():
     assert leader._streams["b"]["main"].lease == follower._streams["b"]["main"].lease
 
 
-def test_ranks_keep_the_walks_a_window_lease_served_when_a_later_walk_drops_it():
+@pytest.mark.parametrize("holder", [False, True], ids=["alone", "beside_a_holder"])
+def test_ranks_keep_the_walks_a_window_lease_served_when_a_later_walk_drops_it(holder):
     """A window lease holds the window's pages at its end. A later walk that writes unprobed cuts it back to the
-    walks it served, and above one rank only the lease's own pages count, so it holds the window there too."""
+    walks it served, and above one rank only the lease's own pages count, so it holds the window there too. With
+    ``holder``, c holds the window pages at the first walk's end already, which b's lease holds as walk starts."""
     ranks = leader, follower = _manager(0, window=24, max_num_pages=64), _manager(1, window=24, max_num_pages=64)
     parts = [_tokens(3 * PAGE_SIZE, seed=1), 3 * PAGE_SIZE, _tokens(52, seed=2)]
     for kv in ranks:
         _ingest(kv, "a", *parts)
         _run(kv, "a", *parts)
         kv.remove_request("a")
+    if holder:
+        c = parts[0] + _tokens(4, seed=3)
+        for kv in ranks:
+            _ingest(kv, "c", c)
+        assert _follow(follower, _send(leader, "c"))
+        for kv in ranks:
+            _run(kv, "c", c)
+    for kv in ranks:
         _ingest(kv, "b", *parts)
     assert _follow(follower, _send(leader, "b"))
     for kv in ranks:
+        assert kv._shared == (3 if holder else 0), "the pool keeps no room for the window pages b's lease shares"
         for walk, length in _walks(parts)[:2]:
             assert _step(kv, "b", length, walk) is None, "the cache didn't serve the first two walks whole"
 
@@ -244,6 +255,10 @@ def test_ranks_keep_the_walks_a_window_lease_served_when_a_later_walk_drops_it()
     assert [part.page_indices for part in leader._streams["b"]["main"].groups] == [
         part.page_indices for part in follower._streams["b"]["main"].groups
     ]
+    for kv in ranks:
+        for rid in ("b", "c") if holder else ("b",):
+            kv.remove_request(rid)
+        assert kv._shared == 0
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():
