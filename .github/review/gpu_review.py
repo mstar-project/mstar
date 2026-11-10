@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -576,21 +577,15 @@ def finished(box, cfg):
 PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
-def exact_secrets():
-    """The exact values a box's progress lines are redacted of: the review's own key, which a DigitalOcean box
-    holds, and the cloud keys."""
-    return [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
-
-
-def print_progress(lines, label):
+def print_progress(lines, exact, label):
     """Print a box session's progress lines to the job's log, after `label` (its vendor, when there are two boxes),
-    each redacted (exact_secrets and the credential patterns), then cut and quoted, since the session wrote them."""
-    exact = exact_secrets()
+    each redacted (the `exact` values and the credential patterns), then cut and quoted, since the session wrote
+    them."""
     for line in lines:
         print(label + bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
 
 
-def show_progress(box, seen, label):
+def show_progress(box, seen, exact, label):
     """Print the lines the box's session added to progress.log since the `seen` lines already printed
     (print_progress); the new count. Whole lines, at most 50 a poll; a line longer than the read's cap counts as
     one, cut, once wc counts it. A file that got shorter is read once more, from its start. The box caps the read
@@ -622,27 +617,27 @@ def show_progress(box, seen, label):
     tail = lines.pop()
     whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
     ended = raw[PROGRESS_CAP:PROGRESS_CAP + 1] == b"\n"  # exactly the cap long: whole, not cut
-    lines = [*lines, *([tail if ended else cut_short(tail)] if tail and whole else [])][:50]
-    print_progress(lines, label)
+    lines = [*lines, *([tail if ended else cut_short(tail, exact)] if tail and whole else [])][:50]
+    print_progress(lines, exact, label)
     return seen + len(lines)
 
 
 PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
 LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
-# What a credential pattern's token is made of. The exact secrets needn't be: cut_short strips their starts itself.
+# What a credential pattern's token is made of. The exact values needn't be: cut_short strips their starts itself.
 TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
 
 
-def cut_short(line):
+def cut_short(line, exact):
     """A progress line that was cut short at a cap, before it is redacted, and marked: without what it ends in that
-    may be the start of a secret the cut split (too short for the redaction to know), the longest start of an exact
-    secret (exact_secrets), then a run of token characters."""
-    for value in filter(None, exact_secrets()):
+    may be the start of a secret the cut split (too short for the redaction to know), the longest start of one of
+    the `exact` values it will be redacted of, then a run of token characters."""
+    for value in filter(None, exact):
         line = line[:len(line) - next((k for k in range(len(value) - 1, 0, -1) if line.endswith(value[:k])), 0)]
     return line.rstrip(TOKEN_CHARS) + "…"
 
 
-def log_lines(f):
+def log_lines(f, exact):
     """The lines of the binary file `f`, without their newline, each cut to LINE_CAP bytes (cut_short), the rest of
     it read past in such pieces: only "\\n" ends a line, as wc counts them, so a bare "\\r" (a progress bar)
     doesn't."""
@@ -654,21 +649,21 @@ def log_lines(f):
                 if more.endswith(b"\n"):
                     break
         text = line.removesuffix(b"\n").decode("utf-8", "replace")
-        yield cut_short(text) if cut else text
+        yield cut_short(text, exact) if cut else text
 
 
-def show_rest(path, seen, label):
+def show_rest(path, seen, exact, label):
     """Once a box's results are back: the lines of its progress.log (`path`) the polls didn't print, the last one
     too, at most PROGRESS_REST (print_progress); from its start if it got shorter than `seen`."""
     if not path.is_file():
         return
     with open(path, "rb") as f:
-        it = log_lines(f)
+        it = log_lines(f, exact)
         if sum(1 for _ in itertools.islice(it, seen)) < seen:  # rewritten shorter: from its start
             f.seek(0)
-            it = log_lines(f)
+            it = log_lines(f, exact)
         lines = list(itertools.islice(it, PROGRESS_REST))
-    print_progress(lines, label)
+    print_progress(lines, exact, label)
 
 
 def wait(out, runner_temp):
@@ -679,13 +674,15 @@ def wait(out, runner_temp):
     message; exits 3, with `unavailable` set, when no box left any."""
     lt = Path(runner_temp, "lt")
     cfg = gpu_py.load_config()
+    # what progress lines are redacted of: the review's own key, which a DigitalOcean box holds, and the cloud keys
+    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
     pending = [box for box in boxes(lt) if (box / "instance").exists()]
     seen = dict.fromkeys(pending, 0)
     label = {box: f"{box.name}: " if len(pending) > 1 else "" for box in pending}
     while pending:
         for box in list(pending):
             st = finished(box, cfg)
-            seen[box] = show_progress(box, seen[box], label[box])
+            seen[box] = show_progress(box, seen[box], exact, label[box])
             if st is None:
                 continue
             pending.remove(box)
@@ -693,7 +690,7 @@ def wait(out, runner_temp):
             results = box / "results"
             results.mkdir(exist_ok=True)
             gpu("pull", key, f"{BOX_OUT}/.", str(results), check=False, timeout=1800)
-            show_rest(results / "progress.log", seen[box], label[box])
+            show_rest(results / "progress.log", seen[box], exact, label[box])
             gpu("ssh", key, f"touch {BOX_OUT}/collected", check=False, timeout=120)
             gpu("terminate", key, check=False)
             print(f"{box.name} collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))
@@ -1103,11 +1100,15 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
                 f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
         log = box / "results/progress.log"
         if log.is_file():  # line by line, each cut to LINE_CAP (log_lines), so no size of it can fill the job's memory
-            redacted = log.with_name("progress.log.redacted")
-            with open(log, "rb") as f, open(redacted, "w") as out_f:
-                for line in log_lines(f):
-                    out_f.write(bot.redact(line, exact=exact) + "\n")
-            redacted.replace(log)
+            with tempfile.NamedTemporaryFile("w", dir=runner_temp, delete=False) as out_f:  # outside what boxes wrote
+                try:
+                    with open(log, "rb") as f:
+                        for line in log_lines(f, exact):
+                            out_f.write(bot.redact(line, exact=exact) + "\n")
+                except BaseException:
+                    os.unlink(out_f.name)
+                    raise
+            os.replace(out_f.name, log)
         result, fields = box / "results/result.json", {}
         if result.is_file():  # the box wrote this: unreadable counts as no verdict
             try:
