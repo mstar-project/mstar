@@ -548,7 +548,8 @@ def test_a_shard_that_never_splits_plans_every_step_copied():
     """Over KV stored by position the shard's exchange auto (a config from before such a pool could
     split runs as it did) or none: the shard derives that it splits nothing, so the node runs
     copied (min_tokens 0 and all), as one without a shard; all_gather splits. A ragged Ulysses
-    attention there plans the heads the copied layer computes: over TP alone."""
+    attention there plans the heads its exchange hands it: over TP alone on a copied node, over
+    TP x SP on a splitting one, though the node's pool keeps every head (``replicated_over_sp``)."""
     for choice, splits in ((None, False), ("none", False), ("all_gather", True)):
         specs = [
             KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
@@ -565,7 +566,7 @@ def test_a_shard_that_never_splits_plans_every_step_copied():
         shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
         assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
         ragged = RaggedAttnManager.build(by_key["ragged"], EngineResourceInfo(
-            device=torch.device("cpu"), joint_comm_group=joint, dependencies={"shard": spec},
+            device=torch.device("cpu"), joint_comm_group=joint, dependencies={"shard": spec}, replicated_over_sp=True,
         ))
         assert ragged._kwargs["num_qo_heads"] == (1 if splits else 2)
 

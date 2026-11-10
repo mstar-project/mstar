@@ -2753,8 +2753,8 @@ two axes:
 2. **Per paged KV pool, stored K/V is split by head or by position.** By head (the default) over the
    node's ``tp * sp`` ranks; by position with ``context_parallel: true`` (below), heads over TP.
 
-Each attention resource derives what it does from the two and the shard's ``exchange`` (below),
-and the model writes no exchange:
+Each attention resource derives what it does from the two and the shard's ``exchange`` (below);
+the model writes no exchange but a ragged attention's ``sp_exchange``:
 
 .. list-table::
    :header-rows: 1
@@ -2968,8 +2968,10 @@ step declares), sends the partial back, and merges what it gets in fp32. Its hop
 synchronous for now, and only the ``flashinfer`` backend plans it. Another is refused when the
 engine builds the attention, at any SP size like the storage checks, but after the validation that
 runs before a worker starts. Ring is eager only, so a ring node doesn't capture the buckets a
-step could split in: those steps split eagerly, and the rest keep their graphs. A step that combines labels (batched CFG's) has no
-stored positions to stripe by, so it fails at plan on a ring node. A step's peak memory is its resident tensors plus the
+step could split in: those steps split eagerly, and the rest keep their graphs. A step that combines listed labels into one plan
+(``combined_labels``, Cosmos3's batched CFG) is refused when it plans on a ring node, not at load
+(a step declares its combined labels): the stripe reads each listed label's rows from the pool's
+plan, which holds the combined label's instead. A step's peak memory is its resident tensors plus the
 larger of its attention and its MLP (or MoE) phase. All-gather's attention phase holds the
 whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone, and
 two fp32 copies of their result while a round merges. So ring lowers the peak only once attention
