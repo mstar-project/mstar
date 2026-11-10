@@ -11,6 +11,7 @@ import json
 import sys
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -72,9 +73,11 @@ from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.registry import model_init_kwargs
 from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step
 from mstar.model.voxcpm2.components.minicpm import MiniCPMLM
-from mstar.model.voxcpm2.config import VoxCPM2Config
+from mstar.model.voxcpm2.config import TALKER_STEP, VoxCPM2Config
 from mstar.model.voxcpm2.submodules import TalkerSubmodule
 from mstar.model.voxcpm2.voxcpm2_model import VoxCPM2Model
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.validation import DeploymentError, validate_deployment
 
 KV_CACHE, ATTN, ROPE, SAMPLER = "kv_cache", "attn", "rope", "sampler"
 BASE_KV, BASE_ATTN, BASE_POS, RES_KV, RES_ATTN = "base_kv", "base_attn", "base_pos", "res_kv", "res_attn"
@@ -512,6 +515,29 @@ def test_declarations_have_no_problems(build):
 
 def test_voxcpm2_declarations_have_no_problems_with_host_fields_on_a_node_with_no_prefix_keys(tiny_voxcpm2):
     assert state_declaration_problems(tiny_voxcpm2) == []
+
+
+@pytest.mark.parametrize("build, config, read", [
+    (_omnilingual, "omnilingual_asr_ctc_300m.yaml", ENCODER_ATTN),
+    (_omnivoice, "omnivoice.yaml", BACKBONE_ATTN),
+], ids=["omnilingual", "omnivoice"])
+def test_sdpa_on_a_packed_read_is_refused_before_any_worker_boots(build, config, read):
+    """SDPA can't tell one request's packed tokens from the next. The bindings refuse it where they resolve, so the
+    deployment fails validation with its other problems, and not at each worker's bind."""
+    path = Path(__file__).parents[2] / "configs" / config
+    deployment = {**yaml.safe_load(path.read_text()), "resources": {read: {"backend": "sdpa"}}}
+    with pytest.raises(DeploymentError) as refused:
+        validate_deployment(build(), deployment, str(path))
+    (problem,) = refused.value.problems
+    assert f"reads[{read!r}] runs SDPA, which can't tell one segment of packed queries" in problem, (
+        "validation would pass, and each worker would fail on its first packed query"
+    )
+
+
+def test_voxcpm2_talker_holds_host_fields_and_still_starts(tiny_voxcpm2):
+    held = [declared.name for declared in tiny_voxcpm2.declare_state() if declared.entry.host]
+    assert held == [TALKER_STEP], "with no host fields on the Talker, the check would have nothing to refuse"
+    make_engine(_submodules={"Talker": make_mgmt(submodule=_talker())})._check_host_fields(tiny_voxcpm2)
 
 
 def _kernel_arguments(manager: RopeManager, monkeypatch, **call) -> tuple:

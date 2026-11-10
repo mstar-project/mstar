@@ -7,6 +7,7 @@ field a removal left behind would attach to whichever request gets that handle n
 
 from __future__ import annotations
 
+import re
 import sys
 from types import SimpleNamespace
 
@@ -30,6 +31,8 @@ from mstar.engine.state.adapters import (
 )
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.host_fields import HostFields, is_host_value
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.model import make_model
 
 RID = 3
 
@@ -154,6 +157,24 @@ def test_a_step_that_never_commits_applies_nothing():
     step.begin_calls()
     step.end_calls()
     assert not host(h, RID, "main", 0)["sent"]
+
+
+@pytest.mark.parametrize("walk, combined", [("decode", {}), ("steps", {"talker": {"steps": {"prefill", "decode"}}})],
+                         ids=["walk", "combined-walk"])
+def test_a_node_holding_host_fields_that_reports_step_is_input_free_is_refused_at_load(walk, combined):
+    """For an input-free walk, exec runs the step a pre-plan declared over the bucket's template rows, so its writes
+    would come from the template and not from the requests."""
+    graph = SimpleNamespace(get_nodes=lambda: {"talker": None})
+    model = make_model(
+        declare_state=lambda: [_flags()], get_graph_walk_graphs=lambda: {"prefill": graph, "decode": graph},
+        get_combined_graph_walks=lambda: combined,
+    )
+    talker = SimpleNamespace(step_is_input_free=lambda graph_walk: graph_walk == walk)
+    engine = make_engine(_submodules={"talker": make_mgmt(submodule=talker)})
+    with pytest.raises(ValueError, match=re.escape(
+        f"'talker' holds the host fields of ['flags'] and reports step_is_input_free for [{walk!r}]",
+    )):
+        engine._check_host_fields(model)
 
 
 def test_a_replay_applies_its_writes():
