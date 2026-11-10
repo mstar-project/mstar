@@ -377,7 +377,8 @@ class Wan22DiT(nn.Module):
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # every per-token tensor is cut to this rank's tokens on a step the shard splits
-        if shard is not None:
+        # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
+        if shard is not None and shard.can_split:
             timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
             hidden_states = shard.scatter(TOKENS, hidden_states)
             rotary_emb = shard.scatter(TOKENS, *rotary_emb, dim=0)  # [S, D] tables

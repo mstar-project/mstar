@@ -37,7 +37,6 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import gather_merge, position_pools
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, StepContext
-from mstar.platforms.compile import compiled
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -139,8 +138,6 @@ class SeqRange(NamedTuple):
     counts: tuple[int, ...]
     # B of a [B, S, ...] layout split along S (axis 1); None for a packed label (axis 0)
     rows: int | None
-    # the step is a warm-up or capture, whose exchanges every replay repeats
-    captured: bool
 
     @property
     def start(self) -> int:
@@ -176,6 +173,10 @@ class SequenceShard(Resource):
 
     prefix_skip_safe = True
     supports_split_steps = True
+
+    def resident_refusal(self) -> str | None:
+        # no per-request state, and a one-token-a-row step (what resident planning replays) is never split
+        return None
 
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
@@ -317,7 +318,7 @@ class SequenceShard(Resource):
                 )
             if (min(label_spans) if self.axis == 1 else sum(label_spans)) < least:
                 return COPIED
-        ranges = {label: self._range(label_spans, ctx.capture) for label, label_spans in spans.items()}
+        ranges = {label: self._range(label_spans) for label, label_spans in spans.items()}
         for sources, plan_label in step.combined_labels.items():
             listed = [source in self.labels for source in sources]
             if not any(listed):
@@ -332,14 +333,14 @@ class SequenceShard(Resource):
             if combined:
                 if self.axis == 1 and len(set(combined)) > 1:
                     raise ValueError(f"combined label {plan_label!r}'s rows must be one length; got {combined}")
-                ranges[plan_label] = self._range(combined, ctx.capture)
+                ranges[plan_label] = self._range(combined)
         return SeqShardPlan(True, ranges)
 
-    def _range(self, spans: list[int], captured: bool) -> SeqRange:
+    def _range(self, spans: list[int]) -> SeqRange:
         world = self.group.world_size
         if self.axis == 0:
-            return SeqRange(self.group, tuple(sp_seq_split(sum(spans), world)), None, captured)
-        return SeqRange(self.group, tuple(sp_seq_split(spans[0], world)), len(spans), captured)
+            return SeqRange(self.group, tuple(sp_seq_split(sum(spans), world)), None)
+        return SeqRange(self.group, tuple(sp_seq_split(spans[0], world)), len(spans))
 
     ### Submodule-level functionality
 
@@ -446,15 +447,10 @@ def ulysses(run: Callable, q, k, v, r: SeqRange):
     """Split tokens to split heads: one all-to-all of q, k and v (each ``[n, H, D]``, this rank's
     tokens) to ``[N, H / P, D]``, ``run``, and the output back.
 
-    A captured step compiles the all-to-all at its own shapes, once in the warm-up, so the graph
-    replays fused layout copies; static (``compiled`` marks no dim dynamic, and a call inside a captured
-    forward inherits the runner's ``dynamic=False``), because another bucket's token count would make
-    that dim dynamic, a slower kernel than eager. Any other step stays eager: its token counts vary,
-    so compiling would stall on each new one and gain nothing per step."""
+    Eager, as main's exchange is (`CommGroup.all_to_all`): a traced variant measured no faster.
+    """
     _check_entry(r, q, k, v)
-    # `CommGroup.all_to_all` is eager to every other caller (torch.compiler.disable): the capture
-    # compiles the function under it
-    all_to_all = compiled(CommGroup.all_to_all.__wrapped__) if r.captured else CommGroup.all_to_all
+    all_to_all = CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
     exchanged = all_to_all(

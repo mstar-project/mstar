@@ -389,6 +389,17 @@ def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
 
 
+@pytest.mark.parametrize("attention, pattern", [
+    (_attention, r"exchanges=False, which can hand a rank no tokens, beside an attention that exchanges"),
+    (_cross, r"ragged cross-attention 'xattn' .* declares exchanges=False, which can leave a rank no tokens"),
+], ids=["attention", "cross_attention"])
+def test_a_split_without_exchanges_beside_an_attention_is_refused(attention, pattern):
+    """A split nothing exchanges can give a rank no tokens, which no attention over them can take."""
+    shard = SeqShardSpec("shard", {"llm"}, ("main",), 1, exchanges=False)
+    refusals = sequence_parallel_refusals([shard, attention()], "llm", 1, 4)
+    assert any(re.search(pattern, refusal) for refusal in refusals), refusals
+
+
 def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
     specs = _paged_llm(_shard(), _attention()).get_node_resources()
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == [

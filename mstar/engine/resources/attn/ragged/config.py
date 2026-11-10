@@ -251,11 +251,12 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
         return take_shard_edge(self, specs)
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        if shard.axis == 0:
+        if shard.axis == 0 or not shard.exchanges:
+            how = "splits packed tokens (axis 0)" if shard.axis == 0 else "declares exchanges=False"
             return [
                 f"ragged cross-attention {self.resource_key!r} on node {node!r}, whose sequence shard "
-                f"{shard.resource_key!r} splits packed tokens (axis 0), which can leave a rank no tokens of a "
-                "row to attend: split each row (axis 1)"
+                f"{shard.resource_key!r} {how}, which can leave a rank no tokens of a row to attend: split "
+                "each row (axis 1) with exchanges"
             ]
         return []
 

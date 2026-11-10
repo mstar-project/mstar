@@ -447,6 +447,7 @@ class LoraSpec(NodeResourceSpec):
             f"ranks (SeqShardSpec {shard.resource_key!r}): LoRA lays its rows out per request, while each "
             "SP rank holds a shard of the tokens. Serve this node without SP, or drop the 'lora:' block"
         ]
+
     def for_node(self, node: str) -> "LoraSpec | None":
         """``node``'s pool: the targets on it, keyed ``lora@<node>``; None when the
         YAML's ``targets`` left it none. Placement stays the whole spec's, so a pool reads

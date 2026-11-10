@@ -18,7 +18,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from flashinfer_reference import reference_attention, reference_flashinfer
-from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, gather_sequence, sp_seq_split
@@ -158,12 +157,12 @@ def _rows_attention(rows: int, causal: bool, lse: bool = False):
     return run
 
 
-def _split_exchanges(rank, world, total, rows, captured):
+def _split_exchanges(rank, world, total, rows):
     """Each exchange of this rank's tokens of a ``rows``-row step (None: one packed label) against
     one rank attending them all, and a write alone (``q=None``), with the same collectives on every
     rank."""
     group = _group(rank, world)
-    r = SeqRange(group, tuple(sp_seq_split(total, world)), rows, captured)
+    r = SeqRange(group, tuple(sp_seq_split(total, world)), rows)
     b = rows or 1
     gen = torch.Generator().manual_seed(0)
     q, k, v = (torch.randn(b * total, heads, 4, generator=gen) for heads in (HEADS, world, world))
@@ -187,11 +186,6 @@ def _split_exchanges(rank, world, total, rows, captured):
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
     torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
-    if captured:
-        # the capture itself, on what its warm-up above compiled
-        with torch.compiler.set_stance("fail_on_recompile"):
-            torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
-        assert _debug_get_cache_entry_list(CommGroup.all_to_all.__wrapped__.__code__)
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
     q_short = torch.randn(b * 5, HEADS, 4, generator=gen)
@@ -217,11 +211,10 @@ def _split_exchanges(rank, world, total, rows, captured):
 
 @pytest.mark.parametrize("rows", [None, 2], ids=["packed", "rows"])
 @pytest.mark.parametrize(
-    "world,total,captured", [(2, 7, False), (3, 11, False), (2, 6, True), (2, 7, True)],
-    ids=["2-uneven", "3-uneven", "2-even-captured", "2-uneven-captured"],
+    "world,total", [(2, 7), (3, 11), (2, 6)], ids=["2-uneven", "3-uneven", "2-even"],
 )
-def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows, captured):
-    _run(_split_exchanges, world, tmp_path / "store", total, rows, captured)
+def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows):
+    _run(_split_exchanges, world, tmp_path / "store", total, rows)
 
 
 # --- when a step splits ---------------------------------------------------------------------------
@@ -252,18 +245,6 @@ def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=
 
 def _rows(label, span, n=2):
     return [(f"r{i}", label, span) for i in range(n)]
-
-
-@pytest.mark.parametrize("capture", [False, True], ids=["replayed", "capture"])
-@pytest.mark.parametrize("shard, segments, combined, label", [
-    ({}, [("r0", "main", 10)], None, "main"),
-    (dict(labels=("video",), axis=1), _rows("video", 5), None, "video"),
-    (dict(labels=("cond", "text")), [("r0", "cond", 5), ("r0", "text", 5)], {("cond", "text"): "cfg"}, "cfg"),
-], ids=["packed", "rows", "combined"])
-def test_a_range_is_captured_only_when_the_runner_captures_its_step(shard, segments, combined, label, capture):
-    shard = _shard(**shard)
-    _split(shard, segments, combined=combined, capture=capture)
-    assert shard.split_range(label).captured == capture
 
 
 @pytest.mark.parametrize("shard, step, ranges", [
