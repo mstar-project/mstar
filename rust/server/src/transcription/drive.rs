@@ -574,7 +574,7 @@ async fn stream_events(mut ctx: Ctx, tx: &tokio::sync::mpsc::Sender<Bytes>) -> R
             let mut decoder = crate::utf8::Utf8Stream::default();
             while let Some(item) = stream.next().await {
                 match item {
-                    Out::Error { status, message } => {
+                    Out::Error { status, message, .. } => {
                         emit(tx, format::error_event(&message, status)).await;
                         emit(tx, format::SSE_DONE.to_string()).await;
                         return Ok(());

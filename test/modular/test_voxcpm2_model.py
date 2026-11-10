@@ -1616,3 +1616,111 @@ def test_the_talker_serves_a_ready_prompt_first(model):
         ("Talker", "talker_prefill_clone"): 1,
     }
     assert ("Talker", "talker_decode") not in priorities
+
+
+# -- the local DiT's solve ----------------------------------------------------------------
+
+
+def _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=False):
+    """``solve_cfm`` as the reference writes it: every step re-embeds its time
+    and re-projects the condition through ``estimator.forward``."""
+    rows, x = noise.shape[0], noise
+    t, dt = t_span[0], t_span[0] - t_span[1]
+    zero_init_steps = max(1, int(len(t_span) * 0.04))
+    mu_in, cond_in = torch.cat([mu, torch.zeros_like(mu)]), torch.cat([cond, cond])
+    scale = cfg_value.to(x.dtype).view(rows, 1, 1)
+    for step in range(1, len(t_span)):
+        if step <= zero_init_steps:
+            dphi_dt = torch.zeros_like(x)
+        else:
+            t_in = t.expand(2 * rows)
+            dt_in = dt.expand(2 * rows) if mean_mode else torch.zeros_like(t_in)
+            velocity = estimator(torch.cat([x, x]), mu_in, t_in, cond_in, dt_in)
+            pos, neg = velocity[:rows], velocity[rows:]
+            dot = torch.sum(pos.reshape(rows, -1) * neg.reshape(rows, -1), dim=1, keepdim=True)
+            st_star = (dot / (torch.sum(neg.reshape(rows, -1) ** 2, dim=1, keepdim=True) + 1e-8)).view(rows, 1, 1)
+            dphi_dt = neg * st_star + scale * (pos - neg * st_star)
+        x = x - dt * dphi_dt
+        t = t - dt
+        if step < len(t_span) - 1:
+            dt = t - t_span[step + 1]
+    return x
+
+
+@pytest.mark.parametrize("mean_mode", [False, True])
+def test_the_solve_computes_its_per_solve_tokens_once_and_matches_the_stepwise_solve(mean_mode):
+    from mstar.model.voxcpm2.components.local import cfm_t_span, solve_cfm
+
+    config = VoxCPM2Config.from_dict(TINY)
+    estimator = _random_generator(config).feat_decoder.estimator
+    gen = torch.Generator().manual_seed(1)
+    rows, hidden = 3, config.dit.hidden_size
+    noise = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    mu = torch.randn(rows, 2 * hidden, generator=gen)
+    cond = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    cfg_value = torch.tensor([1.5, 2.0, 3.0])
+    t_span = cfm_t_span(10, "cpu", torch.float32)
+    with torch.no_grad():
+        got = solve_cfm(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+        want = _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel runs on CUDA")
+@pytest.mark.parametrize("seq", [5, 11])
+@pytest.mark.parametrize("rows", [2, 33])
+def test_fused_rope_attention_matches_the_eager_path_at_the_checkpoints_head_size(rows, seq):
+    """The local stacks' shape (16 query and 2 KV heads of 128, rows of the
+    encoder's 5 or the DiT's 11 tokens): rounding apart, the eager result."""
+    from mstar.model.components.rope_attention import rope_attention, rope_attention_reference
+
+    heads, kv_heads, head_dim = 16, 2, 128
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    # any tables: the kernel reads both halves of each, as the eager rotation does
+    cos, sin = (torch.rand(seq, head_dim, device="cuda", generator=gen) * 2 - 1 for _ in range(2))
+    qkv = torch.randn(rows * seq, (heads + 2 * kv_heads) * head_dim, device="cuda", generator=gen).to(torch.bfloat16)
+    got = rope_attention(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    want = rope_attention_reference(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    assert got.shape == want.shape == (rows * seq, heads * head_dim)
+    # a table the kernel can't read with cos's strides takes the eager path
+    wide = torch.rand(seq, 2 * head_dim, device="cuda", generator=gen) * 2 - 1
+    sliced = wide[:, :head_dim]
+    assert torch.equal(rope_attention(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim),
+                       rope_attention_reference(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim))
+    err = (got.float() - want.float()).abs()
+    # the softmax weights round to bfloat16 before the value product, as SDPA's do,
+    # in another order: a few bfloat16 steps at most, far less on average
+    assert err.max() < 0.07 and err.mean() < 0.003
+
+
+def _local_stack(seed=0):
+    """A local stack the fused paths take: head halves of 32, half precision."""
+    from mstar.model.voxcpm2.components.minicpm import MiniCPMLocalTransformer
+    from mstar.model.voxcpm2.config import MiniCPM4Config
+
+    config = MiniCPM4Config(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                            num_key_value_heads=2, head_dim=64, vocab_size=0)
+    torch.manual_seed(seed)
+    stack = MiniCPMLocalTransformer(config, max_len=11)
+    with torch.no_grad():
+        for name, param in stack.named_parameters():
+            param.copy_(1 + 0.1 * torch.randn_like(param) if "norm" in name else 0.05 * torch.randn_like(param))
+    stack.materialize_buffers()
+    return stack.eval()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused paths run on CUDA")
+def test_the_local_stack_compiles_whole_and_its_fused_bf16_path_matches_fp32():
+    """No graph break between layers (attention, add+norm, SiLU are each one op
+    or kernel Dynamo sees whole), and the half-precision fused path within
+    rounding of the float32 portable one on the same weights."""
+    stack = _local_stack()
+    x = torch.randn(6, 11, 256, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        want = stack(x)  # CPU, float32: the reference rotation, SDPA, unfused add+norm and SiLU
+        fused = stack.to("cuda", torch.bfloat16)
+        got = fused(x.to("cuda", torch.bfloat16))
+        compiled = torch.compile(fused, fullgraph=True)(x.to("cuda", torch.bfloat16))
+    err = (got.float().cpu() - want).norm() / want.norm()
+    assert err < 0.02, err
+    torch.testing.assert_close(compiled, got, rtol=0.02, atol=0.02)

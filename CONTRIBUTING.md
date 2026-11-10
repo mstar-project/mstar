@@ -139,10 +139,13 @@ The **CPU Core** job runs every test module under the directories in
 `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)):
 `test/modular/`, `test/distributed/`, the model-local `mstar/model/*/tests/`
 and a few more, on a GitHub-hosted Ubuntu runner whenever a PR targeting `main`
-is opened, updated or reopened, split over the runner's 4 cores with
-pytest-xdist; `test_tp_async_lockstep_sim.py` runs in a second shard beside it,
-"CPU Core (TP lockstep sim)". It needs no GPU or model weights. New updates cancel an older CPU
-Core run for the same PR. The installation and invocation commands are in
+is opened, updated or reopened. It runs as two shards on two runners, "CPU Core 1/2"
+and "CPU Core 2/2", each split over the runner's 4 cores with pytest-xdist; a test
+file goes whole to one shard, by a stable hash of its path
+([scripts/ci/shard_plugin.py](scripts/ci/shard_plugin.py), `MSTAR_CI_SHARD=i/n`). `test_tp_async_lockstep_sim.py`
+runs in a third job beside them, "CPU Core (TP lockstep sim)", and a "CPU Core" job
+passes only when all three did. It needs no GPU or model weights. New updates cancel
+an older CPU Core run for the same PR. The installation and invocation commands are in
 [the CI workflow](.github/workflows/ci.yml).
 
 There is no list of test files to add to: a new module under one of those

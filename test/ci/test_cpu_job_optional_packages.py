@@ -22,7 +22,7 @@ def install_commands():
 class CpuJobOptionalPackageTests(unittest.TestCase):
     def setUp(self):
         self.commands = install_commands()
-        self.pip_check = self.commands.index("python -m pip check")
+        self.pip_check = self.commands.index("uv pip check")
 
     def only_install_of(self, package):
         found = [i for i, c in enumerate(self.commands) if package in c]
@@ -32,12 +32,12 @@ class CpuJobOptionalPackageTests(unittest.TestCase):
     def test_qwen_tts_goes_in_without_its_dependencies_after_pip_check(self):
         # qwen-tts pins transformers==4.57.3, so pip check fails once it is in
         index = self.only_install_of("qwen-tts")
-        self.assertRegex(self.commands[index], r'^python -m pip install --no-deps "qwen-tts==[\d.]+"$')
+        self.assertRegex(self.commands[index], r'^uv pip install --no-deps "qwen-tts==[\d.]+"$')
         self.assertGreater(index, self.pip_check)
 
     def test_audioseal_goes_in_before_pip_check(self):
         index = self.only_install_of("audioseal")
-        self.assertEqual(self.commands[index], 'python -m pip install "audioseal>=0.2,<0.3"')
+        self.assertEqual(self.commands[index], 'uv pip install "audioseal>=0.2,<0.3"')
         self.assertLess(index, self.pip_check)
 
 
