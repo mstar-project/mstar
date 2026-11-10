@@ -63,8 +63,9 @@ _IMAGE_PROCESSOR = {
 
 class MuseGlimmerModel(MultimodalDecoderModel):
     NAME = "Muse Glimmer"
-    # closes the reasoning channel, which every turn opens (enable_thinking false is "low")
-    REASONING_END = "<|eom|>"
+    # every turn reasons first (enable_thinking false is "low"): a message addressed
+    # to=self that <|eom|> closes, then the answer's, whose header ends in this
+    REASONING_END = "to=user<|message|>"
     METADATA_FILES = (
         "config.json", "processor_config.json",
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
