@@ -689,7 +689,6 @@ class Engine:
         prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
-        text_output = model.text_output() if model is not None else None
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -722,7 +721,7 @@ class Engine:
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
                     prefix_caches=prefix_caches,
-                    text_output=text_output,
+                    text_output=None if model is None else model.text_output,
                 ),
             )
 

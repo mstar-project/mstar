@@ -202,6 +202,11 @@ class GrammarRows:
         stop = sorted(int(t) for t in text_output.stop_token_ids)
         tokenizer = getattr(detok, "tokenizer", None)
         if tokenizer is not None:
+            if vocab_size is not None and vocab_size < len(tokenizer):
+                raise ValueError(
+                    f"enable_grammar belongs on the text sampler; this one draws from {vocab_size} ids, "
+                    f"fewer than the {len(tokenizer)} of the text vocabulary"
+                )
             size = vocab_size or len(tokenizer)
             self.info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=size, stop_token_ids=stop or None)
         else:

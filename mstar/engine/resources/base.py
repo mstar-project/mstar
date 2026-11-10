@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -15,7 +15,6 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
-    from mstar.model.utils import TextOutput
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
     from mstar.engine.accelerator_graph_config import (
@@ -26,6 +25,7 @@ if TYPE_CHECKING:
     )
     from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.model.utils import TextOutput
 
 
 @dataclass(frozen=True)
@@ -86,9 +86,9 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
-    # the model's text output declaration (``Model.text_output``), for a resource that
-    # reasons over its token vocabulary (the sampler's grammars); None for a model without one
-    text_output: "TextOutput | None" = None
+    # the model's ``Model.text_output``, for a resource that reasons over its token
+    # vocabulary (the sampler's grammars): a call, as it may load the tokenizer
+    text_output: "Callable[[], TextOutput | None] | None" = None
 
     @property
     def head_shards(self) -> int:

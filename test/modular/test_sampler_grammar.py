@@ -225,25 +225,30 @@ def test_a_qwen_thinking_turn_starts_its_grammar_after_the_think_block(mk, after
     assert mk["structured_outputs"].get("after") == after
 
 
-def _conductor(enable_grammar: bool, node_groups=()):
+def _conductor(enable_grammar: bool):
     """The conductor's intake: there a ValueError is the client's 400."""
     spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=V, enable_grammar=enable_grammar)
     conductor = Conductor.__new__(Conductor)
     conductor.model = SimpleNamespace(
         get_request_resource_configs=lambda i, o, kw: {"sampler": SamplingReqConfig(temperature=0.3)})
-    conductor.model_config = {"node_groups": list(node_groups)}
     conductor._kv_labels = {}
     conductor._node_resources_cache = [spec]
     return conductor
 
 
-def test_the_conductor_serves_structured_outputs_only_where_a_whole_sampler_enables_it():
+def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it():
     kwargs = {"structured_outputs": {"regex": "a+"}}
-    with pytest.raises(ValueError, match="enable_grammar: true"):
+    with pytest.raises(ValueError, match="does not serve structured_outputs"):
         _conductor(False)._get_resource_configs(["text"], ["text"], kwargs)
     config = _conductor(True)._get_resource_configs(["text"], ["text"], kwargs)["sampler"]
     assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own config was dropped"
-    pd = [{"node_names": ["LLM"], "ranks": [0], "graph_walks": ["prefill"]},
-          {"node_names": ["LLM"], "ranks": [1], "graph_walks": ["decode"]}]
-    with pytest.raises(ValueError, match="splits prefill and decode"):
-        _conductor(True, pd)._get_resource_configs(["text"], ["text"], kwargs)
+
+
+def test_enable_grammar_on_a_sampler_narrower_than_the_text_vocabulary_is_refused():
+    """A non-text sampler (an audio codec's, say) draws ids no grammar describes."""
+    text_output = SimpleNamespace(detokenizer=SimpleNamespace(tokenizer=[b""] * (V + 1)), stop_token_ids=())
+    with pytest.raises(ValueError, match="belongs on the text sampler"):
+        SamplerResource(
+            vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
+            enable_grammar=True, text_output=text_output,
+        )

@@ -37,8 +37,8 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
-from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
@@ -712,15 +712,6 @@ class Conductor:
             )
         return built
 
-    def _split_by_walk(self, resource_key: str) -> bool:
-        """Whether a node of this resource runs its walks on more than one group
-        (``graph_walks`` in ``node_groups``: a prefill/decode split)."""
-        spec = next((s for s in self._node_resources() if s.resource_key == resource_key), None)
-        if spec is None:
-            return False
-        groups = (getattr(self, "model_config", None) or {}).get("node_groups") or []
-        return sum(bool(set(g.get("node_names") or ()) & spec.nodes and g.get("graph_walks")) for g in groups) > 1
-
     def _streamed_partitions(self) -> frozenset[str]:
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
@@ -782,18 +773,11 @@ class Conductor:
             config = spec.request_config(model_kwargs, configs.get(spec.resource_key))
             if config is not None:
                 configs[spec.resource_key] = config
-        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:
-            constrained = sum(getattr(cfg, "grammar", None) is not None for cfg in configs.values())
-            if constrained != 1:
-                raise ValueError(
-                    "this deployment does not serve structured_outputs; turn it on with "
-                    "`resources: {<text sampler>: {enable_grammar: true}}`" if not constrained else
-                    "structured_outputs is on for more than one sampler; enable_grammar belongs on the text sampler only"
-                )
-            key = next(k for k, cfg in configs.items() if getattr(cfg, "grammar", None) is not None)
-            if self._split_by_walk(key):
-                # the prefill worker's first draw would never reach the decode worker's matcher
-                raise ValueError("structured_outputs is not served on a deployment that splits prefill and decode")
+        # as return_logprobs above: a sampler with enable_grammar took it, or none serves it
+        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and not any(
+            getattr(cfg, "grammar", None) is not None for cfg in configs.values()
+        ):
+            raise ValueError("this deployment does not serve structured_outputs")
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())

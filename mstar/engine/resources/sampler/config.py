@@ -221,8 +221,6 @@ class SamplingReqConfig(ResourceReqConfig):
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
-        if self.grammar is not None and not spec.enable_grammar:
-            raise ValueError("this deployment does not serve structured_outputs")
         if self.return_logprobs and not spec.enable_logprobs:
             raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
         if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:
