@@ -130,9 +130,9 @@ def test_align_op_uses_torchs_hip_runtime():
 @pytest.mark.parametrize("dims", [THINKER, TALKER], ids=["thinker", "talker"])
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64, 256, 1024])
 def test_triton_backend_matches_reference(dims, num_tokens, monkeypatch):
+    from mstar.utils.fused_moe import runner
     from mstar.utils.fused_moe.backend import TritonFusedMoE
     from mstar.utils.fused_moe.kernels import get_default_config
-    from mstar.utils.fused_moe import runner
 
     x, w1, w2, weights, ids = _inputs(dims, num_tokens)
     ref = _reference(x, w1, w2, weights, ids)
