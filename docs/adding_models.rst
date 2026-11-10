@@ -1338,7 +1338,15 @@ placed exactly as weights are.
   subclasses of either that keep their base's forward are swapped alike, and are whole
   on every rank. An unbound module keeps its class, so a deployment without a ``lora:``
   block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
-  graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+  graph and its guards). An MoE layer's ``FusedExperts`` is a target per parameter
+  (``LoraCapable.lora_targets``): ``gate_up_proj`` and ``down_proj``, each with an A and B
+  per expert, named ``experts_gate_up_proj`` / ``experts_down_proj`` and placed per expert
+  by the loader's ``"gate:N"`` / ``"up:N"`` / ``"down:N"`` shard ids; its twin adds the
+  deltas inside the dispatch (``FusedExperts._dispatch``), after each grouped GEMM
+  (before the activation, and before the top-k sum and the all-reduce), so a subclass
+  with a ``_dispatch`` of its own is refused as one with its own forward is; so is an
+  adapter of PEFT's fused 3-D form (one A and B on the experts container), read per
+  expert only. Anything else holding weight matrices (a router, a
   depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
   none: the walk records why, and an adapter touching it is refused with that reason. So
   does a child its parent runs through the weight itself rather than its forward (folded at
@@ -1408,7 +1416,17 @@ placed exactly as weights are.
   (Qwen3.5's delta-net ``in_proj_qkv``: one A for the three, B cut by their widths), and
   a base linear that pads a slice per rank for alignment says so in ``slice_align``.
   ``parallel="none"`` is a target whole on every rank, its delta added to an output that
-  is already whole.
+  is already whole. ``experts=E`` is one stacked parameter of an MoE layer's routed
+  experts: each (token, top-k) row runs its token's slot's A and B for the expert the
+  router picked, addressed by one combined id ``(slot - 1) * E + expert`` (the zero
+  adapter's are not stored), on the fused-MoE grouped GEMM (``LoraBackend.apply_experts_``;
+  one align per layer over the combined ids, then a shrink and an accumulating expand per
+  slice). Experts targets are opt-in, since every slot holds a copy of each expert's
+  factors: ``module_lora_spec`` declares them in ``LoraSpec.dropped_targets``, and the
+  YAML's ``targets:`` serves them by naming them. The align op groups fewer than 1024 ids
+  once padded to its warp of 32, so a spec serves at most ``992 // E`` slots (7 at 128
+  experts) and refuses more where the YAML sizes it. Experts split by expert parallelism
+  are refused at deployment validation and at bind (``expert_split``); serve them under TP.
 - **Target kinds and rows.** ``kind="embedding"`` is a token embedding: ``in_features``
   is the vocabulary, the layer passes token ids as ``x``, and the shrink is a gather of
   A's column per token (``mstar::lora_gather_shrink``), PEFT's ``lora_embedding_A`` /
@@ -1416,12 +1434,13 @@ placed exactly as weights are.
   ``per_segment`` is one row per segment and ``token_fold=k`` one row per ``k``
   consecutive tokens of a segment. The pool plans an addressing per grouping its targets
   use; the call checks the rows it gets.
-- **Checkpoint layouts.** Adapters are validated from the safetensors header: modules
-  map to targets, shapes fit them (an adapter for another model size is a 400, not an
-  admit failure), and a conv adapter whose kernel is its stride flattens to the linear
-  over the patch. DoRA (PEFT's ``lora_magnitude_vector``, Kohya's ``dora_scale``), ``modules_to_save``, trainable
-  tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
-  the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
+- **Checkpoint layouts.** Adapters are validated from the same read that pins their
+  digest: modules map to targets, shapes fit them (an adapter for another model size
+  is a 400, not an admit failure), and a conv adapter whose kernel is its stride
+  flattens to the linear over the patch. DoRA (PEFT's ``lora_magnitude_vector``,
+  Kohya's ``dora_scale``), ``modules_to_save``, trainable tokens and bias LoRA are
+  refused by name. A YAML ``targets: [...]`` keeps a subset of the model's targets
+  (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
   a deployment with ``runtime_updates`` off keeps the targets its configured adapters
   touch (a node left with none gets no pool): the API server reads them once at startup
@@ -1442,7 +1461,8 @@ placed exactly as weights are.
   zero adapter; a replay's plan writes each row's slot into the buffers that capture
   recorded, so a captured graph serves any mix of adapters without recapture. The
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
-  latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
+  latter declares the ``y`` it writes), and an experts target's grouped GEMMs are one
+  more, ``mstar::lora_experts_apply_``, so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
   the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
   **Lean captures** under the resources table), so the engine captures every bucket whose
@@ -2732,8 +2752,10 @@ that a misspelled setting is never silently ignored:
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
        targets to allocate; by default, with ``runtime_updates`` off, the targets the
-       configured adapters touch, and every target with it on; a node left with none
-       gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
+       configured adapters touch, and every target with it on, except experts targets,
+       which are allocated only when the list names them; a list chooses among all the
+       declared targets, so a later one may name a target an earlier one left out; a node
+       left with none gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
        ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
        worker to answer one before giving up on it). The one ``lora:`` block sizes the
@@ -2831,10 +2853,15 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    preprocess_workers: 2
 
 The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
-V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
+V-JEPA2, Cosmos3, Parakeet, Nemotron ASR and Omnilingual ASR declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
 and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs set 1, since
 a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
+
+A model that takes several images per request and whose ``load_image`` is mostly a decode can
+also set ``PREPROCESS_PARALLEL_IMAGES = True``, which decodes one request's images at once on a
+second pool the size of the prepare pool, unless ``preprocess_workers`` is 1. Pi0.5 declares it
+for its camera frames.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
@@ -3457,14 +3484,17 @@ Glimmer and Ripple-65B return ``{}`` until a drop has run through a sliding-wind
 and Qwen3-ASR until one has run through its captured prefill. A model without text prompts
 (``TEXT_PROMPTS = False``) is rebuilt on its media walks alone. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
-its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
-temporal group), and ``prepare``, which turns an attachment into the encoder's input
+its placeholder ``pad`` id (intakes may share one: the nth placeholder of a pad goes to the
+nth attachment of that pad in the order of the prompt's parts, which is where ``_prompt_ids``
+renders each), the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (``runs(attachment, metadata)``, one by default; a Qwen3.5 video fills one
+per temporal group), and ``prepare``, which turns an attachment into the encoder's input
 tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
 tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
 match its attachments, prepares each attachment in prompt order, expands each placeholder
-to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
+to its run (a ``MediaRun``) with ``expand_media_pads`` (one pad per token, read from the run's encoder output,
+with its grid), and ``process_prompt`` returns the pads' layout as ``MEDIA_LAYOUT``
+metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
 schedule's walk and the KV layout's alike. ``kv_layout`` lays a media prompt's text out as
 ``ids`` spans and each run of pads as a ``rows`` span, which moves the position counter by
@@ -3482,13 +3512,15 @@ The ``LLM`` node subclasses ``SampledTokenDecoder``
 (decode, packed text prefill, mixed, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
-(``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
+(``where(mask, media[cumsum(mask) - 1], embed(ids))``, the media in prompt order and the mask
+of their tokens laid out from ``MEDIA_LAYOUT``, not found by pad id, so media may share a
+placeholder token), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
 loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
 a one-token budget, ends the partition before decode runs. The loop's cap,
-``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
-ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
+``max(1, max_output_tokens - 1)``, is the only budget. Each encoder's rows match the tokens of
+its runs in the layout, checked in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
 

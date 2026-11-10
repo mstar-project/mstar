@@ -25,6 +25,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     TEXT,
@@ -418,7 +419,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
         torch.full((n, 1), VIDEO_MARK if int(prompt[offset]) == model.config.video_token_id else IMAGE_MARK)
         for offset, n in zip(media["offset"], media["tokens"], strict=True)
     ])
-    (encoder,) = model.encoders
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
@@ -429,7 +429,9 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
     expected_row[ref["input_ids"][0] == model.config.video_token_id] = VIDEO_MARK
-    spliced = splice_media(row.input_ids.float()[:, None], encoder.pads(row.input_ids), marks)
+    spliced = splice_media(
+        row.input_ids.float()[:, None], row.tensor_inputs[MEDIA_MASK], row.tensor_inputs[MEDIA_EMBEDS],
+    )
     assert torch.equal(spliced[:, 0], expected_row)
 
     positions, _ = rope_model.get_rope_index(
@@ -822,7 +824,7 @@ def test_the_layout_places_every_pad(model, processor):
     _, out, _ = run_both(model, processor, "two_videos_around_image")
     (ids,) = out.new_input_tensors["text_inputs"]
     layout = out.metadata[MEDIA_LAYOUT]
-    pads = set(model.encoders[0].pad_ids)
+    pads = set(model._pad_ids().values())
     covered = torch.zeros_like(ids, dtype=torch.bool)
     for offset, n in zip(layout["offset"], layout["tokens"], strict=True):
         assert all(int(t) in pads for t in ids[offset:offset + n])
@@ -949,8 +951,9 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     )
     w._rebuilds.record(prefilled)
     w._rebuilds.flush()
-    # the samples before 9 are in the KV, and 9 is the next decode step's input
-    w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
+    # the samples before 9 are in the KV, and 9 is the next decode step's input; one is an image pad
+    tail = [model._pad_ids()["image"], 8][:samples]
+    w._rebuilds.kept(R, NODE).sampled.extend([*tail, 9])
     eng.dropped.append(R)
     assert w._rebuilds.tokens(R, NODE, None) == held[0], "the drop would refuse the request"
     kv.prepare_rebuild(R, w._rebuilds.start(R, NODE, None))
@@ -964,11 +967,16 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
 
     advance = prefill.resource_step_info
     after = torch.arange(advance, advance + samples).expand(3, -1)
-    assert torch.equal(rebuilt.input_ids, torch.cat([ids, torch.tensor([7, 8][:samples])])), (
+    assert torch.equal(rebuilt.input_ids, torch.cat([ids, torch.tensor(tail, dtype=ids.dtype)])), (
         "the rebuild row would read other ids"
     )
-    assert torch.equal(rebuilt.tensor_inputs["vision_embeds"], copied["vision_embeds"][0]), (
+    assert torch.equal(rebuilt.tensor_inputs[MEDIA_EMBEDS], copied["vision_embeds"][0]), (
         "the rebuild row would splice in other encoder output"
+    )
+    # the ids sampled since take no encoder row, the pad among them included
+    unmasked = torch.zeros(samples, dtype=torch.bool)
+    assert torch.equal(rebuilt.tensor_inputs[MEDIA_MASK], torch.cat([prefill.tensor_inputs[MEDIA_MASK], unmasked])), (
+        "a sampled id would take an encoder row"
     )
     assert torch.equal(rebuilt.custom_pos_ids.long(), torch.cat([prefill.custom_pos_ids.long(), after], dim=1)), (
         "decode would resume at another position"

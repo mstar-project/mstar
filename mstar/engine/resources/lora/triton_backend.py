@@ -21,7 +21,7 @@ the slot's own rank.
 
 These are the CUDA kernels of the ``mstar::lora_shrink`` / ``mstar::lora_expand_`` /
 ``mstar::lora_apply_`` custom ops (``ops.py``), so ``torch.compile`` treats each as one
-opaque node.
+opaque node, and of ``mstar::lora_experts_apply_``, an experts target's grouped GEMMs.
 """
 
 from __future__ import annotations
@@ -32,7 +32,16 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.resources.lora.ops import lora_apply_, lora_expand_, lora_shrink
+from mstar.engine.resources.lora.backend import experts_reference_
+from mstar.engine.resources.lora.ops import (
+    experts_config,
+    lora_apply_,
+    lora_expand_,
+    lora_experts_apply_,
+    lora_shrink,
+)
+from mstar.utils.fused_moe.kernels import invoke_fused_moe_kernel
+from mstar.utils.fused_moe.runner import tl_compute_type
 
 # fused slices the expand kernel takes in one launch (q/k/v, gate/up, a delta-net's
 # q / k / v / z / a / b)
@@ -264,7 +273,7 @@ def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices)
     )
 
 
-def _shrink_cuda(x, a, token_order, slot_indptr, ranks, num_slices):
+def _shrink_cuda(x, a, token_order, slot_indptr, token_slot, ranks, num_slices):
     tokens, in_features = x.shape
     h = x.new_empty(tokens, a.shape[1])
     if tokens == 0:
@@ -273,13 +282,13 @@ def _shrink_cuda(x, a, token_order, slot_indptr, ranks, num_slices):
     return h
 
 
-def _expand_cuda(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices):
+def _expand_cuda(y, h, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
     if y.shape[0] == 0:
         return
     _expand_from(y, h.unsqueeze(0), b, token_order, slot_indptr, ranks, scalings, out_slices)
 
 
-def _apply_cuda(y, x, a, b, token_order, slot_indptr, ranks, scalings, out_slices):
+def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
     tokens, in_features = x.shape
     if tokens == 0:
         return
@@ -300,3 +309,37 @@ lora_shrink.register_kernel("cuda")(_shrink_cuda)
 lora_expand_.register_kernel("cuda")(_expand_cuda)
 lora_apply_.register_kernel("cuda")(_apply_cuda)
 
+
+
+def _experts_apply_cuda(x, y, a, b, ids, row_weight, sorted_ids, expert_ids, num_post_padded, top_k,
+                        out_slices, block_m):
+    """An experts target on the fused-MoE grouped GEMM (``invoke_fused_moe_kernel``) over
+    combined ids: one align per MoE layer (``sorted_ids`` .. ``block_m``) groups its rows by
+    (slot, expert), a shrink writes ``h``, and an expand per slice adds into the layer's
+    cache (``accumulate``) scaled per row. One opaque op for ``torch.compile``: traced as
+    raw Triton launches into column views of ``y``, compiled output differed from eager
+    and graph capture crashed."""
+    if sorted_ids is None:  # no alignment: the rows were never grouped
+        experts_reference_(x, y, a, b, ids, row_weight, top_k, out_slices)
+        return
+    if y.shape[0] == 0:
+        return
+    config = experts_config(ids, a.shape[0])
+    assert config["BLOCK_SIZE_M"] == block_m
+    launch = dict(
+        topk_ids=ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+        num_tokens_post_padded=num_post_padded, config=config, compute_type=tl_compute_type(x.dtype),
+    )
+    max_rank = b.shape[-1]
+    h = x.new_empty(y.shape[0], a.shape[1])
+    invoke_fused_moe_kernel(x, a, h, row_weight, mul_routed_weight=False, top_k=top_k, **launch)
+    offset = 0
+    for i, width in enumerate(out_slices):
+        invoke_fused_moe_kernel(
+            h[:, i * max_rank:(i + 1) * max_rank], b[:, offset:offset + width], y[:, offset:offset + width],
+            row_weight, mul_routed_weight=True, top_k=1, accumulate=True, **launch,
+        )
+        offset += width
+
+
+lora_experts_apply_.register_kernel("cuda")(_experts_apply_cuda)
