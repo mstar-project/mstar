@@ -394,22 +394,14 @@ class Glm5NextModel(Model):
                 )
 
         if self._tokenizer_mode == "byte":
-            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO;
+            # the reply prefix (a forced tool call) follows the prompt
             vocab = self.config.vocab_size
-            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        elif getattr(self.tokenizer, "chat_template", None):
+            text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
+            input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
+        else:
             input_ids = render_chat_template(
                 self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, TEMPLATE_KWARGS)
-        else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
-        if prefix := kwargs.get("reply_prefix"):
-            # what the reply opens with, after the generation prompt (a forced tool call)
-            if self._tokenizer_mode == "byte":
-                prefix_ids = [min(b, self.config.vocab_size - 1) for b in prefix.encode("utf-8")]
-            else:
-                prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
-            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
 
         # Decode runs at least one step, and one more may already be scheduled
         # when it stops, so the prompt leaves two steps' tokens of the context

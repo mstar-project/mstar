@@ -204,8 +204,10 @@ def test_a_tool_search_result_lists_the_tool_it_loads():
     from mstar.model.multimodal import render_chat_template
 
     class _Tokenizer:
+        chat_template = _REFERENCE_TEMPLATE
+
         def apply_chat_template(self, messages, tools=None, **kw):
-            text = jinja2.Environment().from_string(_REFERENCE_TEMPLATE).render(messages=messages, tools=tools)
+            text = jinja2.Environment().from_string(self.chat_template).render(messages=messages, tools=tools)
             return torch.tensor([list(text.encode())])
 
     adapter = adapters.get_adapter("glm5_next")
