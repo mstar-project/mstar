@@ -254,10 +254,10 @@ class _Decoder(torch.nn.Module):
 
 def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     """Only ``decode_spoken``'s graph routes each row's input id and hidden, which
-    the TTS prefill reads. The LLM, built with its graph's decode and hidden walks,
-    returns them from the one decode capture both decode walks replay; a text
-    reply's row drops them, and each of the step's spoken rows keeps its own copy
-    for its loop to accumulate, which holds no other row alive."""
+    the TTS prefill reads. The LLM, its graph's decode and hidden walks bound by
+    ``get_submodule``, returns them from the one decode capture both decode walks
+    replay; a text reply's row drops them, and each of the step's spoken rows
+    keeps its own copy for its loop to accumulate, which holds no other row alive."""
     from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
     from mstar.model.submodule_base import BatchedModelOutput
 
