@@ -801,7 +801,7 @@
 </div>
 <hr class="docutils" />
 <section id="classes">
-<h2>1. Classes<a class="headerlink" href="#classes" title="Link to this heading">#</a></h2>
+<span id="1-classes"></span><h2>1. Classes<a class="headerlink" href="#classes" title="Link to this heading">#</a></h2>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVReqConfig</span><span class="p">(</span><span class="n">ResourceReqConfig</span><span class="p">):</span>
     <span class="o">...</span>
@@ -870,7 +870,7 @@
 </section>
 <hr class="docutils" />
 <section id="reservations">
-<h2>2. Reservations<a class="headerlink" href="#reservations" title="Link to this heading">#</a></h2>
+<span id="2-reservations"></span><h2>2. Reservations<a class="headerlink" href="#reservations" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">KVManager._alloc</span></code> (<a class="reference download internal" download="" href="../_downloads/80b0b8624f2e11368fbec0c403b15d87/manager.py"><span class="xref download myst">manager.py</span></a>) checks every one of the grants against the reservations, under the KV lock which it already holds. A grant is <code class="docutils literal notranslate"><span class="pre">_alloc</span></code> giving a request the next page to write into. Each pool gains:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># per pool, under the KV lock</span>
 <span class="n">_allotments</span>   <span class="c1"># each admitted request's Allotment, its reservation</span>
@@ -931,11 +931,11 @@
 </section>
 <hr class="docutils" />
 <section id="preemption">
-<h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
+<span id="3-preemption"></span><h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
 <p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">StepPipeline._handle_admit_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/c6c09ab6fb65bb1a9110bc80da8ec1ee/step_pipeline.py"><span class="xref download myst">step_pipeline.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Preemption.preempt</span></code> (<a class="reference download internal" download="" href="../_downloads/c0bb601c3467c39e83c833f5aa56be84/preemption.py"><span class="xref download myst">preemption.py</span></a>) before <code class="docutils literal notranslate"><span class="pre">Admission.relieve</span></code>. In place of today’s 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
 <p>Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler’s in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
 <section id="arrival-numbers">
-<h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
+<span id="31-arrival-numbers"></span><h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">CurrentForwardPassInfo</span><span class="p">:</span>
     <span class="o">...</span>
@@ -946,7 +946,7 @@
 <p>A number set by each worker won’t work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.</p>
 </section>
 <section id="choosing-the-victims">
-<h3>3.2 Choosing the victims<a class="headerlink" href="#choosing-the-victims" title="Link to this heading">#</a></h3>
+<span id="32-choosing-the-victims"></span><h3>3.2 Choosing the victims<a class="headerlink" href="#choosing-the-victims" title="Link to this heading">#</a></h3>
 <p>Say request R’s grant is short by <code class="docutils literal notranslate"><span class="pre">pages_short</span></code> pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.</p>
 <ul class="simple">
 <li><p><strong>Candidates.</strong> The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn’t landed, since the rebuild runs on its reservation, and a request holding a lease, until its walk’s admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn’t refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and the room the host set aside for it, and asks again, whatever the host pool. The host’s room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.</p></li>
@@ -970,7 +970,7 @@
 </ul>
 </section>
 <section id="earmarks">
-<h3>3.3 Earmarks<a class="headerlink" href="#earmarks" title="Link to this heading">#</a></h3>
+<span id="33-earmarks"></span><h3>3.3 Earmarks<a class="headerlink" href="#earmarks" title="Link to this heading">#</a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Earmark</span><span class="p">:</span>
     <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span>            <span class="c1"># R, the request whose grant failed</span>
@@ -991,7 +991,7 @@
 </section>
 <hr class="docutils" />
 <section id="the-drop">
-<h2>4. The drop<a class="headerlink" href="#the-drop" title="Link to this heading">#</a></h2>
+<span id="4-the-drop"></span><h2>4. The drop<a class="headerlink" href="#the-drop" title="Link to this heading">#</a></h2>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">KVManager</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Take rid's KV off the GPU without copying it, and return the number</span>
@@ -1056,9 +1056,9 @@
 </section>
 <hr class="docutils" />
 <section id="return-and-rebuild">
-<h2>5. Return and rebuild<a class="headerlink" href="#return-and-rebuild" title="Link to this heading">#</a></h2>
+<span id="5-return-and-rebuild"></span><h2>5. Return and rebuild<a class="headerlink" href="#return-and-rebuild" title="Link to this heading">#</a></h2>
 <section id="states">
-<h3>5.1 States<a class="headerlink" href="#states" title="Link to this heading">#</a></h3>
+<span id="51-states"></span><h3>5.1 States<a class="headerlink" href="#states" title="Link to this heading">#</a></h3>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>State</p></th>
@@ -1089,7 +1089,7 @@
 </ul>
 </section>
 <section id="the-return-check">
-<h3>5.2 The return check<a class="headerlink" href="#the-return-check" title="Link to this heading">#</a></h3>
+<span id="52-the-return-check"></span><h3>5.2 The return check<a class="headerlink" href="#the-return-check" title="Link to this heading">#</a></h3>
 <p>A dropped request asks again when it is dropped, and waits outside the queues (§2), with this check in place of the fit check:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">need</span><span class="p">(</span><span class="n">V</span><span class="p">)</span> <span class="o">=</span> <span class="n">the</span> <span class="n">larger</span> <span class="n">of</span> <span class="n">V</span><span class="s1">'s prompt and, for each label, the pages</span>
           <span class="n">V</span><span class="s1">'s kept history fills, plus 1, capped at V'</span><span class="n">s</span> <span class="n">footprint</span><span class="p">,</span>
@@ -1111,7 +1111,7 @@
 </ul>
 </section>
 <section id="the-rebuild-row">
-<h3>5.3 The rebuild row<a class="headerlink" href="#the-rebuild-row" title="Link to this heading">#</a></h3>
+<span id="53-the-rebuild-row"></span><h3>5.3 The rebuild row<a class="headerlink" href="#the-rebuild-row" title="Link to this heading">#</a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RebuildPolicy</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""How a node rebuilds a dropped request's KV, as its model declares it."""</span>
@@ -1140,12 +1140,12 @@
 </div></blockquote>
 </section>
 <section id="tokens-after-a-rebuild">
-<h3>5.4 Tokens after a rebuild<a class="headerlink" href="#tokens-after-a-rebuild" title="Link to this heading">#</a></h3>
+<span id="54-tokens-after-a-rebuild"></span><h3>5.4 Tokens after a rebuild<a class="headerlink" href="#tokens-after-a-rebuild" title="Link to this heading">#</a></h3>
 <p>A rebuild’s prefill rounds differently from the decode steps that first wrote the KV. So a rebuilt request continues like a fresh prefill of its context, not like the run it was dropped from, and a seeded request rebuilt under load may not repeat its output.</p>
 <p>In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and seeded, captured and eager, the tokens after every rebuild equal a prefill of the kept ids with the same step shape and cached length. 7 of the 24 also match the run without the drop for 64 tokens.</p>
 </section>
 <section id="why-every-request-finishes">
-<h3>5.5 Why every request finishes<a class="headerlink" href="#why-every-request-finishes" title="Link to this heading">#</a></h3>
+<span id="55-why-every-request-finishes"></span><h3>5.5 Why every request finishes<a class="headerlink" href="#why-every-request-finishes" title="Link to this heading">#</a></h3>
 <p>A guaranteed request reserves its whole footprint and is never preempted once it starts, so it then finishes.</p>
 <p>Take the oldest request O, once every older request has finished:</p>
 <ol class="arabic simple">
@@ -1160,7 +1160,7 @@
 </section>
 <hr class="docutils" />
 <section id="tp-followers">
-<h2>6. TP followers<a class="headerlink" href="#tp-followers" title="Link to this heading">#</a></h2>
+<span id="6-tp-followers"></span><h2>6. TP followers<a class="headerlink" href="#tp-followers" title="Link to this heading">#</a></h2>
 <p>Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a request that waits for its shortage, a flip to guaranteed at admission, each earmark, drop and return, and a request that keeps no ids, and records it in the <code class="docutils literal notranslate"><span class="pre">OffloadDelta</span></code> (<a class="reference download internal" download="" href="../_downloads/6f23d3360ef0e39c2e20a12ef5c0f306/ipc_format.py"><span class="xref download myst">ipc_format.py</span></a>) it sends with the next <code class="docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code> of any of the worker’s lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step’s admit. At TP the host holds no cached pages, since <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> refuses a host pool, so its room moves only with moves every rank makes in rank 0’s order and is the same on every rank at each of those points.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">OffloadDelta</span><span class="p">:</span>
@@ -1189,7 +1189,7 @@
 </section>
 <hr class="docutils" />
 <section id="checks">
-<h2>7. Checks<a class="headerlink" href="#checks" title="Link to this heading">#</a></h2>
+<span id="7-checks"></span><h2>7. Checks<a class="headerlink" href="#checks" title="Link to this heading">#</a></h2>
 <p>Always on:</p>
 <ul class="simple">
 <li><p>A victim is preemptible, or guaranteed and not yet started, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.</p></li>
@@ -1204,7 +1204,7 @@
 </section>
 <hr class="docutils" />
 <section id="trade-offs">
-<h2>8. Trade-offs<a class="headerlink" href="#trade-offs" title="Link to this heading">#</a></h2>
+<span id="8-trade-offs"></span><h2>8. Trade-offs<a class="headerlink" href="#trade-offs" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Drops cost a rebuild.</strong> A victim the host pool can’t hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again each time an older request runs short.</p></li>
 <li><p><strong>A lone rebuild isn’t speculated.</strong> Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.</p></li>
@@ -1216,7 +1216,7 @@
 </section>
 <hr class="docutils" />
 <section id="next-steps-out-of-scope-here">
-<h2>9. Next steps (Out of Scope here)<a class="headerlink" href="#next-steps-out-of-scope-here" title="Link to this heading">#</a></h2>
+<span id="9-next-steps-out-of-scope-here"></span><h2>9. Next steps (Out of Scope here)<a class="headerlink" href="#next-steps-out-of-scope-here" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Pool sizing.</strong> Fixed, hand-set pool sizes can also cause thrashing, which this work surfaced. Each cache’s <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> comes from the config, 2048 pages by default, so a pool can fill and preempt long before memory runs out: Command A+’s TP8 config gets about 4 GB of KV per GPU where, by my estimate, about 20 GB is free after weights. Except for M*, every other engine sizes the pool from free memory instead.</p></li>
 <li><p><strong>One pool per GPU.</strong> SGLang has moved from a fixed pool per cache type to one physical pool, where full-attention KV and window or recurrent state grow from opposite ends and compaction remaps pages, since agent contexts vary too much in length for fixed ratios. M*’s caches on a worker could share one pool the same way, but the effects would need to be measured.</p></li>
