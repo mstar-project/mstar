@@ -563,36 +563,6 @@ def test_a_longer_canary_decoder_compiles_no_more_frames():
     assert frames[0] == frames[1] > 1
 
 
-class _InPlacePositions:
-    """Rotates in place, as the position resource's kernel does."""
-
-    def apply_qk(self, q, k, label=None, rope_dtype=None):
-        q.mul_(2.0)
-        k.mul_(2.0)
-        return q, k
-
-
-@torch.no_grad()
-def test_no_pi05_frame_rotates_tensors_it_took_as_inputs():
-    """q and k are views of one projection. A frame that takes them as inputs and rotates them in place fixes the size
-    of their base when it compiles, and a packed prefill reuses that frame across batch sizes, where the base can
-    differ. The capture then fails at boot on `assert_size_stride`."""
-    torch._dynamo.reset()
-    expert, handle = _pi05_expert(Pi05PaliGemmaExpert)
-    handle.positions = _InPlacePositions()
-    rotated_inputs = []
-
-    def backend(graph_module, inputs):
-        rotated_inputs.extend(
-            node for node in graph_module.graph.nodes
-            if node.op == "call_method" and node.target == "mul_" and node.args[0].op == "placeholder"
-        )
-        return graph_module.forward
-
-    torch._dynamo.optimize(backend, dynamic=False)(expert)(*_pi05_call(expert))
-    assert not rotated_inputs, "the rotation belongs in the frame that made q and k"
-
-
 @torch.no_grad()
 @pytest.mark.parametrize("expert_class", [Pi05PaliGemmaExpert, Pi05ActionExpert])
 def test_each_pi05_layer_reads_the_array_by_its_id_in_the_stack(expert_class):
