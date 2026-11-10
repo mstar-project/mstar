@@ -127,6 +127,7 @@ def test_text_to_image_is_one_span_and_keys_nothing():
 
 @pytest.mark.parametrize("kwargs, images, match", [
     ({"true_cfg_scale": 4.0}, 0, "guidance_scale"),
+    ({"guidance_scale": float("inf"), "negative_prompt": "x"}, 0, "finite"),
     ({"output_format": "jpeg"}, 0, "RGBA"),
     ({"num_inference_steps": 1}, 0, "num_inference_steps"),
     # a reference resized under Qwen3-VL's min_pixels would be resized again by its processor

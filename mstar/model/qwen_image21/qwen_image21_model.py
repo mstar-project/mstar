@@ -310,6 +310,9 @@ class QwenImage21Model(Model):
     def _guided(model_kwargs: dict) -> bool:
         """CFG runs, as the pipeline's ``true_cfg_scale``, only with a scale above 1 and a negative prompt."""
         scale = model_kwargs.get("guidance_scale")
+        if scale is not None and (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                                  or not math.isfinite(scale)):
+            raise ValueError(f"guidance_scale must be a finite number; got {scale!r}")
         return scale is not None and float(scale) > 1.0 and model_kwargs.get("negative_prompt") is not None
 
     def _output_resolution(self, model_kwargs: dict) -> int:
@@ -330,9 +333,10 @@ class QwenImage21Model(Model):
                 )
             return len(cfg.sample_sigmas)
         steps = cfg.default_num_inference_steps if steps is None else steps
-        if isinstance(steps, bool) or not isinstance(steps, int) or not 2 <= steps <= MAX_INFERENCE_STEPS:
-            # one step leaves the shift_terminal stretch undefined (NaN in the reference)
-            raise ValueError(f"Qwen-Image-2.1 num_inference_steps must be an integer in [2, {MAX_INFERENCE_STEPS}]")
+        fewest = cfg.scheduler.min_steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or not fewest <= steps <= MAX_INFERENCE_STEPS:
+            raise ValueError(
+                f"Qwen-Image-2.1 num_inference_steps must be an integer in [{fewest}, {MAX_INFERENCE_STEPS}]")
         return steps
 
     def _output_size(self, model_kwargs: dict, references: list, resolution: int) -> tuple[int, int]:
