@@ -578,11 +578,15 @@ class PostprocessNeed(IntEnum):
 
 
 class InlineColumn(NamedTuple):
-    """A device-loopback step's client signal, one host scalar per row: its
-    emit edge rides inline, and nothing is stored."""
+    """A device-loopback step's client signal, held on the host, a value per
+    row and iteration: its emit edge rides inline, and nothing is stored."""
     signal: str
-    # 1-D host view, row i for ``PostprocessRequest.row_rids[i]``
+    # host view, row i for ``PostprocessRequest.row_rids[i]``; a repeated
+    # step's has a column per iteration (``PostprocessRequest.token_width``)
     column: "torch.Tensor"
+    # the first iteration the route sends; those before it went out while the
+    # step ran (``GraphRuntime.emit_prefix``)
+    start: int = 0
 
 
 class PostprocessRequest(NamedTuple):
@@ -694,7 +698,9 @@ class PhasedPostprocess:
     ``stop_loops_batched``), the route (``complete_and_route_batch``) and the
     send (``send_outputs``). It stops for the worker where a phase needs
     Python (``PostprocessNeed``). The reference the Rust runtime's native
-    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows."""
+    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows for a step
+    that ran one iteration; a repeated step's (``token_width``, a row's stop
+    inside it, ``InlineColumn.start``) is the native one's alone."""
 
     _postprocess: _Postprocess | None = None
 

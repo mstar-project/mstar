@@ -288,24 +288,70 @@ def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
     assert iters["native"] == ([[2, 0, 3], [3, 0]] if drop else [[2, 1, 3], [3, 2, 0]])
 
 
-def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_path):
-    """A step that ran three iterations hands over a token per iteration: a row
-    stops at the first that stops it, and the client gets its tokens up to that
-    one, in order; what the device ran past the stop goes nowhere."""
-    box = ZmqCommunicator("api_server", str(tmp_path))
-    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
-    rids = _start(rt, 2)
-    assert rt.pop_rids(NODE, WALK, rids) is not None
-    wide = torch.tensor([[1, 2, 3], [4, EOS, 5]], dtype=torch.int64)
-    trace = _drive(rt, PostprocessRequest(
-        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
-        wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
-        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
-        loop_strides=[3, 3], token_width=3,
-    ), {}, model_stops={})
-    assert trace[-1][2] == [rids[1]]
+# a repeated step's tokens, a row's per iteration: row 1 samples EOS at its
+# second; the device ran both rows on to MAX_ITERS
+RUN = [[1, 2, 3, 5], [4, EOS, 6, 8]]
+
+
+def _sent(frames) -> dict:
+    """Per request, its client values in order, each with its loop iteration."""
     sent = {}
-    for frame in _collect(box):
-        for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
-            sent.setdefault(rid, []).append(value)
-    assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
+    for frame in frames:
+        body = frame.body
+        for rid, value, idx in zip(body.request_ids, body.values, body.loop_indices, strict=True):
+            sent.setdefault(rid, []).append((value, idx.loop_indices[LOOP]))
+    return sent
+
+
+def _counted(frames) -> dict:
+    """Per request, the client chunks its completion reports count."""
+    counts = {}
+    for frame in frames:
+        names = getattr(frame.body, "output_signal_names", None)
+        if names is not None:
+            counts[frame.body.request_id] = counts.get(frame.body.request_id, 0) + len(names)
+    return counts
+
+
+def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path):
+    """A step that ran several iterations hands the client a token per
+    iteration: a row's tokens up to its stop, in order, each with its own
+    iteration's loop index and counted by the completion report, and nothing
+    the device ran past the stop. The reference runs the same tokens one
+    iteration a step."""
+    sent = {}
+    for k in ("one_a_step", "repeated"):
+        d = tmp_path / k
+        d.mkdir()
+        boxes = {p: ZmqCommunicator(p, str(d)) for p in ("api_server", "conductor")}
+        rt = _runtime(rust_runtime.RustGraphRuntime, str(d))
+        rids = _start(rt, 2)
+        if k == "one_a_step":
+            active = list(rids)
+            for i in range(MAX_ITERS):
+                assert rt.pop_rids(NODE, WALK, active) is not None
+                column = torch.tensor([RUN[rids.index(r)][i] for r in active], dtype=torch.int64)
+                trace = _drive(rt, PostprocessRequest(
+                    partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+                    wg_ids=ParallelList(list(active), [0] * len(active)), runtime_stops=True,
+                    tokens=column, row_rids=active, inline=InlineColumn(SIG, column),
+                ), {}, model_stops={})
+                active = [r for r in active if r not in trace[-1][2]]
+        else:
+            assert rt.pop_rids(NODE, WALK, rids) is not None
+            # landed as a repeated step lands them: [iterations, rows], viewed
+            # as a column per iteration
+            wide = torch.tensor(RUN, dtype=torch.int64).t().contiguous().t()
+            trace = _drive(rt, PostprocessRequest(
+                partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+                wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+                tokens=wide, row_rids=rids, inline=InlineColumn(SIG, wide),
+                loop_strides=[MAX_ITERS] * 2, token_width=MAX_ITERS,
+            ), {}, model_stops={})
+            # row 0 runs to the Loop's cap, which ends it without a stop
+            assert trace[-1][2] == [rids[1]]
+        sent[k] = (_sent(_collect(boxes["api_server"])), _counted(_collect(boxes["conductor"])))
+    assert sent["repeated"] == sent["one_a_step"]
+    assert sent["one_a_step"] == (
+        {"r0": [(1, 0), (2, 1), (3, 2), (5, 3)], "r1": [(4, 0), (EOS, 1)]}, {"r0": 4, "r1": 2},
+    )
