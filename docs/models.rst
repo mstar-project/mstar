@@ -186,7 +186,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``nemotron_asr``
      - ``nvidia/nemotron-3.5-asr-streaming-0.6b``
      - Cache-aware streaming FastConformer + RNN-T with a language prompt (``language``: a locale
-       such as ``en-US``, a bare code, or ``auto``); serves whole clips and live calls over
+       such as ``en-US``, a bare code, or ``auto``); serves whole clips, and with ``live: true``
+       (``configs/nemotron_asr_live.yaml``) live calls too, over
        ``/v1/realtime?intent=transcription``, at its widest lookahead by default (``lookahead`` in
        the YAML's ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
    * - ``wan22``
@@ -477,8 +478,11 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   re-decoded, so its transcript is the checkpoint's streaming output. ``lookahead`` also sets
   the latency, 320 ms at 3 and 1.12 s at 13 (the default), and both a clip's and a live
   call's frames use it. A live call's state is bounded however long it runs; the live
-  path takes about 2.4 GB of GPU memory beside the whole-clip path's 4.6 GB (a second copy of the
-  encoder weights and each stream's bounded state).
+  path takes about 1.15 GB of GPU memory beside the whole-clip path's 4.6 GB (each stream's
+  bounded state and the live captures; both paths share one copy of the weights). It is on only
+  with ``live: true`` in ``model_kwargs`` (``configs/nemotron_asr_live.yaml``, at lookahead 3).
+  With it on, whole clips ran 3-8% slower at 1 and 32 at once on an H200 (cause not traced), so a
+  whole-clip deployment leaves it off and runs exactly the clip graph.
 - All four run the FastConformer encoder ``nemotron_duplex`` streams
   (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
   Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's

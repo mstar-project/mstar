@@ -95,12 +95,10 @@ def test_unsupported_checkpoint(tmp_path):
 @pytest.mark.parametrize("nemotron", [False, True])
 def test_graph_and_process_prompt(tmp_path, nemotron):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
-    assert model.nodes == (["audio_encoder", "stream_encoder", "transducer", "transducer_stream"] if nemotron
-                           else ["audio_encoder", "transducer"])
-    *_, pool = model.get_node_resources()
+    assert model.nodes == ["audio_encoder", "transducer"]
+    (pool,) = model.get_node_resources()
     assert isinstance(pool, RecurrentStateSpec) and pool.resource_key == TRANSDUCER_STATE
-    assert pool.nodes == ({"transducer", "transducer_stream"} if nemotron else {"transducer"})
-    assert pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
+    assert pool.nodes == {"transducer"} and pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
     assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols"}
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(8000)]},
                                language="de")
@@ -194,7 +192,7 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     """A whole clip runs its one walk, and a live call the two stream walks,
     each in its own partition; the partitions a request doesn't use are done
     from the start, so a clip's graph is the same as before."""
-    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)))
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live=True)
     assert {p.name for p in model.get_partitions()} == {"default", "Encoder", "Decoder"}
     client = model.get_partition_topology().client_connections()
     assert [c.audio.frame_samples for c in client] == [1280 * model.chunk_frames]
@@ -213,6 +211,20 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
 
 
 
+
+def test_a_deployment_hears_live_calls_only_when_it_asks(tmp_path):
+    """Off by default: a cache-aware checkpoint serves whole clips on the one
+    walk, with no live partitions or stream state for every request to carry;
+    live on a checkpoint that can't stream is refused at load."""
+    (tmp_path / "n").mkdir()
+    (tmp_path / "p").mkdir()
+    clip = ParakeetModel(str(_snapshot(tmp_path / "n", nemotron=True)))
+    assert [p.name for p in clip.get_partitions()] == ["default"]
+    assert not clip.get_partition_topology().client_connections()
+    assert set(clip.get_graph_walk_graphs()) == {WALK}
+    with pytest.raises(ValueError, match="cache-aware"):
+        ParakeetModel(str(_snapshot(tmp_path / "p", nemotron=False)), live=True)
+
 def test_a_live_checkpoint_loads_its_encoder_once(tmp_path, monkeypatch):
     """The clip's and the live call's encoder nodes run the same layers
     (``forward`` / ``forward_stream``): one copy of the weights, not two."""
@@ -222,7 +234,7 @@ def test_a_live_checkpoint_loads_its_encoder_once(tmp_path, monkeypatch):
         FastConformerEncoder, "load",
         classmethod(lambda cls, config, weights, *, device, dtype=None, **keys: cls(config, **keys)),
     )
-    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)))
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live=True)
     clip, live = (model.get_submodule(node) for node in ("audio_encoder", "stream_encoder"))
     assert clip.encoder is live.encoder
 

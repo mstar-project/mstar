@@ -1,0 +1,17 @@
+model: "nemotron_asr"
+max_seq_len: 8192
+# Whole clips and live calls (/v1/realtime?intent=transcription, /generate/ws). A
+# request holds one decoder state slot from its first decode iteration until it is
+# torn down; the pool holds max_concurrent_requests of them plus its sink slot.
+max_concurrent_requests: 128
+resources:
+  transducer_state:
+    max_slots: 129
+node_groups:
+  - node_names: [audio_encoder, stream_encoder, transducer, transducer_stream]
+    ranks: [0]
+model_kwargs:
+  live: true
+  # A live call hears lookahead + 1 encoder frames at a time, so this sets its
+  # latency: 3 is 320 ms (13, the checkpoint's widest, is 1.12 s). Clips use it too.
+  lookahead: 3

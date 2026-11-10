@@ -91,15 +91,23 @@ class ParakeetModel(Model):
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
+    # whether the deployment also hears live calls; set by __init__ from its `live` kwarg
+    live = False
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
-        lookahead: int | None = None, compile_step: bool = True, **kwargs,
+        lookahead: int | None = None, compile_step: bool = True, live: bool = False, **kwargs,
     ):
         self.model_path_hf = model_path_hf
         self.compile_step = compile_step
         self.local_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=CHECKPOINT_FILES)
         self.config = ParakeetModelConfig.from_pretrained(self.local_dir, lookahead=lookahead)
+        if live and not self.config.encoder.causal:
+            raise ValueError(f"live: true needs a cache-aware (causal) checkpoint; {model_path_hf} is not one")
+        # A deployment that also hears live calls (configs/nemotron_asr_live.yaml). Off, the
+        # graph is the whole-clip one alone: a live path costs every clip's request its extra
+        # partitions and the deployment its stream state.
+        self.live = bool(live)
         tokenizer = json.loads((self.local_dir / "tokenizer.json").read_text())
         self._detokenizer = SentencePieceDetokenizer(
             tokenizer, extra_skip_ids={self.config.transducer.blank_token_id},
@@ -107,11 +115,6 @@ class ParakeetModel(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         # modules two nodes share, by (name, device)
         self._modules: dict[tuple[str, str], torch.nn.Module] = {}
-
-    @property
-    def live(self) -> bool:
-        """A cache-aware checkpoint also hears a live stream."""
-        return self.config.encoder.causal
 
     @property
     def chunk_frames(self) -> int:
