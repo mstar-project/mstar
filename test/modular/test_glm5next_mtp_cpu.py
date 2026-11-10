@@ -44,7 +44,7 @@ _WEIGHT_STD = 0.1
 
 
 class _GreedySampler(StubResource):
-    def sample(self, request_ids, logits, **kwargs):
+    def sample(self, logits, **kwargs):
         return logits.argmax(-1)
 
 

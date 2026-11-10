@@ -150,9 +150,9 @@ class _KeepLogits:
     def __init__(self, sampler):
         self.sampler = sampler
 
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         self.logits = logits
-        return self.sampler.sample(request_ids, logits=logits)
+        return self.sampler.sample(logits)
 
 
 class Runtime:

@@ -465,7 +465,7 @@ def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     assert step.steps[ROPE].advance == (1, 8)
     assert sub.max_rows_in_combined(Cosmos3Model.REASONER_PREFILL_VISION_WALK) == sub.MIXED_MAX_PREFILL_ROWS
 
-    sampler = types.SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([42, 0]))
+    sampler = types.SimpleNamespace(loopback_tokens=lambda: torch.tensor([42, 0]))
     engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
     out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
     assert out["input_ids"].tolist() == [42, 5, 6, 7, 8, 9] + [image_pad] * 4 + [10]

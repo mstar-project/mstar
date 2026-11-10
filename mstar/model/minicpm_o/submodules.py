@@ -175,7 +175,7 @@ class LLMSubmodule(ARNodeSubmodule):
         hidden = self.model(input_embeds, label="main")
         if graph_walk != DECODE:
             hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        return sampler.sample(self.model.logits(hidden))
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,

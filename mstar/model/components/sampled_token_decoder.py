@@ -491,7 +491,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = sampler.loopback_tokens()
             laps.lap("tokens")
             decode = graph_walk == self.DECODE_WALK
             if not decode or any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
@@ -598,7 +598,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         )
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = sampler.loopback_tokens()
         media, mask = tensors.pop(MEDIA_EMBEDS, None), tensors.pop(MEDIA_MASK, None)
         decoder_kwargs = self.decoder_kwargs(graph_walk, engine_inputs, input_ids.shape[0], **tensors)
         embeds = self.model.embed(input_ids)
@@ -609,7 +609,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head
             hidden = engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        return sampler.sample(self.model.logits(hidden))
 
     def forward(
         self,

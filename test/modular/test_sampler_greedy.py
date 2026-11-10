@@ -305,14 +305,14 @@ def test_an_eager_greedy_step_takes_the_argmax_and_moves_offsets_as_a_full_one(m
     ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False, lean=GREEDY)
     sampler.plan(SamplerStep(), ctx)
     logits = torch.randn(2, V, generator=torch.Generator().manual_seed(0))
-    assert torch.equal(sampler.sample([1, 2], logits), logits.argmax(-1))
+    assert torch.equal(sampler.sample(logits), logits.argmax(-1))
     assert [sampler._sampler._step_offset[rid] for rid in (1, 2, 3)] == [STRIDE, STRIDE, 0]
     sampler.commit(SamplerStep(), ctx)
     # with the sampled row in it, the full draw
     ctx = StepContext(request_ids=(1, 3), graph_walk=WALK, slot=0, capture=False)
     sampler.plan(SamplerStep(), ctx)
     with pytest.raises(AssertionError, match="drew in full"):
-        sampler.sample([1, 3], logits)
+        sampler.sample(logits)
 
 
 # ---- steps flipping between the two captures ----
@@ -403,7 +403,7 @@ class _Node:
             self.planner.plan(step, ctx)
         self.sampler.plan(smp, ctx)
         assert self.sampler._cg_sampler is graph_sampler and self.sampler._greedy_this_step == greedy
-        ids = self.sampler.loopback_tokens(list(padded))
+        ids = self.sampler.loopback_tokens()
         if self.planner is not None:
             self.planner.flush(ctx.resident_plan)
             self.sampler._cells.gather(rec)

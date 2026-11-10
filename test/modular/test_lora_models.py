@@ -599,7 +599,7 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
     llm.model.forward = lambda embeds, **_: seen.append(embeds) or embeds
     llm.model.logits = lambda hidden: hidden
     engine = SimpleNamespace(captured=False, request_ids=[f"r{i}" for i in range(4)], resources={
-        SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+        SAMPLER: SimpleNamespace(sample=lambda logits: logits),
         ATTN: SimpleNamespace(select_last_hidden=lambda hidden: hidden),
     })
     H.plan([lora_pool], [(f"r{i}", "e", row.input_seq_len) for i, row in enumerate(rows)])

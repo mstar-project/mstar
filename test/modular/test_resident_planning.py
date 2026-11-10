@@ -2042,7 +2042,7 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     node = llm(None, SimpleNamespace(stop_token_ids=(1,)))
     node._position_ids_3d = lambda inputs: pytest.fail("read positions")
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
+    sampler = SimpleNamespace(loopback_tokens=lambda: token)
     engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={SAMPLER: sampler})
     out = node.preprocess("decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}

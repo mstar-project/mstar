@@ -74,7 +74,7 @@ class NodeTests(unittest.TestCase):
         self.node = toy_node(self.model)
 
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x: x[[2, 4]]))
         engine = ModelInputsFromEngine(["a", "b"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
         for walk, rows, expected in (
@@ -93,7 +93,8 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
             self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
-            self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
+            # one row of logits per request; the sampler takes the rows from its planned step
+            self.assertEqual(sampler.sample.call_args.args[0].shape[0], len(engine.request_ids))
         attention.select_last_hidden.assert_called_once()
 
     def test_its_eos_ends_either_prefill_and_the_decode_loop(self):
@@ -152,7 +153,7 @@ class ModelIntegrationTests(unittest.TestCase):
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
         kv, pos, local, global_ = bind_test_resources(node.model.model, self.model.config)
         local.select_last_hidden = lambda hidden: hidden[-1:]
-        sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
+        sampler = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
         node.bind_node_resources(resources)
         engine = ModelInputsFromEngine(["a"], {}, resources)
@@ -324,7 +325,7 @@ class ModelIntegrationTests(unittest.TestCase):
         ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
         engine = ModelInputsFromEngine(["a"], {}, {
             LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x: x),
-            SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+            SAMPLER: SimpleNamespace(sample=lambda logits: logits),
         })
         inputs = node.prepare_inputs(
             "prefill_image", info("prefill_image", layout=layout), {"text_inputs": [ids], "image_embeds": [rows]},

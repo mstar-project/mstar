@@ -164,11 +164,11 @@ def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         for _ in range(2):  # Triton autotune and FlashInfer JIT outside capture
-            res.sample(list(pads), logits)
+            res.sample(logits)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        res.sample(list(pads), logits)
+        res.sample(logits)
     res.commit(SamplerStep(), capture)
 
     def replay(rebuild: frozenset = frozenset()) -> None:

@@ -175,23 +175,24 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
         request_ids=rids, graph_walk="decode", slot=0, capture=False,
         slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=8)),
     )
+    captured_ctx.set_padded_rids(padded_rids)
     prompt = SamplerStep(prefill_tracked_tokens={
         rid: torch.tensor([1, 2], device=device) for rid in rids
     })
     eager.plan(prompt, eager_ctx)
     captured.plan(prompt, captured_ctx)
     for _ in range(2):
-        captured.sample(padded_rids, logits)
+        captured.sample(logits)
     captured.plan(SamplerStep(), captured_ctx)
     torch.xpu.synchronize(device)
     graph = torch.xpu.XPUGraph()
     with torch.xpu.graph(graph):
-        tokens = captured.sample(padded_rids, logits)
+        tokens = captured.sample(logits)
 
     for kept in (None, frozenset({0, 2}), frozenset(), None):
         step = SamplerStep(kept_rids=kept)
         eager.plan(step, eager_ctx)
-        expected = eager.sample(list(rids), logits[:len(rids)])
+        expected = eager.sample(logits[:len(rids)])
         captured.plan(step, captured_ctx)
         graph.replay()
         captured.commit(step, captured_ctx)

@@ -55,7 +55,7 @@ class _GreedySampler(StubResource):
     """Argmax in place of the Triton sampler; the Resource hooks are no-ops,
     so the runner sweeps its step like the real one's."""
 
-    def sample(self, request_ids, logits, **kwargs):
+    def sample(self, logits, **kwargs):
         return logits.argmax(-1)
 
 
