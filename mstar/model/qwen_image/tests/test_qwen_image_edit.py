@@ -220,21 +220,29 @@ def _vaes():
 
 
 def test_the_vae_nodes_match_the_pipelines_math():
-    """Encode: the posterior's mode, (z - mean) / std, packed; decode: unpacked, z / (1 / std) + mean, rounded as
-    the pipeline's image processor does. The Wan class holds the QwenImage checkpoint."""
+    """Encode: the image processor's pixels, to the bit and memory layout (on an H200 a contiguous input moved the
+    latents 1e-3, cuDNN picking kernels by layout), then the posterior's mode, (z - mean) / std, packed; decode:
+    unpacked, z / (1 / std) + mean, rounded as the pipeline's image processor does. The Wan class holds the
+    QwenImage checkpoint."""
+    from diffusers.image_processor import VaeImageProcessor
     from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline as P
+    from PIL import Image
 
     qwen, wan = _vaes()
     image = torch.randint(0, 256, (3, 32, 48), dtype=torch.uint8)
+    pil = Image.fromarray(image.permute(1, 2, 0).numpy())
+    pixels = VaeImageProcessor(vae_scale_factor=16).preprocess(pil, height=32, width=48).unsqueeze(2)
+    seen, encode = [], wan.encode
+    wan.encode = lambda x: seen.append(x) or encode(x)
     encoder = QwenImageVaeEncoderSubmodule(wan)
     encoder.get_device = lambda: torch.device("cpu")
     with torch.no_grad():
         ours = encoder.forward(IMAGE_INPUTS, None, image_0=image)[REF_LATENTS][0]
-        pixels = (image.float() / 255.0 * 2.0 - 1.0)[None, :, None]
         z = qwen.encode(pixels).latent_dist.mode()
         mean = torch.tensor(qwen.config.latents_mean).view(1, 16, 1, 1, 1)
         std = torch.tensor(qwen.config.latents_std).view(1, 16, 1, 1, 1)
         want = P._pack_latents((z - mean) / std, 1, 16, z.shape[3], z.shape[4])[0]
+    assert torch.equal(seen[0], pixels) and seen[0].stride() == pixels.stride()
     assert torch.equal(ours, want)
 
     config = QwenImageConfig()
@@ -246,21 +254,6 @@ def test_the_vae_nodes_match_the_pipelines_math():
         decoded = qwen.decode(latents, return_dict=False)[0][:, :, 0]
         want_out = ((decoded * 0.5 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
     assert torch.equal(image_out, want_out)
-
-
-def test_vae_pixels_are_the_image_processors_to_the_bit_and_layout():
-    """The VAE's latents depend on its input's exact values and memory layout (cuDNN picks kernels by it): on an
-    H200 a contiguous input moved the reference latents 1e-3 from the pipeline's."""
-    from diffusers.image_processor import VaeImageProcessor
-    from PIL import Image
-
-    from mstar.model.components.diffusion.image_io import vae_pixels
-
-    image = torch.randint(0, 256, (3, 48, 64), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
-    pil = Image.fromarray(image.permute(1, 2, 0).numpy())
-    ref = VaeImageProcessor(vae_scale_factor=16).preprocess(pil, height=48, width=64).unsqueeze(2)
-    ours = vae_pixels(image)
-    assert torch.equal(ours, ref) and ours.stride() == ref.stride()
 
 
 class _FakeProcessor:
