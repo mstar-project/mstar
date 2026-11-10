@@ -22,12 +22,7 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    # checked before the adapter saves any upload, which only the finally below removes,
-    # and before submit, after which a raise leaves the request running with no reader
-    stream_options = getattr(req, "stream_options", None) or {}
-    if not isinstance(stream_options, dict):
-        raise ValueError("stream_options must be an object")
-    include_usage = bool(stream_options.get("include_usage"))
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     audio_format = _audio_format(req, sample_rate)
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)

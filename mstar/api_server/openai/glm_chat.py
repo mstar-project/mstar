@@ -22,10 +22,6 @@ ARG_VALUE, ARG_VALUE_END = "<arg_value>", "</arg_value>"
 _CALL_TAGS = {"name": (ARG_KEY, CALL_END), "text": (CALL_END,), "args": (ARG_KEY, CALL_END),
               "key": (ARG_KEY_END, CALL_END), "value": (ARG_VALUE_END, CALL_END)}
 
-# what the templates read; others are dropped, as some would collide with
-# apply_chat_template's own arguments
-TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
-
 
 def template_messages(messages) -> list[dict]:
     """The messages as the templates read them: a call's ``arguments`` as the

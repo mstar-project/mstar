@@ -143,6 +143,11 @@ def messages_from_parts(
     return messages
 
 
+# What GLM-5.2's and GLM-5.3's chat templates read of ``chat_template_kwargs``; other keys
+# are dropped, as some would collide with apply_chat_template's own arguments.
+GLM_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
+
+
 def render_chat_template(
     tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict,
     switches: tuple[str, ...] = (),

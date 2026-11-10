@@ -408,6 +408,8 @@ class RequestData:
     # double-count: rx by (source, dest, edge), tx by (source, edge).
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
+    # the data worker's count, returned on request_complete
+    prompt_tokens: int | None = None
 
     def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
@@ -1476,6 +1478,7 @@ class Conductor:
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
+            prompt_tokens=body.prompt_tokens,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1837,6 +1840,8 @@ class Conductor:
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
                     conductor_arrival_time=request_data.conductor_arrival_time,
+                    prompt_tokens=request_data.prompt_tokens,
+                    max_output_tokens=request_data.max_output_tokens,
                 )
             )
         )

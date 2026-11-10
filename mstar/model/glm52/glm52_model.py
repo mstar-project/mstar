@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 import torch
 
-from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
@@ -47,12 +46,10 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import PromptPart, render_chat_template
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
-    ByteIdDetokenizer,
-    ByteLevelDetokenizer,
-    TextOutput,
+    ByteLevelTextOutput,
     capture_ladder,
     load_snapshot_tokenizer,
     read_fp8_block_quant_config,
@@ -78,7 +75,7 @@ QUANT_METHODS = ("fp8",)
 DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
-class Glm52Model(Model):
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
     DECODE_LOOP = "decode_loop"
@@ -389,7 +386,7 @@ class Glm52Model(Model):
             text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
             input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
-            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:
@@ -441,18 +438,6 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    # built on first use: the tokenizer it reads loads lazily
-    _text_output: TextOutput | None = None
-
-    def text_output(self) -> TextOutput:
-        if self._text_output is None:
-            # a reduced model's byte ids never touch the HF tokenizer
-            detokenizer = (
-                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
-            )
-            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
-        return self._text_output
 
     def postprocess(
         self,

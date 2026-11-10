@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 import torch
 
-from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
@@ -58,12 +57,10 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.multimodal import render_chat_template
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
-    ByteIdDetokenizer,
-    ByteLevelDetokenizer,
-    TextOutput,
+    ByteLevelTextOutput,
     capture_ladder,
     check_loaded,
     load_snapshot_tokenizer,
@@ -83,7 +80,7 @@ DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 QUANT_METHODS = ("fp8",)
 
 
-class Glm5NextModel(Model):
+class Glm5NextModel(ByteLevelTextOutput, Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
     DECODE_LOOP = "decode_loop"
@@ -401,7 +398,7 @@ class Glm5NextModel(Model):
             input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
             input_ids = render_chat_template(
-                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, TEMPLATE_KWARGS)
+                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, GLM_TEMPLATE_KWARGS)
 
         # Decode runs at least one step, and one more may already be scheduled
         # when it stops, so the prompt leaves two steps' tokens of the context
@@ -456,18 +453,6 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    # built on first use: the tokenizer it reads loads lazily
-    _text_output: TextOutput | None = None
-
-    def text_output(self) -> TextOutput:
-        if self._text_output is None:
-            # a reduced model's byte ids never touch the HF tokenizer
-            detokenizer = (
-                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
-            )
-            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
-        return self._text_output
 
     def postprocess(
         self,
