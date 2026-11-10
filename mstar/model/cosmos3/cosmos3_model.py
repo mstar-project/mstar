@@ -496,6 +496,8 @@ class Cosmos3Model(Model):
                 # (three pads, a zero fill and a slice a layer). Falls back to
                 # FlashInfer where FA3 can't load.
                 backend=RaggedAttnBackend.DENSE,
+                # the tower keeps its own bf16 and runs outside autocast
+                dtype=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_DTYPE,
             ),
         )
 

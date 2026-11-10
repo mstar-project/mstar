@@ -161,7 +161,7 @@ class _Node:
             ),
             EngineResourceInfo(
                 device=device, joint_comm_group=None,
-                transfer_engine_info=None, kv_dtype=DTYPE,
+                transfer_engine_info=None, compute_dtype=DTYPE,
                 dependencies={"kv": KVSpec(
                     resource_key="kv", nodes={NODE}, config=kv_config,
                 )},

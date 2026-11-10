@@ -530,7 +530,7 @@ def test_plan_resolves_retention_once_per_source_len():
     assert len(calls) == built
 
 
-def test_dtype_none_is_the_engines_kv_dtype():
+def test_dtype_none_is_the_nodes_dtype():
     from mstar.engine.resources.base import EngineResourceInfo, Resource
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
@@ -538,7 +538,7 @@ def test_dtype_none_is_the_engines_kv_dtype():
     config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
                              retention=SinkWindow(0, 8), dtype=None)
     spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
-    mgr = BoundedKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
+    mgr = BoundedKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), compute_dtype=torch.bfloat16))
     assert mgr.layer(0).dtype == torch.bfloat16
     # left as declared, so the spec still equals one built from the same config
     assert config.dtype is None

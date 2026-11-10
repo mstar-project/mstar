@@ -11,7 +11,15 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
+import torch
+
+from mstar.engine.resources.spec import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    RoutingContext,
+    check_sizes,
+    parse_yaml_dtype,
+)
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -43,6 +51,8 @@ class KVConfig(ABC):
     num_kv_heads: int
     head_dim: int
     num_qo_heads: int | None = None
+    # storage dtype of the pages or ring; None takes the nodes' resolved dtype
+    dtype: torch.dtype | None = None
 
     def __post_init__(self):
         if self.num_layers < 1:
@@ -243,8 +253,11 @@ class PagedKVConfig(KVConfig):
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
         prefix_cache_tp: bool | None = None,
+        dtype: str | torch.dtype | None = None,
     ) -> None:
-        """How much cache this deployment gets, and how it is cut up."""
+        """How much cache this deployment gets, how it is cut up, and its dtype."""
+        if dtype is not None:
+            self.dtype = parse_yaml_dtype(dtype)
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),
@@ -315,13 +328,17 @@ class RingKVConfig(KVConfig):
                 "zero sessions refuses every request at admit."
             )
 
-    def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
-        """``num_sessions`` only. Nothing else here is a deployment knob."""
+    def apply_yaml_overrides(
+        self, num_sessions: int | None = None, dtype: str | torch.dtype | None = None, **kwargs,
+    ) -> None:
+        """``num_sessions`` and ``dtype`` only. Nothing else here is a deployment knob."""
         if kwargs:
             raise TypeError(
                 "ring KV geometry is a checkpoint fact, not a deployment tunable; "
                 f"got {sorted(kwargs)}"
             )
+        if dtype is not None:
+            self.dtype = parse_yaml_dtype(dtype)
         if num_sessions is not None:
             if (
                 not isinstance(num_sessions, int)

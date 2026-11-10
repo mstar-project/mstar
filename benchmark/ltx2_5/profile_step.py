@@ -46,7 +46,7 @@ def ragged_attends(config, shape, batch, device, tp_size=1, sp_group=None):
         heads //= tp_size * (sp_group.world_size if sp_group is not None and key == S.VIDEO_ATTN else 1)
         spec = spec_cls(resource_key=key, nodes={"dit"}, config=RaggedAttentionConfig(
             num_qo_heads=heads, num_kv_heads=heads, head_dim=hd, dtype=torch.bfloat16))
-        res[key] = build_resource(spec, EngineResourceInfo(device=device, kv_dtype=torch.bfloat16))
+        res[key] = build_resource(spec, EngineResourceInfo(device=device, compute_dtype=torch.bfloat16))
     sub = S.LTXDenoiseSubmodule(torch.nn.Linear(1, 1), config, loop_name="x", use_ragged_attention=True,
                                 sp_group=sp_group)
     sub.node_resources = res

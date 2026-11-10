@@ -204,8 +204,9 @@ def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dt
     """The encoder stores each step's layer state and keys / values for the
     next; in another dtype than the layers compute them in, live frames drift
     from one-shot ones. So the pool and the KV take the dtype the engine
-    resolved (``autocast_dtype: null`` computes in fp32), and no deployment
-    dtype is refused for them."""
+    resolved, and no deployment dtype is refused for them. With
+    ``autocast_dtype: null`` the nodes have no dtype to give, so the deployment
+    declares one."""
     from mstar.engine.resources.base import EngineResourceInfo
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
     from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -213,11 +214,14 @@ def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dt
     model = _make_model()
     model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
     specs = {s.resource_key: s for s in model.get_node_resources()}
-    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype)
+    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=autocast_dtype)
+    if autocast_dtype is None:
+        with pytest.raises(ValueError, match="declares no dtype"):
+            RecurrentStatePool.build(specs[ENCODER_STATE], info)
+        return
     pool = RecurrentStatePool.build(specs[ENCODER_STATE], info)
-    want = torch.float32 if autocast_dtype is None else autocast_dtype
-    assert {pool.block(name, 0).dtype for name in specs[ENCODER_STATE].config.blocks} == {want}
-    assert BoundedKVManager.build(specs[ENCODER_KV], info).layer(0).dtype == want
+    assert {pool.block(name, 0).dtype for name in specs[ENCODER_STATE].config.blocks} == {autocast_dtype}
+    assert BoundedKVManager.build(specs[ENCODER_KV], info).layer(0).dtype == autocast_dtype
 
 
 class _LoadReachedError(Exception):

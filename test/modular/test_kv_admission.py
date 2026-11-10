@@ -874,7 +874,7 @@ def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0) -> KVManag
     tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
     group = None if world_size == 1 else JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp)
     return KVManager.build(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
+        device=torch.device("cpu"), compute_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
 
 

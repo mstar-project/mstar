@@ -525,12 +525,13 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp, dtype
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
+                                # dtype
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
-                                    # flashinfer_backend
+                                    # flashinfer_backend, dtype
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -545,6 +546,16 @@ argmax, and the engine from capturing a twin of each batched bucket for them. A 
 whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
 :doc:`adding_models`), so a deployment that never samples greedily can save their capture
 memory and time this way.
+
+``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype: a float
+of 16 bits or more. fp8 and fp4 are refused, since a quantized cache needs scales, not a
+cast. A paged KV cache in float32 is a load error too: the attention backends that read
+paged caches take float16 and bfloat16 only. Paged and ring KV caches,
+attention, cross-attention and ragged attention accept it. Without it, a resource takes
+the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
+attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
+run without autocast, or in different dtypes, and that declares no dtype fails at load.
+The full resolution order is in :doc:`adding_models`.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's

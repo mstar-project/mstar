@@ -158,7 +158,7 @@ def test_ragged_spec_builds_its_backend_without_flash_attn(monkeypatch):
     model.config = Qwen3OmniModelConfig(vision=VisionEncoderConfig.from_dict(VISION))
     spec = next(s for s in model.get_node_resources() if s.resource_key == VISION_ATTN)
 
-    res = build_resource(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
+    res = build_resource(spec, EngineResourceInfo(device=torch.device("cpu"), compute_dtype=torch.bfloat16))
 
     assert isinstance(res, FakeManager)
     assert built["dtype"] == torch.bfloat16 and built["config"].head_dim == 8

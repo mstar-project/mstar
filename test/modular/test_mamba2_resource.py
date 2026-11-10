@@ -114,7 +114,7 @@ def test_a_state_in_the_engine_dtype_reaches_the_manager_as_the_pool_stores_it()
     spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
         num_layers=NUM_LAYERS, blocks=GEOM.to_blocks(state_dtype=None), max_slots=8,
     ))
-    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float16, dependencies={POOL: spec})
+    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=torch.float16, dependencies={POOL: spec})
     pool = RecurrentStatePool.build(spec, info)
     manager = LinearAttnManager.build(
         LinearAttnSpec(MAMBA, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.MAMBA2)),

@@ -60,14 +60,16 @@ class BoundedKVManager(Resource):
         if info.head_shards > 1:
             raise NotImplementedError("bounded KV does not shard heads across ranks yet")
         # resolved here, not written back: the config is the model's, shared by its specs
-        return cls(spec.config, info.device, info.kv_dtype)
+        return cls(spec.config, info.device, info.resolve_dtype(spec.config.dtype, spec.resource_key))
 
-    def __init__(self, config: BoundedKVConfig, device: torch.device, kv_dtype: torch.dtype | None = None):
-        """``kv_dtype`` (the engine's) stands in for ``config.dtype=None``."""
+    def __init__(self, config: BoundedKVConfig, device: torch.device, dtype: torch.dtype | None = None):
+        """``dtype`` is the resolved storage dtype, for ``config.dtype=None``."""
         self.config = config
         self._device = torch.device(device)
         c = config
-        dtype = c.dtype or kv_dtype or torch.get_default_dtype()
+        dtype = c.dtype or dtype
+        if dtype is None:
+            raise ValueError("bounded KV needs a dtype: set BoundedKVConfig.dtype")
         # layer-major so one layer's slots are a contiguous [slots, rows, H, cap, 2D]
         self._cache = torch.zeros(
             c.num_layers, c.max_slots, c.rows_per_request, c.num_heads, max(c.slot_tokens, 1),

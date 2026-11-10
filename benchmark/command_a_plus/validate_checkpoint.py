@@ -180,7 +180,7 @@ class Runtime:
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"max_num_pages": 256}}})
         transfer = TransferEngineInfo(f"validation_{group.rank}", "validation", LocalTransferEngine("localhost"))
         self.resources = {key: build_resource(spec, EngineResourceInfo(
-            device=torch.device("cuda", group.rank), kv_dtype=torch.bfloat16,
+            device=torch.device("cuda", group.rank), compute_dtype=torch.bfloat16,
             joint_comm_group=JointGroups(group, CommGroup.trivial(), group), transfer_engine_info=transfer,
             needs_remote_transfer=False, dependencies={dep: specs[dep] for dep in spec.depends_on()},
         )) for key, spec in specs.items()}

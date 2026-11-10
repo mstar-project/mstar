@@ -13,7 +13,8 @@ each block's queries, and the pages of its prefix.
 import numpy as np
 import torch
 
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.base import AttentionManager, refuse_kernel_dtype
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend
 from mstar.engine.resources.attn.flashinfer import CGSlotKey, EagerSlotKey, FlashInferManager
 from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -190,11 +191,13 @@ class BlockCausalAttentionManager:
         if not isinstance(kv_config, PagedKVConfig) or len(kv_config.groups) > 1:
             raise TypeError(f"block-causal attention needs a plain paged KV, not {spec.config.kv_cache!r}'s config")
         kv_config.shard(info.head_shards)
+        dtype = AttentionManager._planned_dtype(spec, info, kv_config)
+        refuse_kernel_dtype(dtype, AttnBackend.FLASHINFER, spec.resource_key, info.device)
         return FlashInferBlockCausalManager(
             block_size=spec.block_size,
             kv_cache=spec.config.kv_cache,
             device=info.device,
-            dtype=info.kv_dtype,
+            dtype=dtype,
             kv_config=kv_config,
             backend=spec.config.flashinfer_backend,
             sm_scale=spec.config.sm_scale,

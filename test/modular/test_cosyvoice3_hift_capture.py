@@ -88,7 +88,7 @@ def _rig(cfg, hift, monkeypatch=None, device=torch.device("cpu"), dtype=torch.fl
         for name in ("memory_allocated", "max_memory_allocated", "reset_peak_memory_stats", "empty_cache"):
             monkeypatch.setattr(torch.accelerator, name, lambda *args, **kwargs: 0)
     spec = hift_state_specs(cfg, dtype=dtype)[0]
-    pool = build_resource(spec, EngineResourceInfo(device=device, kv_dtype=dtype))
+    pool = build_resource(spec, EngineResourceInfo(device=device, compute_dtype=dtype))
     resources = {HIFT_STATE: pool}
     steps = StepRunner(resources, node_resources={"hift": [HIFT_STATE]})
     node = HiFTSubmodule(hift, cfg)

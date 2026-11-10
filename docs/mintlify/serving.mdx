@@ -140,12 +140,13 @@ Node names are model-specific — they are the node names appearing in the model
 resources:
   kv_cache:
     max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                             # prefix_cache, prefix_cache_salt, prefix_cache_tp
+                             # prefix_cache, prefix_cache_salt, prefix_cache_tp, dtype
   talker_attn:
-    flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
+    flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
+                             # dtype
   vit_attn:                  # a cacheless (ragged) attention resource
     max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
-                                 # flashinfer_backend
+                                 # flashinfer_backend, dtype
   sampler:
     greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 ```
@@ -153,6 +154,8 @@ resources:
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and its encoder context, can therefore size each one separately. If a block names a resource that the model does not declare, or sets a key that the resource does not accept, loading fails. A misspelled setting is never silently ignored. A top-level `kv_cache:` block is no longer read. It raises an error with a message describing the migration.
 
 `greedy_capture: false` on a sampler stops all-greedy steps from taking each row's argmax, and the engine from capturing a twin of each batched bucket for them. A sampler whose vocabulary is past 4096 has them by default (see `SamplerSpec` in [Adding a New Model](/adding_models)), so a deployment that never samples greedily can save their capture memory and time this way.
+
+`dtype` (for example `dtype: bfloat16`) sets one resource's storage dtype: a float of 16 bits or more. fp8 and fp4 are refused, since a quantized cache needs scales, not a cast. A paged KV cache in float32 is a load error too: the attention backends that read paged caches take float16 and bfloat16 only. Paged and ring KV caches, attention, cross-attention and ragged attention accept it. Without it, a resource takes the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes run without autocast, or in different dtypes, and that declares no dtype fails at load. The full resolution order is in [Adding a New Model](/adding_models).
 
 `prefix_cache: false` turns cross-request prefix reuse off for that cache, and `prefix_cache_salt` keeps two otherwise identical deployments off each other's cached pages. A single request opts out by sending `prefix_cache=False`, which travels with its other `model_kwargs`. Above one rank the cache stays off unless `prefix_cache_tp: true` is set as well: rank 0 then decides each hit and the other ranks adopt it. `prefix_cache_tp` can't be combined with `cpu_offload_pages`, and the cache's nodes must run on one TP group, with no replicas and no walks placed on other ranks. Loading fails otherwise. A cache that keeps a sliding window (`AttentionConfig.sliding_window`) has no prefix cache yet: its `prefix_cache` goes off (logged at info), and a serving config that sets `prefix_cache: true` on it is refused.
 
