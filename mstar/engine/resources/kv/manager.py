@@ -3335,12 +3335,9 @@ class KVManager(AttentionResource):
         part.stored_len -= k * page_size
         part.released += k * page_size
         part.generation += 1
-        if group:
-            # A window's pages only cycle: the pages it takes next replace these in its allotment, which only
-            # `_settle_window_allotment` trims, also when another request still holds one of them.
-            self._arena.release(freed)
-        else:
-            self._release(rid, stream, freed)
+        # A window's pages only cycle: the pages it takes next replace these in its allotment, which only
+        # `_settle_window_allotment` trims. One another request still holds is no room, so it leaves the allotment.
+        self._release(rid, stream, freed)
         self._recount(rid)
         return k * page_size
 

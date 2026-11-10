@@ -30,6 +30,8 @@ from test_kv_prefix_lease import (
     _manager,
     _seed,
     _StubTransfer,
+    _window_manager,
+    _write,
 )
 
 from mstar.distributed.communication import CommGroup, JointGroups
@@ -431,6 +433,28 @@ def test_a_cut_lease_refunds_only_the_pages_that_go_back_to_the_evictable_set():
 
     assert kv._room() == room, "the cut moved room that allotments count on"
     assert kv._allotments["a"].remaining == remaining + 1, "the page \"b\" still holds was allotted again"
+
+
+def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_out():
+    """Two repeats lease the same cached window pages. When the first's window rolls them out before its prompt
+    ends, the second still holds them, so they don't come back as room for the first's allotment to count on."""
+    kv = _window_manager()
+    shared = list(range(100))
+    _write(kv, "seed", shared)
+    _remove(kv, "seed")
+    for rid, base in (("a", 1000), ("b", 2000)):
+        _laid_out(kv, rid, shared + list(range(base, base + 100)), keyed=True)
+        assert _ready(kv, rid) and _probe(kv, rid, 200).tokens == 96
+    # a third request is allotted what room is left
+    for slots in range(kv._room(), 0, -1):
+        _laid_out(kv, "c", list(range(5000, 5000 + 8 * slots)))
+        if _ready(kv, "c"):
+            break
+        _remove(kv, "c")
+
+    _grow(kv, "a", 40)
+
+    kv.assert_pages_conserved()
 
 
 def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node():
