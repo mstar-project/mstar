@@ -820,7 +820,13 @@ The spec types are:
        pass to dense attention.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
-       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale, which every sparse
+       attention runs at. The build refuses a cache it cannot use: a page size that is not
+       a power-of-two multiple of ``kpool``, and on CUDA a cache that is not bf16 or a
+       FlashInfer before 0.6.18. A deployment sizes the resource under ``resources:``:
+       ``workspace_mb`` (the floor of each FlashInfer workspace), ``prefill_score_bytes``
+       (an eager prefill's scores per launch) and ``shard_min_rows`` (the rows per rank
+       from which a prefill's selection splits across TP ranks).
        An MTP verify block that the device places after its last accepted row rather than
        where the host planned it declares ``DSAStep(mtp_trims=True)`` and moves its rows
        with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
