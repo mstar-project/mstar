@@ -499,3 +499,721 @@ impl TurnSegmenter {
         &self.rest
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Segmentation edge cases, ported from the Python segmenter's tests with
+    //! the same inputs and expected outputs, and a differential check against
+    //! that segmenter's recorded outputs. A scripted or energy-based speech
+    //! probability stands in for Silero, so the turns are exact.
+
+    use super::*;
+    use crate::realtime::resample::StreamResampler;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The session's item cap the Python tests ran with.
+    const CAP: usize = 300 * SAMPLE_RATE;
+
+    /// Probabilities from a list, one per frame, the last repeating. Clones
+    /// share the position, so a settings change goes on where the old
+    /// segmenter stopped.
+    #[derive(Clone)]
+    struct Scripted {
+        probs: Arc<Vec<f64>>,
+        next: Arc<AtomicUsize>,
+    }
+
+    impl Scripted {
+        fn new(probs: Vec<f64>) -> Scripted {
+            Scripted { probs: Arc::new(probs), next: Arc::new(AtomicUsize::new(0)) }
+        }
+    }
+
+    impl SpeechProbability for Scripted {
+        fn prob(&mut self, frame: &[f32]) -> f64 {
+            assert_eq!(frame.len(), FRAME);
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            self.probs[i.min(self.probs.len() - 1)]
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    /// 1.0 for a frame with speech-level energy, else 0.0.
+    struct Energy;
+
+    impl SpeechProbability for Energy {
+        fn prob(&mut self, frame: &[f32]) -> f64 {
+            assert_eq!(frame.len(), FRAME);
+            let rms = (frame.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / FRAME as f64).sqrt();
+            if rms > 0.05 { 1.0 } else { 0.0 }
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    /// `frames` frames' worth of a 220 Hz int16 tone at `rate`, as decoded from PCM.
+    fn speech(frames: usize, rate: usize) -> Vec<f32> {
+        let n = frames * FRAME * rate / SAMPLE_RATE;
+        (0..n)
+            .map(|i| ((2.0 * std::f64::consts::PI * 220.0 * i as f64 / rate as f64).sin() * 8000.0) as i16 as f32 / 32768.0)
+            .collect()
+    }
+
+    fn silence(frames: usize, rate: usize) -> Vec<f32> {
+        vec![0.0; frames * FRAME * rate / SAMPLE_RATE]
+    }
+
+    fn server(v: ServerVad) -> TurnDetection {
+        TurnDetection::Server(v)
+    }
+
+    fn no_prefix() -> ServerVad {
+        ServerVad { prefix_padding_ms: 0, ..ServerVad::default() }
+    }
+
+    fn semantic(eagerness: &str) -> TurnDetection {
+        TurnDetection::Semantic(SemanticVad { eagerness: eagerness.into(), create_response: true, interrupt_response: true })
+    }
+
+    fn energy(td: &TurnDetection, end_of_turn: Option<EndOfTurn>) -> TurnSegmenter {
+        TurnSegmenter::with_vad(Box::new(Energy), td, CAP, 0, end_of_turn)
+    }
+
+    /// An end-of-turn model answering `p` (failing when `None`), and the
+    /// length of the audio each call heard.
+    fn end_of_turn(p: Option<f64>) -> (EndOfTurn, Arc<Mutex<Vec<usize>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let model: EndOfTurn = Arc::new(move |audio: &[f32]| {
+            seen.lock().unwrap().push(audio.len());
+            p.ok_or_else(|| "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION".to_string())
+        });
+        (model, calls)
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Turn {
+        start: i64,
+        end: i64,
+        audio: Vec<f32>,
+    }
+
+    /// What a session makes of the operations: committed turns, the open one,
+    /// every start, and end-of-turn failures. Asserts each transition comes
+    /// once, in order, with times that never go back.
+    #[derive(Default)]
+    struct Timeline {
+        turns: Vec<Turn>,
+        open: Option<(i64, Option<i64>, Vec<f32>)>,
+        starts: Vec<i64>,
+        failures: Vec<String>,
+    }
+
+    impl Timeline {
+        fn apply(&mut self, ops: Vec<Op>) {
+            for op in ops {
+                match op {
+                    Op::SpeechStarted(ms) => {
+                        assert!(self.open.is_none(), "a start inside a turn");
+                        assert!(self.turns.last().is_none_or(|t| t.end <= ms), "a start at {ms} before the last end");
+                        self.starts.push(ms);
+                        self.open = Some((ms, None, Vec::new()));
+                    }
+                    Op::Audio(a) => {
+                        let (_, end, audio) = self.open.as_mut().expect("audio outside a turn");
+                        assert!(end.is_none(), "audio after a stop");
+                        audio.extend(a);
+                    }
+                    Op::SpeechStopped(ms) => {
+                        let (start, end, _) = self.open.as_mut().expect("a stop outside a turn");
+                        assert!(end.is_none() && *start < ms, "a stop at {ms} for a turn from {start}");
+                        *end = Some(ms);
+                    }
+                    Op::Commit => self.close(),
+                    Op::EndOfTurnFailed(e) => self.failures.push(e),
+                }
+            }
+        }
+
+        fn close(&mut self) {
+            let (start, end, audio) = self.open.take().expect("a commit outside a turn");
+            self.turns.push(Turn { start, end: end.expect("a commit before the stop"), audio });
+        }
+
+        /// A client commit: the segmenter stops an open turn and the client's
+        /// commit commits it.
+        fn client_commit(&mut self, seg: &mut TurnSegmenter) {
+            self.apply(seg.end_turn());
+            if matches!(self.open, Some((_, Some(_), _))) {
+                self.close();
+            }
+        }
+
+        fn feed(&mut self, seg: &mut TurnSegmenter, audio: &[f32], step: usize) {
+            for chunk in audio.chunks(step) {
+                self.apply(seg.feed(chunk));
+            }
+        }
+
+        fn spans(&self) -> Vec<(i64, i64)> {
+            self.turns.iter().map(|t| (t.start, t.end)).collect()
+        }
+
+        /// Each item is exactly the 16 kHz stream between its start and end.
+        fn assert_items_are_the_stream(&self, stream: &[f32]) {
+            for t in &self.turns {
+                let want = &stream[t.start as usize * 16..t.end as usize * 16];
+                assert!(t.audio == want, "the item {}..{} ms is not that span of the stream", t.start, t.end);
+            }
+        }
+
+        /// At another input rate, each item holds 16 samples a millisecond.
+        fn assert_items_fill_their_spans(&self) {
+            for t in &self.turns {
+                assert_eq!(t.audio.len() as i64, (t.end - t.start) * 16, "the item {}..{} ms", t.start, t.end);
+            }
+        }
+    }
+
+    /// The non-audio operations, by name.
+    fn kinds(ops: &[Op]) -> Vec<&'static str> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::SpeechStarted(_) => Some("started"),
+                Op::SpeechStopped(_) => Some("stopped"),
+                Op::Commit => Some("commit"),
+                Op::EndOfTurnFailed(_) => Some("failed"),
+                Op::Audio(_) => None,
+            })
+            .collect()
+    }
+
+    fn cat(parts: &[Vec<f32>]) -> Vec<f32> {
+        parts.concat()
+    }
+
+    /// Input at `rate`, resampled to 16 kHz as the session resamples it.
+    struct Input(Option<StreamResampler>);
+
+    impl Input {
+        fn at(rate: usize) -> Input {
+            Input((rate != SAMPLE_RATE).then(|| StreamResampler::new(rate, SAMPLE_RATE)))
+        }
+
+        fn push(&mut self, audio: &[f32]) -> Vec<f32> {
+            self.0.as_mut().map_or_else(|| audio.to_vec(), |r| r.push(audio))
+        }
+    }
+
+    // ── server_vad ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn one_append_with_speech_silence_speech() {
+        // the turn end falls inside the append; the second utterance stays and becomes the next turn
+        let stream = cat(&[speech(1, 16000), silence(16, 16000), speech(1, 16000)]);
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        let ops = seg.feed(&stream);
+        assert_eq!(kinds(&ops), ["started", "stopped", "commit", "started"]);
+        tl.apply(ops);
+        tl.client_commit(&mut seg);
+        assert_eq!(tl.spans(), [(0, 544), (544, 576)]);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn end_of_turn_inside_an_append() {
+        // 100 ms appends: the sixteenth silent frame completes mid-append and
+        // the next utterance starts in the same append
+        let stream = cat(&[speech(10, 16000), silence(16, 16000), speech(10, 16000), silence(16, 16000)]);
+        let mut seg = energy(&server(no_prefix()), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, 1600);
+        assert_eq!(tl.spans(), [(0, 832), (832, 1664)]);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn silence_window_boundary() {
+        for (silence_ms, gap, ends) in [
+            // 512 ms of silent frames passes all three
+            (499, 16, true),
+            (500, 16, true),
+            (501, 16, true),
+            // 480 ms does not
+            (500, 15, false),
+            // exactly the window ends the turn; 1 ms short does not
+            (512, 16, true),
+            (513, 16, false),
+        ] {
+            let stream = cat(&[speech(4, 16000), silence(gap, 16000), speech(4, 16000)]);
+            let mut seg = energy(&server(ServerVad { silence_duration_ms: silence_ms, ..no_prefix() }), None);
+            let mut tl = Timeline::default();
+            tl.feed(&mut seg, &stream, stream.len());
+            let case = format!("silence_duration_ms {silence_ms}, {gap} silent frames");
+            if ends {
+                assert_eq!(tl.spans(), [(0, (4 + 16) * 32)], "{case}");
+                assert_eq!(tl.starts, [0, (4 + gap as i64) * 32], "{case}");
+            } else {
+                assert!(tl.turns.is_empty(), "{case}");
+                assert_eq!(tl.starts, [0], "{case}");
+            }
+            tl.assert_items_are_the_stream(&stream);
+        }
+    }
+
+    #[test]
+    fn zero_silence_window_ends_a_turn_on_its_first_silent_frame() {
+        let stream = cat(&[speech(10, 16000), silence(3, 16000)]);
+        let mut seg = energy(&server(ServerVad { silence_duration_ms: 0, ..no_prefix() }), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, stream.len());
+        assert_eq!(tl.spans(), [(0, 11 * 32)]);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn back_to_back_turns_in_10ms_appends() {
+        let stream: Vec<f32> = (0..3).flat_map(|k| cat(&[speech(6 + 3 * k, 16000), silence(20, 16000)])).collect();
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, 160);
+        // the 4 silent frames after each commit are the next turn's prefix padding
+        let starts: Vec<i64> = tl.turns.iter().map(|t| t.start).collect();
+        assert_eq!(starts, [0, (6 + 16) * 32, (6 + 20 + 9 + 16) * 32]);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn a_turn_open_at_the_end_is_never_stopped() {
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut ops = Vec::new();
+        for chunk in speech(10, 16000).chunks(1600) {
+            ops.extend(seg.feed(chunk));
+        }
+        assert_eq!(kinds(&ops), ["started"]);
+    }
+
+    #[test]
+    fn a_client_commit_mid_turn_ends_it_with_the_partial_frame() {
+        let stream = cat(&[speech(10, 16000), speech(1, 16000)[..100].to_vec()]);
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, stream.len());
+        tl.client_commit(&mut seg);
+        assert_eq!(tl.spans(), [(0, 5220 * 1000 / 16000)]);
+        assert_eq!(tl.turns[0].audio, stream);
+    }
+
+    #[test]
+    fn a_turn_reaching_the_item_cap_is_committed_and_speech_goes_on() {
+        // 300 s of unbroken speech: the turn ends at the cap, and the speech after it starts the next turn
+        let piece = speech(625, 16000); // 20 s
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        for _ in 0..15 {
+            tl.feed(&mut seg, &piece, piece.len());
+        }
+        tl.feed(&mut seg, &speech(63, 16000), 63 * FRAME); // 2.016 s more
+        tl.client_commit(&mut seg);
+        assert_eq!(tl.spans(), [(0, 300_000), (300_000, 302_016)]);
+        let sizes: Vec<usize> = tl.turns.iter().map(|t| t.audio.len()).collect();
+        assert_eq!(sizes, [300 * 16000, 63 * FRAME]);
+    }
+
+    #[test]
+    fn input_at_24khz_keeps_the_timeline() {
+        // resampled before segmentation, with the same times in ms as at 16 kHz;
+        // the resampler holds its last 1 ms, so the stream goes on one frame past the second turn
+        let r = 24000;
+        let stream = cat(&[speech(10, r), silence(16, r), speech(10, r), silence(17, r)]);
+        let mut input = Input::at(r);
+        let mut seg = energy(&server(no_prefix()), None);
+        let mut tl = Timeline::default();
+        for chunk in stream.chunks(240) {
+            tl.apply(seg.feed(&input.push(chunk)));
+        }
+        assert_eq!(tl.spans(), [(0, 832), (832, 1664)]);
+        tl.assert_items_fill_their_spans();
+    }
+
+    #[test]
+    fn a_clear_drops_the_open_turn_and_keeps_the_timeline() {
+        let mut seg = energy(&server(no_prefix()), None);
+        let ops = seg.feed(&cat(&[speech(5, 16000), speech(1, 16000)[..200].to_vec()]));
+        assert_eq!(kinds(&ops), ["started"]);
+        seg.reset(0);
+        assert!(!seg.speaking);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &cat(&[silence(3, 16000), speech(2, 16000), silence(16, 16000)]), FRAME * 21);
+        // cleared audio still counts on the timeline: 5 frames + 200 samples, then 3 silent frames
+        let starts: Vec<i64> = tl.turns.iter().map(|t| t.start).collect();
+        assert_eq!(starts, [(5 * FRAME as i64 + 200) * 1000 / 16000 + 3 * 32]);
+    }
+
+    /// Feeds one frame per probability, of samples that are each distinct.
+    fn scripted(probs: Vec<f64>, td: &TurnDetection, max_turn: usize) -> (Timeline, Vec<f32>) {
+        let stream: Vec<f32> = (0..probs.len() * FRAME).map(|i| i as f32).collect();
+        let mut seg = TurnSegmenter::with_vad(Box::new(Scripted::new(probs)), td, max_turn, 0, None);
+        let mut tl = Timeline::default();
+        tl.apply(seg.feed(&stream));
+        (tl, stream)
+    }
+
+    #[test]
+    fn the_item_cap_is_never_passed_and_speech_across_it_is_kept() {
+        // a 3 s cap is not a whole number of frames, and the prefix is not
+        // either: no item passes the cap, and speech going on across a cap
+        // split, even at a probability between the two thresholds, starts the
+        // next turn right there, so every sample from the first start on is in one item
+        for prefix_ms in [0, 300] {
+            let probs = [vec![0.0; 20], vec![0.9; 90], vec![0.4; 20], vec![0.9; 200], vec![0.0; 20]].concat();
+            let td = server(ServerVad { prefix_padding_ms: prefix_ms, ..ServerVad::default() });
+            let (tl, stream) = scripted(probs, &td, 3 * 16000);
+            assert!(tl.open.is_none());
+            assert!(tl.turns.len() >= 3 && tl.turns.iter().all(|t| t.audio.len() <= 3 * 16000), "prefix {prefix_ms}");
+            let first = 20 * FRAME - prefix_ms as usize * 16;
+            let joined: Vec<f32> = tl.turns.iter().flat_map(|t| t.audio.clone()).collect();
+            assert!(joined == stream[first..first + joined.len()], "prefix {prefix_ms}");
+            for pair in tl.turns.windows(2) {
+                assert_eq!(pair[1].start, pair[0].end, "prefix {prefix_ms}");
+            }
+        }
+    }
+
+    #[test]
+    fn borderline_frames_do_not_hold_a_started_silence_open() {
+        // silence starts below threshold - 0.15 and only a frame at or above
+        // the threshold cancels it: frames alternating 0.1 and 0.4 end the turn
+        // on the frame that completes the window from the first 0.1, and a 0.6
+        // frame starts the count over
+        let alternating = |n: usize| [0.1, 0.4].repeat(n);
+        let (tl, _) = scripted([vec![0.9; 10], alternating(30)].concat(), &server(no_prefix()), CAP);
+        assert_eq!(tl.turns.iter().map(|t| t.end).collect::<Vec<_>>(), [(10 + 16) * 32]);
+        let probs = [vec![0.9; 10], alternating(4), vec![0.6], alternating(30)].concat();
+        let (tl, _) = scripted(probs, &server(no_prefix()), CAP);
+        assert_eq!(tl.turns.iter().map(|t| t.end).collect::<Vec<_>>(), [(10 + 8 + 1 + 16) * 32]);
+    }
+
+    #[test]
+    fn a_settings_change_keeps_audio_not_scored_yet() {
+        // a partial frame waiting for its decision survives a turn_detection
+        // change: into the new segmenter, or into the item when it goes to null
+        let stream = cat(&[speech(3, 16000), silence(16, 16000)]);
+        let mut old = energy(&server(no_prefix()), None);
+        assert!(old.feed(&stream[..511]).is_empty());
+        let mut seg = energy(&server(ServerVad { threshold: 0.6, ..no_prefix() }), None);
+        seg.take_over(old);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream[511..], stream.len());
+        assert_eq!(tl.spans(), [(0, 19 * 32)]);
+        tl.assert_items_are_the_stream(&stream);
+        assert!(seg.feed(&stream[..300]).is_empty());
+        assert_eq!(seg.unscored(), &stream[..300]);
+    }
+
+    #[test]
+    fn a_settings_change_between_turns_goes_on_at_both_rates() {
+        // what the resampler holds back for its lookahead is audio after the
+        // turn, and goes on to the new segmenter
+        for rate in [16000, 24000] {
+            let utterance = cat(&[speech(3, rate), silence(17, rate)]);
+            let mut input = Input::at(rate);
+            let mut seg = energy(&server(no_prefix()), None);
+            let mut tl = Timeline::default();
+            tl.apply(seg.feed(&input.push(&utterance)));
+            assert_eq!(tl.turns.len(), 1, "{rate} Hz");
+            assert!(!seg.speaking);
+            let mut new = energy(&server(ServerVad { threshold: 0.6, ..no_prefix() }), None);
+            new.take_over(seg);
+            tl.apply(new.feed(&input.push(&utterance)));
+            assert_eq!(tl.spans(), [(0, 19 * 32), (20 * 32, 39 * 32)], "{rate} Hz");
+            if rate == 16000 {
+                tl.assert_items_are_the_stream(&utterance.repeat(2));
+            } else {
+                tl.assert_items_fill_their_spans();
+            }
+        }
+    }
+
+    #[test]
+    fn a_drained_tail_that_completes_a_turn_commits_it_once() {
+        // at 24 kHz the resampler holds its last 1 ms, so the tail a client
+        // commit drains is what completes the silence window: the turn's commit
+        // comes last and end_turn adds nothing, so the session sends no second one
+        let mut input = Input::at(24000);
+        let mut seg = energy(&server(no_prefix()), None);
+        let ops = seg.feed(&input.push(&cat(&[speech(1, 24000), silence(16, 24000)])));
+        assert_eq!(kinds(&ops), ["started"]);
+        let mut tl = Timeline::default();
+        tl.apply(ops);
+        let mut ops = seg.feed(&input.0.as_mut().unwrap().flush());
+        ops.extend(seg.end_turn());
+        assert_eq!(kinds(&ops), ["stopped", "commit"]);
+        assert_eq!(ops.last(), Some(&Op::Commit));
+        tl.apply(ops);
+        assert_eq!(tl.turns.iter().map(|t| t.audio.len()).collect::<Vec<_>>(), [17 * FRAME]);
+    }
+
+    #[test]
+    fn a_client_commit_between_turns_keeps_earlier_audio_out_of_the_next_turn() {
+        // audio not in a turn when the client committed (a partial frame, the
+        // prefix padding) does not leak into the next turn
+        let stream = cat(&[speech(1, 16000)[..511].to_vec(), speech(3, 16000), silence(16, 16000)]);
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream[..511], 511);
+        tl.client_commit(&mut seg);
+        tl.feed(&mut seg, &stream[511..], stream.len());
+        assert_eq!(tl.starts, [511 * 1000 / 16000]);
+        assert_eq!(tl.turns.iter().map(|t| t.audio.len()).collect::<Vec<_>>(), [stream.len() - 511]);
+
+        // whole silent frames held as prefix padding are dropped too
+        let mut seg = energy(&server(ServerVad::default()), None);
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &silence(3, 16000), FRAME);
+        tl.client_commit(&mut seg);
+        tl.feed(&mut seg, &cat(&[speech(3, 16000), silence(16, 16000)]), FRAME);
+        assert_eq!(tl.spans(), [(3 * 32, 22 * 32)]);
+    }
+
+    // ── semantic_vad ────────────────────────────────────────────────────────
+
+    #[test]
+    fn semantic_vad_commits_at_a_pause_the_model_calls_final() {
+        // P(end of turn) 0.9 at the 300 ms pause ends the turn there, well before server_vad's 500 ms window
+        let (model, calls) = end_of_turn(Some(0.9));
+        let stream = cat(&[speech(10, 16000), silence(40, 16000), speech(5, 16000), silence(20, 16000)]);
+        let mut seg = energy(&semantic("medium"), Some(model));
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, 1600);
+        // the pause reaches 300 ms on the 10th silent frame (320 ms); the next turn has 300 ms of prefix
+        assert_eq!(tl.spans(), [(0, 20 * 32), (50 * 32 - 300, 65 * 32)]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], 20 * FRAME);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn semantic_vad_keeps_listening_when_the_model_says_not_done() {
+        // the speech after the pause is the same turn, and medium's 4 s silence limit ends it
+        let (model, calls) = end_of_turn(Some(0.1));
+        let stream = cat(&[speech(10, 16000), silence(20, 16000), speech(10, 16000), silence(130, 16000)]);
+        let mut seg = energy(&semantic("medium"), Some(model));
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, 1600);
+        assert_eq!(tl.spans(), [(0, (10 + 20 + 10 + 125) * 32)]);
+        assert_eq!(calls.lock().unwrap().len(), 2, "once per pause, not once per frame");
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn semantic_vad_goes_on_after_an_end_of_turn_model_error() {
+        // the failure is one operation, the model is not asked again, and
+        // turns end at medium's 4 s silence limit
+        let (model, calls) = end_of_turn(None);
+        let stream = cat(&[speech(10, 16000), silence(130, 16000), speech(10, 16000), silence(130, 16000)]);
+        let mut seg = energy(&semantic("medium"), Some(model));
+        let mut tl = Timeline::default();
+        tl.feed(&mut seg, &stream, 1600);
+        assert_eq!(tl.failures, ["[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION"]);
+        // the second turn's prefix is the 5 silent frames left after the first one ended
+        assert_eq!(tl.spans(), [(0, (10 + 125) * 32), ((10 + 125) * 32, (150 + 125) * 32)]);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        tl.assert_items_are_the_stream(&stream);
+    }
+
+    #[test]
+    fn semantic_vad_eagerness() {
+        for (eagerness, end_frames) in [
+            ("high", 7),   // 0.6 >= 0.3: ends at the 200 ms pause (7 frames, 224 ms)
+            ("medium", 10), // 0.6 >= 0.5: ends at the 300 ms pause (10 frames)
+            ("auto", 10),
+            ("low", 250), // 0.6 < 0.7: no; the 8 s silence ends it (250 frames)
+        ] {
+            let (model, _) = end_of_turn(Some(0.6));
+            let stream = cat(&[speech(10, 16000), silence(260, 16000)]);
+            let mut seg = energy(&semantic(eagerness), Some(model));
+            let mut tl = Timeline::default();
+            tl.feed(&mut seg, &stream, 1600);
+            assert_eq!(tl.spans(), [(0, (10 + end_frames) * 32)], "{eagerness}");
+            tl.assert_items_are_the_stream(&stream);
+        }
+    }
+
+    #[test]
+    fn the_semantic_history_holds_only_its_window_and_is_dropped_at_the_turn_end() {
+        let (model, _) = end_of_turn(Some(0.1));
+        let mut seg = energy(&semantic("auto"), Some(model));
+        let append = cat(&[speech(400, 16000), silence(10, 16000)]);
+        seg.feed(&append);
+        assert!(seg.speaking);
+        assert!(seg.recent.iter().map(Vec::len).sum::<usize>() <= SMART_TURN_SECONDS * SAMPLE_RATE + FRAME);
+        seg.feed(&silence(130, 16000));
+        assert!(!seg.speaking && seg.recent.is_empty());
+        seg.feed(&append);
+        seg.reset(0);
+        assert!(seg.recent.is_empty());
+    }
+
+    // ── against the Python segmenter ────────────────────────────────────────
+
+    fn float(v: &Value) -> f64 {
+        f64::from_bits(v.as_u64().expect("a float as its bits"))
+    }
+
+    fn reference_cfg(v: &Value) -> TurnDetection {
+        match v[0].as_str() {
+            Some("server") => server(ServerVad {
+                threshold: float(&v[1]),
+                prefix_padding_ms: v[2].as_i64().unwrap(),
+                silence_duration_ms: v[3].as_i64().unwrap(),
+                ..ServerVad::default()
+            }),
+            _ => semantic(v[1].as_str().unwrap()),
+        }
+    }
+
+    /// Audio as runs `[first, len]` of consecutive sample values.
+    fn runs(audio: &[f32], into: &mut Vec<[i64; 2]>) {
+        for &x in audio {
+            let x = x as i64;
+            match into.last_mut() {
+                Some(r) if r[0] + r[1] == x => r[1] += 1,
+                _ => into.push([x, 1]),
+            }
+        }
+    }
+
+    /// One case's operations and end-of-turn calls, in the reference script's encoding.
+    fn replay(case: &Value) -> (Value, Value) {
+        let palette: Vec<f64> = case["palette"].as_array().unwrap().iter().map(float).collect();
+        let probs: Vec<f64> = case["probs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| std::iter::repeat_n(palette[r[0].as_u64().unwrap() as usize], r[1].as_u64().unwrap() as usize))
+            .collect();
+        let vad = Scripted::new(probs);
+        let answers: Vec<f64> = case["eot"][0].as_array().unwrap().iter().map(float).collect();
+        let fail_at = case["eot"][1].as_i64().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = calls.clone();
+        let model: EndOfTurn = Arc::new(move |audio: &[f32]| {
+            let mut seen = seen.lock().unwrap();
+            let k = seen.len();
+            let mut r = Vec::new();
+            runs(audio, &mut r);
+            seen.push(json!(r));
+            if k as i64 == fail_at {
+                return Err("boom".into());
+            }
+            Ok(answers[k.min(answers.len() - 1)])
+        });
+        let max_turn = case["max_turn"].as_u64().unwrap() as usize;
+        let mut seg = TurnSegmenter::with_vad(
+            Box::new(vad.clone()),
+            &reference_cfg(&case["cfg"]),
+            max_turn,
+            case["pos"].as_i64().unwrap(),
+            Some(model.clone()),
+        );
+        let mut next = 0usize;
+        let mut events: Vec<Value> = Vec::new();
+        for a in case["actions"].as_array().unwrap() {
+            let ops = match a[0].as_str().unwrap() {
+                "feed" => {
+                    let n = a[1].as_u64().unwrap() as usize;
+                    let audio: Vec<f32> = (next..next + n).map(|i| i as f32).collect();
+                    next += n;
+                    seg.feed(&audio)
+                }
+                "end" => seg.end_turn(),
+                "reset" => {
+                    seg.reset(a[1].as_u64().unwrap() as usize);
+                    vec![]
+                }
+                "shift" => {
+                    seg.shift(a[1].as_i64().unwrap());
+                    vec![]
+                }
+                "take" => {
+                    let cfg = reference_cfg(&a[1]);
+                    let mut new = TurnSegmenter::with_vad(Box::new(vad.clone()), &cfg, max_turn, 0, Some(model.clone()));
+                    new.take_over(seg);
+                    seg = new;
+                    vec![]
+                }
+                other => panic!("unknown action {other}"),
+            };
+            // consecutive audio operations are one event
+            let mut audio_runs = Vec::new();
+            for op in ops {
+                if let Op::Audio(audio) = &op {
+                    runs(audio, &mut audio_runs);
+                    continue;
+                }
+                if !audio_runs.is_empty() {
+                    events.push(json!(["a", std::mem::take(&mut audio_runs)]));
+                }
+                events.push(match op {
+                    Op::SpeechStarted(ms) => json!(["s", ms]),
+                    Op::SpeechStopped(ms) => json!(["p", ms]),
+                    Op::Commit => json!(["c"]),
+                    Op::EndOfTurnFailed(_) => json!(["f"]),
+                    Op::Audio(_) => unreachable!(),
+                });
+            }
+            if !audio_runs.is_empty() {
+                events.push(json!(["a", audio_runs]));
+            }
+            events.push(json!(["|"]));
+        }
+        let calls = Value::Array(calls.lock().unwrap().clone());
+        (Value::Array(events), calls)
+    }
+
+    /// Replays every case; panics naming the first few that differ.
+    fn check_reference(fixture: &str) -> usize {
+        let cases: Vec<Value> = serde_json::from_str(fixture).unwrap();
+        let mut differ = Vec::new();
+        for (i, case) in cases.iter().enumerate() {
+            let (ops, calls) = replay(case);
+            if ops != case["ops"] || calls != case["eot_calls"] {
+                let ops = ops.as_array().unwrap();
+                let want = case["ops"].as_array().unwrap();
+                let at = ops.iter().zip(want).position(|(a, b)| a != b).unwrap_or(ops.len().min(want.len()));
+                differ.push(format!(
+                    "case {i}: event {at}: {:?} here, {:?} in Python (eot calls equal: {})",
+                    ops.get(at),
+                    want.get(at),
+                    calls == case["eot_calls"]
+                ));
+            }
+        }
+        assert!(differ.is_empty(), "{} of {} cases differ:\n{}", differ.len(), cases.len(), differ[..differ.len().min(5)].join("\n"));
+        cases.len()
+    }
+
+    /// Cases recorded from the Python `TurnSegmenter` (`openai/realtime_vad.py`
+    /// before the FastAPI frontend was removed): random settings, scripted
+    /// probabilities and end-of-turn answers, appends of any length, client
+    /// commits, clears, timeline shifts and settings changes between turns.
+    /// Floats are their bits, audio is runs of consecutive sample values, and
+    /// `|` ends an action's operations.
+    #[test]
+    fn matches_the_python_segmenter() {
+        assert!(check_reference(include_str!("testdata/vad_reference.json")) > 100);
+    }
+
+    #[test]
+    #[ignore = "reads a larger fixture of the same format from VAD_REFERENCE_FIXTURE"]
+    fn matches_the_python_segmenter_on_a_larger_fixture() {
+        let path = std::env::var("VAD_REFERENCE_FIXTURE").expect("VAD_REFERENCE_FIXTURE names the fixture");
+        let n = check_reference(&std::fs::read_to_string(path).unwrap());
+        eprintln!("{n} cases match");
+    }
+}
