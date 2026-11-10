@@ -672,10 +672,11 @@ per row, ``Value(name, nodes=, layers={0}, entry=Entry({"tail": TensorType((8, 3
 tensors the caller owns, so a captured forward may write them in place. A row with nothing written
 yet, at span 0 or that pads the step reads its start: ``h.set_start({f: tensor})`` in ``bind_state``
 takes tensors of one entry's shape, made at load, and zeros stand in for a field it doesn't name.
-``h.write(layer, **fields)`` sets the step's rows' entries at its commit. In a step, a layer's reads
-come before its write, a field takes one write, and each row at span 1 or more gets every field
-from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no node with prefix
-keys. Parakeet's transducer state and both speech codecs are the examples.
+``h.write(layer, **fields)`` writes the rows' entries in place where the forward runs it, in an eager
+step or a replay, so a step refused after a write keeps it in the slots its rows already held. In a
+step, a layer's reads come before its write, a field takes one write, and each row at span 1 or more
+gets every field from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no
+node with prefix keys. Parakeet's transducer state and both speech codecs are the examples.
 
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of an array that keeps entries,
@@ -1975,7 +1976,7 @@ and each row's label comes from the step's segments, so there are no cursors:
   and a step with ``keep=False`` refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
-- ``write`` sets the step's rows' entries at its commit.
+- ``write`` sets the step's rows' entries in place where the forward runs it, not at the step's commit.
 
 These raise, naming the array and the cause: a call on an array the step doesn't list or on
 a layer it doesn't declare, an add after a kept add, an add after a read in the same layer,

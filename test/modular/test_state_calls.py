@@ -1076,7 +1076,7 @@ def test_a_write_is_visible_to_the_next_steps_read():
     _commit_written(h, pool)
     _commit_written(h, pool, x=5.0, n=10)
     step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
-    assert h.read(0).fields["n"].tolist() == [10], "the write set the entry at the step's commit"
+    assert h.read(0).fields["n"].tolist() == [10], "a committed step's write is the entry the next step reads"
     h.end_step(step)
 
 

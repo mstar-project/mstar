@@ -843,11 +843,9 @@ class ValueHandle(ArrayHandle):
 
     @torch.compiler.disable
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
-        """Set the step's rows' entries on a Value for later steps, at the step's commit.
-
-        The rule is per row: with no update, each row at span 1 or more gets every field from the step's own write,
-        and a row at span 0 or that pads the step writes nowhere.
-        """
+        """Write each row's ``fields`` into its slot in place. The scatter changes the slots where the forward runs
+        it, in an eager step or a replay, so a step refused after a field's write keeps it in the slots its rows
+        already held."""
         if at is not None:
             raise self._no_layout("write at positions, on anything but a Value")
         layer = self._layer_id(layer)
