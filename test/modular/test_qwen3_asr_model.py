@@ -225,9 +225,13 @@ def test_process_prompt_builds_features_and_prompt():
         assert (layout["offset"], layout["tokens"], layout["output"]) == (
             [ids.index(AUDIO_PAD)], [n_tokens], ["audio_embeds"],
         )
-        # the prompt span is what the prefill writes: every id, audio run included
-        [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
-        assert (span.kind, span.walk, span.length) == ("rows", PREFILL_WALK, len(ids))
+        # the prefill writes every id in one row: the text around the audio run as ids, the run as rows
+        spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+        assert [(span.kind, span.walk) for span in spans] == [
+            ("ids", PREFILL_WALK), ("rows", PREFILL_WALK), ("ids", PREFILL_WALK),
+        ]
+        pre = ids.index(AUDIO_PAD)
+        assert [span.length for span in spans] == [pre, n_tokens, len(ids) - pre - n_tokens]
         assert set(out.metadata) == {MEDIA_LAYOUT, "kv_layout"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 

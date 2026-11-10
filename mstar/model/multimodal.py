@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 
 TEXT = "text"
 VIDEO = "video"
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
 
 
 @dataclass(frozen=True)

@@ -1034,6 +1034,7 @@ class PreprocessWorkerThread:
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
+                streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
             ),
         )
