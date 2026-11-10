@@ -10,6 +10,7 @@ loop counters. One row samples EOS partway through, so steps cover the native
 send, the send with stopped rows, and the completion of the worker graph.
 """
 import sys
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -25,6 +26,10 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.accelerator_graph_runner import ReplayEvents
+from mstar.engine.device_run import RunState
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime import rust as rust_runtime
 from mstar.graph.runtime.base import (
@@ -38,8 +43,12 @@ from mstar.graph.runtime.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
-from mstar.model.submodule_base import StopKind, StopPolicy
+from mstar.model.submodule_base import BatchedModelOutput, HostRows, StopKind, StopPolicy
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
+from mstar.worker.scheduled_batch import ScheduledBatch
+from mstar.worker.step_executor import PendingBatch
+from mstar.worker.step_repeats import stream_run
 
 WALK, NODE, LOOP, SIG, PART, ME = "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
 MAX_ITERS = 4
@@ -242,12 +251,20 @@ def test_a_row_with_no_host_value_routes_through_the_store(tmp_path):
     assert frames["native"] == frames["reference"] and frames["native"]
 
 
-def test_missing_limits_leave_the_check_to_the_model(tmp_path):
-    """A row with no registered limits: the runtime decides nothing (STOPS)."""
+@pytest.mark.parametrize("landing", [None, "host", "device"], ids=["at_postprocess", "host_events", "device_count"])
+def test_missing_limits_leave_the_check_to_the_model(tmp_path, landing):
+    """A row with no registered limits: the runtime decides nothing (STOPS).
+    Nor while a repeated step runs: the host sends nothing and stops looking
+    at once, the step still running, leaving it all to the postprocess."""
     rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
     rid = rt.add_request(
         request_id="r", partition=PART, graph_walk=WALK, partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
+    if landing is not None:
+        wide = torch.full((MAX_ITERS, 1), EOS, dtype=torch.int64).t()
+        running = SimpleNamespace(query=lambda: pytest.fail("the host kept looking at a step it can't send"))
+        landed = _landing(landing)[0]
+        assert stream_run(rt, PART, NODE, WALK, [rid], [rid], wide, InlineColumn(SIG, wide), landed, running) == 0
     column = torch.tensor([EOS], dtype=torch.int64)
     step = rt.begin_postprocess(PostprocessRequest(
         partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
@@ -313,15 +330,95 @@ def _counted(frames) -> dict:
     return counts
 
 
-@pytest.mark.parametrize("early", [False, True], ids=["at_postprocess", "while_running"])
-def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, early):
+class _Event:
+    """A host replay's event: done, or done once the host waits on it, when
+    ``lands`` (it included) all land."""
+
+    def __init__(self, done=False):
+        self.done, self.lands = done, ()
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        for event in self.lands:
+            event.done = True
+
+
+def _landing(kind):
+    """How a repeated step's iterations land as the host looks (``stream_run``):
+    the first has landed when it first looks, the next two land together, then
+    the last. A host run's replay events, or a device run's count, which moves
+    on when the host checks the step's completion; the device run is still
+    going after the third, so its postprocess sends the last."""
+    if kind == "host":
+        events = [_Event(done=True), _Event(), _Event(), _Event()]
+        events[1].lands, events[3].lands = events[1:3], events[3:]
+        return ReplayEvents(events), SimpleNamespace(query=lambda: all(e.done for e in events))
+    run = RunState(2, MAX_ITERS, {EOS}, torch.device("cpu"))
+    run.ran[0] = 1
+    done = iter([False, True])
+
+    def query():
+        run.ran[0] = 3  # the next two landed while the host sent the first
+        return next(done)
+
+    return run, SimpleNamespace(query=query)
+
+
+def _through_the_worker(rt, rids, wide):
+    """The repeated step as the worker postprocesses it
+    (``StepExecutor.postprocess``), its replays landing as ``_landing("host")``
+    has them: its tokens go out as they land, then its route sends the rest."""
+    landing, completion = _landing("host")
+    engine = SimpleNamespace(
+        inline_client_signals=lambda node, walk: {SIG: "new_token"},
+        device_loopback_signals=lambda node, walk: (SIG,),
+        step_finished=lambda *a, **k: None, after_output_copy=lambda batch: None,
+        materialize_publish=lambda batch, rids: None, finalize_stopped_requests=lambda batch, rids: None,
+    )
+    w = make_worker(
+        graph_runtime=rt, engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        tensor_manager=SimpleNamespace(
+            get_tensor=None, cleanup_collectable=lambda *a: None, drop_host_copies=lambda: None,
+        ),
+        request_state=SimpleNamespace(
+            get_fwd_info=lambda rid, partition: None, get_pending_publish_info=lambda rid, partition: {},
+            flush_publish_info=lambda rid, partition: None, buffer_publish_info=lambda *a: None,
+        ),
+        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None, walk_driven_edges={}),
+    )
+    w.executor._stop_token_signal[(NODE, WALK)] = "new_token"
+    node_batch = ExecutingBatch(
+        node_name=NODE, per_request_info={r: SimpleNamespace(rid=r, dynamic_loop_iter_counts={}) for r in rids},
+        step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False, repeats=MAX_ITERS),
+        completion_event=completion,
+    )
+    outputs = BatchedModelOutput(
+        check_stop_buffers={"new_token": wide}, row_request_ids=tuple(rids), rows_only=True, landing=landing,
+        host_rows=HostRows(tuple(rids), {"new_token": wide}),
+    )
+    batch = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, request_to_worker_graph=dict.fromkeys(rids, 0), output_signals=[SIG],
+    )
+    w.executor.postprocess(PendingBatch(
+        batch=batch, node_batch=node_batch, node_name=NODE, partition=PART, graph_walk=WALK, future=Future(),
+    ), outputs)
+
+
+@pytest.mark.parametrize(
+    "landing", [None, "host", "device", "worker"], ids=["at_postprocess", "host_events", "device_count", "worker"],
+)
+def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, landing):
     """A step that ran several iterations hands the client a token per
     iteration: a row's tokens up to its stop, in order, each with its own
     iteration's loop index and counted by the completion report, and nothing
-    the device ran past the stop. The same when some go out while the step
-    runs (``emit_prefix``, up to the iteration the host learned had landed)
-    and its postprocess sends the rest. The reference runs the same tokens one
-    iteration a step."""
+    the device ran past the stop. The same when they go out while the step
+    runs (``stream_run``) as the host learns each iteration landed (``host``:
+    from its replay's event; ``device``: from the run's landing count), and
+    its postprocess sends the rest, the worker's too (``worker``), which
+    starts the route where the early sends left off. The reference runs the
+    same tokens one iteration a step."""
     sent = {}
     for k in ("one_a_step", "repeated"):
         d = tmp_path / k
@@ -345,14 +442,16 @@ def test_a_repeated_steps_client_tokens_match_one_iteration_a_step(tmp_path, ear
             # landed as a repeated step lands them: [iterations, rows], viewed
             # as a column per iteration
             wide = torch.tensor(RUN, dtype=torch.int64).t().contiguous().t()
+            if landing == "worker":
+                _through_the_worker(rt, rids, wide)
+                sent[k] = (_sent(_collect(boxes["api_server"])), _counted(_collect(boxes["conductor"])))
+                continue
             start = 0
-            if early:
-                # the host looks after the first iteration landed, then the third
-                for landed in (1, 3):
-                    start, stopped = rt.emit_prefix(
-                        PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide, start), landed,
-                    )
-                    assert (start, stopped) == (landed, False)
+            if landing is not None:
+                start = stream_run(
+                    rt, PART, NODE, WALK, list(rids), rids, wide, InlineColumn(SIG, wide), *_landing(landing),
+                )
+                assert start == {"host": MAX_ITERS, "device": 3}[landing]
             trace = _drive(rt, PostprocessRequest(
                 partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
                 wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,

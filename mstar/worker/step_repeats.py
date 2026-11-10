@@ -10,19 +10,27 @@ doesn't name runs every step once. Which walks may repeat is settled once, after
 capture (`StepRepeats.settle`). How far a step goes is decided twice: here against
 its rows and its Loop, then by its resources (``Resource.max_repeats``), which can
 only narrow it.
+
+A step's client tokens go out as its iterations land (`stream_run`), not when the
+whole step does.
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.device_run import WalkAsk
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.utils.profiler import phase_record
 
 if TYPE_CHECKING:
+    import torch
+
     from mstar.graph.base import GraphSection
+    from mstar.graph.runtime.base import GraphRuntime, InlineColumn
+    from mstar.model.submodule_base import Landing
     from mstar.worker.speculation import Speculation
 
 logger = logging.getLogger(__name__)
@@ -172,3 +180,40 @@ class StepRepeats:
         ):
             return 1
         return max(1, min(self._configs[key[0]].max, loop_room()))
+
+
+# How long one look at a device run's landing count waits for it to move before
+# the host checks the step for an error; it returns as soon as the count moves.
+_RUN_LOOK_S = 1e-3
+
+
+def stream_run(
+    runtime: GraphRuntime, partition: str, node: str, walk: str, rids: list[int], row_rids: Sequence[int],
+    tokens: torch.Tensor, inline: InlineColumn, landing: Landing, completion: torch.Event,
+) -> int:
+    """While a repeated step runs, send the client each iteration's tokens as
+    it lands (``landing``, then ``GraphRuntime.emit_prefix``), until every row
+    has stopped or the step has run; returns how many iterations went out.
+    Called before the step's wait, with the rows its route takes: what it
+    sends is a prefix of what the route would, which then sends the rest."""
+    width = inline.column.shape[1]
+    taken, looks, first = 0, 0, 0
+    while taken < width:
+        end = min(landing.landed(taken, _RUN_LOOK_S), width)
+        looks += 1
+        if end > taken:
+            sent, stopped = runtime.emit_prefix(
+                partition, node, walk, rids, row_rids, tokens, inline._replace(start=taken), end,
+            )
+            if sent < end:
+                break  # the runtime can't decide every row's stop: the route sends the rest
+            taken, first = end, first or end
+            if stopped:
+                break
+        # the step has run (or failed, which raises): its postprocess sends the rest
+        if completion.query():
+            break
+    # how many iterations had landed when the host first saw any: what went out at once
+    phase_record(f"repeats.{walk}.first_look#", first)
+    phase_record(f"repeats.{walk}.looks#", looks)
+    return taken
