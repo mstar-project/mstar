@@ -3375,7 +3375,8 @@ class KVManager(AttentionResource):
         part.released += k * page_size
         part.generation += 1
         # A window's pages only cycle: the pages it takes next replace these in its allotment, which only
-        # `_settle_window_allotment` trims, so one another request still holds lent takes that request's room.
+        # `_settle_window_allotment` trims, so one another request still holds lent passes its room on
+        # (`_hand_over`).
         others = self._hand_over(stream, freed) if group else ()
         self._release(rid, stream, freed)
         self._recount(rid, *others)
@@ -4474,26 +4475,31 @@ class KVManager(AttentionResource):
             stream.lent.difference_update(pages)
 
     def _hand_over(self, stream: CacheStream, pages: list[int]) -> list[str]:
-        """Before ``stream`` releases its window pages ``pages``, hand each one it took room for and another stream
-        holds lent to that stream, which then takes room for it, and return their requests for the caller to
-        recount. That stream's allotment has the room, since it counts its window pages as its own (`_hit`),
-        and ``stream`` keeps its own for the page that replaces this one. Under the lock."""
+        """Before ``stream`` releases its window pages ``pages``, move the room for each one it pays for (holds
+        outside `lent`) that another stream still holds lent onto that stream, while that stream's request has
+        room left in its allotment, one page each: that allotment counts its window pages as its own (`_hit`),
+        and ``stream`` keeps its room for the page that replaces this one. A page no holder has room for stays on
+        ``stream``, and `_release` shrinks its allotment by it, so `_unused` never grows by a page nothing frees.
+        Returns the requests that took room, for the caller to recount. Under the lock."""
         index = self._index
-        shared = {
+        shared = sorted(
             page for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
             if page not in stream.lent and owners > 1 + (index is not None and index.holds(page))
-        }
+        )
         took = []
         for rid, streams in self._streams.items():
-            for other in streams.values():
-                moved = other.lent & shared
-                if moved:
-                    other.lent -= moved
-                    stream.lent |= moved
-                    shared -= moved
-                    took.append(rid)
             if not shared:
                 break
+            allotment = self._allotments.get(rid)
+            room = 0 if allotment is None else allotment.remaining
+            for other in streams.values():
+                moved = [page for page in shared if page in other.lent][:room]
+                other.lent.difference_update(moved)
+                stream.lent.update(moved)
+                shared = [page for page in shared if page not in moved]
+                room -= len(moved)
+            if allotment is not None and room < allotment.remaining:
+                took.append(rid)
         return took
 
     def _recount(self, *rids: str) -> None:
