@@ -262,7 +262,7 @@ def _submodule_class():
                     hidden_size=HIDDEN, stop_token_ids=(),
                 ),
                 vision_config=SimpleNamespace(spatial_merge_size=MERGE),
-                encoders=(vision_encoder((PAD,)),),
+                encoders=(vision_encoder(),),
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)

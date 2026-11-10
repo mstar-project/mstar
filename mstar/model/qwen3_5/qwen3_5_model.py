@@ -104,7 +104,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         # prompt order. A text-only checkpoint's tokenizer still has the pad
         # tokens, so the tower decides whether the model takes media.
         pad = self._pad_ids() if self.vision_config is not None else {}
-        tower = vision_encoder(tuple(pad.values())) if pad else None
+        tower = vision_encoder() if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
             # a video fills one pad per temporal group
@@ -280,7 +280,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         video = sample_video(filepath, self.video_processor)
         return TensorAndMetadata(data=video.frames, metadata=video.metadata)
 
-    def _video_runs(self, metadata: dict) -> int:
+    def _video_runs(self, video: torch.Tensor, metadata: dict) -> int:
         """A video's pad runs: one per temporal group."""
         return len(self._video_timestamps(metadata))
 
