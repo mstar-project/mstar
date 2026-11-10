@@ -48,6 +48,7 @@ from mstar.model.multimodal import (
     media_layout,
     media_prefill_step,
     media_walk_name,
+    media_walk_names,
     media_walks,
     parts_from_modalities,
     placeholders,
@@ -207,13 +208,14 @@ class MultimodalDecoderModel(Model):
         return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # A dropped text request reprefills its ids on the text walk. A media prompt prefills on
-        # its media walk, which keeps no ids, so the KV cache never drops it; nor anything of a
-        # model with no text walk (TEXT_PROMPTS False).
-        if not self.TEXT_PROMPTS:
-            return {}
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        # A media prompt is rebuilt from host copies of its encoders' outputs, one embedding per pad. Its layout
+        # places them, so a pad id sampled into the rebuild row's tail takes none and needs no `pad_ids`.
+        media = media_walk_names(self.encoders)
+        text = {PREFILL_TEXT} if self.TEXT_PROMPTS else set()
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({*text, *media}), ids_input="text_inputs", sample_output="new_token",
+            loop="decode_loop", copy_width={walk: self.config.hidden_size for walk in media},
+        )}
 
     # -----------------------------------------------------------------------
     # KV layout
@@ -221,8 +223,8 @@ class MultimodalDecoderModel(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
-        # keys; a media prompt's one `rows` span is not (`LabelLayout.keyed_count`), so nothing of
-        # it is.
+        # keys. Nothing of a media prompt is, since its one step carries tensor inputs, which the
+        # prefix cache never cuts.
         growth = tuple((walk, self.DECODE_LOOP) for walk in sorted(self.decoder_walks().decode))
         if not self.TEXT_PROMPTS:
             return {KV_CACHE: {"main": KVLabel(growth=growth)}}
@@ -233,18 +235,34 @@ class MultimodalDecoderModel(Model):
     def checkpoint_path(self) -> str:
         return self._resolve_weights()
 
-    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+    def kv_layout(self, layout: dict, length: int) -> dict:
         """`process_prompt`'s ``kv_layout`` for a prompt of ``length`` tokens
         and its ``MEDIA_LAYOUT``: the whole prompt, written by its one prefill
-        walk, then a slot per decode step. ``advance`` is how far the prompt
-        moves the position counter, its length by default."""
+        walk, then a slot per decode step. A media prompt's runs of pads are
+        ``rows`` spans, which the encoders' outputs fill, and the text around
+        them ``ids`` spans."""
         present = media_encoders(self.encoders, layout)
-        span = Span(
-            "rows" if present else "ids",
-            media_walk_name(present) if present else PREFILL_TEXT,
-            length, length if advance is None else advance, "text_inputs",
-        )
-        return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+        if not present:
+            span = Span("ids", PREFILL_TEXT, length, length, "text_inputs")
+            return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+        walk, spans, end = media_walk_name(present), [], 0
+        for offset, tokens, grid in zip(layout["offset"], layout["tokens"], layout["grid"], strict=True):
+            if offset > end:
+                spans.append(Span("ids", walk, offset - end, offset - end, "text_inputs"))
+            spans.append(Span("rows", walk, tokens, self.media_advance(tokens, grid), "text_inputs"))
+            end = offset + tokens
+        if length > end:
+            spans.append(Span("ids", walk, length - end, length - end, "text_inputs"))
+        # one row writes the whole prompt
+        spans[1:] = [span._replace(opens_step=False) for span in spans[1:]]
+        # Key no span. The default keys the leading text span, and `rebuild_refusal` refuses a prompt keyed only in
+        # part.
+        return {KV_CACHE: {"main": LabelLayout(spans=tuple(spans), growth=(("decode_loop", 1),), keyed_spans=0)}}
+
+    def media_advance(self, tokens: int, grid: list[int]) -> int:
+        """How far a run of ``tokens`` pads moves the position counter: one a
+        pad, unless the model places media by their patch ``grid``."""
+        return tokens
 
     # -----------------------------------------------------------------------
     # Intake

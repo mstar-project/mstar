@@ -43,6 +43,7 @@ def _bagel():
         cfg_renorm_type="global", cfg_renorm_min=0.0, vit_config=SimpleNamespace(patch_size=14),
         vit_max_num_patch_per_side=70, latent_downsample=16, max_latent_size=64,
         temperature=0.0, top_k=-1, top_p=1.0, repetition_penalty=1.0, ignore_eos=False, vocab_size=1000,
+        hidden_size=64,
     )
     model.tokenizer = _StubTokenizer()
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
@@ -416,27 +417,36 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
 
 
-@pytest.mark.parametrize("thinking", [False, True])
-def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
-    """The reference's prompt as one row, each piece tokenized on its own:
-    the instruction, the clip's pads where its embeddings go (one per row the
-    encoder keeps of each 4 s chunk), and the turn close. The layout's one
-    span is that row, on a walk of the graph."""
+def _higgs():
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
-    from mstar.model.keys import KV_CACHE
-    from mstar.model.multimodal import MEDIA_LAYOUT
     from mstar.model.multimodal_decoder import MediaIntake
 
     model = object.__new__(HiggsAudioModel)
-    model.config = cfg = HiggsAudioModelConfig()
+    model.config = HiggsAudioModelConfig()
     model.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens=False: [ord(c) for c in text])
     model.feature_extractor = lambda chunks, **kwargs: {
         "input_features": torch.zeros(len(chunks), 128, 3000),
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
-    pad = cfg.audio_in_token_idx
+    pad = model.config.audio_in_token_idx
     model.media = (MediaIntake("audio", audio_encoder(), pad, model._audio_intake),)
+    return model
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
+    """The reference's prompt as one row, each piece tokenized on its own:
+    the instruction, the clip's pads where its embeddings go (one per row the
+    encoder keeps of each 4 s chunk), and the turn close. The layout's spans
+    are that row, on a walk of the graph: the text around the clip as ids and
+    the clip as rows, written in one step."""
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal import MEDIA_LAYOUT
+
+    model = _higgs()
+    cfg = model.config
+    pad = cfg.audio_in_token_idx
     # two whole chunks of 50 rows and a 1.5 s one of 19
     clip = torch.zeros(int(9.5 * cfg.sampling_rate))
 
@@ -455,8 +465,13 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     assert (layout["offset"], layout["tokens"], layout["output"]) == ([len(before)], [119], ["audio_embeds"])
     # each chunk's mel frames, which the encoder reads on the host
     assert layout["grid"] == [[400, 400, 150]]
-    [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
-    assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
+    kv_layout = out.metadata["kv_layout"][KV_CACHE]["main"]
+    assert [(span.kind, span.walk, span.length, span.opens_step) for span in kv_layout.spans] == [
+        ("ids", "prefill_audio", len(before), True), ("rows", "prefill_audio", 119, False),
+        ("ids", "prefill_audio", len(after), False),
+    ], "the layout would say another step writes the text after the audio than the one that runs"
+    assert kv_layout.keyed_count() == 0, "a step that mixes text and audio would be keyed"
+    span = kv_layout.spans[0]
     assert span.walk in model.get_graph_walk_graphs()
     # the layout's walk is the one the request runs
     signals = {k: list(v) for k, v in out.new_input_tensors.items()}

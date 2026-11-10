@@ -193,50 +193,6 @@ def get_rope_index_text(
     return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
-def get_rope_index_audio(
-    num_audio_tokens: int,
-    start_pos: float,
-    device: torch.device | None = None,
-    position_id_per_seconds: int = 25,
-) -> torch.Tensor:
-    """Build 3D MRoPE position IDs for an audio-only span.
-
-    All three components advance together, one per audio token — audio
-    tokens are positioned exactly like text.  Without vision inputs, HF's
-    ``get_rope_index`` takes its non-spatial branch and returns
-    ``(cumsum(attention_mask) - 1).expand(3, -1, -1)``; checked against the
-    real implementation, an audio span comes back as t == h == w ==
-    2, 3, 4, ….
-
-    Pinning h/w to a constant instead (what this did before) leaves the
-    ``mrope_section`` bands that read those components with no positional
-    progression across the span, which degrades long audio the most.
-
-    Parameters
-    ----------
-    num_audio_tokens : int
-        Number of audio tokens produced by the audio encoder.
-    start_pos : float
-        Starting position offset.
-    device : torch.device, optional
-        Device for the returned tensor.
-    position_id_per_seconds : int
-        Unused here -- kept for API symmetry.  It applies to HF's spatial
-        branch (vision present), where audio position IDs come from
-        timestamps rather than token index.
-
-    Returns
-    -------
-    pos_ids_3d : torch.Tensor
-        Shape ``(3, num_audio_tokens)``.  ``dtype=torch.float``.
-    """
-    del position_id_per_seconds  # kept for API compatibility
-    positions = torch.arange(
-        num_audio_tokens, dtype=torch.float, device=device
-    ) + float(start_pos)
-    return positions.unsqueeze(0).expand(3, -1).contiguous()
-
-
 def get_rope_index_vision(
     grid_thw: torch.LongTensor,
     start_pos: float,

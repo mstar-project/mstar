@@ -28,6 +28,7 @@
 mod adapters;
 mod auth;
 mod bridge;
+mod generation_kwargs;
 mod media;
 mod protocol;
 mod refusals;
@@ -36,6 +37,7 @@ mod serving;
 mod sndfile;
 mod speech_chunking;
 mod tokenizer;
+mod transcription;
 mod unicode_marks;
 mod utf8;
 
@@ -182,6 +184,12 @@ async fn main() {
     let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/audio/speech", post(audio_speech))
+        // an upload of up to 30 minutes: the route's own, larger body limit
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcription::audio_transcriptions)
+                .layer(DefaultBodyLimit::max(transcription::body_limit_bytes(body_limit_mb << 20))),
+        )
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/videos/generations", post(videos_generations))
@@ -308,6 +316,7 @@ enum Surface {
     Speech,
     Images,
     Videos,
+    Transcriptions,
 }
 
 /// The OpenAI error `type` for a status: a 4xx is the client's
@@ -485,6 +494,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
         Surface::Videos => adapter.supports_videos(),
+        Surface::Transcriptions => adapter.supports_transcriptions(),
     };
     if !ok {
         return Err(error(
@@ -655,6 +665,7 @@ async fn chat_completions(
             args.tokens = Some(tok.encode(&text));
         }
     }
+    args.report_usage = true;
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
@@ -663,7 +674,8 @@ async fn chat_completions(
             Ok(base) => base,
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
-        return chat_sse(base, request_id, model_name).into_response();
+        let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
+        return chat_sse(base, request_id, model_name, include_usage).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => {
@@ -686,16 +698,29 @@ async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
     }
 }
 
-/// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
-/// rides on the first delta (the finish one when there is none), as in
-/// `serving_chat.py`: clients time the first token from the first chunk.
+/// SSE `chat.completion.chunk`s: per-chunk deltas, finish, the usage chunk
+/// when `include_usage`, `[DONE]`. The role rides on the first delta (the
+/// finish one when there is none), as in `serving_chat.py`: clients time the
+/// first token from the first chunk.
 fn chat_sse(
     base: OutStream,
     request_id: String,
     model_name: String,
+    include_usage: bool,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let payloads = chat_sse_payloads(base, request_id, now(), model_name);
+    let payloads = chat_sse_payloads(base, request_id, now(), model_name, include_usage);
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
+}
+
+/// OpenAI `usage` from a `usage` chunk's metadata; zeros without one (mock mode).
+fn usage_json(reported: Option<&Value>) -> Value {
+    let count = |key: &str| reported.and_then(|r| r.get(key)).and_then(Value::as_i64).unwrap_or(0);
+    let (prompt, completion) = (count("prompt_tokens"), count("completion_tokens"));
+    json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion})
+}
+
+fn finish_reason(reported: Option<&Value>) -> &str {
+    reported.and_then(|r| r.get("finish_reason")).and_then(Value::as_str).unwrap_or("stop")
 }
 
 /// The `data:` payloads of [`chat_sse`], in order.
@@ -704,21 +729,29 @@ fn chat_sse_payloads(
     request_id: String,
     created: i64,
     model: String,
+    include_usage: bool,
 ) -> impl futures::Stream<Item = String> {
     // Set if a terminal error is emitted mid-stream, so the tail below does NOT
-    // append a clean `finish_reason:"stop"` + `[DONE]` — a failed request must
+    // append a clean finish + `[DONE]` — a failed request must
     // not look cleanly completed to the client.
     let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let role_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // One decoder for the whole stream; the tail flushes what it held back.
     let text = Arc::new(std::sync::Mutex::new(Utf8Stream::default()));
+    // The closing `usage` chunk's metadata, for the tail.
+    let usage: Arc<std::sync::Mutex<Option<Value>>> = Arc::default();
     let body = {
         let model = model.clone();
         let id = request_id.clone();
         let errored = errored.clone();
         let role_sent = role_sent.clone();
         let text = text.clone();
+        let usage = usage.clone();
         base.filter_map(move |item| futures::future::ready(match item {
+            Out::Chunk(c) if c.modality == "usage" => {
+                *usage.lock().unwrap() = Some(c.metadata);
+                None
+            }
             Out::Chunk(c) => chat_delta(&c, &mut text.lock().unwrap()).map(|mut delta| {
                 if !role_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     delta["role"] = json!("assistant");
@@ -747,7 +780,20 @@ fn chat_sse_payloads(
             if !rest.is_empty() {
                 out.push(chunk_json(&request_id, created, &model, with_role(json!({"content": rest})), None));
             }
-            out.push(chunk_json(&request_id, created, &model, with_role(json!({})), Some("stop")));
+            let usage = usage.lock().unwrap().take();
+            out.push(chunk_json(
+                &request_id, created, &model, with_role(json!({})), Some(finish_reason(usage.as_ref())),
+            ));
+            if include_usage {
+                out.push(json!({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": usage_json(usage.as_ref()),
+                }).to_string());
+            }
             out.push("[DONE]".to_string());
         }
         futures::stream::iter(out)
@@ -821,8 +867,8 @@ fn chat_audio_format(req: &ChatCompletionRequest, sample_rate: u32, compressed: 
 }
 
 /// Non-streaming chat: text into `content`, audio into `message.audio` (b64,
-/// in `audio_format`), images into `image_url` data-URL content parts
-/// (matching serving_chat).
+/// in `audio_format`), images into `image_url` data-URL content parts, the
+/// `usage` chunk into `usage` and `finish_reason` (matching serving_chat).
 fn build_chat_response(
     model: &str,
     request_id: &str,
@@ -833,11 +879,13 @@ fn build_chat_response(
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
     let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut usage: Option<&Value> = None;
     for c in &chunks {
         match c.modality.as_str() {
             "text" => text_bytes.extend_from_slice(&c.data),
             "audio" => audio_pcm.extend_from_slice(&c.data),
             "image" => images.push(c.data.clone()),
+            "usage" => usage = Some(&c.metadata),
             _ => {}
         }
     }
@@ -870,8 +918,8 @@ fn build_chat_response(
         "object": "chat.completion",
         "created": now(),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(usage)}],
+        "usage": usage_json(usage),
     }))
 }
 
@@ -1854,6 +1902,7 @@ async fn generate_finish(
         output_modalities,
         model_kwargs,
         parts,
+        report_usage: false,
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
@@ -2228,7 +2277,7 @@ mod tests {
             };
             let st = state(None);
             let base = result_stream(&st, &args, "r", true);
-            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone()).into_response()).await;
+            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone(), false).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text
@@ -2546,11 +2595,15 @@ mod tests {
             .collect()
     }
 
-    fn streamed_content(items: Vec<Out>) -> (String, Vec<Value>) {
+    fn streamed_payloads(items: Vec<Out>, include_usage: bool) -> Vec<String> {
         let base: serving::OutStream = Box::pin(futures::stream::iter(items));
-        let payloads: Vec<String> = futures::executor::block_on(
-            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string()).collect::<Vec<_>>(),
-        );
+        futures::executor::block_on(
+            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), include_usage).collect::<Vec<_>>(),
+        )
+    }
+
+    fn streamed_content(items: Vec<Out>) -> (String, Vec<Value>) {
+        let payloads = streamed_payloads(items, false);
         let events: Vec<Value> = payloads
             .iter()
             .filter(|p| *p != "[DONE]")
@@ -2753,5 +2806,59 @@ mod tests {
     #[test]
     fn sse_closes_an_empty_stream_with_done() {
         assert_eq!(sse_events(vec![]), vec!["data: {\"type\":\"speech.audio.done\"}\n\n".to_string()]);
+    }
+
+    /// What the Python data plane ends a `report_usage` submission with.
+    fn usage_chunk(finish: &str) -> ResultChunk {
+        ResultChunk {
+            modality: "usage".to_string(),
+            data: Vec::new(),
+            metadata: json!({"prompt_tokens": 7, "completion_tokens": 4, "finish_reason": finish}),
+        }
+    }
+
+    #[test]
+    fn chat_response_reports_the_backend_s_usage_and_finish_reason() {
+        for finish in ["length", "stop"] {
+            let mut chunks = split_text_chunks();
+            chunks.push(usage_chunk(finish));
+            let resp = build_chat_response("m", "r", chunks, 24000, "wav").unwrap();
+            assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
+            assert_eq!(resp["choices"][0]["finish_reason"], finish);
+            assert_eq!(resp["usage"], json!({"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11}));
+        }
+        // the mock source sends none
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav").unwrap();
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+        assert_eq!(resp["usage"], json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+    }
+
+    #[test]
+    fn chat_stream_ends_with_its_finish_reason_and_usage_only_when_asked() {
+        for include_usage in [false, true] {
+            let mut chunks = split_text_chunks();
+            chunks.push(usage_chunk("length"));
+            let payloads = streamed_payloads(chunks.into_iter().map(Out::Chunk).collect(), include_usage);
+            assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+            let events: Vec<Value> =
+                payloads[..payloads.len() - 1].iter().map(|p| serde_json::from_str(p).unwrap()).collect();
+            let content: String =
+                events.iter().filter_map(|e| e["choices"][0]["delta"]["content"].as_str()).collect();
+            assert_eq!(content, "中文 😀", "the usage chunk sent a delta");
+            let (finish, usage) = if include_usage {
+                (&events[events.len() - 2], Some(events.last().unwrap()))
+            } else {
+                (events.last().unwrap(), None)
+            };
+            assert_eq!(finish["choices"][0]["finish_reason"], "length");
+            assert_eq!(events.iter().filter(|e| e.get("usage").is_some()).count(), usage.iter().count());
+            if let Some(usage) = usage {
+                assert_eq!(*usage, json!({
+                    "id": "r", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11},
+                }));
+            }
+        }
     }
 }

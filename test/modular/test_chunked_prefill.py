@@ -369,13 +369,51 @@ def test_a_request_removed_mid_prompt_drops_its_prepared_input():
             pass
 
     engine = _engine_with(_Sub(10))
-    engine._loopback_steps = {}
+    engine._loopback_steps, engine._resident_delta = {}, None
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 
     engine.remove_request(0)
 
     assert not engine._chunking.prepared
+
+
+def test_a_prompts_input_set_aside_leaves_its_key_to_an_earlier_step_and_comes_back_whole():
+    """A request dropped mid-prefill in a later step of its prompt reruns the steps before it first, and each of
+    those prepares its own input under the request's key."""
+    sub = _Prompt(10)
+    engine = _engine_with(sub)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+
+    engine.set_aside_chunk_inputs(0, "LLM")
+    sub.n = 6
+    earlier = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 6, 6, 6))
+    engine.release_chunk_inputs(0, "LLM")
+    engine.restore_chunk_inputs(0, "LLM")
+    resumed = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 10, 10, 6))
+
+    assert earlier.chunk_total == 6, "the earlier step would be cut from the prompt's input"
+    assert resumed.chunk_total == 10 and resumed.input_ids.tolist() == list(range(4, 10)), (
+        "the prompt's next chunk would find no input, or the earlier step's"
+    )
+
+
+def test_a_request_removed_while_its_prompts_input_is_set_aside_drops_it():
+    from types import SimpleNamespace
+
+    class _Sub(_Prompt):
+        def cleanup_request(self, request_id):
+            pass
+
+    engine = _engine_with(_Sub(10))
+    engine._loopback_steps = {}
+    engine._runner = SimpleNamespace(remove_request=lambda rid: None)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    engine.set_aside_chunk_inputs(0, "LLM")
+
+    engine.remove_request(0)
+
+    assert not engine._chunking.aside, "a removed request's prompt input would stay on the device"
 
 
 # ── engine: a chunked row starts past its cached prefix ────────────────

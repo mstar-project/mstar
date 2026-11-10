@@ -34,13 +34,11 @@ contract that makes this capture-safe:
   order (`prepare_inputs` checks each encoder's row count against the
   layout), so the packed step's media, concatenated in row order, line up
   with the cumulative mask count;
-- every step of a capture that holds media (the media walks', and the
-  mixed walk's under ``MIXED_MEDIA``) brings the mask, all False on rows
-  without media, so a decode row's sampled id or a text chunk never takes a
-  media row; real tokens precede a replay's padding tail, so the tail's
-  stale mask cannot shift a real row's index; and the captured media buffer
-  has at least the bucket's tokens rows, so a tail index stays in bounds and
-  `splice_media`'s clamp to the last row never binds.
+- every step of the media capture's walks brings the mask, and real tokens
+  precede a replay's padding tail, so the tail's stale mask cannot shift a
+  real row's index; and the captured media buffer has at least the bucket's
+  tokens rows, so a tail index stays in bounds and `splice_media`'s clamp to
+  the last row never binds.
 
 A chunked media row (`split_inputs`) cuts its mask with its ids, and its
 media by the mask's count before each end.
@@ -565,12 +563,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return out
 
     def _pack_media(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
-        """A media walk's or media-mixed step's ``MEDIA_EMBEDS``, its rows' in
-        row order as the forward's cumulative mask count reads them, and its
-        ``MEDIA_MASK``: one host mask and one copy, a row without media (a
-        decode row, a text row or chunk) masking nothing. Every such step
-        brings the mask, all False when no row has media, so a replay never
-        splices in the rows a previous step left in the static buffer."""
+        """A media step's ``MEDIA_EMBEDS``, its rows' in row order as the
+        forward's cumulative mask count reads them, and its ``MEDIA_MASK``: one
+        host mask and one copy, a row without media (a decode or text row)
+        masking nothing. Every step of a walk a media capture replays brings
+        the mask, zeros when no row has media, so a replay never splices in
+        the rows a previous step left in the static buffer."""
         if graph_walk not in self._media_walks and not (graph_walk == MIXED and self._mixes_media):
             return
         rows: list[torch.Tensor] = []

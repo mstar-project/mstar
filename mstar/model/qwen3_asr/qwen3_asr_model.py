@@ -70,6 +70,7 @@ from mstar.model.qwen3_asr.config import (
     SAMPLER,
     Qwen3ASRModelConfig,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
@@ -132,6 +133,10 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # not yet dropped: no drop and rebuild has run through its captured prefill
+        return {}
 
     @property
     def max_windows_per_request(self) -> int:

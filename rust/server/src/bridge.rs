@@ -14,12 +14,14 @@
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
-//!       streaming, accepts_chunks}, `prompt_parts` present for a chat only
+//!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
+//!       chat only, `report_usage` only when set
 //!                        | {t:"abort", rid, sub}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!                        | {t:"voices", rid, sub}
+//!                        | {t:"windows", rid, sub, op, plan, ...}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
@@ -27,6 +29,7 @@
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
 //!                        | {t:"checked", rid, sub, error?, status?}
 //!                        | {t:"voices", rid, sub, metadata:{voices?}}
+//!                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -37,6 +40,10 @@
 //! `chunks` is many submissions' non-error chunks as parallel lists, in
 //! order: one message per pass of the API server's message thread rather than
 //! one per request.
+//!
+//! A submission with `report_usage` ends with a `chunk` of modality `usage`
+//! before its `done`: `metadata` holds `prompt_tokens`, `completion_tokens`
+//! and `finish_reason`.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -104,6 +111,9 @@ struct SubmitMsg<'a> {
     #[serde(skip_serializing_if = "no_parts")]
     prompt_parts: &'a [Part],
     streaming: bool,
+    /// `submit_request`'s `report_usage`; left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    report_usage: bool,
 }
 
 fn no_parts(parts: &&[Part]) -> bool {
@@ -121,6 +131,9 @@ struct ProbeMsg<'a> {
     refusals: Option<&'a Snapshot>,
     #[serde(flatten)]
     check: Option<&'a RefAudioCheck>,
+    /// A `windows` request's operation and its arguments.
+    #[serde(flatten)]
+    windows: Option<&'a serde_json::Map<String, Value>>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -324,6 +337,7 @@ impl Bridge {
             model_kwargs: &args.model_kwargs,
             prompt_parts: &args.parts,
             streaming,
+            report_usage: args.report_usage,
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         if self.mbox.send("bridge", &payload).is_err() {
@@ -347,13 +361,14 @@ impl Bridge {
         t: &str,
         refusals: Option<&Snapshot>,
         check: Option<&RefAudioCheck>,
+        windows: Option<&serde_json::Map<String, Value>>,
         timeout: Duration,
     ) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check };
+        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check, windows };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -365,14 +380,14 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", None, None, timeout).await.is_some()
+        self.round_trip("ping", None, None, None, timeout).await.is_some()
     }
 
     /// The API server's `/metrics` reply, asked with this frontend's refusal
     /// counts: the rendered text in `data` and, when metrics are on, its
     /// `content_type` in `metadata`. None on timeout.
     pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", Some(refusals), None, timeout).await? {
+        match self.round_trip("metrics", Some(refusals), None, None, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
@@ -382,10 +397,30 @@ impl Bridge {
     /// Python route asks it (a model's list can change while it serves): `Ok(None)`
     /// when the model publishes no list, `Err` on timeout or a failure there.
     pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
-        match self.round_trip("voices", None, None, timeout).await {
+        match self.round_trip("voices", None, None, None, timeout).await {
             Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
+    /// One operation on a transcription upload's `WindowPlanner` (`op` and its
+    /// arguments): the reply's `metadata` carries the planner's `duration`,
+    /// `single` and the `windows` it cut, or the `error` it raised. None on
+    /// timeout.
+    pub async fn windows(&self, op: &Value, timeout: Duration) -> Option<ResultChunk> {
+        match self.round_trip("windows", None, None, op.as_object(), timeout).await? {
+            StreamItem::Chunk(chunk) => Some(chunk),
+            _ => None,
+        }
+    }
+
+    /// Have the planner of `plan` delete the upload and its windows; the upload
+    /// alone when the planner never existed. Nothing is awaited.
+    pub fn close_windows(&self, plan: &str, path: &str) {
+        let msg = serde_json::json!({"t": "windows", "rid": "", "sub": 0, "op": "close", "plan": plan, "path": path});
+        if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
+            let _ = self.mbox.send("bridge", &payload);
         }
     }
 
@@ -395,7 +430,7 @@ impl Bridge {
     /// deleted there.
     pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
         let start = std::time::Instant::now();
-        match self.round_trip("check_ref_audio", None, Some(check), timeout).await {
+        match self.round_trip("check_ref_audio", None, Some(check), None, timeout).await {
             Some(StreamItem::Done) => Ok(()),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
             // the request's budget ran out, as the Python frontend's request would
@@ -464,7 +499,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" => (
+        "metrics" | "voices" | "windows" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),
@@ -510,6 +545,10 @@ mod tests {
     use serde_json::json;
 
     fn encoded(parts: &[Part]) -> Value {
+        encoded_with(parts, false)
+    }
+
+    fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
         let msg = SubmitMsg {
@@ -526,6 +565,7 @@ mod tests {
             model_kwargs: &model_kwargs,
             prompt_parts: parts,
             streaming: true,
+            report_usage,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
     }
@@ -536,6 +576,12 @@ mod tests {
             encoded(&[]).get("prompt_parts").is_none(),
             "every non-chat submit gained a key the bridge did not have before"
         );
+    }
+
+    #[test]
+    fn only_a_submit_that_reports_usage_carries_the_key() {
+        assert_eq!(encoded_with(&[], true)["report_usage"], json!(true));
+        assert!(encoded(&[]).get("report_usage").is_none());
     }
 
     #[test]
@@ -709,17 +755,17 @@ mod tests {
         };
         let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
         assert_eq!(
-            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None }),
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None, windows: None }),
             json!({"t": "metrics", "rid": "m", "sub": 4,
                    "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
         );
         assert_eq!(
-            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None }),
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None, windows: None }),
             json!({"t": "ping", "rid": "p", "sub": 5})
         );
         let check = RefAudioCheck { path: "/u/a.wav".into(), decoder: "soundfile", bare: true };
         assert_eq!(
-            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check) }),
+            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check), windows: None }),
             json!({"t": "check_ref_audio", "rid": "c", "sub": 6, "path": "/u/a.wav", "decoder": "soundfile", "bare": true})
         );
     }

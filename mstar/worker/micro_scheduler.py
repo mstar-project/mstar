@@ -1096,9 +1096,14 @@ class MicroScheduler:
         being removed, or in a step in flight."""
         now = time.monotonic()
         held, stopped, in_flight = self.admission.held_until, self.lifecycle.no_new_work(), self.in_flight_rids
-        for (node, rid), cursor in self.rebuilds.cursors():
+        for (node, rid), cursor in self._cursors_here():
             if rid not in in_flight and rid not in stopped and held.get(rid, 0.0) <= now:
                 yield node, rid, cursor
+
+    def _cursors_here(self) -> Iterator[tuple[tuple[str, int], RebuildCursor]]:
+        """The rebuilds this rank schedules: a follower's rebuild on a node rank 0 leads runs as rank 0 sends it."""
+        leads = self.parallel_leader_nodes
+        return ((key, cursor) for key, cursor in self.rebuilds.cursors() if key[0] in leads)
 
     def _rebuild_rows(
         self, key: tuple[str, str], only_walk: str | None = None, skip_walk: str | None = None,
@@ -1531,7 +1536,7 @@ class MicroScheduler:
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
-        for (node, rid), _ in self.rebuilds.cursors():
+        for (node, rid), _ in self._cursors_here():
             rows[node] += rid not in exclude and rid not in self.in_flight_rids
         for spec in self._rows_here(self.runtime.get_ready_nodes(exclude)):
             rows[spec.node_name] += len(spec.rids)
