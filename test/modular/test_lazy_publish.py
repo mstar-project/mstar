@@ -12,7 +12,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -22,6 +21,7 @@ from mstar.engine.resources.position.manager import (
 )
 from mstar.engine.resources.step import ADMIT_OK, Segment, StepContext
 from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.resource import StubResource
 
 OWN_HANDLE = ("own", 0)
 
@@ -158,16 +158,12 @@ def test_position_snapshot_matches_publish_and_does_not_track_later_advances():
 # -- runner + engine -----------------------------------------------------------
 
 
-class _Pub(Resource):
+class _Pub(StubResource):
     """A resource with only the default hooks: its snapshot is the eager value."""
 
     def __init__(self, published):
         self._published = published
         self.publish_calls = 0
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def admit(self, step, ctx):
         return ADMIT_OK
@@ -262,13 +258,10 @@ def test_kv_snapshot_of_a_stream_reset_since_publishes_the_stream_as_it_stands()
     assert _seq(lazy).latest_kv_transfer_info == _seq(live).latest_kv_transfer_info
 
 
-class _WalkPublisher(Resource):
+class _WalkPublisher(StubResource):
     """Publishes the walk it was asked under, so a test can see which one."""
 
     def __init__(self):
-        pass
-
-    def build(self, *args, **kwargs):
         pass
 
     def publish(self, request_id):
