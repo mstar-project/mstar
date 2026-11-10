@@ -1338,7 +1338,15 @@ placed exactly as weights are.
   subclasses of either that keep their base's forward are swapped alike, and are whole
   on every rank. An unbound module keeps its class, so a deployment without a ``lora:``
   block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
-  graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+  graph and its guards). An MoE layer's ``FusedExperts`` is a target per parameter
+  (``LoraCapable.lora_targets``): ``gate_up_proj`` and ``down_proj``, each with an A and B
+  per expert, named ``experts_gate_up_proj`` / ``experts_down_proj`` and placed per expert
+  by the loader's ``"gate:N"`` / ``"up:N"`` / ``"down:N"`` shard ids; its twin adds the
+  deltas inside the dispatch (``FusedExperts._dispatch``), after each grouped GEMM
+  (before the activation, and before the top-k sum and the all-reduce), so a subclass
+  with a ``_dispatch`` of its own is refused as one with its own forward is; so is an
+  adapter of PEFT's fused 3-D form (one A and B on the experts container), read per
+  expert only. Anything else holding weight matrices (a router, a
   depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
   none: the walk records why, and an adapter touching it is refused with that reason. So
   does a child its parent runs through the weight itself rather than its forward (folded at
@@ -1408,7 +1416,17 @@ placed exactly as weights are.
   (Qwen3.5's delta-net ``in_proj_qkv``: one A for the three, B cut by their widths), and
   a base linear that pads a slice per rank for alignment says so in ``slice_align``.
   ``parallel="none"`` is a target whole on every rank, its delta added to an output that
-  is already whole.
+  is already whole. ``experts=E`` is one stacked parameter of an MoE layer's routed
+  experts: each (token, top-k) row runs its token's slot's A and B for the expert the
+  router picked, addressed by one combined id ``(slot - 1) * E + expert`` (the zero
+  adapter's are not stored), on the fused-MoE grouped GEMM (``LoraBackend.apply_experts_``;
+  one align per layer over the combined ids, then a shrink and an accumulating expand per
+  slice). Experts targets are opt-in, since every slot holds a copy of each expert's
+  factors: ``module_lora_spec`` declares them in ``LoraSpec.dropped_targets``, and the
+  YAML's ``targets:`` serves them by naming them. The align op groups fewer than 1024 ids
+  once padded to its warp of 32, so a spec serves at most ``992 // E`` slots (7 at 128
+  experts) and refuses more where the YAML sizes it. Experts split by expert parallelism
+  are refused at deployment validation and at bind (``expert_split``); serve them under TP.
 - **Target kinds and rows.** ``kind="embedding"`` is a token embedding: ``in_features``
   is the vocabulary, the layer passes token ids as ``x``, and the shrink is a gather of
   A's column per token (``mstar::lora_gather_shrink``), PEFT's ``lora_embedding_A`` /
@@ -1416,12 +1434,13 @@ placed exactly as weights are.
   ``per_segment`` is one row per segment and ``token_fold=k`` one row per ``k``
   consecutive tokens of a segment. The pool plans an addressing per grouping its targets
   use; the call checks the rows it gets.
-- **Checkpoint layouts.** Adapters are validated from the safetensors header: modules
-  map to targets, shapes fit them (an adapter for another model size is a 400, not an
-  admit failure), and a conv adapter whose kernel is its stride flattens to the linear
-  over the patch. DoRA (PEFT's ``lora_magnitude_vector``, Kohya's ``dora_scale``), ``modules_to_save``, trainable
-  tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
-  the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
+- **Checkpoint layouts.** Adapters are validated from the same read that pins their
+  digest: modules map to targets, shapes fit them (an adapter for another model size
+  is a 400, not an admit failure), and a conv adapter whose kernel is its stride
+  flattens to the linear over the patch. DoRA (PEFT's ``lora_magnitude_vector``,
+  Kohya's ``dora_scale``), ``modules_to_save``, trainable tokens and bias LoRA are
+  refused by name. A YAML ``targets: [...]`` keeps a subset of the model's targets
+  (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
   a deployment with ``runtime_updates`` off keeps the targets its configured adapters
   touch (a node left with none gets no pool): the API server reads them once at startup
@@ -1442,7 +1461,8 @@ placed exactly as weights are.
   zero adapter; a replay's plan writes each row's slot into the buffers that capture
   recorded, so a captured graph serves any mix of adapters without recapture. The
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
-  latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
+  latter declares the ``y`` it writes), and an experts target's grouped GEMMs are one
+  more, ``mstar::lora_experts_apply_``, so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
   the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
   **Lean captures** under the resources table), so the engine captures every bucket whose
@@ -2732,8 +2752,10 @@ that a misspelled setting is never silently ignored:
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
        targets to allocate; by default, with ``runtime_updates`` off, the targets the
-       configured adapters touch, and every target with it on; a node left with none
-       gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
+       configured adapters touch, and every target with it on, except experts targets,
+       which are allocated only when the list names them; a list chooses among all the
+       declared targets, so a later one may name a target an earlier one left out; a node
+       left with none gets no pool, while a YAML list keeping none at all is an error), ``runtime_updates`` (default false: serve
        ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
        ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
        worker to answer one before giving up on it). The one ``lora:`` block sizes the

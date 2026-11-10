@@ -315,12 +315,18 @@ merge's.
        checkpoint's ``audio_decoder_proj.text_lm_head``)
      - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
-     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
-     - Attention only on MoE layers: an adapter on the routed experts or the router is
-       refused. Talker, code predictor and encoders take none. Not validated: this MoE
-       model's bf16 noise is about 10x a dense model's (its router flips experts on
-       near-ties), so even base rows, run in a larger batch than the reference's, miss
-       the check against merged weights.
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``;
+       the routed experts' ``experts_gate_up_proj`` / ``experts_down_proj`` when the YAML's
+       ``targets:`` names them
+     - Expert targets are opt-in: each slot holds every expert's A and B (about 1.7 GB per
+       slot at rank 16, and as much pinned on the host per adapter held there), and with
+       128 experts a pool serves at most 7 slots. Under TP only: an ``ep_config`` with
+       ``parallel: ep`` over several ranks refuses them at startup. Per-expert adapters
+       only (``experts.<N>.<proj>``), not PEFT's fused 3-D form. The router takes none.
+       Talker, code predictor and encoders take none. Not validated: this MoE model's
+       bf16 noise is about 10x a dense model's (its router flips experts on near-ties),
+       so even base rows, run in a larger batch than the reference's, miss the check
+       against merged weights.
    * - Qwen3-TTS (``Talker``), *not validated*
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
      - Not the text projection (runs before the step) or the CodePredictor. Not
