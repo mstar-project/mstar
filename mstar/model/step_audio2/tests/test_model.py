@@ -18,6 +18,10 @@ from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 from mstar.model.step_audio2.config import (
     AUDIO_ATTN,
+    AUDIO_END,
+    AUDIO_PATCH,
+    AUDIO_START,
+    BOT,
     AUDIO_EMBEDS,
     AUDIO_MEL_FRAMES,
     AUDIO_MELS,
@@ -37,6 +41,7 @@ from mstar.model.step_audio2.config import (
     T2W_CHUNK,
     TTS_END,
     TTS_PAD,
+    TTS_START,
     AudioEncoderConfig,
     StepAudio2Config,
     audio_tokens,
@@ -51,10 +56,19 @@ ASSETS = Path(os.environ.get("STEPAUDIO2_ASSETS", "/workspace/stepaudio2-ref/git
 
 
 class _StubTokenizer:
-    """One id per character, so prompts tokenize without a vocabulary."""
+    """One id per character, so prompts tokenize without a vocabulary, but for the special
+    tokens the prompt's audio and turns are written in, which are their own ids."""
+
+    SPECIAL = {"<audio_start>": AUDIO_START, "<audio_end>": AUDIO_END, "<audio_patch>": AUDIO_PATCH,
+               "<|BOT|>": BOT, "<|EOT|>": EOT, "<tts_start>": TTS_START}
 
     def __call__(self, text, add_special_tokens=False):
-        return {"input_ids": [ord(c) % 1000 for c in text]}
+        import re
+
+        ids = []
+        for piece in re.split("(" + "|".join(map(re.escape, self.SPECIAL)) + ")", text):
+            ids += [self.SPECIAL[piece]] if piece in self.SPECIAL else [ord(c) % 1000 for c in piece]
+        return {"input_ids": ids}
 
 
 def a_config() -> StepAudio2Config:
@@ -354,6 +368,36 @@ def test_a_clip_to_clone_and_inputs_it_cannot_take_are_refused(tmp_path):
         model.process_prompt("hi", ["text"], ["image"])
     with pytest.raises(ValueError, match="unknown Step-Audio2 voice"):
         model.process_prompt("hi", ["text"], ["text", "audio"], voice="nobody")
+
+
+@pytest.mark.parametrize("seconds", [25.005, 50.005])
+def test_audio_just_over_a_multiple_of_25_s_is_served_without_its_empty_window(tmp_path, seconds):
+    """Its last window has no rows; the prompt keeps that window's empty run, as the
+    reference's does, and the tower gets only the windows with rows."""
+    model = a_model(tmp_path)
+    audio = torch.randn(int(16000 * seconds))
+    out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [audio]})
+    ids = out.new_input_tensors["text_inputs"][0].tolist()
+    full = int(seconds // 25)
+    assert out.metadata[AUDIO_MEL_FRAMES] == [2502] * full
+    assert out.new_input_tensors[AUDIO_MELS][0].shape[-1] == 2502 * full
+    assert ids.count(AUDIO_START) == full + 1 and ids.count(AUDIO_PATCH) == full * audio_tokens(2502)
+    last_start = len(ids) - 1 - ids[::-1].index(AUDIO_START)
+    assert ids[last_start + 1] == AUDIO_END
+    with pytest.raises(ValueError, match="too short"):
+        model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [audio[:40]]})
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_an_audio_placeholder_written_in_the_text_is_refused(tmp_path, with_audio):
+    """The splice puts the tower's rows at the prompt's <audio_patch> ids in order, so one in
+    the text would shift every row after it."""
+    model = a_model(tmp_path)
+    inputs = ["text", "audio"] if with_audio else ["text"]
+    tensors = {"audio_inputs": [torch.randn(16000)]} if with_audio else None
+    with pytest.raises(ValueError, match="cannot be written"):
+        model.process_prompt("say <audio_patch> twice", inputs, ["text"], tensors=tensors)
+    model.process_prompt("say audio_patch twice", inputs, ["text"], tensors=tensors)
 
 
 def test_a_spoken_reply_is_capped_to_what_the_vocoders_caches_hold(tmp_path):

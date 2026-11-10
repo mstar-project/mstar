@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from mstar.model.components.audio_features import librosa_mel_filters
 from mstar.model.step_audio2.config import (
+    AUDIO_END,
     AUDIO_PATCH,
     AUDIO_START,
     HOP_LENGTH,
@@ -80,9 +81,15 @@ def render(
                 if kind == "text":
                     pieces.append(item["text"])
                 elif kind == "audio":
-                    for mel in audio_clips(load_audio(item["audio"])):
-                        mels.append(mel)
-                        pieces.append(_audio_piece(mel))
+                    clips = audio_clips(load_audio(item["audio"]))
+                    kept = [mel for mel in clips if audio_tokens(mel.shape[-1])]
+                    if not kept:
+                        raise ValueError(
+                            f"an audio input of {clips[-1].shape[-1] if clips else 0} mel frames is too short "
+                            "for Step-Audio2 to encode (it needs at least 5, about 0.02 s)"
+                        )
+                    mels += kept
+                    pieces += [_audio_piece(mel) for mel in clips]
                 elif kind == "token":
                     pieces.append(list(item["token"]))
                 else:
@@ -107,9 +114,15 @@ def tokenize(pieces: Sequence[Piece], encode: Callable[[str], list[int]]) -> lis
 
 def audio_positions(ids: Sequence[int], tokens_per_clip: Sequence[int]) -> list[int]:
     """The prompt rows each clip's embeddings fill, clips end to end: the run right after
-    each ``<audio_start>`` (``modeling_step_audio_2.py:353-357``). Raises if a run is not
-    the clip's ``<audio_patch>`` placeholders."""
-    starts = [i for i, t in enumerate(ids) if t == AUDIO_START]
+    each ``<audio_start>`` (``modeling_step_audio_2.py:353-357``), but for an empty one
+    (``<audio_start><audio_end>``, a window too short for any row). Raises if a run is not
+    the clip's ``<audio_patch>`` placeholders, or if the prompt has any other
+    ``<audio_patch>`` (one written in the text), which the forward's splice would take for
+    a clip's."""
+    starts = [
+        i for i, t in enumerate(ids)
+        if t == AUDIO_START and not (i + 1 < len(ids) and ids[i + 1] == AUDIO_END)
+    ]
     if len(starts) != len(tokens_per_clip):
         raise ValueError(f"{len(starts)} <audio_start> tokens for {len(tokens_per_clip)} audio clips")
     out: list[int] = []
@@ -118,4 +131,10 @@ def audio_positions(ids: Sequence[int], tokens_per_clip: Sequence[int]) -> list[
         if any(ids[i] != AUDIO_PATCH for i in run if i < len(ids)) or run.stop > len(ids):
             raise ValueError(f"the clip at {start} has {n} rows but its placeholder run differs")
         out += list(run)
+    patches = sum(1 for t in ids if t == AUDIO_PATCH)
+    if patches != len(out):
+        raise ValueError(
+            f"the prompt has {patches} <audio_patch> tokens for its audio's {len(out)} rows; "
+            "<audio_patch> cannot be written in a request's text"
+        )
     return out
