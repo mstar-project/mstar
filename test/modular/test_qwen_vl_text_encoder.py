@@ -198,6 +198,21 @@ def test_image_prompt_matches_transformers(tmp_path, name):
     torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_vision_rotary_frequencies_are_the_hosts_on_cuda():
+    """transformers builds the tower's inv_freq on the host and moves it; CUDA's pow rounds 4 of Qwen2.5-VL's 20
+    differently, which moved Qwen-Image-Edit's text embeddings 2% on an H200."""
+    from types import SimpleNamespace
+
+    from mstar.model.components.qwen3_vit import VisionRotaryEmbedding
+
+    with torch.device("meta"):
+        rope = VisionRotaryEmbedding(SimpleNamespace(head_dim=80, rope_theta=10000.0), keep_fp32=True)
+    rope.to(torch.bfloat16).to_empty(device="cuda")
+    want = 1.0 / (10000.0 ** (torch.arange(0, 40, 2, dtype=torch.float) / 40))
+    assert rope.inv_freq.dtype == torch.float32 and torch.equal(rope.inv_freq.cpu(), want)
+
+
 def test_rejects_other_rope_types():
     cfg = {"text_config": {
         "model_type": "qwen3_vl_text", "vocab_size": 8, "hidden_size": 8, "intermediate_size": 8,

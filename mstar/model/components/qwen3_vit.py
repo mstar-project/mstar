@@ -207,7 +207,9 @@ class VisionRotaryEmbedding(nn.Module):
     halves are concatenated to cover the whole head — no partial rotation.
 
     ``keep_fp32``: the frequencies stay fp32 through a cast of the module (the
-    engine's ``.to(bfloat16)`` would otherwise round them).
+    engine's ``.to(bfloat16)`` would otherwise round them). They are always computed
+    on the host and moved, as transformers builds them: CUDA's ``pow`` rounds 4 of
+    Qwen2.5-VL's 20 differently.
     """
 
     def __init__(self, config: ViTBlockConfig, keep_fp32: bool = False):
@@ -215,16 +217,16 @@ class VisionRotaryEmbedding(nn.Module):
         self._spatial_dim = config.head_dim // 2
         self._theta = config.rope_theta
         self._keep_fp32 = keep_fp32
-        self.register_buffer("inv_freq", self._inv_freq(None), persistent=False)
+        self.register_buffer("inv_freq", self._inv_freq(), persistent=False)
 
-    def _inv_freq(self, device) -> torch.Tensor:
+    def _inv_freq(self) -> torch.Tensor:
         d = self._spatial_dim
-        return 1.0 / (self._theta ** (torch.arange(0, d, 2, dtype=torch.float, device=device) / d))
+        return 1.0 / (self._theta ** (torch.arange(0, d, 2, dtype=torch.float, device="cpu") / d))
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         if self._keep_fp32:
-            self.inv_freq = self._inv_freq(self.inv_freq.device)
+            self.inv_freq = self._inv_freq().to(self.inv_freq.device)
         return result
 
     @torch.no_grad()
