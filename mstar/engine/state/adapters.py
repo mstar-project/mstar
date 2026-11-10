@@ -89,17 +89,30 @@ def build_specs(
     contract doesn't.
     """
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    by_read = _within_step_specs(arrays)
+    resolved = _resolve(arrays)
     specs: list[NodeResourceSpec] = []
     for array in arrays:
-        storage = storage_of(array)
-        if storage is not WITHIN_STEP or not array.nodes <= sdpa_nodes:
-            specs += storage.specs(array, arrays)
+        if storage_of(array) is not WITHIN_STEP or not array.nodes <= sdpa_nodes:
+            specs += resolved.specs[array.name]
         if array.positions is not None:
             specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
-    _apply_kernel_settings(specs, arrays, by_read, kernel_settings)
+    _apply_kernel_settings(specs, arrays, resolved.resource_of, kernel_settings)
     return specs
+
+
+def _resolve(arrays: Sequence[Array]) -> "Resolved":
+    """``arrays`` resolved by their storages, each storage's at once."""
+    by_storage: dict[Storage, list[Array]] = {}
+    for array in arrays:
+        by_storage.setdefault(storage_of(array), []).append(array)
+    specs: dict[str, list[NodeResourceSpec]] = {}
+    resource_of: dict[str, str] = {}
+    for storage, held in by_storage.items():
+        each = storage.resolve(held, arrays)
+        specs |= each.specs
+        resource_of |= each.resource_of
+    return Resolved(specs, resource_of)
 
 
 def _no_layout(array: Array, missing: str) -> ValueError:
@@ -112,30 +125,6 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
         raise _no_layout(array, "entry must be a KVEntry, all PagedKVConfig holds: k and v of one shape, sharded on "
                                 "their heads, with no dtype")
     return k.shape
-
-
-def _within_step_specs(arrays: Sequence[Array]) -> dict[str, NodeResourceSpec]:
-    """The ragged spec of each read of an array with ``max_len`` 0, a `RaggedCrossAttentionSpec` for a read with
-    ``queries``. Reads of one kind, on one node set and with one config share the spec of the first of them, under its
-    key, so each read is a plan on that resource rather than a resource of its own."""
-    sharded_nodes = {node for array in arrays if array.seq_sharded for node in array.nodes}
-    by_name = {array.name: array for array in arrays}
-    by_read: dict[str, NodeResourceSpec] = {}
-    shared: dict[tuple, NodeResourceSpec] = {}
-    for array in arrays:
-        if storage_of(array) is not WITHIN_STEP:
-            continue
-        (key, read), heads, head_dim, dtype = _within_step_read(array)
-        queried = by_name.get(read.queries, array)
-        config = RaggedAttentionConfig(
-            num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
-            # the heads narrow by SP only where the exchange runs over them
-            shard_over_sp=not array.nodes & sharded_nodes or (array.seq_sharded and queried.seq_sharded),
-        )
-        spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
-        spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
-        by_read[key] = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
-    return by_read
 
 
 def _within_step_read(array: Array) -> tuple[tuple[str, Read], int, int, torch.dtype | None]:
@@ -182,7 +171,7 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
 
 
 def _apply_kernel_settings(
-    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], by_read: Mapping[str, NodeResourceSpec],
+    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resource_of: Mapping[str, str],
     kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
     """Set the kernel choices and capture sizes the contract leaves to the engine, and refuse any other, so this hook
@@ -201,8 +190,8 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(binding.kernel_settings)}")
-        # a read on a node in ``sdpa_nodes`` has no spec to set
-        spec = by_key.get(by_read[key].resource_key if key in by_read else key)
+        # an update's settings go on its own spec, and a read on a node in ``sdpa_nodes`` has no spec to set
+        spec = by_key.get(resource_of.get(key, key))
         for field, value in settings.items():
             if spec is not None:
                 setattr(spec.config, field, value)
@@ -216,7 +205,7 @@ def node_handles(
     ``max_len`` 0 have no resource and run SDPA. ``host_fields`` holds the fields of the Values that declare them."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
-    by_read = _within_step_specs(list(arrays.values()))
+    resource_of = _resolve(list(arrays.values())).resource_of
     handles: dict[str, ArrayHandle | SamplerHandle] = {}
     for declared in declarations:
         if node not in declared.nodes:
@@ -226,7 +215,7 @@ def node_handles(
             handles[declared.name] = ValueHandle(declared, resources, None, (), host_fields)
         elif isinstance(declared, Array) and storage_of(declared) is WITHIN_STEP:
             ((read_key, read),) = declared.reads.items()
-            resource_key = by_read[read_key].resource_key
+            resource_key = resource_of[read_key]
             handles[declared.name] = WithinStepHandle(
                 declared, {read_key: None if sdpa else resources[resource_key]}, None,
                 _bindings(WITHIN_STEP, declared), resource_key=resource_key, queried=arrays.get(read.queries),
@@ -788,14 +777,22 @@ class WithinStepHandle(ArrayHandle):
 # Storages
 
 
+class Resolved(NamedTuple):
+    """Arrays resolved into today's resources: each array's specs, its ops' included, by its name, and each read's
+    resource key."""
+
+    specs: dict[str, list[NodeResourceSpec]]
+    resource_of: dict[str, str]
+
+
 class Storage(ABC):
     """How today's resources hold one kind of array: its specs, its own step, its layouts and its handle."""
 
     handle_class: ClassVar[type[ArrayHandle]]
 
     @abstractmethod
-    def specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
-        """``array``'s specs, its ops' included, where ``arrays`` are all the declared ones."""
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+        """``arrays``, all of the declared ones this storage holds, at once, where ``declared`` are all of them."""
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name."""
@@ -813,7 +810,12 @@ class PagedStorage(Storage):
 
     handle_class = PagedArrayHandle
 
-    def specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+        return Resolved(
+            {array.name: self._specs(array) for array in arrays}, {key: key for array in arrays for key in array.reads},
+        )
+
+    def _specs(self, array: Array) -> list[NodeResourceSpec]:
         heads, head_dim = _kv_shape(array)
         if array.seq_sharded or any(read.queries is not None for read in array.reads.values()):
             raise _no_layout(array, "seq_sharded and queries take max_len 0, and today's paged reads attend their own "
@@ -856,7 +858,10 @@ class ValueStorage(Storage):
 
     handle_class = ValueHandle
 
-    def specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+        return Resolved({array.name: self._specs(array, declared) for array in arrays}, {})
+
+    def _specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
         if array.entry.host and not array.entry.tensors:
             # the engine holds a host field, so no resource does
             return []
@@ -901,9 +906,29 @@ class WithinStepStorage(Storage):
 
     handle_class = WithinStepHandle
 
-    def specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
-        by_read = _within_step_specs(arrays)
-        return [by_read[key] for key in array.reads if by_read[key].resource_key == key]
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array]) -> Resolved:
+        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
+        node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
+        resource rather than a resource of its own."""
+        sharded_nodes = {node for array in declared if array.seq_sharded for node in array.nodes}
+        by_name = {array.name: array for array in declared}
+        specs: dict[str, list[NodeResourceSpec]] = {}
+        resource_of: dict[str, str] = {}
+        shared: dict[tuple, NodeResourceSpec] = {}
+        for array in arrays:
+            (key, read), heads, head_dim, dtype = _within_step_read(array)
+            queried = by_name.get(read.queries, array)
+            config = RaggedAttentionConfig(
+                num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
+                # the heads narrow by SP only where the exchange runs over them
+                shard_over_sp=not array.nodes & sharded_nodes or (array.seq_sharded and queried.seq_sharded),
+            )
+            spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
+            spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
+            spec = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
+            resource_of[key] = spec.resource_key
+            specs[array.name] = [spec] if spec.resource_key == key else []
+        return Resolved(specs, resource_of)
 
 
 PAGED = PagedStorage()
