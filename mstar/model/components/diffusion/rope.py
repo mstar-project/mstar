@@ -1,4 +1,4 @@
-"""Multi-axis rotary position embeddings for FLUX-family DiTs.
+"""Multi-axis rotary position embeddings for FLUX-family DiTs, and the Qwen-Image family's per-axis tables.
 
 A token's position is a small integer vector (FLUX.2: ``(t, h, w, l)``,
 Z-Image: ``(t, h, w)``); each axis owns a slice of the head dimension
@@ -56,3 +56,11 @@ def apply_rotary_interleaved(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tens
     x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
     return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+
+def qwen_rope_params(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
+    """``QwenEmbedRope.rope_params`` (Qwen-Image and Qwen-Image-2.1): complex64 ``[len(index), dim / 2]``,
+    built on the CPU as the references build their tables (even under a meta-device context)."""
+    exponent = torch.arange(0, dim, 2, device="cpu").to(torch.float32).div(dim)
+    freqs = torch.outer(index, 1.0 / torch.pow(theta, exponent))
+    return torch.polar(torch.ones_like(freqs), freqs)

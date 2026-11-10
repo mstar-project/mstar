@@ -37,6 +37,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.model.components.diffusion.rope import qwen_rope_params
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import QwenRMSNorm
 
@@ -88,12 +89,6 @@ class QwenStepLayout(NamedTuple):
     modulate_index: torch.Tensor   # [L_img] int: 0 the target's tokens, 1 the references'
 
 
-def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
-    """``QwenEmbedRope.rope_params``: complex64 ``[len(index), dim / 2]``."""
-    freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-    return torch.polar(torch.ones_like(freqs), freqs)
-
-
 def qwen_rope_tables(
     axes_dims: Sequence[int], img_grids: Sequence[tuple[int, int]], text_lengths: Sequence[int], text_rows: int,
     theta: float = 10_000.0,
@@ -103,8 +98,8 @@ def qwen_rope_tables(
     ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``."""
     pos_index = torch.arange(ROPE_POSITIONS)
     neg_index = torch.arange(ROPE_POSITIONS).flip(0) * -1 - 1
-    pos = [_rope_axis(pos_index, d, theta) for d in axes_dims]
-    neg = [_rope_axis(neg_index, d, theta) for d in axes_dims]
+    pos = [qwen_rope_params(pos_index, d, theta) for d in axes_dims]
+    neg = [qwen_rope_params(neg_index, d, theta) for d in axes_dims]
     img = []
     for frame, (h, w) in enumerate(img_grids):
         t_freqs = pos[0][frame:frame + 1].view(1, 1, 1, -1).expand(1, h, w, -1)
