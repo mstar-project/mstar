@@ -1,4 +1,4 @@
-"""glm5_next DSA past index_topk (dsa/kpool.py) on CPU: the k-pool selection and pool keys against the
+"""glm5_next DSA past index_topk (dsa/paged.py) on CPU: the k-pool selection and pool keys against the
 reference indexer (transformers' Glm5NextTextIndexer, ported below), and the long-context engine
 path against itself (one-shot prefill vs stepwise decode vs windowed prefill) and against dense
 MLA where they must agree.
@@ -20,8 +20,9 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import paged as dsa
 from mstar.engine.resources.dsa import sparse_mla
+from mstar.engine.resources.dsa.manager import KPoolDSA
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
@@ -444,7 +445,7 @@ def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatc
     monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
     kv_config = types.SimpleNamespace(tokens_per_page=8, max_seq_len=64, num_qo_heads=4,
                                       kv_lora_rank=16, qk_rope_head_dim=0)
-    resource = dsa.KPoolDSA(DSAConfig(kv_cache=KV_CACHE, topk=16, kpool=4, sm_scale=0.1),
+    resource = KPoolDSA(DSAConfig(kv_cache=KV_CACHE, topk=16, kpool=4, sm_scale=0.1),
                             kv_config, torch.device("cpu"))
     mgmt = engine_mod.SubmoduleManagement(
         submodule=None, forward=None, forward_batched=None, joint_comm_group=None,

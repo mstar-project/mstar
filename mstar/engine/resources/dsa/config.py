@@ -22,9 +22,9 @@ class DSAConfig:
     kv_cache: str
     # the keys a query attends once it sees more: its top ``topk`` by the indexer's score
     topk: int
-    # tokens per pooled key (GLM-5.3's k-pool indexer: kpool.py); 1 scores every token's key
+    # tokens per pooled key (GLM-5.3's k-pool indexer: paged.py); 1 scores every token's key
     kpool: int = 1
-    # the absorbed MLA's softmax scale, for the sparse-attention plans kpool.py makes
+    # the absorbed MLA's softmax scale, for the sparse-attention plans the resource makes
     sm_scale: float | None = None
     # kpool > 1: the indexer's key width; an INDEX_PLANES row is three of them wide
     index_head_dim: int | None = None
@@ -40,7 +40,7 @@ class DSASpec(NodeResourceSpec):
     @property
     def resource_class(self) -> "type[Resource]":
         if self.config.kpool > 1:
-            from mstar.engine.resources.dsa.kpool import KPoolDSA
+            from mstar.engine.resources.dsa.manager import KPoolDSA
 
             return KPoolDSA
         from mstar.engine.resources.dsa.manager import DSAManager

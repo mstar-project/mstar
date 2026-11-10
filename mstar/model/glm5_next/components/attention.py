@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.dsa import kpool
+from mstar.engine.resources.dsa.manager import KPoolDSA
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
 
@@ -82,7 +82,7 @@ class Glm5NextMLAAttention(MLAAttention):
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
         # and the DSA resource, which holds the step's plan (the step declares DSAStep)
         self.index_plane = kv_plane if config.dsa_long_context else None
-        self._dsa: kpool.KPoolDSA | None = None
+        self._dsa: KPoolDSA | None = None
         self.dsa_group = (comm_group or CommGroup.trivial()) if config.dsa_shard_prefill else None
 
     def bind_resources(self, resources: dict) -> None:
