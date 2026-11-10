@@ -598,7 +598,7 @@ jobs:
           ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
           VENDORS: ${{ steps.carry.outputs.vendors }}
           TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
-          # A DigitalOcean box's Anthropic key, written into its user_data (gpu.py, digitalocean.run_secret_env).
+          # A DigitalOcean box's Anthropic key, written into its user_data (gpu.py, run_secret_env).
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 .github/review/gpu_review.py start
 

@@ -99,14 +99,15 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
     eras = {"cache_volume_ids": eras_cache_volumes.split(), **reachable}
     if eras_secret:
         eras["run_secret_id"] = eras_secret
-    # DigitalOcean (with DIGITALOCEAN_TOKEN): the box's Anthropic key is the review's own, from the start step's
-    # environment, written into the droplet's user_data.
-    cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
+    # run_secret_env: a DigitalOcean box's Anthropic key is the review's own, from the start step's environment,
+    # written into the droplet's user_data.
+    cfg = {"mode": "cloud", "results_dir": "results", "run_secret_env": "ANTHROPIC_API_KEY",
+           "ssh_public_key": str(ssh / "live_pr.pub"),
            "identity_file": str(ssh / "live_pr"),
            # one box per vendor at once
            "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": len(bot.VENDORS),
                       "max_total_usd": usd * hours * len(bot.VENDORS), "max_running": int(max_runs)},
-           "eras": eras, "digitalocean": {"run_secret_env": "ANTHROPIC_API_KEY", **reachable},
+           "eras": eras, "digitalocean": reachable,
            "runpod": {"enabled": False}, "lambda": {"enabled": False}}
     (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
 
@@ -435,7 +436,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
             none_free(vendor)
     if any((lt / v / "unavailable.md").exists() for v in vendors):
         stop()
-    secret = os.environ.get(cfg.get("digitalocean", {}).get("run_secret_env") or "", "")
+    secret = os.environ.get(cfg.get("run_secret_env") or "", "")
     for i, vendor in enumerate(vendors):
         box = lt / vendor
         free, _, tried = found[vendor]

@@ -3,6 +3,7 @@
   "results_dir": "~/live-pr-results",
   "ssh_public_key": "~/.ssh/id_ed25519.pub",
   "identity_file": "",
+  "run_secret_env": "",
   "budget": {
     "max_usd_per_hour": 20,
     "max_hours": 6,
@@ -14,9 +15,11 @@
     "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
     "disk_gb": 300,
     "hf_home": "/workspace/hf",
+    "storage": true,
     "volumes": []
   },
   "lambda": {
+    "storage": true,
     "filesystems": [],
     "hf_home": "{mount}/hf",
     "ssh_key_name": ""
@@ -34,7 +37,6 @@
     "cache_volume_ids": []
   },
   "digitalocean": {
-    "hf_home": "/workspace/hf",
-    "run_secret_env": ""
+    "hf_home": "/workspace/hf"
   }
 }

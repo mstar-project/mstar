@@ -1,8 +1,9 @@
-"""Check live-pr-test's gpu.py: the Eras Cloud and DigitalOcean providers, and what every provider shares."""
+"""Check live-pr-test's gpu.py: the Eras Cloud, RunPod, Lambda and DigitalOcean providers, and what they share."""
 
 import argparse
 import base64
 import contextlib
+import datetime
 import functools
 import gzip
 import hashlib
@@ -234,19 +235,6 @@ class TestEras(unittest.TestCase):
         self.assertEqual(offers("nvidia"), [("eras:l0", "nvidia")], "an A100 or an AMD box would pass for Hopper")
         self.assertEqual(offers("amd"), [], "an AMD box would get the Eras template, which asks for nvidia.com/gpu")
 
-    def test_run_is_refused_where_the_box_cant_take_it(self):
-        globs = GPU
-        self.addCleanup(globs.update, {"find_offer": globs["find_offer"]})
-        globs["find_offer"] = lambda cfg, offer: {"id": "runpod:H100:dc:1", "provider": "runpod", "gpu": "H100",
-                                                  "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True}
-        key = Path(tempfile.mkdtemp()) / "key.pub"
-        key.write_text("ssh-ed25519 AAAA test")
-        args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=0, hours=1, tag="t", run="box.sh", input=[],
-                                  allow_over_budget=False, dry_run=True)
-        with self.assertRaises(SystemExit, msg="a pod would hold GPUs with nothing running on them"), \
-                contextlib.redirect_stderr(io.StringIO()):
-            GPU["cmd_launch"](args, {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4}})
-
     def test_an_eras_ssh_key_on_a_later_page_is_reused(self):
         key = base64.b64encode(b"key").decode()
         fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(b"key").digest()).decode().rstrip("=")
@@ -403,7 +391,7 @@ class TestDigitalOcean(unittest.TestCase):
         box, body = d / "box.sh", d / "pr-body.md"
         box.write_text("echo hello\n")
         body.write_text("Generated with Claude Code \N{ROBOT FACE}\n", encoding="utf-8")
-        cfg = {"digitalocean": {"run_secret_env": "BOX_KEY"}}
+        cfg = {"run_secret_env": "BOX_KEY"}
         with unittest.mock.patch.dict(os.environ, {"BOX_KEY": "sk-ant-box"}):
             self.launch(str(box), [str(body)], dry_run=True, cfg=cfg)
             self.assertEqual([c[:2] for c in self.calls if c[0] != "GET"], [], "a dry run would register the key")
@@ -472,6 +460,160 @@ class TestDigitalOcean(unittest.TestCase):
         self.assertIsNotNone(created, "runaway boxes would hold budget.max_running")
         self.assertEqual([c for c in eras_calls if c[0] != "GET"], [],
                          "an Eras box, which its Pod's deadline ends, would be released early")
+
+
+def storage_free_offers(provider, calls, keys=()):
+    """The fake API of `provider` (runpod or lambda) whose team storage is not to be asked about: every call it
+    makes is in `calls`."""
+    def runpod(method, path, body=None, params=None, retry=True):
+        calls.append((method, path, body))
+        if path == "/catalog/gpus":
+            return {"gpus": [{"id": "NVIDIA H100 80GB HBM3", "memory": 80, "price": {"secure": 2.69}, "dataCenters": [
+                {"id": "US-CA-2", "availability": "HIGH"}, {"id": "EU-RO-1", "availability": "NONE"}]}]}
+        if path == "/pods" and method == "POST":
+            return {"id": "p1"}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def lambda_(method, path, body=None, retry=True):
+        calls.append((method, path, body))
+        return {"/ssh-keys": list(keys), "/instance-operations/launch": {"instance_ids": ["i-1"]},
+                "/instance-types": {"gpu_1x_h100": {"regions_with_capacity_available": [{"name": "us-west-1"}],
+                                                    "instance_type": {"gpu_description": "H100 (80 GB SXM5)",
+                                                                      "specs": {"gpus": 1},
+                                                                      "price_cents_per_hour": 329}}}}[path]
+    return {"runpod": runpod, "lambda": lambda_}[provider]
+
+
+class TestStorageFreeProviders(unittest.TestCase):
+    """RunPod and Lambda for a box that keeps nothing (`storage: false`), as the review bot uses them."""
+
+    def provider(self, name, cfg, keys=()):
+        self.calls = []
+        func = {"runpod": "runpod", "lambda": "lambda_"}[name]
+        self.addCleanup(GPU.update, {func: GPU[func]})
+        GPU[func] = storage_free_offers(name, self.calls, keys)
+        return GPU[{"runpod": "RunPod", "lambda": "Lambda"}[name]]({name: {"storage": False, **cfg}})
+
+    def test_offers_cover_every_region_with_capacity_and_ask_for_no_storage(self):
+        for name, region in (("runpod", "US-CA-2"), ("lambda", "us-west-1")):
+            with self.subTest(name):
+                offers = self.provider(name, {}).offers(1, 0, False)
+                self.assertEqual([(o["region"], o["storage"]) for o in offers], [(region, True)],
+                                 "a bot box would wait for a region with the team's storage")
+                self.assertEqual([c for c in self.calls if "volume" in c[1] or "filesystem" in c[1]], [],
+                                 "the bot's account has no volumes to ask about")
+
+    def test_lambda_registers_its_key_by_fingerprint_once_and_mounts_nothing(self):
+        pubkey = "ssh-ed25519 " + base64.b64encode(b"key").decode()
+        name = "live-pr-" + hashlib.sha256(b"key").hexdigest()[:12]
+        for listed in ([], [{"name": name}]):
+            with self.subTest(registered=bool(listed)):
+                p = self.provider("lambda", {"filesystems": ["team"]}, listed)
+                body, _ = p.plan({"id": "lambda:gpu_1x_h100:us-west-1", "region": "us-west-1"}, "live-pr-7-t", pubkey,
+                                 1, argparse.Namespace(dry_run=False, run=None))
+                self.assertNotIn("file_system_names", body, "a bot box would mount the team's filesystem")
+                self.assertEqual(body["ssh_key_names"], [name])
+                self.assertEqual([c for c in self.calls if c[:2] == ("POST", "/ssh-keys")],
+                                 [] if listed else [("POST", "/ssh-keys", {"name": name, "public_key": pubkey})],
+                                 "the key would be registered again on every launch, or never")
+
+    def test_a_pod_mounts_nothing_and_a_lambda_run_goes_in_user_data(self):
+        d = Path(tempfile.mkdtemp())
+        box = d / "box.sh"
+        box.write_text("echo hello\n")
+        cfg = {"run_secret_env": "BOX_KEY"}
+        args = argparse.Namespace(dry_run=False, run=str(box), input=[])
+        with unittest.mock.patch.dict(os.environ, {"BOX_KEY": "sk-ant-box"}):
+            body, _ = self.provider("runpod", {"image": "img", "hf_home": "/h", **cfg}).plan(
+                {"gpu": "H", "count": 1, "region": "US-CA-2"}, "live-pr-7-t", "ssh-ed25519 AAAA", 1, args)
+            self.assertNotIn("mounts", body, "a pod would mount a volume the bot's account lacks")
+            self.assertNotIn("sk-ant-box", json.dumps(body), "the key would reach RunPod's API")
+            self.assertNotIn("user_data", body)
+            lam = self.provider("lambda", {"ssh_key_name": "k"})
+            lam.cfg.update(cfg)
+            body, _ = lam.plan({"id": "lambda:gpu_1x_h100:us-west-1", "region": "us-west-1"}, "live-pr-7-t",
+                               "ssh-ed25519 AAAA", 1, args)
+        files = {f["path"]: gzip.decompress(base64.b64decode(f["content"]))
+                 for f in json.loads(body["user_data"].split("\n", 1)[1])["write_files"]}
+        self.assertEqual(files, {"/run/live-pr/box.sh": b"echo hello\n", "/run/live-pr-key/value": b"sk-ant-box"},
+                         "a Lambda box would have no script to run, or no Anthropic key")
+
+    def test_a_pods_run_is_copied_over_ssh_and_a_pod_that_cant_take_it_is_ended(self):
+        d = Path(tempfile.mkdtemp())
+        box, extra = d / "box.sh", d / "pr-body.md"
+        box.write_text("echo hello\n")
+        extra.write_text("body\n")
+        state, key = Path(tempfile.mkdtemp()), d / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        saved = {k: GPU[k] for k in ("runpod", "find_offer", "STATE", "LEDGER", "cmd_wait", "terminate")}
+        self.addCleanup(GPU.update, saved)
+        sent, ended, created = [], [], []
+
+        def runpod(method, path, body=None, params=None, retry=True):
+            if method == "POST":
+                created.append(body)
+            return {"id": "p1"}
+
+        def fake_run(command, **kwargs):
+            sent.append((command, Path(command[-2]).read_text() if "value" in command[-2:][0] else None))
+            return subprocess.CompletedProcess(command, 1 if self.ssh_fails else 0, "", "boom")
+
+        def cmd_wait(args, cfg):
+            e = GPU["ledger"]()[args.instance]
+            with GPU["ledger_txn"]() as ledger:
+                ledger[args.instance].update(host="1.2.3.4", port=2222)
+            self.assertEqual(e["instance_id"], "p1")
+
+        GPU.update(runpod=runpod, STATE=state, LEDGER=state / "instances.json", cmd_wait=cmd_wait,
+                   find_offer=lambda cfg, offer: {"id": "runpod:H100:dc:1", "provider": "runpod", "gpu": "H100",
+                                                  "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True},
+                   terminate=lambda k, e: ended.append(k))
+        cfg = {"ssh_public_key": str(key), "run_secret_env": "BOX_KEY", "runpod": {"image": "i", "hf_home": "/h",
+                                                                                       "storage": False},
+               "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": None}}
+        args = argparse.Namespace(boxes=1, offer="runpod:H100:dc:1", pr=7, hours=1, tag="t", run=str(box),
+                                  input=[str(extra)], allow_over_budget=False, dry_run=False)
+        for self.ssh_fails in (False, True):
+            sent.clear(), ended.clear(), created.clear()
+            with self.subTest(ssh_fails=self.ssh_fails), unittest.mock.patch.object(subprocess, "Popen"), \
+                    unittest.mock.patch.object(subprocess, "run", fake_run), \
+                    unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k", "BOX_KEY": "sk-ant-box"}), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                GPU["save_ledger"]({})
+                try:
+                    GPU["cmd_launch"](args, cfg)
+                except SystemExit:
+                    pass
+            self.assertNotIn("sk-ant-box", json.dumps(created), "the key would reach RunPod's API")
+            self.assertEqual(ended, ["runpod:p1"] if self.ssh_fails else [],
+                             "a pod without its run would bill idle, or a started one would be ended")
+            if not self.ssh_fails:
+                self.assertEqual(sent[-1][0][-1].split()[:3], ["setsid", "nohup", "bash"], "the run would not start")
+                self.assertEqual(sent[-2][1], "sk-ant-box", "the box would have no Anthropic key")
+                self.assertIn(str(extra), sent[1][0], "the box would miss its inputs")
+
+    def test_a_deleted_box_has_ended_and_creation_times_are_read(self):
+        created = "2026-11-12T10:00:00Z"
+        replies = {"runpod": {"pods": [{"id": "p1", "name": "live-pr-1-t", "status": "RUNNING", "createdAt": created}]},
+                   "lambda": [{"id": "i-1", "name": "live-pr-1-t", "status": "active", "first_healthy": created},
+                              {"id": "i-2", "name": "live-pr-2-t", "status": "booting"}]}
+        for name, cls in (("runpod", "RunPod"), ("lambda", "Lambda")):
+            with self.subTest(name):
+                func = {"runpod": "runpod", "lambda": "lambda_"}[name]
+                self.addCleanup(GPU.update, {func: GPU[func], "runpod_list": GPU["runpod_list"]})
+
+                def api(method, path, body=None, params=None, retry=True, name=name):
+                    if path.startswith(("/pods/", "/instances/")):
+                        raise GPU["ApiError"](404, {"message": "gone"})
+                    return replies[name]
+                GPU[func] = api
+                GPU["runpod_list"] = lambda path, field, params=None: replies["runpod"]["pods"]
+                p = GPU[cls]({})
+                self.assertEqual(p.status({"instance_id": "x"})[0], "ended",
+                                 "the bot would wait on a deleted box until its timeout")
+                epoch = datetime.datetime(2026, 11, 12, 10, tzinfo=datetime.timezone.utc).timestamp()
+                self.assertEqual([i.created for i in p.instances()][0], epoch,
+                                 "the hourly reap could never tell a runaway box from a new one")
 
 
 if __name__ == "__main__":

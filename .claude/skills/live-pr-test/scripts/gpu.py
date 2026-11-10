@@ -20,7 +20,10 @@ usage:
 Offers only cover regions where the team has persistent storage (a RunPod global volume
 mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region), since the
 HF cache lives there; --all-regions lists the rest for
-a "no availability" report. Prices are USD/hr for the whole box.
+a "no availability" report. With `runpod.storage` or `lambda.storage` false (a box that keeps nothing),
+that provider offers every region with capacity and mounts nothing, and the box's HF cache is on its local
+disk. Without `lambda.ssh_key_name`, the ssh public key is registered on Lambda under a name derived from
+it. Prices are USD/hr for the whole box.
 
 An Eras instance runs sshd as root in a Pod that Kubernetes stops at the deadline
 (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
@@ -33,7 +36,11 @@ the --input files in /run/live-pr. On Eras it is the Pod's command, with sshd up
 copying results back, and the instance is released 15 minutes after it exits, so the GPUs go when
 the script ends, whether or not whoever launched it is still there. On DigitalOcean cloud-init
 writes the files and starts the script at boot (in the droplet's user_data, 64 KiB at most); the
-droplet stays up until terminated.
+droplet stays up until terminated. Lambda does the same in its instance's user_data. RunPod's create
+request can't carry files, so launch waits until the pod answers ssh, copies the files over, and starts
+the script detached; a pod that can't be reached or written to is terminated. The secret for the run
+(an Anthropic key, say) is the environment variable that the top-level `run_secret_env` names; on
+DigitalOcean and Lambda it goes in user_data, on RunPod over scp, where anything on the box can read it.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
@@ -63,6 +70,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -263,6 +271,21 @@ def runpod_volume_for(vols: dict[str, dict], dc: str) -> dict | None:
     return vols.get(dc) or vols.get(GLOBAL)
 
 
+def storage_on(cfg: dict, provider: str) -> bool:
+    """Whether `provider`'s boxes get the team's storage: yes, unless its config says `storage: false` (a box that
+    keeps nothing, such as the review bot's: it then offers every region with capacity, mounts nothing, and the
+    HF cache is on the box's local disk)."""
+    return cfg.get(provider, {}).get("storage") is not False
+
+
+def iso_epoch(text: str | None) -> float | None:
+    """An ISO 8601 time as epoch seconds; None for none, or one that doesn't parse."""
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
 def lambda_filesystems(cfg: dict) -> dict[str, dict]:
     """region -> filesystem to attach there."""
     want = set(cfg["lambda"].get("filesystems") or [])
@@ -272,6 +295,25 @@ def lambda_filesystems(cfg: dict) -> dict[str, dict]:
             continue
         by_region.setdefault(fs["region"]["name"], fs)
     return by_region
+
+
+def lambda_ssh_key_name(pubkey: str) -> str:
+    """The name the public key is registered under on Lambda when no `lambda.ssh_key_name` is set: one per key."""
+    return "live-pr-" + hashlib.sha256(base64.b64decode(pubkey.split()[1])).hexdigest()[:12]
+
+
+def lambda_register_ssh_key(name: str, pubkey: str) -> None:
+    """Register the public key under `name` unless a key of that name is listed. The account is shared:
+    nothing here deletes or replaces a key."""
+    def listed():
+        return any(k.get("name") == name for k in lambda_("GET", "/ssh-keys") or [])
+    if listed():
+        return
+    try:
+        lambda_("POST", "/ssh-keys", {"name": name, "public_key": pubkey})
+    except ApiError:
+        if not listed():  # another launch registered it meanwhile, or not
+            raise
 
 
 # ---------------------------------------------------------------- offers
@@ -305,7 +347,7 @@ class Provider:
     user = "root"  # who ssh logs in as
     fixed_deadline = False  # its deadline was fixed at launch, so a later one wouldn't move it
     vendors = ("nvidia",)  # the GPU vendors its images run
-    takes_run = False  # whether `launch --run` works here
+    run_by_ssh = False  # `--run`'s files can't go in the create request: launch copies them over ssh and starts it
 
     def __init__(self, cfg: dict, region: str | None = None):
         self.cfg, self.region = cfg, region
@@ -372,14 +414,19 @@ class Provider:
 
 class RunPod(Provider):
     name, key_env = "runpod", "RUNPOD_API_KEY"
+    run_by_ssh = True  # its create request has no user_data
 
     @classmethod
     def pool(cls, cfg, offer_id):
         _, gpu, dc, count = offer_id.split(":")
         return cls(cfg).offers(int(count), 0, True)
 
+    def volumes(self):
+        """data center -> the volume to mount there; none when `runpod.storage` is false."""
+        return runpod_volumes(self.cfg) if storage_on(self.cfg, self.name) else {}
+
     def offers(self, gpus, min_vram, all_regions, allow_arm=False):
-        vols = runpod_volumes(self.cfg)
+        vols, stored = self.volumes(), storage_on(self.cfg, self.name)
         cat = runpod("GET", "/catalog/gpus", params={
             "include": "AVAILABILITY", "product": "POD", "count": gpus, "cloud": "SECURE"})
         offers = []
@@ -393,7 +440,7 @@ class RunPod(Provider):
             for dc in g.get("dataCenters") or []:
                 if dc.get("availability", "NONE") == "NONE":
                     continue
-                storage = runpod_volume_for(vols, dc["id"]) is not None
+                storage = runpod_volume_for(vols, dc["id"]) is not None or not stored
                 if storage or all_regions:
                     offers.append({
                         "id": f"runpod:{g['id'].replace(' ', '_')}:{dc['id']}:{gpus}",
@@ -405,8 +452,7 @@ class RunPod(Provider):
 
     def plan(self, o, name, pubkey, hours, args):
         rp = self.cfg["runpod"]
-        vol = runpod_volume_for(runpod_volumes(self.cfg), o["region"])
-        kind = "global" if vol["kind"] == "global" else "network"
+        vol = runpod_volume_for(self.volumes(), o["region"])
         body = {
             "name": name, "cloud": "SECURE",
             "gpu": {"id": o["gpu"], "count": o["count"], "minCudaVersion": rp.get("min_cuda", "12.8")},
@@ -414,27 +460,35 @@ class RunPod(Provider):
             # Both names: the API spec and the SSH docs disagree on which one the image reads.
             "env": {"PUBLIC_KEY": pubkey, "SSH_PUBLIC_KEY": pubkey, "HF_HOME": rp["hf_home"]},
             "ports": ["22/tcp"], "startSsh": True,
-            "mounts": {kind: [{"volumeId": vol["id"], "path": "/workspace"}]},
+            **({"mounts": {vol["kind"]: [{"volumeId": vol["id"], "path": "/workspace"}]}} if vol else {}),
             "dataCenterIds": [o["region"]],
         }
+        if args.run:  # the box needs its key before anything is created
+            run_secret(self.cfg, args.dry_run)
         return body, lambda: runpod("POST", "/pods", body, retry=False)["id"]
 
     def hf_home(self):
         return self.cfg["runpod"]["hf_home"]
 
     def status(self, e):
-        p = runpod("GET", f"/pods/{e['instance_id']}")
+        try:
+            p = runpod("GET", f"/pods/{e['instance_id']}")
+        except ApiError as err:
+            if err.status == 404:  # deleted, by terminate or by hand
+                return "ended", None, 22
+            raise
         direct = (p.get("ssh") or {}).get("direct") or {}
         return p.get("status", "?"), direct.get("host"), int(direct.get("port") or 22)
 
     def instances(self):
-        return [Instance(p["id"], p.get("name"), p.get("status")) for p in runpod_list("/pods", "pods")]
+        return [Instance(p["id"], p.get("name"), p.get("status"), iso_epoch(p.get("createdAt")))
+                for p in runpod_list("/pods", "pods")]
 
     def release(self, iid, e):
         runpod("DELETE", f"/pods/{iid}")
 
     def storage(self):
-        return runpod_volumes(self.cfg)
+        return runpod_volumes(self.cfg) if storage_on(self.cfg, self.name) else None
 
     def explain_no_storage(self):
         rp = self.cfg["runpod"]
@@ -460,8 +514,12 @@ class Lambda(Provider):
     def pool(cls, cfg, offer_id):
         return cls(cfg).offers(1, 0, True, allow_arm=True)
 
+    def filesystems(self):
+        """region -> the filesystem to attach there; none when `lambda.storage` is false."""
+        return lambda_filesystems(self.cfg) if storage_on(self.cfg, self.name) else {}
+
     def offers(self, gpus, min_vram, all_regions, allow_arm=False):
-        fss = lambda_filesystems(self.cfg)
+        fss, stored = self.filesystems(), storage_on(self.cfg, self.name)
         offers = []
         for name, entry in (lambda_("GET", "/instance-types") or {}).items():
             it = entry["instance_type"]
@@ -474,7 +532,7 @@ class Lambda(Provider):
             if it.get("architecture", "x86_64") != "x86_64" and not allow_arm:
                 continue
             for region in entry.get("regions_with_capacity_available") or []:
-                storage = region["name"] in fss
+                storage = region["name"] in fss or not stored
                 if storage or all_regions:
                     offers.append({
                         "id": f"lambda:{name}:{region['name']}",
@@ -487,32 +545,45 @@ class Lambda(Provider):
 
     def plan(self, o, name, pubkey, hours, args):
         lm = self.cfg["lambda"]
-        fs = lambda_filesystems(self.cfg)[o["region"]]
+        fs = self.filesystems().get(o["region"])
+        key = lm.get("ssh_key_name") or lambda_ssh_key_name(pubkey)
+        if not lm.get("ssh_key_name") and not args.dry_run:
+            lambda_register_ssh_key(key, pubkey)
         body = {
             "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
-            "ssh_key_names": [lm["ssh_key_name"]], "file_system_names": [fs["name"]],
+            "ssh_key_names": [key], **({"file_system_names": [fs["name"]]} if fs else {}),
             "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
         }
+        if args.run:
+            body["user_data"] = run_user_data(self.cfg, args)
         return body, lambda: lambda_("POST", "/instance-operations/launch", body, retry=False)["instance_ids"][0]
 
     def hf_home(self):
-        fs = lambda_filesystems(self.cfg)[self.region]
+        fs = self.filesystems().get(self.region)
+        if not fs:
+            return f"/home/{self.user}/hf"
         mount = fs.get("mount_point") or f"/lambda/nfs/{fs['name']}"
         return self.cfg["lambda"]["hf_home"].format(fs=fs["name"], mount=mount)
 
     def status(self, e):
-        i = lambda_("GET", f"/instances/{e['instance_id']}") or {}
+        try:
+            i = lambda_("GET", f"/instances/{e['instance_id']}") or {}
+        except ApiError as err:
+            if err.status == 404:  # deleted, by terminate or by hand
+                return "ended", None, 22
+            raise
         return i.get("status", "?"), i.get("ip"), 22
 
     def instances(self):
-        return [Instance(i["id"], i.get("name"), i.get("status")) for i in lambda_("GET", "/instances") or []
-                if i.get("status") not in ("terminating", "terminated")]
+        # created: when it first answered healthily (Lambda lists no creation time); None while it boots
+        return [Instance(i["id"], i.get("name"), i.get("status"), iso_epoch(i.get("first_healthy")))
+                for i in lambda_("GET", "/instances") or [] if i.get("status") not in ("terminating", "terminated")]
 
     def release(self, iid, e):
         lambda_("POST", "/instance-operations/terminate", {"instance_ids": [iid]})
 
     def storage(self):
-        return lambda_filesystems(self.cfg)
+        return lambda_filesystems(self.cfg) if storage_on(self.cfg, self.name) else None
 
     def explain_no_storage(self):
         pass
@@ -520,7 +591,7 @@ class Lambda(Provider):
 
 class Eras(Provider):
     name, key_env = "eras", "ERAS_API_KEY"
-    fixed_deadline = takes_run = True
+    fixed_deadline = True
 
     @classmethod
     def pool(cls, cfg, offer_id):
@@ -600,7 +671,6 @@ class DigitalOcean(Provider):
     ("Size is not available in this region"); a size with none can't start, and only --all-regions lists it."""
     name, key_env = "digitalocean", "DIGITALOCEAN_TOKEN"
     vendors = ("nvidia", "amd")
-    takes_run = True
 
     @classmethod
     def pool(cls, cfg, offer_id):  # read again at launch: a size whose regions emptied since is "no longer available"
@@ -634,14 +704,7 @@ class DigitalOcean(Provider):
         body = {"name": name, "size": o["id"].split(":", 1)[1], "region": o["region"], "image": image,
                 "ssh_keys": [key]}
         if args.run:
-            secret = self.cfg.get("digitalocean", {}).get("run_secret_env")
-            if secret and not args.dry_run and not os.environ.get(secret):
-                die(f"digitalocean.run_secret_env names {secret}, which is not set; the box would have no key")
-            body["user_data"] = cloud_config(args.run, args.input, secret and (
-                "<the value of $" + secret + ">" if args.dry_run else os.environ[secret]))
-            if len(body["user_data"].encode()) > USER_DATA_MAX:
-                die(f"the --run script and inputs take {len(body['user_data'].encode())} bytes of user_data, over "
-                    f"DigitalOcean's {USER_DATA_MAX}; send smaller inputs")
+            body["user_data"] = run_user_data(self.cfg, args)
         return body, lambda: str(digitalocean("POST", "/droplets", body, retry=False)["droplet"]["id"])
 
     def hf_home(self):
@@ -660,15 +723,28 @@ class DigitalOcean(Provider):
 
     def instances(self):
         # GPU droplets are listed only with type=gpus.
-        return [Instance(str(d["id"]), d.get("name"), d.get("status"),
-                         datetime.datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")).timestamp())
+        return [Instance(str(d["id"]), d.get("name"), d.get("status"), iso_epoch(d.get("created_at")))
                 for d in digitalocean_list("/droplets", "droplets", {"type": "gpus"}) if d.get("status") != "archive"]
 
     def release(self, iid, e):
         digitalocean("DELETE", f"/droplets/{iid}")
 
 
-USER_DATA_MAX = 64 * 1024  # what DigitalOcean takes in a droplet's user_data
+USER_DATA_MAX = 64 * 1024  # the most user_data a launch sends (DigitalOcean's limit; Lambda's is far above)
+
+
+def run_secret(cfg: dict, dry_run: bool) -> str | None:
+    """The secret `launch --run` puts at /run/live-pr-key/value: the value of the environment variable that the
+    top-level `run_secret_env` names, or None when it names none. A dry run gets a stand-in. Raises SystemExit
+    when the variable is named but not set: the box would have no key."""
+    name = cfg.get("run_secret_env")
+    if not name:
+        return None
+    if dry_run:
+        return f"<the value of ${name}>"
+    if not os.environ.get(name):
+        die(f"run_secret_env names {name}, which is not set; the box would have no key")
+    return os.environ[name]
 
 
 def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
@@ -683,6 +759,15 @@ def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
         files.append(entry("/run/live-pr-key/value", secret.encode()))
     return "#cloud-config\n" + json.dumps({"write_files": files, "runcmd": [
         ["systemd-run", "--unit", "live-pr", "bash", f"/run/live-pr/{Path(run).name}"]]})
+
+
+def run_user_data(cfg: dict, args) -> str:
+    """cloud_config for `args.run`, its inputs and the run secret, checked against USER_DATA_MAX."""
+    data = cloud_config(args.run, args.input, run_secret(cfg, args.dry_run))
+    if len(data.encode()) > USER_DATA_MAX:
+        die(f"the --run script and inputs take {len(data.encode())} bytes of user_data, over the {USER_DATA_MAX} "
+            "a launch sends; send smaller inputs")
+    return data
 
 
 def digitalocean_ssh_key(pubkey: str, name: str) -> str:
@@ -710,6 +795,10 @@ def has_provider(e: dict) -> bool:
     """Whether a ledger entry's provider is one gpu.py has. One it no longer has (a removed provider's
     entry) is out of gpu.py's reach: it counts toward no cap, and `terminate` drops it without releasing anything."""
     return e["provider"] in PROVIDERS
+
+
+# Statuses (lower case) of an instance that is gone or going: waiting on it is over.
+TERMINAL = ("exited", "error", "terminated", "terminating", "unhealthy", "preempted", "ended", "releasing")
 
 
 def job_name(pr: int, tag: str) -> str:
@@ -827,6 +916,7 @@ def cmd_launch(args, cfg):
     if args.boxes < 1:  # fewer would let budget.max_running pass a launch past it
         die(f"--boxes is {args.boxes}; it counts this launch, so it is at least 1")
     o = find_offer(cfg, args.offer)
+    p = provider_of(cfg, o)
     if not o["storage"]:
         die(f"{o['region']} has no team storage; the HF cache would be cold. Pick a region with storage.")
     cap, hours = cfg["budget"]["max_usd_per_hour"], args.hours or cfg["budget"]["max_hours"]
@@ -834,9 +924,6 @@ def cmd_launch(args, cfg):
         die(f"${o['usd_per_hour']}/hr is over the ${cap}/hr cap; ask before passing --allow-over-budget")
     check_hours(cfg, hours, args.allow_over_budget)
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    p = provider_of(cfg, o)
-    if args.run and not p.takes_run:
-        die(f"{p.name} can't take --run; launch without it and start the work over ssh")
     # unique per launch, so a create whose answer was lost is found again by this name. A --tag is the
     # caller's own unique name: what it looks the instance up by, and what makes an Eras launch idempotent.
     name = job_name(args.pr, args.tag or f"{time.strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}")
@@ -908,9 +995,45 @@ def cmd_launch(args, cfg):
             # the entry as it is now (an extend meanwhile), or as it was if it was terminated meanwhile
             d[key] = {**(d.pop(pending, None) or fields), "instance_id": iid}  # pending's watchdog then exits
         arm_watchdog(key)
+    if args.run and p.run_by_ssh:
+        start_run_over_ssh(key, cfg, args)
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
     print(key)
+
+
+RUN_SSH_WAIT = 600  # seconds a box gets to answer ssh before its --run can be copied to it
+
+
+def start_run_over_ssh(key: str, cfg: dict, args) -> None:
+    """`launch --run` for a provider that can't carry the files in its create request (run_by_ssh): once the box
+    answers ssh, copy the script and its inputs to /run/live-pr and the run secret to /run/live-pr-key/value, and
+    start the script detached. The secret goes over scp from a file, never in a command line or the provider's
+    API. A box that can't be reached or written to is terminated, so no GPU idles on a run that never started."""
+    try:
+        cmd_wait(argparse.Namespace(instance=key, timeout=RUN_SSH_WAIT), cfg)
+        e = reachable(key)
+        secret = run_secret(cfg, False)
+        with tempfile.TemporaryDirectory() as tmp:
+            value = Path(tmp, "value")
+            value.touch(mode=0o600)
+            value.write_text(secret or "")  # not copied without one
+            steps = [
+                (remote(e, cfg, "install -d -m 0700 /run/live-pr /run/live-pr-key"), "make the directories"),
+                (ssh_base(e, cfg, scp=True) + [args.run, *args.input, f"{e['user']}@{e['host']}:/run/live-pr/"],
+                 "copy the script and inputs"),
+                *([(ssh_base(e, cfg, scp=True) + [str(value), f"{e['user']}@{e['host']}:/run/live-pr-key/value"],
+                    "copy the run secret")] if secret else []),
+                (remote(e, cfg, f"setsid nohup bash /run/live-pr/{Path(args.run).name} >/dev/null 2>&1 </dev/null &"),
+                 "start the script"),
+            ]
+            for command, what in steps:
+                r = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+                if r.returncode:
+                    die(f"couldn't {what} on {key}: {tail_lines(r.stderr or r.stdout, 300)}")
+    except SystemExit:
+        terminate(key, entry(key))
+        raise
 
 
 def arm_watchdog(key: str) -> None:
@@ -1079,8 +1202,7 @@ def cmd_wait(args, cfg):
     t0 = time.time()
     while True:
         st, host, port = status(e, cfg)
-        if st.lower() in ("exited", "error", "terminated", "terminating", "unhealthy", "preempted",
-                          "ended", "releasing"):
+        if st.lower() in TERMINAL:
             die(f"{args.instance} is {st}")
         if host:
             e["host"], e["port"] = host, port
@@ -1306,11 +1428,10 @@ def main():
     p.add_argument("--hours", type=float)
     p.add_argument("--tag", help="names the instance live-pr-<pr>-<tag> (and makes an Eras launch idempotent); "
                                 "by default the time and 4 hex digits")
-    p.add_argument("--run", help="Eras, DigitalOcean: a script that is the work itself (on Eras the GPUs go when it "
-                                "ends)")
+    p.add_argument("--run", help="a script that is the work itself (on Eras the GPUs go when it ends)")
     p.add_argument("--input", action="append", default=[],
                    help="a file for the --run script, in /run/live-pr. No secrets here: the files stay in the "
-                        "run's record; use eras.run_secret_id or digitalocean.run_secret_env")
+                        "run's record; use eras.run_secret_id or run_secret_env")
     cache = p.add_mutually_exclusive_group()
     cache.add_argument("--cache", choices=("ro", "none"), default="ro",
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
