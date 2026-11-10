@@ -237,7 +237,8 @@ class DSAManager(Resource):
             host_page_start=None if graph else indptr[:-1].tolist(),
             max_pools=max(max_pools, 1), page_size=self.page_size, topk=topk, kpool=kpool,
             needs_selection=needs_selection, decode_rows=graph or walk == "decode",
-            sparse_plan=sparse_plan, eager=self._eager, captured=graph)
+            sparse_plan=sparse_plan, eager=self._eager, captured=graph,
+            stager=self._int_stager)
 
     def _graph_plan(self, walk: str, slot: int, rows: int,
                     lens: list[int]) -> sparse_mla.SparseGraphPlan:

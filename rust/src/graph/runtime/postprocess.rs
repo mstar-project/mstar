@@ -154,6 +154,7 @@ impl Postprocess {
             || !route.register_uuids.is_empty()
             || !route.new_token_output_idxs.is_empty()
             || !route.local_streaming_signals.is_empty()
+            || !route.local_stream_value_signals.is_empty()
             || !route.rids_needing_request_info.is_empty()
             || !route.freed_input_uuids.is_empty()
     }
