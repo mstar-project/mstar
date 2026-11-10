@@ -853,9 +853,9 @@ on one GPU in every shipped config.
 
 Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
 (``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
-Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
-reads the served adapters once at launch and has neither route, so ``mstar serve``
-refuses ``--rust-frontend`` with ``runtime_updates: true``.
+Both serve runtime updates (below) too: ``mstar-server`` selects the adapter itself,
+and the API server pushes it the served set after every change, so a request pays no
+extra round trip for it.
 
 Adapters can also be loaded and unloaded while the server runs, with vLLM's
 endpoints and bodies. They make the server read paths a client names, so they are off
