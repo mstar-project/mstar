@@ -37,7 +37,6 @@ from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep, ker
 from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC
 from mstar.model.omnilingual_asr.config import (
     ENCODER_ATTN,
-    ENCODER_NODE,
     ENCODER_TOKENS,
     SAMPLE_RATE,
     TOKEN_IDS,
@@ -80,8 +79,6 @@ class OmniASRCTCSubmodule(NodeSubmodule):
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.tokens = handles[ENCODER_TOKENS]
-        if self.tokens.runs_sdpa:
-            raise ValueError(f"Node {ENCODER_NODE!r}: attention_backend sdpa, and packed reads have no SDPA layout")
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         """Eager, each conv layer's channel LayerNorm (in fp32, over a transposed

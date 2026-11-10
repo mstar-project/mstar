@@ -17,8 +17,7 @@ import torch.nn.functional as F
 
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
-from mstar.engine.state.adapters import node_handles
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.adapters import StateSetup, node_handles
 from mstar.model.voxcpm2.config import BASE_ATTN, BASE_KV, RES_ATTN, RES_KV
 from mstar.model.voxcpm2.voxcpm2_model import VoxCPM2Model
 
@@ -111,7 +110,7 @@ def bind_dense_resources(root):
     resources = {BASE_KV: base, BASE_ATTN: base, "base_pos": pos, RES_KV: res, RES_ATTN: res}
     declarations = VoxCPM2Model.declare_state(SimpleNamespace(config=root.config))
     handles = node_handles(
-        SimpleNamespace(declare_state=lambda: declarations), "Talker", resources, host_fields=HostFields(),
+        SimpleNamespace(declare_state=lambda: declarations), "Talker", resources, setup=StateSetup(),
     )
     root.state_handles = handles
     for module in root.modules():

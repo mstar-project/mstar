@@ -48,10 +48,20 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import ArrayStep, Layout, Span
-from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources, sampling_configs
+from mstar.engine.state import Array, ArrayStep, Layout, Span
+from mstar.engine.state.adapters import (
+    PAGED,
+    VALUE,
+    WITHIN_STEP,
+    build_handle,
+    kv_layouts,
+    node_handles,
+    node_resources,
+    sampling_configs,
+    storage_of,
+)
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.calls import ArrayHandle, causal_conv
+from mstar.engine.state.calls import causal_conv
 from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
@@ -70,6 +80,7 @@ from mstar.model.qwen3_5.config import (
     LINEAR_ATTN,
     SAMPLER,
     VISION_ATTN,
+    VISION_TOKENS,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -634,8 +645,8 @@ def _qwen3_5_stack(blocks: int = 2):
     stack.config, stack.vision_config = config, None
     declared = {d.name: d for d in stack.declare_state()}
     kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
-    kv = ArrayHandle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, ROPE)
-    gdn = ArrayHandle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()}, None)
+    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None})
+    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()})
     for module in model.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})
@@ -866,6 +877,17 @@ def test_command_a_plus_passes_a_shorter_max_seq_len_to_the_array(tmp_path):
 @pytest.mark.parametrize("text", [None, _COMMAND_A_PLUS], ids=["tiny", "published"])
 def test_command_a_plus_declarations_have_no_problems(tmp_path, text):
     assert state_declaration_problems(_command_a_plus(tmp_path, text)) == []
+
+
+def test_each_ported_array_goes_to_the_storage_that_holds_its_kind(tmp_path, monkeypatch):
+    def storages(model) -> dict:
+        arrays = [declared for declared in model.declare_state() if isinstance(declared, Array)]
+        return {array.name: storage_of(array) for array in arrays}
+
+    assert storages(_qwen3_5_vision(monkeypatch)) == {KV_CACHE: PAGED, GDN_STATE: VALUE, VISION_TOKENS: WITHIN_STEP}, (
+        "the array's shape decides its storage"
+    )
+    assert storages(_command_a_plus(tmp_path)) == {KV_CACHE: PAGED}, "the array's shape decides its storage"
 
 
 def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:

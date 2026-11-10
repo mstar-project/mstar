@@ -30,7 +30,7 @@ from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig, Piecew
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state import host
-from mstar.engine.state.adapters import kv_layouts, node_resources
+from mstar.engine.state.adapters import StateSetup, kv_layouts, node_resources
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import ARNodeInputs, InputMetadata, engine_step
 from mstar.model.voxcpm2.components.audio_vae import AudioVAE, CausalResidualUnit, decoder_receptive_field_frames
@@ -1060,7 +1060,7 @@ def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
     engine._loopback_steps, engine._resources, engine._submodules = {}, {}, {}
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._chunking = SimpleNamespace(forget_request=lambda rid: None)
-    engine._host_fields = talker.progress.host_fields
+    engine._state_setup = StateSetup(host_fields=talker.progress.host_fields)
     engine.remove_request("r")
     assert talker.progress.host_fields._fields == {}, "a recycled handle would read this request's progress"
     with pytest.raises(ValueError, match="no host fields"):

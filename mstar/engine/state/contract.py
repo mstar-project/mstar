@@ -161,6 +161,7 @@ class Read:
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
+    packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
 
     def __post_init__(self):
         if not isinstance(self.mask, Mask):

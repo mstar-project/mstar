@@ -45,10 +45,15 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Array, Span
-from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources, sampling_configs
-from mstar.engine.state.analysis import position_key, state_declaration_problems
-from mstar.engine.state.calls import ArrayHandle
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.adapters import (
+    StateSetup,
+    build_handle,
+    kv_layouts,
+    node_handles,
+    node_resources,
+    sampling_configs,
+)
+from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, keyed_labels, serving_resources
 from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
 from mstar.model.higgs_audio.config import HiggsAudioModelConfig
@@ -416,7 +421,7 @@ def _talker() -> TalkerSubmodule:
     model = _voxcpm2()
     node = TalkerSubmodule(_OneParameter(torch.bfloat16), model.config, 4)
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
-    node.bind_node_state(node_handles(model, "Talker", resources, host_fields=HostFields()))
+    node.bind_node_state(node_handles(model, "Talker", resources, setup=StateSetup()))
     return node
 
 
@@ -564,8 +569,7 @@ def _bound(stack: nn.Module, declared: list, resources: dict):
     handles = {}
     for array in declared:
         if isinstance(array, Array) and array.max_len:
-            key = None if array.positions is None else position_key(array)
-            handles[array.name] = ArrayHandle(array, resources, key)
+            handles[array.name] = build_handle(array, resources)
     for module in stack.modules():
         if hasattr(module, "bind_state"):
             module.bind_state(handles)

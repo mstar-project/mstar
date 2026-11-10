@@ -66,8 +66,9 @@ def test_a_raising_submodule_leaves_the_request_nowhere():
 
 def test_a_request_opens_its_host_fields_and_a_removal_closes_them():
     engine, _ = _engine(("dit", False))
-    engine._host_fields.declare(Value("flags", nodes={"dit"}, layers={0}, entry=Entry({}, host={"sent": bool})))
+    flags = Value("flags", nodes={"dit"}, layers={0}, entry=Entry({}, host={"sent": bool}))
+    engine._state_setup.host_fields.declare(flags)
     engine.add_request(3)
-    assert engine._host_fields.is_open(3), "with no request info too: the resources take it either way"
+    assert engine._state_setup.host_fields.is_open(3), "with no request info too: the resources take it either way"
     engine.remove_request(3)
-    assert not engine._host_fields.is_open(3), "a handle is recycled once the request is removed"
+    assert not engine._state_setup.host_fields.is_open(3), "a handle is recycled once the request is removed"

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.engine.state import ArrayStep
-from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.engine.state.adapters import node_resources
 from mstar.model.omnivoice.submodules import (
     BACKBONE_ATTN,
     BACKBONE_TOKENS,
@@ -53,18 +53,6 @@ def test_node_resources_do_not_follow_backbone_graphs():
     for model in (on, off):
         (spec,) = node_resources(model)
         assert spec.resource_key == BACKBONE_ATTN and spec.config.max_segments_per_request == 2
-
-
-@pytest.mark.parametrize("backbone_graphs", [True, False])
-def test_the_backbone_refuses_sdpa_at_bind(backbone_graphs):
-    """SDPA can't tell one document's packed tokens from the next. With graphs off, the server would report healthy and
-    fail each request, so startup fails on every graph setting."""
-    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
-
-    model = OmniVoiceModel("k2-fsa/OmniVoice", skip_weight_loading=True, backbone_graphs=backbone_graphs)
-    sub = OmniVoiceBackboneSubmodule(backbone=None, config=model.config)
-    with pytest.raises(ValueError, match="Node 'backbone': attention_backend sdpa, and packed reads"):
-        sub.bind_state(node_handles(model, "backbone", {}, sdpa=True))
 
 
 def test_forward_batched_keys_rows_by_the_engine_ids():

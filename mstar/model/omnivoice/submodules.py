@@ -194,8 +194,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.tokens = handles[BACKBONE_TOKENS]
-        if self.tokens.runs_sdpa:
-            raise ValueError("Node 'backbone': attention_backend sdpa, and packed reads have no SDPA layout")
 
     # -- inputs -----------------------------------------------------------
 
