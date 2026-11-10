@@ -60,6 +60,8 @@ class Mamba2Plan:
 
 class Mamba2Manager(LinearAttnManager):
     supports_split_steps = True
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
 
     def __init__(
         self,

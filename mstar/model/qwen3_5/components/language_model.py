@@ -32,6 +32,7 @@ from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
     compute_inv_freq,
+    compute_text_cos_sin,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -39,6 +40,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTENTION,
     LINEAR_ATTN,
+    LLM_SHARD,
     ROPE,
     Qwen3_5Config,
 )
@@ -256,6 +258,12 @@ class Qwen3_5LanguageModel(nn.Module):
             target_dtype=dtype,
         )
 
+    def build_text_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin for text rows' ``[tokens]`` 1D positions (`compute_text_cos_sin`)."""
+        return compute_text_cos_sin(positions, self.inv_freq, target_dtype=dtype)
+
     def forward(
         self, query_sequence: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -290,13 +298,46 @@ class Qwen3_5ForCausalLM(nn.Module):
             gather_output=True,
         )
         if config.tie_word_embeddings:
+            # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
+        # the node's sequence shard, which brackets the layer stack (`bind_resources`)
+        self.shard = None
+
+    def bind_resources(self, resources: dict) -> None:
+        """The node's sequence shard, if it declares one. See ``NodeSubmodule.bind_node_resources``."""
+        self.shard = resources.get(LLM_SHARD)
+
+    def checkpoint_rules(self):
+        """How the checkpoint's text tower lands here (the MTP head and the vision tower
+        dropped), for its weight loader and for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper)
+
+    # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
+
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.model.embed_tokens.weight.dtype
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
 
     def forward(
-        self, input_ids: torch.Tensor, *, label: str,
-        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        self, input_embeds: torch.Tensor, *, label: str,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None, walk: str | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(
-            self.model.embed_tokens(input_ids), label=label, cos_sin=cos_sin,
-        )
+        """``(tokens, hidden)`` in, the stack's normed output out. A step split over the SP ranks
+        runs the stack on this rank's range of its tokens, and the attention and recurrent
+        resources exchange what they need; identity on a copied step. ``walk`` is the step's, so a
+        compiled frame of a walk the shard never splits traces the bracket straight through."""
+        if self.shard is None:
+            return self.model(input_embeds, label=label, cos_sin=cos_sin)
+        cos, sin = (None, None) if cos_sin is None else cos_sin
+        input_embeds, cos, sin = self.shard.scatter(label, input_embeds, cos, sin, walk=walk)
+        hidden = self.model(input_embeds, label=label, cos_sin=None if cos_sin is None else (cos, sin))
+        return self.shard.gather(label, hidden, walk=walk)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

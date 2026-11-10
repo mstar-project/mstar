@@ -127,6 +127,35 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
         assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
 
 
+@pytest.mark.parametrize(("tp", "sp", "ulysses", "heads"), [
+    (1, 1, True, 8), (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
+])
+def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
+    """On a lockstep instance with a two-rank CFG axis, a Ulysses ragged attention's
+    heads split over the TP x SP ranks only (any other over TP only): each CFG rank
+    runs whole guidance branches, so the instance's world size over-counts the head
+    shards."""
+    from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    def group(size):
+        return CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+
+    joint = JointGroups(tp_group=group(tp), sp_group=group(sp), cfg_group=group(2), instance=group(tp * sp * 2))
+    spec = RaggedAttentionSpec(
+        resource_key="by_hand", nodes={"dit"},
+        config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64),
+        **({"sp_exchange": "ulysses"} if ulysses else {}),
+    )
+    # the node's sequence shard, which `RaggedAttentionSpec.derive` would find
+    spec.shard_key = "shard" if ulysses else None
+    mgr = build_resource(spec, EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
+    ))
+    assert mgr._kwargs["num_qo_heads"] == heads
+
+
 def test_a_dropped_manager_leaves_the_op_registry():
     """The custom op finds a manager by key; the registry must not keep one
     alive past the engine that built it, nor hand one engine's key to

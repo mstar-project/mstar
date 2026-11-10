@@ -28,6 +28,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper, SPPlacement
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 class FlashInferManager(PlacedAttention):
     supports_split_steps = True
+    supports_drop = True
 
     def __init__(
         self,
@@ -58,6 +60,7 @@ class FlashInferManager(PlacedAttention):
         sliding_window: int | None = None,
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
+        sm_scale: float | None = None,
     ):
         super().__init__(kv_cache, device, dtype, kv_config)
         self._splits = {split.combined_walk: split for split in splits}
@@ -88,13 +91,15 @@ class FlashInferManager(PlacedAttention):
             page_size=self._group.page_size,
             max_num_pages=kv_config.num_units,
             device=device,
-            backend=backend
+            backend=backend,
+            sm_scale=sm_scale,
         )
         self._decode_tensor_cores = decode_tensor_cores
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
         )
+        self._sm_scale = sm_scale
 
         # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
         # rank's queries alone)
@@ -112,21 +117,20 @@ class FlashInferManager(PlacedAttention):
 
     def _check_fa2_over_sp(self) -> None:
         """Over an SP-placed pool: one such server hung at its first 32k prefill on fa2 and the cause
-        isn't known, so fa2 is refused on SM90, where fa3 runs, and warned of where it is the only
-        kernel. Read from the config and the GPU, so every rank of the node decides alike."""
+        isn't known (#1363), so a prefill on fa2 is warned of. Read from the config and the GPU, so
+        every rank of the node decides alike."""
         capability = current_platform.cuda_capability(self._device)
         # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
         fa3 = capability is not None and capability[0] == 9
-        if self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
-            raise ValueError(
-                f"attention {self._resource_key!r} over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' "
-                "is refused over an SP-placed pool on SM90 after an unexplained one-off lockstep hang in its "
-                "prefill; use 'auto' or 'fa3'"
-            )
-        if capability is not None and not fa3 and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2"):
+        backend = self._wrapper_kv_kwargs["backend"]
+        # an explicit fa2 on any GPU; `auto` where the capability says FlashInfer has no fa3
+        on_fa2 = (backend == "fa2" and self._device.type == "cuda") or (
+            backend == "auto" and capability is not None and not fa3
+        )
+        if on_fa2:
             logger.warning(
-                "attention %r over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a "
-                "placed pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                "attention %r over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel; an unexplained "
+                "one-off lockstep hang in an fa2 prefill is still open (#1363)",
                 self._resource_key, self._kv_cache_name,
             )
 
@@ -159,6 +163,7 @@ class FlashInferManager(PlacedAttention):
         self._new_kwargs = dict(
             num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,
+            sm_scale=self._sm_scale,
         )
 
     def resident_refusal(self) -> str | None:
@@ -170,12 +175,17 @@ class FlashInferManager(PlacedAttention):
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
-        if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
+        if wrapper is not None and wrapper.plans_in_graph and not stream.reads:
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
             step.reads_tables = True
-        else:
-            step.host_planned = True
+            return
+        step.host_planned = True
+        if wrapper is not None and wrapper.supports_gather_resident and not stream.reads:
+            # the paged arrays come off the tables; the host plans the schedule alone
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.lengths_only.add(pool)
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -191,6 +201,12 @@ class FlashInferManager(PlacedAttention):
     def set_default_layer_idx(self, layer_idx: int) -> None:
         self._check_layer(layer_idx)
         self._default_layer_idx = layer_idx
+
+    def fingerprint(self) -> bytes:
+        if self._window_left == -1 and self._sm_scale is None:
+            return super().fingerprint()
+        # the window and scale shape every later layer's K/V
+        return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -278,6 +294,7 @@ class FlashInferManager(PlacedAttention):
             batch_size=num_rows,
             max_seq_len=config.max_seq_len,
             device=self._device,
+            sm_scale=self._sm_scale,
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
@@ -433,6 +450,12 @@ class FlashInferManager(PlacedAttention):
                 laps.lap("wrapper_plan")
                 plan_states[label] = wrapper
                 continue
+            # a placed pool never runs resident (`KVManager.resident_refusal`)
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
+                wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+                laps.lap("schedule")
+                plan_states[label] = wrapper
+                continue
             kwargs = indptrs.to_kwargs_dict()
             laps.lap("wrapper")
             # TODO: cache the latest plan state
@@ -469,7 +492,8 @@ class FlashInferManager(PlacedAttention):
             raise RuntimeError(f"FlashInfer: no plan for label {label!r} to select last tokens by")
         qo_indptr_buf = self.qo_indptr_buf(label)
         if qo_indptr_buf is None:
-            # planned as a decode: one token per row, so every token is a row's last
+            # an eager step of one-token rows plans the decode wrapper, which
+            # keeps no qo_indptr: each row is its own last token
             return hidden
         last_token_indices = (qo_indptr_buf[1:] - 1).long()
         return hidden.index_select(0, last_token_indices)

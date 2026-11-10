@@ -1,6 +1,9 @@
 model: "cosmos3_edge_droid"
 # Sequence-length hint for the scheduler (see cosmos3_edge.yaml).
 max_seq_len: 8192
+# A robot sends one request at a time, so there is nothing for the data
+# worker's prepare pool to overlap (Cosmos3 declares PREPROCESS_PARALLEL).
+preprocess_workers: 1
 # The policy checkpoint serves action requests (and the Edge video paths);
 # the pool matches cosmos3_edge.yaml.
 resources:

@@ -50,9 +50,8 @@ logger = logging.getLogger(__name__)
 
 
 # Run compiled: eager, the normalize is four full-size passes per tensor (fp32
-# copy, norm, divide, cast); compiled, one. Not dynamic=True: a symbolic head dim
-# made the reduction ~3x slower; the token count goes dynamic on its own at the
-# second size.
+# copy, norm, divide, cast); compiled, one. Only the token count is dynamic: a
+# symbolic head dim made the reduction ~3x slower.
 def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Both in one compiled call, so a layer pays one guard check, not two."""
     def norm(t):
@@ -75,6 +74,8 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 class GDNManager(LinearAttnManager):
     supports_split_steps = True
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
 
     def __init__(
         self,
@@ -166,8 +167,16 @@ class GDNManager(LinearAttnManager):
             )
 
     def resident_refusal(self) -> str | None:
-        # decode addresses the pool by slot alone, which the pool's table holds
-        return None
+        # decode addresses the pool by slot alone, which the pool's table holds. A replayed resident
+        # step reuses the last host plan (`plan`), whose split rows, on a node whose steps split, are
+        # the last split prefill's. From the shard's bind (the group's size and the spec), so every
+        # rank of the node decides alike
+        if self._shard is None:
+            return None
+        return (
+            f"its steps split over {self._shard.group.world_size} SP ranks, and a resident decode would "
+            "replay the last split prefill's rows"
+        )
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         super().bind_dependencies(resources)
@@ -391,7 +400,7 @@ class GDNManager(LinearAttnManager):
         # a split step's hand-off runs the chunked kernel itself, which normalizes nothing
         in_kernel = plan.qk_l2norm_in_kernel and (split is None or self._split_exchange == "ulysses")
         if self.config.qk_l2norm and not in_kernel:
-            q, k = compiled(_l2norm_qk)(q, k)
+            q, k = compiled(_l2norm_qk, dynamic_args=(0, 1))(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
         if not plan.takes_strided_inputs:

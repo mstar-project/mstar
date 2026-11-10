@@ -15,31 +15,26 @@ Graph walks (4):
     video_gen_i2v - I2V: same topology; dit additionally consumes the
                     persisted image_latent for first-frame injection
 
-The walk sequence is fixed up front from the input modalities and stepped through
-``metadata.kwargs["walk_step"]``:
+The walk plan (``walk_plan``) is fixed up front from the input modalities:
 
     T2V: encode_text -> video_gen
     I2V: encode_text -> encode_image -> video_gen_i2v
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling, and the
-request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
+request's ``num_inference_steps`` is the loop's cap (``get_loop_caps``).
 """
 
 import html
-import io
 import logging
+import math
 import os
 import re
-from fractions import Fraction
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
-from mstar.engine.resources import NodeResourceSpec
+from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -50,7 +45,8 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import Model, WalkStep
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -67,6 +63,16 @@ logger = logging.getLogger(__name__)
 # libx264, which postprocess encodes with, refuses a frame wider or taller than this
 _MP4_MAX_SIDE = 16384
 
+# Every model_kwargs key a request may carry; the video adapter maps ``size``
+# onto height/width and forwards num_frames and fps.
+REQUEST_KWARGS = frozenset({
+    "height", "width", "num_frames", "fps", "num_inference_steps", "guidance_scale", "negative_prompt",
+})
+
+
+def _is_number(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
 
 class Wan22Model(Model):
     """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
@@ -76,8 +82,6 @@ class Wan22Model(Model):
     VIDEO_GEN_WALK = "video_gen"
     VIDEO_GEN_I2V_WALK = "video_gen_i2v"
 
-    # Denoise loop name — referenced by ``Wan22DitSubmodule.check_stop`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
     DENOISE_LOOP_NAME = DENOISE_LOOP_NAME
 
     def __init__(
@@ -129,7 +133,11 @@ class Wan22Model(Model):
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The DiT's self-attention as a cacheless ragged resource (with
-        ``attention_backend: flashinfer``); nothing here keeps state.
+        ``attention_backend: flashinfer``), and its sequence shard, which on
+        SP ranks splits each row's tokens: the self-attention exchanges them
+        for heads (Ulysses), and the cross-attention over the text attends a
+        rank's share of them. Nothing here keeps state; ``"sdpa"`` declares
+        nothing, so it can't run on SP ranks.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
@@ -145,6 +153,11 @@ class Wan22Model(Model):
         # that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
         # FA3 beats it on the self-attention (12.4 vs 14.8 ms).
         return [
+            # every row of a step one length (a bucket's), so each row splits alike
+            SeqShardSpec(
+                resource_key=Wan22DitSubmodule.SEQ_SHARD, nodes={"dit"},
+                labels=(Wan22DitSubmodule.MAIN_SPAN,), axis=1,
+            ),
             RaggedAttentionSpec(
                 resource_key=Wan22DitSubmodule.SELF_ATTN, nodes={"dit"},
                 config=RaggedAttentionConfig(
@@ -152,13 +165,25 @@ class Wan22Model(Model):
                     num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
-                    max_segments_per_request=2,
+                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
                     # the DiT is compiled, not captured: keep attention in its graph
+                    # (under SP the op runs the exchange inside it)
                     compile_op=True,
                     dtype=torch.bfloat16,
                 ),
+                sp_exchange="ulysses",
             ),
         ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # The dit's two guidance branches split over cfg_size ranks, which
+        # all-gather the noise predictions (see Wan22DitSubmodule), and its
+        # tokens over sp_size (its sequence shard, see get_node_resources).
+        # Signals stay replicated: no shard_dim entries.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -220,12 +245,10 @@ class Wan22Model(Model):
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop
-                # check_stop registers; Wan22DitSubmodule.prepare_inputs vetoes
-                # the overshoot (None -> the engine skips that forward).
+                # the loop's cap keeps speculation off a request's last step
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's step count stops the loop early.
+            # Ceiling only; the request's step count is the loop's cap.
             max_iters=self.config.max_denoise_steps,
             outputs=[
                 # Matched by name against the section's loop-back edges: the final
@@ -290,11 +313,10 @@ class Wan22Model(Model):
 
     @staticmethod
     def _require_positive_int(name: str, raw) -> int:
-        """Coerce a request geometry knob, or raise ``ValueError``."""
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            raise ValueError(f"Wan2.2 {name} must be an integer; got {raw!r}.") from None
+        """A request geometry knob, which must be a positive JSON integer, or ``ValueError``."""
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"Wan2.2 {name} must be an integer; got {raw!r}.")
+        value = raw
         if value <= 0:
             raise ValueError(f"Wan2.2 {name} must be positive; got {value}.")
         return value
@@ -308,14 +330,13 @@ class Wan22Model(Model):
         axis must fit the DiT's rotary table and each side the mp4 encoder, and fps
         must be positive.
 
-        This runs on the data worker because that is where a ValueError becomes a
-        400 for the one bad request. Left to fail later, none of these fail well:
+        This runs in process_prompt, so a bad request is a 400 before any work.
+        Left to fail later, none of these fail well:
         an unaligned size hits the DiT as a mid-forward shape mismatch and faults
         the WORKER; a non-positive num_frames makes the latent time extent <= 0 and
         crashes on a negative tensor dim; an unaligned num_frames does not fail at
         all but is silently floored (ask for 32 frames, get 29); and a bad fps is
-        only caught after the whole video is generated, on the result path, where
-        the raise is swallowed and the client hangs.
+        only caught after the whole video is generated, on the result path.
         """
         cfg = self.config
         size = {}
@@ -323,7 +344,7 @@ class Wan22Model(Model):
             ("height", cfg.patch_size[1], cfg.spatial_alignment[0], cfg.default_height),
             ("width", cfg.patch_size[2], cfg.spatial_alignment[1], cfg.default_width),
         ):
-            value = size[name] = self._require_positive_int(name, model_kwargs.get(name, default))
+            value = size[name] = self._require_positive_int(name, self._get(model_kwargs, name, default))
             if value % align:
                 lower = value // align * align
                 upper = lower + align
@@ -337,7 +358,7 @@ class Wan22Model(Model):
 
         temporal = cfg.vae_scale_factor_temporal
         frames = self._require_positive_int(
-            "num_frames", model_kwargs.get("num_frames", cfg.default_num_frames)
+            "num_frames", self._get(model_kwargs, "num_frames", cfg.default_num_frames)
         )
         if (frames - 1) % temporal:
             lower = (frames - 1) // temporal * temporal + 1
@@ -376,12 +397,31 @@ class Wan22Model(Model):
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = model_kwargs.get("fps")
         if raw_fps is not None:
-            try:
-                fps = float(raw_fps)
-            except (TypeError, ValueError):
-                raise ValueError(f"Wan2.2 fps must be a number; got {raw_fps!r}.") from None
-            if fps <= 0:
-                raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}.")
+            if isinstance(raw_fps, bool) or not isinstance(raw_fps, (int, float)):
+                raise ValueError(f"Wan2.2 fps must be a number; got {raw_fps!r}.")
+            if not math.isfinite(raw_fps) or raw_fps <= 0:
+                raise ValueError(f"Wan2.2 fps must be positive and finite; got {raw_fps!r}.")
+
+    @staticmethod
+    def _get(model_kwargs: dict, name: str, default):
+        """``model_kwargs[name]``, with null the same as absent."""
+        value = model_kwargs.get(name)
+        return default if value is None else value
+
+    def _resolve_denoise_knobs(self, model_kwargs: dict) -> dict:
+        """num_inference_steps, guidance_scale and negative_prompt, validated; ``ValueError`` names the bad one."""
+        cfg = self.config
+        steps = self._get(model_kwargs, "num_inference_steps", cfg.default_num_inference_steps)
+        # past the denoise loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"Wan2.2 num_inference_steps must be an integer >= 1; got {steps!r}.")
+        guidance = self._get(model_kwargs, "guidance_scale", cfg.guidance_scale)
+        if not _is_number(guidance):
+            raise ValueError(f"Wan2.2 guidance_scale must be a finite number; got {guidance!r}.")
+        negative = self._get(model_kwargs, "negative_prompt", cfg.default_negative_prompt)
+        if not isinstance(negative, str):
+            raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
+        return {"num_inference_steps": steps, "guidance_scale": float(guidance), "negative_prompt": negative}
 
     def process_prompt(
         self,
@@ -398,15 +438,14 @@ class Wan22Model(Model):
         I2V image rides through as ``image_inputs`` for the vae_encoder to
         preprocess, but its size is checked here.
 
-        Every malformed-request check lives here rather than in
-        ``get_initial_forward_pass_args``, even where that also guards: a
-        ValueError here becomes a 400, while the same raise at the conductor is
-        swallowed and the client hangs.
+        Every malformed-request check runs here, before tokenizing, so a bad
+        request is a 400 without any work; ``walk_plan`` repeats the cheap ones
+        as backstops.
         """
         self._validate_request(prompt, input_modalities, output_modalities, tensors)
         self._validate_generation_size(kwargs)
         self._validate_conditioning_image(input_modalities, tensors, kwargs)
-        negative_prompt = kwargs.get("negative_prompt", self.config.default_negative_prompt)
+        negative_prompt = self._resolve_denoise_knobs(kwargs)["negative_prompt"]
         self._ensure_tokenizer()
         return {
             "text_inputs": [
@@ -459,8 +498,8 @@ class Wan22Model(Model):
         if not images:
             return  # presence is _validate_request's job
         expected = (
-            int(model_kwargs.get("height", self.config.default_height)),
-            int(model_kwargs.get("width", self.config.default_width)),
+            self._get(model_kwargs, "height", self.config.default_height),
+            self._get(model_kwargs, "width", self.config.default_width),
         )
         got = tuple(images[0].shape[-2:])
         if got != expected:
@@ -468,6 +507,17 @@ class Wan22Model(Model):
                 f"Wan2.2 conditioning image is {got[0]}x{got[1]} (HxW) but the request is "
                 f"{expected[0]}x{expected[1]}; resize it client-side (the server does not resize)."
             )
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
+        steps = self._get(model_kwargs, "num_inference_steps", self.config.default_num_inference_steps)
+        if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+            return {DENOISE_LOOP_NAME: steps}
+        return {}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
@@ -479,7 +529,6 @@ class Wan22Model(Model):
         """
         if modality != "video":
             raise ValueError(f"Unsupported modality for Wan2.2: {modality!r}")
-        import av
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = (request_kwargs or {}).get("fps")
@@ -492,38 +541,11 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output.cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        # PyAV rejects float rates, so the rate is handed over as an exact
-        # Fraction: integer rates stay integral (24 -> 24) and fractional ones
-        # become a rational the container can carry (23.976 -> 2997/125).
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():  # flush encoder delay
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        return encode_mp4(output.cpu().numpy(), fps)
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
-
-    def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            "num_inference_steps": kw["num_inference_steps"],
-            "guidance_scale": kw["guidance_scale"],
-            "height": kw["height"],
-            "width": kw["width"],
-            "num_frames": kw["num_frames"],
-        }
 
     def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
         """Emit one ``key=value`` log line per request at generation start, echoing every
@@ -552,21 +574,16 @@ class Wan22Model(Model):
             "on" if self.config.compile_dit else "off",
         )
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
-        # These are backstops, not the primary guard. ``process_prompt`` already
-        # rejected every one of these on the data worker, where a ValueError
-        # becomes a 400; a raise HERE runs at the conductor, whose main loop
-        # swallows it, so the client would hang instead. They remain because a
-        # malformed request must never reach the graph, but they should be
-        # unreachable in practice.
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # Backstops; process_prompt already rejected each of these. A
+        # ValueError here is a 400 too.
         target_output = output_modalities[0] if output_modalities else "video"
         if target_output != "video":
             raise ValueError(
@@ -583,115 +600,23 @@ class Wan22Model(Model):
                 "Request declared an image input but no image_inputs tensor "
                 "arrived; image-to-video requires the conditioning image."
             )
-        schedule = [self.ENCODE_TEXT_WALK]
+        walks = [self.ENCODE_TEXT_WALK]
         if is_i2v:
-            schedule.append(self.ENCODE_IMAGE_WALK)
-        schedule.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
+            walks.append(self.ENCODE_IMAGE_WALK)
+        walks.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
 
-        requested_steps = int(
-            model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
-        )
-        num_inference_steps = max(1, min(requested_steps, self.config.max_denoise_steps))
-        if num_inference_steps != requested_steps:
-            logger.info(
-                "Clamped num_inference_steps from %d to %d (max_denoise_steps=%d)",
-                requested_steps, num_inference_steps, self.config.max_denoise_steps,
-            )
-
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": float(model_kwargs.get("guidance_scale", self.config.guidance_scale)),
-            "height": int(model_kwargs.get("height", self.config.default_height)),
-            "width": int(model_kwargs.get("width", self.config.default_width)),
-            "num_frames": int(model_kwargs.get("num_frames", self.config.default_num_frames)),
+        self._validate_generation_size(model_kwargs)
+        knobs = self._resolve_denoise_knobs(model_kwargs)
+        # what the submodules read from ``request_info.step_metadata``
+        request = {
+            "num_inference_steps": knobs["num_inference_steps"],
+            "guidance_scale": knobs["guidance_scale"],
+            "height": self._get(model_kwargs, "height", self.config.default_height),
+            "width": self._get(model_kwargs, "width", self.config.default_width),
+            "num_frames": self._get(model_kwargs, "num_frames", self.config.default_num_frames),
         }
-        self._log_config_echo(model_kwargs, kwargs)
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=schedule[0],
-            is_prefill=True,
-            kwargs=kwargs,
-        )
-
-        text_edge = GraphEdge(next_node="text_encoder", name="text_inputs")
-        text_edge.tensor_info = input_signals["text_inputs"]
-        inputs = [text_edge]
-
-        # text_inputs is consumed only by encode_text; image_inputs stays
-        # persisted for the encode_image pass (I2V).
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(full_metadata),
-        )
-
-    def _video_gen_inputs(
-        self, walk: str, persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """External inputs seeding the denoise walk.
-
-        The loop-back edges are sent empty; the dit submodule seeds them at
-        iteration 0.
-        """
-        inputs: list[GraphEdge] = []
-        persisted = ["text_embeds_pos", "text_embeds_neg"]
-        if walk == self.VIDEO_GEN_I2V_WALK:
-            persisted.append("image_latent")
-        for name in persisted:
-            edge = GraphEdge(next_node="dit", name=name)
-            edge.tensor_info = persist_signals.get(name, [])
-            inputs.append(edge)
-        inputs += [
-            GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="unipc_model_outputs"),
-            GraphEdge(next_node="dit", name="unipc_last_sample"),
-        ]
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Step through the request's fixed walk schedule; done after video_gen."""
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        if step < len(schedule):
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk in (self.ENCODE_TEXT_WALK, self.ENCODE_IMAGE_WALK)
-            if walk == self.ENCODE_IMAGE_WALK:
-                edge = GraphEdge(next_node="vae_encoder", name="image_inputs")
-                edge.tensor_info = persist_signals.get("image_inputs", [])
-                inputs.append(edge)
-            else:
-                inputs = self._video_gen_inputs(walk, persist_signals)
-        else:
-            # video_gen(_i2v) completed — one video per request.
-            request_done = True
-
-        # Each input is consumed for the last time in its pass; the denoise loop
-        # re-injects its own worker-side.
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(metadata),
-            request_done=request_done,
-        )
+        self._log_config_echo(model_kwargs, request)
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -705,19 +630,21 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None, cfg_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` exists for interface parity only: weights load in
-        # the checkpoint's own dtypes.
+        # ``autocast_dtype`` exists for interface parity only: weights load in the
+        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str = "cpu", cfg_group=None,
+    ) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -754,7 +681,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config)
+            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

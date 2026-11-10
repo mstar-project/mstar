@@ -190,6 +190,10 @@ FROZEN_CPU_CORE = (
 )
 RETIRED = {
     "test/modular/test_cpu_core_list.py": "checked test/cpu-core.txt and was deleted with it",
+    "test/modular/test_send_prep_entries.py": (
+        "tested the send stage's stream-consumption report, dropped with stream_tokens_consumed"
+    ),
+    "test/modular/test_kv_decode_plan_cache.py": "tested the KV decode-plan cache, deleted with it",
 }
 
 

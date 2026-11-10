@@ -3,20 +3,22 @@ max_seq_len: 32768
 # The Thinker on 8 GPUs, 4 TP ranks x 2 SP ranks, for long prompts. Its KV pool is
 # stored by position over each SP pair (context_parallel), and a prefill of at least
 # min_tokens tokens splits over the pair: each rank runs the layers on its half of the
-# tokens and attention gathers q, k and v (the shard's exchange all_gather; with its
-# default, auto, a pool stored by position runs every step copied). Estimated from the Thinker's geometry,
-# unmeasured: at 2 SP ranks the MoE sets the step's peak memory, so ring would save
-# nothing. Shorter prefills and decode run copied on both ranks, each attending its
-# half of the stored context, merged. Chunked prefill is off on SP nodes, so a prompt
-# prefills in one step. Pending GPU validation.
+# tokens and attention gathers q, k and v (the shard's exchange all_gather; with the
+# Thinker's default, none, every step runs copied). At 2 SP ranks the MoE
+# sets the step's peak memory, so ring saves none: at 128K tokens on 8 H100s ring peaked at
+# 58.8 GB per GPU and all-gather at 57.9 GB (measured before this config's last merge of
+# main; a rerun is pending, see docs/adding_models.rst). Shorter prefills and decode run
+# copied on both ranks, each attending its half of the stored context, merged. Chunked
+# prefill is off on SP nodes, so a prompt prefills in one step.
 resources:
   thinker_kv:
     context_parallel: true
     # rank 0 decides each prefix hit for the 8 ranks; without it the cache is off
     prefix_cache_tp: true
   thinker_shard:
-    # placeholder, unmeasured. A captured prefill splits on its bucket's size, not its
-    # prompt's.
+    # placeholder: on 8 H100s all-gather prefilled faster than the copied path from 16K
+    # tokens and slower at 4K to 8K, not yet tuned to. A captured prefill splits on its
+    # bucket's size, not its prompt's.
     min_tokens: 8192
     exchange: all_gather
 node_groups:

@@ -34,7 +34,14 @@ from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
+from mstar.engine.resources.attn.config import (
+    AttentionConfig,
+    AttentionSpec,
+    AttentionStep,
+    AttnBackend,
+    BlockCausalAttentionSpec,
+)
+from mstar.engine.resources.attn.ragged import wrappers as ragged_mod
 from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.context_parallel import (
@@ -61,6 +68,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SeqShardStep, SequenceShard
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.model.base import declared_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
 from mstar.model.submodule_base import NodeInputs
 
@@ -77,12 +85,28 @@ def _group(rank: int, size: int) -> CommGroup:
     return CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(size)))
 
 
+def _sp_groups(*nodes: str) -> WorkerParallelGroups:
+    """Rank 0 of a worker holding each of ``nodes`` over ``P`` SP ranks."""
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    for node in nodes:
+        group = _group(0, P)
+        groups.add(node, group, "sp")
+        groups.node_to_instance_comm[node] = group
+    return groups
+
+
+def _zero_unplanned_rows_on_cpu(out: torch.Tensor, qo_indptr: torch.Tensor) -> torch.Tensor:
+    """``zero_unplanned_rows``, on a device whose Triton has no driver."""
+    out[int(qo_indptr[-1]):] = 0
+    return out
+
+
 def _placed(rank: int) -> KVCache:
     config = PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4,
         page_size=8, context_parallel=True,
     )
-    joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial(), instance=_group(rank, P))
     return KVCache(config, CPU, torch.float32, config.place(joint, "kv"))
 
 
@@ -90,11 +114,11 @@ def _manager(rank: int, cfg: PagedKVConfig) -> KVManager:
     # what `KVManager.build` does first: TP placement shards heads over the TP ranks
     cfg.shard(P)
     kv = KVManager(
-        cfg=cfg, name="kv", joint_comm_group=JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial()),
+        cfg=cfg, name="kv",
+        joint_comm_group=JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial(), instance=_group(rank, P)),
         transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     kv.enable_prefix_cache(ROOT, WALKS)
-    kv._plan_cache_mode = 1
     kv._cg_max_seq_len = 64
     return kv
 
@@ -156,13 +180,12 @@ def test_two_ranks_keep_logical_pages_alike_and_split_every_write():
         kv.commit(step, _ctx("b"))
     assert leader._streams["b"]["main"].page_indices[:3] == leader._streams["a"]["main"].page_indices[:3]
 
-    # decode, the second step planned off the first (the plan cache)
+    # decode
     for slot in (0, 1):
         planned = [_decode(kv, "b", slot) for kv in ranks]
         _assert_split_writes(ranks, planned[0][0])
         for kv, (step, ctx) in zip(ranks, planned, strict=True):
             kv.commit(step, ctx)
-    assert [kv.plan_cache_stats["hit"] for kv in ranks] == [1, 1]
     planned = [_decode(kv, "b", 0, leased=False) for kv in ranks]
     _assert_split_writes(ranks, planned[0][0])
     for kv, (step, ctx) in zip(ranks, planned, strict=True):
@@ -246,12 +269,10 @@ class _Submodule:
 def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_support(
     supports, tmp_path, monkeypatch,
 ):
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
+    groups = _sp_groups(NODE)
     # Qwen3.5's own declarations (dummy shapes) with its pool placed, as on SP ranks, and a
     # dependent without support
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
-    apply_yaml_overrides(specs, {"resources": {
+    specs = declared_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {"resources": {
         KV_CACHE: {"context_parallel": True, "max_num_pages": 8}, GDN_STATE: {"max_slots": 4},
     }})
     kv_spec, = (spec for spec in specs if spec.resource_key == KV_CACHE)
@@ -283,20 +304,26 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
         )
 
 
-def test_mla_attention_over_a_placed_pool_is_refused_at_load():
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
-    latent = dict(head_dim=576, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64)
+@pytest.mark.parametrize("kv, attn_spec, manager", [
+    (dict(head_dim=576, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64),
+     lambda: AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(
+         kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1,
+     )), "FlashInferMLAManager"),
+    (dict(head_dim=64),
+     lambda: BlockCausalAttentionSpec(resource_key="attn", nodes={NODE}, block_size=8, config=AttentionConfig(
+         kv_cache="kv", backend=AttnBackend.FLASHINFER,
+     )), "FlashInferBlockCausalManager"),
+], ids=["mla", "block_causal"])
+def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, attn_spec, manager):
+    groups = _sp_groups(NODE)
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, max_seq_len=256, num_qo_heads=4, max_num_pages=8, page_size=PAGE_SIZE,
-            context_parallel=True, **latent,
+            context_parallel=True, **kv,
         )),
-        AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(
-            kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1,
-        )),
+        attn_spec(),
     ]
-    with pytest.raises(ValueError, match="'attn' .FlashInferMLAManager. does not support context parallelism.*'kv'"):
+    with pytest.raises(ValueError, match=f"'attn' .{manager}. does not support context parallelism.*'kv'"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
@@ -306,9 +333,11 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
     """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
     is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
     is refused."""
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
+    from mstar.model.base import enabled_resources
+
+    groups = _sp_groups(NODE)
+    # what a deployment without a `lora:` block builds
+    specs = enabled_resources(_qwen3_5(NODE, {}, tmp_path, monkeypatch), {})
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
     pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
     heads = pool.config.blocks["state"].shape[0]
@@ -334,9 +363,7 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(monkeypat
     """A resource is sized by one head-shard count, so it can't serve a node that places its
     positions over its SP ranks (heads over TP) beside one splitting its steps (heads over TP x SP)."""
     other = "other"
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    for node in (NODE, other):
-        groups.add_sp(node, _group(0, P))
+    groups = _sp_groups(NODE, other)
     monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
     monkeypatch.setattr(engine_mod, "position_pools", lambda specs, node: {"kv": node == NODE})
     with pytest.raises(ValueError, match="'shared' serves nodes that split heads different ways"):
@@ -453,7 +480,8 @@ def _cp_attention(
         dependencies["shard"] = SeqShardSpec("shard", {NODE}, ("main",), 0, exchange=exchange)
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies=dependencies,
-        head_shards=joint.tp_group.world_size,
+        # SP placement replicates the node over the SP ranks, heads split over TP alone
+        replicated_over_sp=joint.sp_group.world_size > 1,
     )
     attn = AttentionManager.build(spec, info)
     placement = kv.config.place(joint, "kv")
@@ -550,8 +578,8 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
     group.device_group, group.initialized = dist.group.WORLD, True
     graph = None
     try:
-        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group) if over_sp
-                 else JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
+        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group) if over_sp
+                 else JointGroups(tp_group=group, sp_group=CommGroup.trivial(), instance=group))
         dtype = torch.bfloat16 if cuda else torch.float32
         if split is not None:
             _split_step(joint, device, dtype, split, causal)
@@ -698,7 +726,7 @@ def _window_split(group: CommGroup) -> None:
     copied, then a copied decode. Each against one rank's windowed attention; the split step's
     sampler rows are each row's last token of the whole step, and every rank holds the step's K/V.
     The attention is built before the pool places its groups and reads the window group's plan."""
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
     # both groups' pages are 2 * CP_PAGE tokens unplaced; placed, the window's are CP_PAGE
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
@@ -713,7 +741,7 @@ def _window_split(group: CommGroup) -> None:
         SeqShardSpec("shard", {NODE}, ("main",), 0, exchange="all_gather"),
     ])
     window = specs["window"]
-    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, head_shards=1)
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, replicated_over_sp=True)
     attn = AttentionManager.build(window, replace(info, dependencies={k: specs[k] for k in window.depends_on()}))
     assert attn._split_exchange == "kv_gather"
     shard = SequenceShard.build(specs["shard"], info)
@@ -804,7 +832,7 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
     world = 4
     case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
     for rank in range(world):
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world), instance=_group(rank, world))
         shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
         attn, _ = _cp_attention(
             joint, CPU, torch.float32, shard=shard, exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
@@ -864,7 +892,8 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     """A backend's kernels are checked when they are built, not when a step first runs them."""
     monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    attn, _ = _cp_attention(JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), CPU, torch.float32)
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
+    attn, _ = _cp_attention(joint, CPU, torch.float32)
     kwargs = dict(attn._wrapper_kv_kwargs)
     good = attn.paged_kernel
     monkeypatch.setattr(attn, "paged_kernel", lambda *args: types.SimpleNamespace())
@@ -876,7 +905,8 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
         with pytest.raises(ValueError, match="OwnTokensKernel"):
             attn._context_parallel_wrapper("main", 0, False, kwargs)
     # a kernel for whole rows alone, where SP's zigzag share would plan other rows on it
-    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32)
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
+    attn, _ = _cp_attention(joint, CPU, torch.float32)
     whole_only = type("WholeOnly", (_GatheredKeys,), {"whole_rows_only": True})
     monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: whole_only())
     with pytest.raises(ValueError, match="whole rows"):
@@ -951,7 +981,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     (dict(flashinfer_backend="cudnn"), "flashinfer_backend 'cudnn'"),
 ])
 def test_attention_a_placed_pool_cannot_serve_is_refused_at_build(attention, refused):
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with pytest.raises(ValueError, match=f"'attn': {refused} is unsupported over KV pool 'kv'"):
         _cp_attention(joint, CPU, torch.float32, **attention)
 
@@ -981,7 +1011,7 @@ def test_a_placed_pool_keeping_a_window_stripes_its_full_layers_and_keeps_the_wi
     for rank in range(P):
         # one config for both, as one process emulating TP builds them (`_manager`)
         cfg.shard(P)
-        joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
+        joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial(), instance=_group(rank, P))
         ranks.append(KVManager(cfg=cfg, name="kv", joint_comm_group=joint, transfer_engine_info=None,
                                device=CPU, dtype=torch.float32))
     assert cfg.groups == (full, replace(window, page_size=window.page_size // P))
@@ -999,7 +1029,7 @@ def test_a_placed_pool_keeping_a_window_stripes_its_full_layers_and_keeps_the_wi
 
     # 3-token window pages (a 6-token full page over 1 full and 2 window layers) don't split 2 ways
     cfg = pool(page_size=6, window_layers=(1, 2))
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with pytest.raises(ValueError, match="keeps its sliding-window layers whole on each of its 2 partners in 3-token"):
         cfg.place(joint, "kv")
 
@@ -1085,7 +1115,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     # real tokens to its 16-token bucket, which the step splits 8 and 8
     lease = SlotLease(0, BucketKey("w", bs=1, num_tokens=16))
     for rank in range(P):
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P), instance=_group(rank, P))
         shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
         attn, _ = _cp_attention(joint, CPU, torch.float32, shard=shard)
         ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False, slot_lease=lease,
@@ -1279,7 +1309,7 @@ def _cosmos3_over_ranks(rank, world, store):
         statics, latents, timesteps = inputs(32, 64)
         with torch.no_grad():
             want, _ = _cosmos3_steps(sub, _SdpaResources().as_dict(), statics, latents, timesteps)
-            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group))
+            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group))
             got, runner = _cosmos3_steps(sub, res, statics, latents, timesteps)
             row = tower.denoise_step_row(statics[0], latents, timesteps, statics[0]["rotary"], statics[0]["rotary"])
             warm = tower.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
@@ -1337,7 +1367,8 @@ def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_declares_it(monkey
     with pytest.raises(ValueError, match=r"spans nodes \['reasoner'\] without the sequence shard"):
         resolve_spec_dependencies([replaced(spec, nodes={DIT_NODE}) if spec is shard else spec for spec in specs])
 
-    res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial()))
+    trivial = CommGroup.trivial()
+    res = _cosmos3_resources(model, JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial))
     runner = StepRunner(res)
     runner.ingest_request("t", {"kv": KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
     reasoner = Cosmos3ReasonerSubmodule(sub.transformer, model.config)
@@ -1393,8 +1424,9 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
     context = _IdleContext()
+    monkeypatch.setattr(ragged_mod, "zero_unplanned_rows", _zero_unplanned_rows_on_cpu)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, placement = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(PREFILL_ROWS, CPU, torch.float32, padding=padding)
     n, pad = case.q.shape[0], padding[0] * padding[1] + 8
@@ -1420,6 +1452,7 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
         def run(self, q, cache, return_lse):
             return torch.zeros_like(q), torch.full(q.shape[:2], -math.inf)
 
+    monkeypatch.setattr(ragged_mod, "zero_unplanned_rows", _zero_unplanned_rows_on_cpu)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: Context())
     exchanged = []
 
@@ -1429,7 +1462,7 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
 
     monkeypatch.setattr(TPContextParallelWrapper, "_exchange_queries", lambda self, q: q)
     monkeypatch.setattr(TPContextParallelWrapper, "_exchange_partials", exchange)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, placement = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(((0, 5), (0, 3)), CPU, torch.float32)
     _plan(attn, case, bucket=BucketKey("w", bs=2, num_tokens=8))
@@ -1448,16 +1481,16 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
         capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     kv = types.SimpleNamespace(can_capture=lambda: True, captures_bucket=lambda bucket, packed: True,
-                               placement=PagedKVConfig(
+                               lean_capture=False, placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
     step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
     runner = AcceleratorGraphRunner(
         submodule_name="t3", resources={"kv": kv}, step_runner=mock.Mock(), device=CPU, autocast_dtype=None,
         submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config],
-                                        declare_step=lambda **kwargs: step),
+                                        declare_step=lambda **kwargs: step, compiled_entries_per_shape=1),
         joint_comm_group=joint, num_slots=1, head_shards=1,
     )
     if len(batch_sizes) == 1:
@@ -1485,7 +1518,7 @@ def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeyp
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
     context = _IdleContext()
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
     lease = SlotLease(1, BucketKey(graph_walk="w", bs=len(PREFILL_ROWS), num_tokens=16))
@@ -1504,42 +1537,40 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     to read right."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setattr(fi_mod, "current_platform", types.SimpleNamespace(cuda_capability=lambda device=None: (10, 0)))
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     assert attn._wrapper_kv_kwargs["backend"] == attn._new_kwargs["backend"] == "fa2"
 
 
 @pytest.mark.parametrize(("over_sp", "capability", "backend", "outcome"), [
-    (True, (9, 0), "fa2", "refused"),
+    (True, (9, 0), "fa2", "warned"),
     (True, (9, 0), "auto", "quiet"),  # auto prefills on fa3 on SM90
     (True, (10, 0), "fa2", "warned"),
     (True, (10, 0), "auto", "warned"),  # auto runs fa2 from SM100
     (True, (8, 0), "auto", "warned"),  # and below SM90, where FlashInfer has no fa3
     (True, (8, 0), "fa2", "warned"),
+    (True, None, "fa2", "warned"),  # off NVIDIA too
     (False, (9, 0), "fa2", "quiet"),
     (False, (10, 0), "fa2", "quiet"),
 ])
 def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, backend, outcome):
-    """One SP-placed server hung in an fa2 prefill, cause unknown: refused on SM90, where fa3 runs
-    instead, a warning wherever fa2 is the only kernel, and a TP-placed pool doesn't care."""
+    """One SP-placed server hung in an fa2 prefill, cause unknown: a warning wherever an SP-placed
+    pool prefills on fa2, and a TP-placed pool doesn't care."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
     if over_sp:
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     else:
-        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    if outcome == "refused":
-        with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool on SM90"):
-            _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
-        return
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
-        _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+        # nothing here touches the device but the check of its type, so no GPU is needed
+        _cp_attention(joint, torch.device("cuda", 0), torch.float32, flashinfer_backend=backend)
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
 @pytest.mark.parametrize("over_sp, capability, backend, outcome", [
-    (True, (9, 0), "fa2", "refused"), (True, (9, 0), "auto", "quiet"), (True, (10, 0), "auto", "warned"),
+    (True, (9, 0), "fa2", "warned"), (True, (9, 0), "auto", "quiet"), (True, (10, 0), "auto", "warned"),
     (False, (9, 0), "fa2", "quiet"),
 ])
 def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
@@ -1552,9 +1583,9 @@ def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
     if over_sp:
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     else:
-        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
         max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
@@ -1567,18 +1598,32 @@ def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
         )),
     ])
     window = specs["window"]
-    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32,
-                              head_shards=joint.tp_group.world_size, dependencies={"kv": kv})
+    # nothing here touches the device but the check of its type, so no GPU is needed
+    info = EngineResourceInfo(device=torch.device("cuda", 0), joint_comm_group=joint, kv_dtype=torch.float32,
+                              replicated_over_sp=over_sp, dependencies={"kv": kv})
     attn = AttentionManager.build(window, info)
     resources = {"kv": types.SimpleNamespace(placement=kv.config.place(joint, "kv"))}
-    if outcome == "refused":
-        with pytest.raises(ValueError, match="attention 'window' .*'fa2' is refused over an SP-placed pool on SM90"):
-            attn.bind_dependencies(resources)
-        return
     with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
         attn.bind_dependencies(resources)
     assert attn._placement is None
-    assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
+    assert any("attention 'window'" in r.getMessage() for r in caplog.records) == (outcome == "warned")
+
+
+@pytest.mark.parametrize("over_sp", [False, True], ids=["tp", "sp"])
+def test_a_placed_pools_own_tokens_attend_at_the_contexts_sm_scale(over_sp, monkeypatch):
+    """The two parts merge by log-sum-exp, so a declared ``sm_scale`` must reach both: TP's whole
+    rows on the ragged prefill, SP's zigzag share on one-slot pages."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
+    if over_sp:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
+    attn, _ = _cp_attention(joint, CPU, torch.float32, sm_scale=0.5)
+    _plan(attn, _Case.build(PREFILL_ROWS, CPU, torch.float32))
+    state = attn._current_plan_states["main"]
+    own = state.new.kernel.kernel if over_sp else state.new._ragged
+    assert own.sm_scale == state.context.sm_scale == 0.5
 
 
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
@@ -1586,7 +1631,7 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
     CUDA-core decode has no kernel for unless it is one of a few sizes."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32, decode_tensor_cores=False)
     _plan(attn, _Case.build(DECODE_ROWS, CPU, torch.float32))
     assert attn._current_plan_states["main"].context.attn_wrapper.use_tensor_cores
@@ -1596,7 +1641,7 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
 
 # where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
 THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
-    pytest.param(False, None, id="by_head-ulysses"),
+    pytest.param(False, "ulysses", id="by_head-ulysses"),
     pytest.param(True, "all_gather", id="by_position-all_gather"),
     pytest.param(True, "ring", id="by_position-ring"),
 ])
@@ -1608,7 +1653,6 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
     declarations, built as the engine builds them. Two steps (a first prefill, then one over stored
     context with a fresh row and a riding decode row) run split, eager and compiled, and give what
     they give copied; a split prefill samples each row's last token."""
-    from mstar.engine.resources.base import head_shards
     from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
     from mstar.engine.resources.step import SubmoduleStep
     from mstar.model.components import MoeParallelConfig
@@ -1650,7 +1694,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
         # the engine's order: derive, then the SP refusals
         by_key = resolve_spec_dependencies(specs)
         assert sequence_parallel_refusals(specs, "Thinker", 1, world) == []
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
 
         # (rid, tokens) per step: two first prefills, then their next tokens beside a fresh prompt,
         # one row a decode; 13 tokens, the last 2 the MoE's padding
@@ -1670,7 +1714,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 key: build_resource(spec, EngineResourceInfo(
                     device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
                     dependencies={dep: by_key[dep] for dep in spec.depends_on()},
-                    head_shards=head_shards(joint, placed),
+                    replicated_over_sp=placed,
                 ))
                 for key, spec in by_key.items()
             }

@@ -23,7 +23,7 @@ from mstar.engine.resources.step import StepContext
 
 class _FlashInferRaggedManagerBase(_RaggedManagerBase):
     """FlashInfer extras on top of the shared manager: the kernel backend, and a
-    workspace per (label, slot) shared by that slot's eager and captured wrappers."""
+    workspace per (label, slot) shared by every wrapper on that slot."""
 
     def __init__(
         self,
@@ -31,15 +31,17 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
         key: str,
+        **kwargs,
     ):
-        super().__init__(device=device, dtype=dtype, config=config, key=key)
+        super().__init__(device=device, dtype=dtype, config=config, key=key, **kwargs)
         self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
-        self._kwargs["backend"] = config.flashinfer_backend
+        self._flashinfer_backend = "auto" if config.flashinfer_backend is None else config.flashinfer_backend
 
-    def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
-        return super()._build_wrapper(
-            label, slot, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
-        )
+    def _build_wrapper(self, label: str, slot: int, **wrapper_kwargs) -> _RaggedPrefillBase:
+        return super()._build_wrapper(label, slot, **{
+            "workspace_buffer": self._workspaces.get(label, slot), "backend": self._flashinfer_backend,
+            **wrapper_kwargs,
+        })
 
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,

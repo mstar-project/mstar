@@ -57,24 +57,23 @@ def _load(
     model: nn.Module,
     path: str | Path,
     device: torch.device | str,
-    remapper,
     selectors: list[dict],
     expected: set[str],
-    stacked: list[StackedParamRule] | None = None,
 ) -> set[str]:
     """Fill ``expected`` from the shards each selector picks out, or raise.
 
-    A selector (``prefix=`` or ``keys=``) only narrows which shards open;
-    ``remapper`` decides what loads. An unfilled parameter is fatal, since a
-    half-loaded tower produces plausible garbage.
+    A selector (``prefix=`` or ``keys=``) only narrows which shards open; the
+    model's ``checkpoint_rules()`` decide what loads. An unfilled parameter is
+    fatal, since a half-loaded tower produces plausible garbage.
     """
+    rules = model.checkpoint_rules()
     loaded: set[str] = set()
     for selector in selectors:
         loaded |= load_weights_into(
             model,
             iter_safetensors_shards(Path(path), device=device, **selector),
-            name_remapper=remapper,
-            stacked_params=stacked,
+            name_remapper=rules.remap,
+            stacked_params=list(rules.stacked_params),
         )
     missing = sorted(expected - loaded)
     if missing:
@@ -96,13 +95,12 @@ def load_qwen3_5_weights(
         # an untied head sits at the root, outside the text prefix
         selectors.append({"keys": {_LM_HEAD}})
     return _load(
-        model, path, device, qwen3_5_name_remapper, selectors,
+        model, path, device, selectors,
         expected={
             n for n, _ in model.named_parameters()
             # tied: the checkpoint carries no tensor for it
             if not (tied and n == _LM_HEAD)
         },
-        stacked=_STACKED_PARAMS,
     )
 
 
@@ -113,7 +111,6 @@ def load_qwen3_5_vision_weights(
 ) -> set[str]:
     """Load the ViT. Returns the parameter paths that were filled."""
     return _load(
-        model, path, device, qwen3_5_vision_name_remapper,
-        [{"prefix": _VISION_PREFIX}],
+        model, path, device, [{"prefix": _VISION_PREFIX}],
         expected={n for n, _ in model.named_parameters()},
     )
