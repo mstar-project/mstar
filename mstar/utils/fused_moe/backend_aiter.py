@@ -62,8 +62,6 @@ class AiterFusedMoE(FusedMoEBackend):
         self._prepared = False
 
     def prepare_weights(self, w1: nn.Parameter, w2: nn.Parameter) -> None:
-        if self._prepared:
-            return
         from aiter.ops.shuffle import shuffle_weight
 
         for w in (w1, w2):

@@ -13,6 +13,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.moe import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock
+from mstar.utils.fused_moe.backend import MoEBackend
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ def instantiate_moe_block(
     ``moe_backend`` picks the routed experts' kernels (see ``MoEBackend``).
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
+    if MoEBackend(moe_backend) is MoEBackend.AITER and (moe_parallel.parallel == "ep" or moe_parallel.mask_padding):
+        # AiterFusedMoE can't skip rows (another rank's experts, or padding), so the first forward would fail
+        raise ValueError("moe_backend 'aiter' can't run with ep_config parallel: ep or mask_padding; use 'triton'")
     if moe_parallel.parallel == "tp":
         return ParallelSparseMoeBlock(
             hidden_size=hidden_size,

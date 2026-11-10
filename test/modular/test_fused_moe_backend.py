@@ -110,6 +110,18 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
     assert block.experts_backend.prepared == [(block.experts.gate_up_proj, block.experts.down_proj)]
 
 
+def test_load_weights_into_prepares_the_experts_backend(on_platform, monkeypatch):
+    from mstar.model.components import SparseMoeBlock
+    from mstar.model.components import moe as moe_module
+    from mstar.model.loader.base import load_weights_into
+
+    on_platform(CpuPlatform())
+    monkeypatch.setattr(moe_module, "make_moe_backend", lambda kind, inter: _RecordingBackend(inter))
+    block = SparseMoeBlock(64, 4, 2, 32)
+    load_weights_into(torch.nn.Sequential(block), [])
+    assert len(block.experts_backend.prepared) == 1
+
+
 @pytest.mark.parametrize("parallel", ["tp", "ep"])
 def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatch, parallel):
     from mstar.model.components import MoeParallelConfig, instantiate_moe_block
@@ -126,9 +138,20 @@ def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatc
     with torch.device("meta"):
         instantiate_moe_block(
             hidden_size=64, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
-            moe_parallel=MoeParallelConfig(parallel=parallel), moe_backend="aiter",
+            moe_parallel=MoeParallelConfig(parallel=parallel), moe_backend="triton",
         )
-    assert built == ["aiter"]
+    assert built == ["triton"]
+
+
+@pytest.mark.parametrize("parallel", [dict(parallel="ep"), dict(mask_padding=True)])
+def test_aiter_with_a_config_that_skips_rows_fails_at_build(parallel):
+    from mstar.model.components import MoeParallelConfig, instantiate_moe_block
+
+    with pytest.raises(ValueError, match="can't run with"):
+        instantiate_moe_block(
+            hidden_size=64, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+            moe_parallel=MoeParallelConfig(**parallel), moe_backend="aiter",
+        )
 
 
 @pytest.mark.parametrize("skip_invalid", [False, True])

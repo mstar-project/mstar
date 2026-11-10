@@ -187,6 +187,9 @@ def load_weights_into(
         skip_predicate: optional ``(name) -> bool``; returning ``True``
             skips the key. Applied before ``name_remapper``.
 
+    Once every weight is in, MoE blocks convert their expert weights to their
+    backend's layout (``prepare_moe_weights``), so a model only sets ``moe_backend``.
+
     Returns: set of parameter paths that received a tensor.
     """
     match_stacked = _StackedMatcher(stacked_params or [])
@@ -227,6 +230,9 @@ def load_weights_into(
             "parameters got no weight",
             type(module).__name__, num_dropped, dropped, unloaded, len(params_dict),
         )
+    from mstar.model.components.moe import prepare_moe_weights
+
+    prepare_moe_weights(module)
     return loaded
 
 
