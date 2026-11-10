@@ -748,7 +748,7 @@ def _renamed_scale(name):
     return Renamed
 
 
-@pytest.mark.parametrize("name", ["timestep", LATENTS])
+@pytest.mark.parametrize("name", ["timestep", LATENTS, "cond_pos"])
 def test_a_guidance_scale_that_shadows_a_staged_input_is_refused_at_construction(name):
     with pytest.raises(ValueError, match=name):
         _renamed_scale(name)()

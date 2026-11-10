@@ -218,15 +218,17 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             if guidance is not None else (0,),
         }
         # The step scalars the base slices per step: the scheduler's, and a guided model's scales. A scale is an
-        # input under its own name, beside the step scalars and the loop-back edges; its fill is staged in the
-        # request's state under ``guidance:<name>`` (``_guidance_sources``), apart from the schedule's sources
-        # and the base's own keys.
+        # input under its own name, beside the step scalars, the loop-back edges and the branches' request inputs;
+        # its fill is staged in the request's state under ``guidance:<name>`` (``_guidance_sources``), apart from
+        # the schedule's sources and the base's own keys. Shared request inputs no branch names are the model's
+        # own and can't be checked here.
         scales = guidance.scales if guidance is not None else ()
-        shadowed = set(scales) & {*self.STEP_SCALARS, *self.loop_back_names}
+        branch_inputs = {edge for branch in guidance.branches for edge in branch.values()} if guidance else set()
+        shadowed = set(scales) & {*self.STEP_SCALARS, *self.loop_back_names, *branch_inputs}
         if shadowed:
             raise ValueError(
-                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with a step scalar "
-                f"or loop-back input"
+                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with a step scalar, "
+                f"loop-back input or guidance branch input"
             )
         self.step_scalars: Mapping[str, StepScalar] = {
             **self.STEP_SCALARS, **{name: StepScalar(f"guidance:{name}", broadcast=False) for name in scales},
