@@ -141,15 +141,16 @@ def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame
 
     pytest.importorskip("mstar_rust")
     script = (
-        "import sys, types\n"
+        "import signal, sys, types\n"
+        # what a background job inherits; the bridge is built after, as it is in a launched server
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         "from mstar.api_server.rust_frontend import RustFrontendBridge\n"
         f"bridge = RustFrontendBridge(types.SimpleNamespace(), {str(tmp_path)!r})\n"
         "print('serving', flush=True)\n"
         "bridge.run()\n"
         "print('stopped', flush=True)\n"
     )
-    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
-                            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
     try:
         assert proc.stdout.readline().strip() == "serving"
         time.sleep(0.5)  # the loop is running

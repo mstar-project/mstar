@@ -19,7 +19,7 @@ Only the API server process renders `/metrics`, from one registry. The other pro
 - **API server.** Request counts, request latencies, output volume and HTTP refusals are recorded as requests pass through it. The data worker is a thread of the API server, so its families are recorded in the same process. These are current at every scrape.
 - **Conductor.** While metrics are on, the conductor sends the API server a status message every second. Its gauges show the latest message, so they can be up to a second old; `mstar_conductor_status_age_seconds` says how old.
 - **Engine workers.** Each worker sends the conductor its cumulative numbers every second, and the conductor adds them to its next status message, so worker families can be up to two seconds old. A lost or reordered message cannot corrupt a counter: every message carries totals, not increments, and the API server keeps the latest.
-- **Rust frontend.** With `--rust-frontend`, `mstar-server` serves `/metrics` by asking the API server for the rendered text over the bridge, so both frontends show the same families. It answers `503` if the bridge does not reply within two seconds. `mstar-server` counts its own HTTP refusals and sends the totals with each `/metrics` request, and the API server exports them in `mstar_http_refusals_total`.
+- **Rust frontend.** `mstar-server`, the default frontend, serves `/metrics` by asking the API server for the rendered text over the bridge, so both frontends show the same families. It answers `503` if the bridge does not reply within two seconds. `mstar-server` counts its own HTTP refusals and sends the totals with each `/metrics` request, and the API server exports them in `mstar_http_refusals_total`.
 
 The registry holds only `mstar_` families: no `process_` or `python_` metrics. Every value starts from zero when the server starts.
 
@@ -116,7 +116,7 @@ Gauge, read at scrape time. Requests submitted and not yet taken up by the data 
 Exported by the API server, counted by whichever frontend serves the deployment.
 
 `mstar_http_refusals_total{model_name, route, status}` <br />
-Counter. HTTP requests the frontend answered with an error without submitting them to the API server: `401` (missing or wrong API key), `413` (body over `MSTAR_MAX_BODY_MB`), `422` (body that fails validation), `400` (a bad form field or request), `409` (a `request_id` in flight), `404` (unknown route, or a model without the endpoint), `405` (wrong method), and `503` when the Rust frontend's `MSTAR_MAX_CONCURRENT_REQUESTS` cap turns a request away. WebSocket handshakes are not counted. With `--rust-frontend`, the values are the totals `mstar-server` sent with the latest `/metrics` request.
+Counter. HTTP requests the frontend answered with an error without submitting them to the API server: `401` (missing or wrong API key), `413` (body over `MSTAR_MAX_BODY_MB`), `422` (body that fails validation), `400` (a bad form field or request), `409` (a `request_id` in flight), `404` (unknown route, or a model without the endpoint), `405` (wrong method), and `503` when the Rust frontend's `MSTAR_MAX_CONCURRENT_REQUESTS` cap turns a request away. WebSocket handshakes are not counted. Unless `--python-frontend` is set, the values are the totals `mstar-server` sent with the latest `/metrics` request.
 
 ## Conductor {#conductor}
 
@@ -259,4 +259,4 @@ scrape_configs:
       - targets: ["localhost:8000"]
 ```
 
-The conductor and workers report once a second, so a scrape interval under a second only repeats values. Keep the scrape timeout above two seconds with `--rust-frontend`, which waits that long for the bridge before answering `503`.
+The conductor and workers report once a second, so a scrape interval under a second only repeats values. Keep the scrape timeout above two seconds: `mstar-server` waits that long for the bridge before answering `503`.

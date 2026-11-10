@@ -115,8 +115,8 @@ is **not** the only wiring step. A model also needs:
   only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
   same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
   row in ``ADAPTERS``, tested by
-  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
-  surface only it serves is unfinished.
+  ``test/rust/test_rust_openai_adapters.py``): ``mstar serve`` serves HTTP from ``mstar-server``,
+  the Python HTTP frontend is deprecated, and a surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
