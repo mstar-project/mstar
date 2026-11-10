@@ -153,29 +153,32 @@ class MoeGemmSweep:
         amd = current_platform.is_rocm()
         # GEMM -> BLOCK_SIZE_M -> the fastest tiles, best first (several on AMD, for the option sweep)
         ranked: dict[str, dict[int, list[tuple[float, dict]]]] = {"up": {}, "down": {}}
+        # On AMD the plain tiles only seed the option sweep and never become a row: both GEMMs then
+        # carry HIP options that were timed for them (a row's "down" inherits the gate/up's keys).
+        seeds = {"up": {}, "down": {}} if amd else ranked
         tried = rejected = 0
 
-        def consider(cfg, gemm, keep) -> None:
+        def consider(cfg, gemm, keep, store) -> None:
             nonlocal tried, rejected
             tried += 1
             us = timed(cfg, gemm)
             if us is None:
                 rejected += 1
                 return
-            top = ranked[gemm].setdefault(cfg["BLOCK_SIZE_M"], [])
+            top = store[gemm].setdefault(cfg["BLOCK_SIZE_M"], [])
             top.append((us, cfg))
             top.sort(key=lambda t: t[0])
             del top[keep:]
 
         for cfg in candidates(m, top_k, self.quick, amd):
             for gemm in gemms:
-                consider(cfg, gemm, AMD_SWEPT_TILES if amd else 1)
+                consider(cfg, gemm, AMD_SWEPT_TILES if amd else 1, seeds)
         if amd:
             for gemm in gemms:
-                for top in list(ranked[gemm].values()):
+                for top in list(seeds[gemm].values()):
                     for _, cfg in list(top):
                         for variant in amd_variants(cfg):
-                            consider(variant, gemm, AMD_SWEPT_TILES)
+                            consider(variant, gemm, AMD_SWEPT_TILES, ranked)
         best = {gemm: {bm: top[0] for bm, top in by_bm.items()} for gemm, by_bm in ranked.items()}
         result = BucketResult(bucket=m, current=current, current_us=current_us, default_us=default_us,
                               best=None, best_us=float("nan"), timed=tried - rejected, rejected=rejected)
