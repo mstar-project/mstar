@@ -756,7 +756,7 @@ class TestApprove(unittest.TestCase):
                            ("MI250 (gfx90a) kernels", "MI250 (gfx90a) kernels"),
                            ("AMD MI300X kernels; ROCm code", ""), ("ROCm-specific kernels", ""),
                            ("AMD-only code path", ""), ("the ROCm 7 path", ""), ("no ROCm support", ""),
-                           ("MI300X 2 nodes", "2 nodes")):
+                           ("MI300X 2 nodes", "2 nodes"), ("MI300 kernels", ""), ("MI300A kernels", "MI300A")):
             with self.subTest(text):
                 left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
                 self.assertIn(kept, left, "what the AMD box can't run either would stop counting")

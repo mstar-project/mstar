@@ -224,9 +224,13 @@ HARDWARE_PHRASE = re.compile(rf"({UNTESTABLE_HARDWARE.pattern})(-(?:specific|onl
 
 def covered_by_amd(word):
     """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
-    `is_amd`), or a model gpu.py rents (MI300X and up; an MI250 stays untestable)."""
-    return bool(AMD_HARDWARE.fullmatch(word)) and (not re.fullmatch(AMD_MODEL, word, re.IGNORECASE)
-                                                   or bool(AMD_RENTED.search(word)))
+    `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
+    untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
+    change can pass on an H200."""
+    if not AMD_HARDWARE.fullmatch(word):
+        return False
+    series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
+    return not re.fullmatch(AMD_MODEL, word, re.IGNORECASE) or bool(AMD_RENTED.search(word + "x" if series else word))
 
 
 def beyond_vendors(text, vendors):
