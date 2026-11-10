@@ -508,6 +508,46 @@ def test_batched_windows_on_pool(random_token2wav, device):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
 
 
+def test_batched_relative_positions_match_the_dense_path(random_token2wav):
+    """The conformer's relative-position term on the bounded caches, at a magnitude that
+    matters: ``random_token2wav``'s small weights leave it near zero, where a band read
+    backwards (relative position ``-k`` for ``k``) still passes the test above."""
+    import copy
+
+    from mstar.model.components.token2wav.flow import RelPositionAttention
+
+    model = copy.deepcopy(random_token2wav)
+    gen = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for mod in model.flow.encoder.modules():
+            if isinstance(mod, RelPositionAttention):
+                mod._bands.clear()
+                for t in (mod.linear_pos.weight, mod.pos_bias_u, mod.pos_bias_v):
+                    t.copy_(torch.randn(t.shape, generator=gen))
+    p = 12
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32, generator=gen),
+        spk_emb=torch.randn(1, 192, generator=gen), mel=torch.randn(1, 2 * p, 80, generator=gen),
+    ))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cpu")
+    ref = new_state(model, voice)
+    # the token encoder's output: the DiT's small weights would hide it in the mel
+    encoded = []
+    hook = model.flow.encoder.register_forward_hook(lambda _m, _i, out: encoded.append(out.clone()))
+    try:
+        for win, last in reference_windows(torch.randint(0, 6561, (60,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32)
+            flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            want, got = encoded[-2:]
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    finally:
+        hook.remove()
+
+
 @needs_ckpt
 def test_assets_load_completely():
     from mstar.model.components.token2wav.model import load_token2wav
