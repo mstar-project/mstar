@@ -375,7 +375,8 @@ class Allotment:
     took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, and
     ``grown_from`` the allotment's pages before. `unreserve` puts back the first and the last. ``taken_back`` counts
     the pages of ``remaining`` a guaranteed request took back from borrowers, which it writes first and lends no
-    more (`KVManager._lends`)."""
+    more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining``, or none for a
+    preemptible request. `KVManager._count` sets all three."""
     pages: int
     remaining: int = 0
     asks_again: int = 0
@@ -385,6 +386,7 @@ class Allotment:
     grown: int = 0
     grown_from: int = 0
     taken_back: int = 0
+    lends: int = 0
 
 
 class Dropped(NamedTuple):
@@ -699,8 +701,9 @@ class KVManager(AttentionResource):
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted once they start,
-        #   decided at their first `ask`, or later when the host has no room to set aside for their move. Preemptible
-        #   requests may borrow the pages they were allotted and haven't written (`_borrowable`).
+        #   decided at their first `ask`, or later when the host has no room to set aside for their move.
+        # `_borrowable` counts the pages of `_unused` that guaranteed requests lend, which preemptible requests may
+        #   borrow.
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they
         #   restore it.
         # `_footprints` holds each request's `_footprint` as it was at intake.
@@ -717,6 +720,7 @@ class KVManager(AttentionResource):
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
         self._guaranteed: set[str] = set()
+        self._borrowable = 0
         self._snapshots: list["RecurrentStatePool"] = []
         self._footprints: dict[str, int] = {}
         self._kept = 0
@@ -4142,7 +4146,7 @@ class KVManager(AttentionResource):
             room = self._spare()
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
-                self._unused -= allotment.remaining
+                self._count(rid, allotment, 0, 0)
             self._asks.pop(rid, None)
             self._stalled.discard(rid)
             if rid in self._streams:
@@ -4241,7 +4245,7 @@ class KVManager(AttentionResource):
                 f"pages still being written into, but not owned alone: {crowded}"
             )
 
-            unused = 0
+            unused = borrowable = 0
             for rid, allotment in self._allotments.items():
                 held = 0
                 for label, stream in self._streams[rid].items():
@@ -4253,12 +4257,16 @@ class KVManager(AttentionResource):
                 assert allotment.taken_back <= allotment.remaining, (
                     f"{rid} took back {allotment.taken_back} pages but has {allotment.remaining} left to write"
                 )
+                if rid in self._guaranteed:
+                    borrowable += allotment.remaining - allotment.taken_back
             assert unused == self._unused, (
                 f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
             )
+            assert borrowable == self._borrowable, (
+                f"guaranteed requests lend {borrowable} pages, but the pool counts {self._borrowable}"
+            )
             evictable = 0 if self._index is None else len(self._index.evictable())
             # A follower replays rank 0's moves as they arrive, and its own commit can give the room back later.
-            borrowable = self._borrowable()
             assert not self._decides or self._unused - borrowable <= arena.num_free + evictable, (
                 f"admitted requests were allotted {self._unused} pages they haven't used, {borrowable} of them "
                 f"lent, but only {arena.num_free} are free and {evictable} evictable"
@@ -4568,7 +4576,7 @@ class KVManager(AttentionResource):
     def _unreserve(self, rid: str) -> None:
         allotment = self._allotments.pop(rid, None)
         if allotment is not None:
-            self._unused -= allotment.remaining
+            self._count(rid, allotment, 0, 0)
             self._asks[rid] = allotment.asks_again
         self._stalled.discard(rid)
         # a request that holds nothing waits with no room set aside on the host
@@ -4672,24 +4680,16 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         if rid not in self._guaranteed:
             if not self._taking_back():
-                room += self._borrowable()
+                room += self._borrowable
         elif allotment is None:
             room += self._frees([other for other in self._streams if other not in self._guaranteed])
         else:
-            room = min(room + self._borrowable(), self._lends(rid) + max(0, room))
+            room = min(room + self._borrowable, allotment.lends + max(0, room))
         return room - (self._kept if passing or rid in self._passers else 0)
 
     def _spare(self) -> int:
         """The free and evictable pages no allotment holds back from borrowers."""
-        return self._room() + self._borrowable()
-
-    def _borrowable(self) -> int:
-        return sum(self._lends(rid) for rid in self._allotments)
-
-    def _lends(self, rid: str) -> int:
-        """The pages a guaranteed ``rid`` was allotted and hasn't written, less what it took back."""
-        allotment = self._allotments[rid]
-        return allotment.remaining - allotment.taken_back if rid in self._guaranteed else 0
+        return self._room() + self._borrowable
 
     def _taking_back(self) -> bool:
         """Whether a guaranteed request waits holding its allotment. Nothing more is lent until it has what it waits
@@ -4789,7 +4789,7 @@ class KVManager(AttentionResource):
                     return Victims([rid], [], [])
                 return Victims([], [], [], waits=short.pages)
             self._claim(rid, claim)
-            return self._earmark(Earmark(rid, max(pages_short, self._lends(rid)), set()), victims)
+            return self._earmark(Earmark(rid, max(pages_short, self._allotments[rid].lends), set()), victims)
 
     def _wait(self, rid: str, pages: int) -> None:
         """Make ``rid``, which holds its allotment, ask for the ``pages`` its grant needed past it. Any move of ``rid``
@@ -4999,7 +4999,7 @@ class KVManager(AttentionResource):
         if self._index is not None:
             pages += self._index.evictable_after(released)
         return pages + sum(
-            self._allotments[rid].remaining - self._lends(rid) for rid in rids if rid in self._allotments
+            self._allotments[rid].remaining - self._allotments[rid].lends for rid in rids if rid in self._allotments
         )
 
     def _settle(self, rid: str, freed: int, allotment: Allotment | None = None) -> None:
@@ -5069,7 +5069,7 @@ class KVManager(AttentionResource):
         # A request past its allotment holds more than ``allotment.pages``, so ``pages`` add to what it holds. A
         # guaranteed request takes back what it lends first.
         allotment = self._allotments[rid]
-        taken = min(pages, self._lends(rid))
+        taken = min(pages, allotment.lends)
         allotment.taken_back += taken
         allotment.pages = max(allotment.pages, self._held(rid)) + pages - taken
         self._recount(rid)
@@ -5177,7 +5177,7 @@ class KVManager(AttentionResource):
         then `_room_for`. Until `_recount` runs, a page taken lowers the room instead of
         ``remaining``, so the allowance is the same before and after `_recount`."""
         allotment = self._allotments.get(rid)
-        return (0 if allotment is None else allotment.remaining - self._lends(rid)) + self._room_for(rid)
+        return (0 if allotment is None else allotment.remaining - allotment.lends) + self._room_for(rid)
 
     def _hit_allowance(self, rid: str) -> int:
         """The pages ``rid``'s cache hits on evictable pages may take: `_allowance`, or the room alone for a
@@ -5237,12 +5237,18 @@ class KVManager(AttentionResource):
         if allotment is None:
             return
         remaining = max(0, allotment.pages - self._held(rid))
-        self._unused += remaining - allotment.remaining
         # the pages written are those taken back first
-        allotment.taken_back = max(0, allotment.taken_back - max(0, allotment.remaining - remaining))
-        allotment.remaining = remaining
+        self._count(rid, allotment, remaining, max(0, allotment.taken_back - max(0, allotment.remaining - remaining)))
         if _DEBUG_ASSERTS:
             self.assert_pages_conserved()
+
+    def _count(self, rid: str, allotment: Allotment, remaining: int, taken_back: int) -> None:
+        """Set ``allotment``'s ``remaining`` and ``taken_back``, and what it lends, `_unused` and `_borrowable` with
+        them."""
+        lends = remaining - taken_back if rid in self._guaranteed else 0
+        self._unused += remaining - allotment.remaining
+        self._borrowable += lends - allotment.lends
+        allotment.remaining, allotment.taken_back, allotment.lends = remaining, taken_back, lends
 
     def _held(self, rid: str) -> int:
         return sum(
@@ -5381,7 +5387,7 @@ class KVManager(AttentionResource):
                 within = held_back = 0
                 if allotment is not None:
                     within = min(num_new_pages, allotment.remaining)
-                    held_back = min(num_new_pages, allotment.remaining - self._lends(request_id))
+                    held_back = min(num_new_pages, allotment.remaining - allotment.lends)
                 new_pages = None if short else self._grant(
                     request_id, label, num_new_pages, num_new_pages - held_back, undoable,
                 )
@@ -5410,9 +5416,9 @@ class KVManager(AttentionResource):
                 stream.page_indices.extend(new_pages)
                 if within:
                     # what `_recount` would count, without its pass over the streams
-                    allotment.remaining -= within
-                    self._unused -= within
-                    allotment.taken_back = max(0, allotment.taken_back - within)
+                    self._count(
+                        request_id, allotment, allotment.remaining - within, max(0, allotment.taken_back - within),
+                    )
                 stream.generation += 1
                 # a later group's pages have no footprint of their own
                 if not group and stream.footprint is not None and len(stream.page_indices) > stream.footprint:
