@@ -4696,8 +4696,14 @@ class KVManager(AttentionResource):
         if not guaranteed:
             room += 0 if self._taking_back() else self._borrowable
         else:
-            room += self._frees([other for other in self._streams if other not in self._guaranteed])
+            room += self._reclaimable()
         return room - (self._kept if passing else 0)
+
+    def _reclaimable(self) -> int:
+        """What moving every preemptible request would free. Under the lock even from `grew_since`, since the GPU
+        thread opens a label in `_streams` during an admit."""
+        with self._lock:
+            return self._frees([rid for rid in self._streams if rid not in self._guaranteed])
 
     def _spare(self) -> int:
         """The free and evictable pages no allotment holds back from borrowers."""
