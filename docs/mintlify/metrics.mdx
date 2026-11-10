@@ -160,10 +160,10 @@ Histogram, seconds, engine steps that ran a forward. From when the worker hands 
 Histogram, rows the step's forward ran. Buckets: [batch](/metrics#metrics-buckets).
 
 `mstar_prefix_cache_query_tokens_total{model_name, component}` <br />
-Counter. Prompt tokens looked up in the prefix cache, once per request (its whole keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL, Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.
+Counter. Prompt tokens looked up in the prefix cache, once per request (its whole keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL, Orpheus, Qwen3.5 and GLM-5.3). Under tensor parallelism only rank 0 counts a lookup.
 
 `mstar_prefix_cache_hit_tokens_total{model_name, component}` <br />
-Counter. Tokens the prefix cache already held at that lookup. The hit rate is `rate(mstar_prefix_cache_hit_tokens_total[5m])` divided by `rate(mstar_prefix_cache_query_tokens_total[5m])`. For Qwen3.5 these are the KV cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool cuts to 0 still counts.
+Counter. Tokens the prefix cache already held at that lookup. The hit rate is `rate(mstar_prefix_cache_hit_tokens_total[5m])` divided by `rate(mstar_prefix_cache_query_tokens_total[5m])`. For Qwen3.5 and GLM-5.3 these are the KV cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool cuts to 0 still counts.
 
 `mstar_kv_preemptions_total{model_name, component}` <br />
 Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves itself to the host to wait.
