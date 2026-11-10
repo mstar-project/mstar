@@ -751,6 +751,18 @@ def test_a_guidance_scale_that_shadows_a_staged_input_is_refused_at_construction
         _renamed_scale(name)()
 
 
+@pytest.mark.parametrize("name", ["guidance_scale", LATENTS])
+def test_a_shared_request_input_that_shadows_a_staged_input_is_refused_per_row(name):
+    """An input no branch names is out of construction's sight; staged last, it would replace the step's own."""
+
+    class Shadowing(GuidedToy):
+        def request_inputs(self, fwd_info, inputs, key):
+            return {**super().request_inputs(fwd_info, inputs, key), name: torch.zeros(1)}
+
+    with pytest.raises(ValueError, match=name):
+        Shadowing().prepare_inputs(WALK, _guided_info("a", 3.0), _guided_inputs(2.0, 1.0))
+
+
 def test_a_guidance_scale_named_like_a_schedule_source_stages_beside_it():
     """A renamed scale stages apart from the schedule's source, and ``Cfg`` combines with the scale it names."""
     sub = _renamed_scale("sigmas")()

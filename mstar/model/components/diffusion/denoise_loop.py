@@ -221,7 +221,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # input under its own name, beside the step scalars, the loop-back edges and the branches' request inputs;
         # its fill is staged in the request's state under ``guidance:<name>`` (``_guidance_sources``), apart from
         # the schedule's sources and the base's own keys. Shared request inputs no branch names are the model's
-        # own and can't be checked here.
+        # own: prepare_inputs checks those per row.
         scales = guidance.scales if guidance is not None else ()
         branch_inputs = {edge for branch in guidance.branches for edge in branch.values()} if guidance else set()
         shadowed = set(scales) & {*self.STEP_SCALARS, *self.loop_back_names, *branch_inputs}
@@ -333,7 +333,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         """The request's conditioning tensors for this step, without a batch dim. A guided model returns every
         branch input its ``key.branches`` read (the contract is on ``Guidance.branches``); the base maps them onto
-        each branch's row."""
+        each branch's row. No name may be a step scalar's or a loop-back edge's (``prepare_inputs`` refuses it)."""
         raise NotImplementedError
 
     def num_tokens(self, key: StepKey) -> int:
@@ -504,13 +504,20 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 f"{state['schedule'].num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
             )
         key = self.step_key(fwd_info, bucket_key)
+        conditioning = self.request_inputs(fwd_info, inputs, key)
+        shadowed = conditioning.keys() & {*self.step_scalars, *self.loop_back_names}
+        if shadowed:
+            raise ValueError(
+                f"{type(self).__name__}.request_inputs returned {sorted(shadowed)}, the name of a step scalar or "
+                f"loop-back input"
+            )
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
                 name: state[scalar.source][k + scalar.offset:k + scalar.offset + 1]
                 for name, scalar in self.step_scalars.items()
             },
-            **self.request_inputs(fwd_info, inputs, key),
+            **conditioning,
         }
         return NodeInputs(tensor_inputs=tensors, input_seq_len=self.num_tokens(key), resource_step_info=key)
 
