@@ -92,6 +92,8 @@ jobs:
       - name: Install mstar with CPU PyTorch
         env:
           UV_SYSTEM_PYTHON: "1"
+          # Compile .pyc files at install, as pip does, so pytest's workers don't each compile them.
+          UV_COMPILE_BYTECODE: "1"
         run: |
           uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu

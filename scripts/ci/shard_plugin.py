@@ -3,8 +3,8 @@
 CPU Core runs as two shards on two runners and loads this with `-p shard_plugin` (.github/workflows/ci.yml,
 PYTHONPATH=scripts/ci). Each test file goes whole to one shard, so its module fixtures run once, and which
 shard is a stable hash of its path: no list of files to keep. The salt makes the shards' test seconds match
-within 1% on four CPU Core runs of 2026-11-10 (their `cpu-tests-results` junit reports); a new file lands on
-either side at random. Without the variable, every file is collected. Plain Python, so test/ci checks the split
+within 0.2% on four CPU Core runs of 2026-11-10 (from their junit reports); a new file lands on either side at
+random. Without the variable, every file is collected. Plain Python, so test/ci checks the split
 without pytest.
 """
 
