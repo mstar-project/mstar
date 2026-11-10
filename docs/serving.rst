@@ -540,9 +540,13 @@ travels with its other ``model_kwargs``. Above one rank the cache stays off unle
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise. A cache that keeps
-a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
-``prefix_cache`` goes off (logged at info), and a serving config that sets
-``prefix_cache: true`` on it is refused.
+a sliding window (``AttentionConfig.sliding_window``) caches the sliding layers' pages
+too: a hit ends on a page of every group, and needs the full layers' pages up to it
+and the sliding layers' pages of the window before it. Its pages leave the window
+into the cache, where eviction takes them before the full layers' page they end on.
+With ``cpu_offload_pages`` as well its ``prefix_cache`` goes off (logged at info),
+since a copy back from the host skips the window's pages, and a serving config that
+sets ``prefix_cache: true`` on it is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on

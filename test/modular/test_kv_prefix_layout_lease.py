@@ -99,8 +99,8 @@ class _Node(_TextNode):
     """One request's cache and positions under a real runner, after an earlier
     request ran every walk of ``seeded`` and indexed what it filled."""
 
-    def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
-        super().__init__()
+    def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0, window: int | None = None):
+        super().__init__(window=window)
         self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK, IMAGE_WALK), ("decode",))})
         self.runner.ingest_request("seed", {"kv": _config(seeded, decode=decode)})
         for walk, length in _walks(seeded):
@@ -414,6 +414,16 @@ def test_a_repeat_with_another_question_is_served_the_whole_image_and_the_slots_
         "the repeat's page for the image's end does not hold the slots the first "
         "request wrote there, so its question attends to other KV"
     )
+
+
+def test_a_window_pool_serves_a_repeat_up_to_the_page_before_the_image_end():
+    """A hit inside a page would need that page of the window too, so a window pool caches no image end and
+    serves the whole pages before it: 48 slots, whose window (16-48) is cached."""
+    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK], window=32)
+
+    answers = [node.walk(walk, length) for walk, length in _walks([TEXT, IMAGE, OTHER_ASK])]
+
+    assert answers == [len(TEXT), 3 * PAGE_SIZE - len(TEXT), 0]
 
 
 def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached_since(monkeypatch):

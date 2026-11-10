@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import threading
 from collections import Counter
@@ -560,6 +561,8 @@ class KVManager(AttentionResource):
         self._groups: tuple[KVGroup, ...] = cfg.groups
         # (index, group) of each group past the first, each a window applied at commit
         self._windows = tuple((g, group) for g, group in enumerate(self._groups) if g)
+        # a cache hit ends on a boundary of every group's pages
+        self._hit_unit = math.lcm(*(group.page_size for group in self._groups))
         # layer -> the index of its group
         self._layer_group = [0] * cfg.num_layers
         for g, group in enumerate(self._groups):
@@ -804,7 +807,7 @@ class KVManager(AttentionResource):
         index = self._index
         return KVPageCounts(
             used=self.config.pages_of(total - self._arena.num_free), total=self.config.pages_of(total),
-            cached=0 if index is None else index.num_pages(),
+            cached=0 if index is None else self.config.pages_of(index.num_pages()),
         )
 
     def resolve_cached_prefix(
@@ -866,11 +869,17 @@ class KVManager(AttentionResource):
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
                 # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
-                walk = self._index.lookup if self._world_size == 1 else self._index.pages_for
-                matched = self._retain_cached(rid, stream, walk(rooted)[:len(rooted) - 1])
-                held = len(matched) * self.config.tokens_per_page
-                # If an image ends inside the next page, look up its cached partial page.
-                image_end = self._image_end(ends, held, total)
+                held, matched = self._match(rooted, len(rooted) - 1)
+                if self._world_size == 1:
+                    self._index.touch(matched)
+                if self._windows:
+                    held, matched = self._retain_window_match(rid, stream, rooted, held, matched)
+                else:
+                    matched = self._retain_cached(rid, stream, matched)
+                    held = len(matched) * self.config.tokens_per_page
+                # If an image ends inside the next page, look up its cached partial page. Not with windows: the
+                # hit would end inside a page of each window group too.
+                image_end = None if self._windows else self._image_end(ends, held, total)
                 if image_end is not None:
                     end, key = image_end
                     cached = self._retain_cached(rid, stream, self._index.lookup([key]))
@@ -923,6 +932,106 @@ class KVManager(AttentionResource):
         with self._lock:
             chain.rooted, chain.rooted_ends = rooted, ends
 
+    def _ends_on(self, g: int, page: int) -> int:
+        """The first group's page that group ``g``'s page ``page`` ends on, both counted from the stream's first
+        token."""
+        return ((page + 1) * self._groups[g].page_size - 1) // self.config.tokens_per_page
+
+    @staticmethod
+    def _window_key(key: bytes, g: int, page: int) -> bytes:
+        """The key of group ``g``'s page ``page``: ``key``, the first group's rooted key of the page it ends on
+        (`_ends_on`), which commits to every token up to there, then ``g`` and ``page``. No hash, since a match
+        looks up a window's worth of these under the lock."""
+        return key + bytes((g,)) + page.to_bytes(4, "little")
+
+    def _kept(self, g: int, end: int) -> list[int]:
+        """Group ``g``'s pages, counted from the stream's first token, that a stream holds once it has written
+        ``end`` tokens, a multiple of the group's page: all but what its retention has released."""
+        group = self._groups[g]
+        released = group.retention.released_pages(end, group.page_size)
+        return [*range(released.start), *range(released.stop, end // group.page_size)]
+
+    def _match(self, rooted: list[bytes], limit: int) -> tuple[int, list[int]]:
+        """The longest boundary within the first ``limit`` of ``rooted``'s pages at which the index holds every
+        page each group keeps (`_kept`), with those pages, group by group. Walks back from the first group's
+        run: a window page missing at ``i`` puts the boundary at or below that page's start. Doesn't stamp."""
+        index, page_size, unit = self._index, self.config.tokens_per_page, self._hit_unit
+        run = index.pages_for(rooted[:limit])
+        end = len(run) * page_size // unit * unit
+        while end:
+            pages, lower = run[:end // page_size], end
+            for g, group in self._windows:
+                kept = self._kept(g, end)
+                held = [index.page_for(self._window_key(rooted[self._ends_on(g, i)], g, i)) for i in kept]
+                missing = [i for i, page in zip(kept, held, strict=True) if page is None]
+                if missing:
+                    lower = min(lower, missing[-1] * group.page_size // unit * unit)
+                pages += held
+            if lower == end:
+                return end, pages
+            end = lower
+        return 0, []
+
+    def _lease_pages(self, end: int) -> list[int]:
+        """How many pages each group holds of a lease ending at ``end``, the first group's first."""
+        return [end // self.config.tokens_per_page, *(len(self._kept(g, end)) for g, _ in self._windows)]
+
+    def _split(self, pages: list[int], end: int) -> list[list[int]]:
+        """``pages``, a lease ending at ``end``, cut into each group's pages. The first group's take what the
+        windows don't, so a lease that also holds a cached image end keeps it there."""
+        counts = self._lease_pages(end)
+        counts[0] = len(pages) - sum(counts[1:])
+        parts, at = [], 0
+        for count in counts:
+            parts.append(pages[at:at + count])
+            at += count
+        return parts
+
+    def _retain_window_match(
+        self, rid: str, stream: CacheStream, rooted: list[bytes], end: int, pages: list[int],
+    ) -> tuple[int, list[int]]:
+        """`_retain_cached` for a pool with windows: retain the longest match ``rid`` can take, and return its end
+        and pages. A window page is never lent and always takes room, since it rolls out of the window as the
+        stream writes and a page the stream takes itself replaces it."""
+        if self._decides:
+            page_size, unit = self.config.tokens_per_page, self._hit_unit
+            evictable = self._index.evictable()
+            taken = [0]
+            for page in pages[:end // page_size]:
+                taken.append(taken[-1] + (page in evictable))
+            allowance = self._allowance(rid)
+            fits = end
+            while fits and taken[fits // page_size] + sum(self._lease_pages(fits)[1:]) > allowance:
+                fits -= unit
+            if fits < end:
+                # what takes room only grows with the end, so every boundary under ``fits`` fits too
+                end, pages = self._match(rooted, fits // page_size)
+            stream.lent.update(page for page in pages[:end // page_size] if page not in evictable)
+        self._arena.retain(pages)
+        return end, pages
+
+    def _cut_lease(self, rid: str, stream: CacheStream, held: int) -> None:
+        """Cut the stream's lease to its first ``held`` tokens, floored to a page. With windows only where each
+        window keeps a subset of what it keeps at the lease's end: none of it, or a lease that ends within the
+        window. Any other cut would need window pages the lease doesn't hold, so it raises."""
+        page_size = self.config.tokens_per_page
+        end = stream.lease_len
+        parts = self._split(stream.lease, end)
+        keep = parts[0][:held // page_size]
+        for g, _ in self._windows:
+            at = dict(zip(self._kept(g, end), parts[g], strict=True))
+            kept = self._kept(g, held)
+            if held % self._hit_unit or any(i not in at for i in kept):
+                raise RuntimeError(
+                    f"KV {self.name}: {rid}'s lease ends at {end} tokens, and its window pages there don't "
+                    f"cover a cut to {held}"
+                )
+            keep += [at[i] for i in kept]
+        kept_pages = set(keep)
+        cut = [page for page in stream.lease if page not in kept_pages]
+        stream.lease, stream.lease_len = keep or None, len(parts[0][:held // page_size]) * page_size
+        self._release(rid, stream, cut)
+
     def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
         """Returns the same lease with every step until `admit` converts it."""
         with self._lock:
@@ -968,8 +1077,12 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
-            matched = self._index.pages_for(chain.rooted[:len(pages)])
-            if len(matched) < len(pages) and not caught_up:
+            # the lease's end, from its length, which grows with the end
+            end = 0
+            while sum(self._lease_pages(end)) < len(pages):
+                end += self._hit_unit
+            found, matched = self._match(chain.rooted, end // self.config.tokens_per_page)
+            if found < end and not caught_up:
                 return False
             if matched != pages:
                 raise RuntimeError(
@@ -977,7 +1090,7 @@ class KVManager(AttentionResource):
                     f"pages {matched[:4]}... here ({len(matched)}), {pages[:4]}... there ({len(pages)})"
                 )
             self._arena.retain(matched)
-            stream.lease, stream.lease_len = matched, len(matched) * self.config.tokens_per_page
+            stream.lease, stream.lease_len = matched, end
             return True
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
@@ -1036,15 +1149,14 @@ class KVManager(AttentionResource):
         )
         cursor = stream.span_cursor
         if cursor.done and stream.lease is not None:
-            keep, partial = divmod(cursor.consumed, self.config.tokens_per_page)
-            if partial:
+            if cursor.consumed % self.config.tokens_per_page:
                 raise RuntimeError(
                     f"KV {self.name}: {rid}/{label}: the walks the cache served end "
                     f"inside a page ({cursor.consumed} slots), so their KV cannot be kept"
                 )
+            self._cut_lease(rid, stream, cursor.consumed)
             lease, stream.lease = stream.lease, None
-            self._adopt(rid, stream, lease[:keep])
-            self._release(rid, stream, lease[keep:])
+            self._adopt(rid, stream, lease or [], stream.lease_len)
         else:
             self._release_lease(rid, stream)
         stream.chain = None
@@ -1083,10 +1195,7 @@ class KVManager(AttentionResource):
                 return
             held = cursor.consumed + prefix.tokens
             if held < stream.lease_len:
-                keep = held // self.config.tokens_per_page
-                cut = stream.lease[keep:]
-                stream.lease, stream.lease_len = stream.lease[:keep] or None, keep * self.config.tokens_per_page
-                self._release(rid, stream, cut)
+                self._cut_lease(rid, stream, held)
                 self._recount(rid)
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
@@ -1159,6 +1268,7 @@ class KVManager(AttentionResource):
             )
             if 0 < chain.cursor < filled else None
         )
+        start, filed = chain.cursor, []
         while chain.cursor < filled:
             key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
             page = stream.page_indices[chain.cursor]
@@ -1166,10 +1276,29 @@ class KVManager(AttentionResource):
                 # another request filled this page first and its copy is the
                 # one the index names; ours stays private to this stream
                 page = self._index.page_for(key)
+            filed.append((key, page))
             parent = page
             chain.cursor += 1
-        if ended is not None:
+        if filed and self._windows:
+            self._index_window_pages(stream, start, filed)
+        if ended is not None and not self._windows:
             self._cache_image_end(stream, chain, *ended)
+
+    def _index_window_pages(self, stream: CacheStream, start: int, filed: list[tuple[bytes, int]]) -> None:
+        """Offer the index each window page that ends on the first group's pages from ``start`` just filed, as
+        ``(rooted key, indexed page)``, while the stream still holds it. Before the window's release this commit,
+        which then leaves the index its owner. Each goes under the first-group page its last token is on, so the
+        tree keeps that page until its window pages are gone, and a window page outlives no chain that reaches it."""
+        page_size = self.config.tokens_per_page
+        stop = start + len(filed)
+        for g, group in self._windows:
+            part = stream.group(g)
+            first = part.released // group.page_size
+            for i in range(start * page_size // group.page_size, stop * page_size // group.page_size):
+                if not first <= i < first + len(part.page_indices):
+                    continue  # the window released it before its first-group page filled
+                key, parent = filed[self._ends_on(g, i) - start]
+                self._index.insert(self._window_key(key, g, i), part.page_indices[i - first], parent)
 
     def _evict(self, n: int) -> int:
         """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. Pages still waiting
@@ -1611,16 +1740,21 @@ class KVManager(AttentionResource):
                 continue
             stream.chain.extend(col[i].tolist(), page_size)
 
-    def _adopt(self, rid: str, stream: CacheStream, pages: list[int]) -> None:
-        """Make ``pages`` the whole of a stream that has written nothing yet.
+    def _adopt(self, rid: str, stream: CacheStream, pages: list[int], end: int = 0) -> None:
+        """Make ``pages`` the whole of a stream that has written nothing yet: with windows, a lease ending at
+        ``end``, which leaves each group as writing ``end`` tokens would (`_split`).
 
         Any pages the stream already holds are empty ones a refused admit left, so they are released.
         """
-        empty = stream.page_indices.tolist()
-        stream.page_indices.assign(pages)
+        empty = []
+        for part, group, held in zip(stream.groups, self._groups, self._split(pages, end), strict=True):
+            empty += part.page_indices.tolist()
+            part.page_indices.assign(held)
+            part.stored_len = len(held) * group.page_size
+            if part is not stream:
+                part.released = end - part.stored_len
         self._release(rid, stream, empty)
         self._readonly_epoch += 1
-        stream.stored_len = len(pages) * self.config.tokens_per_page
 
     def _release_lease(self, rid: str, stream: CacheStream, refund: bool = True) -> None:
         """Give back a lease `admit` never converted; a converted one is released
@@ -1974,12 +2108,18 @@ class KVManager(AttentionResource):
                         "the pages the lease holds for it"
                     )
                     whole = stream.lease_len // self.config.tokens_per_page
-                    self._adopt(segment.request_id, stream, stream.lease[:whole] + stream.lease[whole + 1:])
+                    first, *later = self._split(stream.lease, stream.lease_len)
+                    # the first group's whole pages, then past a cached image end the page it is copied onto
+                    self._adopt(
+                        segment.request_id, stream,
+                        first[:whole] + first[whole + 1:] + [page for part in later for page in part],
+                        stream.lease_len,
+                    )
                     stream.stored_len = stream.lease_len
                     # they came out of the index, so they are already in it
                     stream.chain.cursor = whole
                     # A cached image end stays leased until `plan` copies it on the step's stream.
-                    stream.lease = stream.lease[whole:whole + 1] or None
+                    stream.lease = first[whole:whole + 1] or None
                     if stream.lease is not None:
                         self._image_ends.append((segment.request_id, stream))
                     stream.converted = True
@@ -2982,7 +3122,7 @@ class KVManager(AttentionResource):
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
                         # Above one rank a hit is stamped at commit, which every rank runs in step order,
                         # so every rank evicts the same pages.
-                        self._index.touch(stream.page_indices[:stream.chain.cursor])
+                        self._index.touch(stream.page_indices[:stream.chain.cursor] + held_pages(stream.later))
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
                     policy = (
@@ -3115,7 +3255,9 @@ class KVManager(AttentionResource):
     ) -> int:
         """Release what ``policy`` no longer keeps of the stream's pages in group ``group``: the
         step's policy, or a group's. ``touch`` runs `_touch_plan_cache`. Under the lock."""
-        excess = stream.group(group).stored_len - policy.protected_prefix - policy.context_budget
+        part, page_size = stream.group(group), self._groups[group].page_size
+        excess = (len(policy.released_pages(part.stored_len + part.released, page_size)) * page_size
+                  - part.released)
         if excess <= 0:
             return 0
         if touch:
@@ -3167,7 +3309,12 @@ class KVManager(AttentionResource):
         part.stored_len -= k * page_size
         part.released += k * page_size
         part.generation += 1
-        self._release(rid, stream, freed)
+        if group:
+            # A window's pages only cycle: the pages it takes next replace these in its allotment, which only
+            # `_settle_window_allotment` trims, also when another request still holds one of them.
+            self._arena.release(freed)
+        else:
+            self._release(rid, stream, freed)
         self._recount(rid)
         return k * page_size
 
@@ -4198,10 +4345,13 @@ class KVManager(AttentionResource):
                 and overrides.get_labels(node_name, chain.spans[cursor.done].walk) == [label]
                 and self._keyed_label(rid, node_name, chain.spans[cursor.done].walk) == label
             ):
-                pages = self._index.pages_for(chain.rooted)[:len(chain.rooted) - 1]
+                # A window's pages take room like the stream's own (`_retain_window_match`), so only the first
+                # group's count.
+                end, pages = self._match(chain.rooted, len(chain.rooted) - 1)
+                pages = pages[:end // page_size]
                 whole += len(pages)
                 total = sum(span.length for span in chain.spans)
-                image_end = self._image_end(chain.rooted_ends, len(pages) * page_size, total)
+                image_end = None if self._windows else self._image_end(chain.rooted_ends, end, total)
                 if image_end is not None:
                     pages = pages + self._index.pages_for([image_end[1]])
             else:

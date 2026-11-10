@@ -791,9 +791,9 @@ The spec types are:
        among many full ones (1984-token sliding pages at 31 full and 1 sliding) a short
        window saves little. ``max_num_pages`` and ``cpu_offload_pages`` count pages of
        every layer at the declared ``page_size``, or at 128 tokens when it is unset, so
-       the pool's bytes don't move with the derived page. Such a cache doesn't prefix
-       cache yet, so its ``prefix_cache`` goes off (logged at info), and a serving config's
-       ``prefix_cache: true`` is refused. It doesn't fork, serve a node on another instance
+       the pool's bytes don't move with the derived page. Such a cache prefix caches its
+       window's pages as well; beside ``cpu_offload_pages`` its ``prefix_cache`` goes off
+       (logged at info), and a serving config's ``prefix_cache: true`` is refused. It doesn't fork, serve a node on another instance
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``

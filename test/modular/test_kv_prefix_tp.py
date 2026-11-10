@@ -40,15 +40,19 @@ def _stub_transfer(monkeypatch):
 
 def _manager(
     rank: int, max_num_pages: int = 32, opt_in: bool = True,
-    world_size: int = 2, shared: bool = False, **overrides,
+    world_size: int = 2, shared: bool = False, window: int | None = None, **overrides,
 ) -> KVManager:
     cfg = dict(
-        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
+        num_layers=1 if window is None else 3, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
         max_num_pages=max_num_pages, page_size=PAGE_SIZE, prefix_cache_tp=opt_in,
     )
     cfg.update(overrides)
+    cfg = PagedKVConfig(**cfg)
+    if window is not None:
+        # layers 1 and 2 keep the last ``window`` tokens, in pages of half the first layer's
+        cfg.keep_window(window, (1, 2))
     kv = KVManager(
-        cfg=PagedKVConfig(**cfg),
+        cfg=cfg,
         name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
         needs_remote_transfer=shared,
@@ -165,8 +169,9 @@ def _follower_worker(follower: KVManager) -> Worker:
     )
 
 
-def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
-    ranks = leader, follower = _manager(0), _manager(1)
+@pytest.mark.parametrize("window", [None, 24])
+def test_a_follower_takes_rank_0s_hit_and_never_probes_itself(window):
+    ranks = leader, follower = _manager(0, window=window), _manager(1, window=window)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
     _cache(ranks, "a", shared)
@@ -178,8 +183,12 @@ def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
 
     for kv in ranks:
         _run(kv, "b", prompt)
-    assert _pages(leader, "b") == _pages(follower, "b")
+    assert leader._streams["b"]["main"].pages() == follower._streams["b"]["main"].pages()
     assert _pages(leader, "b")[:5] == _pages(leader, "a")[:5], "b missed the prefix a cached"
+    if window is not None:
+        # The window page of tokens 72-80: a, at 83 tokens, holds window pages 7-10, and b, at 100, 9-12.
+        a, b = (leader._streams[rid]["main"].later[0] for rid in "ab")
+        assert a.page_indices[2] == b.page_indices[0], "b's sliding layers missed the window a cached"
 
 
 def test_ranks_evict_alike_however_their_probes_and_commits_interleave():

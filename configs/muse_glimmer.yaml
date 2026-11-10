@@ -10,8 +10,6 @@ resources:
     # 8K tokens or 24 of 32K, where keeping every layer's K/V held 31 or 7
     # (benchmark/kv_capacity.py).
     max_num_pages: 2048
-    # a pool that keeps a window doesn't prefix cache yet
-    prefix_cache: false
 
 node_groups:
   # Text and images. ~60 GB of bf16 weights: one 141 GB GPU (H200), or

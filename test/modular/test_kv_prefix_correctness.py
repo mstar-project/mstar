@@ -72,13 +72,19 @@ def _stub_transfer(monkeypatch):
 class _Node:
     """One node's KV and position resources, with a stand-in for its forward."""
 
-    def __init__(self, cached: bool = True):
+    def __init__(self, cached: bool = True, window: int | None = None):
         device = torch.device("cpu")
+        cfg = PagedKVConfig(
+            num_layers=2, num_kv_heads=1, head_dim=4, max_seq_len=4096,
+            max_num_pages=128, page_size=PAGE_SIZE,
+        )
+        if window is not None:
+            # Layer 1 keeps the last ``window`` tokens. The cache's pages then hold one group's layers each,
+            # which `_write` doesn't address, so nothing is written: a window test checks pages, not bytes.
+            cfg.keep_window(window, (1,))
+            self._write = lambda view, positions: None
         self.kv = KVManager(
-            cfg=PagedKVConfig(
-                num_layers=2, num_kv_heads=1, head_dim=4, max_seq_len=4096,
-                max_num_pages=128, page_size=PAGE_SIZE,
-            ),
+            cfg=cfg,
             name=KV, joint_comm_group=None, transfer_engine_info=None,
             device=device, dtype=torch.float32,
         )

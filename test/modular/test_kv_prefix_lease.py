@@ -453,6 +453,106 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
     kv.assert_pages_conserved()
 
 
+# ── a pool that keeps a window ──────────────────────────────────────────
+
+# Layer 0 keeps every token in pages of 16; layers 1 and 2 keep the last 24, three pages of 8.
+WINDOW = 24
+
+
+def _window_manager(max_num_pages: int = 64) -> KVManager:
+    cfg = PagedKVConfig(
+        num_layers=3, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+    )
+    cfg.keep_window(WINDOW, (1, 2))
+    kv = KVManager(
+        cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(ROOT)
+    return kv
+
+
+def _write(kv: KVManager, rid: str, tokens: list[int]) -> None:
+    """Probe, then write what the cache didn't serve in one step, whose commit files what it filled."""
+    kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(len(tokens))))
+    inputs = ARNodeInputs(input_seq_len=len(tokens))
+    prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
+    kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+    _grow(kv, rid, len(tokens) - (prefix.tokens if prefix is not None else 0))
+
+
+def test_a_repeat_on_a_window_pool_takes_the_window_pages_the_first_request_left_in_the_cache():
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    a = kv._streams["a"]["main"]
+    # at 100 tokens the window holds pages 9-12 (tokens 72-100); 9-11 end on the last whole full page
+    full, window = a.page_indices[:6], a.later[0].page_indices[:3]
+    lengths = (a.later[0].stored_len, a.later[0].released)
+    kv.remove_request("a")
+
+    _write(kv, "b", tokens)
+    b = kv._streams["b"]["main"]
+
+    assert b.page_indices[:6] == full, "the repeat recomputed the full layers' pages"
+    assert b.later[0].page_indices[:3] == window, (
+        "the repeat's sliding layers attend pages other than the ones that hold tokens 72-96"
+    )
+    assert (b.later[0].stored_len, b.later[0].released) == lengths, (
+        "the repeat's window doesn't stand where writing the prompt would have left it"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_a_window_page_missing_from_the_cache_moves_the_hit_back_below_it():
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    kv.remove_request("a")
+    rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
+    kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, 10)], 1, 10)))
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+
+    # tokens 80-88 are gone from the window, so the hit ends at 80, whose window (56-80) is whole
+    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens == 80
+    kv.assert_pages_conserved()
+
+
+def test_eviction_takes_window_pages_before_the_full_page_they_end_on():
+    kv = _window_manager()
+    _write(kv, "a", list(range(100)))
+    full = kv._streams["a"]["main"].page_indices[:6]
+    kv.remove_request("a")
+    window = kv._index.num_pages() - len(full)
+
+    kv._evict(window)
+
+    assert all(kv._index.holds(page) for page in full), (
+        "eviction dropped a full layers' page while window pages that only it reaches stayed cached"
+    )
+
+
+@pytest.mark.parametrize("other", [0, 80])
+def test_a_window_lease_cut_below_its_end_keeps_nothing_or_raises(other):
+    """Past the window, a shorter prefix needs window pages the lease doesn't hold: a declined
+    hit gives the lease back, and any other cut is refused rather than served wrong."""
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    kv.remove_request("a")
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+    runner = StepRunner({"kv": kv, "other": _Holding(other)}, node_resources={NODE: ["kv", "other"]})
+    matched = runner.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100))
+
+    if other:
+        with pytest.raises(RuntimeError, match="window"):
+            runner.apply_cached_prefix("b", NODE, WALK, None, matched)
+    else:
+        runner.apply_cached_prefix("b", NODE, WALK, None, matched)
+        assert kv._streams["b"]["main"].lease is None
+        kv.assert_pages_conserved()
+
+
 # ── what is done with the lock down ─────────────────────────────────────
 
 
@@ -560,3 +660,4 @@ def test_a_chain_extension_raced_by_a_remove_raises_nothing(monkeypatch):
             f"postprocess path: {error!r}"
         )
     kv.assert_pages_conserved()
+
