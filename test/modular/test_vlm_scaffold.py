@@ -401,6 +401,9 @@ def test_a_second_decode_walk_in_the_graph_is_a_decode_walk_everywhere():
     assert llm.get_stop_policies("decode_other")["decode_loop"].eos_tokens == frozenset({7})
     (decode,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
     assert decode.replay_graph_walks == ["decode", "decode_other"]
+    # each decoder node takes its own graph's walks: one in no decode loop is refused
+    with pytest.raises(ValueError, match="no walk runs Drafter"):
+        model.get_submodule("Drafter")
 
 
 def test_qwen_media_capture_stages_every_media_buffer():

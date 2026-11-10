@@ -220,8 +220,8 @@ class MultimodalDecoderModel(Model):
 
     def decoder_walks(self) -> DecoderWalks:
         """The LLM node's decode and hidden walks, read off this model's graph:
-        what `get_submodule` binds to its node, and what the mixed step and the KV growth
-        name."""
+        what the mixed step and the KV growth name, and what `get_submodule`
+        binds to that node."""
         return decoder_walks(self.get_graph_walk_graphs(), "LLM", self.DECODE_LOOP)
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
@@ -495,8 +495,9 @@ class MultimodalDecoderModel(Model):
             dtype = autocast_dtype or torch.bfloat16
             submodule = self._create_submodule(node_name, device, dtype, tp_group)
             if isinstance(submodule, SampledTokenDecoder):
-                # the walks it decodes in are the graph's, whatever the model built
-                submodule.bind_walks(self.decoder_walks())
+                # the walks this node decodes in are the graph's, whatever the model built;
+                # a decoder node in no decode loop is refused
+                submodule.bind_walks(decoder_walks(self.get_graph_walk_graphs(), node_name, self.DECODE_LOOP))
             self._submodule_cache[node_name] = submodule
             if tp_group is not None and tp_group.world_size > 1:
                 # the LLM's norms reduce its row-parallel partial sums in one
