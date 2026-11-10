@@ -1091,6 +1091,16 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner,
 
 ERR_TAIL = 4096  # how much of a box session's stderr, redacted, the run's artifact keeps: its last 4 KB
 ERR_READ = 65536  # how much of its end is read and redacted, to keep ERR_TAIL of it
+# what the workflow's "Keep the report" uploads from each box's results
+UPLOADED = ("report.md", "result.json", "progress.log", "claude.err.tail")
+
+
+def remove(path):
+    """Remove whatever is at `path`: a directory with all it holds, or anything else."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def redact(out, runner_temp, s2="", s3="", s4=""):
@@ -1098,13 +1108,15 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
     the kept reports and the artifact all get the redacted copy: the exact values of the secrets this job
     holds (S2-S4), then bot.redact's credential patterns, which also strip a box's own Anthropic key. For a box
     with no pass, partial or fail, the redacted tail of its session's stderr (claude.err.tail, for the artifact),
-    so a session that died at once leaves its reason."""
+    so a session that died at once leaves its reason. First, anything but a regular file at a path the artifact
+    uploads (UPLOADED) goes: redact would skip it, and the upload would take a directory's files unredacted."""
     exact = (s2, s3, s4)
     for box in boxes(Path(runner_temp, "lt")):
+        for path in (box / "results" / name for name in UPLOADED):
+            if path.is_symlink() or not path.is_file():
+                remove(path)
         tail = box / "results/claude.err.tail"  # only this step writes it: whatever the box left there goes
-        if tail.is_dir():
-            shutil.rmtree(tail)
-        tail.unlink(missing_ok=True)
+        remove(tail)
         for f in (box / "results/report.md", box / "unavailable.md"):
             if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
                 f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))

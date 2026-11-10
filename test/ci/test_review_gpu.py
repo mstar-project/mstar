@@ -502,7 +502,10 @@ class TestComment(unittest.TestCase):
             (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key " + lined.encode()
                                                    + b"\n" + split + b"\n")
             (results / "progress.log.redacted").mkdir()  # the box's, in the way of a fixed temporary name
+            (results / "report.md").mkdir()  # the box's: a directory the artifact would upload unredacted
+            (results / "report.md/notes").write_text(lined)
             gpu_review.redact({}, temp, s2=key, s3=lined)
+            self.assertFalse((results / "report.md").exists(), "a directory's files would be uploaded unredacted")
             self.assertEqual((results / "progress.log").read_text(),
                              "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n"
                              "[REDACTED]\n" + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
