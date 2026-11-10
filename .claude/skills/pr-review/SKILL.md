@@ -616,11 +616,10 @@ judgement, as the summary's status line counts them) and no skipped file. Otherw
 and asks for `/review` again; an open question and the design risk don't hold it back, though both
 still stop approval.
 
-The bot overrides the review's call in one case: when the PR's last live test failed or was
-partial, the live test runs in full, with both kinds of check, whatever the review asked for, so a
-failure is never hidden behind a narrower run. An earlier live test that was unavailable or ended
-with no verdict leaves your call as it is unless a conclusive one before it failed or was partial; so
-does none at all. A re-review with `untestable` set is exempt:
+The bot overrides the review's call in one case: when the PR's last live test failed, was partial
+or left no valid verdict, the live test runs in full, with both kinds of check, whatever the review
+asked for, so a failure is never hidden behind a narrower run. An earlier live test that was
+unavailable leaves your call as it is unless one before it failed; so does none at all. A re-review with `untestable` set is exempt:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
 run" with your reason, and a person approves.
