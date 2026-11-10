@@ -13,6 +13,9 @@
 * :class:`Finish`, last, with why the reply ended and its usage.
 
 A failed reply has no ``Finish``.
+
+``template_level`` is the request side the two agent routes share: the
+template's reasoning level for the effort a client names.
 """
 
 from __future__ import annotations
@@ -139,6 +142,16 @@ def _passed(deltas: list[dict], matcher: StopMatcher | None, out: list) -> str |
         if stop is not None:
             return stop
     return None
+
+
+def template_level(rank: int, efforts: tuple[str, ...], asked: str) -> str:
+    """The template's reasoning level for an effort of ``rank`` (0 low, 1 medium,
+    2 high, 3 the client's top), by GLM's level names; a template without that one
+    takes its lowest. High stays high: GLM's max nearly doubles an agent's output tokens."""
+    if not efforts:
+        raise ValueError(f"{asked}: this model has no reasoning levels")
+    wanted = ("low", "high", "high", "max")[rank]
+    return wanted if wanted in efforts else efforts[0]
 
 
 def submit(api, request_id: str, model_name: str, req, args) -> str:

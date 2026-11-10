@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from mstar.api_server.openai import reply, serving_responses
+from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
 from mstar.model.base import ProcessPromptOutput
@@ -275,7 +275,7 @@ def _output_config(config, efforts: tuple[str, ...]) -> dict:
         return {}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"output_config.effort takes low, medium, high or max; got {effort!r}")
-    return {"reasoning_effort": serving_responses.template_level(
+    return {"reasoning_effort": reply.template_level(
         _EFFORT_RANK[effort], efforts, f"output_config.effort={effort!r}")}
 
 
