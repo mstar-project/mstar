@@ -485,10 +485,12 @@ so attaching more files does not multiply them.
        64x64: 3 bytes a pixel for uint8 frames, 15 for a loader that also
        holds their float32 copy. Over it, the request gets a 400. At 1080p30
        the default refuses clips over about 3.5 s on Cosmos3, which decodes
-       every frame and converts it to float, and over about 259 s on
-       Qwen3-Omni and Qwen3.5, which decode 2 uint8 frames a second
-       (Qwen3-Omni decodes every frame, about 17 s, when the clip's header
-       gives no frame count).
+       every frame and converts it to float; over about 52 s on Qwen3-Omni,
+       which decodes 2 frames a second and resizes them through a float32
+       copy (about 13.6 s when the clip's header gives no frame count and it
+       decodes every frame); and over about 259 s on Qwen3.5, which decodes
+       2 uint8 frames a second. It bounds the decode, not what the model's
+       preprocessing makes of the frames afterwards.
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``
      - Images, audio clips and videos one request may attach, together (see

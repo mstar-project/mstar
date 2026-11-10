@@ -4,6 +4,7 @@ import pathlib
 import struct
 import sys
 import types
+import weakref
 import zlib
 from dataclasses import dataclass
 
@@ -421,6 +422,31 @@ def test_cosmos3_pyav_fallback_stops_at_the_budget(tmp_path, monkeypatch):
     assert model.load_video(path, "cpu").data.shape[0] == 10
 
 
+def test_cosmos3_pyav_fallback_frees_its_frames_before_the_float_copy(tmp_path, monkeypatch):
+    """The fallback is charged for its uint8 frames and their float copy, which
+    is its peak only if the decoded frames are gone before the copy is made."""
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    path = _mp4(tmp_path / "clip.mp4", frames=10)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
+    decoded, alive_at_copy = [], []
+    from_numpy, to_float = torch.from_numpy, torch.Tensor.float
+
+    def track(array):
+        decoded.append(weakref.ref(array))
+        return from_numpy(array)
+
+    def float_copy(tensor, *args, **kwargs):
+        alive_at_copy.append(sum(ref() is not None for ref in decoded))
+        return to_float(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "from_numpy", track)
+    monkeypatch.setattr(torch.Tensor, "float", float_copy)
+    object.__new__(Cosmos3Model).load_video(path, "cpu")
+    assert len(decoded) == 10
+    assert alive_at_copy == [0]
+
+
 def test_a_tiny_frame_counts_as_the_minimum(monkeypatch):
     """Millions of 2x2 frames fit 3 GiB at 3 bytes a pixel but cost about 2 KB each once
     decoded; every frame is charged at least MIN_FRAME_PIXELS."""
@@ -507,13 +533,20 @@ def test_qwen3_omni_without_a_header_count_decodes_with_the_counting_reader(tmp_
     monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_BYTES))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         load_video(None, mkv, "cpu")
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 20 * RGB_BYTES))
+    # the whole clip, then the float32 copy fetch_video's resize makes of the 4 sampled frames
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12)))
     assert tuple(load_video(None, mkv, "cpu").data.shape) == (4, 3, 64, 64)
     assert sampled == []
 
-    # a header with a frame count is charged first, and the sampled reader then runs
+    # a header with a frame count is charged first, the sampled frames and their
+    # float32 copy, and the sampled reader then runs
     mp4 = _mp4(tmp_path / "clip.mp4", frames=10)
     assert probe_video(mp4) is not None
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES - 1))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
+        load_video(None, mp4, "cpu")
+    assert sampled == []
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_AND_FLOAT_BYTES))
     load_video(None, mp4, "cpu")
     assert sampled == [mp4]
     assert vision.VIDEO_READER_BACKENDS["decord"].__wrapped__ is decord
@@ -532,7 +565,11 @@ def test_the_whole_clip_reader_counts_frames_as_it_decodes(tmp_path, monkeypatch
     monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 4 * RGB_BYTES))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
         read_video_whole_budgeted({"video": path})
-    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * 20 * RGB_BYTES))
+    # the whole clip, then the float32 copy fetch_video's resize makes of the 4 sampled frames
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12) - 1))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_BYTES"):
+        read_video_whole_budgeted({"video": path})
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_BYTES", str(64 * 64 * (10 * RGB_BYTES + 4 * 12)))
     video, metadata, sample_fps = read_video_whole_budgeted({"video": f"file://{path}"})
     assert video.shape == (4, 3, 64, 64) and video.dtype == torch.uint8
     assert metadata["total_num_frames"] == 10 and metadata["frames_indices"].tolist() == [0, 3, 6, 9]

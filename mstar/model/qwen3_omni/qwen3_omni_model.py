@@ -70,7 +70,7 @@ from mstar.model.base import (
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
-from mstar.model.media_limits import VideoBudget, probe_video
+from mstar.model.media_limits import RGB_AND_FLOAT_BYTES, VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -968,11 +968,13 @@ class Qwen3OmniModel(Model):
         from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
 
         install_budgeted_readers(VIDEO_READER_BACKENDS)
-        # the sampled readers decode the frames fetch_video samples, at full size before resizing them
+        # the sampled readers decode the frames fetch_video samples at full size, and
+        # its bicubic resize holds a float32 copy of them beside them
         probe = probe_video(filepath)
         if probe is not None:
             total, fps, height, width = probe
-            VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
+            sampled = smart_nframes({"video": filepath}, total_frames=total, video_fps=fps)
+            VideoBudget().add(height, width, sampled, bytes_per_pixel=RGB_AND_FLOAT_BYTES)
         with header_charged(probe is not None):
             video_input, video_sample_fps = fetch_video(
                 {"video": filepath},

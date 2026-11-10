@@ -1255,10 +1255,13 @@ class Cosmos3Model(Model):
                 frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
         if not frames:
             raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float().div_(255.0)
+        video = torch.stack(frames)
+        num_frames = len(frames)
+        del frames  # freed before the float copy, as the budget counts them
+        video = video.to(device).float().div_(255.0)
         metadata = {
-            "num_frames": len(frames), "average_fps": fps,
-            "duration_seconds": (len(frames) / fps) if fps else None,
+            "num_frames": num_frames, "average_fps": fps,
+            "duration_seconds": (num_frames / fps) if fps else None,
             "height": int(video.shape[-2]), "width": int(video.shape[-1]),
         }
         return TensorAndMetadata(data=video, metadata=metadata)
