@@ -24,9 +24,8 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
 )
-from mstar.engine.resources.lora.config import LoraStep
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
 from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, node_resources, state_setup, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
@@ -48,7 +47,7 @@ from mstar.model.ltx2_5.config import (
 )
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
 from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape
-from mstar.model.submodule_base import NodeInputs, engine_step, lora_rows
+from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.model.wan22.components.dit import Wan22DiTAttention
 from mstar.model.wan22.config import SELF_ATTN, Wan22Config
 from mstar.model.wan22.submodules import Wan22DitSubmodule, WanStepKey
@@ -264,21 +263,21 @@ def test_a_lora_pool_gets_its_rows_from_the_steps_segments_as_before():
     model = _klein()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
     key = _klein_key()
-    declared = lora_rows(sub.declare_step("gen", [0, 1], [_inputs(key)] * 2), ("lora",))
-    assert isinstance(declared.steps["lora"], LoraStep)
-    assert list(declared.steps["lora"].segments) == [Segment(rid, "main", key.total_tokens) for rid in (0, 1)]
+    declared = with_segment_steps(sub.declare_step("gen", [0, 1], [_inputs(key)] * 2), ("lora",))
+    segments = tuple(Segment(rid, "main", key.total_tokens) for rid in (0, 1))
+    assert declared.steps["lora"] == ResourceStep(segments=segments)
 
 
-def test_engine_step_runs_the_expansion_after_the_lora_rows():
+def test_engine_step_runs_the_expansion_after_the_lora_pools_step():
     model = _klein()
     sub = SimpleNamespace(
         declare_step=KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
         .declare_step,
-        lora_keys=("lora",),
+        segment_keys=("lora",),
         state_handles=node_handles(model, "dit", {KLEIN_ATTN: _StubRagged()}),
     )
     step = engine_step(sub, "gen", [0], [_inputs(_klein_key())])
-    assert isinstance(step.steps["lora"], LoraStep) and isinstance(step.steps[KLEIN_ATTN], AttentionStep)
+    assert type(step.steps["lora"]) is ResourceStep and isinstance(step.steps[KLEIN_ATTN], AttentionStep)
 
 
 # One compiled frame per attention, not one per layer
