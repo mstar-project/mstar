@@ -14,7 +14,6 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.linear_attn.gdn_kernels import (
-    FlashInferGDNKernels,
     GDNDecodeKernel,
     GDNDecodePlan,
     GDNKernels,
@@ -121,7 +120,8 @@ class GDNPrefillWrapper(GDNWrapper):
         has_sink_state: bool = True,
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
-        kernels: GDNKernels | None = None,
+        *,
+        kernels: GDNKernels,
     ):
         super().__init__(
             device=device,
@@ -132,8 +132,6 @@ class GDNPrefillWrapper(GDNWrapper):
             null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
-        if kernels is None:
-            kernels = FlashInferGDNKernels(has_sink=has_sink_state)
         self._kernel: GDNPrefillKernel = (
             kernels.captured_prefill(bs, num_tokens) if accelerator_graph
             else kernels.chunked_prefill()
@@ -416,7 +414,8 @@ class GDNDecodeWrapper(GDNWrapper):
         bs: int | None=None,
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
-        kernels: GDNKernels | None = None,
+        *,
+        kernels: GDNKernels,
     ):
         super().__init__(
             device=device,
@@ -426,8 +425,6 @@ class GDNDecodeWrapper(GDNWrapper):
             accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
-        if kernels is None:
-            kernels = FlashInferGDNKernels(has_sink=null_slot_id >= 0)
         self._kernel: GDNDecodeKernel = kernels.decode(bs if accelerator_graph else None)
 
         self._plan_state: GDNDecodePlan | None = None
@@ -540,7 +537,8 @@ class GDNMixedWrapper(GDNWrapper):
         null_slot_id: int = 0,
         # the prefill half's prompt rows under capture; eagerly, the step's own
         max_prefill_rows: int | None = None,
-        kernels: GDNKernels | None = None,
+        *,
+        kernels: GDNKernels,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id, num_tokens=num_tokens, bs=bs,
@@ -549,8 +547,6 @@ class GDNMixedWrapper(GDNWrapper):
         if accelerator_graph and max_prefill_rows is None:
             raise ValueError("GDNMixedWrapper: a captured split needs max_prefill_rows")
         self._max_prefill_rows = max_prefill_rows
-        if kernels is None:
-            kernels = FlashInferGDNKernels(has_sink=has_sink_state)
         # A prefill kernel that stages its inputs normalises its own q/k and
         # reads the strided views, as the decode half can. Otherwise the caller
         # normalises and copies for both halves, which are built not to

@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.linear_attn.wrappers import GDNPrefillWrapper
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -125,6 +126,7 @@ def make_wrapper(device, has_sink: bool, accelerator_graph: bool = False):
         num_tokens=BUCKET_TOKENS if accelerator_graph else None,
         bs=4 if accelerator_graph else None,
         accelerator_graph=accelerator_graph,
+        kernels=FlashInferGDNKernels(has_sink=has_sink),
     )
 
 

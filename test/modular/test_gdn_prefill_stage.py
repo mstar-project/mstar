@@ -89,7 +89,7 @@ def test_mixed_wrapper_normalizes_decode_rows_once(stage_inputs):
 
 
 def test_decode_wrapper_is_untouched():
-    decode = GDNDecodeWrapper(device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID)
+    decode = GDNDecodeWrapper(device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, kernels=_kernels(False))
     assert decode.qk_l2norm_in_kernel and decode.takes_strided_inputs
 
 
@@ -259,7 +259,7 @@ def test_chunked_kernel_agrees_through_either_path():
     has_state = torch.zeros(rows, dtype=torch.bool, device=_CUDA)
 
     def run(stage_inputs):
-        wrapper = GDNPrefillWrapper(stage_inputs=stage_inputs, **kwargs)
+        wrapper = GDNPrefillWrapper(kernels=_kernels(stage_inputs), **kwargs)
         wrapper.plan(list(spans), slots, has_state)
         state = torch.zeros(4, 32, 128, 128, device=_CUDA)
         if stage_inputs:
