@@ -297,11 +297,11 @@ DO_SIZES = [  # two pages, as the API pages them
                 "price_hourly": 0.00893, "regions": ["nyc1"], "available": True, "description": "Basic"},
                do_size("gpu-h100x1-80gb", "nvidia_h100", 1, 80, 3.39),
                do_size("gpu-h100x8-640gb", "nvidia_h100", 8, 80, 23.92),
-               do_size("gpu-h200x1-141gb", "nvidia_h200", 1, 141, 3.44, available=False),
+               do_size("gpu-h200x1-141gb", "nvidia_h200", 1, 141, 3.44, regions=()),  # "available", in no region
                do_size("gpu-l40sx1-48gb", "nvidia_l40s", 1, 48, 1.57)],
      "links": {"pages": {"last": "https://api.digitalocean.com/v2/sizes?page=2",
                          "next": "https://api.digitalocean.com/v2/sizes?page=2"}}, "meta": {"total": 10}},
-    {"sizes": [do_size("gpu-mi300x1-192gb", "amd_mi300x", 1, 192, 1.99, regions=()),  # sold, but no region listed
+    {"sizes": [do_size("gpu-mi300x1-192gb", "amd_mi300x", 1, 192, 1.99, regions=()),  # likewise
                do_size("gpu-h200x8-1128gb-contracted", "nvidia_h200", 8, 141, 27.52),
                do_size("gpu-h100x1-80gb-spot", "nvidia_h100", 1, 80, 1.99),
                do_size("gpu-b300x1-288gb-lc-spot", "nvidia_b300", 1, 288, 6.17),
@@ -371,13 +371,15 @@ class TestDigitalOcean(unittest.TestCase):
         self.assertEqual(self.offers("nvidia"), {
             "digitalocean:gpu-h100x1-80gb": ("nvidia", "NVIDIA H100", 1, 3.39, "available"),
             "digitalocean:gpu-h100x8-640gb": ("nvidia", "NVIDIA H100", 8, 23.92, "available")},
-            "a size under 80 GB, sold only under contract or as spot, or not available would be offered")
+            "a size under 80 GB, sold only under contract or as spot, or in no region would be offered")
         self.assertEqual(self.offers("amd"), {
-            "digitalocean:gpu-mi300x1-192gb": ("amd", "AMD MI300X", 1, 1.99, "available"),
             "digitalocean:gpu-mi300x8-1536gb": ("amd", "AMD MI300X", 8, 15.92, "available")},
-            "an MI300X size that lists no region would never be offered, though a create without one takes it")
+            "a size listed available but in no region would be offered, and its create refused")
         self.assertEqual(list(self.offers("amd", gpus=2)), ["digitalocean:gpu-mi300x8-1536gb"])
-        self.assertIn("digitalocean:gpu-h200x1-141gb", self.offers("nvidia", all_regions=True))
+        self.assertEqual(self.offers("nvidia", all_regions=True)["digitalocean:gpu-h200x1-141gb"][-1], "none",
+                         "--all-regions would hide a size a person may want to see")
+        with self.assertRaises(SystemExit, msg="a size whose regions emptied since the listing would be created"):
+            GPU["find_offer"]({}, "digitalocean:gpu-mi300x1-192gb")
 
     def launch(self, run, inputs=(), dry_run=False, offer="digitalocean:gpu-mi300x1-192gb", gpu="AMD MI300X",
                count=1, cfg=None):
@@ -385,7 +387,7 @@ class TestDigitalOcean(unittest.TestCase):
         key = Path(tempfile.mkdtemp()) / "key.pub"
         key.write_text("ssh-ed25519 AAAA test")
         GPU["find_offer"] = lambda cfg, oid: {"id": offer, "provider": "digitalocean", "gpu": gpu, "count": count,
-                                              "usd_per_hour": 1.99, "region": "any", "storage": True}
+                                              "usd_per_hour": 1.99, "region": "ric1", "storage": True}
         args = argparse.Namespace(boxes=1, offer=offer, pr=7, hours=1, tag="1-1-amd", run=run, input=list(inputs),
                                   allow_over_budget=False, dry_run=dry_run)
         cfg = {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4},
@@ -408,7 +410,7 @@ class TestDigitalOcean(unittest.TestCase):
             self.assertNotIn("sk-ant-box", self.printed, "a dry run would print the box's key")
             created = self.launch(str(box), [str(body)], cfg=cfg)
         self.assertEqual(created["image"], "gpu-amd-base", "an AMD box would boot an image with no ROCm")
-        self.assertNotIn("region", created, "a size with no region listed would be asked for where it isn't")
+        self.assertEqual(created["region"], "ric1", "the create would land where the size isn't, and be refused")
         self.assertEqual(created["ssh_keys"], ["f"], "the box would get a root password, not the runner's key")
         header, config = created["user_data"].split("\n", 1)
         self.assertEqual(header, "#cloud-config")

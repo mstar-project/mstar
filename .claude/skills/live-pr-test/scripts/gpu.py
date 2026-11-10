@@ -595,14 +595,16 @@ class Eras(Provider):
 
 
 class DigitalOcean(Provider):
-    """GPU Droplets: one offer per size, created wherever DigitalOcean has it (no region asked for)."""
+    """GPU Droplets: one offer per size, created in the first region its listing names. /v2/sizes marks every GPU
+    size available, but only a size's `regions` are where it can launch now, and a create elsewhere is refused
+    ("Size is not available in this region"); a size with none can't start, and only --all-regions lists it."""
     name, key_env = "digitalocean", "DIGITALOCEAN_TOKEN"
     vendors = ("nvidia", "amd")
     takes_run = True
 
     @classmethod
-    def pool(cls, cfg, offer_id):
-        return cls(cfg).offers(1, 0, True)
+    def pool(cls, cfg, offer_id):  # read again at launch: a size whose regions emptied since is "no longer available"
+        return cls(cfg).offers(1, 0, False)
 
     def offers(self, gpus, min_vram, all_regions, allow_arm=False):
         offers = []
@@ -612,13 +614,15 @@ class DigitalOcean(Provider):
             vram = (g.get("vram") or {}).get("amount") or 0
             # Contracted sizes are sold under a contract, never created self-serve; a spot size can be taken
             # back mid-run, which would lose the test.
+            regions = s.get("regions") or []
             if vendor_of(gpu) not in self.vendors or (g.get("count") or 0) < gpus or vram < min_vram \
-                    or s["slug"].endswith(("-contracted", "-spot")) or not (s.get("available") or all_regions):
+                    or s["slug"].endswith(("-contracted", "-spot")) or not (regions or all_regions):
                 continue
             offers.append({
                 "id": f"digitalocean:{s['slug']}", "provider": "digitalocean", "gpu": gpu, "count": g["count"],
-                "vram_gb": vram, "region": "any", "usd_per_hour": round(s["price_hourly"], 2),
-                "availability": "available" if s.get("available") else "none", "storage": True,
+                "vram_gb": vram, "region": regions[0] if regions else "none",
+                "usd_per_hour": round(s["price_hourly"], 2),
+                "availability": "available" if regions else "none", "storage": True,
             })
         return offers
 
@@ -627,7 +631,8 @@ class DigitalOcean(Provider):
         image = ("gpu-amd-base" if vendor_of(o["gpu"]) == "amd" else
                  "gpu-h100x8-base" if o["count"] > 1 else "gpu-h100x1-base")
         key = "<registered at launch>" if args.dry_run else digitalocean_ssh_key(pubkey, name)
-        body = {"name": name, "size": o["id"].split(":", 1)[1], "image": image, "ssh_keys": [key]}
+        body = {"name": name, "size": o["id"].split(":", 1)[1], "region": o["region"], "image": image,
+                "ssh_keys": [key]}
         if args.run:
             secret = self.cfg.get("digitalocean", {}).get("run_secret_env")
             if secret and not args.dry_run and not os.environ.get(secret):
