@@ -1041,8 +1041,9 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
         err = box / "results/claude.err"
         if err.is_file() and fields.get("verdict") not in ("pass", "partial", "fail"):
             tail = bot.redact(err.read_text(errors="replace"), exact=exact)  # whole, so no secret is cut in two
-            if len(tail) > ERR_TAIL:
-                tail = tail[-ERR_TAIL:].partition("\n")[2]
+            if len(tail) > ERR_TAIL:  # from a line's start, unless the last line alone is longer
+                cut = tail[-ERR_TAIL:]
+                tail = cut.partition("\n")[2] or cut
             (box / "results/claude.err.tail").write_text(tail)
 
 
