@@ -125,7 +125,7 @@ class Glm52Model(Model):
             if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
                 raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
+            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:

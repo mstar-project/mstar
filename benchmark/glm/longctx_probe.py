@@ -9,7 +9,7 @@ median chunk gap, token counts and whether the reply names the key, or a refusal
 without it the reply ends where the model stops, which is how retrieval is judged. Pointed at
 vLLM or SGLang (``--url``, ``--model``) it gives numbers to compare. For example::
 
-    mstar-serve --config glm5_next_longctx.yaml   # glm5_next_tp8.yaml + docs/models.rst's long-context override
+    mstar-serve --config configs/glm5_next_tp8_longctx.yaml
     python -m benchmark.glm.longctx_probe --tokenizer zai-org/GLM-5.3-Flash \\
         --lengths 4000,32000,128000 --reps 2 --max-tokens 256 --ignore-eos --output probe.jsonl
 """

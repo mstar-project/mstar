@@ -25,35 +25,6 @@
         "*": {"impl": "triton", "config": {"path": "grouped", "router": {"bk": 256, "splits": 16, "warps": 2}}}
       },
       "measured": {"1": {"us": 24.15, "default_us": 29.85}, "2": {"us": 31.12, "default_us": 33.38}, "4": {"us": 51.94, "default_us": 53.52}, "5": {"us": 63.94, "default_us": 70.87}, "6": {"us": 75.37, "default_us": 81.02}, "8": {"us": 89.78, "default_us": 90.45}}
-    },
-    {
-      "dtype": "float8_e4m3fn",
-      "shape": {"E": 288, "H": 4096, "I": 512, "K": 8},
-      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-04", "harness": "python -m benchmark.kernels.sweep moe_decode --dtype float8_e4m3fn --shape H=4096,E=288,I=512,K=8 --buckets 1,2,3,4,5,6,7,8,12,16,32", "torch": "2.11.0+cu129", "triton": "3.6.0", "note": "GLM-5.3-Flash routed experts at TP4 (hidden 4096, 288 experts, 512/rank, top-8), tree 7ab5a812a. measured: one layer's routed + shared experts, CUDA-graph replay, us a call, default_us the built-in H200 table"},
-      "rows": {
-        "1": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 8, "bk": 1024, "bjs": 32, "bks": 256, "warps": 4}, "down": {"bn": 16, "bc": 256, "warps": 8}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "2": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 16, "bk": 256, "bjs": 32, "bks": 128, "warps": 2}, "down": {"bn": 32, "bc": 256, "warps": 8}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "3": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 8, "bk": 512, "bjs": 32, "bks": 128, "warps": 4}, "down": {"bn": 32, "bc": 256, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "4": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 16, "bk": 256, "bjs": 16, "bks": 128, "warps": 4}, "down": {"bn": 32, "bc": 128, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "5": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 8, "bk": 512, "bjs": 32, "bks": 128, "warps": 4}, "down": {"bn": 32, "bc": 128, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "6": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 16, "bk": 256, "bjs": 16, "bks": 256, "warps": 4}, "down": {"bn": 32, "bc": 256, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "7": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 8, "bk": 512, "bjs": 32, "bks": 128, "warps": 4}, "down": {"bn": 16, "bc": 256, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "12": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 16, "bk": 256, "bjs": 16, "bks": 256, "warps": 4}, "down": {"bn": 32, "bc": 256, "warps": 4}, "router": {"bk": 256, "splits": 16, "warps": 2}}},
-        "*": {"impl": "triton", "config": {"path": "grouped", "router": {"bk": 256, "splits": 16, "warps": 2}}}
-      },
-      "measured": {
-        "1": {"us": 28.1, "default_us": 29.51, "triton_us": 28.1},
-        "2": {"us": 37.5, "default_us": 39.85, "triton_us": 37.5},
-        "3": {"us": 49.65, "default_us": 58.26, "triton_us": 49.65},
-        "4": {"us": 65.19, "default_us": 65.3, "triton_us": 65.01},
-        "5": {"us": 77.98, "default_us": 80.68, "triton_us": 77.98},
-        "6": {"us": 88.65, "default_us": 101.94, "triton_us": 88.65},
-        "7": {"us": 109.13, "default_us": 116.05, "triton_us": 109.13},
-        "8": {"us": 117.33, "default_us": 121.6, "triton_us": 117.33},
-        "12": {"us": 165.81, "default_us": 172.66, "triton_us": 165.81},
-        "16": {"us": 223.21, "default_us": 222.56, "triton_us": 222.5},
-        "32": {"us": 340.87, "default_us": 340.85, "triton_us": 341.19}
-      }
     }
   ]
 }

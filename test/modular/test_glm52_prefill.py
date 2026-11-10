@@ -205,7 +205,7 @@ def test_prefill_buckets_past_the_context_limit_skip_small_batches(monkeypatch):
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]
 
 
-@pytest.mark.parametrize("name", ["glm52_tp8.yaml"])
+@pytest.mark.parametrize("name", ["glm52_tp8.yaml", "glm52_tp8_mtp.yaml"])
 def test_a_shipped_config_s_ladders_reach_their_batch_sizes(name):
     """The YAML's ``prefill_token_buckets`` mapping passes the load-time checks and, as the
     engine applies it, captures one request's prefill on the fine ladder and a batch's on

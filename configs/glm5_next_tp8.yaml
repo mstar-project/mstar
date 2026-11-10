@@ -1,41 +1,37 @@
 model: "glm5_next"
-# GLM-5.3-Flash on 8x H200 (TP8): the 306 GB fp8 checkpoint is ~38 GB/rank. Resolve the
-# checkpoint through the HF cache (HF_HOME) or pass model_kwargs.checkpoint_path.
-# glm5_next_tp4.yaml is the same deployment on 4 GPUs. docs/models.rst has the overrides
-# for greedy workloads (MTP drafting, 15-53% faster) and for long context.
-#
-# The context is index_topk, 2048 tokens, where dense MLA computes exactly what DSA would.
+# GLM-5.3-Flash on 8 GPUs of 80 GB: the 306 GB fp8 checkpoint is ~38 GB/rank at
+# TP8. Resolve the checkpoint through the HF cache (HF_HOME) or pass
+# model_kwargs.checkpoint_path.
 max_seq_len: 2048
-# The largest captured decode batch: past it the scheduler splits decode into two steps.
-# One request per KDA slot below, so a prefill never waits in the worker for a slot.
+# One request per KDA slot below: past them a prefill would wait in the worker
+# for a slot, which stalls decode speculation.
 max_concurrent_requests: 64
-# FlashInfer's one-kernel all-reduce: 3.7-5.9 us a decode call on 8x H200, against
-# symm_multimem's 5.8-9.6. Messages past 32 MiB (a 4096-token step) go to NCCL.
+# FlashInfer's one-kernel all-reduce, faster than symm_multimem at decode sizes
+# and past 2 MB
 tp_allreduce: "flashinfer"
+# a 4096-token prefill bucket moves 32 MiB per all-reduce
 tp_allreduce_max_kb: 32768
+tp_async_sched: true
 model_kwargs:
-  # the fused fp8 MoE kernel, which is what lets decode capture
+  # the fused fp8 MoE kernel where it runs, which is what lets decode capture;
+  # "reference" serves the eager loop
   moe_quant_kernel: "auto"
-  # One graph per (rows, token bucket).
+  # MTP drafts per step; glm5_next_tp8_mtp.yaml turns it on
+  mtp_num_draft_tokens: 0
+  # one graph per (rows, token bucket), ~40 s of capture at startup; other
+  # shapes run eager
   prefill_graphs: true
-# A prefill step takes up to 4 prompts (the largest capture batch) of up to 2048 tokens,
-# so the ladder runs to 4 x 2048 and no step runs eager: 64 apart to one prompt's 2048,
-# 256 apart past it.
-prefill_token_buckets:
-  LLM:
-    prefill: [
-      128, 256, 384, 512, 640, 768, 896,
-      1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048,
-      2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144,
-      6400, 6656, 6912, 7168, 7424, 7680, 7936, 8192]
 resources:
   kv_cache:
-    # pages = requests x rows a request books / page_size + the sink: 64 x 2048 / 128 + 1.
-    # 11 latent planes (the MLA layers) of 512 bf16 = 11.3 KB/token, ~1.5 GB/rank.
+    # Only the 11 MLA layers are paged, a 512-wide latent each: ~11.3 KB/token.
+    # 1024 pages x 128 tokens hold a full-length request per KDA slot below,
+    # plus the sink page: ~1.5 GB/rank.
     max_num_pages: 1025
     page_size: 128
   kda_state:
-    # max_concurrent_requests + the sink, ~18.5 MB/slot/rank (head-sharded): ~1.2 GB/rank
+    # 64 requests plus the pool's sink, head-sharded like the KDA layers:
+    # ~18.5 MB/slot/rank. The real slots also cap the decode batch and its
+    # captured sizes.
     max_slots: 65
 node_groups:
   - node_names: [LLM]
