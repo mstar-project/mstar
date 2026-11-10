@@ -188,6 +188,23 @@ def test_a_cfg_rank_runs_its_branch_unpadded(rank):
     assert torch.equal(pred[0], _renorm_cfg(cond, uncond, 4.0))
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a GPU"))])
+def test_rope_rounds_as_the_reference(device):
+    """The rotation is diffusers' complex product bit for bit on each device: CUDA's complex multiply rounds through
+    fused multiply-adds, so a real-arithmetic rotation that matched on CPU drifted 0.4% over a GPU step."""
+    from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
+
+    from mstar.model.qwen_image.components.transformer import apply_rope, qwen_rope_tables
+
+    img_freqs, txt_freqs = qwen_rope_tables((16, 56, 56), [(16, 24), (8, 8)], [7], 7)
+    g = torch.Generator().manual_seed(0)
+    for freqs in (img_freqs, txt_freqs[0]):
+        x = torch.randn(1, freqs.shape[0], 4, 128, generator=g).to(device, torch.bfloat16)
+        freqs = freqs.to(device)
+        assert torch.equal(apply_rope(x, freqs), apply_rotary_emb_qwen(x, freqs, use_real=False))
+
+
 def _vaes():
     from diffusers import AutoencoderKLWan
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage import AutoencoderKLQwenImage

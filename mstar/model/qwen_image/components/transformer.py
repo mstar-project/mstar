@@ -15,7 +15,8 @@ Each row's text is left-padded to the step's ``Lt``, so the joint sequence of a 
 and the real ``[txt | img]`` as the reference attends it. RoPE follows ``QwenEmbedRope``
 (``scale_rope``): the target at frame 0 and reference ``i`` at frame ``i``, heights and widths
 centred, text from ``max(h/2, w/2)`` over every image. The rotation is the reference's
-complex product written in real arithmetic, so a compiled block keeps it in its graph.
+complex product itself: its rounding is the device's complex multiply (fused multiply-adds on
+CUDA), which no one real-arithmetic formula reproduces on every device.
 
 Linears are tensor-parallel (``comm_group``): q/k/v and the MLP's first linear split by
 column, the attention outputs and the MLP's second by row; the modulation linears stay whole.
@@ -78,12 +79,10 @@ class QwenImageTransformerConfig:
 
 
 class QwenStepLayout(NamedTuple):
-    """Per-step derived tensors (``build_layout``): fp32 rotary tables and the modulation index."""
+    """Per-step derived tensors (``build_layout``): complex64 rotary tables and the modulation index."""
 
-    img_cos: torch.Tensor          # [L_img, head_dim / 2]
-    img_sin: torch.Tensor
-    txt_cos: torch.Tensor          # [branches, Lt, head_dim / 2], one row per local branch
-    txt_sin: torch.Tensor
+    img_freqs: torch.Tensor        # [L_img, head_dim / 2]
+    txt_freqs: torch.Tensor        # [branches, Lt, head_dim / 2], one row per local branch
     modulate_index: torch.Tensor   # [L_img] int: 0 the target's tokens, 1 the references'
 
 
@@ -96,8 +95,8 @@ def _rope_axis(index: torch.Tensor, dim: int, theta: float) -> torch.Tensor:
 def qwen_rope_tables(
     axes_dims: Sequence[int], img_grids: Sequence[tuple[int, int]], text_lengths: Sequence[int], text_rows: int,
     theta: float = 10_000.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(img_cos, img_sin, txt_cos, txt_sin)`` on the host, fp32, as ``QwenEmbedRope`` (``scale_rope``)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(img_freqs, txt_freqs)`` on the host, complex64, as ``QwenEmbedRope`` (``scale_rope``)
     builds them: ``img_grids`` are the target's then each reference's ``(h, w)`` in tokens, and
     ``text_lengths`` the real text of each local branch, left-padded to ``text_rows``."""
     pos_index = torch.arange(ROPE_POSITIONS)
@@ -119,15 +118,14 @@ def qwen_rope_tables(
         index = (torch.arange(text_rows) - (text_rows - length)).clamp(min=0) + start
         txt.append(all_axes[index])
     txt_freqs = torch.stack(txt)
-    return tuple(t.contiguous() for t in (img_freqs.real, img_freqs.imag, txt_freqs.real, txt_freqs.imag))
+    return img_freqs.contiguous(), txt_freqs.contiguous()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """``apply_rotary_emb_qwen(use_real=False)``: ``x [R, S, H, D]`` as ``D / 2`` complex pairs times
-    ``cos + i sin`` (``[S, D / 2]`` or ``[R, S, D / 2]``), in fp32, back to ``x``'s dtype."""
-    cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-    real, imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
-    return torch.stack([real * cos - imag * sin, real * sin + imag * cos], dim=-1).flatten(3).type_as(x)
+def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """``apply_rotary_emb_qwen(use_real=False)``: ``x [R, S, H, D]`` as ``D / 2`` complex pairs times ``freqs``
+    (``[S, D / 2]`` or ``[R, S, D / 2]``), in complex64, back to ``x``'s dtype."""
+    pairs = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    return torch.view_as_real(pairs * freqs.unsqueeze(-2)).flatten(3).type_as(x)
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int = 256, scale: float = 1000.0) -> torch.Tensor:
@@ -203,16 +201,16 @@ class QwenImageJointAttention(nn.Module):
         self.to_add_out = RowParallelLinear(comm_group, inner, dim, bias=True)
 
     def forward(
-        self, img: torch.Tensor, txt: torch.Tensor, layout: QwenStepLayout, txt_cos: torch.Tensor,
-        txt_sin: torch.Tensor, attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        self, img: torch.Tensor, txt: torch.Tensor, layout: QwenStepLayout, txt_freqs: torch.Tensor,
+        attend: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x.unflatten(-1, (-1, self.head_dim))
 
-        q_i = apply_rope(self.norm_q(heads(self.to_q(img))), layout.img_cos, layout.img_sin)
-        k_i = apply_rope(self.norm_k(heads(self.to_k(img))), layout.img_cos, layout.img_sin)
-        q_t = apply_rope(self.norm_added_q(heads(self.add_q_proj(txt))), txt_cos, txt_sin)
-        k_t = apply_rope(self.norm_added_k(heads(self.add_k_proj(txt))), txt_cos, txt_sin)
+        q_i = apply_rope(self.norm_q(heads(self.to_q(img))), layout.img_freqs)
+        k_i = apply_rope(self.norm_k(heads(self.to_k(img))), layout.img_freqs)
+        q_t = apply_rope(self.norm_added_q(heads(self.add_q_proj(txt))), txt_freqs)
+        k_t = apply_rope(self.norm_added_k(heads(self.add_k_proj(txt))), txt_freqs)
         q = torch.cat([q_t, q_i], dim=1)
         k = torch.cat([k_t, k_i], dim=1)
         v = torch.cat([heads(self.add_v_proj(txt)), heads(self.to_v(img))], dim=1)
@@ -256,7 +254,7 @@ class QwenImageBlock(nn.Module):
 
     def forward(
         self, img: torch.Tensor, txt: torch.Tensor, temb: torch.Tensor, layout: QwenStepLayout,
-        txt_cos: torch.Tensor, txt_sin: torch.Tensor, attend,
+        txt_freqs: torch.Tensor, attend,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         index = layout.modulate_index if self.zero_cond_t else None
         img_mod1, img_mod2 = self.img_mod(temb).chunk(2, dim=-1)
@@ -265,7 +263,7 @@ class QwenImageBlock(nn.Module):
 
         img_in, img_gate1 = _modulate(self.img_norm1(img), img_mod1, index)
         txt_in, txt_gate1 = _modulate(self.txt_norm1(txt), txt_mod1)
-        img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_cos, txt_sin, attend)
+        img_attn, txt_attn = self.attn(img_in, txt_in, layout, txt_freqs, attend)
         img = img + img_gate1 * img_attn
         txt = txt + txt_gate1 * txt_attn
 
@@ -324,14 +322,13 @@ class QwenImageTransformer(nn.Module):
             timestep = torch.cat([timestep, timestep * 0], dim=0)
         txt = self.txt_in(self.txt_norm(txt))
         temb = self.time_text_embed(timestep, img.dtype)
-        repeats = rows // layout.txt_cos.shape[0]
-        txt_cos, txt_sin = layout.txt_cos.repeat(repeats, 1, 1), layout.txt_sin.repeat(repeats, 1, 1)
+        txt_freqs = layout.txt_freqs.repeat(rows // layout.txt_freqs.shape[0], 1, 1)
         if self.dynamic_text:
             # compiled blocks: one graph for any prompt length, the image dims static
-            for tensor in (txt, txt_cos, txt_sin):
+            for tensor in (txt, txt_freqs):
                 torch._dynamo.mark_dynamic(tensor, 1)
         for block in self.transformer_blocks:
-            img, txt = block(img, txt, temb, layout, txt_cos, txt_sin, attend)
+            img, txt = block(img, txt, temb, layout, txt_freqs, attend)
         if self.config.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         return self.proj_out(self.norm_out(img, temb))

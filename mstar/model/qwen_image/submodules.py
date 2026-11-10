@@ -268,13 +268,13 @@ class QwenImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def build_layout(self, key: StepKey, device) -> QwenStepLayout:
         bucket: QwenEditKey = key.bucket
-        img_cos, img_sin, txt_cos, txt_sin = qwen_rope_tables(
+        img_freqs, txt_freqs = qwen_rope_tables(
             self.config.transformer.axes_dims_rope, [bucket.grid, *bucket.ref_grids],
             [bucket.text_lengths[b] for b in key.branches], text_rows(key),
         )
         index = torch.cat([torch.zeros(bucket.image_tokens, dtype=torch.int32),
                            torch.ones(bucket.joint_image_tokens - bucket.image_tokens, dtype=torch.int32)])
-        return QwenStepLayout(*(t.to(device) for t in (img_cos, img_sin, txt_cos, txt_sin, index)))
+        return QwenStepLayout(*(t.to(device) for t in (img_freqs, txt_freqs, index)))
 
     def model_output(self, engine_inputs, key: StepKey, latents, timestep, text_embeds, ref_latents, **cond):
         layout = self.layout(key, latents.device)
