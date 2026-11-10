@@ -1,24 +1,135 @@
 .. _metrics-reference:
 
 Metrics reference
-=================
+=====================
 
-Every Prometheus metric family M\* serves at ``GET /metrics``, what moves it, and which
-process measures it. How to turn metrics on is in :ref:`serving-metrics`; a ready-to-run
-Prometheus and Grafana setup is in :ref:`metrics-setup`.
+Use ``GET /metrics`` to monitor request outcomes, latency, output volume,
+queueing, cache occupancy and tensor transfers. Metrics are off by default.
+For installation and model requirements, see :doc:`installation` and :doc:`models`.
+
+Enable and read metrics
+---------------------------
+
+Install the metrics extra in the serving environment. From a repository checkout:
+
+.. code-block:: bash
+
+   pip install -e ".[metrics]"
+
+Install the example model's dependencies using :doc:`Kokoro guide </models/kokoro>`, then start
+the server with metrics enabled:
 
 .. code-block:: bash
 
    mstar serve kokoro --enable-metrics
-   curl -s localhost:8000/metrics | grep '^mstar_'
 
-Metrics are off by default. With ``--enable-metrics`` off, ``/metrics`` answers ``404``,
-the conductor sends no status message and the workers record nothing. Like ``/health``,
-``/metrics`` needs no API key; it exposes counts, latencies and the names of the model,
-its graph nodes and routes, never prompts or outputs.
+After startup, send requests using :doc:`clients`. In another terminal,
+read the metrics endpoint:
+
+.. code-block:: bash
+
+   curl --fail http://localhost:8000/metrics
+
+The response is Prometheus text with ``mstar_`` metric families. Labeled
+series appear when first used, so a fresh server may not show every family.
+Without ``--enable-metrics``, the endpoint returns ``404``, the conductor
+sends no status message and workers record no metrics.
+
+Like ``/health``, ``/metrics`` needs no API key. It exposes counts, latencies
+and model, node and route names, never prompts or outputs.
+
+Choose the measurement
+--------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Question
+     - Read
+   * - Are submitted requests succeeding?
+     - `Requests <#requests>`_ and `HTTP refusals <#http-refusals>`_; pre-submission refusals are separate.
+   * - Where does request latency accumulate?
+     - `Request stages <#request-stages>`_ and `Data worker <#data-worker>`_.
+   * - When does output become available?
+     - `Output <#output>`_; server first-chunk time excludes the network to the client.
+   * - Are requests waiting for capacity?
+     - `Conductor <#conductor>`_ and `Engine workers <#engine-workers>`_.
+   * - How much data moves between nodes?
+     - `Tensor transport <#tensor-transport>`_; these are consumer-side measurements.
+   * - Are the displayed values stale?
+     - `Where the numbers come from <#where-the-numbers-come-from>`_ and ``mstar_conductor_status_age_seconds``.
+
+.. _metrics-setup:
+
+Prometheus and Grafana
+--------------------------
+
+``examples/observability/`` runs Prometheus and Grafana in Docker Compose against an
+M\* server on the host. Start that server with ``--enable-metrics`` as above,
+then run this in another terminal from the repository root:
+
+.. code-block:: bash
+
+   docker compose -f examples/observability/docker-compose.yml up -d
+
+Prometheus (``localhost:9090``) scrapes ``/metrics`` every 5 seconds; Grafana
+(``localhost:3000``) has Prometheus as its default data source and loads any dashboard
+JSON placed in ``examples/observability/grafana/dashboards/``. Its README covers how
+the containers reach the host on Linux, a server on another port, and the optional
+anonymous viewer.
+
+The ``M* serving`` dashboard there (``mstar.json``) has a panel for every family on
+this page, in one row per component: requests, request stages and output, data worker,
+conductor, engine workers, tensor transport and HTTP refusals. Its ``model`` variable
+picks the ``model_name`` values to show.
+
+To scrape from an existing Prometheus, add a job for the server's address:
+
+.. code-block:: yaml
+
+   scrape_configs:
+     - job_name: mstar
+       metrics_path: /metrics
+       scrape_interval: 5s
+       static_configs:
+         - targets: ["localhost:8000"]
+
+Stop the monitoring containers with ``docker compose -f
+examples/observability/docker-compose.yml down`` when finished.
+
+The conductor and workers report once a second, so a scrape interval under a second
+only repeats values. Keep the scrape timeout above two seconds with
+``--rust-frontend``, which waits that long for the bridge before answering ``503``.
+
+Example queries
+-------------------
+
+These queries aggregate all matching series. Add a ``model_name`` selector
+when inspecting one model. Cache gauges can appear under multiple components
+when nodes share a cache; see Engine workers before summing them.
+
+.. code-block:: text
+
+   # Requests per second by outcome
+   sum by (outcome) (rate(mstar_requests_total[1m]))
+
+   # Share of requests that did not succeed
+   sum(rate(mstar_requests_total{outcome!="success"}[5m]))
+     / sum(rate(mstar_requests_total[5m]))
+
+   # p95 end-to-end latency and time to first output
+   histogram_quantile(0.95, sum by (le) (rate(mstar_e2e_request_latency_seconds_bucket[5m])))
+   histogram_quantile(0.95, sum by (le) (rate(mstar_time_to_first_output_seconds_bucket[5m])))
+
+   # KV cache use per node and cache
+   mstar_kv_pages_used / mstar_kv_pages_total
+
+   # The conductor stopped reporting (alert)
+   mstar_conductor_status_age_seconds > 10
+
 
 Where the numbers come from
----------------------------
+-------------------------------
 
 Only the API server process renders ``/metrics``, from one registry. The other
 processes send it plain numbers on messages they already exchange, so the time a value
@@ -45,8 +156,9 @@ reflects depends on where it was measured:
 The registry holds only ``mstar_`` families: no ``process_`` or ``python_`` metrics.
 Every value starts from zero when the server starts.
 
+
 Conventions
------------
+---------------
 
 - Names use Prometheus base units (``_seconds``, ``_bytes``), and counters end in
   ``_total``. Read counters and histograms with ``rate()`` or ``increase()``.
@@ -77,12 +189,13 @@ Conventions
   the first scrape that saw a series: if a set's first request fails, its error series
   starts at 1.
 
+
 What is counted from when
--------------------------
+-----------------------------
 
 - **API server families count from the first request after warmup.** The server
-  enables metrics after its warmup requests, so first-shape compile times stay out of
-  the request latency histograms.
+  enables metrics after warmup, so work performed during warmup is excluded.
+  Compilation of a new shape during later requests is included in their latency.
 - **Engine worker histograms and counters, and the transfers workers read, count
   from the same point.** When the API server enables its metrics it has the conductor
   tell every worker, so a worker counts the steps whose time starts after that, and
@@ -93,11 +206,15 @@ What is counted from when
   ``mstar_http_refusals_total``. A request that was submitted and then failed is
   counted once, as ``outcome="error"`` in ``mstar_requests_total``.
 
+
 Requests
---------
+------------
 
 Exported by the API server, recorded where a request leaves it, the same way for
 ``/generate``, ``/generate/ws``, the OpenAI routes and both frontends.
+
+``mstar_requests_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_requests_total{model_name, output_modalities, outcome}``
    Counter. Requests that left the API server. ``success``: the result went to the
@@ -105,13 +222,25 @@ Exported by the API server, recorded where a request leaves it, the same way for
    delivery, or the conductor went away. ``abort``: the client went away, or its
    finished result was dropped unread. ``timeout``: ``--timeout`` expired.
 
+
+``mstar_requests_in_flight``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_requests_in_flight{model_name}``
    Gauge, read at scrape time. Requests the API server holds: submitted and not yet
    returned, failed or aborted.
 
+
+``mstar_e2e_request_latency_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``
    Histogram, seconds, successful requests. From submission (after the request body was
    read) to the result leaving the API server. Buckets: :ref:`E2E <metrics-buckets>`.
+
+
+``mstar_time_to_first_output_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_time_to_first_output_seconds{model_name, output_modalities}``
    Histogram, seconds, successful requests. From submission to the first result chunk
@@ -119,17 +248,25 @@ Exported by the API server, recorded where a request leaves it, the same way for
    network to the client, and a non-streaming client sees nothing until the end.
    Buckets: :ref:`first output <metrics-buckets>`.
 
+
 Request stages
---------------
+------------------
 
 Exported by the API server, for successful requests, from the timestamps every request
 carries. The conductor's timestamps are compared with the API server's, which assumes
 both run on one host.
 
+``mstar_request_preprocess_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_request_preprocess_seconds{model_name, output_modalities}``
    Histogram, seconds. From submission to the data worker handing the preprocessed
    request to the conductor, including the wait in the data worker's queue. Buckets:
    :ref:`stage <metrics-buckets>`.
+
+
+``mstar_request_queue_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_request_queue_seconds{model_name, output_modalities}``
    Histogram, seconds. From the conductor taking the request in to admitting it for
@@ -137,43 +274,73 @@ both run on one host.
    conductor sends it with the request's completion. Buckets:
    :ref:`queue <metrics-buckets>`.
 
+
+``mstar_request_engine_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_request_engine_seconds{model_name, output_modalities}``
    Histogram, seconds. From the conductor dispatching the request to the workers (after
    any wait in ``mstar_request_queue_seconds``) to the conductor finishing it. Buckets:
    :ref:`E2E <metrics-buckets>`.
+
+
+``mstar_request_delivery_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_request_delivery_seconds{model_name, output_modalities}``
    Histogram, seconds. From the conductor finishing the request to the result leaving
    the API server: the last chunks' postprocessing and transfer, and the client handler
    picking the result up. Buckets: :ref:`stage <metrics-buckets>`.
 
+
 Output
-------
+------------
 
 Exported by the API server, counted per result chunk as it reaches the API server.
+
+``mstar_output_chunks_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_output_chunks_total{model_name, modality}``
    Counter. Result chunks, for every request whatever its outcome. Error chunks are not
    counted.
 
+
+``mstar_output_bytes_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_output_bytes_total{model_name, modality}``
    Counter. Bytes of those chunks.
+
+
+``mstar_output_audio_seconds_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_output_audio_seconds_total{model_name}``
    Counter, seconds. Audio in those chunks, from their byte length as 16-bit PCM at the
    chunk's sample rate and channel count. Audio chunks that carry no sample rate are
    not counted.
 
+
+``mstar_time_to_first_chunk_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_time_to_first_chunk_seconds{model_name, modality}``
    Histogram, seconds, successful requests. From submission to the first chunk of each
    output modality reaching the API server: time to first audio, first image, first
    video frame. Buckets: :ref:`first output <metrics-buckets>`.
 
-Data worker
------------
 
-Exported by the API server. The data worker is the API server thread that loads each
-request's media and runs the model's prompt processing, one request at a time.
+Data worker
+---------------
+
+Exported by the API server. The data worker loads media and runs the model's
+prompt processing. Models that declare ``PREPROCESS_PARALLEL`` and do not use
+client input streams can prepare requests in a thread pool, sized by
+``preprocess_workers`` or the CPU plan. Other models prepare requests inline.
+
+``mstar_data_worker_preprocess_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_data_worker_preprocess_seconds{model_name, input_modalities}``
    Histogram, seconds. From the data worker taking a request off its queue to handing
@@ -181,11 +348,19 @@ request's media and runs the model's prompt processing, one request at a time.
    outcome later. Unlike ``mstar_request_preprocess_seconds``, it leaves out the wait in
    the queue. Buckets: :ref:`stage <metrics-buckets>`.
 
+
+``mstar_data_worker_preprocess_failures_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_data_worker_preprocess_failures_total{model_name, input_modalities}``
    Counter. Requests whose preprocessing failed in the data worker, each once: a file
    count or media length over its limit, a file that cannot be decoded, the model's
    prompt processing, or handing the inputs on. Such a request also ends as
    ``outcome="error"`` in ``mstar_requests_total`` unless its client had already gone.
+
+
+``mstar_upload_size_bytes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_upload_size_bytes{model_name, modality}``
    Histogram, bytes. Size on disk of each ``image``, ``audio`` or ``video`` file a
@@ -195,15 +370,23 @@ request's media and runs the model's prompt processing, one request at a time.
    the WAV files they write from the decoded audio. Buckets:
    :ref:`upload size <metrics-buckets>`.
 
+
+``mstar_data_worker_queue_depth``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_data_worker_queue_depth{model_name}``
    Gauge, read at scrape time. Requests submitted and not yet taken up by the data
-   worker; the one it is working on is not counted. A request whose client went away
+   worker; requests already taken up for inline or pooled preparation are not counted. A request whose client went away
    counts until the data worker takes it up.
 
+
 HTTP refusals
--------------
+-----------------
 
 Exported by the API server, counted by whichever frontend serves the deployment.
+
+``mstar_http_refusals_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_http_refusals_total{model_name, route, status}``
    Counter. HTTP requests the frontend answered with an error without submitting them
@@ -215,10 +398,14 @@ Exported by the API server, counted by whichever frontend serves the deployment.
    handshakes are not counted. With ``--rust-frontend``, the values are the totals
    ``mstar-server`` sent with the latest ``/metrics`` request.
 
+
 Conductor
----------
+-------------
 
 From the conductor's status message, sent every second while metrics are on.
+
+``mstar_conductor_requests``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_conductor_requests{model_name, state}``
    Gauge, up to a second old. Requests the conductor holds. ``waiting``: queued at
@@ -227,10 +414,18 @@ From the conductor's status message, sent every second while metrics are on.
    reader to release its outputs before the workers free its state; it still counts
    toward ``max_concurrent_requests``.
 
+
+``mstar_component_in_flight``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_component_in_flight{model_name, component}``
    Gauge, up to a second old. Running requests with a pass on the graph node that the
    conductor dispatched and has not heard back from. The conductor sees whole passes,
    so a node running a request's decode loop counts it once for the loop.
+
+
+``mstar_routing_predicted_saving_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_routing_predicted_saving_total{model_name, term}``
    Counter, up to a second old. Per term of the data-parallel replica cost (see
@@ -240,18 +435,26 @@ From the conductor's status message, sent every second while metrics are on.
    is a mean of per-request shares, not the token ratio the workers' prefix-cache counters
    give.
 
+
+``mstar_conductor_status_age_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_conductor_status_age_seconds{model_name}``
    Gauge, seconds, computed at scrape time. Time since the API server received the
    conductor's last status message, or since metrics were enabled if none arrived yet.
    More than a few seconds means the conductor stopped reporting, and the conductor,
    worker and transport values its message carries are stale.
 
+
 Engine workers
---------------
+------------------
 
 From the workers' numbers, forwarded in the conductor's status message, so up to two
 seconds old. A node with replicas on several workers shows their sum. The ranks of a
 TP, SP or CFG instance count once: the instance's first rank reports.
+
+``mstar_kv_pages_used``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_kv_pages_used{model_name, component, resource}``
    Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
@@ -259,12 +462,24 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    attention), told apart by ``resource``. A cache two nodes of one worker share shows
    under each node, so summing over ``component`` counts it twice.
 
+
+``mstar_kv_pages_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_kv_pages_total{model_name, component, resource}``
    Gauge. Pages of the cache that requests can hold.
+
+
+``mstar_kv_pages_cached``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_kv_pages_cached{model_name, component, resource}``
    Gauge. Pages the prefix cache names. Running requests may also hold some of them;
    the cache frees the others when a request needs the room.
+
+
+``mstar_rebuild_host_bytes_used``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_rebuild_host_bytes_used{model_name, component}``
    Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids, which a
@@ -272,8 +487,16 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    keeps no ids, so its request is never dropped. One pool serves every node of a worker
    that declares a rebuild policy, and shows under each.
 
+
+``mstar_rebuild_host_bytes_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_rebuild_host_bytes_total{model_name, component}``
    Gauge. Bytes of the rebuild host pool, the serving config's ``rebuild_host_mb``.
+
+
+``mstar_step_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_step_seconds{model_name, component, graph_walk}``
    Histogram, seconds, engine steps that ran a forward. From when the worker hands the
@@ -283,13 +506,25 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    between step completions, and ``rate(mstar_step_seconds_sum[1m])`` is the share of
    time the worker had a step running. Buckets: :ref:`step <metrics-buckets>`.
 
+
+``mstar_batch_size``
+~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_batch_size{model_name, component, graph_walk}``
    Histogram, rows the step's forward ran. Buckets: :ref:`batch <metrics-buckets>`.
+
+
+``mstar_prefix_cache_query_tokens_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_prefix_cache_query_tokens_total{model_name, component}``
    Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
    keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL,
    Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.
+
+
+``mstar_prefix_cache_hit_tokens_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_prefix_cache_hit_tokens_total{model_name, component}``
    Counter. Tokens the prefix cache already held at that lookup. The hit rate is
@@ -298,12 +533,17 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
    cuts to 0 still counts.
 
+
+``mstar_component_pending_steps``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
    running: waiting for room in a step, or for the worker to pick the node.
 
+
 Tensor transport
-----------------
+--------------------
 
 Tensor transfers between graph nodes (:ref:`tensor-transport`), counted by the reader,
 once per edge read: the tensors of one graph edge that one worker read from one
@@ -313,11 +553,22 @@ publishes once a second. ``src`` is the node that produced the tensors, ``dst``
 the node that reads them, and ``api_server`` stands for the request's inputs (as
 ``src``) and its results (as ``dst``).
 
+``mstar_transfer_bytes_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_transfer_bytes_total{model_name, src, dst, transport}``
    Counter, bytes. Tensor bytes read over the edge.
 
+
+``mstar_transfers_total``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 ``mstar_transfers_total{model_name, src, dst, transport}``
    Counter. Tensors read over the edge.
+
+
+``mstar_transfer_seconds``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``mstar_transfer_seconds{model_name, src, dst, transport}``
    Histogram, seconds, one observation per edge read. The reader's time to read the
@@ -327,15 +578,16 @@ the node that reads them, and ``api_server`` stands for the request's inputs (as
    included; it is the ``tx`` time of :ref:`request-profiling`. Buckets:
    :ref:`transfer <metrics-buckets>`.
 
-A tensor already on the reader moves nothing and is not counted. An edge the conductor
-joined from several producers is one read per producing node, with its read time split
-between them by bytes. Under tensor parallelism every rank counts its own read, so an
-edge two ranks read is two reads.
+   A tensor already on the reader moves nothing and is not counted. An edge the conductor
+   joined from several producers is one read per producing node, with its read time split
+   between them by bytes. Under tensor parallelism every rank counts its own read, so an
+   edge two ranks read is two reads.
+
 
 .. _metrics-buckets:
 
 Histogram buckets
------------------
+---------------------
 
 Upper bounds, without ``+Inf``:
 
@@ -357,64 +609,3 @@ Upper bounds, without ``+Inf``:
 - **Batch** (``mstar_batch_size``): 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 rows.
 - **Transfer** (``mstar_transfer_seconds``): 10, 25, 50, 100, 250, 500 µs, then 1, 2.5,
   5, 10, 25, 50, 100, 250, 500 ms, then 1, 2.5, 5, 10 s.
-
-Example queries
----------------
-
-.. code-block:: text
-
-   # Requests per second by outcome
-   sum by (outcome) (rate(mstar_requests_total[1m]))
-
-   # Share of requests that did not succeed
-   sum(rate(mstar_requests_total{outcome!="success"}[5m]))
-     / sum(rate(mstar_requests_total[5m]))
-
-   # p95 end-to-end latency and time to first output
-   histogram_quantile(0.95, sum by (le) (rate(mstar_e2e_request_latency_seconds_bucket[5m])))
-   histogram_quantile(0.95, sum by (le) (rate(mstar_time_to_first_output_seconds_bucket[5m])))
-
-   # KV cache use per node and cache
-   mstar_kv_pages_used / mstar_kv_pages_total
-
-   # The conductor stopped reporting (alert)
-   mstar_conductor_status_age_seconds > 10
-
-.. _metrics-setup:
-
-Prometheus and Grafana
-----------------------
-
-``examples/observability/`` runs Prometheus and Grafana in Docker Compose against an
-M\* server on the host:
-
-.. code-block:: bash
-
-   mstar serve kokoro --enable-metrics          # on the host, port 8000
-   docker compose -f examples/observability/docker-compose.yml up -d
-
-Prometheus (``localhost:9090``) scrapes ``/metrics`` every 5 seconds; Grafana
-(``localhost:3000``) has Prometheus as its default data source and loads any dashboard
-JSON placed in ``examples/observability/grafana/dashboards/``. Its README covers how
-the containers reach the host on Linux, a server on another port, and the optional
-anonymous viewer.
-
-The ``M* serving`` dashboard there (``mstar.json``) has a panel for every family on
-this page, in one row per component: requests, request stages and output, data worker,
-conductor, engine workers, tensor transport and HTTP refusals. Its ``model`` variable
-picks the ``model_name`` values to show.
-
-To scrape from an existing Prometheus, add a job for the server's address:
-
-.. code-block:: yaml
-
-   scrape_configs:
-     - job_name: mstar
-       metrics_path: /metrics
-       scrape_interval: 5s
-       static_configs:
-         - targets: ["localhost:8000"]
-
-The conductor and workers report once a second, so a scrape interval under a second
-only repeats values. Keep the scrape timeout above two seconds with
-``--rust-frontend``, which waits that long for the bridge before answering ``503``.

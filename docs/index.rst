@@ -41,3 +41,10 @@ A model declares a graph of components, such as an encoder, a transformer, or an
    :caption: Contributing
 
    adding_models
+   model_examples
+   model_contract
+   model_submodules
+   model_resources
+   model_capture
+   model_deployment
+   model_streaming

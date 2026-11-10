@@ -1,0 +1,347 @@
+Model interface
+===============
+
+Use this reference while implementing the model interface. Start with the
+`model-authoring path <adding_models.html>`__ to choose a scaffold and test one request
+end to end. The constructor handles configuration and tokenization; worker-side
+``get_submodule`` loads weights.
+
+.. _step-2-implement-the-model-class:
+
+Model hooks
+-----------
+
+Subclass
+`mstar.model.base.Model <https://github.com/mstar-project/mstar/blob/main/mstar/model/base.py>`__
+and implement its abstract methods. The constructor receives ``model_path_hf`` (from
+``HF_MODELS``) and any ``**kwargs``. It normally loads the tokenizer and stores a config
+dataclass. Do not load weights in the constructor. Load them in ``get_submodule``, so
+that the conductor process never allocates GPU memory.
+
+A scaffold may implement these abstract methods for you. Override the ones its
+model-specific contract leaves open:
+
+.. _get-node-resources:
+
+``get_node_resources``
+~~~~~~~~~~~~~~~~~~~~~~
+
+``get_node_resources(self) -> list[NodeResourceSpec]``
+
+Declare every resource the engine builds for this model, and which nodes share each one.
+See `Declare resources per node <model_resources.html#step-2a-declare-your-resources>`__.
+
+.. _get-graph-walk-graphs:
+
+``get_graph_walk_graphs``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``get_graph_walk_graphs(self) -> dict[str, GraphSection]``
+
+Return ``{walk_name: graph}``. See `Connect the graph <adding_models.html#step-3-declare-the-computation-graph>`__.
+
+.. _process-prompt:
+
+``process_prompt``
+~~~~~~~~~~~~~~~~~~
+
+``process_prompt(self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, open_streams=frozenset(), **kwargs) -> NameToTensorList | ProcessPromptOutput``
+
+Tokenize the prompt and produce the initial request tensors, for example
+``{"text_inputs": [token_ids]}``. This method runs in the API-server data worker, after
+raw media tensors are loaded. It can therefore read ``tensors`` (for example
+``image_inputs``, ``audio_inputs`` or ``video_inputs``) to compute derived tensors such
+as ``pixel_values``. The returned dict is merged into the request’s tensors. To return
+metadata as well, use ``ProcessPromptOutput(tensors, metadata)``; the data worker folds
+that metadata into request kwargs. ``open_streams`` names client streams left open for
+appends; reject unsupported live openings with ``ValueError``.
+
+``input_modalities`` is the request layout: one entry per prompt element in the order
+written, so ``["image", "text", "image"]`` is a distinct request from
+``["image", "image", "text"]``. ``prompt_parts`` carries the same sequence with the text
+attached, and is ``None`` for entrypoints that submit files and text separately.
+`mstar.model.multimodal <https://github.com/mstar-project/mstar/blob/main/mstar/model/multimodal.py>`__
+turns either into the prefill plan that ``process_prompt`` and the schedule builder both
+work from.
+
+.. _walk-plan:
+
+``walk_plan``
+~~~~~~~~~~~~~
+
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+
+The walks a partition runs for this request, in order, as
+`WalkStep <https://github.com/mstar-project/mstar/blob/main/mstar/conductor/request_info.py>`__
+objects; ``[]`` when the request doesn’t use the partition. A prefill-decode model
+returns
+``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+
+Inputs and persistence
+^^^^^^^^^^^^^^^^^^^^^^
+
+The conductor derives each step’s input edges from the walk’s graph: every external and
+loop-back input that no stream feeds gets the persisted signal of its own name, the one
+``bind`` names, or an empty edge (a denoise loop’s seed, a chunk loop’s tick). A
+persisted tensor a step reads is released when the step is sent, unless a later step of
+some partition reads it with no walk of that partition persisting the name in between;
+anything else stays held until the request ends.
+
+Step metadata
+^^^^^^^^^^^^^
+
+``step_metadata`` carries request constants to every node of the step’s walk. The step
+that samples the reply’s first token, the last prefill before decode, sets
+``FINAL_PREFILL`` (from ``mstar.conductor.request_info``) in its step metadata;
+``media_prefill_step`` does this for a ``MultimodalDecoderModel``.
+
+When a step completes
+^^^^^^^^^^^^^^^^^^^^^
+
+A step whose walk a stream feeds and that runs no Loop but chunk loops runs once per
+chunk until the worker reports the stream’s final chunk, its inputs’ tensors sent with
+the first chunk only; any other step advances when its walk reports, and the partition
+is done after its last step.
+
+Invalid plans
+^^^^^^^^^^^^^
+
+A ``ValueError`` here refuses the request with a 400, and so does a plan of ``[]`` for
+every partition (nothing would ever run). A plan the conductor can’t run is a model bug,
+refused with a 500: a step whose walk is not one of its partition’s, a ``bind`` key that
+is not an input of the step’s walk, a step after one that runs once per chunk (only the
+stream’s end, which ends the partition, moves past it), or a later step whose walk takes
+no input the conductor sends (it moves a worker onto a step only by sending it inputs).
+
+Producer-triggered plans
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
+many passes each step runs, but the conductor moves past a step on its first report when
+it is the last step (the partition ends) or the next step takes inputs it sends, so such
+a step must run once (a ``Loop``, say). Such a partition’s plan must list every walk the
+stream can move it to: before the partition’s last pass, a report of a walk the plan
+doesn’t run fails the request. Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image,
+Orpheus and Chatterbox are references.
+
+.. _get-submodule:
+
+``get_submodule``
+~~~~~~~~~~~~~~~~~
+
+``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
+
+Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
+weights here, on ``device``. Return ``None`` for dummy mode.
+
+``tp_group`` and ``sp_group`` are the node’s tensor-parallel and sequence-parallel
+communicators when the node is sharded. Pass ``tp_group`` to the parallel-linear
+constructors. See `Tensor parallelism <model_deployment.html#tensor-parallelism>`__. ``cfg_group``
+is passed only to a node whose group sets ``cfg_size > 1``; see `Guidance (CFG)
+parallelism <model_deployment.html#guidance-cfg-parallelism>`__.
+
+``moe_parallel`` is the node group’s ``ep_config``, parsed into a ``MoeParallelConfig``.
+It is passed only to an EP-enabled node whose group sets one, so a model without MoE
+layers never receives it. See `Expert parallelism
+(MoE) <model_deployment.html#expert-parallelism-moe>`__.
+
+``autocast_dtype`` is the dtype in which the node’s parameters must be allocated. If you
+build the module on the ``meta`` device, cast it to this dtype before calling
+``to_empty(device)``. Casting after ``to_empty`` allocates every parameter in float32
+first, which doubles the peak VRAM during loading.
+
+See `Compute hooks <model_submodules.html#step-4-implement-the-submodules>`__.
+
+Forwarded request fields
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``model_kwargs`` reaches your model from clients through the OpenAI routes’
+``extra_body`` passthrough. The Dynamo bridge (``mstar/integrations/dynamo/bridges.py``)
+strips OpenAI-standard fields no model consumes (``_STRIP_KEYS``) before that
+passthrough runs. If your model starts reading such a field from ``model_kwargs`` — the
+way ``ignore_eos`` is read — also delete the key from ``_STRIP_KEYS``, or requests
+arriving through the Dynamo frontend will silently lose it.
+
+Keep tensor payloads off the control plane
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``model_kwargs`` cross the control plane to the conductor as plain data, so a value that
+``process_prompt`` moves onto a tensor edge must not travel there too. List those kwargs
+in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the originals for ``postprocess``
+and leaves them out of the conductor’s copy. Pi0.5 lists ``robot_state``, and Cosmos3
+lists ``action`` and ``robot_state`` (it passes only their sizes on, as ``action_shape``
+and ``robot_state_dim`` metadata). A tensor left in ``model_kwargs`` fails at send with
+an error that names the kwarg.
+
+Protect internal metadata
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The metadata ``process_prompt`` returns is laid over the request’s own ``model_kwargs``,
+so a key the model reads back there (a prompt layout) must be set in every mode and
+listed in ``INTERNAL_KWARGS``: the data worker drops a client’s value for it before
+``process_prompt``. Qwen3-TTS lists its prompt layout, speaker, language and clip
+digest.
+
+Context-only stream items
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A stream that starts with context-only items (a voice clone’s reference frames) says so
+in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a streaming
+``Connection``, and ``n``, at most that edge’s policy’s left context, leads the first
+window as context and is never output. Leave the key out when ``n`` is 0. The data
+worker drops a client’s value, and the consumer partition’s workers prime the stream
+with it (Qwen3-TTS, VoxCPM2).
+
+The following methods have defaults and are optional to override: ``text_output``,
+``postprocess`` and ``postprocess_inline`` (described next),
+``get_request_resource_configs`` (see `request resource
+parameters <model_resources.html#per-request-resource-parameters>`__),
+``get_sampling_config``, ``get_max_output_tokens``, ``get_autocast_dtype``,
+``load_image``, ``load_audio``, ``load_video``, ``load_decoded_image``, and the
+`partition methods <model_streaming.html#advanced-async-partitions-and-streaming>`__.
+
+Media loading defaults
+~~~~~~~~~~~~~~~~~~~~~~
+
+The default ``load_audio`` decodes an upload to mono at the class attribute
+``AUDIO_INPUT_RATE`` (16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30
+minutes); set those rather than overriding it.
+
+Decoded images and robot policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``load_decoded_image`` takes an image the API server already holds decoded (RGB uint8
+``[3, H, W]``, from the openpi WebSocket) and must return what ``load_image`` returns
+for the same pixels in a file. The default refuses, so a model takes images only as
+files until it overrides this. pi0.5’s ``load_image`` calls it, so the two paths cannot
+drift apart. A robot policy also overrides ``robot_io``, returning a ``RobotIO``: the
+``model_kwargs`` key its robot state goes under, and the
+``[action_horizon, action_dim]`` shape of the float32 actions its ``postprocess``
+returns. The openpi WebSocket serves a model by these two hooks alone, so a new policy
+needs no change to the API server.
+
+.. _text-output:
+
+``text_output``
+~~~~~~~~~~~~~~~
+
+``text_output(self) -> TextOutput | None``
+
+Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that end a
+reply, which are dropped unless the request sets ``ignore_eos``. ``postprocess`` and
+``postprocess_inline`` derive their text paths from it. A text chunk may end inside a
+character, since the API server joins a request’s text chunks before decoding them, so
+declare a detokenizer from ``mstar.model.utils`` that emits each token’s raw bytes
+(``TextChunkDetokenizer`` or ``ByteLevelDetokenizer`` for byte-level BPE,
+``SentencePieceDetokenizer`` for a SentencePiece vocabulary) rather than
+``tokenizer.decode([id])``, which turns a split character into U+FFFD.
+
+``postprocess``
+~~~~~~~~~~~~~~~
+
+``postprocess(self, output, modality, request_kwargs=None) -> bytes``
+
+Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
+images, and so on. The default encodes text through ``text_output`` and mono audio as
+headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated; integer
+samples are cast), and raises ``ValueError`` for any other modality. Override it for
+those, or for audio with more than one channel, and hand the rest to
+``super().postprocess``.
+
+.. _postprocess-inline:
+
+``postprocess_inline``
+~~~~~~~~~~~~~~~~~~~~~~
+
+``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
+
+``postprocess`` for one decode step’s inline values (one sampled token id per request),
+called once per step. With ``text_output`` declared, each id maps to its bytes (the
+detokenizer’s ``token_bytes``); otherwise each value goes through ``postprocess`` as a
+one-element tensor.
+
+``Model.nodes`` is a read-only property. It returns the sorted set of node names that
+appear in any graph walk.
+
+Graph primitives
+----------------
+
+``get_graph_walk_graphs`` returns one graph per walk. The primitives are defined in
+``mstar/graph/base.py``:
+
+- ``GraphNode(name, input_names, outputs)`` is one unit of compute. ``name`` is the node
+  name that ``get_submodule`` receives, and the name that resource specs put in their
+  ``nodes`` set. ``Model.nodes`` returns all such names across all walks.
+  ``input_names`` lists the tensor names that must be present before the node can run.
+  ``outputs`` is a list of ``GraphEdge``.
+- ``GraphEdge(next_node, name, ...)`` routes an output tensor named ``name`` to
+  ``next_node``. Two flags are important. ``persist=True`` keeps the tensor available
+  for later steps and walks, which is how a generated token is carried from ``prefill``
+  into the ``decode`` loop. ``output_modality``, combined with
+  ``next_node=EMIT_TO_CLIENT``, streams the tensor to the client. Its value is one of
+  ``"text"``, ``"image"``, ``"audio"``, ``"video"`` or ``"action"``. The special
+  destinations ``EMIT_TO_CLIENT`` and ``EMPTY_DESTINATION`` are defined in
+  ``mstar/graph/special_destinations.py``. Note that no edge flag stops a ``decode``
+  loop. A loop stops when a submodule’s ``check_stop`` registers a stop signal against
+  that ``Loop``, for example on EOS. See `submodule
+  stopping <model_submodules.html#check-stop>`__.
+- ``Sequential([...])`` and ``Parallel([...])`` compose subgraphs in order or
+  concurrently.
+- ``Loop(name, section, max_iters, outputs)`` is a subgraph that iterates. Its body
+  feeds its own outputs back as the inputs of the next iteration. It runs at most
+  ``max_iters`` times, and can stop earlier. A decode loop’s ``max_iters`` is the
+  model’s context length, and each request’s own length is its cap from
+  ``get_loop_caps``. Give the loop a ``name`` so that a submodule’s ``check_stop`` can
+  register a stop signal against it. This is the usual ``decode`` loop.
+
+The following method fragment shows internal persistence and loop-back only; it does not
+emit client output. A complete model also adds ``EMIT_TO_CLIENT`` edges with an
+``output_modality``. It has two walks: a ``prefill`` node that runs once, and a
+``decode`` ``Loop`` whose body feeds its own output back as the next input.
+
+.. code:: python
+
+   def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+       prefill = GraphNode(
+           name="LLM",
+           input_names=["text_inputs"],
+           # the generated token persists so the decode loop can pick it up
+           outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name="new_token",
+                              persist=True)],
+       )
+       decode = Loop(
+           name="decode_loop",
+           section=GraphNode(
+               name="LLM",
+               input_names=["text_inputs"],
+               outputs=[GraphEdge(next_node="LLM", name="text_inputs")],  # loop-back
+           ),
+           max_iters=self.config.max_position_embeddings,
+           outputs=[],
+       )
+       return dict(prefill=prefill, decode=decode)
+
+Test map
+--------
+
++----------------------------------------------------+-------------------------------------------+
+| Test                                               | Covers                                    |
++====================================================+===========================================+
+| ``test/modular/test_resource_runner.py``           | The admit, plan and commit lifecycle      |
+|                                                    | driven by ``declare_step``.               |
++----------------------------------------------------+-------------------------------------------+
+| ``test/modular/vjepa2/fake_resources.py``          | Stub resources for testing a submodule’s  |
+|                                                    | step declaration without a GPU.           |
++----------------------------------------------------+-------------------------------------------+
+| ``test/modular/test_accelerator_graph_capture.py`` | Capture registration, slot completeness,  |
+|                                                    | and agreement across ranks.               |
++----------------------------------------------------+-------------------------------------------+
+| ``test/modular/test_micro_scheduler.py``           | Batch admission, and the paths for failed |
+|                                                    | and backpressured requests.               |
++----------------------------------------------------+-------------------------------------------+
+| ``test/modular/test_admit_failure_handling.py``    | Behavior when a resource cannot admit a   |
+|                                                    | step.                                     |
++----------------------------------------------------+-------------------------------------------+
+| ``test/modular/test_kv_offload.py``                | Offload and reload of a request’s cache   |
+|                                                    | state.                                    |
++----------------------------------------------------+-------------------------------------------+

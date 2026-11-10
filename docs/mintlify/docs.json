@@ -28,9 +28,16 @@
         "group": "User guide",
         "pages": [
           "serving",
-          "metrics",
           "clients",
-          "evaluation"
+          "metrics",
+          {
+            "group": "Evaluation",
+            "pages": [
+              "evaluation",
+              "evaluation/compare",
+              "evaluation/full-duplex"
+            ]
+          }
         ]
       },
       {
@@ -98,7 +105,14 @@
       {
         "group": "Contributing",
         "pages": [
-          "adding_models"
+          "adding_models",
+          "model_examples",
+          "model_contract",
+          "model_submodules",
+          "model_resources",
+          "model_capture",
+          "model_deployment",
+          "model_streaming"
         ]
       }
     ]
