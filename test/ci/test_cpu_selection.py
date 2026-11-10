@@ -1,11 +1,13 @@
 """Check the CPU test selection without requiring PyTorch or Docker."""
 
 import fnmatch
+import re
 import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +18,7 @@ CPU_TEST_PATHS = SELECTOR_NS["CPU_TEST_PATHS"]
 NOT_CPU_CORE = SELECTOR_NS["NOT_CPU_CORE"]
 EXPANDED_PATHS = SELECTOR_NS["expand_paths"](REPO_ROOT)
 IS_COLLECTED = SELECTOR_NS["is_collected"]
+SHARDS = runpy.run_path(str(REPO_ROOT / "scripts/ci/shard_plugin.py"))  # the CPU Core shards (MSTAR_CI_SHARD)
 # pytest's default python_files
 TEST_MODULE_PATTERNS = ("test_*.py", "*_test.py")
 # runs in its own CPU Core shard, beside the rest
@@ -254,6 +257,30 @@ class CpuSelectionTests(unittest.TestCase):
         )
         unused = [path for path in NOT_CPU_CORE if not any(IS_COLLECTED(m, [path]) for m in modules)]
         self.assertEqual(unused, [], "NOT_CPU_CORE entries that cover no test module")
+
+    def test_cpu_core_shards_run_every_module_exactly_once(self):
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+        job = workflow[workflow.index("\n  cpu-tests:\n"):]
+        job = job[:re.search(r"\n  [\w-]+:\n", job[1:]).start() + 1]
+        listed = re.findall(r"^\s+shard: (\S+)$", job, re.MULTILINE)
+        total = {spec.split("/")[1] for spec in listed}
+        self.assertEqual(len(total), 1, f"the cpu-tests shards don't agree on how many there are: {listed}")
+        total = int(total.pop())
+        self.assertEqual(sorted(listed), [f"{i}/{total}" for i in range(1, total + 1)],
+                         "a CPU Core shard would be missing or run twice")
+        for line in ("MSTAR_CI_SHARD: ${{ matrix.shard }}", "PYTHONPATH: scripts/ci", "-p shard_plugin"):
+            self.assertIn(line, job, "the CPU Core shards would each run the whole suite")
+        modules = [path for path in repo_test_modules() if IS_COLLECTED(path, EXPANDED_PATHS)]
+        config = unittest.mock.Mock(rootpath=REPO_ROOT)
+        for shards in sorted({total, 3}):
+            kept = {}
+            for shard in range(1, shards + 1):
+                with unittest.mock.patch.dict("os.environ", {"MSTAR_CI_SHARD": f"{shard}/{shards}"}):
+                    kept[shard] = [path for path in modules
+                                   if SHARDS["pytest_ignore_collect"](REPO_ROOT / path, config) is None]
+            runs = sorted(path for paths in kept.values() for path in paths)
+            self.assertEqual(runs, modules, f"over {shards} shards a module would run twice or not at all")
+            self.assertTrue(all(kept.values()), f"a shard of {shards} would run nothing")
 
     def test_selected_modules_outside_packages_have_unique_basenames(self):
         # pytest's default import mode imports these by basename, so two of them stop

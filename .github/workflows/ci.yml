@@ -33,25 +33,33 @@ jobs:
   # with no list of files to maintain: modules that need a GPU, weights or an
   # optional package skip themselves; see CONTRIBUTING.md. test/ci checks that
   # every other test module is excluded there with a reason. scripts/ci/check.sh
-  # runs the same paths for the Mac cpu-smoke check.
+  # runs the same paths for the Mac cpu-smoke check. The cpu-core job below
+  # reports the result as the required check "CPU Core".
   cpu-tests:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # The CPU Core shards' pytest arguments; MSTAR_CI_SHARD picks each one's files.
+      CPU_CORE: >-
+        -p shard_plugin -n 4 --dist worksteal
+        --ignore=test/modular/test_tp_async_lockstep_sim.py
+        test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Everything but the TP lockstep simulation, one pytest worker per
-          # runner core (4); worksteal moves queued tests off a busy worker.
-          - name: CPU Core
-            id: cpu-tests
-            args: >-
-              -n 4 --dist worksteal
-              --ignore=test/modular/test_tp_async_lockstep_sim.py
-              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
-          # Its three simulations take up to 3.5 minutes each on these runners
-          # and would set the main shard's wall time, so they run beside it.
+          # Everything but the TP lockstep simulation, split by test file over
+          # two runners (MSTAR_CI_SHARD, scripts/ci/shard_plugin.py), one pytest
+          # worker per runner core (4); worksteal moves queued tests off a busy worker.
+          - name: CPU Core 1/2
+            id: cpu-tests-1
+            shard: 1/2
+          - name: CPU Core 2/2
+            id: cpu-tests-2
+            shard: 2/2
+          # Its three simulations take up to 3.5 minutes each on these runners,
+          # longer than either shard's slowest file, so they run beside them.
           - name: CPU Core (TP lockstep sim)
             id: cpu-tests-tp-sim
             args: -n 3 test/modular/test_tp_async_lockstep_sim.py
@@ -121,6 +129,9 @@ jobs:
           maturin develop --release -m rust/Cargo.toml
       - name: Run CPU tests
         env:
+          MSTAR_CI_SHARD: ${{ matrix.shard }}
+          # Where -p finds shard_plugin; loaded even with plugin autoload off.
+          PYTHONPATH: scripts/ci
           HF_HUB_OFFLINE: "1"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           # One thread per worker: workers with 4 OpenMP threads each
@@ -130,7 +141,7 @@ jobs:
           MKL_NUM_THREADS: "1"
         run: |
           python -m pytest -q -ra --strict-markers --durations=20 -p xdist \
-            --junitxml=${{ matrix.id }}.xml ${{ matrix.args }}
+            --junitxml=${{ matrix.id }}.xml ${{ matrix.args || env.CPU_CORE }}
       - name: Upload CPU test report
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,6 +149,17 @@ jobs:
           name: ${{ matrix.id }}-results
           path: ${{ matrix.id }}.xml
           retention-days: 7
+  # The required check "CPU Core": it passes only when every cpu-tests job
+  # passed (both shards and the TP lockstep sim), and fails when one failed,
+  # timed out or was cancelled. It runs on every event the workflow runs on.
+  cpu-core:
+    name: CPU Core
+    needs: cpu-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every CPU Core job passed
+        run: test "${{ needs.cpu-tests.result }}" = success
   # Dynamo backend contract: bridge body translations plus a registration
   # smoke against the pinned ai-dynamo wheel (in-memory discovery backend —
   # no GPU, no etcd). Fails here when a wheel bump moves the contract.
