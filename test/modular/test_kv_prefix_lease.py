@@ -679,4 +679,3 @@ def test_a_chain_extension_raced_by_a_remove_raises_nothing(monkeypatch):
             f"postprocess path: {error!r}"
         )
     kv.assert_pages_conserved()
-

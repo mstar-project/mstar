@@ -542,8 +542,11 @@ cache's nodes must run on one TP group, with no replicas and no walks placed on 
 ranks. Loading fails otherwise. A cache that keeps
 a sliding window (``AttentionConfig.sliding_window``) caches the sliding layers' pages
 too: a hit ends on a page of every group, and needs the full layers' pages up to it
-and the sliding layers' pages of the window before it. Its pages leave the window
-into the cache, where eviction takes them before the full layers' page they end on.
+and the sliding layers' pages of the window before it. A sliding page is filed in
+the cache when the full layers' page its last token is on fills, while the request
+still holds it, so it stays cached after the window moves past it. Eviction takes it
+before that full layers' page. With far more sliding layers than full ones, a short
+step can roll a sliding page out of the window before then, and startup logs that.
 With ``cpu_offload_pages`` as well its ``prefix_cache`` goes off (logged at info),
 since a copy back from the host skips the window's pages, and a serving config that
 sets ``prefix_cache: true`` on it is refused.
