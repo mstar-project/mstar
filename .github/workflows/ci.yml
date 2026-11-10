@@ -80,53 +80,59 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
+      # uv installs into setup-python's interpreter (UV_SYSTEM_PYTHON below), with
+      # the same pins pip had, in a fraction of the time; its cache is keyed on them.
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: |
             pyproject.toml
             .github/workflows/ci.yml
       - name: Install mstar with CPU PyTorch
+        env:
+          UV_SYSTEM_PYTHON: "1"
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu
           # flex_attention imports torch._inductor, which needs Triton even on
           # CPU; 3.6.0 is the version torch 2.10.0 pins.
-          python -m pip install triton==3.6.0
-          python -m pip install -e ".[dev,waypoint,metrics]"
+          uv pip install triton==3.6.0
+          uv pip install -e ".[dev,waypoint,metrics]"
           # BAGEL's CPU graph/KV tests import these model modules without
           # loading weights or requiring the CUDA-only BAGEL extras.
-          python -m pip install einops regex transformers
+          uv pip install einops regex transformers
           # LingBot-World's request contract tests clean prompts and resample
           # camera poses the way its reference does (no weights needed).
-          python -m pip install ftfy scipy
+          uv pip install ftfy scipy
           # Model.load_audio decodes with libsndfile before torchcodec; the
           # tests of that path skip without it.
-          python -m pip install soundfile
+          uv pip install soundfile
           # The eval runner (benchmark/asr_eval.py, imported by the WER and DROID
           # dataset tests) needs aiohttp, which datasets 5.2 stopped pulling in.
-          python -m pip install aiohttp
+          uv pip install aiohttp
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
-          python -m pip install diffusers==0.39.0
+          uv pip install diffusers==0.39.0
           # pytest is pinned with the rest of the test stack, so a release can't
           # change fixture behaviour under every PR at once.
-          python -m pip install pytest==9.2.0 pytest-xdist==3.8.0
+          uv pip install pytest==9.2.0 pytest-xdist==3.8.0
           # The AudioSeal watermark streaming tests build its generator with
           # random weights (no download).
-          python -m pip install "audioseal>=0.2,<0.3"
-          python -m pip check
+          uv pip install "audioseal>=0.2,<0.3"
+          uv pip check
           # The Qwen3-TTS codec tests load qwen-tts' speech-tokenizer modules.
           # Its metadata pins transformers==4.57.3 and packages mstar never
           # imports, so it goes in without them, after pip check.
-          python -m pip install --no-deps "qwen-tts==0.1.1"
+          uv pip install --no-deps "qwen-tts==0.1.1"
+          # The extension's build tool (next step).
+          uv pip install maturin
       - name: Build and install the extension
         env:
           # maturin develop wants a virtualenv; setup-python's interpreter is
           # the one the tests run on.
           VIRTUAL_ENV: ${{ env.pythonLocation }}
-        run: |
-          python -m pip install maturin
-          maturin develop --release -m rust/Cargo.toml
+        run: maturin develop --release -m rust/Cargo.toml
       - name: Run CPU tests
         env:
           MSTAR_CI_SHARD: ${{ matrix.shard }}
