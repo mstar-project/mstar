@@ -21,12 +21,14 @@ import torch
 from mstar.engine.resources.attn.base import EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.ragged.config import (
+    KeyPrefixAttentionStep,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedAttnBackend,
     RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedKeyPrefixAttentionSpec,
     cross_label,
 )
 from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION, cudnn_rows, kernel_rows
@@ -218,6 +220,27 @@ class RaggedBlockCausalAttnManager(AttentionResource):
                 spec, info, FlashInferRaggedBlockCausalManager, block_size=spec.block_size,
             )
         raise ValueError(f"Unknown ragged block-causal attention backend {backend!r}")
+
+
+class RaggedKeyPrefixAttnManager(AttentionResource):
+    """Cacheless self-attention over a prefix of each span's keys; see
+    ``RaggedKeyPrefixAttentionSpec``."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedKeyPrefixAttentionSpec, info: EngineResourceInfo):
+        backend = _refuse_cudnn(spec, resolve_ragged_attn_backend(spec.config.backend, info.device), "key-prefix")
+        if backend is RaggedAttnBackend.DENSE:
+            from mstar.engine.resources.attn.ragged.dense import DenseRaggedKeyPrefixManager
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedKeyPrefixManager
+
+            return _build_dense_or_flashinfer(spec, info, DenseRaggedKeyPrefixManager, FlashInferRaggedKeyPrefixManager)
+        if backend is RaggedAttnBackend.FLASHINFER:
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedKeyPrefixManager
+
+            return _build_ragged(spec, info, FlashInferRaggedKeyPrefixManager)
+        raise ValueError(f"Unknown ragged key-prefix attention backend {backend!r}")
 
 
 # Live managers by op key, which is how the custom op below names one: an op
@@ -718,3 +741,25 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
 def _merged_over_keys(run, q, k, v, r):
     """``sharded_key_merge`` over a ragged wrapper's ``run``, asked for its log-sum-exp."""
     return sharded_key_merge(functools.partial(run, return_lse=True), q, k, v, r)
+
+
+class _RaggedKeyPrefixManagerBase(_RaggedManagerBase, RaggedKeyPrefixAttnManager):
+    """Key-prefix self-attention: every label in the step is its own layout, each
+    segment attending the first ``key_lens`` of its own tokens."""
+
+    def _plan_layouts(self, step: KeyPrefixAttentionStep, ctx: StepContext, plan_states, shard_plan) -> None:
+        # its spec derives no sequence shard, so no step splits it (shard_plan is None)
+        segments = list(step.segments or ())
+        if len(step.key_lens) != len(segments):
+            raise ValueError(
+                f"KeyPrefixAttentionStep: {len(step.key_lens)} key lengths for {len(segments)} segments"
+            )
+        by_label: dict[str, tuple[list[Segment], list[int]]] = {}
+        for seg, key_len in zip(segments, step.key_lens, strict=True):
+            segs, lens = by_label.setdefault(seg.label, ([], []))
+            segs.append(seg)
+            lens.append(key_len)
+        for label, (segs, lens) in by_label.items():
+            wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
+            wrapper.plan_key_prefix(self._cu_seqlens(segs), lens)
+            plan_states[label] = wrapper
