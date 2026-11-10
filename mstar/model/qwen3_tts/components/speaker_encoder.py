@@ -7,19 +7,17 @@ in the Talker prefill. Module names follow the ``speaker_encoder.*`` keys of
 the checkpoint so weights stream in without remapping.
 
 Both pieces are plain, batch-friendly PyTorch: the encoder is a stack of 1-D
-convolutions with "same" reflect padding, and the front end is an STFT plus a
-Slaney-normalized mel filterbank (the filterbank ``librosa.filters.mel``
-produces, computed here without the librosa dependency).
+convolutions with "same" reflect padding, and the front end is the shared
+Matcha/CosyVoice log-mel (``audio_features.MatchaLogMel``).
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
 
 # ---------------------------------------------------------------------------
@@ -27,99 +25,13 @@ from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
 # ---------------------------------------------------------------------------
 
 
-def _hz_to_mel_slaney(freq: torch.Tensor) -> torch.Tensor:
-    """Slaney mel scale: linear below 1 kHz, logarithmic above (librosa default)."""
-    f_sp = 200.0 / 3
-    min_log_hz = 1000.0
-    min_log_mel = min_log_hz / f_sp
-    logstep = math.log(6.4) / 27.0
-    mel = freq / f_sp
-    log_region = freq >= min_log_hz
-    mel = torch.where(
-        log_region,
-        min_log_mel + torch.log(freq.clamp(min=min_log_hz) / min_log_hz) / logstep,
-        mel,
+def speaker_mel(config: Qwen3TTSSpeakerEncoderConfig) -> MatchaLogMel:
+    """The log-mel ``extract_speaker_embedding`` computes of 24 kHz reference
+    audio: ``[batch, samples]`` -> ``[batch, mel_dim, frames]``."""
+    return MatchaLogMel(
+        sample_rate=config.sample_rate, n_fft=config.n_fft, num_mels=config.mel_dim, hop_size=config.hop_size,
+        win_size=config.win_size, fmin=config.fmin, fmax=config.fmax,
     )
-    return mel
-
-
-def _mel_to_hz_slaney(mel: torch.Tensor) -> torch.Tensor:
-    f_sp = 200.0 / 3
-    min_log_hz = 1000.0
-    min_log_mel = min_log_hz / f_sp
-    logstep = math.log(6.4) / 27.0
-    freq = f_sp * mel
-    log_region = mel >= min_log_mel
-    return torch.where(
-        log_region, min_log_hz * torch.exp(logstep * (mel - min_log_mel)), freq
-    )
-
-
-def slaney_mel_filterbank(
-    sample_rate: int, n_fft: int, n_mels: int, fmin: float, fmax: float
-) -> torch.Tensor:
-    """``librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax)``: ``[n_mels, n_fft // 2 + 1]``."""
-    fft_freqs = torch.linspace(0.0, sample_rate / 2, n_fft // 2 + 1, dtype=torch.float64)
-    mel_edges = torch.linspace(
-        _hz_to_mel_slaney(torch.tensor(float(fmin), dtype=torch.float64)).item(),
-        _hz_to_mel_slaney(torch.tensor(float(fmax), dtype=torch.float64)).item(),
-        n_mels + 2,
-        dtype=torch.float64,
-    )
-    hz_edges = _mel_to_hz_slaney(mel_edges)
-    fdiff = hz_edges[1:] - hz_edges[:-1]
-    ramps = hz_edges.unsqueeze(1) - fft_freqs.unsqueeze(0)  # [n_mels + 2, bins]
-    lower = -ramps[:-2] / fdiff[:-1].unsqueeze(1)
-    upper = ramps[2:] / fdiff[1:].unsqueeze(1)
-    weights = torch.clamp(torch.minimum(lower, upper), min=0.0)
-    # Slaney normalization: each filter integrates to about the same area.
-    enorm = 2.0 / (hz_edges[2:] - hz_edges[:-2])
-    return (weights * enorm.unsqueeze(1)).to(torch.float32)
-
-
-class Qwen3TTSMelFrontEnd(nn.Module):
-    """Log-mel features of 24 kHz reference audio, as ``extract_speaker_embedding`` computes them.
-
-    ``waveform`` is ``[batch, samples]`` in ``[-1, 1]``; the output is
-    ``[batch, frames, mel_dim]`` in float32, ready for the encoder. Windows are
-    Hann, frames are not centered but the signal is reflect-padded by
-    ``(n_fft - hop) // 2`` on both sides, magnitudes get a ``1e-9`` floor and
-    the mel energies are log-compressed with a ``1e-5`` clamp.
-    """
-
-    def __init__(self, config: Qwen3TTSSpeakerEncoderConfig) -> None:
-        super().__init__()
-        self.n_fft = config.n_fft
-        self.hop_size = config.hop_size
-        self.win_size = config.win_size
-        self.register_buffer(
-            "mel_basis",
-            slaney_mel_filterbank(config.sample_rate, config.n_fft, config.mel_dim, config.fmin, config.fmax),
-            persistent=False,
-        )
-        self.register_buffer("window", torch.hann_window(config.win_size), persistent=False)
-
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        waveform = waveform.to(torch.float32)
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
-        padding = (self.n_fft - self.hop_size) // 2
-        waveform = F.pad(waveform.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
-        spec = torch.stft(
-            waveform,
-            self.n_fft,
-            hop_length=self.hop_size,
-            win_length=self.win_size,
-            window=self.window,
-            center=False,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=True,
-        )
-        magnitude = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
-        mel = torch.matmul(self.mel_basis, magnitude)
-        return torch.log(torch.clamp(mel, min=1e-5)).transpose(1, 2)
 
 
 # ---------------------------------------------------------------------------

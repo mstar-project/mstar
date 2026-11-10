@@ -8,13 +8,13 @@ The same per-pair kernels, as ``routed_experts``, run ``fused_experts``' bf16 / 
 (no shared expert) at a few tokens on NVIDIA GPUs, for shapes that pass ``routed_fits``.
 The router's top-k program, as ``router_topk``, also serves softmax routers (``TopKRouter``).
 
-The fp8 path's launch tiles of a (GPU, shape) come from the kernel registry's ``moe_decode``
-tables where one has the shape, else from the built-in table for the GPU (see ``_tuning``).
+Both paths' crossover and launch tiles of a (GPU, dtype, shape) come from the kernel registry's
+``moe_decode`` tables where one has the shape, else from the built-in table for the GPU and
+dtype (see ``_tuning``).
 """
 from __future__ import annotations
 
 import dataclasses
-import functools
 
 import torch
 import triton
@@ -35,9 +35,17 @@ class _Tuning:
     logits kernel's K step, most K splits and warps; None where the caller routes."""
 
     pair_max_tokens: int
-    gate_up: tuple[tuple[int | None, dict], ...]
-    down: tuple[tuple[int | None, dict], ...]
+    gate_up: tuple[tuple[int | None, tuple[tuple[str, int], ...]], ...]  # given as dicts
+    down: tuple[tuple[int | None, tuple[tuple[str, int], ...]], ...]
     router: dict | None = None
+
+    def __post_init__(self):
+        # The tiles are kept as (name, value) pairs, read as dicts by ``_tiles``: ``_tuning``
+        # hands this to compiled forwards as a constant, and dynamo can't guard a dict that
+        # comes out of a constant, so unpacking one into a launch would fail to trace.
+        for name in ("gate_up", "down"):
+            rows = tuple((bound, tuple(dict(tiles).items())) for bound, tiles in getattr(self, name))
+            object.__setattr__(self, name, rows)
 
 
 # Tiles from sweeps on each GPU: the H200 at hidden 4096, the H100 at hidden 6144.
@@ -63,68 +71,93 @@ _H100 = _Tuning(
 MOE_DECODE = register(KernelOp(
     name="moe_decode", shape=("H", "E", "I", "K"), bucket="M",
     impls=(Impl("triton", tolerance=Tolerance(2**-7, 1e-3)),),
-    doc="the small-batch fp8 MoE's launch tiles (fused_moe.decode): hidden H, E experts of per-rank "
-        "intermediate I, top-K; per-pair rows by token count, then the grouped '*' row",
+    doc="the small-batch MoE's launch tiles (fused_moe.decode): fp8 experts with a shared expert, or "
+        "bf16 / fp16 ones (routed_experts); hidden H, E experts of per-rank intermediate I, top-K; "
+        "per-pair rows by token count, then the grouped '*' row",
+    # the sweep times the fp8 kernels; a bf16 / fp16 entry is measured end to end
+    sweep_dtypes=("float8_e4m3fn",),
 ))
 
 
-# ``routed_experts``: weights in x.dtype, no shared expert. Swept on an H100 only, at Qwen3-Omni's
-# Thinker and Talker expert shapes (hidden 2048 / 1024); other NVIDIA GPUs run the same tiles
-# unswept. Past 7 tokens the Thinker's grouped GEMMs read each repeated expert once and win.
-ROUTED_MAX_TOKENS = 7
+# ``routed_experts``' built-in table: weights in x.dtype, no shared expert, the caller routes.
+# Swept on an H100 only, at Qwen3-Omni's Thinker and Talker expert shapes (hidden 2048 / 1024);
+# a GPU or shape without a ``moe_decode`` entry runs these tiles unswept. Past 7 tokens the
+# Thinker's grouped GEMMs read each repeated expert once and win on the H100.
 _UNSCALED = _Tuning(
-    pair_max_tokens=ROUTED_MAX_TOKENS,
+    pair_max_tokens=7,
     gate_up=((1, dict(bj=4, bk=256, warps=4)), (None, dict(bj=2, bk=1024, warps=4))),
     down=((None, dict(bn=32, bc=128, warps=8)),),
 )
 
 
-def routed_fits(H, I):
-    """Whether ``routed_experts``' tiles, unclamped, divide experts of hidden ``H`` and
+def routed_fits(H, I, tuning):
+    """Whether ``tuning``'s per-pair tiles, unclamped, divide experts of hidden ``H`` and
     intermediate ``I``; ``fused_experts`` sends other shapes (TP shards of 192 or 96) to its
     grouped path. A tile clamped to a smaller dimension needn't be a power of two, which
     ``tl.arange`` requires."""
-    return (all(I % t["bj"] == 0 and H % t["bk"] == 0 for _, t in _UNSCALED.gate_up)
-            and all(H % t["bn"] == 0 and I % t["bc"] == 0 for _, t in _UNSCALED.down))
+    gate_up = [dict(t) for _, t in tuning.gate_up]
+    down = [dict(t) for _, t in tuning.down]
+    return (all(I % t["bj"] == 0 and H % t["bk"] == 0 for t in gate_up)
+            and all(H % t["bn"] == 0 and I % t["bc"] == 0 for t in down))
 
 
-@functools.cache
-def _tuning(device: torch.device, shape: tuple[int, int, int, int] | None = None) -> _Tuning:
-    """The registry's ``moe_decode`` entry for ``shape`` (H, E, I, K) on this GPU if a table
-    has one, else the H100 table on an H100 and the H200 one everywhere else."""
+_TUNINGS: dict[tuple, _Tuning] = {}
+on_reset(_TUNINGS.clear)
+
+
+@torch.compiler.assume_constant_result
+def _tuning(device: torch.device, shape: tuple[int, int, int, int] | None = None,
+            dtype: torch.dtype = torch.float8_e4m3fn) -> _Tuning:
+    """The registry's ``moe_decode`` entry for ``dtype`` experts of ``shape`` (H, E, I, K) on
+    this GPU if a table has one; else, for fp8 experts, the H100 table on an H100 and the H200
+    one everywhere else, and for bf16 / fp16 ones (``routed_experts``) ``_UNSCALED``. Picked
+    once per key. A constant to dynamo: the routed path decides inside compiled forwards, where
+    a traced table read would break the graph."""
+    key = (device, shape, dtype)
+    if key not in _TUNINGS:
+        _TUNINGS[key] = _pick_tuning(device, shape, dtype)
+    return _TUNINGS[key]
+
+
+def _pick_tuning(device, shape, dtype) -> _Tuning:
     if shape is not None and device.type == "cuda":
         dims = dict(zip("HEIK", shape, strict=True))
-        entry = MOE_DECODE.lookup(torch.float8_e4m3fn, dims, device)
+        entry = MOE_DECODE.lookup(dtype, dims, device)
         if entry is not None:
             return _from_entry(entry)
+    if dtype != torch.float8_e4m3fn:
+        return _UNSCALED
     if device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
         return _H100
     return _H200
 
 
-on_reset(_tuning.cache_clear)
-
-
 def _from_entry(entry: TableEntry) -> _Tuning:
     """A ``moe_decode`` entry as a ``_Tuning``. Its rows are per-pair ones keyed by token count,
     ``{"path": "pair", "gate_up": ..., "down": ..., "router": ...}``, then the ``"*"`` row
-    ``{"path": "grouped", "router": ...}``: past the last per-pair row the experts run grouped.
-    The router's config is one per entry, repeated in every row."""
+    ``{"path": "grouped", "router": ...}``: past the last per-pair row the experts run grouped,
+    and an entry of the ``"*"`` row alone runs them grouped at every count. An fp8 entry's
+    router config is one per entry, repeated in every row; a bf16 / fp16 entry's rows have
+    none, as its caller routes."""
     rows = [(tokens, choice.config) for tokens, choice in entry.rows]
-    routers = [None if config is None else config.get("router") for _, config in rows]
-    if routers[0] is None or any(router != routers[0] for router in routers):
-        raise ValueError(f"{entry.source}: every moe_decode row needs a config with the entry's one router config")
+    if any(config is None for _, config in rows):
+        raise ValueError(f"{entry.source}: every moe_decode row needs a config")
+    routers = [config.get("router") for _, config in rows]
+    fp8 = entry.dtype == "float8_e4m3fn"
+    if any(router != routers[0] for router in routers) or (routers[0] is None) == fp8:
+        need = "the entry's one router config" if fp8 else "no router config (its caller routes)"
+        raise ValueError(f"{entry.source}: every {entry.dtype} moe_decode row needs {need}")
     *pair, (last_key, last) = rows
     if last_key is not None or last.get("path") != "grouped":
         raise ValueError(f"{entry.source}: a moe_decode entry ends with the '*' row, {{\"path\": \"grouped\"}}")
-    if not pair or any(row.get("path") != "pair" for _, row in pair):
-        raise ValueError(f"{entry.source}: a moe_decode entry's rows before '*' are per-pair ones, at least one")
+    if any(row.get("path") != "pair" for _, row in pair):
+        raise ValueError(f"{entry.source}: a moe_decode entry's rows before '*' are per-pair ones")
     final = len(pair) - 1
     return _Tuning(
-        pair_max_tokens=pair[-1][0],
+        pair_max_tokens=pair[-1][0] if pair else 0,
         gate_up=tuple((None if i == final else t, dict(row["gate_up"])) for i, (t, row) in enumerate(pair)),
         down=tuple((None if i == final else t, dict(row["down"])) for i, (t, row) in enumerate(pair)),
-        router=dict(last["router"]),
+        router=None if last.get("router") is None else dict(last["router"]),
     )
 
 
@@ -551,7 +584,7 @@ def _sum_kernel(part, out, T, K: tl.constexpr, H: tl.constexpr, BN: tl.constexpr
 def _tiles(T, tuning):
     """(gate/up, down) per-pair tiles for T tokens."""
     def pick(rows):
-        return next(tiles for bound, tiles in rows if bound is None or T <= bound)
+        return dict(next(tiles for bound, tiles in rows if bound is None or T <= bound))
 
     return pick(tuning.gate_up), pick(tuning.down)
 
@@ -749,20 +782,28 @@ def _launch_experts(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     _launch_down(buf["act"], ids, tw, w2, s2, sw2, buf["out"], block_size, pdl, **dn)
 
 
+def routed_tuning(x, w13, top_k):
+    """``_tuning`` of ``routed_experts`` over ``x`` and experts ``w13 (E, 2I, H)``."""
+    E, two_inter, H = w13.shape
+    return _tuning(x.device, (H, E, two_inter // 2, top_k), x.dtype)
+
+
 def routed_experts(x, w13, w2, topk_w, topk_ids, *, reduce=True):
-    """``fused_experts`` for up to ``ROUTED_MAX_TOKENS`` tokens: per-pair GEMVs over
-    ``w13 (E, 2I, H)`` / ``w2 (E, H, I)`` in ``x.dtype``, no shared expert, SwiGLU and the
-    routing weights in fp32. ``(T, H)``, or each slot's term ``(T, K, H)`` without ``reduce``.
-    ``topk_ids``: real experts only, distinct per token; the shapes must pass ``routed_fits``."""
+    """``fused_experts`` for up to ``routed_tuning``'s ``pair_max_tokens`` tokens: per-pair
+    GEMVs over ``w13 (E, 2I, H)`` / ``w2 (E, H, I)`` in ``x.dtype``, no shared expert, SwiGLU
+    and the routing weights in fp32. ``(T, H)``, or each slot's term ``(T, K, H)`` without
+    ``reduce``. ``topk_ids``: real experts only, distinct per token; the shapes must pass
+    ``routed_fits``."""
     T, H = x.shape
     K = topk_ids.shape[1]
-    assert T <= ROUTED_MAX_TOKENS and x.is_contiguous()
+    tuning = routed_tuning(x, w13, K)
+    assert T <= tuning.pair_max_tokens and x.is_contiguous()
     assert w13.dtype == w2.dtype == x.dtype and w13.is_contiguous() and w2.is_contiguous()
     out = torch.empty((T, H) if reduce else (T, K, H), dtype=x.dtype, device=x.device)
     if T:
         act = torch.empty(T * K, w2.shape[2], dtype=torch.float32, device=x.device)
         ids, tw = topk_ids.contiguous(), topk_w.float().contiguous()
-        gu, dn = _tiles(T, _UNSCALED)
+        gu, dn = _tiles(T, tuning)
         _launch_gate_up(x, ids, w13, None, None, act, None, None, False, **gu)
         _launch_down(act, ids, tw, w2, None, None, out, None, False, **dn, reduce=reduce)
     return out

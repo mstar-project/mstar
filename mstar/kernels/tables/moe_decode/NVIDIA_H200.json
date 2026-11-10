@@ -3,6 +3,14 @@
   "op": "moe_decode",
   "entries": [
     {
+      "dtype": "bfloat16",
+      "shape": {"E": 128, "H": 2048, "I": 768, "K": 8},
+      "provenance": {"device": "NVIDIA H200", "date": "2026-11-08", "harness": "end to end, not swept: Qwen3-Omni Thinker text decode ms/token (ITL p50 in the 2026-11-04 run) at c=1/2/4, 256 tokens with --ignore-eos, on configs/qwen3omni_2gpu.yaml (2 H200s, the Thinker on the second), at per-pair crossovers 0, 2 and 7, 2 boots each", "torch": "2.10 / 2.12.1+cu132", "triton": "3.6 / 3.7.1", "mstar": "bca860723 for the 2.12.1 run (never pushed; its MoE and registry code matches f2be562df0's but for a type annotation, and its crossover 0 arm ran its own \"*\"-only H200 entry, the rows here)", "note": "Qwen3-Omni-30B-A3B Thinker experts, TP1: the grouped GEMMs at every token count (crossover 0). ms/token at c=1/2/4, crossover 0 / 2 / 7 (the built-in). torch 2.10, Triton 3.6 (merceod, 2026-11-08): 3.22/4.39/5.81, 3.56/4.60/5.80, 3.57/4.60/6.11. torch 2.12.1+cu132, Triton 3.7.1 (2026-11-04, on bca860723): 3.28-3.29/4.38-4.39/5.71, 3.11/4.18-4.19/5.70-5.71, 3.14-3.16/4.19-4.22/5.82. Grouped ran within about 2% across the two boxes and per-pair 9-15% apart at 1-2 tokens, so there per-pair was 5-11% slower than grouped on the torch 2.10 box and 4-6% faster on the 2.12.1 one; at 4 tokens grouped beat 7 on both. The boxes also differ in mstar commit and host, so the cause isn't isolated, but one GPU-keyed entry can't pick per-pair for both, and grouped, steady across them, trails per-pair by at most about 6% at 1-2 tokens, whereas per-pair would trail grouped by up to about 11%. The per-pair tiles were swept on an H100, not here"},
+      "rows": {
+        "*": {"impl": "triton", "config": {"path": "grouped"}}
+      }
+    },
+    {
       "dtype": "float8_e4m3fn",
       "shape": {"H": 6144, "E": 256, "I": 256, "K": 8},
       "provenance": {"device": "NVIDIA H200", "date": "2026-10-30", "harness": "#388's per-pair/grouped sweep at this shape, every call's weights read from HBM (cb3c9fbaa, fused_moe: GLM-5.2's decode tiles on the H200)", "note": "GLM-5.2-FP8's experts at TP8 (hidden 6144, 256 experts of 256, top-8); was decode.py's _H200_GLM52 table before the kernel registry (#986). measured: one layer's routed + shared experts, CUDA-graph replay, us a call, default_us the built-in H200 table"},

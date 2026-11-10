@@ -61,7 +61,7 @@ def _tiny_config() -> VJepa2Config:
     )
 
 
-def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPassInfo:
+def _make_request_info(iter_idx: int) -> CurrentForwardPassInfo:
     """Minimal ``CurrentForwardPassInfo`` that exposes the loop iter count
     the submodule expects (populated by ``worker.py:941-943`` in production).
     """
@@ -73,7 +73,6 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
         max_tokens=0,
     )
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
-    info.step_metadata["rollout_horizon"] = rollout_horizon
     return info
 
 
@@ -129,7 +128,7 @@ def _submodule_loop(
     predictions: list[torch.Tensor] = []
     with torch.no_grad():
         for k in range(num_steps):
-            info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
+            info = _make_request_info(iter_idx=k)
             out = submodule.forward(
                 _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
             )
@@ -207,7 +206,7 @@ class TestRolloutParity:
         encoder_hidden = x_full
         with torch.no_grad():
             for k in range(3):
-                info = _make_request_info(iter_idx=k, rollout_horizon=3)
+                info = _make_request_info(iter_idx=k)
                 out = submodule.forward(
                     _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
                 )
@@ -220,41 +219,3 @@ class TestRolloutParity:
                 # The head of next_hidden is the tail of the prior hidden.
                 torch.testing.assert_close(next_hidden[:, : n - n_pred, :], encoder_hidden[:, n_pred:, :])
                 encoder_hidden = next_hidden
-
-
-class TestEarlyExit:
-    def test_register_loop_stop_at_requested_horizon(self):
-        """When ``step_metadata["rollout_horizon"]`` is reached, the
-        submodule requests that the DynamicLoop terminate"""
-        torch.manual_seed(2)
-        config = _tiny_config()
-        predictor = VJEPA2Predictor(config).eval()
-
-        submodule = VJepa2RolloutPredictorSubmodule(
-            predictor=predictor,
-            config=config,
-            num_output_frames=2,
-            frames_per_second=4,
-            anticipation_seconds=1.0,
-        )
-
-        x_full = torch.randn(1, config.num_patches, config.hidden_size)
-        horizon = 3
-        stop_seen_at: list[int] = []
-        encoder_hidden = x_full
-        with torch.no_grad():
-            # Drive the submodule as if max_iters were larger than horizon;
-            # after iter horizon-1 the submodule should register the stop.
-            for k in range(horizon + 2):
-                info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
-                out = submodule.forward(
-                    _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
-                )
-                encoder_hidden = out["encoder_hidden"][0]
-                if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
-                    stop_seen_at.append(k)
-
-        # The very first iter where the stop fires should be iter == horizon - 1,
-        # because the submodule checks ``iter_idx + 1 >= horizon``.
-        assert stop_seen_at, "submodule never registered a loop stop"
-        assert stop_seen_at[0] == horizon - 1

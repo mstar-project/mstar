@@ -49,18 +49,7 @@ ROUTES = {
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
-NOT_PORTED = {
-    ("ChatterboxAdapter", "speech"),
-    ("CosyVoice3Adapter", "speech"),
-    ("FishS2ProAdapter", "speech"),
-    ("KokoroAdapter", "speech"),
-    ("OmniVoiceAdapter", "speech"),
-    ("VoxCPM2Adapter", "speech"),
-    ("DiffusionImageAdapter", "images"),
-    ("LTX25Adapter", "videos"),
-    ("Wan22Adapter", "videos"),
-    ("GlmChatAdapter", "chat"),
-}
+NOT_PORTED: set[tuple[str, str]] = {("GlmChatAdapter", "chat")}
 
 
 def _classes() -> dict[str, object]:
@@ -166,8 +155,9 @@ CHAT = {
     "temperature": 0.5, "top_p": 0.8, "max_completion_tokens": 16, "max_tokens": 64, "seed": 3,
     "modalities": ["text", "audio"], "audio": {"voice": "Ethan"},
     "repetition_penalty": 1.05, "top_k": 20,
-    "chat_template_kwargs": {"enable_thinking": False},
-    "tools": [], "tool_choice": "auto",
+    # a template key named like a refused field reaches the model, as the flat off one is dropped first
+    "chat_template_kwargs": {"enable_thinking": False, "current_date": "2026-11-08", "logprobs": True},
+    "tools": [], "tool_choice": "auto", "logprobs": False,
 }
 
 # ChatCompletionRequest's declared fields; the rest is model_extra.
@@ -199,11 +189,15 @@ def _chat_classes() -> list[str]:
                   if a.supports_chat and (c, "chat") not in NOT_PORTED)
 
 
-CHAT_CLASSES = _chat_classes()
+# Text-only chat refuses the multimodal CHAT body; its own table is below.
+TEXT_ONLY_CHAT = {"TextChatAdapter"}
+CHAT_CLASSES = [c for c in _chat_classes() if c not in TEXT_ONLY_CHAT]
 
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
-    assert CHAT_CLASSES == ["BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter"]
+    assert _chat_classes() == [
+        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
+    ]
 
 
 class _UnportedChatAdapter(OpenAIAdapter):
@@ -241,6 +235,52 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
     assert sub["mk"] == want.model_kwargs
     assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
     assert rust_files == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}
+
+
+def _wrapped(text: str, width: int, sep: str) -> str:
+    return sep.join(text[i:i + width] for i in range(0, len(text), width))
+
+
+# PNG as clients send it, by whether the Python adapter takes it. Its base64 is
+# padded and holds "+" and "/".
+IMAGE_URLS = {
+    "padded": (f"data:image/png;base64,{PNG}", True),
+    "unpadded": (f"data:image/png;base64,{PNG.rstrip('=')}", True),
+    "wrapped": ("data:image/png;base64," + _wrapped(PNG, 76, "\n") + "\n", True),
+    "wrapped-unpadded": ("data:image/png;base64," + _wrapped(PNG.rstrip("="), 64, "\r\n"), True),
+    "unicode-spaces": (f"data:image/png;base64,{PNG[:8]}\u00a0{PNG[8:]}\u3000", True),
+    "unused-bits-set": (f"data:image/png;base64,{PNG[:-2]}J=", True),
+    "excess-padding": (f"data:image/png;base64,{PNG}==", False),
+    "url-safe": ("data:image/png;base64," + PNG.replace("+", "-").replace("/", "_"), False),
+    "cut-mid-quad": (f"data:image/png;base64,{PNG[:-3]}", False),
+}
+
+
+@pytest.mark.parametrize("cls", CHAT_CLASSES)
+def test_an_image_chat_takes_the_data_urls_the_python_adapter_takes(cls, tmp_path):
+    model = _model_of(cls)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        for name, (url, taken) in IMAGE_URLS.items():
+            body = {"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": "Read the page."},
+            ]}]}
+            try:
+                want = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path)
+            except ValueError:
+                want = None
+            assert (want is not None) == taken, name
+            before = len(stub.submitted)
+            status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+            if want is None:
+                assert status == 400 and len(stub.submitted) == before, (name, status, data)
+                continue
+            assert status == 200, (name, data)
+            sub = stub.submitted[-1]
+            assert (sub["text"], sub["in"], sub["mk"]) == (want.text, want.input_modalities, want.model_kwargs), name
+            assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts], name
+            assert _files(sub["files"]) == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}, name
 
 
 # ── both frontends answer a chat the same way ────────────────────────────────
@@ -288,11 +328,20 @@ def _normalized(status, data: bytes, stream: bool):
     return status, [e if e == "[DONE]" else blank(json.loads(e)) for e in events]
 
 
+def _image_chat(url: str) -> dict:
+    return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]}
+
+
 PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
+    "json-mode": ({"messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}},
+                  False),
     "bad-role": ({"messages": [{"role": "tool", "content": "42"}]}, False),
+    # remote fetch is off unless MSTAR_ALLOW_REMOTE=1, and a server path never reads
+    "remote-image": (_image_chat("https://example.com/page.png"), False),
+    "server-path-image": (_image_chat("/etc/hosts"), False),
 }
 
 
@@ -304,9 +353,156 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
 
     from mstar.api_server import entrypoint
 
+    monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     body, stream = PARITY_CASES[case]
     monkeypatch.setattr(entrypoint, "api_server", _PythonServer(model, tmp_path))
     py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
     with _model_stack(model, _StubAPIServer()) as (port, _upload):
         rust = _post(port, "/v1/chat/completions", body, timeout=30)
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+
+
+# ── GET /v1/audio/voices ─────────────────────────────────────────────────────
+
+class _VoicedModel:
+    def __init__(self, voices=("tara", "leo")):
+        self.voices = list(voices)
+
+    def get_voices(self):
+        return list(self.voices)
+
+    def get_default_voice(self):
+        return "tara"
+
+
+def _get(port, path, timeout=15):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+@pytest.mark.parametrize("model,voiced", [("orpheus", True), ("orpheus", False), ("qwen3_5_0.8b", True)],
+                         ids=["voices", "no-voice-list", "not-a-speech-model"])
+def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypatch):
+    """Both ask the model (``serving_speech.list_voices``) per request, so a voice
+    added while serving shows on both; a model with none, or no speech surface,
+    gets the same 404."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    server = _PythonServer(model, tmp_path)
+    stub = _StubAPIServer()
+    server.model = stub.model = _VoicedModel() if voiced else None
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    py = TestClient(entrypoint.app)
+    with _model_stack(model, stub) as (port, _upload):
+        for added in ([], ["nova"]):
+            if voiced:
+                server.model.voices += added
+            expected = py.get("/v1/audio/voices")
+            status, body = _get(port, "/v1/audio/voices")
+            assert (status, json.loads(body)) == (expected.status_code, expected.json())
+    if voiced and model == "orpheus":
+        assert expected.json()["voices"][-1] == {"id": "nova", "name": "nova"}
+
+
+# ── text-only chat (TextChatAdapter) ─────────────────────────────────────────
+
+def _text(**fields):
+    return {"model": "ripple_65b", "messages": [{"role": "user", "content": "Bonjour, 世界"}], **fields}
+
+
+TEXT_CHAT_CASES = {
+    "accepted": _text(temperature=0.3, top_p=0.9, max_tokens=16, seed=2, top_k=5),
+    # one input modality per part, or a model that rebuilds its turns from them keeps only the first
+    "multi-turn": {"model": "ripple_65b", "messages": [
+        {"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"}, {"role": "user", "content": "again"},
+    ]},
+    "text-response-format": _text(response_format={"type": "text"}, best_of=1, n=1, logprobs=False),
+    "image": {"model": "ripple_65b", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is it"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}},
+    ]}]},
+    "no-text": {"model": "ripple_65b", "messages": [{"role": "user", "content": ""}]},
+    "zero-max-tokens": _text(max_tokens=0),
+    "zero-max-completion-tokens": _text(max_completion_tokens=0),
+    "n": _text(n=2),
+    "stop": _text(stop=["\n"]),
+    "logprobs": _text(logprobs=True),
+    "logit-bias": _text(logit_bias={"50256": -100}),
+    "presence-penalty": _text(presence_penalty=0.5),
+    "tiny-penalty": _text(frequency_penalty=1e-05),
+    "stop-token-ids": _text(stop_token_ids=[2, 3]),
+    "best-of": _text(best_of=2),
+    "json-format": _text(response_format={"type": "json_object"}),
+    "tool-call": _text(tool_choice="required"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TEXT_CHAT_CASES))
+def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path):
+    """The Python adapter's refusal is the Rust 400's message, word for word
+    (values quoted with Python's ``repr``); an accepted chat reaches the backend
+    with the same arguments, once ``submit_request`` normalizes them."""
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+    body = TEXT_CHAT_CASES[case]
+    try:
+        want, refusal = ADAPTER_REGISTRY["ripple_65b"].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack("ripple_65b", stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    assert (sub["text"], sub["in"], sub["out"]) == (want.text, want.input_modalities, want.output_modalities)
+    assert normalize_generation_kwargs(sub["mk"]) == want.model_kwargs
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
+    assert not sub["files"]
+
+
+# ── an image request reaches the backend as the Python adapter builds it ────
+
+IMAGE_CASES = {
+    "size": {"prompt": "a cat", "size": "512x256"},
+    "size-spaced": {"prompt": "a cat", "size": " 512 X 256 "},
+    "size-underscored": {"prompt": "a cat", "size": "1_024x512"},
+    "size-empty": {"prompt": "a cat", "size": ""},
+    "bad-size": {"prompt": "a cat", "size": "big"},
+    "three-sides": {"prompt": "a cat", "size": "1x2x3"},
+    "seeded": {"prompt": "a cat", "seed": 3, "guidance_scale": 4.0},
+}
+
+
+@pytest.mark.parametrize("case", sorted(IMAGE_CASES))
+@pytest.mark.parametrize("cls", sorted(c for c, a in _classes().items() if a.supports_images))
+def test_an_image_request_is_submitted_or_refused_as_the_python_adapter_does(cls, case, tmp_path):
+    from mstar.api_server.openai.protocol import ImageGenerationRequest
+
+    model = _model_of(cls)
+    body = {"model": model, **IMAGE_CASES[case]}
+    try:
+        want = ADAPTER_REGISTRY[model].image_to_request(ImageGenerationRequest(**body), tmp_path)
+        refusal = None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        status, data = _post(port, "/v1/images/generations", body)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        return
+    assert status == 200, data
+    sub = stub.submitted[0]
+    assert (sub["text"], sub["in"], sub["out"], sub["mk"] or {}) == (
+        want.text, want.input_modalities, want.output_modalities, want.model_kwargs)

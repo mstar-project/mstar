@@ -39,7 +39,7 @@ from mstar.communication.event import EventWakeup
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -485,6 +485,7 @@ def test_a_served_request_is_not_a_refusal(served):
 
 
 def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
+    pytest.importorskip("prometheus_client")
     from mstar.api_server import auth
 
     server = make_test_api_server(preprocess_worker=_DataWorker())
@@ -734,12 +735,9 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
-    class _Model:
+    class _Model(StubModel):
         def process_prompt(self, *args, **kwargs):
             return None
-
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["default"])
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
@@ -1031,7 +1029,7 @@ def test_transfer_snapshots_render_as_prometheus_client_would():
 SLOW_PROMPT_S = 0.03
 
 
-class _MediaModel:
+class _MediaModel(StubModel):
     """Decodes images with the base model's real loader and WAVs with the
     stdlib (CI has neither soundfile nor torchcodec); takes one image per
     request. The prompt text can slow, hold or fail its prompt processing."""
@@ -1042,9 +1040,6 @@ class _MediaModel:
 
     def max_input_files(self):
         return {"image": 1}
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def load_image(self, filepath, device):
         from mstar.model.base import Model
@@ -1363,7 +1358,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1404,8 +1399,10 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
     monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
                         lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
+    monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
     entrypoint.main(["--config", cfg, "--enable-metrics"])
@@ -1419,7 +1416,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1445,7 +1442,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
-        "status_interval_s": 1.0, "lora_adapter_digests": {}}
+        "status_interval_s": 1.0, "model_config": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 

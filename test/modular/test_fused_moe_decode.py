@@ -69,7 +69,9 @@ def _host_layer(tokens, hidden=256, inter=256, experts=16, top_k=4):
 
 
 def test_tuning_follows_the_gpu_name(monkeypatch):
-    pick = decode._tuning.__wrapped__
+    def pick(device):
+        return decode._pick_tuning(device, None, torch.float8_e4m3fn)
+
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H100 80GB HBM3")
     assert pick(torch.device("cuda", 0)) is decode._H100
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H200")

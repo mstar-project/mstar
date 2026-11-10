@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ def public_row(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
-async def measure(
+def measure(
     suite: Suite,
     url: str,
     items: list[Item],
@@ -69,16 +70,23 @@ async def measure(
             row["slot_wait_s"] = sent - t0
         return row
 
+    async def load_pass(load: Callable[[], Awaitable[Any]]) -> Any:
+        nonlocal session
+        async with new_session() as session:
+            return await load()
+
+    async def timed_load() -> tuple[list[dict[str, Any]], float]:
+        nonlocal wall_start
+        wall_start = time.perf_counter()
+        return await run_load(items, one, spec)
+
     if warmup_requests:
         log(f"[{suite.name}] warmup: {warmup_requests} request(s) at {spec.describe()}")
-        async with new_session() as session:
-            await warmup(items, one, spec, warmup_requests)
+        asyncio.run(load_pass(lambda: warmup(items, one, spec, warmup_requests)))
     out: list[RepeatResult] = []
     timed = True
     for rep in range(repeats):
-        async with new_session() as session:
-            wall_start = time.perf_counter()
-            rows, wall = await run_load(items, one, spec)
+        rows, wall = asyncio.run(load_pass(timed_load))   # scoring blocks for minutes: keep it off the loop
         keep = save_audio == "all" or (save_audio == "last" and rep == repeats - 1)
         rep_dir = audio_dir / f"r{rep}" if (audio_dir is not None and keep) else None
         metrics = suite.score(items, rows, wall, rep_dir)
@@ -118,8 +126,7 @@ def run_point(
     def log(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
-    reps = asyncio.run(measure(suite, url, items, spec, repeats, warmup_requests, audio_dir, save_audio, log,
-                               error_log))
+    reps = measure(suite, url, items, spec, repeats, warmup_requests, audio_dir, save_audio, log, error_log)
     cfg = {
         **config,
         "load": {"mode": spec.mode, "concurrency": spec.concurrency, "rate": spec.rate, "seed": spec.seed},
