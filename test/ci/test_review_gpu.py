@@ -404,6 +404,15 @@ class TestComment(unittest.TestCase):
                 with unittest.mock.patch.object(*failing, side_effect=RuntimeError):
                     self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
                 self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
+        for s2, s3, text, redacted in (
+                (key, lined, "09:01 only ghi+jkl== here", "09:01 only [REDACTED] here"),  # one line of a key alone
+                ("abc/def", "dop_v1_abc/def", "key dop_v1_abc/def", "key [REDACTED]"),  # a key that holds another
+                ("tok\r\n \n", "", "a tok b", "a [REDACTED] b")):  # a key with "\r\n" and a line of spaces
+            with self.subTest(text), tempfile.TemporaryDirectory() as temp:
+                Path(temp, "lt/results").mkdir(parents=True)
+                Path(temp, "lt/unavailable.md").write_text(text)
+                gpu_review.redact({}, temp, s2=s2, s3=s3)
+                self.assertEqual(Path(temp, "lt/unavailable.md").read_text(), redacted)
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
