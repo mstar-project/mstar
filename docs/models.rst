@@ -997,7 +997,10 @@ voices a slot is 284 MiB of ``t2w_dit_kv`` (more for a longer voice), 64 MiB of
 reply. ``t2w_state`` has one more slot than each ``t2w_*_kv`` (its sink), and startup
 refuses counts that disagree. The conformer's caches hold a whole reply, so a voice of 17 s
 or more does not fit the flow's relative position table at the reply cap, and startup
-refuses one. Every node runs eagerly for now (no CUDA graphs).
+refuses one. The LLM's decode and prefill run on CUDA graphs (decode at batch sizes up to
+32, prefill up to 8 prompts and 2048 tokens; anything wider runs eagerly), as do the audio
+tower's 32 blocks (one request a step, up to 2560 post-conv frames, two full 25 s clips) and
+the vocoder's windows.
 
 Command A+ (``command_a_plus``)
 -------------------------------
