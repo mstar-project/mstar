@@ -380,7 +380,8 @@ def test_a_client_stream_that_declares_audio_needs_looped_output():
     """/v1/realtime would fail such a call at the first chunk without a loop
     step, and mis-pair its text and audio unless the loop steps once per item
     from the stream. Turn tokens are not needed to start: only a conversation
-    needs them."""
+    needs them. A model without them that sends audio is checked too: it is
+    no live transcription, whose text has no audio to pair with."""
     class _Unmarked(_DuplexToy):
         def get_partition_topology(self):
             conn = _client_connection("audio_in")
@@ -409,6 +410,15 @@ def test_a_client_stream_that_declares_audio_needs_looped_output():
     assert _refused(_Unlooped(), "['ear'] emit outside one")
     assert _refused(_AtLoopExit(), "['listen_loop'] emit outside one")
     assert _refused(_TwoFramesAStep(), "['Ear'] do not")
+
+    class _UnmarkedSpeaker(_Unmarked):
+        def get_graph_walk_graphs(self):
+            ear = super().get_graph_walk_graphs()["listen"].section
+            ear.outputs.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="audio", output_modality="audio"))
+            return {"listen": ear}
+
+    assert _UnmarkedSpeaker().live_transcription_stream is None
+    assert _refused(_UnmarkedSpeaker(), "['ear'] emit outside one")
     assert check_client_streams(_Unmarked(), {}) == check_client_streams(_Marked(), {}) == []
 
 

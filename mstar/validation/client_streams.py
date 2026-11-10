@@ -65,7 +65,7 @@ def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]
     walks = model.get_graph_walk_graphs()
     if model.live_transcription_stream is None and any(conn.audio is not None for conn in connections):
         # /v1/realtime pairs a declared-audio model's text with its audio by the emitting loop's step
-        # (a live transcription has no audio out to pair)
+        # (a live transcription has no audio out to pair: a model that sends audio is never one)
         loops = [loop for walk in walks.values() for loop in walk.get_loops().values()]
         looped = {name for loop in loops for name in loop.get_nodes()}
         nested = {name for loop in loops for name in loop.section.get_loops()}

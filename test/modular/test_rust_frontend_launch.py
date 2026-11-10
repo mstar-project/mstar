@@ -128,6 +128,9 @@ def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
         def get_partition_topology(self):
             return PartitionTopology(["Encoder"], [ear])
 
+        def get_graph_walk_graphs(self):
+            return {}
+
     server = SimpleNamespace(model=_Duplex(), client_audio=[ear])
     assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": {
         "streams": 1, "turn_tokens": True, "channels": 1, "stream": "audio_in", "rate": 16000, "frame_samples": 1280,
