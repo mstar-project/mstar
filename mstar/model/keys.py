@@ -10,6 +10,9 @@ ROPE = "rope"
 SAMPLER = "sampler"
 # a vision tower's cacheless attention
 VISION_ATTN = "vision_attn"
+# a windowed tower's two layouts on it: windows of patches, and whole frames
+VISION_WINDOW = "window"
+VISION_FULL = "full"
 # a text-only prompt's prefill walk, in a `MultimodalDecoderModel`'s graph
 PREFILL_TEXT = "prefill_text"
 # text prefill and decode rows batched in one step (`Model.get_combined_graph_walks`)

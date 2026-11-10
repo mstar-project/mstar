@@ -620,7 +620,7 @@ class H3Model(Model):
                 weight_loader.build_text_encoder(config, snapshot, device),
                 weight_loader.build_text_conditioner(config, snapshot, device),
                 attn_resource_key=REFINER_ATTN if ragged else None,
-                vision=weight_loader.build_vision_tower(snapshot, device), config=config,
+                vision=weight_loader.build_vision_tower(snapshot, device),
             )
         if node_name == VAE_ENCODER_NODE:
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))

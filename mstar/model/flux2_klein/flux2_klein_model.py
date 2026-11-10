@@ -45,11 +45,11 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
-from mstar.model.components.diffusion.qwen3.submodule import (
+from mstar.model.components.diffusion.qwen.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_LEN,
-    Qwen3TextEncoderSubmodule,
+    QwenTextEncoderSubmodule,
 )
 from mstar.model.components.quant_linear import (
     check_linear_dtype,
@@ -434,7 +434,7 @@ class Flux2KleinModel(Model):
 
         if node_name == "text_encoder":
             encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
-            return Qwen3TextEncoderSubmodule(
+            return QwenTextEncoderSubmodule(
                 encoder, self.config.text_encoder, max_batch_size=self.max_batch_size,
                 capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
             )

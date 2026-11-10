@@ -1,14 +1,16 @@
-"""Qwen's interleaved 3D MRoPE (Qwen3-VL, Qwen3.5, Qwen3-Omni's Thinker, the Cosmos3
-reasoner): the 3D positions of a prompt with media, from its intake layout or per image,
+"""Qwen's 3D MRoPE (Qwen3-VL, Qwen3.5, Qwen3-Omni's Thinker, the Cosmos3 reasoner, and
+Qwen2/2.5-VL): the 3D positions of a prompt with media, from its intake layout or per image,
 a packed step's, and the rotary tables they give.
 
 Text advances all three grids together; an image holds T and sweeps H and W over its
 merged patch grid, and moves the cursor by ``max(h', w')``. The frequency dims are
-interleaved ``[T, H, W, T, H, W, ...]`` (``mrope_section`` dims each, T taking the tail).
+interleaved ``[T, H, W, T, H, W, ...]`` (``mrope_section`` dims each, T taking the tail),
+or, in Qwen2/2.5-VL's layout, sectioned ``[T..., H..., W...]``.
 """
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING
 
 import torch
@@ -102,13 +104,18 @@ def compute_inv_freq(
 
 
 def recompose_frequencies(
-    freqs: torch.Tensor, mrope_section: list[int],
+    freqs: torch.Tensor, mrope_section: list[int], interleaved: bool = True,
 ) -> torch.Tensor:
     """Weave the three grids together, T as the base and H/W overwriting.
 
     ``freqs`` is ``[3, seq_len, rotary_dim // 2]``; T keeps dims 0,3,6..., H
-    takes 1,4,7..., W 2,5,8... (the ``mrope_interleaved`` layout).
+    takes 1,4,7..., W 2,5,8... (the ``mrope_interleaved`` layout). Not interleaved,
+    the grids take consecutive sections of ``mrope_section`` dims, T first, as
+    Qwen2/2.5-VL's ``apply_multimodal_rotary_pos_emb`` selects them.
     """
+    if not interleaved:
+        bounds = [0, *itertools.accumulate(mrope_section)]
+        return torch.cat([freqs[dim, ..., bounds[dim]:bounds[dim + 1]] for dim in range(3)], dim=-1)
     out = freqs[0].clone()
     for dim, offset in enumerate((1, 2), start=1):  # H, W
         idx = slice(offset, mrope_section[dim] * 3, 3)
@@ -121,12 +128,13 @@ def compute_3d_cos_sin(
     inv_freq: torch.Tensor,
     mrope_section: list[int],
     target_dtype: torch.dtype | None = None,
+    interleaved: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """cos/sin of shape ``[seq_len, rotary_dim]`` from ``[3, seq_len]`` positions."""
     pos = position_ids_3d[:, None, :].float()        # [3, 1, seq_len]
     ifreq = inv_freq[None, :, None].float()          # [1, rotary_dim//2, 1]
     freqs = (ifreq * pos).transpose(1, 2)            # [3, seq_len, rotary_dim//2]
-    freqs = recompose_frequencies(freqs, mrope_section)
+    freqs = recompose_frequencies(freqs, mrope_section, interleaved)
     # doubled for the rotate-half convention
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos(), emb.sin()

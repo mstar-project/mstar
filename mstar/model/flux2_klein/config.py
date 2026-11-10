@@ -18,7 +18,7 @@ from pathlib import Path
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 
 # Resource key the dit node declares its ragged joint attention under.
 DIT_ATTN = "dit_attn"
@@ -117,7 +117,7 @@ class Flux2KleinConfig:
 
     transformer: Flux2TransformerConfig = field(default_factory=Flux2TransformerConfig)
     vae: Flux2VaeConfig = field(default_factory=Flux2VaeConfig)
-    text_encoder: Qwen3EncoderConfig = field(default_factory=Qwen3EncoderConfig)
+    text_encoder: QwenEncoderConfig = field(default_factory=QwenEncoderConfig)
     scheduler: FlowMatchConfig = field(default_factory=FlowMatchConfig)
 
     # Generation defaults; every one is overridable per request through model_kwargs.
@@ -180,7 +180,7 @@ class Flux2KleinConfig:
         with open(snapshot / "vae" / "config.json") as f:
             vae = Flux2VaeConfig.from_dict(json.load(f))
         with open(snapshot / "text_encoder" / "config.json") as f:
-            text_encoder = Qwen3EncoderConfig.from_dict(json.load(f))
+            text_encoder = QwenEncoderConfig.from_dict(json.load(f))
         with open(snapshot / "scheduler" / "scheduler_config.json") as f:
             scheduler = FlowMatchConfig.from_scheduler_config(json.load(f), empirical_mu=True)
         if transformer.joint_attention_dim != text_encoder.output_dim:

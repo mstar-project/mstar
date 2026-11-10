@@ -1,6 +1,6 @@
 """FLUX.2 [klein] node submodules (four nodes, one optional engine resource).
 
-    text_encoder -> Qwen3TextEncoderSubmodule  native Qwen3 taps over all 512 padded positions (shared node)
+    text_encoder -> QwenTextEncoderSubmodule  native Qwen3 taps over all 512 padded positions (shared node)
     vae_encoder  -> KleinVaeEncoderSubmodule   reference images -> normalized packed latent tokens (edits)
     dit          -> KleinDenoiseSubmodule      DenoiseLoopSubmodule + the klein transformer + Euler step
     vae_decoder  -> KleinVaeDecoderSubmodule   packed tokens -> uint8 image; batches equal shapes
@@ -45,7 +45,7 @@ from mstar.model.components.diffusion.image_io import (
     unpack_latents,
     unpatchify_latents,
 )
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
+from mstar.model.components.diffusion.qwen.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
 from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig

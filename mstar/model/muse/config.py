@@ -29,8 +29,8 @@ SAMPLER = keys.SAMPLER
 # the ViT tower's cacheless attention, on the `vision_encoder` node
 VISION_ATTN = keys.VISION_ATTN
 # the tower's two ragged layouts: 32x32-patch windows, and whole frames
-VISION_WINDOW = "window"
-VISION_FULL = "full"
+VISION_WINDOW = keys.VISION_WINDOW
+VISION_FULL = keys.VISION_FULL
 
 
 # a mixture-of-experts text config, which this dense port would load wrong

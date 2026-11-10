@@ -44,7 +44,7 @@ import torch
 from test_flux2_klein_reference_equivalence import _encode_rows
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
+from mstar.model.components.diffusion.qwen.submodule import TEXT_INPUTS
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.z_image.config import DENOISE_LOOP, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import CAP_PAD_MASK, LATENTS, TEXT_EMBEDS, padded_length

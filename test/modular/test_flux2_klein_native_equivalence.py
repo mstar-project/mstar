@@ -46,10 +46,9 @@ from mstar.model.components.diffusion.image_io import (  # noqa: E402
     unpack_latents,
     unpatchify_latents,
 )
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
-from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig, QwenHiddenStateEncoder  # noqa: E402
+from mstar.model.components.diffusion.qwen.weight_loading import (  # noqa: E402
     QKV_RULES_LM,
-    make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
@@ -315,9 +314,9 @@ def test_text_encoder_tapped_hidden_states_bit_exact_with_padding():
     )
     ref = transformers.Qwen3ForCausalLM(hf_cfg).eval()
     taps = (2, 4, 5)
-    text_cfg = Qwen3EncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"}, hidden_state_layers=taps,
+    text_cfg = QwenEncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"}, hidden_state_layers=taps,
                                             max_sequence_length=12)
-    native = make_text_encoder(text_cfg).eval()
+    native = QwenHiddenStateEncoder(text_cfg).eval()
     load_native(native, iter(ref.state_dict().items()), remap_text_encoder_key, "tiny qwen3",
                 stacked_params=QKV_RULES_LM, skip=text_encoder_skip(text_cfg))
     # only the layers up to the deepest tap exist (klein: 27 of 36)

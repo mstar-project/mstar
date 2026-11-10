@@ -25,6 +25,7 @@ from mstar.model.components.qwen3_vit import (
     VisionBlock,
     VisionRotaryEmbedding,
     bilinear_table_taps,
+    window_order,
 )
 from mstar.model.keys import VISION_ATTN
 from mstar.model.muse.config import (
@@ -74,22 +75,6 @@ def _interpolation(grid, side: int):
     )
 
 
-def _windows(grid, window: int):
-    """Raster -> window order, and each window's length. Windows tile each
-    frame from the top left; edge windows are partial. Frames never mix."""
-    index, lengths, offset = [], [], 0
-    for t, h, w in grid:
-        frame = torch.arange(h * w).view(h, w)
-        for f in range(t):
-            for r0 in range(0, h, window):
-                for c0 in range(0, w, window):
-                    block = frame[r0:r0 + window, c0:c0 + window].reshape(-1)
-                    index.append(block + offset + f * h * w)
-                    lengths.append(block.numel())
-        offset += t * h * w
-    return torch.cat(index), tuple(lengths)
-
-
 def _merge_order(grid, merge: int):
     """Raster -> 2x2-block order, block-major over the merged grid."""
     index, offset = [], 0
@@ -106,7 +91,7 @@ def tower_inputs(grid: list[tuple[int, int, int]], config: MuseGlimmerVisionConf
     """The tower's index tensors for ``grid``, built once per request, on
     the CPU: the node's `preprocess` moves them."""
     indices, weights = _interpolation(grid, config.pos_emb_height)
-    window_index, window_lengths = _windows(grid, config.window_patches)
+    window_index, window_lengths = window_order(grid, config.window_patches)
     raster_pos = torch.cat([
         torch.stack([
             torch.arange(w).repeat(h * t), torch.arange(h).repeat_interleave(w).repeat(t),

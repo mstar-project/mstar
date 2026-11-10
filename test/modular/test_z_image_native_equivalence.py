@@ -21,10 +21,9 @@ transformers = pytest.importorskip("transformers")
 from diffusers import ZImageTransformer2DModel  # noqa: E402
 
 from mstar.model.components.diffusion.flow_match import euler_step  # noqa: E402
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
-from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig, QwenHiddenStateEncoder  # noqa: E402
+from mstar.model.components.diffusion.qwen.weight_loading import (  # noqa: E402
     QKV_RULES_LM,
-    make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
@@ -135,9 +134,9 @@ def _tiny_caption_encoder():
         tie_word_embeddings=True, attn_implementation="sdpa",
     )
     ref = transformers.Qwen3ForCausalLM(hf_cfg).eval()
-    cfg = Qwen3EncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"},
+    cfg = QwenEncoderConfig.from_dict({**hf_cfg.to_dict(), "model_type": "qwen3"},
                                        hidden_state_layers=(hf_cfg.num_hidden_layers - 1,), max_sequence_length=12)
-    native = make_text_encoder(cfg).eval()
+    native = QwenHiddenStateEncoder(cfg).eval()
     load_native(native, iter(ref.state_dict().items()), remap_text_encoder_key, "tiny qwen3",
                 stacked_params=QKV_RULES_LM, skip=text_encoder_skip(cfg))
     assert len(native.layers) == hf_cfg.num_hidden_layers - 1

@@ -35,7 +35,7 @@ from mstar.model.components.diffusion.decode_utils import (
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS, Qwen3TextEncoderSubmodule
+from mstar.model.components.diffusion.qwen.submodule import TEXT_EMBEDS, QwenTextEncoderSubmodule
 from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
@@ -90,7 +90,7 @@ def shape_from_metadata(config: ZImageConfig, step_metadata: dict) -> ZShape:
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class ZImageTextEncoderSubmodule(Qwen3TextEncoderSubmodule):
+class ZImageTextEncoderSubmodule(QwenTextEncoderSubmodule):
     """Caption features ``[1, cap_len, 2560]`` for one request: Qwen3 hidden states after
     layer 35 at the real token positions, zero elsewhere (the DiT swaps those rows for its
     learned pad token), cut to the padded caption length. The batching, padding and capture

@@ -27,10 +27,9 @@ from pathlib import Path
 import torch
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKL, remap_autoencoder_kl_key
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3HiddenStateEncoder
-from mstar.model.components.diffusion.qwen3.weight_loading import (
+from mstar.model.components.diffusion.qwen.encoder import QwenHiddenStateEncoder
+from mstar.model.components.diffusion.qwen.weight_loading import (
     QKV_RULES_LM,
-    make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
@@ -100,9 +99,9 @@ def build_vae(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16
     return load_native(vae, iter_diffusers_component(snapshot / "vae", device), remap_autoencoder_kl_key, "Z-Image VAE")
 
 
-def build_text_encoder(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Qwen3HiddenStateEncoder:
+def build_text_encoder(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> QwenHiddenStateEncoder:
     with torch.device("meta"):
-        encoder = make_text_encoder(config.text_encoder)
+        encoder = QwenHiddenStateEncoder(config.text_encoder)
     materialize(encoder, dtype, device)
     skip = text_encoder_skip(config.text_encoder)  # filtered before the read: the unused last layer stays on disk
     return load_native(

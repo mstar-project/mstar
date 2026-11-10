@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
+from mstar.model.components.diffusion.qwen.submodule import TEXT_INPUTS
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_GEN_WALK, Flux2KleinModel
 from mstar.model.flux2_klein.submodules import LATENTS, TEXT_EMBEDS

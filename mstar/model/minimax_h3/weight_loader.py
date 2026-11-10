@@ -17,12 +17,11 @@ import torch
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.bigvgan import fold_weight_norm
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3HiddenStateEncoder
-from mstar.model.components.diffusion.qwen3.weight_loading import (
-    make_text_encoder,
+from mstar.model.components.diffusion.qwen.encoder import QwenHiddenStateEncoder
+from mstar.model.components.diffusion.qwen.weight_loading import (
     qkv_rules,
-    qwen3_vl_text_skip,
-    remap_qwen3_vl_text_key,
+    remap_text_encoder_key,
+    text_encoder_skip,
 )
 from mstar.model.components.diffusion.weight_loading import (
     iter_transformers_component,
@@ -123,16 +122,16 @@ def build_text_conditioner(config: H3Config, snapshot: Path, device, dtype: torc
 
 
 def build_text_encoder(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16
-                       ) -> Qwen3HiddenStateEncoder:
+                       ) -> QwenHiddenStateEncoder:
     """Qwen3-VL-32B's language model through layer 50; the vision tower, the 14 layers
     after the tap, the final norm and the LM head stay on disk."""
     with torch.device("meta"):
-        encoder = make_text_encoder(config.text)
+        encoder = QwenHiddenStateEncoder(config.text)
     materialize(encoder, dtype, device)
-    skip = qwen3_vl_text_skip(config.text)
+    skip = text_encoder_skip(config.text)
     return load_native(
         encoder, iter_transformers_component(Path(snapshot) / PARTITION / "text_encoder", device, skip=skip),
-        remap_qwen3_vl_text_key, "MiniMax-H3 Qwen3-VL text encoder", stacked_params=qkv_rules(config.text),
+        remap_text_encoder_key, "MiniMax-H3 Qwen3-VL text encoder", stacked_params=qkv_rules(config.text),
         skip=skip,
     )
 

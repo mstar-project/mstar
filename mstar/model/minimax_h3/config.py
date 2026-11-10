@@ -10,7 +10,7 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 
 H3_REPO = "MiniMaxAI/MiniMax-H3"
 PARTITION = "FL2VA"
@@ -234,11 +234,13 @@ class H3AudioVAEConfig:
 @dataclass
 class H3Config:
     transformer: H3TransformerConfig = field(default_factory=H3TransformerConfig)
-    text: Qwen3EncoderConfig = field(
-        default_factory=lambda: Qwen3EncoderConfig(
+    text: QwenEncoderConfig = field(
+        default_factory=lambda: QwenEncoderConfig(
             hidden_size=5120, intermediate_size=25600, num_hidden_layers=64, num_attention_heads=64,
             num_key_value_heads=8, rope_theta=5_000_000.0, hidden_state_layers=(TEXT_ENCODER_LAYER,),
             max_sequence_length=TEXT_MAX_POSITIONS, fused_qkv=False,
+            # Qwen3-VL's image pad and its interleaved MRoPE split (FL2VA keyframes)
+            image_token_id=151655, mrope_section=(24, 20, 20),
         )
     )
     video_vae: H3VideoVAEConfig = field(default_factory=H3VideoVAEConfig)
@@ -247,9 +249,6 @@ class H3Config:
     # model_index.json "_minimax_h3.sigma_shift_scales"
     video_shift: float = 12.0
     audio_shift: float = 3.0
-    # Qwen3-VL's image pad and its interleaved MRoPE split (FL2VA keyframes)
-    image_token_id: int = 151655
-    mrope_section: tuple[int, ...] = (24, 20, 20)
     # the text encoder's positions: the longest prompt the reference can encode
     text_max_positions: int = TEXT_MAX_POSITIONS
 
@@ -260,9 +259,8 @@ class H3Config:
             (root / "transformer" / "config.json").read_text())))
         transformer.validate()
         text_encoder = json.loads((root / "text_encoder" / "config.json").read_text())
-        rope = text_encoder["text_config"].get("rope_scaling") or text_encoder["text_config"].get("rope_parameters", {})
         max_positions = int(text_encoder["text_config"].get("max_position_embeddings", TEXT_MAX_POSITIONS))
-        text = Qwen3EncoderConfig.from_qwen3_vl(
+        text = QwenEncoderConfig.from_qwen3_vl(
             text_encoder,
             # three q/k/v GEMMs, as transformers runs them: fused, cuBLAS picks another
             # kernel for the 1024-wide k/v and they drift from the reference's last bit
@@ -280,8 +278,6 @@ class H3Config:
             audio_vae=H3AudioVAEConfig.from_dir(root / "audio_vae"),
             video_shift=float(shifts.get("video", 12.0)),
             audio_shift=float(shifts.get("audio", 3.0)),
-            image_token_id=int(text_encoder["image_token_id"]),
-            mrope_section=tuple(int(n) for n in rope.get("mrope_section", (24, 20, 20))),
             text_max_positions=max_positions,
         )
 

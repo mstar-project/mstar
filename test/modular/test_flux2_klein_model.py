@@ -333,14 +333,16 @@ def test_load_image_resamples_before_rgb_conversion(tmp_path):
     assert not np.array_equal(np.array(other), np.array(expected))
 
 
-def test_qwen3_encoder_config_rejects_taps_at_or_past_the_final_norm():
-    from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+def test_qwen_encoder_config_taps_lie_within_the_layers():
+    from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 
-    with pytest.raises(ValueError, match="below layer"):
-        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36))
+    with pytest.raises(ValueError, match="within the 36 layers"):
+        QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 37))
+    # the last layer's tap is HF's normed last hidden state
+    assert QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36)).taps_final_norm
     with pytest.raises(ValueError, match="1-indexed"):
-        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(0,))
-    assert Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(35,)).num_layers_needed == 35
+        QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(0,))
+    assert QwenEncoderConfig(num_hidden_layers=36, hidden_state_layers=(35,)).num_layers_needed == 35
 
 
 def test_component_iterator_filters_skipped_keys_before_reading(tmp_path):
@@ -478,13 +480,13 @@ def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_ba
     """Powers of two plus the max batch itself, so a full batch never falls off the
     largest graph; the VAE stops at its compile cap and splits larger batches."""
     import mstar.model.components.diffusion.decode_utils as subs
-    from mstar.model.components.diffusion.qwen3.submodule import Qwen3TextEncoderSubmodule
+    from mstar.model.components.diffusion.qwen.submodule import QwenTextEncoderSubmodule
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
     monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: None)  # no inductor on CPU tests
 
     config = Flux2KleinConfig()
-    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
+    text = QwenTextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
                                      capture_walk=ENCODE_TEXT_WALK)
     [graph] = text.get_accelerator_graph_configs(torch.device("cpu"))
     assert graph.capture_batch_sizes == encoder
@@ -498,9 +500,9 @@ def test_the_text_encoder_refuses_a_row_without_its_prompt_length():
     """Whether a batch replays the captured encoder is read from each row's ``text_len``
     step metadata; a model that never sets it must fail, not run eager on every batch."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.components.diffusion.qwen3.submodule import TEXT_LEN, Qwen3TextEncoderSubmodule
+    from mstar.model.components.diffusion.qwen.submodule import TEXT_LEN, QwenTextEncoderSubmodule
 
-    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
+    text = QwenTextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
                                      capture_walk=ENCODE_TEXT_WALK)
 
     def row(**step_metadata):

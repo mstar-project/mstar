@@ -29,7 +29,7 @@ import torch
 from test_flux2_klein_reference_equivalence import _encode_rows
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
+from mstar.model.components.diffusion.qwen.submodule import TEXT_INPUTS
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel
 from mstar.model.flux2_klein.submodules import IMAGE_INPUTS, LATENTS, REF_LATENTS, TEXT_EMBEDS

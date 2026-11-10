@@ -30,8 +30,7 @@ from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepKey, StepScalar
-from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
-from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
+from mstar.model.components.diffusion.qwen.vl_prompt import VisionTokens
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
 from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
@@ -107,28 +106,25 @@ class H3TextEncoderSubmodule(NodeSubmodule):
     """Prompt token ids ``[L]`` -> the DiT's text rows ``[L, hidden]`` bf16: Qwen3-VL-32B
     through layer 50, then the DiT's ``condition_proj`` and token refiner. The refiner's
     output doesn't depend on the step, so it runs here, once per request. With keyframes
-    the prompt is laid out by ``qwen3_vl_prompt`` around the vision tower's tokens.
+    the encoder lays the prompt out around the vision tower's tokens.
     """
 
     disable_torch_compile = True
 
     def __init__(self, encoder: nn.Module, conditioner: nn.Module, *, attn_resource_key: str | None = None,
-                 vision: QwenVisionModel | None = None, config: H3Config | None = None):
+                 vision: QwenVisionModel | None = None):
         super().__init__()
         self.encoder = encoder
         self.conditioner = conditioner
         self.attn_resource_key = attn_resource_key
         self._attend = None
         self.vision = vision
-        self.h3_config = config
         if vision is not None:
             # per-frame SDPA, not a node resource: the tower runs once per request on a few
             # thousand patches
             self._frames = FrameSDPA()
             for block in vision.blocks:
                 block.attn.bind_resources({VISION_ATTN: self._frames})
-            text = config.text
-            self.register_buffer("mrope_inv_freq", qwen3_inv_freq(text.head_dim, text.rope_theta), persistent=False)
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
@@ -179,13 +175,8 @@ class H3TextEncoderSubmodule(NodeSubmodule):
             pixels, to_device_nonblocking(indices, device), to_device_nonblocking(weights, device),
             to_device_nonblocking(positions, device),
         )
-        prompt = qwen3_vl_prompt(
-            ids, self.h3_config.image_token_id, grids, merge, merged, deepstack, self.encoder.embed_tokens,
-            self.mrope_inv_freq, list(self.h3_config.mrope_section),
-        )
         ones = torch.ones_like(ids[None])
-        return self.encoder(ids[None], ones, padded=False, inputs_embeds=prompt.inputs_embeds,
-                            rotary=prompt.rotary, deepstack=prompt.deepstack)
+        return self.encoder(ids[None], ones, padded=False, images=VisionTokens(grids, merge, merged, deepstack))
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], slot_lease=None, piecewise_leases=None,
                      **kwargs) -> SubmoduleStep | None:

@@ -267,7 +267,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         with torch.no_grad():
             if images:
                 text_node = H3TextEncoderSubmodule(
-                    encoder, conditioner, vision=weight_loader.build_vision_tower(args.snapshot, dev), config=config,
+                    encoder, conditioner, vision=weight_loader.build_vision_tower(args.snapshot, dev),
                 ).to(dev)
                 hidden = text_node._encode_with_images(ids.to(dev), vision_pixels.to(dev), grids)
             else:

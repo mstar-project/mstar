@@ -17,7 +17,7 @@ from pathlib import Path
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig
-from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 DIT_ATTN = "dit_attn"
@@ -94,7 +94,7 @@ class ZImageConfig:
     vae: AutoencoderKLConfig = field(default_factory=lambda: AutoencoderKLConfig(
         latent_channels=16, scaling_factor=0.3611, shift_factor=0.1159,
     ))
-    text_encoder: Qwen3EncoderConfig = field(default_factory=lambda: Qwen3EncoderConfig(
+    text_encoder: QwenEncoderConfig = field(default_factory=lambda: QwenEncoderConfig(
         # hidden_states[-2] of the 36-layer Qwen3-4B == output of layer 35
         hidden_state_layers=(35,), max_sequence_length=512,
     ))
@@ -132,7 +132,7 @@ class ZImageConfig:
             vae = AutoencoderKLConfig.from_dict(json.load(f))
         with open(snapshot / "text_encoder" / "config.json") as f:
             text_cfg = json.load(f)
-        text_encoder = Qwen3EncoderConfig.from_dict(
+        text_encoder = QwenEncoderConfig.from_dict(
             text_cfg, hidden_state_layers=(int(text_cfg["num_hidden_layers"]) - 1,), max_sequence_length=512,
         )
         with open(snapshot / "scheduler" / "scheduler_config.json") as f:

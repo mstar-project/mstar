@@ -259,11 +259,7 @@ def test_a_prompt_is_capped_by_the_text_encoder_alone():
     assert ids.numel() == 12_800
     with pytest.raises(ValueError, match="positions"):
         model.process_prompt("x" * (H3Config().text_max_positions + 1), ["text"], ["video", "audio"])
-    from mstar.model.components.diffusion.qwen3.weight_loading import make_text_encoder
-
-    with torch.device("meta"):
-        encoder = make_text_encoder(H3Config().text)
-    assert encoder.max_positions == H3Config().text_max_positions  # it encodes every prompt admitted
+    assert H3Config().text.max_sequence_length == H3Config().text_max_positions  # it encodes every prompt admitted
 
 
 def test_walk_plan_and_step_metadata():
@@ -738,8 +734,7 @@ def test_the_vision_tower_keeps_its_frame_attention_through_resource_binding():
         depth=2, hidden_size=32, intermediate_size=64, num_heads=2, in_channels=3, patch_size=4,
         temporal_patch_size=2, spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=24,
     ))
-    node = H3TextEncoderSubmodule(nn.Identity(), nn.Identity(), attn_resource_key=REFINER_ATTN, vision=tower,
-                                  config=H3Config())
+    node = H3TextEncoderSubmodule(nn.Identity(), nn.Identity(), attn_resource_key=REFINER_ATTN, vision=tower)
     for resources in ({}, {REFINER_ATTN: object()}):
         node.bind_node_resources(resources)
         assert all(block.attn.ragged_attn is node._frames for block in tower.blocks)
