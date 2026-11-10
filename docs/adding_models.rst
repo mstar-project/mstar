@@ -3320,7 +3320,7 @@ iteration past the schedule. The hooks:
 
 ``bucket_key_for`` returns whatever has to match for two rows to share a forward, the
 model's own key. The per-step hooks get the step's ``StepKey`` instead: that key, plus what
-the base adds per step (the linears' dtype under a step schedule, whether the request is
+the base adds per step (the linears' dtype under a step schedule, whether the step is
 guided, and the guidance branches this rank runs), so they read the model's fields as
 ``key.bucket.<field>``. The step key is also the CUDA-graph bucket key.
 
@@ -3329,10 +3329,14 @@ The default ``denoise`` is the Euler step of ``model_output``. A model that step
 declaration: ``GUIDANCE`` names, per branch, the request inputs that branch reads, and a
 ``combine`` function (``guidance.cfg`` or ``guidance.cfg_renorm``). A guided step runs each
 branch as a row of ``model_output``, splits the branches over the node's ``cfg_size``
-ranks, gathers their predictions and combines them with the request's ``guidance_scale``
-(a step scalar, so rows at different scales share a forward). ``Guidance.active`` is the
-one rule for whether a request is guided, which the text encoder also asks before it
-encodes a negative prompt.
+ranks, gathers their predictions and combines them with the request's scales (by default
+its ``guidance_scale``; ``Guidance.scales`` names more), each a step scalar, so rows at
+different scales share a forward. ``combine`` receives them as ``{name: tensor}``.
+``Guidance.active`` is the one rule for whether guidance is on: for a request, which the
+text encoder also asks before it encodes a negative prompt, and for each step, at the
+scales ``guidance_scales_at(step_metadata, step)`` gives it. That hook is the request's
+per-step fill (default: its knobs at every step); a model with guidance on an interval of
+steps overrides it, and its other steps run branch 0 alone.
 
 A multi-step scheduler that carries solver state between iterations names it in
 ``SOLVER_STATE``; those become loop-back edges alongside ``latents``, seeded by

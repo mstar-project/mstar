@@ -3,8 +3,13 @@
 A model declares ``GUIDANCE = Guidance(branches=..., combine=...)`` on its
 :class:`~mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule`, and the base does the rest:
 it runs each branch as a row of the model's forward, splits the branches over the deployment's ``cfg_size``
-ranks, gathers the predictions and combines them, with the request's ``guidance_scale`` as a per-row
-step scalar. A model writes the prediction (``model_output``), never the branches.
+ranks, gathers the predictions and combines them, with the request's scales (``scales``, by default its
+``guidance_scale``) as per-row step scalars. A model writes the prediction (``model_output``), never the branches.
+
+Whether guidance is on is decided per step. A request runs its branches at all when one of its scale knobs is
+above 1 (``active``, which intake and the text encoder ask too); a step runs them when, in addition, one of the
+scales its fill holds for that step is (``DenoiseLoopSubmodule.guidance_scales_at``, by default the knobs at every
+step). Its other steps run branch 0 alone, so guidance on an interval of steps is a fill, not a mechanism.
 
 Branch order is part of the contract. Branch ``b`` is ``branches[b]``, and ``combine`` receives the
 predictions in that order (``cfg``: conditional first). Within a step the rows are request-major
@@ -21,31 +26,30 @@ from typing import NamedTuple, Protocol
 
 import torch
 
-# The request knob every guided model reads (``step_metadata``), and its step scalar's source.
+# The scale knob (``step_metadata``) of a single-scale guidance, and the step scalar it becomes.
 GUIDANCE_SCALE = "guidance_scale"
-GUIDANCE_SCALES = "guidance_scales"
 
 
 class GuidanceCombine(Protocol):
-    """``(predictions in branch order, scale [B, 1, ...] at the predictions' rank) -> prediction``."""
+    """``(predictions in branch order, {scale name: [B, 1, ...] at the predictions' rank}) -> prediction``."""
 
-    def __call__(self, preds: Sequence[torch.Tensor], scale: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor: ...
 
 
-def cfg(preds: Sequence[torch.Tensor], scale: torch.Tensor) -> torch.Tensor:
-    """Classifier-free guidance, ``u + s (c - u)``.
+def cfg(preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    """Classifier-free guidance, ``u + s (c - u)`` with ``s`` the ``guidance_scale``.
 
     The references multiply the difference by a Python float, which rounds the product once in the
-    prediction's dtype. ``scale`` is an fp32 tensor here, so the product is taken in fp32 and cast back
+    prediction's dtype. ``s`` is an fp32 tensor here, so the product is taken in fp32 and cast back
     to match, as ``flow_match.euler_step`` does for its ``dt``."""
     cond, uncond = preds
-    return uncond + (scale * (cond - uncond).float()).to(cond.dtype)
+    return uncond + (scales[GUIDANCE_SCALE] * (cond - uncond).float()).to(cond.dtype)
 
 
-def cfg_renorm(preds: Sequence[torch.Tensor], scale: torch.Tensor) -> torch.Tensor:
+def cfg_renorm(preds: Sequence[torch.Tensor], scales: Mapping[str, torch.Tensor]) -> torch.Tensor:
     """:func:`cfg`, rescaled per token to the conditional prediction's norm over the last dim
     (Qwen-Image's ``comb * |cond| / |comb|``)."""
-    comb = cfg(preds, scale)
+    comb = cfg(preds, scales)
     return comb * (preds[0].norm(dim=-1, keepdim=True) / comb.norm(dim=-1, keepdim=True))
 
 
@@ -60,8 +64,12 @@ class Guidance(NamedTuple):
     # the input's name here, ``branches[b][argument]``.
     branches: tuple[Mapping[str, str], ...]
     combine: GuidanceCombine
+    # The request knobs ``combine`` reads, by name: each is staged per step from the request's fill and handed to
+    # ``combine`` under its name. Two scales (text and image guidance, say) are two names here.
+    scales: tuple[str, ...] = (GUIDANCE_SCALE,)
 
-    def active(self, step_metadata: Mapping) -> bool:
-        """Whether a request runs its branches: a scale above 1. Every place that acts on it (the
-        text encoder skipping the negative prompt, intake, the step key) asks here."""
-        return float(step_metadata[GUIDANCE_SCALE]) > 1.0
+    def active(self, scales: Mapping) -> bool:
+        """Whether guidance is on at these scales (a request's ``step_metadata``, or one step's fill): one of them
+        above 1. Every place that acts on it (the text encoder skipping the negative prompt, intake, the step
+        key) asks here."""
+        return any(float(scales[name]) > 1.0 for name in self.scales)
