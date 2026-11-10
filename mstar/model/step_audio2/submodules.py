@@ -117,9 +117,10 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
-        # a spoken reply's client token rides inline too; its speech ids go through the host
+        # A spoken reply's speech id goes to the vocoder by value, off the stop check's
+        # host copy; a step carries one inline signal, so its client token is stored.
         if graph_walk == DECODE_SPOKEN:
-            return {self.device_loopback.signal: self.device_loopback.buffer}
+            return {SPEECH_IDS: self.device_loopback.buffer, self.device_loopback.signal: self.device_loopback.buffer}
         return super().inline_signals(graph_walk)
 
     def get_accelerator_graph_configs(
