@@ -969,9 +969,12 @@ follows the ring.
 
 A resource can also store in a different dtype from the one its nodes compute in. A node
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
-attention is planned in bf16. ``dtype`` is a plain storage dtype (float32, bfloat16 or
-float16): an fp8 or fp4 cache needs scales and a kernel that reads them, so a quantized
-dtype is a load error here.
+attention is planned in bf16. ``dtype`` is a plain storage dtype (float16, bfloat16,
+float32, or float64 for a CPU reference run): an fp8 or fp4 cache needs scales and a kernel that reads them, so a quantized
+dtype is a load error here, as is an integer or bool one. The FlashInfer, FlashInfer MLA
+and dense attention backends have kernels for float16 and bfloat16 only, so an attention
+on one of them that resolves to float32 is a load error. Of the CUDA backends, only flex,
+which reads ring caches, takes float32.
 
 RoPE has no storage dtype on CUDA. Its ``rope_dtype`` and ``rope_table_dtype`` set the
 rotation's math and table; on XPU, the cos/sin cache is stored in ``rope_dtype``, else in
@@ -2795,8 +2798,8 @@ that a misspelled setting is never silently ignored:
 
 ``dtype`` takes a torch dtype name, such as ``bfloat16`` or ``torch.bfloat16``, and sets
 the resource's dtype as if the model had declared it on the spec (see
-:ref:`Step 2a <Step 2a — Declare your resources>`). A name that is not a torch dtype is a
-load error.
+:ref:`Step 2a <Step 2a — Declare your resources>`). A name that is not a torch dtype, or a
+dtype that is not a float of 16 bits or more, is a load error.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

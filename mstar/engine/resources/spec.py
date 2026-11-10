@@ -330,18 +330,21 @@ def apply_yaml_overrides(
         logger.info("Resource specs after YAML overrides: %s", specs)
 
 
-def require_unscaled_dtype(dtype: torch.dtype, what: str) -> torch.dtype:
-    """Refuse a quantized storage dtype (fp8, fp4) where a plain cast is meant.
+# what a cast can store into: the floats of 16 bits or more (float64 for CPU reference runs)
+PLAIN_STORAGE_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
-    Below 16 bits a value needs a scale and a kernel that reads it; a ``.to()``
-    into such a dtype saturates or underflows silently.
-    """
+
+def require_unscaled_dtype(dtype: torch.dtype, what: str) -> torch.dtype:
+    """Refuse a storage dtype a plain cast can't fill: a quantized float (fp8, fp4)
+    needs scales and a kernel that reads them, which a ``.to()`` would silently
+    saturate or underflow; an integer or bool would truncate."""
+    if dtype in PLAIN_STORAGE_DTYPES:
+        return dtype
     if dtype.is_floating_point and dtype.itemsize < 2:
-        raise ValueError(
-            f"{what} is {dtype}, a quantized dtype: it needs scales and a kernel "
-            "that reads them, which a cast cannot give"
-        )
-    return dtype
+        reason = "a quantized dtype: it needs scales and a kernel that reads them, which a cast cannot give"
+    else:
+        reason = "not a storage dtype a cast can fill"
+    raise ValueError(f"{what} is {dtype}, {reason}; use float16, bfloat16, float32 or float64")
 
 
 def parse_yaml_dtype(value: str | torch.dtype) -> torch.dtype:

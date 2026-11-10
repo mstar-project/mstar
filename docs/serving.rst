@@ -547,8 +547,10 @@ whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
 :doc:`adding_models`), so a deployment that never samples greedily can save their capture
 memory and time this way.
 
-``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype; fp8 and fp4
-are refused, since a quantized cache needs scales, not a cast. Paged and ring KV caches,
+``dtype`` (for example ``dtype: bfloat16``) sets one resource's storage dtype: a float
+of 16 bits or more. fp8 and fp4 are refused, since a quantized cache needs scales, not a
+cast. A paged KV cache in float32 is a load error too: the attention backends that read
+paged caches take float16 and bfloat16 only. Paged and ring KV caches,
 attention, cross-attention and ragged attention accept it. Without it, a resource takes
 the dtype its model declared for it, and otherwise the dtype of the nodes that use it. An
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes

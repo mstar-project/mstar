@@ -42,6 +42,25 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
     return backend
 
 
+# backends whose kernels take 16-bit floats only: FlashInfer, and FlashAttention-3
+# (AITER on ROCm), or FlashInfer where it can't run, for dense
+HALF_ONLY_BACKENDS = frozenset({AttnBackend.FLASHINFER, AttnBackend.FLASHINFER_MLA, AttnBackend.DENSE})
+
+
+def refuse_kernel_dtype(dtype: torch.dtype, backend: AttnBackend, resource_key: str, device: torch.device) -> None:
+    """Refuse at load an attention dtype its backend has no kernel for, which would
+    otherwise fail at the first plan. Only accelerators run these kernels, so CPU
+    stand-ins are not checked."""
+    if device.type == "cpu" or backend not in HALF_ONLY_BACKENDS:
+        return
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"attention {resource_key!r} is planned in {dtype}, but the {backend.value} backend "
+            "has kernels for float16 and bfloat16 only; set `dtype` (bfloat16 or float16) on "
+            "the attention or on its KV cache"
+        )
+
+
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
 
@@ -143,6 +162,8 @@ class AttentionManager(AttentionResource):
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         kv_config.shard(info.head_shards)
+        dtype = cls._planned_dtype(spec, info, kv_config)
+        refuse_kernel_dtype(dtype, backend, spec.resource_key, info.device)
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass
@@ -166,7 +187,7 @@ class AttentionManager(AttentionResource):
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
-                    dtype=cls._planned_dtype(spec, info, kv_config),
+                    dtype=dtype,
                     kv_config=kv_config,
                     wrapper_class=dense_or_flashinfer(
                         info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
@@ -182,7 +203,7 @@ class AttentionManager(AttentionResource):
             return FlashInferMLAManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=cls._planned_dtype(spec, info, kv_config),
+                dtype=dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
                 sm_scale=spec.config.sm_scale,
@@ -193,7 +214,7 @@ class AttentionManager(AttentionResource):
             return FlashInferManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=cls._planned_dtype(spec, info, kv_config),
+                dtype=dtype,
                 kv_config=kv_config,
                 backend=flashinfer_backend,
                 splits=spec.config.splits,
@@ -211,7 +232,7 @@ class AttentionManager(AttentionResource):
             return FlexAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
-                dtype=cls._planned_dtype(spec, info, kv_config),
+                dtype=dtype,
                 kv_config=kv_config,
             )
 
