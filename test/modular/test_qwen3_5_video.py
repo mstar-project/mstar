@@ -376,10 +376,10 @@ def test_only_a_text_prompt_is_keyed_for_the_prefix_cache(model, processor):
     assert keyed_labels(model) == {KV_CACHE: {"main": model.kv_labels()[KV_CACHE]["main"]}}
     question = "Question 0: what happens?"
     text = model.process_prompt(question, [TEXT], ["text"], prompt_parts=parts_from_modalities([TEXT], [question]))
-    layouts = kv_layouts(model.declare_state(), text.metadata["state_layout"], {})
+    layouts = kv_layouts(model.declare_state(), text.metadata["state_layout"], text.metadata.get("keyed_spans", {}))
     assert layouts[KV_CACHE]["main"].keyed_count() == 1
     _, out, _ = run_both(model, processor, "mixed")
-    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], {})
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
     assert layouts[KV_CACHE]["main"].keyed_count() == 0
 
 

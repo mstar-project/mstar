@@ -401,6 +401,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         out.metadata["state_layout"] = {
             KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}, GDN_STATE: {"main": Layout()},
         }
+        if kv.keyed_spans is not None:
+            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
         return out
 
     # ------------------------------------------------------------------
