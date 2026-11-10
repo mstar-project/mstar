@@ -1,5 +1,6 @@
 //! Realtime transcription on a model that hears audio as it comes (one
-//! `ClientAudio` client stream and no turn tokens): a port of
+//! `ClientAudio` client stream, no turn tokens and no audio to the client,
+//! `Model.live_transcription_stream`): a port of
 //! `serving_realtime.RealtimeLiveTranscription`. Each item is one engine
 //! request, opened by its first audio and ended by its commit, whose text goes
 //! out as deltas; nothing is re-decoded. If the item's call fails (or can't

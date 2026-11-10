@@ -8,11 +8,12 @@ transcription-session events) streams speech-to-text with partial results.
 Both take audio in OpenAI's formats, converted on the socket to what the
 model hears.
 
-On a model that hears audio as it comes (one ``ClientAudio`` client stream
-and no turn tokens, ``Model.live_transcription_stream``), the transcription
-intent is :class:`RealtimeLiveTranscription`: each item is one engine request,
-opened by its first append and ended by its commit, whose tokens stream out as
-deltas while the audio arrives. What follows about re-decoding,
+On a model that hears audio as it comes (one ``ClientAudio`` client stream,
+no turn tokens and no audio to the client,
+``Model.live_transcription_stream``), the transcription intent is
+:class:`RealtimeLiveTranscription`: each item is one engine request, opened by
+its first append and ended by its commit, whose tokens stream out as deltas
+while the audio arrives. What follows about re-decoding,
 ``chunk_seconds`` and the unfixed counts is the other models' path.
 
 The transcription intent is a subset of OpenAI's Realtime transcription
@@ -992,11 +993,12 @@ _REDECODE_KNOBS = ("chunk_seconds", "unfixed_chunks", "unfixed_tokens")
 
 class RealtimeLiveTranscription(RealtimeTranscription):
     """A transcription session on a model that hears audio as it comes (one
-    ``ClientAudio`` client stream and no turn tokens): each item is one engine
-    request, opened by its first audio and ended by its commit, whose tokens go
-    out as deltas; nothing is re-decoded. If the item's call fails (or can't
-    open), the client gets an ``error``, the rest of the item's audio is
-    dropped, and its commit reports it failed."""
+    ``ClientAudio`` client stream, no turn tokens and no audio to the client,
+    ``Model.live_transcription_stream``): each item is one engine request,
+    opened by its first audio and ended by its commit, whose tokens go out as
+    deltas; nothing is re-decoded. If the item's call fails (or can't open),
+    the client gets an ``error``, the rest of the item's audio is dropped, and
+    its commit reports it failed."""
 
     def __init__(self, api, model_name: str, adapter, websocket: WebSocket, stream: Connection):
         super().__init__(api, model_name, adapter, websocket)

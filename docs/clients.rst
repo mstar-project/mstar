@@ -684,7 +684,7 @@ Per-model notes:
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
 - **Realtime transcription, on a model that hears audio as it comes** (a ``ClientAudio`` client
-  stream and no ``turn_tokens``, such as ``nemotron_asr``) — each item is one engine request,
+  stream, no ``turn_tokens`` and no audio sent to the client, such as ``nemotron_asr``) — each item is one engine request,
   opened by its first append and ended by its commit, so its text streams as
   ``conversation.item.input_audio_transcription.delta`` events while the audio is still
   arriving, and ``mstar.transcription.partial`` events report the audio covered so far. Nothing
@@ -694,7 +694,10 @@ Per-model notes:
   item's request fails (or can't open), the server sends an ``error``, drops the rest of the
   item's audio, and answers its commit with
   ``conversation.item.input_audio_transcription.failed``; the next item opens a request of its
-  own.
+  own. An append that fails inside the server gets an ``error`` with an error
+  id; that audio is not heard, and the item goes on. If ending the item's request at its commit
+  fails inside the server (or gets no answer), the request is aborted, the server sends an
+  ``error``, and the commit is answered with ``failed``; the session goes on.
 - **Realtime turn detection** — by default the client ends each utterance with
   ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
   server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),
