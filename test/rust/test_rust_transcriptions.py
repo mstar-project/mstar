@@ -94,6 +94,10 @@ class _Model:
         return self._kwargs
 
 
+def _hello(record, i):
+    return _pieces("hello")
+
+
 class _ASRStub:
     """Both frontends' data plane: each submission's chunks come from
     ``script(record, index)``, ``record`` being what was submitted."""
@@ -104,7 +108,7 @@ class _ASRStub:
         self.upload_dir = upload_dir
         self.max_concurrent_requests = cap
         self.metrics = None
-        self.script = lambda record, i: _pieces("hello")
+        self.script = _hello
         self.reset()
 
     def reset(self):

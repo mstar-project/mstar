@@ -12,6 +12,7 @@ import multiprocessing as mp
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -3023,6 +3024,13 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def _stop_with(proc, bridge) -> None:
+    """Stops the bridge once ``proc`` (mstar-server) exits, so the deployment
+    does not outlive its HTTP frontend."""
+    proc.wait()
+    bridge.stop()
+
+
 def _ws_max_size(config: dict) -> int:
     """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
     message the server reads (by default what an HTTP body may be, since one
@@ -3132,11 +3140,12 @@ def main(argv: list[str] | None = None):
         help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
-        "--rust-frontend", action="store_true",
-        help="Serve HTTP from the Rust mstar-server binary instead of "
-             "uvicorn/FastAPI; the Python process keeps preprocessing "
-             "and the conductor protocol",
+        "--python-frontend", action="store_true",
+        help="Serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
+             "of mstar-server, the default",
     )
+    # the default since mstar-server became it; kept so existing commands run
+    parser.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
         help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
@@ -3144,6 +3153,8 @@ def main(argv: list[str] | None = None):
              "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.python_frontend and (args.rust_frontend or args.rust_frontend_bin):
+        parser.error("--python-frontend serves without mstar-server, so it takes no --rust-frontend(-bin)")
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
     if args.socket_path_prefix is None:
@@ -3167,11 +3178,14 @@ def main(argv: list[str] | None = None):
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
         raise SystemExit(f"mstar: {e}") from None
-    if args.rust_frontend:
+    if not args.python_frontend:
         from mstar.api_server.rust_frontend import find_server_binary
 
         # Before anything loads, so a missing or stale binary fails fast.
-        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        try:
+            rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        except (FileNotFoundError, RuntimeError) as e:
+            raise SystemExit(f"mstar: {e}\n(--python-frontend serves from uvicorn instead)") from None
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3260,7 +3274,7 @@ def main(argv: list[str] | None = None):
             _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
-        if args.rust_frontend:
+        if not args.python_frontend:
             import tempfile
 
             from mstar.api_server.openai.adapters import get_adapter
@@ -3288,13 +3302,20 @@ def main(argv: list[str] | None = None):
                 ws_max_bytes=_ws_max_size(config),
                 client_streams=api_server.client_streams,
                 realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
-            logger.info("Starting mstar API server (Rust frontend) on port %s",
+            logger.info("Starting mstar API server (mstar-server) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
             api_server.set_on_fatal(bridge.stop)
+            Thread(target=_stop_with, args=(rust_proc, bridge), name="mstar-server-watch", daemon=True).start()
             bridge.run()
+            if (code := rust_proc.poll()) not in (None, 0):
+                # it exits 0 when a signal stops it, so this is a crash, a kill or a lost port
+                logger.error("mstar-server exited with code %d; stopping the deployment", code)
+                exit_code = 3
         else:
-            # (mstar-server logs the same warning for the Rust frontend.)
+            logger.warning("--python-frontend: the uvicorn/FastAPI frontend is deprecated and will be removed; "
+                           "mstar-server is the default")
+            # (mstar-server logs the same warning for itself.)
             warn_if_no_api_key(api_key, args.host, args.port)
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
             # uvicorn.run() inlined so the server object is reachable. The
@@ -3316,7 +3337,14 @@ def main(argv: list[str] | None = None):
         exit_code = 1
     finally:
         if rust_proc is not None:
+            # so that once mstar serve has exited, the frontend has too. With the
+            # bridge stopped, what mstar-server has left to drain can't finish.
             rust_proc.terminate()
+            try:
+                rust_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rust_proc.kill()
+                rust_proc.wait()
         if bridge_dir is not None:
             import shutil
             shutil.rmtree(bridge_dir, ignore_errors=True)
