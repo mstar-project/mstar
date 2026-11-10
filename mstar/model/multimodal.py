@@ -19,7 +19,7 @@ rendered prompt ever does.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -345,46 +345,57 @@ def as_uint8_chw(image, truncate: bool = False) -> torch.Tensor:
     return image[:3].contiguous()
 
 
+class MediaRun(NamedTuple):
+    """One placeholder's run: ``tokens`` pads, read from encoder ``output``,
+    with its ``grid`` (empty without one)."""
+
+    tokens: int
+    output: str
+    grid: Sequence[int] = ()
+
+
 class MediaPads(NamedTuple):
     """A prompt with each media placeholder expanded to its tokens, and where
-    each expanded run sits. The lists run in prompt order, one entry a run."""
+    each expanded run sits. The lists run in prompt order, one entry a run:
+    the columns of its ``MEDIA_LAYOUT`` (`media_layout`)."""
 
     ids: torch.Tensor
-    # the run's pad id, and its index among that pad's runs
-    pad: list[int]
-    index: list[int]
     # the run's first pad position in ``ids``, and its length
     offset: list[int]
     tokens: list[int]
+    # the encoder output it is read from, and its grid (empty without one)
+    output: list[str]
+    grid: list[Sequence[int]]
 
 
 def expand_media_pads(
     ids: torch.Tensor,
-    counts: Mapping[int, Sequence[int]],
+    pad_runs: Mapping[int, Sequence[MediaRun]],
     sentinels: Mapping[int, tuple[int, int]] | None = None,
 ) -> MediaPads:
-    """Expand the nth occurrence of each pad id in ``ids`` to ``counts[pad][n]``
-    pads, wrapped in ``sentinels[pad]`` when given (a template that writes a
-    bare pad, as the processor's ``replace_*_token`` then wraps it).
+    """Expand the nth occurrence of each pad id in ``ids`` to its run
+    ``pad_runs[pad][n]``, wrapped in ``sentinels[pad]`` when given (a
+    template that writes a bare pad, as the processor's ``replace_*_token``
+    then wraps it).
 
-    Raises ``ValueError`` when a pad occurs other than once per count: user
+    Raises ``ValueError`` when a pad occurs other than once per run: user
     text that spells a placeholder token, or a layout naming an attachment
     the request did not carry. ``ids`` are host ids, straight from the
     tokenizer.
     """
     sentinels = sentinels or {}
     # a loop over the placeholders, not the tokens: a text-only prompt has none
-    hits = torch.isin(ids, ids.new_tensor(list(counts))).nonzero().flatten() if counts else ids.new_empty(0)
-    seen = dict.fromkeys(counts, 0)
+    hits = torch.isin(ids, ids.new_tensor(list(pad_runs))).nonzero().flatten() if pad_runs else ids.new_empty(0)
+    seen = dict.fromkeys(pad_runs, 0)
     pieces: list[torch.Tensor] = []
     layout = MediaPads(ids, [], [], [], [])
     cursor = size = 0
     for i, token in zip(hits.tolist(), ids[hits].tolist(), strict=True):
         n = seen[token]
-        if n >= len(counts[token]):
+        if n >= len(pad_runs[token]):
             raise ValueError(
                 f"the prompt holds more placeholders {token} than the "
-                f"{len(counts[token])} attachments it has tokens for"
+                f"{len(pad_runs[token])} attachments it has tokens for"
             )
         seen[token] = n + 1
         pieces.append(ids[cursor:i])
@@ -393,18 +404,19 @@ def expand_media_pads(
         if start is not None:
             pieces.append(ids.new_tensor([start]))
             size += 1
-        tokens = int(counts[token][n])
-        layout.pad.append(token)
-        layout.index.append(n)
+        tokens, output, grid = pad_runs[token][n]
+        tokens = int(tokens)
         layout.offset.append(size)
         layout.tokens.append(tokens)
+        layout.output.append(output)
+        layout.grid.append(grid)
         pieces.append(ids.new_full((tokens,), token))
         size += tokens
         if end is not None:
             pieces.append(ids.new_tensor([end]))
             size += 1
         cursor = i + 1
-    short = {pad: (seen[pad], len(c)) for pad, c in counts.items() if seen[pad] != len(c)}
+    short = {pad: (seen[pad], len(r)) for pad, r in pad_runs.items() if seen[pad] != len(r)}
     if short:
         raise ValueError(f"placeholder counts in the prompt (found, expected) per pad id: {short}")
     if not pieces:
@@ -429,44 +441,48 @@ class MediaEncoder:
     """An encoder node of the media walks, as data.
 
     ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);
-    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad
-    of ``pad_ids`` in the prompt, in prompt order. ``walk`` names the walk a
-    prompt carrying this medium alone prefills on, for a model whose graph
-    already calls it something else (walk names are read by configs and
-    metrics).
+    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per token
+    of the ``MEDIA_LAYOUT`` runs it fills, in prompt order. The layout, not a
+    placeholder id, places each row, so encoders may share a placeholder
+    token. ``walk`` names the walk a prompt carrying this medium alone
+    prefills on, for a model whose graph already calls it something else
+    (walk names are read by configs and metrics).
     """
 
     name: str
     node: str
     inputs: tuple[str, ...]
     output: str
-    pad_ids: tuple[int, ...]
-    walk: str | None = None
-
-    def __post_init__(self):
-        if not self.pad_ids:
-            # the splice would have no pad to fill
-            raise ValueError(f"media encoder {self.node!r} names no pad ids")
-
-    def pads(self, ids: torch.Tensor) -> torch.Tensor:
-        """Which of ``ids`` are this encoder's pads."""
-        pad = ids == self.pad_ids[0]
-        for p in self.pad_ids[1:]:
-            pad = pad | (ids == p)
-        return pad
+    walk: str | None = field(default=None, kw_only=True)
 
 
-def splice_media(embeds: torch.Tensor, pad: torch.Tensor, media: torch.Tensor) -> torch.Tensor:
-    """``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``,
+def splice_media(embeds: torch.Tensor, mask: torch.Tensor, media: torch.Tensor) -> torch.Tensor:
+    """``embeds`` with the nth token that ``mask`` marks replaced by ``media[n]``,
     an index past the end taking the last row. Static shapes and no host sync,
     so it runs inside a captured forward."""
-    index = (torch.cumsum(pad, 0) - 1).clamp_(0, media.shape[0] - 1)
-    return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
+    index = (torch.cumsum(mask, 0) - 1).clamp_(0, media.shape[0] - 1)
+    return torch.where(mask[:, None], media[index].to(embeds.dtype), embeds)
 
 
-def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
+def media_rows(layout: Mapping, length: int) -> tuple[torch.Tensor, list[MediaRun]]:
+    """A prompt's media placement from its ``MEDIA_LAYOUT``: a host bool mask
+    of its ``length`` tokens, True on every run's tokens, and the runs in
+    prompt order. The splice reads the encoders' rows in that order
+    (`splice_media`)."""
+    mask = torch.zeros(length, dtype=torch.bool)
+    runs = []
+    for offset, tokens, output, grid in zip(
+        layout.get("offset", ()), layout.get("tokens", ()), layout.get("output", ()), layout.get("grid", ()),
+        strict=True,
+    ):
+        mask[offset:offset + tokens] = True
+        runs.append(MediaRun(tokens, output, grid))
+    return mask, runs
+
+
+def vision_encoder() -> MediaEncoder:
     """The ``vision_encoder`` node every VLM here declares."""
-    return MediaEncoder("vision", "vision_encoder", ("pixel_values",), "vision_embeds", pad_ids)
+    return MediaEncoder("vision", "vision_encoder", ("pixel_values",), "vision_embeds")
 
 
 def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
@@ -483,25 +499,17 @@ def media_walk_names(encoders: Sequence[MediaEncoder]) -> list[str]:
     ]
 
 
-def media_layout(
-    pads: MediaPads,
-    output_of: Mapping[int, str],
-    grids: Mapping[int, Sequence[Sequence[int]]] | None = None,
-) -> dict[str, list]:
+def media_layout(pads: MediaPads) -> dict[str, list]:
     """A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's
     ``offset`` and ``tokens``, the encoder ``output`` it is read from, and
-    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one). Plain lists: it rides
-    the step's control message, so every node of the walk reads it on the
-    host (`media_grids`)."""
-    grids = grids or {}
+    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one).
+    Plain lists: it rides the step's control message, so every node of the
+    walk reads it on the host (`media_grids`)."""
     return {
         "offset": list(pads.offset),
         "tokens": list(pads.tokens),
-        "output": [output_of[p] for p in pads.pad],
-        "grid": [
-            [int(v) for v in grids[p][i]] if p in grids else []
-            for p, i in zip(pads.pad, pads.index, strict=True)
-        ],
+        "output": list(pads.output),
+        "grid": [[int(v) for v in grid] for grid in pads.grid],
     }
 
 
@@ -512,25 +520,6 @@ def media_grids(layout: Mapping, output: str) -> list[tuple[int, ...]]:
         tuple(grid) for grid, out in zip(layout.get("grid", ()), layout.get("output", ()), strict=True)
         if out == output
     ]
-
-
-def media_rows_between(layout: Mapping, start: int, end: int) -> dict[str, tuple[int, int]]:
-    """The rows ``[a, b)`` of each encoder output that the pads among tokens
-    ``[start, end)`` of a ``MEDIA_LAYOUT``'s prompt read, by output; an
-    output with no pad there is left out. An output's runs fill its rows in
-    prompt order, so the rows a token range reads are one slice."""
-    rows: dict[str, tuple[int, int]] = {}
-    filled: dict[str, int] = {}
-    for off, tokens, out in zip(
-        layout.get("offset", ()), layout.get("tokens", ()), layout.get("output", ()), strict=True,
-    ):
-        base = filled.get(out, 0)
-        lo, hi = max(off, start), min(off + tokens, end)
-        if hi > lo:
-            first = rows[out][0] if out in rows else base + lo - off
-            rows[out] = (first, base + hi - off)
-        filled[out] = base + tokens
-    return rows
 
 
 def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[MediaEncoder]:

@@ -661,6 +661,10 @@ class Model(ABC):
     # conductor in arrival order. Declare it only once those calls are checked
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
+    # Also decode one request's images at once, for a ``load_image`` that is mostly
+    # a GIL-free decode: intra-op work in it would run on each of these threads.
+    # It needs PREPROCESS_PARALLEL, since the decode pool is sized like the prepare pool.
+    PREPROCESS_PARALLEL_IMAGES: bool = False
 
     # The rate the default ``load_audio`` decodes an upload to, and the longest
     # clip it decodes (default 30 min). The request's audio budget
@@ -1040,6 +1044,14 @@ class Model(ABC):
             into the existing ``tensors`` dict via ``dict.update``.
         """
         pass
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        """A response's ``usage.prompt_tokens``: the positions the prompt fills,
+        attachments included, as OpenAI and vLLM count them. ``tensors`` and
+        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``text_inputs``, which hold each attachment's pads in place; a model
+        that splits ``text_inputs`` around its attachments adds theirs."""
+        return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
 
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
