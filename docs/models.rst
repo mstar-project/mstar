@@ -980,8 +980,8 @@ GLM-5.3-Flash on 4x H200 (1024 in, 256 out) gains 53%, 38%, 21% and 15% output t
 32 and 64 concurrent requests; GLM-5.2 on 8x H200 (1024 in, 512 out) 47%, 36%, 26% and 26%.
 The drafts are verified greedily, so on a deployment with MTP a request that sets no
 ``temperature`` runs greedy, and one with a ``temperature`` above 0 or a
-``repetition_penalty`` other than 1 is a 400. That holds until sampled MTP lands (#406) or
-sampled rows fall back to plain decode per request. A GLM-5.3 verify step books its whole
+``repetition_penalty`` other than 1 is a 400: MTP serves no sampled request, so a workload
+that samples needs a deployment without this override. A GLM-5.3 verify step books its whole
 block of k + 1 cache rows, so its pool is four times the plain one; GLM-5.2 overwrites its
 rejected rows and needs one more page a request:
 
