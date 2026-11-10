@@ -594,22 +594,25 @@ class TestApprove(unittest.TestCase):
             return {"prior": [{"ref": "4", "priority": said, "status": "fixed_above", "fixed_in": 9, "why": "w"}],
                     "extra": {**still, "POST graphql": threads_page(thread(4, f"**[{tag}]** x"))}}
 
-        def outside(priority, said=None):
-            """An item outside the diff fixed above, and a re-review's verdict on it at priority `said`."""
+        def outside(priority, earlier=None):
+            """An item outside the diff fixed above, as `carried` makes it when the earlier review's state had it
+            at priority `earlier`."""
             item = {"priority": priority, "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
-            return {"extra": still, "outside": [item], "prior": [] if said is None else [
-                {"ref": "a.py:1", "priority": said, "status": "fixed_above", "fixed_in": 9, "why": "w"}]}
+            state = {"outside_diff": [{**item, "priority": earlier}]} if earlier else None
+            review = render_summary.carried({"outside_diff": [item], "prior_findings": [], "questions": []}, state,
+                                            False)
+            return {"extra": still, "outside": review["outside_diff"]}
 
         for name, blocks, kwargs in (("outside the diff", True, outside("P1")),
                                      ("a bot thread", True, on_thread("P1", "P1")),
                                      ("a P1 thread the re-review calls P2", True, on_thread("P1", "P2")),
-                                     ("a P2 item the re-review calls P1", True, outside("P2", "P1")),
+                                     ("an earlier P1 item restated as P2", True, outside("P2", "P1")),
                                      ("a P2's bot thread", False, on_thread("P2", "P2"))):
             with self.subTest(name):
                 text, _, writes = self.approve({"value": "on"}, above=above, **kwargs)
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], not blocks,
                                  f"{name}: a P0/P1 a PR above fixes would approve, or a P2 one wouldn't")
-                self.assertEqual("**[P1]**" in text and "The bot won't approve this PR until it's fixed in this PR"
+                self.assertEqual("**[P1]**" in text and "A P0/P1 has to be fixed in this PR itself, not only above"
                                  in text, blocks, f"{name}: the checklist wouldn't say why")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
