@@ -72,11 +72,11 @@ class TestApproval(unittest.TestCase):
                                     "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"],
                                    REPO_ROOT)[0], [], "a low-risk engine or model change couldn't be approved")
 
-    def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
+    def test_only_a_passing_live_test_approves_and_the_reviews_open_items_stop_it(self):
         pr = {"head": {"sha": "0123456789", "repo": OWN_HEAD}, "base": {"sha": "abcdef", "repo": BASE_REPO},
               "user": {"login": "an-author"}, "title": "T"}
 
-        def why(verdict, run, files=("docs/models.rst",), since="", skipped=(), questions=(), prior=(), threads=()):
+        def why(verdict, run, files=("docs/models.rst",), skipped=(), questions=(), prior=(), threads=()):
             fake = FakeGh({f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
                            {"permission": "write"}, "POST graphql": threads_page(*threads),
                            f"GET repos/{R}/compare/main...0123456789": {"files": [{"filename": f} for f in files]}})
@@ -85,7 +85,7 @@ class TestApproval(unittest.TestCase):
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             with workspace(), unittest.mock.patch.object(bot, "run", fake):
-                return gpu_review.decide(gpu_review.approval_facts(7, "0123456789", verdict, since, r)).why
+                return gpu_review.decide(gpu_review.approval_facts(7, "0123456789", verdict, r)).why
 
         self.assertEqual(why("pass", "full"), [])
         self.assertEqual(why("pass", "full", [f"docs/{i}.rst" for i in range(300)]),
@@ -101,19 +101,10 @@ class TestApproval(unittest.TestCase):
             self.assertEqual(why("pass", "full", prior=judged, threads=[thread(4, "**[P1]** x")]),
                              ["open P0–P2 findings: inline 4 (P1)"],
                              "the model's word alone would clear a finding no line of which changed")
-        self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
-                         "a change that needs no GPU run could never be approved")
-        self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
-                         "a skipped run the review didn't choose would count as a pass")
-        runtime = ("docs/models.rst", "mstar/worker/worker.py")
-        self.assertEqual(why("skipped", "none", runtime), [f"no GPU run on runtime code ({gpu_review.COUNTED})"],
-                         "a model's `none` alone would approve runtime code no GPU ran")
-        gated = ".github/PULL_REQUEST_TEMPLATE.md"
-        self.assertEqual(why("skipped", "none", (gated,)),
-                         [f"touches the review's rules or dependencies ({gpu_review.COUNTED}): {gated}"],
-                         "a file the gate already refuses would also be called runtime code")
-        self.assertEqual(why("skipped", "none", runtime, since="f" * 40), [],
-                         "a change since a passing live test could never be approved without a GPU")
+        self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")),
+                         ["no live test ran on this commit (the review chose none): the bot approves only after one "
+                          "passes, so a person approves"],
+                         "a review's `none` would approve with no live test, docs alone included")
 
 
 
@@ -141,7 +132,7 @@ class TestCarry(unittest.TestCase):
         ("re-review with no live test, full", True, "full", ["performance"], [], "",
          {"run": "full", "checks": "performance"}),
         ("pass on an ancestor, none", True, "none", ["correctness"], [live_test("pass")], "ahead",
-         {"run": "none", "checks": "correctness", "verdict": "skipped", "since": "a" * 40}),
+         {"run": "none", "checks": "correctness", "verdict": "skipped"}),
         ("pass on an ancestor, targeted", True, "targeted", ["correctness"], [live_test("pass")], "ahead",
          {"run": "targeted", "checks": "correctness", "since": "a" * 40}),
         ("pass on an ancestor, full", True, "full", ["correctness"], [live_test("pass")], "ahead",
@@ -596,7 +587,7 @@ class TestApprove(unittest.TestCase):
                 self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
-        finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
+        finding = {"priority": "P2", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
         above = [{"number": 9, "head_sha": "a" * 40}]
         for name, reply, approved in (("still open at its head", {"state": "open", "head": {"sha": "a" * 40}}, True),
                                       ("moved on", {"state": "open", "head": {"sha": "b" * 40}}, False),
@@ -606,6 +597,26 @@ class TestApprove(unittest.TestCase):
                 _, out, writes = self.approve({"value": "on"}, outside=[finding], above=above,
                                               extra={f"GET repos/{R}/pulls/9": reply})
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved, f"a PR above that is {name}")
+
+    def test_a_p1_fixed_only_in_a_pr_above_stops_the_approval(self):
+        above = [{"number": 9, "head_sha": "a" * 40}]
+        still = {f"GET repos/{R}/pulls/9": {"state": "open", "head": {"sha": "a" * 40}}}
+
+        def on_thread(p):
+            """An earlier inline finding a re-review judged fixed above."""
+            return {"prior": [{"ref": "4", "priority": p, "status": "fixed_above", "fixed_in": 9, "why": "w"}],
+                    "extra": {**still, "POST graphql": threads_page(thread(4, f"**[{p}]** x"))}}
+
+        for name, p, kwargs in (
+                ("outside the diff", "P1", {"extra": still, "outside": [
+                    {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}]}),
+                ("a bot thread", "P1", on_thread("P1")), ("a P2's bot thread", "P2", on_thread("P2"))):
+            with self.subTest(name):
+                text, _, writes = self.approve({"value": "on"}, above=above, **kwargs)
+                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], p == "P2",
+                                 f"{name}: a P0/P1 a PR above fixes would approve, or a P2 one wouldn't")
+                if p == "P1":  # inert breaks the `#9` link
+                    self.assertIn("9 above: a P0/P1 must be fixed in this PR", text, "the checklist wouldn't say why")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         posted = []
@@ -695,15 +706,14 @@ class TestPost(unittest.TestCase):
             (ws / "review.json").write_text(json.dumps({"live_test": {"run": "none", "reason": "docs <!-- x -->\n"}}))
             _, gated = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
                             run_url="u", trusted="true", gated="true")
-            Path(temp, "decision.md").write_text(
-                "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
+            Path(temp, "decision.md").write_text("#### What's left for you\n- [ ] no live test ran on this commit\n")
             _, none = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
                            run_url="u", trusted="true")
         (_, gated), = gated.writes()
         (_, none), = none.writes()
         self.assertEqual(gated.count("<!--"), 0, "the review's text could forge a passing live test")
         self.assertEqual(none, "<!-- claude-live-test-none -->\nNo GPU run: docs <\u200b!-- x -->\n\n"
-                               "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
+                               "#### What's left for you\n- [ ] no live test ran on this commit\n")
 
 
     def test_an_edited_finding_is_left_to_a_person_not_to_another_review(self):
