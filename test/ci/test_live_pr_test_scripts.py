@@ -211,21 +211,6 @@ class TestGpu(unittest.TestCase):
                                                   "next launch")
             self.assertEqual(self.watchdogs, [])
 
-    def test_an_eras_outage_refuses_only_an_eras_launch(self):
-        def eras_down(*a, **k):
-            raise GPU["ApiError"](-1, "GET /instances: gave up after retries")
-        self.g["eras"] = eras_down
-        cfg = {**CFG, "budget": {**CFG["budget"], "max_running": 1}}
-        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
-            self.assertFalse(self.launch(cfg=cfg)[3], "an Eras outage would stop launches on RunPod and Lambda")
-            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"])
-            GPU["save_ledger"]({})
-            self.g["find_offer"] = lambda cfg, oid: {**OFFER, "id": "eras:l1", "provider": "eras"}
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
-                GPU["cmd_launch"](argparse.Namespace(offer="eras:l1", pr=7, hours=1, tag=None, allow_over_budget=False,
-                                                     dry_run=False), cfg)
-        self.assertIn("budget.max_running", err.getvalue(), "an Eras launch would go past max_running unchecked")
-
     def test_an_entry_of_a_provider_gpu_py_does_not_have_holds_nothing_up(self):
         key = "slurm:node1:42"
         GPU["save_ledger"]({key: {"provider": "slurm", "instance_id": "42", "name": "live-pr-7-x", "pr": 7,
@@ -272,7 +257,8 @@ class TestGpu(unittest.TestCase):
     def test_offers_with_a_provider_not_answering_is_not_no_availability(self):
         def erroring(*a, **k):
             raise GPU["ApiError"](503, "unavailable")
-        args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
+        args = argparse.Namespace(gpus=1, vendor="nvidia", min_vram=80, all_regions=False, allow_arm=False,
+                                  json=False)
         unittest.mock.patch.object(GPU["RunPod"], "offers", erroring).start()
         unittest.mock.patch.object(GPU["Lambda"], "offers", lambda *a, **k: []).start()
         self.addCleanup(unittest.mock.patch.stopall)

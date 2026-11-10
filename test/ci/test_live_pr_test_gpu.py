@@ -23,6 +23,12 @@ import gpu as gpu_module  # noqa: E402
 GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 
 
+def keys(*names):
+    """The environment with only these providers' API keys set, so no test reaches a real provider."""
+    return unittest.mock.patch.dict(os.environ, {cls.key_env: "k" if cls.name in names else ""
+                                                 for cls in GPU["PROVIDERS"].values()})
+
+
 class TestEras(unittest.TestCase):
     def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False, run=None,
                     inputs=(), gone=()):
@@ -189,17 +195,56 @@ class TestEras(unittest.TestCase):
         self.assertLess(GPU["ledger"]()["eras:i"]["deadline"], soon)
         self.assertGreater(GPU["ledger"]()["runpod:i"]["deadline"], soon)
 
-    def test_max_running_counts_this_tools_live_instances_on_every_page(self):
+    def test_max_running_counts_this_tools_live_instances_on_every_page_of_every_provider(self):
         globs = GPU
-        self.addCleanup(globs.update, {"eras": globs["eras"]})
+        self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "runpod")})
         globs["eras"] = lambda *a, params=None, **k: (
             {"items": [{"id": "i1", "name": "live-pr-4-8-1", "status": "active"},
                        {"id": "i3", "name": "someone-else", "status": "active"}]} if params.get("page_token")
             else {"items": [{"id": "i2", "name": "live-pr-2-1-1", "status": "ended"}], "next_page_token": "p2"})
-        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
+        globs["runpod"] = lambda *a, **k: {"pods": [{"id": "p1", "name": "live-pr-5-x", "status": "RUNNING"}]}
+        with keys("eras", "runpod"):
             up = GPU["running"]({"eras": {}})
-        self.assertEqual([line.split()[0] for line in up], ["eras:i1"],
+        self.assertEqual([line.split()[0] for line in up], ["eras:i1", "runpod:p1"],
                          "every live test would hold its own box, past budget.max_running")
+
+        def down(*a, **k):
+            raise GPU["ApiError"](503, "down")
+        globs["runpod"] = down
+        with keys("eras", "runpod"), self.assertRaises(GPU["ApiError"], msg="a provider it can't list would count 0"):
+            GPU["running"]({"eras": {}})
+
+    def test_offers_are_of_the_vendor_asked_for_and_eras_offers_no_amd(self):
+        globs = GPU
+        self.addCleanup(globs.update, {"eras": globs["eras"]})
+        listing = [{"id": f"l{i}", "hourly_price": 3.0, "launches_available": 1,
+                    "access_method": {"is_available": True},
+                    "hardware": {"gpu": {"model": model, "count": 1, "memory_per_device": "192Gi"}}}
+                   for i, model in enumerate(("H200", "MI300X", "A100"))]
+        globs["eras"] = lambda *a, **k: {"items": listing}
+
+        def offers(vendor):
+            printed = io.StringIO()
+            args = argparse.Namespace(gpus=1, vendor=vendor, min_vram=80, all_regions=False, allow_arm=False, json=True)
+            with keys("eras"), contextlib.redirect_stdout(printed):
+                GPU["cmd_offers"](args, {"budget": {"max_usd_per_hour": 30}})
+            return [(o["id"], o["vendor"]) for o in json.loads(printed.getvalue())["offers"]]
+
+        self.assertEqual(offers("nvidia"), [("eras:l0", "nvidia")], "an A100 or an AMD box would pass for Hopper")
+        self.assertEqual(offers("amd"), [], "an AMD box would get the Eras template, which asks for nvidia.com/gpu")
+
+    def test_run_is_refused_where_the_box_cant_take_it(self):
+        globs = GPU
+        self.addCleanup(globs.update, {"find_offer": globs["find_offer"]})
+        globs["find_offer"] = lambda cfg, offer: {"id": "runpod:H100:dc:1", "provider": "runpod", "gpu": "H100",
+                                                  "count": 1, "usd_per_hour": 3.0, "region": "dc", "storage": True}
+        key = Path(tempfile.mkdtemp()) / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        args = argparse.Namespace(offer="runpod:H100:dc:1", pr=0, hours=1, tag="t", run="box.sh", input=[],
+                                  allow_over_budget=False, dry_run=True)
+        with self.assertRaises(SystemExit, msg="a pod would hold GPUs with nothing running on them"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            GPU["cmd_launch"](args, {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4}})
 
     def test_an_eras_ssh_key_on_a_later_page_is_reused(self):
         key = base64.b64encode(b"key").decode()

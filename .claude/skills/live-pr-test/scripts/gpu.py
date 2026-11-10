@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Provision Hopper-or-newer GPUs for live PR tests: Eras Cloud, RunPod or Lambda.
+"""Provision GPUs for live PR tests (NVIDIA Hopper or newer, AMD MI300X or newer): Eras Cloud, RunPod or Lambda.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
-  gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
+  gpu.py offers --gpus N [--vendor nvidia|amd] [--min-vram GB] [--all-regions] [--allow-arm] [--json]
   gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
                [--cache ro|none | --cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
-  gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
+  gpu.py list [--all]                            instances launched here (--all: this tool's, by any session)
   gpu.py extend <instance> --hours H [--allow-over-budget]
                                                  move the watchdog deadline to now + H (Eras: earlier only)
   gpu.py terminate <instance>
@@ -55,6 +55,7 @@ import urllib.parse
 import urllib.request
 from http.client import HTTPException  # the module name is taken by http() below
 from pathlib import Path
+from typing import NamedTuple
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 STATE = Path(os.environ.get("LIVE_PR_STATE", "~/.local/state/mstar-live-pr-test")).expanduser()
@@ -63,9 +64,16 @@ RUNPOD = "https://api.runpod.io/v2"
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 LAMBDA = "https://cloud.lambda.ai/api/v1"
 ERAS = "https://api.erascloud.ai"
-# Hopper or newer. \b keeps out the H20 (Hopper silicon, a fraction of the compute).
-HOPPER_PLUS = re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I)
+# The GPUs this tool rents, by vendor: NVIDIA Hopper or newer (\b keeps out the H20, Hopper silicon with a
+# fraction of the compute), and AMD MI300X or newer.
+SUPPORTED = {"nvidia": re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I),
+             "amd": re.compile(r"\bMI3[0-5]\d?X\b", re.I)}
 JOB_PREFIX = "live-pr-"  # what the names of this tool's instances start with
+
+
+def vendor_of(gpu: str) -> str | None:
+    """The vendor of a GPU this tool rents, by the GPU's name; None for any other GPU."""
+    return next((vendor for vendor, names in SUPPORTED.items() if names.search(gpu)), None)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -248,6 +256,13 @@ GIB = re.compile(r"(\d+(?:\.\d+)?)\s*([GT])i?", re.I)
 
 # ---------------------------------------------------------------- providers
 
+class Instance(NamedTuple):
+    """One of a provider's instances, as its listing shows it."""
+    id: str
+    name: str
+    status: str
+
+
 class Provider:
     """One source of GPUs: what the CLI and the ledger below do differently per provider.
 
@@ -257,6 +272,8 @@ class Provider:
     key_env = ""  # the API key this provider needs
     user = "root"  # who ssh logs in as
     fixed_deadline = False  # its deadline was fixed at launch, so a later one wouldn't move it
+    vendors = ("nvidia",)  # the GPU vendors its images run
+    takes_run = False  # whether `launch --run` works here
 
     def __init__(self, cfg: dict, region: str | None = None):
         self.cfg, self.region = cfg, region
@@ -290,9 +307,17 @@ class Provider:
         nothing on a dry run."""
         raise NotImplementedError
 
+    def instances(self) -> list[Instance]:
+        """Every instance on the account, but those ended or being released."""
+        raise NotImplementedError
+
+    def storage(self) -> dict | None:
+        """Region -> the team's persistent storage there, or None for a provider that needs none."""
+        return None
+
     def named(self, name: str) -> list[str]:
         """The ids of the account's instances with this name (one create makes one, the name is unique)."""
-        raise NotImplementedError
+        return [i.id for i in self.instances() if i.name == name]
 
     def adopt(self, name: str) -> str | None:
         """The instance a create whose answer was lost made, found by its name, or None after 2 min."""
@@ -327,7 +352,7 @@ class RunPod(Provider):
             "include": "AVAILABILITY", "product": "POD", "count": gpus, "cloud": "SECURE"})
         offers = []
         for g in cat.get("gpus") or []:
-            if not HOPPER_PLUS.search(g["id"]) or (g.get("memory") or 0) < min_vram:
+            if vendor_of(g["id"]) not in self.vendors or (g.get("memory") or 0) < min_vram:
                 continue
             per_gpu = (g.get("price") or {}).get("secure")
             if not per_gpu:
@@ -370,8 +395,8 @@ class RunPod(Provider):
         direct = (p.get("ssh") or {}).get("direct") or {}
         return p.get("status", "?"), direct.get("host"), int(direct.get("port") or 22)
 
-    def named(self, name):
-        return [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
+    def instances(self):
+        return [Instance(p["id"], p.get("name"), p.get("status")) for p in runpod_list("/pods", "pods")]
 
     def release(self, iid, e):
         runpod("DELETE", f"/pods/{iid}")
@@ -395,12 +420,6 @@ class RunPod(Provider):
         except ApiError as e:
             print(f"  key's account: unknown ({e})")
 
-    def listing(self):
-        """All of RunPod's pods, for `list --all`."""
-        if self.enabled():
-            for p in runpod_list("/pods", "pods"):
-                yield f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr"
-
 
 class Lambda(Provider):
     name, key_env, user = "lambda", "LAMBDA_API_KEY", "ubuntu"
@@ -417,7 +436,7 @@ class Lambda(Provider):
             desc = it.get("gpu_description", "")
             n = it.get("specs", {}).get("gpus", 0)
             vram = lambda_vram(desc)
-            if not HOPPER_PLUS.search(desc) or n < gpus or (vram is not None and vram < min_vram):
+            if vendor_of(desc) not in self.vendors or n < gpus or (vram is not None and vram < min_vram):
                 continue
             # GH200 is arm64; the torch/flashinfer wheels this repo installs are x86_64-first.
             if it.get("architecture", "x86_64") != "x86_64" and not allow_arm:
@@ -453,8 +472,9 @@ class Lambda(Provider):
         i = lambda_("GET", f"/instances/{e['instance_id']}") or {}
         return i.get("status", "?"), i.get("ip"), 22
 
-    def named(self, name):
-        return [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
+    def instances(self):
+        return [Instance(i["id"], i.get("name"), i.get("status")) for i in lambda_("GET", "/instances") or []
+                if i.get("status") not in ("terminating", "terminated")]
 
     def release(self, iid, e):
         lambda_("POST", "/instance-operations/terminate", {"instance_ids": [iid]})
@@ -465,30 +485,24 @@ class Lambda(Provider):
     def explain_no_storage(self):
         pass
 
-    def listing(self):
-        """All of Lambda's instances, for `list --all`."""
-        if self.enabled():
-            for i in lambda_("GET", "/instances") or []:
-                yield f"lambda:{i['id']}  {i.get('name')}  {i.get('status')}  {i['instance_type']['name']}"
-
 
 class Eras(Provider):
     name, key_env = "eras", "ERAS_API_KEY"
-    fixed_deadline = True
+    fixed_deadline = takes_run = True
 
     @classmethod
     def pool(cls, cfg, offer_id):
         return cls(cfg).offers(1, 0, False)
 
     def offers(self, gpus, min_vram, all_regions, allow_arm=False):
-        # Hopper+ is checked here rather than in the filter: Eras names models "H200", "B300", ...
+        # The model is checked here rather than in the filter: Eras names models "H200", "B300", ...
         flt = json.dumps({"field": "hardware.gpu.count", "op": ">=", "value": gpus})
         page, offers = eras("GET", "/compute-listings", params={"page_size": 100, "filter": flt}), []
         for x in page.get("items") or []:
             g = (x.get("hardware") or {}).get("gpu") or {}
             m = GIB.match(str(g.get("memory_per_device") or ""))
             vram = int(float(m.group(1)) * (1024 if m.group(2).upper() == "T" else 1)) if m else None
-            if not HOPPER_PLUS.search(str(g.get("model") or "")) or (vram is not None and vram < min_vram):
+            if vendor_of(str(g.get("model") or "")) not in self.vendors or (vram is not None and vram < min_vram):
                 continue
             if x.get("hourly_price") is None:
                 continue
@@ -540,9 +554,9 @@ class Eras(Provider):
                                            if failure else "")
         return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
 
-    def named(self, name):
-        return [i["id"] for i in eras_items("/instances", 200)
-                if i.get("name") == name and i.get("status") not in ("ended", "releasing")]
+    def instances(self):
+        return [Instance(i["id"], i.get("name"), i.get("status")) for i in eras_items("/instances", 200)
+                if i.get("status") not in ("ended", "releasing")]
 
     def release(self, iid, e):
         eras("POST", f"/instances/{iid}/release", {})
@@ -568,7 +582,7 @@ def job_name(pr: int, tag: str) -> str:
 
 def cmd_offers(args, cfg):
     offers, errors, answered, failed = [], [], 0, []
-    for p in (Eras(cfg), RunPod(cfg), Lambda(cfg)):  # one that can't be reached is skipped, with its reason
+    for p in (cls(cfg) for cls in PROVIDERS.values()):  # one that can't be reached is skipped, with its reason
         if not p.enabled():
             errors.append(f"{p.name}: skipped (disabled, or no API key)")
             continue
@@ -578,6 +592,8 @@ def cmd_offers(args, cfg):
         except ApiError as e:
             errors.append(f"{p.name}: {e}")
             failed.append(p.name)
+    offers = [{**o, "vendor": vendor_of(o["gpu"])} for o in offers]
+    offers = [o for o in offers if o["vendor"] == args.vendor]
     offers.sort(key=lambda o: (o["availability"] == "none", o["usd_per_hour"], o["count"]))  # what can start now first
     cap = cfg["budget"]["max_usd_per_hour"]
     # No offers with a provider that errored, or none answering, says nothing about capacity there:
@@ -594,7 +610,7 @@ def cmd_offers(args, cfg):
         die(f"availability unknown: {', '.join(failed) or 'no provider'} didn't answer (see above), "
             "and no provider that did has an offer; fix the keys or the errors")
     if all(o["availability"] == "none" for o in offers):
-        print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
+        print(f"no availability: no {args.vendor} box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
         if not offers:
             return
@@ -681,6 +697,8 @@ def cmd_launch(args, cfg):
     check_hours(cfg, hours, args.allow_over_budget)
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
     p = provider_of(cfg, o)
+    if args.run and not p.takes_run:
+        die(f"{p.name} can't take --run; launch without it and start the work over ssh")
     # unique per launch, so a create whose answer was lost is found again by this name. A --tag is the
     # caller's own unique name: what it looks the instance up by, and what makes an Eras launch idempotent.
     name = job_name(args.pr, args.tag or f"{time.strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}")
@@ -701,9 +719,7 @@ def cmd_launch(args, cfg):
                 try:
                     up = running(cfg)
                 except ApiError as err:
-                    if isinstance(p, Eras):
-                        die(f"can't count this tool's Eras instances for budget.max_running: {err}")
-                    up = []  # an Eras outage doesn't stop a launch elsewhere
+                    die(f"can't count this tool's instances for budget.max_running: {err}")
                 if len(up) >= max_running:
                     die(f"{len(up)} of this tool's instances are up, from every session; budget.max_running is "
                         f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
@@ -929,7 +945,7 @@ def cmd_wait(args, cfg):
             die(f"{args.instance} is {st}")
         if host:
             e["host"], e["port"] = host, port
-            probe = remote(e, cfg, "nvidia-smi -L")
+            probe = remote(e, cfg, "nvidia-smi -L || amd-smi list")
             probe[1:1] = ["-o", "BatchMode=yes"]
             r = subprocess.run(probe, capture_output=True, text=True, check=False)
             if r.returncode == 0:
@@ -1018,24 +1034,33 @@ def cmd_extend(args, cfg):
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
+def enabled_providers(cfg: dict) -> list[Provider]:
+    return [p for p in (cls(cfg) for cls in PROVIDERS.values()) if p.enabled()]
+
+
 def running(cfg: dict) -> list[str]:
-    """This tool's Eras instances up now, from every session and machine (the ledger has only this
-    machine's), one line each; none without an Eras key. "This tool's" goes by name, so every
-    live-pr-* instance in the Eras organization counts. budget.max_running reads this list, then
-    launches: a soft cap, since two machines can both see the last free slot."""
-    if not Eras(cfg).enabled():
-        return []
-    return [f"eras:{i['id']}  {i.get('name')}  {i.get('status')}" for i in eras_items("/instances", 200)
-            if str(i.get("name")).startswith(JOB_PREFIX) and i.get("status") not in ("ended", "releasing")]
+    """This tool's instances up now on every enabled provider, from every session and machine (the
+    ledger has only this machine's), one line each. "This tool's" goes by name, so every live-pr-*
+    instance on those accounts counts. budget.max_running reads this list, then launches: a soft cap,
+    since two machines can both see the last free slot. A provider that can't be listed raises, so the
+    cap fails closed."""
+    return [f"{p.name}:{i.id}  {i.name}  {i.status}" for p in enabled_providers(cfg) for i in p.instances()
+            if str(i.name).startswith(JOB_PREFIX)]
 
 
 def release_by_name(cfg: dict, pr: int, tag: str) -> None:
-    """End whatever this tool launched on Eras for `pr` and `tag`, by its name, for a launch cancelled
-    before its instance was recorded."""
-    eras_cloud = Eras(cfg)
-    if eras_cloud.enabled():
-        for iid in eras_cloud.named(job_name(pr, tag)):
-            eras_cloud.release(iid, {})
+    """End whatever this tool launched for `pr` and `tag` on any enabled provider, by its name, for a launch
+    cancelled before its instance was recorded. Every provider is tried; the first error is raised after."""
+    failed = None
+    for p in enabled_providers(cfg):
+        try:
+            for iid in p.named(job_name(pr, tag)):
+                p.release(iid, {})
+        except ApiError as err:
+            print(f"{p.name}: {err}", file=sys.stderr)
+            failed = failed or err
+    if failed:
+        raise failed
 
 
 def cmd_list(args, cfg):
@@ -1052,16 +1077,12 @@ def cmd_list(args, cfg):
         print(f"{key}  pr {e['pr']}  {e['count']}x {e['gpu']} {e['region']}  {st}  "
               f"{hrs:.2f} h, ~${hrs * e['usd_per_hour']:.2f}  deadline in {left:.0f} min")
     if args.all:
-        print("--- this tool's on Eras, from every session; all of RunPod and Lambda ---")
-        for line in RunPod(cfg).listing():
-            print(line)
+        print("--- this tool's on every provider, from every session ---")
         try:
             up = running(cfg)
         except ApiError as err:
-            up = [f"eras: {err}"]
+            up = [f"? {err}"]
         for line in up:
-            print(line)
-        for line in Lambda(cfg).listing():
             print(line)
 
 
@@ -1088,7 +1109,7 @@ def cmd_check(args, cfg):
     print(f"budget: ${cfg['budget']['max_usd_per_hour']}/hr, {cfg['budget']['max_hours']} h")
     key_ok = Path(cfg["ssh_public_key"]).expanduser().exists()
     print(f"ssh key: {cfg['ssh_public_key']} ({'ok' if key_ok else 'MISSING'})")
-    for p in (RunPod(cfg), Lambda(cfg)):
+    for p in (cls(cfg) for cls in PROVIDERS.values()):
         if not p.enabled():
             print(f"{p.name}: skipped (disabled or no API key)")
             continue
@@ -1096,6 +1117,9 @@ def cmd_check(args, cfg):
             stores = p.storage()
         except ApiError as e:
             print(f"{p.name}: {e}")
+            continue
+        if stores is None:
+            print(f"{p.name}: key set; its boxes keep the HF cache on their own disk")
             continue
         where = ", ".join(
             f"any data center (global volume {s['name']!r}, {s['id']})" if r == GLOBAL
@@ -1111,6 +1135,7 @@ def main():
     sub.add_parser("check")
     p = sub.add_parser("offers")
     p.add_argument("--gpus", type=int, required=True)
+    p.add_argument("--vendor", choices=sorted(SUPPORTED), default="nvidia")
     p.add_argument("--min-vram", type=int, default=80)
     p.add_argument("--all-regions", action="store_true")
     p.add_argument("--json", action="store_true")
