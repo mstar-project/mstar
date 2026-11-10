@@ -38,6 +38,7 @@ from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 from mstar.api_server.served_models import ServedModels
+from mstar.model.step_audio2.constants import REF_AUDIO_REFUSAL as STEP_AUDIO2_REF_AUDIO_REFUSAL
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -199,7 +200,8 @@ CHAT_CLASSES = [c for c in _chat_classes() if c not in TEXT_ONLY_CHAT]
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
     assert _chat_classes() == [
-        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
+        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "StepAudio2Adapter",
+        "TextChatAdapter",
     ]
 
 
@@ -362,6 +364,83 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     with _model_stack(model, _StubAPIServer()) as (port, _upload):
         rust = _post(port, "/v1/chat/completions", body, timeout=30)
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+
+
+# ── Step-Audio2: a spoken chat, and the clip it does not clone yet ─────────────
+
+# a 10 ms 16 kHz silent WAV, so the audio part takes the real media path
+WAV = base64.b64encode(
+    b"RIFF" + (36 + 320).to_bytes(4, "little") + b"WAVEfmt " + (16).to_bytes(4, "little")
+    + (1).to_bytes(2, "little") + (1).to_bytes(2, "little") + (16000).to_bytes(4, "little")
+    + (32000).to_bytes(4, "little") + (2).to_bytes(2, "little") + (16).to_bytes(2, "little")
+    + b"data" + (320).to_bytes(4, "little") + bytes(320)
+).decode()
+STEP_AUDIO2_SPOKEN = {
+    "model": "step_audio2",
+    "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": WAV, "format": "wav"}},
+            {"type": "text", "text": "Answer briefly."},
+        ]},
+    ],
+    "modalities": ["text", "audio"], "audio": {"voice": "default_male"},
+    "temperature": 0.7, "top_p": 0.9, "max_tokens": 64, "seed": 3, "repetition_penalty": 1.05,
+}
+STEP_AUDIO2_CHATS = {
+    "spoken": STEP_AUDIO2_SPOKEN,
+    "spoken-stream": {**STEP_AUDIO2_SPOKEN, "stream": True},
+    "text": {"model": "step_audio2", "messages": [{"role": "user", "content": "Hi."}], "max_completion_tokens": 8},
+    "ref-audio": {**STEP_AUDIO2_SPOKEN, "ref_audio": f"data:audio/wav;base64,{WAV}"},
+    "empty-ref-audio": {**STEP_AUDIO2_SPOKEN, "ref_audio": ""},
+}
+
+
+class _RecordingPythonServer(_PythonServer):
+    def __init__(self, model_name, upload_dir):
+        super().__init__(model_name, upload_dir)
+        self.submitted = []
+
+    def submit_request(self, **kwargs):
+        self.submitted.append(kwargs)
+        return super().submit_request(**kwargs)
+
+
+@pytest.mark.parametrize("case", sorted(STEP_AUDIO2_CHATS))
+def test_both_frontends_submit_and_answer_a_step_audio2_chat_alike(case, tmp_path, monkeypatch):
+    """A spoken Step-Audio2 chat (an audio part, a voice) reaches ``submit_request`` from each
+    frontend with the same arguments and files, and its client gets the same status and body;
+    a ``ref_audio`` clip is refused by both with the same 400 before anything is submitted."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+    body = STEP_AUDIO2_CHATS[case]
+    stream = bool(body.get("stream"))
+    server = _RecordingPythonServer("step_audio2", tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    stub = _StubAPIServer()
+    with _model_stack("step_audio2", stub) as (port, _upload):
+        rust = _post(port, "/v1/chat/completions", body, timeout=30)
+        rust_files = _files(stub.submitted[0]["files"]) if stub.submitted else None
+    assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+    if case == "ref-audio":
+        assert py.status_code == 400 and not server.submitted and not stub.submitted
+        assert json.loads(rust[1])["error"]["message"] == STEP_AUDIO2_REF_AUDIO_REFUSAL
+        return
+    assert py.status_code == 200, py.content
+    (want,), (sub,) = server.submitted, stub.submitted
+    assert sub["text"] == want["text"]
+    assert (sub["in"], sub["out"]) == (want["input_modalities"], want["output_modalities"])
+    assert normalize_generation_kwargs(sub["mk"]) == normalize_generation_kwargs(want["model_kwargs"])
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want["prompt_parts"]]
+    assert rust_files == {m: [Path(p).read_bytes() for p in ps] for m, ps in (want["file_paths"] or {}).items()}
+    if case.startswith("spoken"):
+        assert sub["out"] == ["text", "audio"] and sub["mk"]["voice"] == "default_male"
+        assert rust_files == {"audio": [base64.b64decode(WAV)]}
 
 
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────

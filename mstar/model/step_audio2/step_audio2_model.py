@@ -83,6 +83,7 @@ from mstar.model.step_audio2.config import (
     StepAudio2Config,
     audio_tokens,
 )
+from mstar.model.step_audio2.constants import REF_AUDIO_REFUSAL
 from mstar.model.step_audio2.token2wav import CONFORMER_REPLY_TOKENS, T2W_STREAMING
 from mstar.model.step_audio2.weight_loader import load_audio_weights, load_llm_weights
 from mstar.model.submodule_base import NodeSubmodule
@@ -106,10 +107,6 @@ DEFAULT_VOICE = "default_female"
 # A spoken reply's tokens: each is at most one speech id, so this many keep the vocoder's
 # conformer caches within what they hold (``CONFORMER_REPLY_TOKENS``).
 SPEECH_MAX_OUTPUT_TOKENS = CONFORMER_REPLY_TOKENS
-
-REF_AUDIO_REFUSAL = (
-    "Step-Audio2 does not clone a voice from ref_audio yet; choose one of its voices with 'voice'"
-)
 
 
 class SpokenTextDetokenizer:
