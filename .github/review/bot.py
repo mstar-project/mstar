@@ -44,6 +44,8 @@ POSTING_BOT_USERS = [f"{b}[bot]" for b in render_summary.POSTING_BOTS]
 INCOMPLETE = "<!-- claude-review-incomplete -->"
 RESOLVED = "<!-- claude-review-incomplete-resolved -->"
 REFUSED = "<!-- claude-review-continue-refused -->"
+# The marker of the comment on a new PR listing the commands its author and maintainers can run (review-hint.yml).
+HINT = "<!-- claude-review-hint -->"
 # What Claude Code wrote of the run: the action's execution file, and the session transcripts.
 EXECUTION = "claude-execution-output.json"
 TYPES = render_summary.TYPES
@@ -172,6 +174,12 @@ def marked(comments, marker):
     """The ids of the bot's own comments that start with `marker`."""
     return [c["id"] for c in comments
             if (c.get("user") or {}).get("login") in BOT_USERS and (c.get("body") or "").startswith(marker)]
+
+
+def is_hint(c):
+    """Whether REST comment `c` is the bot's hint. The job's token posts it, so either login counts; a forged one
+    could only suppress it."""
+    return (c.get("user") or {}).get("login") in POSTING_BOT_USERS and (c.get("body") or "").startswith(HINT)
 
 
 def last_summary(conversation):
@@ -507,12 +515,12 @@ def discussion(repo, pr):
                          "author_association": c.get("author_association"),
                          "created_at": c.get("created_at"), "url": c.get("html_url"),
                          **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
-    # The conversation tab: replies to the summary, and the author's answers.
+    # The conversation tab: replies to the summary, and the author's answers. The hint is fixed text, not discussion.
     conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
                      "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
                      "author_association": c.get("author_association"), "url": c.get("html_url"),
                      "body": c.get("body")}
-                    for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
+                    for c in api_list(f"repos/{repo}/issues/{pr}/comments") if not is_hint(c)]
     return comments, conversation
 
 
@@ -1374,10 +1382,57 @@ def approval_current(out, repo, head_ref):
     print(f"::notice::PR #{pr}: {why}.")
 
 
+# ---------------------------------------------------------------- the hint on a new PR
+
+def hint_text(repo, can_write, trusted_head, assoc, skip_label):
+    """The hint: the commands the PR's author may run, by preflight's rules, and those someone with write access may
+    run on it. `skip-ai-review` changes only a contributor's own `/review light`."""
+    lead = "The review bot runs only when someone asks for it; opening or pushing to a PR starts no review."
+    if can_write and trusted_head:
+        ask = ("You, or anyone with write access, can comment `/review light` for a quick review, `/review nogpu` for "
+               "a deeper one with design questions, or `/review` for the same plus a GPU live test, which can approve "
+               "the PR. Comment it again after pushes to re-review.")
+    elif can_write:
+        ask = ("You, or anyone with write access, can comment `/review light` for a quick review or `/review nogpu` "
+               "for a deeper one with design questions; the GPU live test takes a branch on this repository or on a "
+               "fork with write access. Comment it again after pushes to re-review.")
+    elif assoc in CONTRIBUTORS and skip_label:
+        ask = ("This PR has the `skip-ai-review` label, which turns off the author's own `/review light`; a "
+               "maintainer can still comment `/review light` for a quick review.")
+    elif assoc in CONTRIBUTORS:
+        ask = ("You can comment `/review light` here for a quick review, and again after pushes to re-review; a "
+               "maintainer can run it too. It's advisory: a maintainer still reviews your PR.")
+    else:
+        lead = f"Thanks for the PR! {lead}"
+        ask = ("A maintainer can comment `/review light` here for a quick automated review. Once you've had a PR "
+               "merged here, you can run it on your own PRs too.")
+    return f"{HINT}\n{lead}\n{ask} [How it works](https://github.com/{repo}/blob/HEAD/.github/review/README.md)\n"
+
+
+def hint(out, repo, pr):
+    """Post the hint on a PR that opened ready for review or was marked ready (review-hint.yml), once: a later run
+    finds it by its marker and edits it only if the text changed. A draft waits to be marked ready. An author whose
+    access can't be read fails the step rather than get a wrong hint."""
+    pull = api(f"repos/{repo}/pulls/{pr}")
+    if pull.get("draft"):
+        print("::notice::A draft gets the hint when it is marked ready for review.")
+        return
+    author = pull["user"]["login"]
+    can_write = api(f"repos/{repo}/collaborators/{author}/permission").get("permission") in WRITE
+    text = hint_text(repo, can_write, can_write and head_trusted(repo, pull), pull.get("author_association"),
+                     "skip-ai-review" in [label.get("name") for label in pull.get("labels") or []])
+    earlier = [c for c in api_list(f"repos/{repo}/issues/{pr}/comments") if is_hint(c)]
+    if not earlier:
+        comment(repo, pr, text)
+    elif earlier[-1]["body"] != text:
+        gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{earlier[-1]['id']}", "--input", "-",
+           input=json.dumps({"body": text}))
+
+
 STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
          "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post,
-         "approval_current": approval_current}
+         "approval_current": approval_current, "hint": hint}
 
 if __name__ == "__main__":
     main(STEPS)

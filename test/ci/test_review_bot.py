@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,78 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(self.preflight("continue", peer, actor="a-maintainer"),
                          ({"run": "true", "mode": "", "turns": "2000"}, []),
                          "a maintainer couldn't continue a light review of a first-timer's PR")
+
+
+class TestHint(unittest.TestCase):
+    """bot.hint: one comment on a new PR naming the `/review` commands its author and maintainers can run."""
+
+    # The PR's author, as GitHub reports them: permission, association, skip-ai-review, head repository.
+    AUTHORS = {
+        "a team member": ("write", "MEMBER", False, "o/r"),
+        "a team member with skip-ai-review": ("write", "MEMBER", True, "o/r"),
+        "a team member on a stranger's fork": ("write", "MEMBER", False, "a-stranger/r"),
+        "a contributor": ("read", "CONTRIBUTOR", False, "an-author/r"),
+        "a contributor with skip-ai-review": ("read", "CONTRIBUTOR", True, "an-author/r"),
+        "a first-timer": ("read", "FIRST_TIME_CONTRIBUTOR", False, "an-author/r"),
+        "someone with no association": ("none", "NONE", False, "an-author/r"),
+    }
+    COMMANDS = {"light": "/review light", "nogpu": "/review nogpu", "full": "/review"}
+
+    def routes(self, perm="write", assoc="MEMBER", skip=False, head="o/r", draft=False, comments=()):
+        head_repo = {"full_name": head, "owner": {"login": head.split("/")[0]}}
+        return {"GET repos/o/r/collaborators/an-author/permission": perm,
+                "GET repos/o/r/collaborators/a-maintainer/permission": {"permission": "write"},
+                "GET repos/o/r/collaborators/a-stranger/permission": {"permission": "read"},
+                "GET repos/o/r/pulls/1": {"user": {"login": "an-author"}, "author_association": assoc, "draft": draft,
+                                          "labels": [{"name": "skip-ai-review"}] if skip else [],
+                                          "head": {"repo": head_repo}},
+                "GET repos/o/r/issues/1/comments": list(comments),
+                "pr comment": "https://github.com/o/r/pull/1#issuecomment-9",
+                "PATCH repos/o/r/issues/comments/*": "{}"}
+
+    def post(self, perm="write", **kwargs):
+        """The writes bot.hint makes on PR 1."""
+        perm = perm if isinstance(perm, Fail) else {"permission": perm}
+        return step(bot.hint, self.routes(perm, **kwargs), repo="o/r", pr="1")[1].writes()
+
+    def accepted(self, actor, perm, assoc, skip, head):
+        """The commands preflight accepts from `actor` on that PR."""
+        routes = self.routes({"permission": perm}, assoc, skip, head)
+        return {words for command, words in self.COMMANDS.items()
+                if step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command=command, actor=actor,
+                        author="an-author", assoc=assoc if actor == "an-author" else "MEMBER",
+                        skip_label=str(skip).lower())[0]["run"] == "true"}
+
+    def test_it_names_exactly_the_commands_preflight_accepts(self):
+        for name, (perm, assoc, skip, head) in self.AUTHORS.items():
+            with self.subTest(name):
+                own = self.accepted("an-author", perm, assoc, skip, head)
+                anyone = own | self.accepted("a-maintainer", perm, assoc, skip, head)
+                [(key, body)] = self.post(perm, assoc=assoc, skip=skip, head=head)
+                self.assertEqual(key, "pr comment")
+                self.assertEqual(set(re.findall(r"`(/review(?: \w+)?)`", body)), anyone,
+                                 "the hint would name a command the preflight refuses on this PR, or leave one out")
+                self.assertEqual(body.splitlines()[2].startswith("You"), bool(own),
+                                 "the hint would offer the author a command they can't run, or hide one they can")
+
+    def test_it_posts_once_and_edits_rather_than_repeats(self):
+        [(_, text)] = self.post()
+        mine = {"id": 9, "user": {"login": "github-actions[bot]"}, "body": text}
+        self.assertEqual(self.post(comments=[mine]), [], "marking a PR ready again would post a second hint")
+        self.assertEqual(self.post(comments=[{**mine, "body": bot.HINT + "\nolder text"}]),
+                         [("PATCH repos/o/r/issues/comments/9", json.dumps({"body": text}))])
+        self.assertEqual(self.post(comments=[{**mine, "user": {"login": "someone"}}])[0][0], "pr comment",
+                         "anyone could stop the hint by posting its marker")
+        self.assertEqual(self.post(draft=True), [], "a draft would get the hint before it is ready")
+        with self.assertRaises(RuntimeError, msg="an author whose access can't be read would get a wrong hint"):
+            self.post(Fail())
+
+    def test_the_review_doesnt_read_the_hint_as_discussion(self):
+        hint = {"id": 9, "user": {"login": "github-actions[bot]"}, "body": bot.HINT + "\nthe hint"}
+        person = {**hint, "id": 10, "user": {"login": "someone"}}
+        files = collect(**{"GET repos/o/r/issues/7/comments": [hint, person]})[1]
+        self.assertEqual([c["id"] for c in json.loads(files["pr-conversation.json"])], [10],
+                         "the review would read the hint, or a person could hide a comment behind its marker")
 
 
 HEAD, LAST = "1" * 40, "2" * 40
