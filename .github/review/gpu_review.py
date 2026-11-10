@@ -577,6 +577,12 @@ def finished(box, cfg):
 PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
+def exact_lines(values):
+    """The non-empty lines of each of `values`: what text redacted line by line is redacted of, since a value with a
+    newline in it is never whole in one line."""
+    return [part for value in values for part in value.split("\n") if part]
+
+
 def print_progress(lines, exact, label):
     """Print a box session's progress lines to the job's log, after `label` (its vendor, when there are two boxes),
     each redacted (the `exact` values and the credential patterns), then cut and quoted, since the session wrote
@@ -675,7 +681,7 @@ def wait(out, runner_temp):
     lt = Path(runner_temp, "lt")
     cfg = gpu_py.load_config()
     # what progress lines are redacted of: the review's own key, which a DigitalOcean box holds, and the cloud keys
-    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN")]
+    exact = exact_lines(os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN"))
     pending = [box for box in boxes(lt) if (box / "instance").exists()]
     seen = dict.fromkeys(pending, 0)
     label = {box: f"{box.name}: " if len(pending) > 1 else "" for box in pending}
@@ -1100,15 +1106,16 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
                 f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
         log = box / "results/progress.log"
         if log.is_file():  # line by line, each cut to LINE_CAP (log_lines), so no size of it can fill the job's memory
-            with tempfile.NamedTemporaryFile("w", dir=runner_temp, delete=False) as out_f:  # outside what boxes wrote
-                try:
-                    with open(log, "rb") as f:
-                        for line in log_lines(f, exact):
-                            out_f.write(bot.redact(line, exact=exact) + "\n")
-                except BaseException:
-                    os.unlink(out_f.name)
-                    raise
-            os.replace(out_f.name, log)
+            out_f = tempfile.NamedTemporaryFile("w", dir=runner_temp, delete=False)  # outside what boxes wrote
+            try:
+                with out_f, open(log, "rb") as f:
+                    lined = exact_lines(exact)
+                    for line in log_lines(f, lined):
+                        out_f.write(bot.redact(line, exact=lined) + "\n")
+                os.replace(out_f.name, log)
+            except BaseException:
+                Path(out_f.name).unlink(missing_ok=True)
+                raise
         result, fields = box / "results/result.json", {}
         if result.is_file():  # the box wrote this: unreadable counts as no verdict
             try:
