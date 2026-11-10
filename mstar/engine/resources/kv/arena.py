@@ -98,6 +98,10 @@ class PageArena(Protocol):
     def acquire(self, n: int) -> list[int] | None: ...
     def retain(self, pages: Iterable[int]) -> None: ...
     def release(self, pages: Iterable[int]) -> None: ...
+    def give_back(self, pages: list[int]) -> None:
+        """Undo the acquire that handed out ``pages``, which nothing else holds:
+        they go back to the front of the free list in their order, so the next
+        acquire hands them out again."""
     def seal(self, pages: Iterable[int]) -> None: ...
     def any_sealed(self, pages: Iterable[int]) -> bool: ...
     def is_sealed(self, page: int) -> bool: ...
@@ -206,6 +210,14 @@ class PythonPageArena:
                 if self.writes is not None:
                     self.writes.queue(self.index.key_of(page))
         self.allocator.free(freed)
+
+    def give_back(self, pages: list[int]) -> None:
+        for page in pages:
+            assert self.num_owners[page] == 1, f"page {page} given back with {self.num_owners[page]} owners"
+        for page in pages:
+            self.num_owners[page] = 0
+            self.sealed[page] = False
+        self.allocator.give_back(pages)
 
     def seal(self, pages: Iterable[int]) -> None:
         for page in pages:

@@ -14,7 +14,7 @@
 # would have posted, so you can check them (and their line anchors) by hand.
 #
 #   usage: .github/review/replay.sh <pr-number> [outfile]
-#   MODE=nogpu for the mode `/review` runs (default: light)
+#   MODE=nogpu or full for the mode of `/review nogpu` or `/review` (default: light); a replay runs no live test
 #   MAX_TURNS=<n> for the turn cap (default: 40, as in the workflow)
 #   (a replay that reaches the cap prints only Claude's max-turns error, no findings; rerun it
 #   with a larger MAX_TURNS)
