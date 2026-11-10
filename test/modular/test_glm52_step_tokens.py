@@ -30,8 +30,8 @@ def test_longctx_config_window_fits_its_pages(name):
     assert model.config.mtp_num_draft_tokens == (3 if "mtp" in name else 0)
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks (MTP over DSA captures none)
-    buckets = cfg["model_kwargs"].get("prefill_batched_token_buckets", [])
-    assert max(buckets, default=0) <= model.config.prefill_chunk_tokens
+    ladders = cfg.get("prefill_token_buckets", {}).get("LLM", {}).get("prefill", {})
+    assert max((n for ladder in ladders.values() for n in ladder), default=0) <= model.config.prefill_chunk_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -56,34 +56,15 @@ def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match
         _submodule(cfg).bind_node_resources(resources)
 
 
-def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag):
+def test_long_context_captures_no_prefill_bucket_past_the_chunk():
     import torch
 
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
     sub = _submodule(cfg)
     sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
+               for ladder in c.capture_token_lengths.values() for n in ladder]
     assert prefill and max(prefill) <= chunk
 
-
-def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan(torch_flag):
-    """A captured prefill attends in one sparse plan, which FlashInfer takes up to
-    sparse_mla.MAX_ROWS rows; a longer bucket runs eager, whose plan takes chunks."""
-    import torch
-
-    from mstar.engine.resources.dsa import sparse_mla
-
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144,
-                           prefill_chunk_tokens=4 * sparse_mla.MAX_ROWS,
-                           prefill_batched_token_buckets=[1024, 2 * sparse_mla.MAX_ROWS])
-    sub = _submodule(cfg)
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    prefill = [n for c in configs if c.capture_graph_walk == "prefill"
-               for n in c.capture_token_lengths]
-    assert 1024 in prefill and max(prefill) <= sparse_mla.MAX_ROWS

@@ -18,7 +18,6 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -68,21 +67,19 @@ class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
         self.max_row_tokens = max_row_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths
-                if distribute_tokens(n, bs)[0] <= self.max_row_tokens]
+        return [n for n in super().get_total_tokens(bs)
+                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__(config.prefill_token_buckets)
+        super().__init__()
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # what get_accelerator_graph_configs fits to its captures
-        self._recompile_limit: int | None = None
         # dsa_long_context: handles whose prefill starts past a cached prefix; their step runs
         # eager (_cg_key), since a bucket's capture scores only its own rows
         self._prefix_hits: set[int] = set()
@@ -136,6 +133,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # a decoder layer's frames are traced once per layer kind: dense, MoE, and the last one
+    # on the sampled rows
+    compiled_entries_per_shape = 3
     # an MTP row costs k+1 tokens, so the decode capture pads less coarsely
     MTP_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
 
@@ -327,25 +327,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        prefill_buckets = self.PREFILL_TOKEN_BUCKETS
-        batched = self.config.prefill_batched_token_buckets
+        prefill_buckets = list(self.PREFILL_TOKEN_BUCKETS)
         if self.config.dsa_long_context:
             # a captured prefill plans dense attention, which a step past
             # prefill_chunk_tokens leaves unplanned (declare_step), and its sparse attention in
             # one plan, which FlashInfer takes up to sparse_mla.MAX_ROWS rows
             cap = min(self.config.prefill_chunk_tokens, sparse_mla.MAX_ROWS)
-            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > cap})
+            past = [n for n in prefill_buckets if n > cap]
             if past:
                 logger.warning("Glm52LLMSubmodule: prefill buckets %s pass %d tokens "
                                "(prefill_chunk_tokens or sparse_mla.MAX_ROWS) and run eager",
                                past, cap)
                 prefill_buckets = [n for n in prefill_buckets if n <= cap]
-                batched = [n for n in batched or () if n <= cap]
-        groups = [(prefill_buckets, prefill_batch_sizes)]
-        if batched:
-            # one request's buckets and a batch's apart, so each can be fine or coarse
-            groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
-                      (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -357,44 +350,23 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *(
-                _PackedPrefillConfig(
-                    max_row_tokens=self._context_limit(),
-                    capture_graph_walk="prefill",
-                    capture_token_lengths=list(buckets),
-                    make_node_input=lambda n: ARNodeInputs(
-                        input_ids=torch.zeros(n, dtype=torch.long, device=device),
-                        input_seq_len=n,
-                    ),
-                    capture_batch_sizes=list(sizes),
-                    **flags,
-                )
-                for buckets, sizes in groups if buckets and sizes
+            *([_PackedPrefillConfig(
+                max_row_tokens=self._context_limit(),
+                capture_graph_walk="prefill",
+                capture_token_lengths=prefill_buckets,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n,
+                ),
+                capture_batch_sizes=list(prefill_batch_sizes),
+                **flags,
+            )] if prefill_buckets else []
             ),
         ]
         if self.config.dsa_long_context and self.mtp_k:
             # MTP's prefill over DSA stays eager
             configs = [c for c in configs if c.capture_graph_walk == "decode"]
-        self._fit_recompile_limit(configs)
         return configs
-
-    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """The recompile limit these captures take: a decoder layer's frames hold an entry per
-        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
-        the shapes past the limit capture uncompiled."""
-        tokens = {
-            n for config in configs
-            for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
-            for n in config.get_total_tokens(bs)
-        }
-        need = 3 * len(tokens) + 16  # and the engine's compiled fallback
-        if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
-                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
-        self._recompile_limit = need
-
-    def dynamo_recompile_limit(self) -> int | None:
-        return self._recompile_limit
 
     # ── per-step contract ──
 

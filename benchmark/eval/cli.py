@@ -36,6 +36,7 @@ from benchmark.eval.e2e import hosts as e2e_hosts
 from benchmark.eval.harness import SAVE_AUDIO, run_point
 from benchmark.eval.load import MODES, LoadSpec
 from benchmark.eval.schema import collect_metadata, served_models
+from benchmark.eval.server import exit_on_signals
 from benchmark.eval.suites import SUITES
 
 
@@ -370,11 +371,6 @@ def cmd_agreement(args) -> None:
         print(f"wrote {args.chart}", file=sys.stderr)
 
 
-def _exit_on_signal(signum, frame) -> None:  # noqa: ARG001
-    # Unwind through the `with server:` block so a cancelled job never leaves GPU workers behind.
-    raise SystemExit(128 + signum)
-
-
 def _interrupted(e: BaseException | None) -> str:
     """The one line ``compare`` prints on Ctrl-C instead of a traceback."""
     while e is not None and not isinstance(e, e2e_hosts.Interrupted):   # a second Ctrl-C while cleaning up
@@ -388,26 +384,25 @@ def _interrupted(e: BaseException | None) -> str:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _exit_on_signal)
-    if args.command == "run":
-        cmd_run(args)
-    elif args.command == "report":
-        cmd_report(args)
-    elif args.command == "rescore":
-        cmd_rescore(args)
-    elif args.command == "compare":
-        try:
-            code = e2e_compare.cmd_compare(args)
-        except KeyboardInterrupt as e:
-            print(_interrupted(e), file=sys.stderr)
-            code = 128 + signal.SIGINT
-        sys.exit(code)
-    elif args.command == "calibrate":
-        sys.exit(e2e_compare.cmd_calibrate(args))
-    elif args.command == "rejudge":
-        cmd_rejudge(args)
-    elif args.command == "agreement":
-        cmd_agreement(args)
-    else:
-        cmd_data(args)
+    with exit_on_signals():   # unwind `with server:`: a cancelled job leaves no GPU workers
+        if args.command == "run":
+            cmd_run(args)
+        elif args.command == "report":
+            cmd_report(args)
+        elif args.command == "rescore":
+            cmd_rescore(args)
+        elif args.command == "compare":
+            try:
+                code = e2e_compare.cmd_compare(args)
+            except KeyboardInterrupt as e:
+                print(_interrupted(e), file=sys.stderr)
+                code = 128 + signal.SIGINT
+            sys.exit(code)
+        elif args.command == "calibrate":
+            sys.exit(e2e_compare.cmd_calibrate(args))
+        elif args.command == "rejudge":
+            cmd_rejudge(args)
+        elif args.command == "agreement":
+            cmd_agreement(args)
+        else:
+            cmd_data(args)

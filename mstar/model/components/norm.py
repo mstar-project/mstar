@@ -56,6 +56,13 @@ def add_rms_norm(
     return h.reshape(orig_shape), r.reshape(orig_shape)
 
 
+def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm with no scale over the last dim: the variance in fp32, the
+    product promoted to fp32, then back to the input dtype."""
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    return (x * torch.rsqrt(variance + eps)).to(x.dtype)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with optional Gemma-style ``(1 + weight)`` scaling.
 
@@ -74,12 +81,22 @@ class RMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.gemma_mode = gemma_mode
+        # the TP kernels scale by ``weight + weight_bias``
+        self._weight_bias = 1.0 if gemma_mode else 0.0
         # Llama-style starts at 1; Gemma-style starts at 0 because the
         # checkpoint stores (weight - 1).
         init = torch.zeros(hidden_size) if gemma_mode else torch.ones(hidden_size)
         self.weight = nn.Parameter(init)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, comm_group=None) -> torch.Tensor:
+        """With ``comm_group``, ``hidden_states`` is a row-parallel partial sum
+        that the norm's kernel reduces over the group."""
+        if comm_group is not None and comm_group.world_size > 1:
+            normed = comm_group.allreduce_rmsnorm(
+                hidden_states.reshape(-1, self.hidden_size), self.weight,
+                self.variance_epsilon, self._weight_bias,
+            )
+            return normed.reshape(hidden_states.shape)
         return rms_norm(hidden_states, self.weight, self.variance_epsilon, self.gemma_mode)
 
     def forward_residual(
@@ -108,8 +125,7 @@ class RMSNorm(nn.Module):
             normed, r = comm_group.allreduce_add_rmsnorm(
                 hidden_states.reshape(-1, orig_shape[-1]),
                 residual.reshape(-1, orig_shape[-1]),
-                self.weight, self.variance_epsilon,
-                weight_bias=1.0 if self.gemma_mode else 0.0,
+                self.weight, self.variance_epsilon, self._weight_bias,
             )
             return normed.reshape(orig_shape), r.reshape(orig_shape)
         return add_rms_norm(hidden_states, residual, self.weight, self.variance_epsilon, self.gemma_mode)

@@ -15,9 +15,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Loop, Sequential
+from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
@@ -313,64 +312,19 @@ def test_pi05_worker_graphs_from_yaml():
 
 
 # ----------------------------------------------------------------------
-# Forward pass transitions
+# Walk plan
 # ----------------------------------------------------------------------
 
 
-def test_pi05_initial_forward_pass_args_starts_in_prefill():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        input_signals={
-            "image_inputs": [],
-            "text_inputs": [],
-        },
-    )
-    assert args.full_metadata.graph_walk == Pi05Model.PREFILL_WALK
-    assert args.full_metadata.is_prefill is True
-    edge_targets = {(e.next_node, e.name) for e in args.inputs}
-    assert ("vit_encoder", "image_inputs") in edge_targets
-    assert ("LLM", "text_inputs") in edge_targets
-    # Pi0.5 has no separate state_inputs edge — state is part of text_inputs.
-    assert not any(e.name == "state_inputs" for e in args.inputs)
+def _pointer() -> TensorPointerInfo:
+    return TensorPointerInfo(dims=[1], dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                             source_session_id="", source_entity="")
 
 
-def test_pi05_prefill_transitions_to_action_gen():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.PREFILL_WALK,
-        is_prefill=True,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.full_metadata.graph_walk == Pi05Model.ACTION_GEN_WALK
-    assert result.full_metadata.is_prefill is False
-    assert result.request_done is False
-    edge_names = {e.name for e in result.inputs}
-    assert edge_names == {"noisy_actions", "timestep_index"}
-
-
-def test_pi05_action_gen_marks_request_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.ACTION_GEN_WALK,
-        is_prefill=False,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.request_done is True
+def test_pi05_plan_refuses_a_request_without_images():
+    # without the images the prefill could never run
+    with pytest.raises(ValueError, match="image_inputs"):
+        _make_model().walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
 
 
 # ----------------------------------------------------------------------
@@ -405,6 +359,14 @@ def test_sincos_timestep_embedding_shape_and_range():
     )
     assert emb.shape == (1, dim)
     assert torch.all(emb.abs() <= 1.0 + 1e-6)
+
+
+def test_pi05_action_gen_time_embedding_fits_an_eager_batch_past_the_capture_sizes():
+    """The buffer was sized to the largest captured batch (4), so an eager batch of 5 got 4 rows and crashed."""
+    llm = object.__new__(Pi05LLMSubmodule)
+    llm._time_emb_buffer, llm.config = None, Pi05Config()
+    llm.get_device = lambda: torch.device("cpu")
+    assert llm._get_time_emb_buffer(5).shape == (5, llm.config.action_hidden_size)
 
 
 def test_euler_step_shapes():
@@ -493,6 +455,21 @@ def test_pi05_process_prompt_formats_state_into_text():
     # 4 state values -> 4 bin numbers, the first should be 0 and last 255.
     assert " 0 " in stub.last_prompt or stub.last_prompt.split("State: ", 1)[1].startswith("0 ")
     assert "255" in stub.last_prompt
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_pi05_process_prompt_refuses_a_non_finite_state(bad):
+    """A NaN or inf joint reading would otherwise bin like an ordinary value
+    (NaN and +inf as 255, -inf as -1): the request is refused, on every route."""
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    with pytest.raises(ValueError, match="robot_state must be finite"):
+        model.process_prompt(
+            prompt="pick up the block", input_modalities=["image", "text"], output_modalities=["action"],
+            tensors=_ONE_IMAGE, robot_state=[0.1, bad, 0.3],
+        )
+    assert stub.last_prompt is None
 
 
 def test_pi05_process_prompt_without_state_uses_plain_text():
@@ -856,6 +833,48 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
+
+
+# ----------------------------------------------------------------------
+# generation-input contract
+# ----------------------------------------------------------------------
+
+
+def test_pi05_request_kwargs_are_only_the_robot_state():
+    model = _make_model()
+    # flow steps are deployment YAML; a client num_steps is reported as ignored
+    assert model.request_kwargs() == {"robot_state"}
+
+
+@pytest.mark.parametrize("state", [
+    "0.1 0.2",
+    [0.1, "0.2"],
+    [True, 0.0],
+    [[0.1, 0.2]],
+    [],
+    [0.0] * 33,
+    [float("nan")],
+    {"a": 1},
+])
+def test_pi05_bad_robot_state_is_a_400(state):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="robot_state"):
+        model.process_prompt(
+            prompt="pick", input_modalities=["image", "text"], output_modalities=["action"], robot_state=state,
+        )
+
+
+def test_pi05_out_of_range_state_bins_as_openpi_does():
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors=_ONE_IMAGE, robot_state=[-5.0, 0, 5.0] + [0.5] * 29,
+    )
+    # below -1 is bin -1 and at or above 1 the last bin (`discretize_state`)
+    assert stub.last_prompt.split("State: ", 1)[1].startswith("-1 128 255 192 ")
 
 
 @pytest.mark.parametrize("policy_saved", [False, True])

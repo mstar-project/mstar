@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -17,7 +19,9 @@ if TYPE_CHECKING:
     # import out of module exec
     from mstar.engine.accelerator_graph_config import (
         AcceleratorGraphConfig,
+        AcceleratorGraphConfigType,
         PiecewiseAcceleratorGraphConfig,
+        PiecewiseConfigType,
     )
     from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -85,10 +89,11 @@ class EngineResourceInfo:
     @property
     def head_shards(self) -> int:
         """How many ways the node's ranks split its attention heads, which each
-        builder sizes head counts by: all its TP × SP ranks. A ragged resource
-        declaring ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        builder sizes head counts by: its TP × SP ranks (CFG ranks run whole
+        branches, every head). A ragged resource declaring
+        ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
         group = self.joint_comm_group
-        return 1 if group is None else group.world_size
+        return 1 if group is None else group.tp_group.world_size * group.sp_group.world_size
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -111,6 +116,21 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class Residency(IntEnum):
+    """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
+    from its ids. Ordered by how far the state is from the device."""
+    RESIDENT = 0
+    ON_HOST = 1
+    DROPPED = 2
+
+
+class Rebuild(NamedTuple):
+    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
+    The last id is the one the next decode step reads."""
+    walk: str
+    ids: Sequence[int]
+
+
 class KeyedWalks(NamedTuple):
     """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
@@ -131,6 +151,42 @@ class Resource(ResidentHooks, ABC):
 
     def can_capture(self) -> bool:
         return True
+
+    # this resource's key among the engine's resources, set by `build_resource`
+    resource_key: str | None = None
+
+    # Whether this resource's kernels can be left out of a step whose rows all allow
+    # it (``lean_for``). The engine then captures a lean twin of each bucket whose
+    # step drives the resource and whose kind it accepts (``lean_captures``), keyed
+    # by ``BucketKey.lean``, and names the resource in ``StepContext.lean`` for a
+    # step that runs it lean, eager steps included; the resource checks that at plan.
+    # Each rank makes the choice from its own state, so the resource's lean and
+    # plain kernels must issue the same collectives.
+    lean_capture: bool = False
+
+    def lean_for(self, request_ids) -> bool:
+        """Whether every one of ``request_ids`` lets this ``lean_capture`` resource
+        run lean. Read from state every rank of a lockstep instance sets alike (its
+        ingests), on the thread that leases the step's graph."""
+        return False
+
+    def lean_captures(
+        self, config_type: AcceleratorGraphConfigType | PiecewiseConfigType,
+    ) -> bool:
+        """Whether a capture of ``config_type`` gets this resource's lean twin."""
+        return True
+
+    def outside_step(self) -> AbstractContextManager[None]:
+        """Run a ``lean_capture`` resource's callers outside any planned step (a
+        compile's warm-up) on this thread, as in a step that runs it lean."""
+        return nullcontext()
+
+    # Whether this resource's step on a node is the node's own segments
+    # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
+    # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
+    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
+    # node's tokens).
+    steps_from_segments: bool = False
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
@@ -164,6 +220,12 @@ class Resource(ResidentHooks, ABC):
         """The longest prefix up to ``prefix`` this resource can serve, for a
         resource that holds only some lengths."""
         return prefix
+
+    @property
+    def chunk_alignment(self) -> int:
+        """Tokens a cut prefill chunk is a multiple of, so that each chunk starts on a
+        position this resource can keep state at (`Engine.chunk_alignment`). 1 cuts anywhere."""
+        return 1
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -441,12 +503,34 @@ class Resource(ResidentHooks, ABC):
     def supports_eviction(self):
         return False
 
-    def is_offloaded(self, rid: str) -> bool:
-        return False
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
+    def residency(self, rid: str) -> Residency:
+        return Residency.RESIDENT
 
     def offload(self, rid: str) -> int:
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
+
+    def check_drop(self, rid: str, tokens: int) -> None:
+        """Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""
+        return
+
+    def drop(self, rid: str, tokens: int) -> int:
+        """Discard the request's state that can be recomputed from the ``tokens``
+        token ids its rebuild writes, and keep the rest. Returns what was reclaimed."""
+        return 0
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
+        return
+
+    def land_rebuild(self, rid: str) -> None:
+        """The dropped request's rebuild has run its last chunk."""
+        return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
@@ -568,4 +652,6 @@ class PublishedInfo(ABC):
 
 
 def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
-    return spec.resource_class.build(spec, info)
+    resource = spec.resource_class.build(spec, info)
+    resource.resource_key = spec.resource_key
+    return resource

@@ -152,7 +152,7 @@ class _Serve:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="glm52_dsa_serve", my_session_id="glm52_dsa_serve",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -177,7 +177,7 @@ class _Serve:
         # ignore_eos: reduced EOS ids live inside the byte vocab; greedy decode
         # on random weights may hit one and break the exact-length assertions.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
         self.runner.ingest_request(rid, self.overrides)
 
@@ -245,15 +245,13 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
             ended = "stop"
         else:
             info.graph_walk = "decode"
-            for step in range(cap):
+            for _ in range(cap):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
-                info.dynamic_loop_iter_counts["decode_loop"] = step
-                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if stop:
+                if submodule.check_stop(serve.rid, info, out):
                     ended = "stop"
                     break
         stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
@@ -319,7 +317,7 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
-    # ---- (1) the sparse path serves and stops cleanly ------------------
+    # ---- (1) the sparse path serves to the loop cap ------------------
     generated, ended, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
     # ignore_eos: only the loop cap ends it, and max_tokens counts the prefill's token (vLLM semantics)
     assert ended == "cap" and len(generated) == MAX_TOKENS, (ended, generated)

@@ -16,7 +16,7 @@ kernel shapes.
   offline ones.
 - Blocks: each new frame attends the ``left_context`` frames before it and
   itself in the bounded KV, and each depthwise conv continues from its cached
-  last inputs (``FastConformerEncoder.blocks``).
+  last inputs (``FastConformerEncoder.blocks_stream``).
 
 A stream's state is bounded however long it runs: its host counters
 (``StreamState``, in its per-request state), its newest audio and mel frames
@@ -134,18 +134,19 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     lets a consumer's ``FixedChunkPolicy(1)`` pace a frame-synchronous loop.
 
     Live streams' chunks run in one batched pass, except that a step holding a
-    chunk of more than a second (an upload, a large append) is not batched
-    (``can_batch``): the engine then runs each stream of it on its own. The
-    encoder is bound to the bounded KV and the conv pool; ``front_key`` names
-    the pool of each stream's audio and mel tails.
+    chunk of more than a second (an upload, an opening clip, the stream's last
+    append) is not batched (``can_batch``): the engine then runs each stream of
+    it on its own. The encoder is bound to the bounded KV and the conv pool;
+    ``front_key`` names the pool of each stream's audio and mel tails.
 
     A stream one frame of audio further on the frame grid (every live step of
-    a client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
+    a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
     others take the front end eagerly, then the blocks as a graph
     (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    stream's end), else eagerly (a one-shot upload, a large append). In a step
-    whose other streams take the eager blocks, or when the whole-step region
-    has no graph for its streams, those streams run eagerly too.
+    stream's end), else eagerly (a one-shot upload, an opening clip, the
+    stream's last append). In a step whose other streams take the eager blocks,
+    or when the whole-step region has no graph for its streams, those streams
+    run eagerly too.
 
     Nemotron VoiceChat's duplex model is its only user, also after #937.
     Construction refuses ``lookahead > 0``, ``reflect_edges=False`` and
@@ -249,7 +250,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as
         offline: ``(frames, projection out)``."""
-        return self._blocks(self.encoder.subsample(self.log_mel(wav)[None].to(self.projection.weight.dtype)))[0]
+        x = self.encoder.subsample(self.log_mel(wav)[None].to(self.projection.weight.dtype))
+        # fp32 residual, as a stream step's (``_blocks_stream``)
+        return self.projection(self.encoder.blocks(x.float()))[0]
 
     # -- engine contract ------------------------------------------------------
 
@@ -299,7 +302,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # A pass pads every stream to its longest chunk, so a chunk of more than
         # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
         # each stream's step on its own (declare, admit, plan, forward, commit).
-        # Such chunks are uploads and large appends, so it is a rare step.
+        # Such chunks are uploads, opening clips and a stream's last append, so
+        # it is a rare step.
         longest = int(self.BATCHED_CHUNK_S * self.log_mel.sampling_rate)
         return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
 
@@ -395,15 +399,15 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
     def _layers_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         s = call.static_inputs
-        return {"y": self._blocks(s["x"], s["n"])}
+        return {"y": self._blocks_stream(s["x"], s["n"])}
 
-    def _blocks(self, x: torch.Tensor, n: torch.Tensor | None = None) -> torch.Tensor:
-        """The blocks (a stream step given ``n``) and the projection. The residual
+    def _blocks_stream(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """A stream step of the blocks, and the projection. The residual
         goes in fp32, which the fused add + LayerNorm keeps: under bf16 autocast
         a bf16 residual put the frames measurably further from an fp32 run (see
         docs/models.rst). The offline encoders keep theirs in bf16; for Canary
         an fp32 one was no closer."""
-        return self.projection(self.encoder.blocks(x.float(), new=n))
+        return self.projection(self.encoder.blocks_stream(x.float(), n))
 
     # -- the front end --------------------------------------------------------
 
@@ -431,7 +435,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         self.front.scatter_("sig", y)
         self.front.scatter_("last", x[:, -1:])
         self.front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
-        return self._blocks(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
+        return self._blocks_stream(new, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
     def _front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
                n: list[int]) -> torch.Tensor | None:
@@ -572,7 +576,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                                       request_ids=[rids[i] for i in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
-                y = self._blocks(x, to_device_nonblocking(eager_n, device))
+                y = self._blocks_stream(x, to_device_nonblocking(eager_n, device))
             for i in new:
                 states[i].frames += eager_n[i]
                 frames[i] = y[i][: eager_n[i]]
