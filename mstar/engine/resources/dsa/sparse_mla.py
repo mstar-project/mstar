@@ -13,6 +13,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.utils.h2d import PinnedStager
 
 # FlashInfer's kernel over one-token pages faults past ~16k rows, so an eager plan attends in
 # chunks of this many rows.
@@ -162,6 +163,7 @@ class EagerSparsePlans:
         self._sets: tuple[list, list] = ([], [])
         self._planned: list[torch.cuda.Event | None] = [None, None]
         self._turn = 0
+        self._stager = PinnedStager(torch.int32)
 
     def plan(self, lens: list[int], width: int, heads: int, kv_lora_rank: int, kpe: int,
              sm_scale: float) -> EagerSparsePlan:
@@ -190,9 +192,11 @@ class EagerSparsePlans:
             indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
             _plan(workspace, wrapper, indices[:need], lens[r0:r1], heads, kv_lora_rank, kpe,
                   sm_scale)
+            # the plan's offsets, then its lengths: one pinned copy
+            staged = torch.empty(indptr.numel() + chunk.numel(), dtype=torch.int32, device=device)
+            self._stager.copy_(staged, torch.cat([indptr, chunk]).numpy())
             chunks.append(SparseChunk(r0, r1, wrapper, indices[:need],
-                                      indptr.to(device, non_blocking=True),
-                                      chunk.to(device, non_blocking=True)))
+                                      staged[:indptr.numel()], staged[indptr.numel():]))
         self._planned[turn] = torch.cuda.Event()
         self._planned[turn].record()
         return EagerSparsePlan(chunks)
