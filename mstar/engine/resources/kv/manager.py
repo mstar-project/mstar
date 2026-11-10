@@ -5128,9 +5128,8 @@ class KVManager(AttentionResource):
         # guaranteed request takes back what it lends first.
         allotment = self._allotments[rid]
         taken = min(pages, allotment.lends)
-        allotment.taken_back += taken
         allotment.pages = max(allotment.pages, self._held(rid)) + pages - taken
-        self._recount(rid)
+        self._recount(rid, took_back=taken)
 
     def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
@@ -5286,8 +5285,9 @@ class KVManager(AttentionResource):
         if stream.lent:
             stream.lent.difference_update(pages)
 
-    def _recount(self, rid: str) -> None:
-        """Bring ``rid``'s share of `_unused` up to date after its pages or its allotment change.
+    def _recount(self, rid: str, took_back: int = 0) -> None:
+        """Bring ``rid``'s share of `_unused` up to date after its pages or its allotment change, and after it took
+        back ``took_back`` pages it lent.
 
         A stale count would let a waiting request be admitted into room an admitted request still needs.
         """
@@ -5295,8 +5295,9 @@ class KVManager(AttentionResource):
         if allotment is None:
             return
         remaining = max(0, allotment.pages - self._held(rid))
+        taken_back = allotment.taken_back + took_back
         # the pages written are those taken back first
-        self._count(rid, allotment, remaining, max(0, allotment.taken_back - max(0, allotment.remaining - remaining)))
+        self._count(rid, allotment, remaining, max(0, taken_back - max(0, allotment.remaining - remaining)))
         if _DEBUG_ASSERTS:
             self.assert_pages_conserved()
 
