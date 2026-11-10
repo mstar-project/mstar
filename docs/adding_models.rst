@@ -988,6 +988,16 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+       ``longrope=LongRoPE.from_hf(config)`` (Phi-3, Phi-4-mini) builds a short and a long
+       table, each with its per-dimension factors and attention scale (``LongRopeManager``).
+       A request whose ``MAX_POSITION_KWARG`` (set by ``process_prompt``; the data worker
+       drops a client's value) passes
+       ``original_max_position_embeddings`` rotates with the long one for its whole life,
+       others with the short one. The spec builds the request's config from that kwarg and
+       names the long table in its prefix keys (``PositionSpec.prefix_variant``), so the two
+       cannot disagree. Explicit ``pos_ids`` and resident planning are refused under it. A
+       cos/sin table on CUDA needs a ``rotary_dim`` that is a multiple of 32 with NeoX
+       pairing, of 16 with GPT-J pairing (``interleave``).
    * - ``SamplerSpec(vocab_size=..., enable_repetition_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetition_penalty`` declares a capability, not an
