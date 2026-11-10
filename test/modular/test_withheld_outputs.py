@@ -11,6 +11,7 @@ to record what it was asked to route.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
@@ -252,14 +253,17 @@ def test_the_stops_resume_names_what_the_check_withheld(tmp_path):
     assert route.withheld == {"frame": [DROP]}
 
 
-def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
-    """Step-Audio2's ``decode_mixed``: a spoken row whose token is text routes its token
-    to the next step but no item to the vocoder's stream, a spoken row's speech id routes
-    both, and a text row, which has no stream, routes its token. Through Step-Audio2's own
-    stop check and postprocess, the real engine stop check and the real
-    ``StepExecutor.postprocess``."""
+@pytest.mark.parametrize("batched", [False, True], ids=["per_row", "batched"])
+def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path, batched):
+    """Step-Audio2's ``decode_mixed``: a spoken row whose token is text, or its stop id,
+    routes its token to the next step but no item to the vocoder's stream; a spoken row's
+    speech id routes both; a text row, which has no stream, routes its token and withholds
+    nothing, its stop id included. Through Step-Audio2's own ``TokenStop`` and postprocess,
+    the real engine stop check and the real ``StepExecutor.postprocess``; ``batched`` hands
+    the step's tokens over as row buffers, so ``check_stop_batched`` decides off host rows."""
     from mstar.model.step_audio2.config import (
         DECODE,
+        DECODE_LOOP,
         DECODE_MIXED,
         DECODE_SPOKEN,
         EOT,
@@ -273,8 +277,11 @@ def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
     config = SimpleNamespace(stop_token_ids=(EOT, TTS_END))
     llm = LLMSubmodule(torch.nn.Identity(), config)
     llm.node_resources = {LLM_SAMPLER: SimpleNamespace(has_slot_masters=True)}
-    spoken_text, spoken_speech, text = 11, 12, 13
-    rows = {spoken_text: (DECODE_SPOKEN, 785), spoken_speech: (DECODE_SPOKEN, SPEECH_BASE + 7), text: (DECODE, 785)}
+    spoken_text, spoken_speech, text, spoken_end, text_end = 11, 12, 13, 14, 15
+    rows = {
+        spoken_text: (DECODE_SPOKEN, 785), spoken_speech: (DECODE_SPOKEN, SPEECH_BASE + 7), text: (DECODE, 785),
+        spoken_end: (DECODE_SPOKEN, TTS_END), text_end: (DECODE, EOT),
+    }
     infos = {
         rid: SimpleNamespace(
             graph_walk=walk, max_tokens=64, step_metadata={}, dynamic_loop_iter_counts={},
@@ -287,6 +294,16 @@ def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
         outputs[rid] = {"new_token": [torch.tensor([token])]}
         llm.postprocess(rid, infos[rid], outputs[rid])
     assert set(outputs[text]) == {"new_token", "text_inputs"}
+    if batched:
+        def per_row(*args):
+            raise AssertionError("the batched check fell back to the per-row one")
+        llm.check_stop = per_row
+        model_output = BatchedModelOutput(
+            per_rid_outputs=outputs, row_request_ids=tuple(rows),
+            check_stop_buffers={"new_token": torch.tensor([[token] for _, token in rows.values()])},
+        )
+    else:
+        model_output = BatchedModelOutput(per_rid_outputs=outputs)
 
     engine = make_engine(_submodules={"LLM": make_mgmt(submodule=llm)})
     node_batch = ExecutingBatch(
@@ -294,6 +311,8 @@ def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
         step_context=StepContext(request_ids=tuple(rows), graph_walk=DECODE_MIXED, slot=0, capture=False),
     )
     runtime = _RecordingRuntime()
+    # it routes through the store only, as a step that withholds does anyway
+    runtime.supports_inline_emit = False
     tensor_manager = SharedMemoryCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(tmp_path),
@@ -324,16 +343,16 @@ def test_a_mixed_step_streams_only_the_spoken_rows_speech_ids(tmp_path):
         speculative_new_iter=False,
     )
 
-    w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs=outputs))
+    w.executor.postprocess(pending, model_output)
 
-    assert node_batch.withheld_outputs == {spoken_text: (SPEECH_IDS,)}
-    assert runtime.stops in ([], [{}])
+    assert node_batch.withheld_outputs == {spoken_text: (SPEECH_IDS,), spoken_end: (SPEECH_IDS,)}
+    # once per walk of the step, in the order its rows first ran them
+    assert runtime.stops == [{spoken_end: [DECODE_LOOP]}, {text_end: [DECODE_LOOP]}]
     (route,) = runtime.routes
     routed = dict(zip(
         [(rid, s) for rid in route.wg_ids.keys for s in signals], route.num_tensors, strict=True,
     ))
+    speech = {spoken_speech}
     assert routed == {
-        (spoken_text, "text_inputs"): 1, (spoken_text, SPEECH_IDS): 0,
-        (spoken_speech, "text_inputs"): 1, (spoken_speech, SPEECH_IDS): 1,
-        (text, "text_inputs"): 1, (text, SPEECH_IDS): 0,
+        (rid, signal): int(signal == "text_inputs" or rid in speech) for rid in rows for signal in signals
     }

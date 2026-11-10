@@ -6,14 +6,12 @@ order. RoPE is plain 1D over the sequence, so the position resource advances by 
 count.
 
 A spoken reply decodes on its own walk, whose sampled ids stream to the vocoder. The
-stream carries only speech ids: the stop check withholds the stream's item on a row whose
-id is anything else (text, ``<tts_pad>``, a stop id), off the host copy it already has, so
-no forward reads its own tokens. The ``TokenStop`` declares the stream withheld, as it is
-on a stop row, so startup checks the edge can go without an item.
+stream carries only speech ids: the ``TokenStop`` withholds the stream's item on a spoken
+row whose id is anything else (text, ``<tts_pad>``, a stop id), off the host copy the stop
+check already has, so no forward reads its own tokens.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -43,7 +41,6 @@ from mstar.model.step_audio2.config import (
     AUDIO_PATCH,
     DECODE,
     DECODE_LOOP,
-    DECODE_MIXED,
     DECODE_SPOKEN,
     DECODE_WALKS,
     LLM_ATTN,
@@ -61,20 +58,13 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    BatchedStopCheck,
     DeviceLoopback,
-    HostRows,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    StopCheck,
-    StopPolicy,
     TokenStop,
 )
-
-# what a spoken row's step leaves unrouted when its id is not speech
-_WITHHELD = (SPEECH_IDS,)
 
 
 class LLMSubmodule(ARNodeSubmodule):
@@ -94,12 +84,13 @@ class LLMSubmodule(ARNodeSubmodule):
         self.config = config
         # A prefill samples the reply's first token, so a stop id there (or a one-token
         # budget) ends the partition. A text decode's stop ids are checked by the graph
-        # runtime; a spoken decode's by ``check_stop``, which also withholds (see
-        # ``get_stop_policies``). The budget is the loop's cap.
+        # runtime; a spoken decode's by ``check_stop``, which also withholds the stream on
+        # any id but speech. The budget is the loop's cap.
         self.token_stop = TokenStop(
             loop=DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
             sampler=LLM_SAMPLER, walk=frozenset({DECODE, DECODE_SPOKEN}), prefill_walks=PREFILL_WALKS,
-            last_prefill_flag=FINAL_PREFILL, withhold=_WITHHELD, runtime_check=True,
+            last_prefill_flag=FINAL_PREFILL, withhold=(SPEECH_IDS,), withhold_unless=is_speech_id,
+            withhold_walk=DECODE_SPOKEN, runtime_check=True,
         )
         # a text reply's decode reads its last token off the sampler's slot masters, and
         # its client token rides inline
@@ -235,49 +226,11 @@ class LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ):
         # Rebind, not copy: the decode loop routes on ``text_inputs``, and a spoken
-        # reply's stream on ``speech_ids`` (``check_stop`` withholds it unless speech).
+        # reply's stream on ``speech_ids`` (the stop check withholds it unless speech).
         if "new_token" in outputs:
             outputs["text_inputs"] = outputs["new_token"]
             if request_info.graph_walk == DECODE_SPOKEN:  # the row's own walk, in a mixed step too
                 outputs[SPEECH_IDS] = outputs["new_token"]
-
-    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
-        # a spoken row's check withholds its non-speech ids, so the runtime's check,
-        # which never calls check_stop, cannot stand in for it
-        if graph_walk in (DECODE_SPOKEN, DECODE_MIXED):
-            return None
-        return super().get_stop_policies(graph_walk)
-
-    def check_stop(
-        self, request_id: str, request_info: CurrentForwardPassInfo, outputs: Mapping[str, list[torch.Tensor]],
-    ) -> set[str] | StopCheck:
-        # The base check withholds on a stop id alone; here a spoken row withholds on any
-        # id but speech, and only a spoken row has the stream to withhold.
-        stop = self.token_stop
-        if stop.buffer not in outputs:
-            return set()
-        token = outputs[stop.buffer][0].reshape(-1)[0].item()
-        stops = self._stop_names(request_info) if self._token_stops(request_id, token, request_info) else set()
-        if request_info.graph_walk == DECODE_SPOKEN and not is_speech_id(token):
-            return StopCheck(stops, withheld=_WITHHELD)
-        return stops
-
-    def check_stop_batched(
-        self, request_ids: list[str], request_infos: dict[str, CurrentForwardPassInfo], host_rows: HostRows,
-    ) -> dict[str, set[str]] | BatchedStopCheck | None:
-        pairs = host_rows.first_values(self.token_stop.buffer, request_ids)
-        if pairs is None:
-            return None
-        verdict, names = self._token_stops, self._stop_names
-        stops: dict[str, set[str]] = {}
-        withheld: dict[str, tuple[str, ...]] = {}
-        for rid, token in pairs:
-            info = request_infos[rid]
-            if verdict(rid, token, info):
-                stops[rid] = names(info)
-            if not is_speech_id(token) and info.graph_walk == DECODE_SPOKEN:
-                withheld[rid] = _WITHHELD
-        return BatchedStopCheck(stops, withheld) if withheld else stops
 
 
 class AudioEncoderSubmodule(NodeSubmodule):

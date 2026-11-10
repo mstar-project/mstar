@@ -64,18 +64,36 @@ def test_audio_cuts_into_25_second_windows_with_a_placeholder_run_each():
     assert [r.count("<audio_patch>") for r in runs] == [audio_tokens(2502), audio_tokens(202)]
 
 
-@pytest.mark.parametrize("seconds", [25.005, 50.005, 25.0045])
-def test_a_window_with_no_rows_renders_its_empty_run_and_is_not_encoded(seconds):
+@pytest.mark.parametrize(("seconds", "tail_frames"), [(25.005, 3), (50.005, 3), (25.015, 4)])
+def test_a_window_with_no_rows_renders_its_empty_run_and_is_not_encoded(seconds, tail_frames):
     """The last window of an audio just over a multiple of 25 s has 3 or 4 mel frames and
     no rows (``compute_token_num``); the reference still renders its run, empty."""
-    audio = torch.randn(int(16000 * seconds))
+    audio = torch.randn(round(16000 * seconds))
+    tail = audio.shape[0] % processor.WINDOW_SAMPLES
+    assert processor.log_mel(audio[-tail:]).shape[-1] == tail_frames and audio_tokens(tail_frames) == 0
+    assert audio_tokens(5) == 1  # the first length with a row
     pieces, mels = processor.render([{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], lambda _: audio)
     windows = -(-audio.shape[0] // processor.WINDOW_SAMPLES)
     runs = [p for p in pieces if isinstance(p, str) and p.startswith("<audio_start>")]
     assert len(runs) == windows and runs[-1] == "<audio_start><audio_end>"
     assert [m.shape[-1] for m in mels] == [2502] * (windows - 1)
-    with pytest.raises(ValueError, match="too short"):
-        processor.render([{"role": "user", "content": [{"type": "audio", "audio": "x"}]}], lambda _: audio[:50])
+
+
+def test_an_audio_with_no_window_of_rows_renders_empty_beside_the_others():
+    """An audio under 321 samples is one window with no rows: an empty run, as the
+    reference renders it, and the request's other audio is encoded as ever."""
+    short, real = torch.randn(320), torch.randn(16000 * 2)
+    assert processor.log_mel(short).shape[-1] == 4 and processor.log_mel(torch.randn(321)).shape[-1] == 5
+    clips = {"short": short, "real": real}
+    pieces, mels = processor.render([{"role": "user", "content": [
+        {"type": "audio", "audio": "short"}, {"type": "text", "text": "and"}, {"type": "audio", "audio": "real"},
+    ]}], clips.__getitem__)
+    runs = [p for p in pieces if isinstance(p, str) and p.startswith("<audio_start>")]
+    assert runs == ["<audio_start><audio_end>", "<audio_start>" + "<audio_patch>" * audio_tokens(202) + "<audio_end>"]
+    assert [m.shape[-1] for m in mels] == [202]
+    # alone, nothing is encoded
+    assert processor.render([{"role": "user", "content": [{"type": "audio", "audio": "short"}]}],
+                            clips.__getitem__)[1] == []
 
 
 def test_audio_positions_skip_an_empty_run_and_refuse_a_stray_placeholder():

@@ -6,7 +6,12 @@ with role ``user`` written ``human``; a turn's content is text, a list of text /
 token items, or None (an open turn, the generation prompt); ``eot=False`` leaves a turn
 open (a spoken reply's ``<|BOT|>assistant\\n<tts_start>``). Audio is cut into 25 s windows,
 each a log-mel clip whose embedding rows replace the ``<audio_patch>`` run right after its
-``<audio_start>``.
+``<audio_start>``. A window of 4 mel frames or fewer (the last of an audio just over a
+multiple of 25 s, or a whole audio under 321 samples) has no rows: the reference renders
+its empty run and runs it through the tower for nothing. Here it renders the same and is
+not encoded. That cannot change the other windows: the reference pads its batch to the
+longest window, and a window with rows is longer. With no window of rows left, the
+request prefills as text.
 
 The reference tokenizes every rendered piece on its own and concatenates the ids
 (``stepaudio2.py:18-26``), so two adjacent text pieces never merge into one BPE token; the
@@ -82,13 +87,7 @@ def render(
                     pieces.append(item["text"])
                 elif kind == "audio":
                     clips = audio_clips(load_audio(item["audio"]))
-                    kept = [mel for mel in clips if audio_tokens(mel.shape[-1])]
-                    if not kept:
-                        raise ValueError(
-                            f"an audio input of {clips[-1].shape[-1] if clips else 0} mel frames is too short "
-                            "for Step-Audio2 to encode (it needs at least 5, about 0.02 s)"
-                        )
-                    mels += kept
+                    mels += [mel for mel in clips if audio_tokens(mel.shape[-1])]
                     pieces += [_audio_piece(mel) for mel in clips]
                 elif kind == "token":
                     pieces.append(list(item["token"]))

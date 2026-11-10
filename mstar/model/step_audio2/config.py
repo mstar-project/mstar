@@ -29,10 +29,10 @@ NUM_SPEECH_CODES = 6561
 # text ids are below the first multimodal special token (``stepaudio2.py:55``)
 TEXT_VOCAB_END = AUDIO_START
 # A reply ends at a turn's end, a spoken reply's end, or the config's eos. The reference
-# ``StepAudio2`` stops on EOT alone (``stepaudio2.py:90-92``) and drops that last token
-# (``outputs[0, prompt:-1]``, ``:54``). A spoken reply puts <tts_end> right before it: all 3
-# sampled reference s2s replies recorded in ``oracle/probe/ends.json`` end on <tts_end> once
-# EOT is dropped. Stopping on <tts_end> saves the step that would sample that EOT.
+# ``StepAudio2`` stops on EOT alone, its tokenizer's end token (``stepaudio2.py:90-92``), and
+# drops that last token (``outputs[0, prompt_ids.shape[-1]:-1]``, ``:54``). Its sampled
+# spoken replies end on <tts_end> followed directly by EOT, so stopping on <tts_end> gives
+# the same reply and saves the step that would sample the EOT.
 STOP_TOKEN_IDS = (EOT, TTS_END, ENDOFTEXT)
 # A spoken reply interleaves one text token with this many speech ids.
 SPEECH_IDS_PER_TEXT = 4
