@@ -165,13 +165,13 @@ def test_only_the_spoken_decode_streams_to_the_vocoder_in_the_reference_clients_
     assert model.get_combined_graph_walks() == {"LLM": {DECODE_MIXED: {DECODE, DECODE_SPOKEN}}}
 
 
-def test_a_text_decode_loops_back_on_the_device_and_a_spoken_ones_ids_go_by_value():
+def test_both_decodes_loop_back_on_the_device_and_a_spoken_ones_ids_go_by_value():
     llm = an_llm()
-    assert llm.device_loopback_signals(DECODE) == {"text_inputs"}
-    assert llm.device_loopback_signals(DECODE_SPOKEN) == frozenset()
+    for walk in (DECODE, DECODE_SPOKEN):
+        assert llm.device_loopback_signals(walk) == {"text_inputs"}
     assert llm.inline_signals(DECODE) == {"text_inputs": "new_token"}
-    # the speech id first: a step carries the first inline signal it outputs
-    assert list(llm.inline_signals(DECODE_SPOKEN).items()) == [(SPEECH_IDS, "new_token"), ("text_inputs", "new_token")]
+    # one buffer, so the step's inline column carries both
+    assert llm.inline_signals(DECODE_SPOKEN) == {SPEECH_IDS: "new_token", "text_inputs": "new_token"}
 
 
 # --- stop and withhold -----------------------------------------------------------------------

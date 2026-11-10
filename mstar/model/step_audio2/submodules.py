@@ -110,15 +110,14 @@ class LLMSubmodule(ARNodeSubmodule):
             last_prefill_flag=FINAL_PREFILL, withhold=(SPEECH_IDS,), withhold_unless=is_speech_id,
             withhold_walk=DECODE_SPOKEN, runtime_check=True,
         )
-        # a text reply's decode reads its last token off the sampler's slot masters, and
-        # its client token rides inline
+        # Both decodes read their last token off the sampler's slot masters. The client
+        # token rides inline, and so does a spoken reply's speech id, to the vocoder by
+        # value: one column off the stop check's host copy, so the step stores nothing.
         self.device_loopback = DeviceLoopback(
-            walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
+            walk=frozenset({DECODE, DECODE_SPOKEN}), signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
 
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
-        # A spoken reply's speech id goes to the vocoder by value, off the stop check's
-        # host copy; a step carries one inline signal, so its client token is stored.
         if graph_walk == DECODE_SPOKEN:
             return {SPEECH_IDS: self.device_loopback.buffer, self.device_loopback.signal: self.device_loopback.buffer}
         return super().inline_signals(graph_walk)
