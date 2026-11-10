@@ -1,0 +1,60 @@
+---
+title: "Robotics and interactive world models"
+description: "Deployment, request options, capacity and implementation notes for Robotics and interactive world models."
+---
+
+Choose a model by the input and output your application needs. These models use the native client interfaces; endpoint coverage differs by family. See [Using a Server](/clients).
+
+## `pi05`
+
+Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert). A request sends one image per camera, up to the config's `num_cameras` (3 in `configs/pi05.yaml`). Cameras it leaves out are masked, as openpi does, and more images than that are a 400. `configs/pi05_droid.yaml` serves the DROID fine-tune (`lerobot/pi05_droid`) with openpi's DROID normalization: raw joint state in, joint velocities out. It also serves openpi's policy WebSocket, so openpi's DROID client connects unchanged (see [Using a Server](/clients)).
+
+Checkpoint: `lerobot/pi05_base`.
+
+## `vjepa2`
+
+V-JEPA 2 video encoder + masked predictor.
+
+Checkpoint: `facebook/vjepa2-vitl-fpc64-256`.
+
+## `vjepa2_ac`
+
+V-JEPA 2-AC encoder + action-conditioned predictor. Video frames take the official repo's central square crop, not the HF processor's resize and crop.
+
+Checkpoint: `vjepa2-ac-vitg`.
+
+## `waypoint`
+
+Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface. A request carries a seed image and `model_kwargs.actions` (1 to `max_frames`, 512 latent frames, controller dicts); it generates one frame per action. A live `/generate/ws` call (opened with `end_input: false`) appends more as `{"append": {"model_kwargs": {"actions": [...]}}}` and plays until it ends its input, or for at most `max_frames` actions in all.
+
+Checkpoint: `Overworld/Waypoint-1.5-1B`.
+
+## `lingbot_world_1_3b`
+
+LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps). A request carries the whole camera trajectory as JSON in `model_kwargs`, which the API server caps at 1 MiB: about 3,900 frames of `[4, 4]` float32 poses; send `[F, 3, 4]` rows for up to the 4,077-frame maximum. One rollout per GPU.
+
+The DiT's attention runs through the engine's ragged attention resource, its blocks are compiled (Inductor's deterministic mode), the condition encode runs channels-last, and the VAE decode is channels-last, compiled and bf16 where cuDNN \>= 9.16 (frames 51 dB from the fp32 decode). `model_kwargs: {reference_numerics: true}` runs the reference's numerics instead (FlashAttention-2, needs `flash-attn`; an eager DiT; the fp32 contiguous encode and decode), with which a rollout is bit-identical to the reference's. `lingbot_world_1_3b_fast.yaml` compiles the DiT with autotuned kernels (`dit_compile_autotune`): ~5% faster, but the rollout for a seed then differs from one server process to the next.
+
+The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (`Robbyant/lingbot-world`).
+
+Checkpoint: `robbyant/lingbot-world-v2-1.3b-causal-fast`.
+
+## Deployment configs
+
+The CLI maps the model keys to these deployment configs. See [Installation](/installation) for dependencies; model-specific requirements and limits follow on this page:
+
+| CLI model key        | Config in the repository          |
+|----------------------|-----------------------------------|
+| `pi05`               | `configs/pi05.yaml`               |
+| `vjepa2`             | `configs/vjepa2.yaml`             |
+| `vjepa2_ac`          | `configs/vjepa2_ac.yaml`          |
+| `waypoint`           | `configs/waypoint.yaml`           |
+| `lingbot_world_1_3b` | `configs/lingbot_world_1_3b.yaml` |
+
+From the repository root, launch a deployment with:
+
+``` bash
+mstar serve pi05
+```
+
+For client requests and response formats, see [Using a Server](/clients).

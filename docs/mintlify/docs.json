@@ -17,25 +17,98 @@
     "groups": [
       {
         "group": "Get started",
-        "pages": ["index", "installation", "quickstart", "reference"]
+        "pages": [
+          "index",
+          "installation",
+          "quickstart",
+          "reference"
+        ]
       },
       {
         "group": "User guide",
-        "pages": ["serving", "metrics", "clients", "evaluation"]
+        "pages": [
+          "serving",
+          "metrics",
+          "clients",
+          "evaluation"
+        ]
+      },
+      {
+        "group": "Models",
+        "pages": [
+          "models",
+          {
+            "group": "Text and multimodal chat",
+            "pages": [
+              "models/qwen",
+              "models/muse-glimmer",
+              "models/ripple",
+              "models/command-a-plus",
+              "models/glm",
+              "models/qwen3-omni",
+              "models/bagel"
+            ]
+          },
+          {
+            "group": "Speech generation and conversation",
+            "pages": [
+              "models/kokoro",
+              "models/orpheus",
+              "models/chatterbox",
+              "models/cosyvoice3",
+              "models/qwen3-tts",
+              "models/fish-s2-pro",
+              "models/voxcpm2",
+              "models/omnivoice",
+              "models/nemotron-voicechat"
+            ]
+          },
+          {
+            "group": "Speech recognition",
+            "pages": [
+              "asr",
+              "models/whisper-qwen-asr",
+              "models/higgs-audio",
+              "models/omnilingual-asr",
+              "models/fastconformer-asr"
+            ]
+          },
+          {
+            "group": "Images, video and robotics",
+            "pages": [
+              "models/flux-z-image",
+              "models/cosmos3",
+              "models/wan22",
+              "models/ltx2-5",
+              "models/minimax-h3",
+              "models/world-models"
+            ]
+          },
+          "models/lora"
+        ]
       },
       {
         "group": "Reference",
-        "pages": ["architecture", "models", "asr", "api", "environment_variables"]
+        "pages": [
+          "architecture",
+          "api",
+          "environment_variables"
+        ]
       },
       {
         "group": "Contributing",
-        "pages": ["adding_models"]
+        "pages": [
+          "adding_models"
+        ]
       }
     ]
   },
   "navbar": {
     "links": [
-      { "label": "GitHub", "href": "https://github.com/mstar-project/mstar" }
+      {
+        "label": "GitHub",
+        "href": "https://github.com/mstar-project/mstar"
+      }
     ]
   },
   "footer": {

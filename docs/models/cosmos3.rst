@@ -1,0 +1,315 @@
+Cosmos3
+============
+
+``cosmos3``
+-----------
+
+Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
+
+Checkpoint: ``nvidia/Cosmos3-Nano``.
+
+``cosmos3_droid``
+-----------------
+
+Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
+``droid_lerobot``, 8-dim raw actions); no sound pathway. The config
+serves the released policy sampling defaults (4 steps, guidance 3.0).
+
+Checkpoint: ``nvidia/Cosmos3-Nano-Policy-DROID``.
+
+``cosmos3_edge``
+----------------
+
+Cosmos3-Edge (4B): dense Nemotron backbone, 480p-native t2i/t2v/i2v and
+robot-action modes, plus the reasoner (image/video chat through
+``/v1/chat/completions``) on the shared understanding tower.
+
+Checkpoint: ``nvidia/Cosmos3-Edge``.
+
+``cosmos3_edge_droid``
+----------------------
+
+Edge action-policy fine-tune for DROID (``domain_name``
+``droid_lerobot``); serves the released 4-step, guidance-3.0 policy
+defaults.
+
+Checkpoint: ``nvidia/Cosmos3-Edge-Policy-DROID``.
+
+``cosmos3_super``
+-----------------
+
+Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+
+Checkpoint: ``nvidia/Cosmos3-Super``.
+
+``cosmos3_super_t2i_4step`` / ``cosmos3_super_i2v_4step``
+---------------------------------------------------------
+
+4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
+stochastic sampler); TP=2 deployments.
+
+Checkpoint: ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``cosmos3``
+     - ``configs/cosmos3_nano.yaml``
+   * - ``cosmos3_droid``
+     - ``configs/cosmos3_droid.yaml``
+   * - ``cosmos3_edge``
+     - ``configs/cosmos3_edge.yaml``
+   * - ``cosmos3_edge_droid``
+     - ``configs/cosmos3_edge_droid.yaml``
+   * - ``cosmos3_super``
+     - ``configs/cosmos3_super_tp2.yaml``
+   * - ``cosmos3_super_i2v_4step``
+     - ``configs/cosmos3_super_i2v_4step_tp2.yaml``
+   * - ``cosmos3_super_t2i_4step``
+     - ``configs/cosmos3_super_t2i_4step_tp2.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve cosmos3
+
+For client requests and response formats, see :doc:`/clients`.
+
+Cosmos3 environment requirements
+--------------------------------
+
+- ``flashinfer`` is required: it is the paged KV/attention backend used by the
+  prefill, the captured CUDA graphs, and multi-request batches.
+- The default denoise attention backend is ``dense_gen``
+  (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
+  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
+  (AITER's varlen kernel on ROCm).
+  That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
+  exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
+  one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
+  a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
+  against 6.3 ms for the paged prefill. ``resources: attn_gen:
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
+- Video-input requests (video-to-video, action inverse-dynamics) decode the
+  conditioning clip with ``torchcodec``; environments without it reject those
+  requests at preprocessing (other modes are unaffected).
+- Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
+  when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
+  ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  covers a torchcodec that cannot load FFmpeg.
+- Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
+  ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
+  pip-installable).
+- The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
+  9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
+  automatically.
+- Two GPUs (H200 numbers, measured before the Cosmos3-Edge Blackwell changes,
+  so the one-GPU baselines are older): ``configs/cosmos3_nano_sp2.yaml`` halves
+  one request's denoise (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while
+  ``configs/cosmos3_nano_dp2.yaml`` (a whole replica per GPU) serves more under
+  concurrency: 2.13 videos/min at 2 concurrent vs 1.63 for sp2 and 1.07 on one GPU.
+  For Edge (832x480x121, 20 steps): ``configs/cosmos3_edge_sp2.yaml`` takes one
+  request from 6.3 to 4.4 s (generation only: the reasoner has no SP path), and
+  ``configs/cosmos3_edge_dp2.yaml`` serves 15.8 videos/min at 4 concurrent vs 7.9 on
+  one GPU.
+
+Cosmos3 image-to-video conditioning
+-----------------------------------
+
+An image-to-video request's conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
+``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting. The image
+pins the first latent frame, so the request must ask for a video of more than
+one latent frame (``num_frames`` above 4); an image output, or a shorter video,
+is refused with a 400.
+
+Cosmos3-Edge reasoner and action loop
+-------------------------------------
+
+``cosmos3_edge`` serves the understanding tower as a vision-language model on the
+same transformer instance and KV pool as the generator. ``/v1/chat/completions``
+takes image and video content parts (URLs or data URIs) and streams tokens; the
+chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
+``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
+``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused unless the checkpoint's
+``generation_config.json`` sets one; ``max_tokens``
+defaults to 2048), and for video attachments ``video_fps`` / ``video_num_frames``
+(frames are sampled at 2 fps by default, each frame a timestamped span).
+
+The following request is a template: replace ``data:image/jpeg;base64,...``
+with a data URI containing your JPEG image.
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "cosmos3_edge", "stream": true, "max_tokens": 256,
+     "messages": [{"role": "user", "content": [
+       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+       {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
+     "enable_thinking": false}'
+
+The reasoner is a ``SampledTokenDecoder`` on the VLM scaffold: its decode steps are captured into CUDA graphs per batch bucket, each compiled first: the eager decode step is over a thousand tiny kernels, and the fused step runs at the weight-streaming floor (about twice the uncompiled rate at batch size 1 on an H100). Text prefills, mixed prefill + decode steps and image or video prefills (up to four prompts a step, each prompt one row with its vision tokens spliced in) are captured too, and a prompt past the largest bucket prefills eagerly.
+
+Concurrent chat requests share decode steps (continuous batching over the captured decode graphs, padded to the next batch bucket). Requests never see each other's data, but the batch bucket changes the bf16 arithmetic of the step, so a long greedy answer can part from its solo run where two candidate tokens tie: in every measured divergence the two tokens' logits were equal or one bf16 ulp apart, the first differing token came after tens to hundreds of identical ones, and identical prompts in one batch agreed with each other.
+
+Short answers (128 tokens) came out identical in 8 of 8 runs; 256-token answers with thinking on in 2 of 8. Generation requests batch into one denoise pass too, which is the same maths but not the same bf16 arithmetic — under classifier-free guidance the branch rounding is amplified, so an image or clip produced alongside other requests differs from its solo result at the kernel-drift level (~30 dB PSNR at guidance 6). A generation step whose requests total more than ``max_batched_vision_tokens`` (a ``model_kwargs`` key, off by default since it is a per-GPU number; 16384 on an H100 is, at 832x480, more than 42 latent frames across the step's requests, e.g. two clips of 85 or more frames each; a windowed request counts its current window) runs every request in it alone, since batching such steps cost more than it saved on an H100, so those outputs match their solo results.
+
+Serve with one request at a time when outputs must be bitwise repeatable.
+
+The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
+
+Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode. An
+image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
+is faster for a single frame. False decodes everything with the compiled stock
+``vae.decode`` on the shared instance.
+
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8) for video, image, sound and action. With
+``compile_denoise_batched`` (default on) the layer stack these steps share is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager.
+Compiled, a batched action step's outputs differ from the eager stack's at the
+kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
+which already fills the GPU's GEMM and attention throughput, so a batch of N
+costs about N single steps: batching keeps requests in step rather than adding
+throughput.
+
+The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action ``domain_name``) predicts a chunk of robot actions from the current observation: ``output_modalities=action`` with ``model_kwargs`` ``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8, "action_chunk_size": 32}``; the reply's ``action`` payload is float32 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the embodiment's actions. A policy request may also send the robot's current state as ``robot_state``, one row of ``raw_action_dim`` finite numbers (a NaN or inf is a 400), as pi0.5 takes it. The state is one more action token, kept clean at video frame 0 in front of the chunk, so ``num_frames`` is ``action_chunk_size + 1`` and the reply carries only the predicted rows.
+
+The released DROID policies were trained this way. A request that sends a ``robot_state`` is a policy request, and its chunk, fps and domain default to the checkpoint's ``checkpoint.json`` (Edge DROID: 32 rows, 15 fps, ``droid_lerobot``; ``configs/cosmos3_droid.yaml`` sets the same for Nano, whose file is empty), so NVIDIA's RoboLab request is the image, the prompt, the state and ``size="736x544"``: the wrist frame above the two exterior frames reflection-padded to 736x544, the 7 joint positions and the gripper as DROID records them, and the task with view, duration and resolution text (a JSON caption for Edge).
+
+The DROID configs map the gripper to the checkpoint's ``1 - gripper`` in every action a request sends and back in every action it gets (``inverted_action_dims``), and ``cosmos3_edge_droid`` guides only inside the cookbook's interval ``[960, 1001]`` (``guidance_interval_action``; outside it the conditional branch runs alone, batched requests too). For a control loop use ``/generate/ws`` (one connection, pipelined observations): ``examples/cosmos3_action_ws_client.py`` builds that request, runs the loop and reports chunks/s, actions/s and latency percentiles.
+
+Cosmos3 streaming rollout (windowed video)
+------------------------------------------
+
+Long clips can be generated window by window instead of in one denoise loop,
+with each finished window streamed to the client while the next one is being
+denoised. The deployment opts in with ``enable_windowed_video: true`` in the
+config YAML (``configs/cosmos3_edge.yaml`` and ``configs/cosmos3_nano_ar.yaml``
+do), which adds the ``video_gen_ar`` walk and a ``vae_decoder_ar`` node in its
+own ``window_decoder`` partition; a request opts in per call:
+
+.. list-table:: Windowed request knobs (``model_kwargs`` or the video request body)
+   :header-rows: 1
+   :widths: 22 14 64
+
+   * - Knob
+     - Default
+     - Meaning
+   * - ``window_mode``
+     - — (``chained`` with ``stream_video``)
+     - ``chained``: every window is a full bidirectional denoise conditioned on
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
+       (experimental, see below): the finished window's clean K/V is committed
+       to the cache and later windows attend to it block-causally; no overlap,
+       and frames older than ``context_frames`` behind the frontier are
+       released from the cache (the persistent world state of a long rollout
+       stays bounded).
+   * - ``window_frames``
+     - 61 on Edge, 29 elsewhere; ``kv``: 29
+     - Pixel frames per window (quantized to latent frames).
+   * - ``overlap_frames``
+     - 32 on Edge, 8 elsewhere
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
+   * - ``context_frames``
+     - 61
+     - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.
+   * - ``stream_video``
+     - ``false``
+     - Emit each window as its own video chunk as it is decoded instead of one
+       assembled clip. ``/generate`` streams the chunks as NDJSON lines,
+       ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
+       NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
+   * - ``session_id``
+     - —
+     - Names a world-state session: the DiT node keeps the rollout's last window
+       and the decoder its context. The most recent ``session_store_size`` idle
+       sessions are kept; a session with a request in flight is never evicted, and
+       a second request on it is refused until the first finishes.
+   * - ``resume_session``
+     - ``false``
+     - Continue the named session: window 0 is conditioned on the stored last
+       frames (pinned clean, like a chained overlap) and only the ``num_frames``
+       new frames are delivered — a new prompt steers the same world.
+   * - ``session_timeout_s``
+     - 600
+     - Seconds an idle session is kept after its request finishes, at most the
+       deployment's ``session_timeout_max_s`` (3600); more is a 400. An expired session resumes
+       like an unknown one: the request is rejected.
+   * - ``end_session``
+     - ``false``
+     - Drop the named session once this request is done (with or without
+       ``resume_session``) instead of keeping its state.
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/generate \
+     -F 'text=a drone flies over a coastal town at dawn' \
+     -F 'output_modalities=video' \
+     -F 'model_kwargs={"num_frames":241,"window_mode":"chained","stream_video":true}'
+
+.. warning::
+
+   ``window_mode: kv`` is experimental, and the server logs a warning at
+   startup when windowed video is enabled. The checkpoints were not trained
+   block-causally: committed K/V conditions the next window far more weakly
+   than frames pinned in the sequence, so an image-conditioned kv rollout
+   jumps away from the scene at the first window boundary and, unless the
+   prompt describes the image, can turn to texture noise within a few
+   windows. ``chained`` with Edge's 61/32 defaults holds the scene over 241
+   frames when the prompt describes the image; its first chunk arrives later,
+   since window 0 is 61 frames. A prompt that
+   contradicts the image still takes over within a few windows in every
+   windowed mode; non-windowed clips are not affected.
+
+The schedule is padded up to whole windows and the video trimmed back to
+``num_frames``; a seeded request is deterministic end to end (later windows draw
+their noise from the same generator). Windowed requests batch with each other
+and with plain requests at the same walk, under the same 16384-vision-token
+cap on the step (each windowed request counts its current window).
+``gen_capture_video`` lists (height,
+width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
+latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
+``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
+graph, which captures the paged attention, measured 3-6% slower than the eager dense
+FA3 step for both the 121-frame clip and the 29-frame window, so it only pays for
+small, launch-bound tiers.

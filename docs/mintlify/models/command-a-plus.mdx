@@ -1,0 +1,45 @@
+---
+title: "Command A+"
+description: "Deployment, request options, capacity and implementation notes for Command A+."
+---
+
+Command A+ text and image chat: a 218B-parameter MoE (25B active) with sliding-window attention. Tested on 4x GB200 at TP4; see Prepare weights and GPUs.
+
+Registry key: `command_a_plus` *(Experimental)*. Checkpoint: `CohereLabs/command-a-plus-05-2026-bf16`.
+
+## Deployment configs
+
+The CLI maps the model keys to these deployment configs. See [Installation](/installation) for dependencies; model-specific requirements and limits follow on this page:
+
+| CLI model key    | Config in the repository          |
+|------------------|-----------------------------------|
+| `command_a_plus` | `configs/command_a_plus_tp4.yaml` |
+
+From the repository root, launch a deployment with:
+
+``` bash
+mstar serve command_a_plus
+```
+
+For client requests and response formats, see [Using a Server](/clients).
+
+Text and image chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an always-on shared expert), with three sliding-window (4096) layers for every global one. Served on `POST /generate` (there is no OpenAI adapter yet):
+
+```text
+mstar serve command_a_plus --gpus 0,1,2,3
+curl -s http://localhost:8000/generate -F 'text=What is in this image?' -F 'files=@cat.jpg'
+```
+
+## Image inputs
+
+Images are tiled like transformers' `Cohere2VisionProcessor` (up to 12 512x512 tiles plus a thumbnail, 256 tokens each) and encoded on the first LLM rank. In `messages`, an image is a `{"type": "image"}` item; the uploaded files fill them in order.
+
+## Prepare weights and GPUs
+
+Install the `command_a_plus` extra, and point `CUDA_HOME` at a toolkit matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build. The ~437 GB of BF16 weights are never downloaded automatically: download the checkpoint and set `model_kwargs.checkpoint_dir` in `configs/command_a_plus_tp4.yaml`, the default (TP4, 65536-token `max_seq_len`). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as H200, set `resources.kv_cache.max_num_pages` to 2048. It keeps only the sliding layers' window per request, and no prefix cache yet. Tokenizer and config metadata are pinned to one checkpoint revision. `configs/command_a_plus_tp8.yaml` targets 8x 80 GB GPUs and keeps NCCL's all-reduce until FlashInfer's is measured there.
+
+`model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}` with `system` / `user` / `assistant` turns goes through the chat template; a plain `text` prompt is one user turn. Sampling defaults to temperature 0.9, top-p 0.95 and repetition penalty 1.04. The model reasons before answering, so give it a generous `max_output_tokens`; a prompt plus `max_output_tokens` (2048 when unset) longer than `max_seq_len` is rejected.
+
+## Execution and measured performance
+
+On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs, Triton kernels, and one all-reduce per layer (`tp_allreduce: flashinfer` at TP4). On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across 64 (`benchmark/command_a_plus/bench_http.py`, measured before the sliding layers kept only their window); `validate_checkpoint.py` there checks parity against Hugging Face, with `--images` for image prompts. Not supported yet: FP8 weights and prefill CUDA graphs.

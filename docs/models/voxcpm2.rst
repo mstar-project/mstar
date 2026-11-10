@@ -1,0 +1,106 @@
+VoxCPM2
+============
+
+Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
+patches through a local flow-matching DiT, decoded by AudioVAE V2 in
+streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.
+
+Registry key: ``voxcpm2``. Checkpoint: ``openbmb/VoxCPM2``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``voxcpm2``
+     - ``configs/voxcpm2.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve voxcpm2
+
+For client requests and response formats, see :doc:`/clients`.
+
+Install and choose a voice mode
+-------------------------------
+
+Install with ``pip install -e '.[voxcpm2]'`` and serve with
+``mstar serve voxcpm2 --gpus 0``. ``/v1/audio/speech`` takes the text alone
+(zero-shot), a voice description in ``instructions`` (voice design), a
+``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
+``ref_text`` (continuation). Output is 48 kHz.
+
+Request types and ignored fields
+--------------------------------
+
+``min_len``, ``max_len`` and ``inference_timesteps`` must be integers (a whole float
+such as ``16.0`` is accepted; ``2.7`` and ``"20"`` are 400s), ``max_new_tokens`` /
+``max_output_tokens`` (160 ms patches) follow the server's integer rule, and
+``cfg_value`` is a number in [0, 10].
+``inference_timesteps`` is a deployment setting a request may only repeat. A budget past
+the model's ``max_len`` is refused. ``seed`` fixes the diffusion noise. ``voice`` is
+dropped (VoxCPM2 has no named voices) and a sent ``speed`` is logged as ignored.
+
+
+
+Long text can end early
+-----------------------
+
+One request with long text can end early: on some seeds the stop head fires
+mid-text, as it does in the official ``voxcpm`` package (a 983-character
+Russian text stopped about three quarters of the way in on 5 of 10 seeds
+there). Split long text into several requests.
+
+Capacity and text limits
+------------------------
+
+A request may hold the whole 8,192-position context, and nothing preempts a
+request once a KV cache is full, so each LM's cache defaults to 2,049 pages
+(32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
+``max_concurrent_requests: 32``; the conductor queues the rest. Start-up
+refuses a cap the caches cannot hold, so raise ``resources.base_kv`` and
+``resources.res_kv`` ``max_num_pages`` with it. Text over
+``max_text_tokens`` (1,365 by default) gets a 400: English speech runs at up
+to about 2.9 patches per token, so longer text may not fit in the
+4,096-patch (655 s) audio budget.
+
+Startup compilation cost
+------------------------
+
+The Talker's decode step (both LMs, the local DiT solve, the stop head) is
+``torch.compile``'d and captured as CUDA graphs at start-up, so a first
+start-up with a cold Inductor cache takes 10 to 30 minutes (591 s on a
+B200, 1,723 s on an H100), and about two minutes once the cache is warm.
+``model_kwargs: {compile_talker: false}``
+in the deployment YAML captures the eager step instead: on a B200 the server
+is up in about 15 seconds, with about a third less throughput at
+concurrency 1 and a sixth less at concurrency 8.
+
+Talker prefill capture
+----------------------
+
+The Talker's prefill (both LMs over the prompt, the first patch's solve and
+the stop head) is captured too, per total prompt tokens (up to 2,048) and
+prompts in a step (up to 32); a step past them runs the LMs eagerly.
+
+VAE worker placement
+--------------------
+
+``configs/voxcpm2.yaml`` runs the VAE decoder's windows on the worker's side
+lane (``side_stream: true``), beside the Talker's steps rather than taking
+turns with them.
+
+VAE compilation
+---------------
+
+The streaming VAE decoder is ``torch.compile``'d at start-up, about a
+quarter faster per window batch; ``model_kwargs: {compile_vae: false}``
+decodes eagerly.

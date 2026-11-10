@@ -1,0 +1,85 @@
+Whisper and Qwen3-ASR
+=====================
+
+``whisper_large_v3_turbo``
+--------------------------
+
+Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
+decoder with write-once cross-attention; language detection, forced
+language/task, ``initial_prompt`` context, ``/v1/audio/transcriptions``.
+The 4-decoder-layer distillation of large-v3, the same class as Whisper large-v3.
+
+Checkpoint: ``openai/whisper-large-v3-turbo``.
+
+``whisper_large``
+-----------------
+
+Whisper large-v3 (32 decoder layers) on the same scaffold.
+
+Checkpoint: ``openai/whisper-large-v3``.
+
+``qwen3_asr``
+-------------
+
+Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)
++ dense Qwen3 decoder; up to 20 min of audio per request, 30 languages
+(detected or forced), ``/v1/audio/transcriptions``. A repetition loop
+in the transcript is collapsed as the reference SDK does.
+
+Checkpoint: ``Qwen/Qwen3-ASR-1.7B``.
+
+``qwen3_asr_realtime``
+----------------------
+
+The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the
+short steps of ``/v1/realtime`` sessions.
+
+Checkpoint: ``Qwen/Qwen3-ASR-0.6B``.
+
+For installation, a complete file-transcription request, timestamps and realtime input, use :doc:`/asr`.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``whisper_large``
+     - ``configs/whisper_large.yaml``
+   * - ``whisper_large_v3_turbo``
+     - ``configs/whisper_large_v3_turbo.yaml``
+   * - ``qwen3_asr``
+     - ``configs/qwen3_asr.yaml``
+   * - ``qwen3_asr_realtime``
+     - ``configs/qwen3_asr_realtime.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve whisper_large
+
+For client requests and response formats, see :doc:`/clients`.
+
+Qwen3-ASR language and prompt context
+-------------------------------------
+
+Qwen3-ASR uses greedy decoding, as the checkpoint's ``do_sample: false`` declares. A request reads ``language``
+(an ISO code or name; it forces the language and drops the model's ``language X`` line),
+``initial_prompt`` (or the request text) as system-turn context, and ``assistant_prefix``,
+a string the model continues from (the realtime route's running hypothesis).
+
+Qwen3-ASR output limits and timestamps
+--------------------------------------
+
+``max_output_tokens`` defaults to 4096; a larger value is served up to the text model's
+``max_position_embeddings`` while the KV pool has room, and past it is a 400. The model
+writes no timestamps: ``/v1/audio/transcriptions`` gives a timed format's segments one
+per window. ``min_p`` and ``repetition_penalty`` are refused.
+
+Whisper has different token limits and supports timestamps; see :doc:`Whisper request options </asr>`.
