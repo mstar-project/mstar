@@ -209,9 +209,8 @@ def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=No
     return _ToyModel(
         walks,
         partitions=lambda: [
-            PartitionDefinition(name="P", graph_walks={"gen"}, initial_walk="gen"),
-            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})},
-                                initial_walk="chunk", producer_partitions=["P"]),
+            PartitionDefinition(name="P", graph_walks={"gen"}),
+            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})}),
         ],
         topology=lambda: PartitionTopology(partitions=["P", "C"], connections=[
             Connection(from_partition="P", to_partition="C", edge_name="codes",
@@ -701,13 +700,26 @@ def _z_image(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _higgs(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig, audio_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    config = HiggsAudioModelConfig()
+    pad = config.audio_in_token_idx
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.kokoro.kokoro_model import KokoroModel, KokoroModelConfig
     return _bare(KokoroModel, config=KokoroModelConfig())
+
+
+def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+    config = MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
+    )
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -719,6 +731,13 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.ltx2_5.config import LTX25Config
     model = _constructed(name, model_kwargs)
     model.set_config(LTX25Config())
+    return model
+
+
+def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3.config import H3Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3Config())
     return model
 
 
@@ -780,6 +799,19 @@ def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
     )
 
 
+def _ripple(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ripple.config import RippleConfig
+    from mstar.model.ripple.ripple_model import RippleModel
+    config = RippleConfig(
+        vocab_size=100352, hidden_size=5120, intermediate_size=40960, num_hidden_layers=80,
+        num_attention_heads=80, num_key_value_heads=8, head_dim=128,
+        layer_types=(("sliding_attention",) * 4 + ("full_attention",)) * 16,
+        sliding_window=1024, max_position_embeddings=2097152, rope_theta=10000.0, rms_norm_eps=1e-6,
+        embed_scale=71.55, ffn_clamp_threshold=20.0, stop_token_ids=(100265, 100257),
+    )
+    return _bare(RippleModel, config=config)
+
+
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
     # The talker imports flashinfer at module level; none of it runs here.
     if importlib.util.find_spec("flashinfer") is None:
@@ -810,9 +842,12 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
-    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
-    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
+    config = Qwen3ASRModelConfig()
+    pad = config.audio_token_id
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
@@ -830,7 +865,7 @@ def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _canary(name, model_kwargs, tmp_path, monkeypatch):
@@ -878,8 +913,11 @@ _FACTORIES = {
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
+    "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
+    "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,
+    "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,

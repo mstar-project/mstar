@@ -81,6 +81,25 @@ def test_generate_accepts_streaming_only_output_without_streaming_field(monkeypa
     assert server.streaming is True
 
 
+@pytest.mark.parametrize("content_type,status", [
+    ("application/json", 400),
+    # media types are case-insensitive
+    ("Application/X-WWW-Form-Urlencoded; charset=utf-8", 200),
+])
+def test_generate_refuses_a_body_that_is_not_a_form(monkeypatch, content_type, status):
+    """A JSON body parses as an empty form: it is refused, not submitted empty."""
+    server = _RecordingServer()
+    monkeypatch.setattr(entrypoint, "api_server", server)
+
+    response = TestClient(entrypoint.app).post(
+        "/generate", content='{"text": "hi"}' if status == 400 else "text=hi",
+        headers={"content-type": content_type},
+    )
+
+    assert response.status_code == status
+    assert (server.streaming is not None) == (status == 200)
+
+
 def test_generate_rejects_malformed_model_kwargs(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", object())
 
