@@ -553,18 +553,37 @@ class TestComment(unittest.TestCase):
             self.assertTrue((results / "claude.err.tail").read_text().endswith("x\nAPI Error: 401\n"))
             self.assertLess(peak, 2 << 20, "an 8 MB stderr would be read whole into the job's memory")
         key, filler = "k3y+secret\nline2==", "S" * 4000  # an exact key the read's seek splits
+        hf_token = "hf_" + "Q1w2E3r4T5y6U7i8O9p0" * 3  # and a pattern's token, whose end alone no pattern knows
         body = (filler + "\n") * 16 + "API Error: 401\n"
-        for at in (3, 13):  # in its first line, then in its second
+        for secret, at in ((key, 3), (key, 13), (hf_token, 10)):  # in a key's first line or its second; in a token
             with self.subTest(at=at), tempfile.TemporaryDirectory() as temp:
                 results = Path(temp, "lt/amd/results")
                 results.mkdir(parents=True)
-                pad = "p" * (gpu_review.ERR_READ - len(key[at:] + "\n" + body) - 1) + "\n"
-                (results / "claude.err").write_bytes(("a\n" + key + "\n" + pad + body).encode())
+                pad = "p" * (gpu_review.ERR_READ - len(secret[at:] + "\n" + body) - 1) + "\n"
+                (results / "claude.err").write_bytes(("a\n" + secret + "\n" + pad + body).encode())
                 gpu_review.redact({}, temp, s3=filler, s4=key)
                 tail = (results / "claude.err.tail").read_text()
                 self.assertTrue(tail.endswith("API Error: 401\n"))
-                self.assertNotIn("line2", tail, "the end of a key the seek split would reach the artifact")
-                self.assertNotIn("secret", tail, "the end of a key the seek split would reach the artifact")
+                for piece in (secret[at:at + 6], secret[-6:]):
+                    self.assertNotIn(piece, tail, "the end of a secret the seek split would reach the artifact")
+        for left in ("file", "dir"):  # the box's own claude.err.tail, unredacted, where none is written
+            with self.subTest(left=left), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp, "lt/amd/results")
+                results.mkdir(parents=True)
+                (results / "result.json").write_text(json.dumps({"verdict": "pass"}))
+                tail = results / "claude.err.tail"
+                if left == "dir":
+                    tail.mkdir()
+                    tail = tail / "x"
+                tail.write_text("API Error: 401 for key plaintoken123\n")
+                gpu_review.redact({}, temp, s4="plaintoken123")
+                self.assertFalse((results / "claude.err.tail").exists(), "the box's own tail would reach the artifact")
+        with tempfile.TemporaryDirectory() as temp:  # a stderr with no newline in its last 64 KB
+            results = Path(temp, "lt/amd/results")
+            results.mkdir(parents=True)
+            (results / "claude.err").write_text("z" * gpu_review.ERR_READ + " API Error: 401")
+            gpu_review.redact({}, temp)
+            self.assertEqual((results / "claude.err.tail").read_text(), "… API Error: 401", "it would leave no reason")
 
     def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
         box_key = "sk-ant-api03-" + "Ab1_-" * 8

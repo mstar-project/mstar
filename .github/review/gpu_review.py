@@ -1101,6 +1101,10 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
     so a session that died at once leaves its reason."""
     exact = (s2, s3, s4)
     for box in boxes(Path(runner_temp, "lt")):
+        tail = box / "results/claude.err.tail"  # only this step writes it: whatever the box left there goes
+        if tail.is_dir():
+            shutil.rmtree(tail)
+        tail.unlink(missing_ok=True)
         for f in (box / "results/report.md", box / "unavailable.md"):
             if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
                 f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
@@ -1130,15 +1134,22 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
                 cut = f.seek(0, os.SEEK_END) > ERR_READ
                 f.seek(-ERR_READ if cut else 0, os.SEEK_END if cut else os.SEEK_SET)
                 window = f.read()
-            text = window.decode("utf-8", "replace")
-            if cut:  # without its partial first line and any end of an exact key it starts with (cut_short's
-                text = text.partition("\n")[2]  # mirror), so a secret the seek split can't leave its end
+            text, whole = window.decode("utf-8", "replace"), True  # whole: it starts a line
+            if cut:  # so a secret the seek split can't leave its end: without its partial first line (or, with no
+                # newline in it, what comes before its first whitespace), then any end of an exact key it starts
+                # with (cut_short's mirror)
+                if "\n" in text:
+                    text = text.partition("\n")[2]
+                else:
+                    space = re.search(r"\s", text)
+                    text, whole = text[space.start():] if space else "", False
                 for value in filter(None, exact):
                     text = text[next((k for k in range(len(value) - 1, 0, -1) if text.startswith(value[-k:])), 0):]
             text = bot.redact(text, exact=exact)  # whole, so no secret is cut in two
             start = max(len(text) - ERR_TAIL, 0)  # marked where it starts mid-line
-            whole = text[start - 1] == "\n" if start else True
-            (box / "results/claude.err.tail").write_text(("" if whole else "…") + text[start:])
+            if start:
+                whole = text[start - 1] == "\n"
+            tail.write_text(("" if whole else "…") + text[start:])
 
 
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):
