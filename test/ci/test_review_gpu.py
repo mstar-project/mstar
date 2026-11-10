@@ -754,7 +754,9 @@ class TestApprove(unittest.TestCase):
                            ("the ROCm path needs the aiter weights from a gated repo",
                             "aiter weights from a gated repo"),
                            ("MI250 (gfx90a) kernels", "MI250 (gfx90a) kernels"),
-                           ("AMD MI300X kernels; ROCm code", "")):
+                           ("AMD MI300X kernels; ROCm code", ""), ("ROCm-specific kernels", ""),
+                           ("AMD-only code path", ""), ("the ROCm 7 path", ""), ("no ROCm support", ""),
+                           ("MI300X 2 nodes", "2 nodes")):
             with self.subTest(text):
                 left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
                 self.assertIn(kept, left, "what the AMD box can't run either would stop counting")

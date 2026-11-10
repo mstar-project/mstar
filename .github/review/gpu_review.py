@@ -215,8 +215,11 @@ def vendor_list(text):
 
 # What is left of a clause of the review's `untestable` text once its AMD hardware words are gone, that says
 # nothing on its own.
-FILLER = re.compile(r"\b(?:a|an|the|and|or|of|on|for|in|its|kernels?|code|paths?|gpus?|hardware|support)\b|\W|_",
-                    re.IGNORECASE)
+FILLER = re.compile(r"\b(?:a|an|the|and|or|no|of|on|for|in|its|kernels?|code|paths?|backends?|gpus?|hardware"
+                    r"|support|cloud)\b|\W|_", re.IGNORECASE)
+# A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`).
+HARDWARE_PHRASE = re.compile(rf"({UNTESTABLE_HARDWARE.pattern})(-(?:specific|only|based))?"
+                             r"(\s+v?\d+(?:\.\d+)*(?![\w.]))?", re.IGNORECASE)
 
 
 def covered_by_amd(word):
@@ -228,12 +231,18 @@ def covered_by_amd(word):
 
 def beyond_vendors(text, vendors):
     """The review's `untestable` text (model text) without what a run on `vendors` covers: with AMD among them, its
-    AMD hardware words (covered_by_amd), and a clause (between `;` and `,`) they leave saying nothing (FILLER)."""
+    AMD hardware words (covered_by_amd, HARDWARE_PHRASE), and a clause (between `;` and `,`) they leave saying
+    nothing (FILLER)."""
     if "amd" not in vendors or not text:
         return text or ""
+    def drop(m):  # the version stays unless it is ROCm's or HIP's: `MI300X 2` is two of them
+        if not covered_by_amd(m[1]):
+            return m[0]
+        return "" if not m[3] or m[1].lower() in ("rocm", "hip") else m[3]
+
     kept = []
     for clause in re.split(r"[;,]", text):
-        rest = UNTESTABLE_HARDWARE.sub(lambda m: "" if covered_by_amd(m[0]) else m[0], clause)
+        rest = HARDWARE_PHRASE.sub(drop, clause)
         rest = " ".join(rest.split())
         if FILLER.sub("", rest):
             kept.append(rest)
