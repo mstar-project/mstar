@@ -20,16 +20,14 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.lora import LoraReqConfig, LoraSpec, LoraStep
+from mstar.engine.resources.lora import AdapterInfo, LoraReqConfig, LoraSpec
+from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
+from mstar.engine.resources.lora.identity import adapter_digest
 from mstar.engine.resources.lora.pool import LoraAdapterPool
-from mstar.engine.resources.step import Segment, StepContext
-from mstar.model.qwen3_5.config import (  # noqa: F401 - LORA re-exported
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-    LORA,
-    Qwen3_5Config,
-)
-from mstar.model.submodule_base import ARNodeInputs, engine_step, lora_rows
+from mstar.engine.resources.lora.store import classify_adapter
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext
+from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
+from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
 
 DTYPE = torch.float64
 
@@ -117,16 +115,47 @@ def write_peft(path, modules: dict[str, tuple[torch.Tensor, torch.Tensor]], alph
     return str(path)
 
 
+def pin_digests(spec: LoraSpec) -> LoraSpec:
+    """``spec`` with each adapter's digest pinned, as the API server pins the serving
+    config's (``resolve_lora_adapters``), but without checking that the adapter fits."""
+    spec.adapter_digests = {
+        name: adapter_digest(read_lora_file(path, convert_keys=spec.convert_keys))
+        for name, path in spec.adapters.items()
+    }
+    return spec
+
+
+def header_info(spec: LoraSpec, items) -> AdapterInfo:
+    """``classify_adapter`` on the ``(checkpoint key, shape)`` pairs a safetensors header
+    lists: what ``check_adapter_file`` refuses, for adapters too large to write out (a
+    released model size) or a refusal checked without writing a file."""
+    shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+    for key, shape in items:
+        # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
+        module, kind = parse_lora_key(normalize_lora_key(key))
+        if kind != "alpha":
+            shapes.setdefault(module, {})[kind] = tuple(shape)
+    for module, ab in shapes.items():
+        if set(ab) != {"A", "B"}:  # as read_lora_file refuses it
+            raise ValueError(f"LoRA module {module!r} is missing lora_{'B' if 'A' in ab else 'A'}")
+    return classify_adapter(spec, shapes)
+
+
 def serve(spec: LoraSpec, adapters: dict[str, str], max_rank: int = 4, **kw) -> LoraSpec:
     """``spec`` sized as a deployment's YAML would, on the CPU reference backend in fp64."""
     spec.apply_yaml_overrides(max_slots=2, max_rank=max_rank, adapters=dict(adapters), **kw)
     spec.dtype = DTYPE
     spec.backend = "torch"
-    return spec
+    return pin_digests(spec)
 
 
 def pool(spec: LoraSpec, rank: int = 0, world: int = 1) -> LoraAdapterPool:
     return LoraAdapterPool(spec, "cpu", rank=rank, world_size=world)
+
+
+def _config(adapter: str | None) -> LoraReqConfig | None:
+    """As the conductor opens a request: a base-model one carries no config."""
+    return None if adapter is None else LoraReqConfig(adapter=adapter)
 
 
 def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
@@ -134,8 +163,8 @@ def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
     over them, as the engine drives a step whose segments are one per request."""
     for p in pools:
         for rid, adapter, _ in rows:
-            p.ingest_request(rid, LoraReqConfig(adapter=adapter))
-        step = LoraStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
+            p.ingest_request(rid, _config(adapter))
+        step = ResourceStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
         ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk="prefill", slot=0, capture=False)
         assert p.admit(step, ctx).ok
         p.plan(step, ctx)
@@ -143,13 +172,13 @@ def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
 
 def admit_declared(lora_pool, step, rows, walk: str = "prefill") -> None:
     """Admit and plan a node's declared ``step`` for ``rows`` ((rid, adapter, span)), with
-    the LoraStep the engine adds to it (``lora_rows``)."""
+    the pool's step the engine adds to it (``with_segment_steps``)."""
     for rid, adapter, _ in rows:
-        lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
+        lora_pool.ingest_request(rid, _config(adapter))
     ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False)
     key = lora_pool.spec.resource_key
-    lora_step = lora_rows(step, (key,)).get(key)
-    assert lora_step is not None, "the node's step declares no segments to lay its LoRA rows out from"
+    lora_step = with_segment_steps(step, (key,)).get(key)
+    assert lora_step is not None, "the node's step declares no segments to lay its rows out from"
     assert lora_pool.admit(lora_step, ctx).ok
     lora_pool.plan(lora_step, ctx)
 
@@ -309,7 +338,7 @@ def bind_under(module: nn.Module, prefix: str, lora_pool: LoraAdapterPool, check
             continue
         target = make_lora_capable(module.get_submodule(path[len(prefix):]))
         if check:
-            _check(target, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
+            _check(target, None, spec.targets[ref.target], lora_pool.targets[ref.target], path, spec.resource_key)
         target.lora_delta = lora_pool.layer_delta(ref.target, ref.layer)
         bound += 1
     return bound
@@ -409,6 +438,11 @@ def write_peft_adapter(directory, rank, projs, alpha=None, text_only=False, seed
     return str(path), ref
 
 
+def _declared(model) -> LoraSpec:
+    """The model's LoRA spec, as it declares it beside its other resources."""
+    return next(s for s in model.get_node_resources() if isinstance(s, LoraSpec))
+
+
 def lora_spec(paths, **kw) -> LoraSpec:
     from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
 
@@ -484,7 +518,7 @@ class Stack:
     # the node's forward, per request: (its hidden rows, its head rows)
     run: Callable[[nn.Module, list[torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]
     declare: Callable[[nn.Module, list[str], list[torch.Tensor]], object]
-    inputs: Callable[[object, int, int], torch.Tensor]         # (config, tokens, seed) -> a row
+    inputs: Callable[[object, int, int], torch.Tensor]         # (config, n, seed) -> a row whose length scales with n
     # (the model at its released config, (config, TP group) -> the root its LoRA binds in)
     released: Callable[[], tuple[object, Callable]] | None = None
     worlds: tuple[int, ...] = (1, 2, 4)
@@ -492,6 +526,8 @@ class Stack:
     # the layouts the adapters' files name their modules in
     a1_rename: Callable[[str], str] = lambda m: m
     a2_rename: Callable[[str], str] = lambda m: m
+    # the YAML's `targets:` (every target the spec declares), for opt-in ones (experts)
+    opt_in: bool = False
 
 
 def model_object(cls, config, **attrs):
@@ -565,14 +601,14 @@ def _orpheus():
         return OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c)
 
     return Stack(
-        config=tiny, lora_spec=lambda c: model_object(OrpheusModel, c).get_lora_specs()[0], build=build,
+        config=tiny, lora_spec=lambda c: _declared(model_object(OrpheusModel, c)), build=build,
         weights=lambda c: llama_weights(c, "model.", "lm_head"),
         a1=lambda c: {**llama_layers(c, "model."), "lm_head": (c.vocab_size, c.hidden_size),
                       "model.embed_tokens": (c.hidden_size, c.vocab_size)},
         a2=lambda c: _subset(llama_layers(c, "model."), "0.self_attn.q_proj", "0.self_attn.v_proj",
                              "1.mlp.down_proj"),
-        run=_ids_run(lambda s: s.language_model, lambda s, ids: s.embed_tokens(ids),
-                     lambda s, x: s.language_model(x, label="main"), lambda s, x: s.lm_head(x)),
+        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed(ids),
+                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.logits(x)),
         declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
         released=lambda: (model_object(OrpheusModel, OrpheusModelConfig()),
                           lambda c, g: OrpheusForCausalLM(c, comm_group=g)),
@@ -582,56 +618,99 @@ def _orpheus():
 
 
 def _higgs():
-    from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
+    """Higgs-Audio's LLM node as the model builds it (its audio encoder, no text-only
+    prompt), its LoRA rows planned by the walk it serves (``prefill_audio``). The forward
+    is this test's own embed, splice, stack and head, over prompts that open with one
+    audio pad (served prompts carry one per audio token) whose row replaces its embedding."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.multimodal import splice_media
+
+    def build(c, group, weights):
+        model = model_object(HiggsAudioModel, c)
+        llm = model.build_llm(group).to(DTYPE)
+        llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
+        encoders = (audio_encoder(),)
+        return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
+
+    def inputs(c, n, seed):
+        ids = torch.randint(0, c.vocab_size - 1, (n,), generator=torch.Generator().manual_seed(seed))
+        ids[0] = c.audio_in_token_idx
+        return ids
+
+    def audio(s, ids):
+        """The encoder's rows for the pads in ``ids``: one row for every pad, so a batch
+        splices what each of its prompts would alone."""
+        pads = int((ids == s.config.audio_in_token_idx).sum())
+        return rand(1, s.config.hidden_size, seed=7).to(DTYPE).expand(pads, -1)
+
+    def embed(s, ids):
+        return splice_media(s.model.embed(ids), ids == s.config.audio_in_token_idx, audio(s, ids))
+
+    def declare(sub, rids, rows):
+        return engine_step(sub, "prefill_audio", rids, [
+            ARNodeInputs(input_ids=i, input_seq_len=len(i), tensor_inputs={"audio_embeds": audio(sub, i)})
+            for i in rows
+        ])
 
     head = "audio_decoder_proj.text_lm_head"
     return Stack(
         config=lambda: HiggsAudioModelConfig(
             hidden_size=16, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-            head_dim=4, intermediate_size=32, vocab_size=64,
+            head_dim=4, intermediate_size=32, vocab_size=64, audio_in_token_idx=63,
         ),
-        lora_spec=lambda c: model_object(HiggsAudioModel, c).get_lora_specs()[0],
-        build=lambda c, group, w: HiggsAudioLLMSubmodule(_loaded(HiggsAudioLLM(c, comm_group=group).to(DTYPE), w), c),
+        lora_spec=lambda c: _declared(model_object(HiggsAudioModel, c)),
+        build=build,
         weights=lambda c: llama_weights(c, "", head, qk_norm=True),
         a1=lambda c: {**llama_layers(c, ""), head: (c.vocab_size, c.hidden_size)},
         a2=lambda c: _subset(llama_layers(c, ""), "0.self_attn.k_proj", "1.mlp.up_proj", "1.self_attn.o_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed_tokens(ids),
-                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.vocab_size),
+        run=_ids_run(lambda s: s.model, embed,
+                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.logits(x)),
+        declare=declare, inputs=inputs,
         released=lambda: (model_object(HiggsAudioModel, HiggsAudioModelConfig()),
-                          lambda c, g: HiggsAudioLLM(c, comm_group=g)),
+                          lambda c, g: model_object(HiggsAudioModel, c).build_llm(g)),
         a2_rename=lambda m: f"model.{m}",  # a Qwen3ForCausalLM-shaped adapter
     )
 
 
-def _omni(dense: bool):
-    """``dense``: every layer a dense MLP, so TP runs on a CPU (the sharded MoE dispatch
-    is a Triton kernel); else layer 0 is MoE and takes no delta."""
+def _omni():
+    """Layers 0 and 2 are MoE, their routed experts adapted (opted in by the YAML's
+    ``targets:``), layer 1 a dense MLP. A row is ``per_token`` tokens per unit of the
+    ``n`` it is asked for, so at ``test_lora_models.ROWS``' sizes one expert gathers
+    more rows than the torch reference's 64-row chunk."""
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, ThinkerTextConfig
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
-    moe_layers = () if dense else (0,)
+    moe = (0, 2)
+    per_token = 16
+    projs = (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8)))
 
     def weights(c):
         tc = c.thinker_text
         out = llama_weights(tc, "model.", "lm_head", qk_norm=True)
-        for layer in moe_layers:
-            for proj in ("gate_proj", "up_proj", "down_proj"):
+        for layer in moe:
+            for proj, _ in projs:
                 del out[f"model.layers.{layer}.mlp.{proj}.weight"]
-            out[f"model.layers.{layer}.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=900)
+            seed = 900 + 100 * layer
+            out[f"model.layers.{layer}.mlp.gate.weight"] = rand(tc.num_experts, tc.hidden_size, seed=seed)
             for e in range(tc.num_experts):
-                for proj, shape in (("gate_proj", (8, 16)), ("up_proj", (8, 16)), ("down_proj", (16, 8))):
-                    out[f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"] = rand(*shape, seed=901 + e, scale=0.2)
+                for i, (proj, shape) in enumerate(projs):
+                    out[f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"] = rand(
+                        *shape, seed=seed + 1 + 3 * e + i, scale=0.2)
         return out
 
     def adapted(c):
-        return {m: s for m, s in llama_layers(c.thinker_text, "model.").items()
-                if "self_attn" in m or int(m.split(".")[2]) not in moe_layers}
+        tc = c.thinker_text
+        experts = {
+            f"model.layers.{layer}.mlp.experts.{e}.{proj}": shape
+            for layer in moe for e in range(tc.num_experts) for proj, shape in projs
+        }
+        return {**{m: s for m, s in llama_layers(tc, "model.").items()
+                   if "self_attn" in m or not m.startswith(tuple(f"model.layers.{n}." for n in moe))},
+                **experts}
 
     # the released Qwen3-Omni-30B-A3B Thinker's text config
     full = Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
@@ -641,23 +720,25 @@ def _omni(dense: bool):
     ))
     return Stack(
         config=lambda: Qwen3OmniModelConfig(thinker_text=ThinkerTextConfig(
-            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=3,
             num_attention_heads=4, num_key_value_heads=2, head_dim=4, num_experts=4,
             num_experts_per_tok=2, moe_intermediate_size=8,
-            mlp_only_layers=[i for i in range(2) if i not in moe_layers],
+            mlp_only_layers=[1],
         )),
-        lora_spec=lambda c: model_object(Qwen3OmniModel, c).get_lora_specs()[0],
+        lora_spec=lambda c: _declared(model_object(Qwen3OmniModel, c)),
         build=lambda c, group, w: ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c),
         weights=weights,
         a1=lambda c: {**adapted(c), "lm_head": (c.thinker_text.vocab_size, c.thinker_text.hidden_size)},
-        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "up_proj"),
+        a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "1.mlp.up_proj", "experts.1.up_proj",
+                             "experts.3.down_proj"),
         run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.embed_tokens(ids),
                      lambda s, x: s.model(input_embeds=x, label="main")[0], lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
-        released=None if dense else lambda: (model_object(Qwen3OmniModel, full),
-                                             lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
-        worlds=(1, 2, 4) if dense else (1,),
+        declare=_declare("prefill_text"),
+        inputs=lambda c, n, seed: _tokens(lambda c: c.thinker_text.vocab_size)(c, per_token * n, seed),
+        released=lambda: (model_object(Qwen3OmniModel, full),
+                          lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"thinker.{m}",  # the full model's checkpoint naming
+        opt_in=True,
     )
 
 
@@ -690,7 +771,7 @@ def _qwen3_tts():
             num_hidden_layers=2, text_hidden_size=8, text_vocab_size=32, **dims,
             code_predictor=Qwen3TTSCodePredictorConfig(num_hidden_layers=1, **dims),
         )),
-        lora_spec=lambda c: model_object(Qwen3TTSModel, c).get_lora_specs()[0],
+        lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c, codec_dtype=torch.float32)),
         # the code predictor sits beside the Talker, with relative paths of the same shape
         build=lambda c, group, w: TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w),
@@ -702,7 +783,7 @@ def _qwen3_tts():
         run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.codec_embedding(ids),
                      lambda s, x: s.model(x, label="main"), lambda s, x: s.model.codec_head(x)),
         declare=_declare("talker_prefill"), inputs=_tokens(lambda c: c.talker.vocab_size),
-        released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig()),
+        released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig(), codec_dtype=torch.float32),
                           lambda c, g: Qwen3TTSTalkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"talker.{m}",
     )
@@ -763,7 +844,7 @@ def _chatterbox_t3():
         return [tuple(torch.cat(p) for p in zip(per[i], per[i + k], strict=True)) for i in range(k)]
 
     return Stack(
-        config=_t3_config, lora_spec=lambda c: model_object(ChatterboxModel, c).get_lora_specs()[0],
+        config=_t3_config, lora_spec=lambda c: _declared(model_object(ChatterboxModel, c)),
         build=build, weights=weights,
         a1=lambda c: {**llama_layers(c.t3.backbone, "tfmr."), "speech_head": (40, 16)},
         a2=lambda c: _subset(llama_layers(c.t3.backbone, "tfmr."), "v_proj", "down_proj"),
@@ -810,8 +891,7 @@ def _qwen3_5():
 STACKS = {
     "orpheus": _orpheus,
     "higgs_audio": _higgs,
-    "qwen3_omni_thinker": lambda: _omni(dense=False),
-    "qwen3_omni_thinker_dense": lambda: _omni(dense=True),
+    "qwen3_omni_thinker": _omni,
     "qwen3_tts_talker": _qwen3_tts,
     "chatterbox_t3": _chatterbox_t3,
     "qwen3_5": _qwen3_5,

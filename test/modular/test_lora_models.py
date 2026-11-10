@@ -27,9 +27,10 @@ import lora_module_helpers as H  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.engine.resources.lora import LoraBaseOnly, LoraReqConfig, LoraSpec  # noqa: E402
+from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig, LoraSpec  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key  # noqa: E402
-from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
+from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
+from mstar.engine.resources.spec import instance_key  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
@@ -37,13 +38,15 @@ from mstar.model.components.lora.modules import _check  # noqa: E402
 from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
-from mstar.model.qwen3_5.config import VISION_ATTN, VISION_LORA, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
-from mstar.model.qwen3_5.lora import qwen3_5_lora_specs  # noqa: E402
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
+from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule  # noqa: E402
-from mstar.model.submodule_base import engine_step, lora_rows  # noqa: E402
+from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
+# the vision node's pool, as the engine keys it (`LoraSpec.for_node`)
+VISION_POOL = instance_key(LORA_RESOURCE_KEY, "vision_encoder")
 # two adapters, the base model, and a1 again (sharing its slot)
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4), ("r3", "a1", 2)]
 # ranks set up one at a time: the Qwen3.5 build sets the process-wide default dtype
@@ -51,7 +54,18 @@ _SETUP = threading.Lock()
 
 
 def _bound(module) -> bool:
-    return getattr(module, "lora_delta", None) is not None
+    return getattr(module, "lora_delta", None) is not None or bool(getattr(module, "lora_params", None))
+
+
+def _declared(spec) -> list[str]:
+    """Every target the spec declares, the opt-in (experts) ones included."""
+    return sorted({**spec.targets, **spec.dropped_targets})
+
+
+def _bound_modules(spec) -> int:
+    """The modules a spec's bindings name (an experts module has one per parameter)."""
+    return len({path.removesuffix(f".{ref.param}") if ref.param else path
+                for path, ref in spec.module_map.bindings.items()})
 
 
 def _unbound(stack, c, weights):
@@ -66,7 +80,8 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
     c = stack.config()
     p1, r1 = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding, stack.a1_rename)
     p2, r2 = H.make_adapter(tmp_path / "a2.safetensors", stack.a2(c), 2, None, 200, rename=stack.a2_rename)
-    spec = H.serve(stack.lora_spec(c), {"a1": p1, "a2": p2})
+    spec = stack.lora_spec(c)
+    spec = H.serve(spec, {"a1": p1, "a2": p2}, **({"targets": _declared(spec)} if stack.opt_in else {}))
     base = stack.weights(c)
     rows = [stack.inputs(c, n, i) for i, (_, _, n) in enumerate(ROWS)]
     rids = [rid for rid, _, _ in ROWS]
@@ -76,7 +91,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
             sub = stack.build(c, group, base)
             lora_pool = H.pool(spec, rank, world)
             sub.bind_node_resources({spec.resource_key: lora_pool})
-            assert sum(map(_bound, sub.modules())) == len(spec.module_map.bindings)
+            assert sum(map(_bound, sub.modules())) == _bound_modules(spec)
             H.admit_declared(lora_pool, stack.declare(sub, rids, rows), ROWS)
         with torch.no_grad():
             return stack.run(sub, rows)
@@ -104,15 +119,19 @@ QWEN3_5_SIZES = json.loads((FIXTURES / "qwen3_5_configs.json").read_text())["siz
 
 
 def _released(name: str, size: str | None = None):
-    """The model at its released config (Qwen3.5: ``size``), and per LoRA spec
-    ``(TP group -> the root it binds in, whether that root is TP)``."""
+    """The model's LoRA spec and config at its released size (Qwen3.5: ``size``), and per
+    node the spec reaches, in the spec's order, ``(TP group -> the root it binds in,
+    whether that root is TP)``."""
     if name != "qwen3_5":
         model, root = H.STACKS[name]().released()
-        return model, [(lambda g: root(model.config, g), True)]
+        return lora_spec(model.get_node_resources()), model.config, [(lambda g: root(model.config, g), True)]
     entry = QWEN3_5_SIZES[size]
     text = Qwen3_5Config(**entry["text_config"], tie_word_embeddings=entry["tie_word_embeddings"])
     vision = Qwen3_5VisionConfig(**entry["vision_config"])
-    return H.model_object(Qwen3_5DenseModel, text, vision_config=vision), [
+    # the model's own declaration; its vision attention reads only these two processor fields
+    processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=vision.patch_size)
+    model = H.model_object(Qwen3_5DenseModel, text, vision_config=vision, _image_processor=processor)
+    return lora_spec(model.get_node_resources()), text, [
         (lambda g: Qwen3_5ForCausalLM(text, g), True), (lambda g: Qwen3_5VisionModel(vision), False),
     ]
 
@@ -136,21 +155,89 @@ def _shipped() -> list[tuple[str, int]]:
 def test_every_placed_module_binds_at_the_released_size(name, size, world):
     """What generic binding checks on each rank: the module is the declared target, and
     its rank-local shape is the pool's shard of it (whole, on a root that is not TP)."""
-    model, roots = _released(name, size)
-    specs = model.get_lora_specs()
+    spec, config, roots = _released(name, size)
+    nodes = list(dict.fromkeys(t.node or next(iter(spec.nodes)) for t in spec.targets.values()))
     for rank in sorted({0, world - 1}):
         group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world)))
-        for spec, (build, tp) in zip(specs, roots, strict=True):
+        for node, (build, tp) in zip(nodes, roots, strict=True):
             with torch.device("meta"):
                 root = build(group if tp else CommGroup.trivial())
-            for path, ref in spec.module_map.bindings.items():
-                target = spec.targets[ref.target]
-                _check(make_lora_capable(root.get_submodule(path)), target, target.shard(world if tp else 1),
+            for path, ref in spec.module_map.part(node).bindings.items():
+                target = {**spec.targets, **spec.dropped_targets}[ref.target]
+                module = root.get_submodule(path if ref.param is None else path.removesuffix(f".{ref.param}"))
+                _check(make_lora_capable(module), ref.param, target, target.shard(world if tp else 1),
                        path, spec.resource_key)
             if isinstance(root, Qwen3_5ForCausalLM):
                 # the delta-net's slices are this rank's [q|k|v|z|a+pad|b]
-                q, k, v, z, a, pad, b = root.model.layers[model.config.linear_layer_indices[0]].self_attn.in_proj_blocks
+                q, k, v, z, a, pad, b = root.model.layers[config.linear_layer_indices[0]].self_attn.in_proj_blocks
                 assert spec.targets["in_proj_fused"].shard(world).out_slices == (q, k, v, z, a + pad, b)
+
+
+def test_expert_lora_refuses_expert_parallelism_and_more_ids_than_the_align_op_groups():
+    """Startup refusals, each saying why: experts split by EP (rank 1 of 2 holds half), at
+    deployment validation and at bind, and more slots than the fused-MoE align op groups
+    at the released 128 experts, on the spec as the YAML sizes it."""
+    from mstar.model.components import MoeParallelConfig
+    from mstar.model.components.lora.modules import bind_module_lora
+    from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+    from mstar.validation.resources import _expert_lora_split_by_ep
+
+    stack = H.STACKS["qwen3_omni_thinker"]()
+    c = stack.config()
+    spec = stack.lora_spec(c)
+    spec = H.serve(spec, {}, targets=_declared(spec))
+    group = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    holder = torch.nn.Module()
+    with torch.device("meta"):
+        holder.model = Qwen3OmniThinkerModel(c, comm_group=group, moe_parallel=MoeParallelConfig(parallel="ep"))
+    with pytest.raises(ValueError, match=r"holds experts 2\.\.3 of 4 .*expert parallelism"):
+        bind_module_lora(holder, {spec.resource_key: H.pool(spec, rank=1, world=2)})
+    ep = {"node_names": sorted(spec.nodes), "tp_size": 2, "ep_config": {"parallel": "ep"}}
+    (problem,) = _expert_lora_split_by_ep([spec], {"node_groups": [ep]})
+    assert "split by expert parallelism" in problem
+    assert not list(_expert_lora_split_by_ep([spec], {"node_groups": [{**ep, "ep_config": None}]}))
+
+    released = _released("qwen3_omni_thinker")[0]
+    with pytest.raises(ValueError, match="serve at most 7 slots"):
+        released.apply_yaml_overrides(max_slots=8, targets=["qkv_proj", "experts_down_proj"])
+    assert "experts_down_proj" not in released.targets and released.max_slots != 8
+
+
+def test_the_api_server_keeps_the_experts_targets_the_yaml_names_and_refuses_them_unnamed(tmp_path):
+    """Experts targets are opt-in, resolved once from the declaration: named, they survive
+    the API server's resolve and any later override that names no targets, and a later
+    list restores what an earlier one left out; unnamed, an adapter on them fails the
+    deployment saying where to name them, a hint an adapter on a left-out linear does not
+    get."""
+    from mstar.engine.resources.lora.serving import resolve_lora_adapters
+    from mstar.model.base import declared_resources
+
+    stack = H.STACKS["qwen3_omni_thinker"]()
+    c = stack.config()
+    path, _ = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding,
+                             stack.a1_rename)
+    model = SimpleNamespace(get_node_resources=lambda: [stack.lora_spec(c)])
+    declared = stack.lora_spec(c)
+    assert {"experts_gate_up_proj", "experts_down_proj"} == set(declared.dropped_targets)
+    named = _declared(declared)
+    config = {"resources": {"lora": {"adapters": {"a1": path}, "targets": named}}}
+    spec = lora_spec(declared_resources(model, config))
+    resolve_lora_adapters(spec, config)
+    assert sorted(spec.targets) == named
+    spec.apply_yaml_overrides(max_slots=3)
+    assert sorted(spec.targets) == named
+    spec.apply_yaml_overrides(targets=["qkv_proj"])
+    spec.apply_yaml_overrides(targets=named)
+    assert sorted(spec.targets) == named
+    config = {"resources": {"lora": {"adapters": {"a1": path}, "targets": [t for t in named if t != "o_proj"]}}}
+    with pytest.raises(ValueError, match=r"\['o_proj'\] are left out") as refused:
+        resolve_lora_adapters(lora_spec(declared_resources(model, config)), config)
+    assert "experts target" not in str(refused.value)
+    config = {"resources": {"lora": {"adapters": {"a1": path}}}}
+    spec = lora_spec(declared_resources(model, config))
+    assert not {"experts_gate_up_proj", "experts_down_proj"} & set(spec.targets)
+    with pytest.raises(ValueError, match="served only when that list names it"):
+        resolve_lora_adapters(spec, config)
 
 
 # --- adapters on the Hub ---------------------------------------------------------------------------
@@ -158,25 +245,37 @@ def test_every_placed_module_binds_at_the_released_size(name, size, world):
 # headers (key -> shape) read off the Hub, a few per key layout and size; `refused` is a
 # substring of the refusal an adapter must get, `served_without` what it is refused for
 HUB = {m: json.loads((FIXTURES / f"{m}_lora_hub_keys.json").read_text())["adapters"] for m in ("qwen3_5", "orpheus")}
-HUB["qwen3_omni_thinker"] = {"moe-experts": {  # packed tensors, run by the fused kernel
-    "refused": "experts.*not a LoRA-capable linear",
-    "keys": {
-        "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_A.weight": [2, 2048],
-        "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_B.weight": [4096, 2],
-        "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_A.weight": [2, 2048],
-        "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_B.weight": [768, 2],
+_OMNI_EXPERTS = {
+    "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_A.weight": [2, 2048],
+    "base_model.model.thinker.model.layers.1.self_attn.q_proj.lora_B.weight": [4096, 2],
+    "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_A.weight": [2, 2048],
+    "base_model.model.thinker.model.layers.0.mlp.experts.1.gate_proj.lora_B.weight": [768, 2],
+}
+HUB["qwen3_omni_thinker"] = {
+    # the experts targets are opt-in: served only where the YAML's `targets:` names them
+    "moe-experts": {"refused": "served only when that list names it", "keys": _OMNI_EXPERTS},
+    "moe-experts-named": {"targets": ["qkv_proj", "experts_gate_up_proj"], "keys": _OMNI_EXPERTS},
+    # PEFT's `target_parameters` on the stacked experts: one A and B for the container
+    "moe-experts-fused-3d": {"refused": "fused 3-D expert adapters are not read yet", "keys": {
+        "base_model.model.thinker.model.layers.0.mlp.experts.lora_A.weight": [256, 2048],
+        "base_model.model.thinker.model.layers.0.mlp.experts.lora_B.weight": [1536, 256],
+    }},
+    "moe-router": {
+        "refused": "TopKRouter holds weight matrices", "targets": ["qkv_proj", "experts_gate_up_proj"],
+        "keys": {**_OMNI_EXPERTS,
+                 "base_model.model.thinker.model.layers.0.mlp.gate.lora_A.weight": [2, 2048],
+                 "base_model.model.thinker.model.layers.0.mlp.gate.lora_B.weight": [128, 2]},
     },
-}}
+}
 
 
-def _validate(model: str, size: str | None, repo: str, keys: dict) -> list[LoraSpec]:
-    """What ``LoraReqConfig.validate`` does with an adapter, from its header."""
-    specs = _released(model, size)[0].get_lora_specs() if size != "tiny" else [
-        H.STACKS[model]().lora_spec(H.tiny())]
-    for spec in specs:
-        spec.apply_yaml_overrides(max_rank=512)
-        spec.check_adapter(repo, inspect_keys(spec, sorted(keys.items())))
-    return specs
+def _validate(model: str, size: str | None, repo: str, keys: dict, targets: list[str] | None = None) -> LoraSpec:
+    """What registering an adapter checks (``check_adapter_file``), from the shapes its header lists."""
+    spec = (_released(model, size)[0] if size != "tiny"
+            else H.STACKS[model]().lora_spec(H.tiny()))
+    spec.apply_yaml_overrides(max_rank=512, targets=targets)
+    spec.check_adapter(repo, H.header_info(spec, sorted(keys.items())))
+    return spec
 
 
 @pytest.mark.parametrize("model,repo", [(m, r) for m, entries in HUB.items() for r in sorted(entries)])
@@ -185,15 +284,15 @@ def test_hub_adapter_is_served_or_refused_by_name(model, repo):
     keys = entry["keys"]
     if "refused" in entry:
         with pytest.raises(ValueError, match=entry["refused"]):
-            _validate(model, entry.get("size"), repo, keys)
+            _validate(model, entry.get("size"), repo, keys, entry.get("targets"))
         if "served_without" not in entry:
             return
         keys = {k: v for k, v in keys.items() if entry["served_without"] not in k}
-    specs = _validate(model, entry.get("size"), repo, keys)
-    # no module is silently dropped: each is placed by exactly one of the model's specs
+    spec = _validate(model, entry.get("size"), repo, keys, entry.get("targets"))
+    # no module is silently dropped: each is placed on one of the model's targets
     for module in {parse_lora_key(normalize_lora_key(k))[0] for k in keys}:
-        placed = [s.resource_key for s in specs if (r := s.module_map(module)) is not None and r.target in s.targets]
-        assert len(placed) == 1, f"{module}: placed by {placed}"
+        ref = spec.module_map(module)
+        assert ref is not None and ref.target in spec.targets, module
 
 
 @pytest.mark.parametrize("model,repo,other", [
@@ -201,7 +300,7 @@ def test_hub_adapter_is_served_or_refused_by_name(model, repo):
     ("orpheus", "Tachyeon/orpheus-3b-sft-lora", "tiny"),
 ])
 def test_control_an_adapter_checked_against_another_size_is_refused(model, repo, other):
-    """Mechanism off for the header's shape check: refused, not loaded until a request fails."""
+    """Mechanism off for the adapter check's shape check: refused, not loaded until a request fails."""
     layer0 = {k: v for k, v in HUB[model][repo]["keys"].items() if ".layers.0." in k}
     with pytest.raises(ValueError, match="does not fit"):
         _validate(model, other, repo, layer0)
@@ -318,17 +417,21 @@ def _encode(sub, rid="r"):
 
 
 def _vision_pool(paths, max_slots=2):
-    """The vision node's pool, its spec linked to the LLM's as a deployment builds it."""
-    spec = qwen3_5_lora_specs(H.tiny_config(), vision_config())[1]
+    """The vision node's pool, from the model's one spec as the engine builds it."""
+    spec = qwen3_5_lora_spec(H.tiny_config(), vision_config()).for_node("vision_encoder")
     spec.apply_yaml_overrides(max_slots=max_slots, max_rank=4, adapters=dict(paths))
     spec.dtype, spec.backend = H.DTYPE, "torch"
-    return H.pool(spec)
+    return H.pool(H.pin_digests(spec))
 
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
-    lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
-    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease)
-    lora = step.steps[VISION_LORA]
+    from test_lora_pool import engine_lean
+
+    lora_pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter=adapter))
+    # lean as the engine sets it: a lease's bucket's, or what an eager step's rows allow
+    lean = engine_lean(lora_pool, [rid]) if lease is None else lease.bucket.lean
+    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease, lean=lean)
+    lora = step.steps[VISION_POOL]
     assert lora_pool.admit(lora, ctx).ok
     lora_pool.plan(lora, ctx)
     return lora, ctx
@@ -338,13 +441,13 @@ def _encode_leased(sub, lora_pool):
     """As the leased path runs it, for a step whose rows run no adapter (``can_lease``
     leases a one-row region to no other): the outer step plans only the LoRA rows of the
     patch embed and merger (attention is the region's), and the block loop's region plans
-    its own, both base-only."""
+    its own, both lean."""
     region_cfg = sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), H.DTYPE)[VISION_BLOCK_LOOP]
     bucket = 32
-    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, LoraBaseOnly(VISION_BLOCK_LOOP)))
+    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP, frozenset({VISION_POOL})))
     inp = _prompt(sub)
     outer = engine_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
-    assert set(outer.steps) == {VISION_LORA}
+    assert set(outer.steps) == {VISION_POOL}
     _admit(lora_pool, outer, "r", None)
     kwargs = sub.preprocess("encode", _engine("r"), [inp])
     with torch.no_grad():
@@ -352,9 +455,9 @@ def _encode_leased(sub, lora_pool):
             kwargs["pixel_values"], kwargs["indices"], kwargs["weights"], kwargs["position_ids"],
         )
         seq_lens = list(kwargs["segment_lengths"]["main"])
-        # the runner's step for the region (`lora_rows` over `region_step`)
-        region = lora_rows(region_cfg.region_step(["r"], seq_lens), sub.lora_keys)
-        assert sum(seg.span for seg in region.steps[VISION_LORA].segments) == PATCHES
+        # the runner's step for the region (`with_segment_steps` over `region_step`)
+        region = with_segment_steps(region_cfg.region_step(["r"], seq_lens), sub.segment_keys)
+        assert sum(seg.span for seg in region.steps[VISION_POOL].segments) == PATCHES
         lora, ctx = _admit(lora_pool, region, "r", None, walk=PIECEWISE_WALK, lease=lease)
         sub._frames.lengths = seq_lens
         pad = (0, 0, 0, bucket - PATCHES)
@@ -370,10 +473,10 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
     patch embed and merger still need, through the piecewise block loop."""
     path, ref = write_vision_adapter(tmp_path / "v")
     lora_pool = _vision_pool({"v": path})
-    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
     if mode == "eager":
         step = engine_step(sub, "encode", ["r"], [_prompt(sub)])
-        assert set(step.steps) == {VISION_ATTN, VISION_LORA}
+        assert set(step.steps) == {VISION_ATTN, VISION_POOL}
         _admit(lora_pool, step, "r", adapter)
         got = _encode(sub)
     else:
@@ -392,7 +495,7 @@ def test_qwen3_5_compiled_patch_embed_with_an_adapter_row_matches_eager(tmp_path
     count): equal to eager with an adapter row, at two patch counts."""
     path, _ = write_vision_adapter(tmp_path / "v")
     lora_pool = _vision_pool({"v": path})
-    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
     torch._dynamo.reset()
     compiled = torch.compile(sub.model.embed, dynamic=True, backend="inductor")
     for i, grids in enumerate(([(1, 4, 4)], GRIDS)):
@@ -414,13 +517,13 @@ def test_qwen3_5_text_only_adapter_holds_no_vision_slot(tmp_path):
     path, _ = write_vision_adapter(tmp_path / "v")
     text, _ = H.write_peft_adapter(tmp_path / "t", 2, ("self_attn.q_proj",), text_only=True)
     lora_pool = _vision_pool({"v": path, "t": text}, max_slots=1)
-    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
 
     def encode(rid, adapter):
         lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
         assert lora_pool.admit_retrieve(rid, "vision_encoder", "encode", None).ready
         ctx = StepContext(request_ids=[rid], graph_walk="encode", slot=0, capture=False)
-        assert lora_pool.admit(engine_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_LORA], ctx).ok
+        assert lora_pool.admit(engine_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_POOL], ctx).ok
         return lora_pool.slot_of(rid)
 
     assert encode("r0", "v") == 1  # the one slot, held
@@ -440,7 +543,7 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
     model = H.build_stack(base, config=dataclasses.replace(H.tiny_config(), tie_word_embeddings=True))
     assert model.lm_head.weight is model.model.embed_tokens.weight
     lora_pool = H.pool(H.lora_spec({"h": path}))
-    H.bind(model, H._Rows(), {H.LORA: lora_pool})
+    H.bind(model, H._Rows(), {LORA_RESOURCE_KEY: lora_pool})
     H.plan([lora_pool], [("r0", "h", 1), ("r1", "h", 1), ("r2", "h", 1)])  # three decode rows
     ids, hidden = torch.tensor([1, 2, 60]), H.rand(3, H.HIDDEN, seed=4)
     with torch.no_grad():
@@ -468,9 +571,9 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
                                  image_token_id=pad, mrope_section=[2, 1, 1])
     base = H.hf_text_weights()
     lora_pool = H.pool(H.lora_spec({"e": path}))
-    encoder = vision_encoder((pad,))
+    encoder = vision_encoder()
     llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config(), (encoder,))
-    llm.bind_node_resources({H.LORA: lora_pool})
+    llm.bind_node_resources({LORA_RESOURCE_KEY: lora_pool})
     llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64))
 
     table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]

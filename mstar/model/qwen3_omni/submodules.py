@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
@@ -55,7 +55,6 @@ from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
     compute_rope_freqs,
-    get_rope_index_audio,
     get_rope_index_text,
     get_rope_index_vision,
 )
@@ -275,9 +274,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self,
         thinker_model: nn.Module,
         config: Qwen3OmniModelConfig,
-        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__(prefill_token_buckets)
+        super().__init__()
         self.model = thinker_model  # Qwen3OmniThinkerModel
         self.config = config
         # only a decode row's token ends the loop; a prefill is not in it yet
@@ -293,9 +291,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Pre-compute inverse frequencies for 3D MRoPE
         self._inv_freq: torch.Tensor | None = None
 
-        self._audio_bos_embed: torch.Tensor | None = None
-        self._audio_eos_embed: torch.Tensor | None = None
-
         self._vision_bos_embed: torch.Tensor | None = None
         self._vision_eos_embed: torch.Tensor | None = None
 
@@ -308,29 +303,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 device=device,
             )
         return self._inv_freq
-
-    def _wrap_audio_input(self, audio_embeds: torch.Tensor):
-        # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
-        # sentinel token embeddings so the Thinker sees the same
-        # prompt layout the HF processor produces.
-        device = self.get_device()
-        if self._audio_bos_embed is None or self._audio_eos_embed is None:
-            audio_start_id = self.config.thinker.audio_start_token_id
-            audio_end_id = self.config.thinker.audio_end_token_id
-            start_tok = torch.tensor(
-                [audio_start_id], dtype=torch.long, device=device
-            )
-            end_tok = torch.tensor(
-                [audio_end_id], dtype=torch.long, device=device
-            )
-            self._audio_bos_embed = self.model.model.embed_tokens(start_tok)
-            self._audio_eos_embed = self.model.model.embed_tokens(end_tok)
-
-        return torch.cat([
-            self._audio_bos_embed,
-            audio_embeds,
-            self._audio_eos_embed
-        ], dim=0)
 
     def _wrap_vision_input(self, vision_embeds: torch.Tensor):
         # Wrap the vision span in ``<|vision_bos|>`` / ``<|vision_eos|>``
@@ -367,7 +339,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         name = self._EMBED_INPUTS.get(graph_walk)
         if name is not None and name in inputs:
-            # the attachment's row carries the text around it (`_spliced_row`)
+            # the attachment's row carries the text around it (`_audio_row`, `_spliced_row`)
             around = sum(text.shape[0] for text in inputs.get("text_inputs", ()))
             return InputSeqLenInfo(inputs[name][0].shape[0] + 2 + around)
         return None
@@ -400,17 +372,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
             seq_len = text_ids.shape[0]
             # A text row leaves its positions to the plan, which starts from the
             # counter a cache hit has already moved.
-            masks_for_talker = torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
-                talker_text_mask(text_ids, self.config) # text inclusion
-            ])
+            tensor_inputs = {}
+            if fwd_info.step_metadata.get("audio_output", True):
+                tensor_inputs["masks_for_talker"] = torch.stack([
+                    torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
+                    talker_text_mask(text_ids, self.config) # text inclusion
+                ])
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker
-                }
+                tensor_inputs=tensor_inputs,
             )
 
         # an audio or vision row's own positions start from the stream's counter
@@ -418,47 +390,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
             rid=fwd_info.rid_handle, label="main"
         )
         if graph_walk == "prefill_audio":
-            before, after = self._text_around(fwd_info, inputs)
-            audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
-            audio_len = audio_embeds.shape[0]
-
-            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            # scalar writes: a list index uploads from pageable memory, a host sync
-            mm_mask[0] = False
-            mm_mask[-1] = False
-
-            wrapped_embeds = self._wrap_audio_input(audio_embeds)
-            seq_len = audio_len + 2
-            # Position IDs:
-            #   - audio_start_token: text-like position at clip_pos
-            #   - audio tokens:      temporal increments per frame,
-            #                        h/w = clip_pos (handled by helper)
-            #   - audio_end_token:   text-like position right after
-            clip_pos = start_pos + before.shape[0]
-            start_pos_ids = get_rope_index_text(1, clip_pos, device)
-            audio_pos_ids = get_rope_index_audio(
-                audio_len,
-                clip_pos + 1,
-                device,
-                self.config.thinker.position_id_per_seconds,
-            )
-            end_pos_ids = get_rope_index_text(
-                1, clip_pos + 1 + audio_len, device
-            )
-            pos_ids = torch.cat(
-                [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
-            )
-            return self._spliced_row(before, after, wrapped_embeds, pos_ids, mm_mask, start_pos, seq_len)
+            return self._audio_row(fwd_info, inputs, start_pos)
 
         if graph_walk == "prefill_vision":
             before, after = self._text_around(fwd_info, inputs)
             vision_embeds = inputs["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
-            mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            # scalar writes: a list index uploads from pageable memory, a host sync
-            mm_mask[0] = False
-            mm_mask[-1] = False
+            mm_mask = self._media_mask(vision_len, fwd_info)
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)
             # Vision tokens use spatial 3D positions (temporal constant,
@@ -513,6 +452,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
             row.tensor_inputs["deepstack"] = deepstack
             return row
 
+    def _media_mask(self, media_len: int, fwd_info: CurrentForwardPassInfo) -> torch.Tensor | None:
+        """Which rows of an attachment and its two sentinels are media, for the
+        Talker; None for a request with no audio output, which never reads it.
+        ``fill_`` on a view: an index write of a Python scalar syncs with the host."""
+        if not fwd_info.step_metadata.get("audio_output", True):
+            return None
+        mask = torch.ones(media_len + 2, dtype=torch.bool, device=self.get_device())
+        mask[0].fill_(False)
+        mask[-1].fill_(False)
+        return mask
+
     def _text_around(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -523,33 +473,74 @@ class ThinkerSubmodule(ARNodeSubmodule):
         none = torch.zeros(0, dtype=torch.long, device=device)
         return torch.cat([none, *texts[:split]]), torch.cat([none, *texts[split:]])
 
+    def _audio_row(
+        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, start_pos: int,
+    ) -> ARNodeInputs:
+        """A clip between its sentinels and the text around it, from one
+        embedding call. Its positions are one range: text and audio both advance
+        all three MRoPE components by one a row."""
+        device = self.get_device()
+        cfg = self.config.thinker
+        before, after = self._text_around(fwd_info, inputs)
+        audio = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
+        p, clip = before.shape[0], audio.shape[0] + 2
+        n = p + clip + after.shape[0]
+        # the start sentinel's id; past its own slot the encoder's rows overwrite it
+        ids = torch.full((n,), cfg.audio_start_token_id, dtype=torch.long, device=device)
+        ids[p + clip - 1].fill_(cfg.audio_end_token_id)
+        ids[:p].copy_(before)
+        ids[p + clip:].copy_(after)
+        embeds = self.model.model.embed_tokens(ids)
+        embeds[p + 1:p + clip - 1].copy_(audio)
+        tensor_inputs = {"mrope_pos_advance": n, "text_token_ids": torch.cat([before, after])}
+        if fwd_info.step_metadata.get("audio_output", True):
+            # row 0 marks the clip's rows, row 1 the rows the Talker keeps of the text and sentinels
+            masks = torch.zeros((2, n), dtype=torch.bool, device=device)
+            masks[0, p + 1:p + clip - 1].fill_(True)
+            masks[1, p:p + clip].copy_(~masks[0, p:p + clip])
+            masks[1, :p].copy_(talker_text_mask(before, self.config))
+            masks[1, p + clip:].copy_(talker_text_mask(after, self.config))
+            tensor_inputs["masks_for_talker"] = masks
+        return ARNodeInputs(
+            input_seq_len=n,
+            input_embeds=embeds,
+            custom_pos_ids=(torch.arange(n, dtype=torch.float, device=device) + float(start_pos)).expand(3, -1),
+            tensor_inputs=tensor_inputs,
+        )
+
     def _spliced_row(
         self, before: torch.Tensor, after: torch.Tensor, media_embeds: torch.Tensor, media_pos_ids: torch.Tensor,
-        mm_mask: torch.Tensor, start_pos: int, media_advance: int,
+        mm_mask: torch.Tensor | None, start_pos: int, media_advance: int,
     ) -> ARNodeInputs:
         """One prefill row of an attachment between the text around it. The row
         places its own positions and declares its own advance: a prefix match cuts
         it, but only passing the whole row moves the counter, so a step prepared
         again starts from the same position."""
-        embeds, pos_ids, multimodal, included = [media_embeds], [media_pos_ids], [mm_mask], [~mm_mask]
+        embeds, pos_ids = [media_embeds], [media_pos_ids]
         if before.numel():
             embeds.insert(0, self.model.model.embed_tokens(before))
             pos_ids.insert(0, get_rope_index_text(before.shape[0], start_pos, before.device))
-            multimodal.insert(0, torch.zeros_like(before, dtype=torch.bool))
-            included.insert(0, talker_text_mask(before, self.config))
         if after.numel():
             embeds.append(self.model.model.embed_tokens(after))
             after_pos = start_pos + before.shape[0] + media_advance
             pos_ids.append(get_rope_index_text(after.shape[0], after_pos, after.device))
-            multimodal.append(torch.zeros_like(after, dtype=torch.bool))
-            included.append(talker_text_mask(after, self.config))
         input_embeds = torch.cat(embeds, dim=0)
+        masks = {}
+        if mm_mask is not None:
+            multimodal, included = [mm_mask], [~mm_mask]
+            if before.numel():
+                multimodal.insert(0, torch.zeros_like(before, dtype=torch.bool))
+                included.insert(0, talker_text_mask(before, self.config))
+            if after.numel():
+                multimodal.append(torch.zeros_like(after, dtype=torch.bool))
+                included.append(talker_text_mask(after, self.config))
+            masks["masks_for_talker"] = torch.stack([torch.cat(multimodal), torch.cat(included)])
         return ARNodeInputs(
             input_seq_len=input_embeds.shape[0],
             input_embeds=input_embeds,
             custom_pos_ids=torch.cat(pos_ids, dim=1),
             tensor_inputs={
-                "masks_for_talker": torch.stack([torch.cat(multimodal), torch.cat(included)]),
+                **masks,
                 "mrope_pos_advance": before.shape[0] + media_advance + after.shape[0],
                 # Ids cannot ride `input_ids`: the row is packed by embeds
                 "text_token_ids": torch.cat([before, after]),
@@ -572,7 +563,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
-        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        cut.tensor_inputs = {}
+        if "masks_for_talker" in tensors:
+            cut.tensor_inputs["masks_for_talker"] = tensors["masks_for_talker"][:, start:end]
         if graph_walk == "prefill_vision":
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
         if graph_walk != "prefill_text":
@@ -600,7 +593,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)
                 if walk in THINKER_DECODE_WALKS or (
-                    rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+                    rid in info and info[rid].step_metadata.get(FINAL_PREFILL, False)
                 )
             )
         prefill_tokens = {
@@ -897,7 +890,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         result: NameToTensorList = {}
 
         # The last prefill samples the first token
-        if request_info.step_metadata.get("is_last_prefill", False):
+        if request_info.step_metadata.get(FINAL_PREFILL, False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -928,7 +921,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len(model_inputs) > 1
 
-    # A deployment sets its own with `model_kwargs.prefill_token_buckets`.
+    # A deployment sets its own with the serving config's `prefill_token_buckets`.
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     # past 4 for thinker_mixed, whose decode rows ride in these captures
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -1174,7 +1167,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         **kwargs
     ):
         return_token = request_info.graph_walk in THINKER_DECODE_WALKS or (
-            request_info.step_metadata.get("is_last_prefill", False)
+            request_info.step_metadata.get(FINAL_PREFILL, False)
         )
         if not return_token:
             outputs.pop("new_token", None)
@@ -1365,10 +1358,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Codec hidden: [codec_embed(nothink, think_bos, think_eos,
         #                speaker, pad, bos)] (9 tokens)
         tc = self.config.talker
-        speaker_id = tc.speaker_id.get(speaker.lower())
-        if speaker_id is None:
-            logger.warning(f"Speaker {speaker} not implemented")
-            speaker_id = tc.codec_pad_id
+        # checked at admission (Qwen3OmniModel._resolve_voice)
+        speaker_id = tc.speaker_id[speaker.lower()]
 
         # Codec part of assistant prefix
         return self.talker_code_emb(torch.tensor([
@@ -1773,10 +1764,6 @@ class Code2WavSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    # No capture carries this key, so a batch of terminal flushes runs eager
-    # and skips the decode when none of its windows has a new frame.
-    _CONTEXT_ONLY_KEY = "context_only"
-
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()
         self.code2wav = code2wav_model
@@ -1799,37 +1786,9 @@ class Code2WavSubmodule(NodeSubmodule):
         # samples that ``postprocess`` drops, and the convs keep the input
         # lengths of a full window (bf16 cuDNN convs go wrong at some other
         # odd lengths on B200).
-        self.full_seqlen = self.config.code2wav.codec_max_window
-
-    @staticmethod
-    def _chunk(rid, per_request_input_metadata: Mapping[str, InputMetadata] | None):
-        meta = (per_request_input_metadata or {}).get(rid)
-        return meta.stream_chunks.get("codec_tokens") if meta is not None else None
-
-    @classmethod
-    def _context_only(
-        cls, request_ids, per_request_input_metadata: Mapping[str, InputMetadata] | None,
-    ) -> bool:
-        """Whether every window is a terminal flush with no new frames, which
-        emits no audio: a reply whose frames end on a chunk boundary ends with
-        one. Every stream item is a frame (the Talker withholds codec_eos), so
-        the counts say so."""
-        for rid in request_ids:
-            chunk = cls._chunk(rid, per_request_input_metadata)
-            if chunk is None or chunk.num_items > chunk.context_items:
-                return False
-        return bool(request_ids)
-
-    def cg_key_info(
-        self,
-        graph_walk: str,
-        per_request_info: Mapping[str, CurrentForwardPassInfo],
-        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        if self._context_only(list(per_request_info), per_request_input_metadata):
-            return self._CONTEXT_ONLY_KEY
-        return None
+        # As wide as any window can be: a fully primed stream's widest.
+        code2wav = self.config.code2wav
+        self.full_seqlen = max(code2wav.chunk_policy().window_sizes(code2wav.codec_left_context_frames))
 
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         num_quantizers = self.config.code2wav.num_quantizers
@@ -1856,17 +1815,20 @@ class Code2WavSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata | None = None,
         **kwargs
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
+        # The window's leading frames that an earlier window already decoded.
+        chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
+        context = chunk.context_items if chunk is not None else 0
+        if chunk is not None and chunk.is_final and chunk.num_items <= context:
+            # a terminal flush with no new frame (a reply whose frames end on a
+            # chunk boundary, or whose first frame was codec_eos): nothing to
+            # decode, and declined it still ends the stream
+            return None
         num_quantizers = self.config.code2wav.num_quantizers  # 16
         num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
         # Every item is a frame: the Talker withholds its codec_eos frame
         # (``TalkerSubmodule.check_stop``).
-        received = inputs.get("codec_tokens")
-        if received:
-            codec_tokens = received[0]
-        else:
-            # a stream whose first frame was codec_eos ends with an empty chunk
-            codec_tokens = torch.zeros((0, num_groups), dtype=torch.long, device=self.get_device())
+        codec_tokens = inputs["codec_tokens"][0]
         if codec_tokens.dim() == 3:
             # stacked (1, groups) frames, the Talker's batched rows
             codec_tokens = codec_tokens.flatten(0, 1)
@@ -1882,10 +1844,7 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
 
-        # The window's leading frames that an earlier window already decoded.
-        chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
         orig_seq_len = codec_tokens.shape[0]
-        context = chunk.context_items if chunk is not None else 0
 
         # pad sequence to full_seqlen for batching
         pad_len = self.full_seqlen - codec_tokens.shape[0]
@@ -1928,9 +1887,6 @@ class Code2WavSubmodule(NodeSubmodule):
         position_ids = torch.stack([
             inp.tensor_inputs["position_ids"] for inp in inputs
         ], dim=0)
-        metadata = engine_inputs.per_request_input_metadata
-        if not engine_inputs.captured and self._context_only(engine_inputs.request_ids, metadata):
-            return {"codec_tokens": batched_codec_tokens[..., :0], "position_ids": position_ids[..., :0]}
         return {"codec_tokens": batched_codec_tokens, "position_ids": position_ids}
 
     def forward_batched(
@@ -1950,18 +1906,10 @@ class Code2WavSubmodule(NodeSubmodule):
         the first chunk has no overlap. The overlap lets the vocoder warm up
         at chunk boundaries; ``postprocess`` cuts each request's new audio
         out of the window.
-
-        A zero-frame batch (terminal flushes with no new frames, see
-        ``preprocess``) decodes nothing and emits empty chunks.
         """
         request_ids = engine_inputs.request_ids
         if codec_tokens is None:
             return {rid: {} for rid in request_ids}
-        if codec_tokens.numel() == 0:
-            return {
-                rid: {"audio_chunk": [torch.empty(0, dtype=torch.int16, device=codec_tokens.device)]}
-                for rid in request_ids
-            }
 
         wavs = self.code2wav(
             codec_tokens, position_ids
@@ -2023,9 +1971,6 @@ class Code2WavSubmodule(NodeSubmodule):
         orig_seq_len = int(inputs.kwargs["frames"])
         left_context_size = int(inputs.kwargs["context"])
         audio = outputs["audio_chunk"][0].reshape(-1)
-        if audio.numel() == 0:
-            outputs["audio_chunk"][0] = audio
-            return
         # Each decoder block's ConvTranspose1d(2r, stride r, padding r) needs
         # the next frame, so a window decodes to ``tail`` samples (555 for
         # Qwen3-Omni) short of window * total_upsample. The next window

@@ -2,8 +2,9 @@
 
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
-``message.content``, audio into ``message.audio`` (base64 WAV), images into
-``image_url`` data-URL content parts.
+``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
+``image_url`` data-URL content parts, and the closing ``usage`` chunk into
+``usage`` and ``finish_reason``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.request_types import USAGE
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
@@ -22,16 +24,17 @@ from mstar.utils.utf8_stream import Utf8Stream
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
+    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    audio_format = _audio_format(req, sample_rate)
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
     args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
     request_id = rid("chatcmpl")
-    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
         # resolved once, before it is submitted: the response names the adapter that
         # served it, as vLLM's does, whether the model field or the lora_adapter kwarg
         # picked it
-        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs).model_kwargs
         served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
         if served is not None:
             model_name = served
@@ -44,25 +47,51 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
+            report_usage=True,
         )
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate),
+                _stream_events(batches, model_name, request_id, sample_rate, include_usage),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _audio_format(req, sample_rate: int) -> str:
+    """The container ``message.audio`` is sent in, from OpenAI's ``audio.format``: a speech
+    container, with ``pcm16`` naming raw PCM. Stream deltas are raw PCM16, so a stream takes only that."""
+    fmt = str((req.audio or {}).get("format") or ("pcm16" if req.stream else "wav")).lower()
+    allowed = ("pcm16",) if req.stream else tuple(
+        "pcm16" if f == "pcm" else f for f in media_io.audio_formats(sample_rate=sample_rate))
+    if fmt not in allowed:
+        how = "streamed" if req.stream else "produced"
+        raise ValueError(f"audio.format {fmt!r} cannot be {how} by this server; use one of: {', '.join(allowed)}")
+    return "pcm" if fmt == "pcm16" else fmt
+
+
+def _usage(reported: dict | None) -> dict:
+    """OpenAI ``usage`` from a ``usage`` chunk's metadata; zeros without one."""
+    prompt = (reported or {}).get("prompt_tokens", 0)
+    completion = (reported or {}).get("completion_tokens", 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _finish_reason(reported: dict | None) -> str:
+    return (reported or {}).get("finish_reason", "stop")
+
+
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
+    usage = None
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
@@ -70,16 +99,18 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
             audio_pcm.append(c.data)
         elif c.modality == "image":
             images.append(c.data)
+        elif c.modality == USAGE:
+            usage = c.metadata
 
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
 
     if audio_pcm:
-        wav = media_io.pcm16_to_wav_bytes(b"".join(audio_pcm), sample_rate)
+        audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
         message["audio"] = {
             "id": rid("audio"),
-            "data": base64.b64encode(wav).decode("ascii"),
+            "data": base64.b64encode(audio).decode("ascii"),
             "expires_at": now() + 86400,
             "transcript": text,
         }
@@ -96,12 +127,12 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": _finish_reason(usage)}],
+        "usage": _usage(usage),
     }
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate):
+async def _stream_events(batches, model_name, request_id, sample_rate, include_usage=False):
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -120,6 +151,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
     # first chunk, so nothing may go out before the model has produced one.
     role = {"role": "assistant"}
     failed = False
+    usage = None
     # a byte-level BPE token's bytes can end inside a character: hold them
     text = Utf8Stream()
     try:
@@ -135,6 +167,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
                     if content:
                         text_events.append(chunk({**role, "content": content}))
                         role = {}
+                    continue
+                if c.modality == USAGE:
+                    usage = c.metadata
                     continue
                 if text_events:
                     yield "".join(text_events)
@@ -167,5 +202,14 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         yield error(str(exc.detail), exc.status_code)
     if not failed:
         tail = text.flush()
-        yield chunk({**role, "content": tail} if tail else role, finish="stop")
+        yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage))
+        if include_usage:
+            yield sse({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [],
+                "usage": _usage(usage),
+            })
     yield SSE_DONE

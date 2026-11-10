@@ -16,11 +16,12 @@ Long uploads
     ask for the whole file.
 
     The adapter's ``long_form`` picks the mode, and a request can override it;
-    Whisper and Qwen3-ASR default to ``parallel``.
+    every transcription adapter in ``adapters.py`` defaults to ``parallel``.
 
     ``sequential`` is openai-whisper's ``transcribe`` loop.
     Windows run in order, each conditioned on the transcript so far
-    (``initial_prompt``) and on the language the first window settled. When
+    (``initial_prompt``, when the model reads it) and on the language the
+    first window settled. When
     the adapter ``seeks_by_timestamps`` every window is decoded with
     timestamps, and a window that stopped inside a segment gives that
     unfinished segment up: the next window starts where the last closed
@@ -201,7 +202,8 @@ class Window:
     raw_text: str = ""
     # the accepted parse (sequential mode drops an unfinished last segment)
     transcript: Transcript | None = None
-    temperature: float = 0.0
+    # the temperature it was accepted at; None where no retry ladder ran (the request's)
+    temperature: float | None = None
     compression_ratio: float = 0.0
 
 
@@ -439,11 +441,11 @@ def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[st
 async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str | None:
     """The window's raw text, or None once the client is gone (collect_results
     aborted the window and returned nothing). collect_results releases the
-    request on every path but cancellation, which the caller's ``_release``
-    covers."""
+    request on completion, HTTP errors, and cancellation; ``_release`` covers
+    windows whose collection never started."""
     try:
         chunks = await api.collect_results(window.request_id, raw_request)
-    except HTTPException:
+    except (HTTPException, asyncio.CancelledError):
         inflight.discard(window.request_id)
         raise
     inflight.discard(window.request_id)
@@ -518,13 +520,16 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[s
     # route-added conditioning and timestamps go only to a model that reads them
     seeks = bool(adapter.seeks_by_timestamps) and not planner.single and _reads(api, "timestamps")
     conditions = _reads(api, "initial_prompt")
+    samples = _reads(api, "temperature")
     offset = 0.0
     while True:
         window = planner.whole() if planner.single else await asyncio.to_thread(planner.window_at, offset)
         carry = _carry_over(texts[reset_since:]) if texts and conditions else None
         for temperature, prompt in _attempts(req, carry):
             attempt = _window_request(req, language, prompt, timestamps=seeks)
-            if temperature != (req.temperature or 0.0):
+            # every attempt carries its rung, so the greedy retry without the
+            # prompt stays greedy whatever the checkpoint defaults to
+            if samples:
                 attempt = attempt.model_copy(update={"temperature": temperature})
             _submit(api, adapter, attempt, window, streaming=False, inflight=inflight)
             text = await _collect(api, window, inflight, raw_request)
@@ -574,7 +579,8 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
         for seg in window_segments:
             segments.append({
                 **seg, "start": seg["start"] + window.offset, "end": seg["end"] + window.offset,
-                "temperature": window.temperature, "compression_ratio": window.compression_ratio,
+                "temperature": (req.temperature or 0.0) if window.temperature is None else window.temperature,
+                "compression_ratio": window.compression_ratio,
             })
         for word in t.words:
             words.append({**word, "start": word["start"] + window.offset, "end": word["end"] + window.offset})
@@ -670,7 +676,8 @@ async def create_transcription(
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
     finally:
-        # a read cancelled before its tail finished leaves the tail in inflight for _release
+        # Started reads release themselves on cancellation; _release handles
+        # tails whose read task never started.
         for read in tail_reads.values():
             read.cancel()
         await asyncio.gather(*tail_reads.values(), return_exceptions=True)

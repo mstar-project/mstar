@@ -131,7 +131,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, no_forward_rids=set(),
             final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
@@ -180,7 +180,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, no_forward_rids=set(),
             final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
@@ -410,6 +410,36 @@ def _input(uuid, streaming=True):
             request_id="X", graph_walk="listen", fwd_index=0, random_seed=0, max_tokens=0,
         ),
     )
+
+
+def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_reading_it():
+    """A TP follower can handle rank 0's DRAIN, and send READS_DONE, before the conductor's NEW_REQUEST. Rank 0's
+    moves for the request wait until the follower holds the request, so the follower takes it in with no read and
+    nothing scheduled. Rank 0's parked REMOVE then tears it down."""
+    known, ingested = [], []
+    w = _worker(known_rids=known, is_follower=True)
+    w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
+    w.request_state.add_request = lambda rid, info: w.request_state.per_request_info.update(
+        {rid: SimpleNamespace(stream_buffers={})}
+    )
+    w.engine_manager.add_request = lambda rid, cfgs, info: ingested.append(rid)
+    w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
+    w.tensor_manager.register_request = lambda rid, cfg: None
+    w.tensor_manager.start_read_tensors = lambda *a, **kw: pytest.fail("a drained request started a read")
+
+    _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
+    assert len(_reads_done(w)) == 1
+    _remove(w, request_id="X", source=MessageSource.TP_RANK_0)
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    w.ingest._add_new_request(SimpleNamespace(
+        request_id="X", request_info=info, initial_inputs=[],
+        partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
+    ))
+
+    assert ingested == ["X"], "rank 0's moves for a drained request would wait for good"
+    assert w.lifecycle.failed_rids == {"X"} and "X" in w.lifecycle.pending_removes and not w.lifecycle._parked
+    w.pipeline._teardown(w.pipeline.in_flight_rids)
+    assert w.forced == ["X"]
 
 
 def _input_worker(**kwargs):

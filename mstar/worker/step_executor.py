@@ -40,6 +40,7 @@ from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs,
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation
@@ -279,7 +280,7 @@ class GpuStepBody:
 class StepExecutor:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
-        lockstep: Lockstep, lifecycle: RequestLifecycle, *,
+        lockstep: Lockstep, lifecycle: RequestLifecycle, preemption: Preemption, *,
         wakeup_event=None, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None,
         device_capability: DeviceCapability | None = None,
@@ -298,6 +299,7 @@ class StepExecutor:
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
+        self.preemption = preemption
         self.wakeup_event = wakeup_event
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
@@ -647,8 +649,8 @@ class StepExecutor:
                 torch.accelerator.synchronize(self.device)
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
-        lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
+        the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:
@@ -664,15 +666,24 @@ class StepExecutor:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
-        if landed:
+        ended = {
+            rid: run for rid in rebuild
+            if rid in ran and (run := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
+        if ended:
             # the step's kernels read the prepared input released here
             self.wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, run in ended.items():
+                self.preemption.rebuilt(rid, node, run.ran)
+                # A row from a record prepared its own input. A prompt's step in progress goes on from the
+                # input the engine keeps for the prompt, which waited aside while the rows before it ran.
+                if run.row.record is not None:
+                    engine.release_chunk_inputs(rid, node)
+                if self._rebuilds.rebuilding(rid, node):
+                    if self._rebuilds.cursor(rid, node).resumes_prefill:
+                        engine.restore_chunk_inputs(rid, node)
+                    continue
                 engine.land_rebuild(node, rid)
         for rid in rebuild:
             outputs.pop(rid, None)
@@ -723,13 +734,14 @@ class StepExecutor:
             range_pop(synchronize=False)
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
         # If any nodes in the batch have "overstayed" their loop stop, then make
-        # sure to not route their outputs
-        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.cached_rids
+        # sure to not route their outputs. A row the cache served, or one that
+        # declined its stream's final chunk, ran no forward but completes its node.
+        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.no_forward_rids
         if batch_N.speculative_new_iter:
             stopped_rids = self._graph_runtime.pending_loop_stop_rids(
                 list(batch_N.batch.rids_by_walk()), batch_N.loop_name,
             )
-            stopped_rids &= set(batch_N.node_batch.request_ids)
+            stopped_rids &= valid_rids
             for stopped_rid in stopped_rids:
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
@@ -780,8 +792,8 @@ class StepExecutor:
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
         # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
-        # the routing/output loops below only touch rids that ran or that the
-        # cache served.
+        # the routing/output loops below only touch rids that ran or that
+        # complete without a forward.
         for rid in list(batch_N.batch.request_to_worker_graph):
             if rid not in valid_rids:
                 batch_N.batch.discard_rid(rid)
@@ -819,16 +831,19 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        self._rebuilds.record(batch_N.node_batch, {
+            rid: self.request_state.get_fwd_info(rid, batch_N.partition) for rid in batch_N.node_batch.cached_rids
+        })
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=batch_N.batch.incomplete_node_rids,
         )
-        self._rebuilds.keep_samples(
+        forgot = self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
+        self.preemption.refuse_drops(forgot, batch_N.node_name)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -910,6 +925,7 @@ class StepExecutor:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
@@ -1274,13 +1290,11 @@ class StepExecutor:
                     buffered_publish.add(rid)
         laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
-        # new-token counts (the inline token is not counted) and no stream
-        # buffers, and an empty entry per rid cost a dict each to build and to
-        # extract on the runtime side. A rid left out gets nothing added,
+        # new-token counts (the inline token is not counted), and an empty
+        # entry per rid cost a dict each to build and to extract on the
+        # runtime side. A rid left out gets nothing added,
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
-        consumed = self.streams.consumption_batch(send_rids)
-        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -1292,9 +1306,6 @@ class StepExecutor:
             ),
             new_token_counts=ParallelList(
                 ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
-            ),
-            stream_tokens_consumed=ParallelList(
-                [rid for rid, _ in consumed], [c for _, c in consumed],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
@@ -1313,52 +1324,46 @@ class StepExecutor:
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """The values of a client signal that can ride inline this step.
 
-        Taken off the stop check's host copy, one ``tolist`` for the batch.
-        Every rid must have a row, or the step keeps the tensor path for the
-        whole batch: the runtime applies the values positionally.
+        Taken off the stop check's host copy, one ``tolist`` for the batch,
+        in ``rids`` order. A row with no host row ran no forward (see
+        ``ExecutingBatch.no_forward_rids``): its value is None, so it alone
+        takes the tensor path.
         """
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
         if not batch_N.batch.request_walks:
             return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
         # Per real walk: a combined walk is no walk of the submodule's.
-        walk_of = batch_N.batch.walk_of
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
-        candidates: dict[str, tuple[str, set[str]]] = {}
+        candidates: dict[str, str] = {}
         for walk in walks:
             for signal, buffer_name in engine.inline_client_signals(
                 batch_N.node_name, walk,
             ).items():
-                candidates.setdefault(signal, (buffer_name, set()))[1].add(walk)
-        if not candidates:
-            return None, []
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        for signal, (buffer_name, inline_walks) in candidates.items():
+                candidates.setdefault(signal, buffer_name)
+        for signal, buffer_name in candidates.items():
             if signal not in signals:
                 continue
             buf = host_rows.buffers.get(buffer_name)
             if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
                 continue
             values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
-            out = []
-            for rid in rids:
-                i = row_of.get(rid)
-                if i is not None and i < len(values):
-                    out.append(values[i])
-                elif walk_of(rid) in inline_walks:
-                    return None, []  # an inline row with no value: tensor path
-                else:
-                    out.append(0)  # its walk sends this signal no inline value
-            return signal, out
+            return signal, self._values_by_rid(values, host_rows, rids)
         return None, []
+
+    @staticmethod
+    def _values_by_rid(values: list[int], host_rows: "HostRows", rids: list[int]) -> list[int | None]:
+        """``values``, in host-row order, in ``rids`` order; None for a rid with no host row."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids[:len(values)])}
+        return [values[row_of[rid]] if rid in row_of else None for rid in rids]
 
     def _inline_emit_one_walk(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """`_inline_emit_values` for a step of one walk: every row takes the
         value, so one comprehension, and a slice when the host rows are in
         the batch's order (the usual case)."""
@@ -1372,14 +1377,8 @@ class StepExecutor:
             values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
             n = len(rids)
             if len(values) >= n and list(host_rows.request_ids[:n]) == rids:
-                out = values[:n]
-            else:
-                row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-                try:
-                    out = [values[row_of[rid]] for rid in rids]
-                except (KeyError, IndexError):
-                    return None, []
-            return signal, out
+                return signal, values[:n]
+            return signal, self._values_by_rid(values, host_rows, rids)
         return None, []
 
     @staticmethod

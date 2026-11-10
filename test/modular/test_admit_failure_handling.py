@@ -85,7 +85,9 @@ class _FakeEngine(Engine):
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), rows_only=False)
+    return SimpleNamespace(
+        request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), no_forward_rids=set(), rows_only=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,6 +145,10 @@ class _SchedEngine(_Engine):
         del node_name, resources
         return rid in self.holders
 
+    def can_offload(self, node_name, rid):
+        del node_name, rid
+        return True
+
     def offload_request(self, node_name, rid, affected_resources=None):
         del node_name, affected_resources
         self.offloaded.append(rid)
@@ -182,7 +188,7 @@ def _batches(reason, prepared=("r0", "r1"), cached=()):
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
+        node_name="node", admit_error=reason, request_ids=list(prepared), no_forward_rids=set(cached),
         failed_resource=None,
     )
     return batch, node_batch
@@ -192,7 +198,7 @@ def _refused(batch, reason, failed_resource="kv"):
     """What a step of all of ``batch``'s rows comes back as when admit refuses it."""
     return SimpleNamespace(
         node_name=batch.node_name, admit_error=reason, failed_resource=failed_resource,
-        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(), no_forward_rids=set(),
     )
 
 
@@ -578,6 +584,16 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
     assert _victim(worker, {"r0", "r1"}) == "r1"
 
 
+def test_a_request_its_resources_keep_on_the_device_is_no_eviction_candidate():
+    """A KV pool keeps a guaranteed request on the device. Chosen as the victim, its offload moved nothing, and the
+    refused step got no room."""
+    worker = _evicting_worker(["r0", "r1", "g"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    _engine(worker).can_offload = lambda node, rid: rid != "g"
+
+    assert _victim(worker, {"r9"}) == "r1", "g was chosen as the victim"
+    assert _engine(worker).offloaded == ["r1"]
+
+
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
     """A mixed batch limited to one row: every step under it holds one walk
     and carries that walk's label. The first of them to admit has to lift
@@ -659,8 +675,8 @@ class _FakeMgmt(SubmoduleManagement):
         super().__init__(
             submodule=submodule, forward=None, forward_batched=None, joint_comm_group=None, resources={}, head_shards=1,
         )
-        self._num_slots = num_slots
-        self._next_slot = next_slot
+        self._slots.num_slots = num_slots
+        self._slots.next_slot = next_slot
         self._seen = seen
         self._slot_raise_at = slot_raise_at
 

@@ -13,17 +13,17 @@ RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step
 _unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{held_until, parked}
 (purged by clear), Lockstep.read_failed_rids (purged by clear),
-Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info, _fwd_by_partition}
-and StreamBufferManager._rids (purged by remove_request), the engine's and
-tensor manager's per-request state (including ChunkingManagement.prepared,
+Rebuilds.{_kept, _keeps_ids, _prefilling, _writes, _cursors}, Preemption._preempted,
+RequestStateManager.{per_request_info, _fwd_by_partition} and StreamBufferManager._rids
+(purged by remove_request), the engine's and tensor manager's per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
-_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
-_admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
+_leases, _restores, _snap_writes, _decode, _unkeyed, _chunk_ends,
+_admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
-release), SamplerCells._cells (purged by the sampler's remove_request), and
-WorkerProfileInfo.
+release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
+sampler's remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

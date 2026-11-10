@@ -30,7 +30,7 @@ def _resource(monkeypatch, slots: int, max_bs: int, comm_group=None, ingraph: bo
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
     monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", str(slots))
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU, comm_group=comm_group)
+    res = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=CPU, comm_group=comm_group)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=s) for s in (0, 1)], max_bs, 1)
     return res
@@ -68,6 +68,15 @@ def test_a_row_taken_for_a_request_another_resource_holds_back_is_given_back(mon
     res.unreserve("a")
     assert not res._cg_buffers.has_slot("a") and res._cg_buffers.free_rows == 2
     assert res.ask("a", NODE, WALK) is ASKS
+
+
+def test_a_request_passes_the_first_one_only_while_a_row_is_left_for_it(monkeypatch):
+    res = _resource(monkeypatch, slots=2, max_bs=2)
+    for rid in ("p", "q"):
+        res.ingest_request(rid)
+
+    assert res.reserve_past("p", NODE, WALK, None) is None, "a request waited though a row was left for the first one"
+    assert res.reserve_past("q", NODE, WALK, None) is not None, "a request passed into the first one's last row"
 
 
 def test_without_fixed_rows_the_sampler_admits_every_request(monkeypatch):

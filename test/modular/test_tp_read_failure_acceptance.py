@@ -63,7 +63,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.graph.runtime.base import PhasedPostprocess
-from mstar.utils.ipc_format import WorkerMessageType
+from mstar.utils.ipc_format import OffloadDelta, WorkerMessageType
 
 HERE = Path(__file__).resolve().parent
 
@@ -135,14 +135,15 @@ def _span(kind: str, rid: str) -> int:
 
 
 def _step_metadata(kind: str, rid: str) -> dict:
-    """The walk's step metadata: a grid prompt's ``MEDIA_LAYOUT``, as intake
-    lays it out."""
+    """The walk's step metadata: the walk plan's mark on the step before
+    decode, and a grid prompt's ``MEDIA_LAYOUT``, as intake lays it out."""
+    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.model.multimodal import MEDIA_LAYOUT
 
     if kind == "text":
-        return {}
+        return {FINAL_PREFILL: True}
     spec = _PROMPTS[kind][rid]
-    return {MEDIA_LAYOUT: {
+    return {FINAL_PREFILL: True, MEDIA_LAYOUT: {
         "offset": [spec["texts"][0] + 1], "tokens": [_span(kind, rid)],
         "output": ["vision_embeds"], "grid": [list(spec["grid"])],
     }}
@@ -262,7 +263,7 @@ def _submodule_class():
                     hidden_size=HIDDEN, stop_token_ids=(),
                 ),
                 vision_config=SimpleNamespace(spatial_merge_size=MERGE),
-                encoders=(vision_encoder((PAD,)),),
+                encoders=(vision_encoder(),),
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)
@@ -377,13 +378,17 @@ def _kv_config(tokens):
 
 
 def _engine(rank, group, kv, prefix_cache, graph_runtime):
+    from functools import partial
+
     from mstar.engine.engine import Engine, SubmoduleManagement
     from mstar.engine.resources import StepRunner
 
     sub = _submodule_class()(group, rank)
     engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
     if rank == 0:
-        engine._tp_leader_nodes = {NODE}
+        engine._tp_leader_nodes, engine._resident_delta = {NODE}, OffloadDelta.new()
+        # as `Engine.__init__` wires it on rank 0, so the follower replays rank 0's reservations
+        kv.journal = partial(engine._journal, pool=KV)
     else:
         engine._tp_follower_nodes = {NODE}
     engine._resources = {KV: kv}
@@ -682,6 +687,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         parallel_nodes={NODE}, parallel_leader_nodes={NODE} if rank == 0 else set(),
         is_tp_follower=rank != 0, launch_wait_s=1.0, max_consecutive_spec=1,
     )
+    w.lockstep._followers = {NODE: list(WORKERS[1:])} if rank == 0 else {}
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
             getattr(w, setup)()
@@ -699,7 +705,7 @@ def _probe(engine, rid, tokens):
     )
     hits = engine.decide_cached_prefix(batch)
     leases = hits.get(rid, {})
-    return {label: list(pages) for label, pages in leases.items()}
+    return {label: list(lease.pages) for label, lease in leases.items()}
 
 
 def _reporting_failures(all_reduce, rank, outbox):

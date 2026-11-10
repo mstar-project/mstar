@@ -214,13 +214,16 @@ environment, and so does a variable that expands to nothing (``--api-key "$UNSET
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
 ``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`. The standalone Nemotron realtime server
-(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
-variable.
+:doc:`clients`.
 
 Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
+
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
@@ -252,6 +255,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``unpausable_outputs``
+     - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
+       that streams one of them reserves its whole KV footprint and is never preempted once it
+       starts (see below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]``
+       unless the model declares otherwise. ``[]`` gives a voice deployment a fast first chunk
+       under KV pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
@@ -278,7 +287,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_call_input_mb``
      - *(optional, default 512)* For a model that takes live client input: how many MiB
        of files (and append text) one call may send over its whole life, its opening
-       message's included.
+       message's included, and of decoded audio samples a route appends
+       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
+       included).
        A live call's opening message past it is refused, and an append that would pass
        it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
        decoded input is larger than its files, and how much of it waits in buffers
@@ -320,6 +331,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        closes its socket with ``1009`` before any handler sees it, so the client gets no
        error frame. Raise it for clients that send big uncompressed frames, such as several
        raw camera images in one openpi observation.
+   * - ``scheduling``
+     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
+       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
+       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
+       may go without running before it goes first, for every key its entry leaves unbounded.
+       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
+       a node, a walk or both, which replaces the model's list; the most specific entry for a
+       pair decides. An entry naming nothing the model runs, a negative priority, a
+       ``max_wait`` under 1, two entries for the same target or an unknown field fail
+       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
+       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -334,6 +356,56 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, one token budget for every walk the model budgets, or a
        mapping of walk -> budget; null turns a walk's chunking off. Overrides the
        model's defaults. See *Chunked prefill budgets* below.
+   * - ``prefill_token_buckets``
+     - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
+       graph capture is taken at, in place of the model's. A name is a walk the
+       node runs, for its packed captures on that walk (the model's
+       ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
+       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of
+       one of its piecewise packed regions, for that region's ``total_tokens``
+       (BAGEL's ``vit_block_loop``, OmniVoice's ``backbone_layers``). A step
+       pads to the smallest rung that holds it, and a longer one runs eagerly.
+       A walk's ladder is a list, or a
+       mapping of min batch size -> list for a ladder per range of batch sizes:
+       ``{1: [...], 2: [...]}`` captures one request on the first and every larger
+       batch on the second (a larger batch size's ladder must reach at least as
+       far). A walk's ladder runs to the first rung that holds the most tokens a
+       step its capture replays runs: its token budget (``max_batch_tokens``; a walk
+       inside a combined walk runs under the combined walk's), or, for a combined
+       walk's steps, past it where the capture's widest batch of one-token decode
+       rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
+       that many. The rungs past it, which no step would reach, are dropped and
+       logged. A ladder is kept whole
+       where its steps run under no budget or may hold a prompt of a walk whose
+       chunking ``max_batch_tokens`` turned off, which runs whole, as is a
+       region's. A vision tower's ``vision_block_loop`` and an AuT encoder's
+       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
+       every other region keeps its own batch cap. A tower's attention resource is
+       sized from the model's own top rung, and a batch with more attention segments
+       than it holds is split into its requests, a request still over it running
+       eagerly, so a ladder past that rung replays its longer steps only with the
+       resource raised under ``resources``: ``vision_attn: {max_segments_per_step: N}``
+       for a vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N
+       frames or windows a step), and ``audio_attn: {max_segments_per_request: N}`` for
+       Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung adds captures,
+       graph memory and startup time. Loading fails, before any weights load, if the
+       setting is not a mapping of node -> name -> ladder, names a node in no node
+       group or a walk of the model that does not run the node (a node runs the walks
+       it is in and its combined walks), a ladder is not a non-empty list of distinct
+       positive ints, or a name that is no walk has a mapping. Warmup fails on a walk
+       whose steps replay another walk's capture, naming that walk, on a walk the node
+       captures by batch size alone (a ``decode`` capture), on a walk of a node whose
+       model captures no walk at all (a vision tower, an AuT encoder), naming its
+       regions, on a name that is neither a walk nor a region of the node or is both
+       (on a node whose model declares no region, every name that is no walk), and on a
+       region captured by batch size alone; a walk or region the node captures nothing
+       for at this deployment (a model that turns its captures off, such as GLM-5.2 with
+       ``dsa_long_context``) is logged and skipped. Loading also fails where a model
+       refuses a region whose buckets it uses elsewhere: CosyVoice3's
+       ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
+       key replaces ``model_kwargs.prefill_token_buckets``,
+       ``prefill_batched_token_buckets`` (GLM-5.2), ``backbone_token_buckets``
+       (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.
@@ -354,22 +426,31 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``min_chunk_tokens``
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
-       chunked walk. See *Chunked prefill budgets* below.
+       chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
+       up to a page. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
-     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
-       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
-       keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
-       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
+     - *(optional, default 64, or 1024 where a node copies media)* MiB of pinned host memory a worker serving a
+       node whose model declares a rebuild policy sets aside at startup for what its requests are rebuilt from
+       after a drop from the KV cache: their prompt ids, and, where the node's rebuild policy copies what a walk
+       reads besides the ids, those copies too, such as Qwen3.5's encoder output for a prompt with images or
+       video at one rank. A request takes its room when it arrives, 8 B a token (int64) and its copies at the
+       values per slot the policy declares in the node's dtype, and gives back what it doesn't use once its
+       prompt and copies are kept. One the pool can't hold then is never dropped on that node, though it can
+       still move to the host with ``cpu_offload_pages``. Every rank of a TP, SP or CFG node keeps the ids,
+       since each rank rebuilds the requests its first rank drops, and every rank but the first sets aside twice
+       this, since it also holds the ids of requests the first rank has torn down until it tears them down too.
+       A non-negative int, and 0 sets no pool aside, so no request is dropped there and the node preempts as
+       one with no rebuild policy does. The pool is rounded up to a power of two, as the pinned allocator would
+       round it anyway.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
        a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
+       ``--cache-dir``); its modality comes from the extension, or give
+       ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
@@ -450,12 +531,20 @@ them by that name:
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     sampler:
+       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
+argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
+whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
+:doc:`adding_models`), so a deployment that never samples greedily can save their capture
+memory and time this way.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
@@ -476,23 +565,63 @@ Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to 
 freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
 what it refuses.
 
-On a single rank, a request waits at the head of its pool's queue until its prompt fits
-beside the prompts already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that
-can't fit in its pool at its full output length gets a 400 if it asked for that length,
-and otherwise has the model's default length cut until it fits. The pool
-reserves only prompts, so it still has to hold the decode of every request allowed to run
-at once, and a decode step that finds no page outside the admitted prompts holds its
-requests until they time out.
-``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
-frees only the device pages no other running request reads, though, so a request that
-shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is
-copied to the host once no request holds it, and a later request whose prefix the device
-evicted copies it back from there. So the host pool should hold more pages than the device's
-prefix cache.
+A request waits at the head of its pool's queue until its reservation fits beside the
+reservations already admitted. A request behind it starts first when its own pages fit, output
+included, less the cached part of its prompt that running requests keep from eviction and, on a
+node with recurrent state, that a snapshot can restore. While the head waits, no request behind it starts in the pages such a request
+frees. A cache hit on a page only the prefix index holds counts as a page the request takes. A request that can't fit in its
+pool at its full output length gets a 400 if it asked for that length, and otherwise has the
+model's default length cut until it fits. A request that can be rebuilt reserves only its
+prompt, so a decode step can find no page outside the reservations. The worker then takes pages
+from the newest requests, those that arrived after the request that ran short, until they cover
+its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
+its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
+ran short gets the pages freed, up to its shortage. When the newer requests can't cover it, it
+moves to the host if the host pool can hold all of its pages, and otherwise waits holding its
+pages. A request on the host, a dropped one and one waiting for pages wait outside the queue, so a
+new prompt that fits still starts, unless one of them is the oldest request in its pool, which no
+newer prompt passes unless its room is already allotted. They are tried oldest first, before the queue. The oldest refused request that moves can let
+in moves newer requests that wait holding pages, to the host or by a drop as above, and the pages they free are set aside for
+it. A request on the host returns once its pages and one more page fit, or every page its
+grant needed when it moved itself, and its pages are then copied back. A dropped request returns
+once its prompt, or its history and one more page if that is larger, fits, counting no prompt page
+another request holds, then recomputes its KV in prefill chunks cut by its walk's chunk budget, and isn't dropped again until it writes a token past
+that. A request that streams an output in
+``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
+and is never dropped or moved to the host. Voice requests then queue when the pool is short and
+are never preempted mid-stream. A request with images, video or audio can be dropped at one rank
+when its node's rebuild policy names the walks its prompt runs in: the worker keeps a host copy of
+what each prefill step read, the encoder's output included, and rebuilds the request by running
+those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image chat, a
+Qwen3-Omni request with audio or images in and text out, or a Higgs Audio transcription. A Qwen3-Omni
+request with video in and text out and a Bagel think-mode edit with no guidance key only part of their
+prompt, which a rebuild can't key again, so they are rebuilt only with the prefix cache off for the
+request or the server. A request no drop can free, because it holds KV made from another node's outputs or from
+media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
+it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
+grows with each page the request takes after that, so its move always fits. Bagel generations, which
+write a label per guidance, and requests with media above one rank are such requests. When the host
+pool has no room for it at admission, or later once the device has room for the rest of its
+footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
+host pool logs it. While the device has no room for that either, nothing is logged: newer requests
+move for it as for any request that runs short, and otherwise it moves to the host, into the room
+set aside for it, and returns once its whole footprint fits. So ``cpu_offload_pages`` also sets how
+many pages such requests can hold with only their prompt reserved.
+
+Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
+step that follows, so every rank admits each step from the same reservations. On a node with a
+second paged KV cache, such as Whisper's decoder, a decode step that finds no page and nothing to
+offload holds its requests until they time out. Elsewhere, a request that runs short, when moving
+or dropping the newer requests wouldn't cover it and the host pool can't hold it, waits holding its
+pages until its shortage fits. Several such requests can wait on each
+other. ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
+pool's pages divided by the pages one request needs, prompt and output together, is a safe value.
+``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping it. An
+offload frees only the device pages no other running request reads, though, so a request that
+shares most of its prompt frees little. Offload helps a pool that runs short now and then. It
+doesn't replace the cap. With a host pool and the prefix cache on, a cached page is copied to the
+host once no request holds it, and a later request whose prefix the device evicted copies it back
+from there. So the host pool should hold more pages than the device's prefix cache.
 
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
@@ -526,7 +655,16 @@ A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
-for the next step rather than running the step over its budget.
+for the next step rather than running the step over its budget. Under ``fifo`` the first
+prompt in line, started or not, keeps that much of each step from the other prompts, so a
+stream of short ones cannot hold it off.
+
+A node whose resources keep state only on a grid of tokens counted from where a chunk starts
+(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each
+chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
+default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
+up to a page, a budget under a page fails loading, and one under three pages logs a warning:
+a step can then leave up to a page, less one token, of its budget unused.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
@@ -776,10 +914,13 @@ DROID robot's normalization stats:
 With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
 actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
 of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
-[-1, 1].
+[-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
+``max_state_dim``, 32 when it sets none); anything else is a 400.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
+sampling knob means.
+Give each request its own ``seed`` for independent
 samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
 with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
 most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
@@ -1019,7 +1160,7 @@ Metrics
 
 Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
 Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
-(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
+(``pip install 'mstar-ai[metrics]'``); without it the server stops at startup with that
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
@@ -1107,7 +1248,7 @@ or ``increase()``.
   request needs the room.
 - ``mstar_rebuild_host_bytes_used{model_name, component}``,
   ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
-  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids and host copies, and the pool's size.
   A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
