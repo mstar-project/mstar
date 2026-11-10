@@ -5,6 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -180,6 +181,16 @@ def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceS
             return problems
         logger.info("KV %s %s: its prefix cache is off", name, why)
         cfg.prefix_cache = False
+    if window is not None and cfg.prefix_cache:
+        full, sliding = cfg.groups
+        # A window page is cached once the full page its last token is on fills (`_index_window_pages`). A step of
+        # a few tokens can roll it out of the window before then, when the window is shorter than that gap.
+        if sliding.retention.context_budget + math.gcd(full.page_size, sliding.page_size) < full.page_size:
+            logger.info(
+                "KV %s keeps a %d-token window beside %d-token full pages, so short steps release some window "
+                "pages before they are cached, and a repeat that needs them hits less",
+                name, sliding.retention.context_budget, full.page_size,
+            )
     return problems
 
 
