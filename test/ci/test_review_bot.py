@@ -985,7 +985,9 @@ class TestImprove(unittest.TestCase):
                 {"issue_url": "https://api.github.com/repos/o/r/issues/8", "user": bot_user,
                  "body": "an ordinary comment of the bot's"},
                 {"issue_url": "https://api.github.com/repos/o/r/issues/9", "user": bot_user,
-                 "body": "<!-- claude-review-summary -->\nquiet"}],
+                 "body": "<!-- claude-review-summary -->\nquiet"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/10", "user": bot_user,
+                 "body": "<!-- claude-review-summary -->\napproved"}],
             "GET repos/o/r/issues/2/comments*": [],
             "GET repos/o/r/pulls/5": {"user": {"login": "a-person"}},
             "GET repos/o/r/pulls/5/reviews*": [],
@@ -1011,11 +1013,20 @@ class TestImprove(unittest.TestCase):
             "GET repos/o/r/issues/9/comments*": [
                 {"id": 4, "user": bot_user, "created_at": old, "html_url": "t",
                  "body": "<!-- claude-review-summary -->"}],
+            # A PR whose only activity in the window is a person's approval with no text.
+            "GET repos/o/r/pulls/10": {"user": {"login": "a-person"}},
+            "GET repos/o/r/pulls/10/reviews*": [{"user": person, "submitted_at": at, "html_url": "v", "body": ""}],
+            "GET repos/o/r/pulls/10/comments*": [
+                {"id": 11, "user": bot_user, "created_at": old, "html_url": "w", "path": "a.py", "line": 1,
+                 "body": "[P2] z"}],
+            "GET repos/o/r/issues/10/comments*": [],
         }
         with workspace() as d:
             out, _ = self.inputs(routes)
             text = (d / "improve-evidence/5.json").read_text()
             quiet = (d / "improve-evidence/9.json").exists()
+            approved = json.loads((d / "improve-evidence/10.json").read_text())["inline"] \
+                if (d / "improve-evidence/10.json").exists() else []
         self.assertEqual(out["run"], "true")
         self.assertEqual(json.loads(out["schema"]), bot.IMPROVE_SCHEMA)
         e = json.loads(text)
@@ -1025,6 +1036,7 @@ class TestImprove(unittest.TestCase):
                          "the old resolved finding, the reply, and not another bot's comment or one older than "
                          f"{bot.IMPROVE_DAYS} days")
         self.assertFalse(quiet, "a resolved finding on a PR quiet in the window would repeat in every run")
+        self.assertEqual([c["id"] for c in approved], [11], "an approval with no text wouldn't count as activity")
         self.assertTrue(e["inline"][0]["resolved"] and not e["inline"][0]["outdated"])
         self.assertEqual([m["why"] for m in e["moot"]], ["gone"])
 

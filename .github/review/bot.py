@@ -1202,7 +1202,9 @@ def pr_evidence(repo, pr, since):
     def read(c):  # what a reader sees: not empty, and not another bot's
         return c.get("body") and not (c.get("user_type") == "Bot" and c["user"] not in POSTING_BOT_USERS)
 
-    active = any(read(c) and (c.get("created_at") or "") >= since for c in [*reviews, *inline, *conversation])
+    # A person's review counts whatever its text (most approvals have none); a comment, when a reader sees it.
+    active = any((c.get("created_at") or "") >= since
+                 for c in [*[r for r in reviews if r["user_type"] != "Bot"], *filter(read, [*inline, *conversation])])
 
     def kept(comments):
         rows = []
