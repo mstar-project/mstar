@@ -177,10 +177,12 @@ def vendor_list(text):
 # nothing on its own.
 FILLER = re.compile(r"\b(?:a|an|the|and|or|no|of|on|for|in|its|kernels?|code|paths?|backends?|gpus?|hardware"
                     r"|support|cloud)\b|\W|_", re.IGNORECASE)
-# A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`),
-# but not a count (`ROCm 8 GPUs`).
+# A hardware word with what goes with it: a suffix (`ROCm-specific`) and, after ROCm or HIP, a version (`ROCm 7`,
+# `ROCm 6.2 GPUs`, `ROCm v7`), but not a count: a whole number before a plural count word, or a hyphenated one
+# (`ROCm 8 GPUs`, `ROCm 8-GPU`).
+COUNT = r"(?:gpu|node|rank|device|host|machine|gcd)"
 HARDWARE_PHRASE = re.compile(rf"({bot.UNTESTABLE_HARDWARE.pattern})(-(?:specific|only|based))?"
-                             r"(\s+v?\d+(?:\.\d+)*(?![\w.])(?!\s*-?\s*(?:gpus?|nodes?|ranks?|devices?|x\b)))?",
+                             rf"((?!\s+\d+(?:\s+{COUNT}s|-{COUNT}s?)\b)\s+v?\d+(?:\.\d+)*(?![\w.]))?",
                              re.IGNORECASE)
 
 

@@ -779,7 +779,9 @@ class TestApprove(unittest.TestCase):
                            ("AMD MI300X kernels; ROCm code", ""), ("ROCm-specific kernels", ""),
                            ("AMD-only code path", ""), ("the ROCm 7 path", ""), ("no ROCm support", ""),
                            ("MI300X 2 nodes", "2 nodes"), ("MI300 kernels", ""), ("MI300A kernels", "MI300A"),
-                           ("ROCm 8 GPUs", "8 GPUs"), ("ROCm 2 nodes", "2 nodes"),
+                           ("ROCm 8 GPUs", "8 GPUs"), ("ROCm 2 nodes", "2 nodes"), ("ROCm 8-GPU", "8-GPU"),
+                           ("ROCm 7 GPU kernels", ""), ("ROCm 6.2 GPUs", ""), ("ROCm v7 GPUs", ""),
+                           ("ROCm 7 node kernels", "node"),
                            ("cloud backends", "cloud backends")):
             with self.subTest(text):
                 left = gpu_review.beyond_vendors(text, ["nvidia", "amd"])
