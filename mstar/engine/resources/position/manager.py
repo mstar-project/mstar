@@ -30,6 +30,7 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 if TYPE_CHECKING:
@@ -374,6 +375,9 @@ class RopeManager(PositionManager):
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
 
+    def max_repeats(self, step: PositionStep, ctx: StepContext) -> int:
+        return ANY_REPEATS  # a resident row's position is its length plus a fixed offset
+
     def resident_refusal(self) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
@@ -413,7 +417,7 @@ class RopeManager(PositionManager):
                 counters = all_counters.get(segment.request_id)
                 if counters is None:
                     counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + advance
+                counters[segment.label] = counters.get(segment.label, 0) + advance * ctx.repeats
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them

@@ -32,6 +32,7 @@ from mstar.engine.resources.recurrent.pool import (
     RecurrentStatePool,
     checkpoint_rows,
 )
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.platforms.compile import compiled
@@ -157,6 +158,9 @@ class GDNManager(LinearAttnManager):
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
+
+    def max_repeats(self, step, ctx) -> int:
+        return ANY_REPEATS  # decode addresses the pool by slot alone
 
     def resident_refusal(self) -> str | None:
         # decode addresses the pool by slot alone, which the pool's table holds

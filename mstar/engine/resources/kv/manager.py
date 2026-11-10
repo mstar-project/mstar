@@ -482,6 +482,12 @@ class KVManager(AttentionResource):
     prefix_skip_safe = True
     # this pool's resident tables, once a node's planner bound them
     _resident: "KVResidentTables | None" = None
+    # Tokens a commit can run ahead of what has been read back and keyed, past
+    # the one a step always has: the step in flight's and the one committing's
+    # extra replays, 2 * (repeats - 1) for the most this pool has repeated. It
+    # only loosens the chain-drop check, so a pool-wide high mark is safe: a gap
+    # that never fills still outgrows it and drops the chain, a few tokens later.
+    _run_lag: int = 0
 
     def __init__(
         self,
@@ -1104,7 +1110,7 @@ class KVManager(AttentionResource):
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
-        touched: list[tuple[int, int]],
+        touched: list[tuple[int, int]], span: int,
     ) -> None:
         """Offer every page this commit filled to the index. ``touched`` holds
         ``(index, end)`` for each span of the layout this commit wrote into.
@@ -1130,11 +1136,11 @@ class KVManager(AttentionResource):
         # what was here before this write, not after: a decode step can commit
         # before the token it writes is read back and counted. the lazy chain
         # extension holds back a few steps more (`extend_prefix_chains_batch`)
-        lag = (
+        lag = self._run_lag + (
             self._chain_pending.get(segment.request_id, 0) * self._chain_backlog_width
             if self._chain_backlog else 0
         )
-        if stream.released or stream.stored_len - segment.span > chain.covered_len + lag:
+        if stream.released or stream.stored_len - span > chain.covered_len + lag:
             stream.chain = None
             return
         ended = None
@@ -2027,7 +2033,8 @@ class KVManager(AttentionResource):
             # chunked row reserves ahead, so those steps take every row here.
             ready: list[CacheStream] = []
             rows = step.segments
-            if not ctx.capture and not ahead and len(self._groups) == 1:
+            repeats = ctx.repeats
+            if not ctx.capture and not ahead and repeats == 1 and len(self._groups) == 1:
                 ready, slow = self._arena.admit_rows(streams, rows, ctx.real_rows(), sink or None, page_size)
                 rows = [rows[i] for i in slow]
             for segment in rows:
@@ -2049,7 +2056,7 @@ class KVManager(AttentionResource):
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
-                span = segment.span
+                span = segment.span * repeats
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
@@ -2466,7 +2473,7 @@ class KVManager(AttentionResource):
         page_size = self._groups[group].page_size
         if pending:
             return self._plan_output(self._sequence_views(segments, pending, ctx, sink, group), page_size, ring)
-        if not ctx.capture and group == 0:
+        if not ctx.capture and group == 0 and ctx.repeats == 1:
             return self._plan_label_rows(segments, ctx, sink, ring, page_size)
         streams = self._streams
         capture = ctx.capture
@@ -2489,7 +2496,8 @@ class KVManager(AttentionResource):
                 continue
             stream = streams[s.request_id][s.label].group(group)
             sids.append(stream.page_indices.sid)
-            lens.append(span + stream.stored_len)
+            # a step that repeats plans its last replay: every page it reaches
+            lens.append(span * ctx.repeats + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
             sink_pages = self._sink_pages
@@ -2952,7 +2960,10 @@ class KVManager(AttentionResource):
             is_pad = ctx.is_padding_row
             sink = step.sink
             rows = () if ctx.capture else step.segments
-            if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
+            repeats = ctx.repeats
+            # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
+            self._run_lag = max(self._run_lag, 2 * (repeats - 1))
+            if rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
                 slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
@@ -2965,7 +2976,8 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                if step.commit and segment.span > 0:
+                span = segment.span * repeats
+                if step.commit and span > 0:
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the
                     # length here would be lost on reload
@@ -2973,12 +2985,12 @@ class KVManager(AttentionResource):
                         logger.warning(
                             "KV %s: dropping %d committed tokens for %s label "
                             "%s; the stream was offloaded mid-step",
-                            self.name, segment.span,
+                            self.name, span,
                             segment.request_id, segment.label,
                         )
                         self._readonly_epoch += 1
                         continue
-                    stream.stored_len += segment.span
+                    stream.stored_len += span
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
                         # Above one rank a hit is stamped at commit, which every rank runs in step order,
                         # so every rank evicts the same pages.
@@ -2994,17 +3006,17 @@ class KVManager(AttentionResource):
                     touched = []
                     if stream.span_cursor is not None and (stream.chain is not None or _DEBUG_ASSERTS):
                         written = stream.stored_len + stream.released
-                        touched = stream.span_cursor.advance(written - segment.span, written)
+                        touched = stream.span_cursor.advance(written - span, written)
                         if _DEBUG_ASSERTS:
                             self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
-                        self._index_filled_pages(segment, stream, ctx, touched)
+                        self._index_filled_pages(segment, stream, ctx, touched, span)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
                     for g, group in windows:
                         part = stream.group(g)
-                        part.stored_len += segment.span
+                        part.stored_len += span
                         part.generation += 1
                         # What the window's layers can no longer read goes back to the pool, as
                         # below. No touch: this commit already dropped the read-only plans of
@@ -4497,6 +4509,25 @@ class KVManager(AttentionResource):
     set_layer_idx = AttentionResource.set_default_layer_idx
 
     # Resident planning
+
+    def max_repeats(self, step: KVStep, ctx: StepContext) -> int:
+        """What the pool can hand over covers, one page a row at most: a refused
+        admit would break the chain for pages a shorter run doesn't need. Past
+        a row's reach (its pages, or ``max_seq_len``) there is no table row."""
+        if ctx.resident is None:
+            return 1
+        requests = ctx.request_ids
+        rows = max(len({(s.request_id, s.label) for s in step.segments if s.span and s.request_id in requests}), 1)
+        evictable = 0 if self._index is None else len(self._index.evictable())
+        if self._arena.num_free + evictable < rows:
+            return 1
+        page_size = self._groups[0].page_size
+        longest = max((
+            self._streams[s.request_id][s.label].stored_len for s in step.segments
+            if s.span and s.label in self._streams.get(s.request_id, ())
+        ), default=0)
+        reach = min(self.config.max_seq_len, self.config.request_pages * page_size)
+        return max(1, min(page_size, reach - longest))
 
     def resident_refusal(self) -> str | None:
         if len(self._groups) > 1:

@@ -2284,11 +2284,12 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            return cg_runner.run_forward(
+            out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
+            return cg_runner.repeat(lease, out, ctx.repeats)
         if release_event is not None:
             release_event.set()
         if running_batched:
@@ -2893,6 +2894,36 @@ class Engine:
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
+
+    def enable_repeats(self, node_name: str, walks: Collection[str]) -> None:
+        """Before capture: the deployment asks these walks of the node to repeat,
+        which turns on what the node says they need (``enable_repeats``)."""
+        mgmt = self._submodules[node_name]
+        mgmt.submodule.enable_repeats(walks)
+        if (loopback := getattr(mgmt.submodule, "device_loopback", None)) is not None:
+            mgmt.resources[loopback.sampler].enable_device_loopback_reader()
+
+    def record_tokens(self, batch: ExecutingBatch, host_rows: HostRows, info_of) -> None:
+        self._submodules[batch.node_name].submodule.record_tokens(batch.step_context.graph_walk, host_rows, info_of)
+
+    def repeat_refusal(self, node_name: str, graph_walk: str, loop_back: Collection[str]) -> str | None:
+        """Why no step of this walk can replay with no host work between, or
+        None. After capture: its node must run the walk on resident tables,
+        carry every loop-back signal, and every resource must allow it."""
+        mgmt = self._submodules[node_name]
+        if mgmt.resident is None or graph_walk not in mgmt.resident.walks:
+            return "it doesn't run on resident tables (resident_walks, resident_planning)"
+        carries = mgmt.submodule.repeat_carry(graph_walk, loop_back)
+        if carries is None:
+            return "node: it keeps no device loop-back to carry between replays"
+        refusal = mgmt.accelerator_graph_runner.carry_refusal(graph_walk, carries)
+        if refusal is None:
+            step = mgmt.resident.captured_steps[graph_walk]
+            step.ctx.resident = mgmt.resident  # the capture's context; its step is over
+            refusal = self._runner.repeat_refusal(step)
+        if refusal is None:
+            mgmt.accelerator_graph_runner.accept_repeats(graph_walk, carries)
+        return refusal
 
     def batch_cap_varies(self, node_name: str, graph_walk: str) -> bool:
         """Whether this walk's ``get_max_batch_size`` can move between passes."""

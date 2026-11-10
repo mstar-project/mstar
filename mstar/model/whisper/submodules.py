@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -34,6 +34,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -755,11 +756,24 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 walk in FIRST_TOKEN_WALKS and token in self.token_stop.stop_ids
                 and not info.resource_configs[SAMPLER].ignore_eos
             )
-        self._record(info, token)
+        self._record(info.rid_handle, info, (token,))
         if not super()._token_stops(request_id, token, info):
             return False
         self.request_state(info.rid_handle).add("stopped", True)
         return True
+
+    def record_tokens(
+        self, graph_walk: str, host_rows: HostRows, info_of: Callable[[int], CurrentForwardPassInfo],
+    ) -> None:
+        """Keep a word-timestamp row's tokens for the align walk on a walk
+        asked to repeat: the runtime checks its stop, which leaves
+        ``_token_stops`` nothing to read them from."""
+        if graph_walk not in self._repeat_walks:
+            return
+        tokens = host_rows.buffers[self.token_stop.buffer]
+        for row, rid in enumerate(host_rows.request_ids):
+            if rid in self.request_states:
+                self._record(rid, info_of(rid), tokens[row].reshape(-1).tolist())
 
     def _record_prompt_token(self, info: CurrentForwardPassInfo, token: int) -> None:
         """For a word-timestamp request, keep what the align walk needs off a
@@ -775,19 +789,26 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         else:
             state.add("decoded", [token])
 
-    def _record(self, info: CurrentForwardPassInfo, token: int) -> None:
-        """Keep a decode step's token for the align walk (the loop no longer
-        persists them), if the request has a transcript started. Nothing after
-        the step that stopped the loop: a speculative step past it must not
-        extend the transcript. Once per step: when the batched stop check
-        raises partway, the engine re-runs it per request, and a step whose
-        token is already in (after the prompt's, one per earlier iteration) is
-        not appended again."""
-        state = self.request_state(info.rid_handle)
+    def _record(self, rid: int, info: CurrentForwardPassInfo, tokens: Sequence[int]) -> None:
+        """Keep a decode step's tokens, one an iteration, for the align walk
+        (the loop no longer persists them), if the request has a transcript
+        started; from ``_token_stops`` one, from ``record_tokens`` a repeated
+        step's. Nothing past the token that stops the loop: neither a
+        speculative step past it nor a repeated step's later iterations extend
+        the transcript. Once per step: when the batched stop check raises
+        partway, the engine re-runs it per request, and a step whose tokens are
+        already in (after the prompt's, one per earlier iteration) is not
+        appended again."""
+        state = self.request_state(rid)
         decoded = state.get("decoded", None)
         if (
-            decoded is not None and not state.get("stopped", False)
-            and len(decoded) == 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
+            decoded is None or state.get("stopped", False)
+            or len(decoded) != 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
         ):
+            return
+        for token in tokens:
             decoded.append(token)
+            if super()._token_stops(rid, token, info):
+                state.add("stopped", True)
+                return
 

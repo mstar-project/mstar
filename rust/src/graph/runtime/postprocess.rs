@@ -20,12 +20,14 @@ pub(super) const NEED_SEND: u8 = 3;
 
 /// A step's token column, read in place: `rows` integers of `itemsize`
 /// bytes, `stride` elements apart, row i belonging to the caller's
-/// `row_rids[i]`. The caller holds the tensor for the step.
+/// `row_rids[i]`. A step that repeated holds `width` values per row, side by
+/// side, one per iteration. The caller holds the tensor for the step.
 pub(super) struct TokenColumn {
     ptr: usize,
     rows: usize,
     stride: usize,
     itemsize: usize,
+    width: usize,
 }
 
 impl TokenColumn {
@@ -36,16 +38,27 @@ impl TokenColumn {
             "int32" => 4,
             _ => return None,
         };
-        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize })
+        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize, width: 1 })
+    }
+
+    /// The same column with `width` values per row (`stride` at least that).
+    pub(super) fn wide(mut self, width: usize) -> Self {
+        self.width = width.max(1);
+        self
     }
 
     /// Row `row`'s value; the callers check `row < self.rows`.
     fn read(&self, row: usize) -> i64 {
-        debug_assert!(row < self.rows);
-        // SAFETY: row < rows, which the callers check against the column the
-        // caller holds for the step.
+        self.read_at(row, 0)
+    }
+
+    /// Row `row`'s value of iteration `at < self.width`.
+    fn read_at(&self, row: usize, iter: usize) -> i64 {
+        debug_assert!(row < self.rows && iter < self.width);
+        // SAFETY: row < rows and iter < width, which the callers check against
+        // the column the caller holds for the step.
         unsafe {
-            let at = (self.ptr as *const u8).add(row * self.stride * self.itemsize);
+            let at = (self.ptr as *const u8).add((row * self.stride + iter) * self.itemsize);
             if self.itemsize == 8 {
                 std::ptr::read_unaligned(at as *const i64)
             } else {
@@ -66,6 +79,20 @@ impl TokenColumn {
             row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         rids.iter().map(|r| row_of.get(r).map(|&i| self.read(i))).collect()
     }
+
+    /// Each row's values after its first, up to the iteration it stopped at
+    /// (`kept`: rid -> iterations that count; a row not there keeps them all).
+    fn tails_for(&self, rids: &[u32], row_rids: &[u32], kept: &FxHashMap<u32, u32>) -> Option<Vec<Vec<i64>>> {
+        let row_of: FxHashMap<u32, usize> =
+            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        rids.iter()
+            .map(|r| {
+                let row = *row_of.get(r)?;
+                let end = kept.get(r).map_or(self.width, |&k| (k as usize).min(self.width));
+                Some((1..end).map(|j| self.read_at(row, j)).collect())
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -80,7 +107,18 @@ pub(super) struct Stored {
     pub num_tensors: Vec<usize>,
     pub inline_signal: Option<String>,
     pub inline_values: Vec<Option<i64>>,
+    /// A repeated step's values after each row's first, in `rids` order
+    pub inline_tails: Vec<Vec<i64>>,
     pub logprobs: Vec<Option<f64>>,
+}
+
+/// `check_stops`' result: a stop per (rid, rule index), the iterations each
+/// stop kept, and the rids with no limits for this walk yet.
+pub(super) struct Stops {
+    pub rids: Vec<u32>,
+    pub rules: Vec<u32>,
+    pub kept: Vec<u32>,
+    pub missing: Vec<u32>,
 }
 
 /// A step's postprocess (`PostprocessRequest`), and how far it got.
@@ -103,6 +141,9 @@ pub(super) struct Postprocess {
     pub python_send: bool,
     /// `RouteInput.loop_strides`, in `rids` order; None is 1 each
     pub loop_strides: Option<Vec<u32>>,
+    /// rid -> the iterations of a repeated step that count, for a row that
+    /// stopped inside it: what the device ran past that is dropped
+    kept: FxHashMap<u32, u32>,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -122,7 +163,7 @@ impl Postprocess {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides,
+            loop_strides, kept: FxHashMap::default(),
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -147,6 +188,18 @@ impl Postprocess {
         self.partition_done.retain(|rid| !dropped.contains(rid));
     }
 
+    /// Only the runtime's stop check and inline route read every iteration of
+    /// a step that repeated; the worker's paths would see only the first.
+    fn refuse_repeated(&self, path: &str) -> PyResult<()> {
+        if self.tokens.as_ref().is_some_and(|t| t.width > 1) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}/{}: a step of several iterations can't take the worker's {path} path",
+                self.node_name, self.graph_walk,
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether the send needs what only the worker has (`_route_needs_python`).
     fn send_needs_python(&self, route: &RouteOut) -> bool {
         self.python_send
@@ -169,6 +222,7 @@ impl Postprocess {
             num_tensors: s.num_tensors,
             inline_signal: s.inline_signal,
             inline_values: s.inline_values,
+            inline_tails: s.inline_tails,
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),
@@ -241,12 +295,12 @@ impl GraphRuntime {
         self.interner.get(s).unwrap_or(Sym::MAX)
     }
 
-    /// `check_stops_inline`'s check: `(stop_rids, stop_rules, missing)`.
-    #[allow(clippy::type_complexity)]
+    /// `check_stops_inline`'s check. A row of a repeated step stops at its first
+    /// iteration that stops it.
     pub(super) fn stops_over(
         &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32],
         tokens: Option<&TokenColumn>, row_rids: &[u32],
-    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    ) -> PyResult<Stops> {
         let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
         else {
             return Err(PyKeyError::new_err("check_stops: no rules for this (node, walk)"));
@@ -254,9 +308,9 @@ impl GraphRuntime {
         let Some(rules) = self.stop_rules.get(&(node, walk)) else {
             return Err(PyKeyError::new_err("check_stops: no rules for this (node, walk)"));
         };
-        let (mut stop_rids, mut stop_rules, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+        let mut out = Stops { rids: Vec::new(), rules: Vec::new(), kept: Vec::new(), missing: Vec::new() };
         if rules.is_empty() {
-            return Ok((stop_rids, stop_rules, missing));
+            return Ok(out);
         }
         let tokens = if rules.iter().any(|r| r.ar) {
             match tokens {
@@ -276,28 +330,38 @@ impl GraphRuntime {
         };
         let p = self.interner.get(partition);
         for (i, &rid) in rids.iter().enumerate() {
-            let token = match tokens {
+            let row = match tokens {
                 None => 0,
-                Some(t) if in_order => t.read(i),
-                Some(t) => match row_of.get(&rid) {
-                    Some(&row) => t.read(row),
+                Some(_) if in_order => i,
+                Some(_) => match row_of.get(&rid) {
+                    Some(&row) => row,
                     None => continue,
                 },
             };
             let Some(info) = self.info(rid) else { continue };
             let Some((_, limits)) = info.stop_limits.iter().find(|(k, _)| *k == (node, walk)) else {
-                missing.push(rid);
+                out.missing.push(rid);
                 continue;
             };
-            for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
-                let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
-                if count + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
-                    stop_rids.push(rid);
-                    stop_rules.push(k as u32);
+            let width = tokens.map_or(1, |t| t.width) as u32;
+            'iters: for at in 0..width {
+                let token = tokens.map_or(0, |t| t.read_at(row, at as usize));
+                let mut stopped = false;
+                for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
+                    let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
+                    if count + at + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
+                        out.rids.push(rid);
+                        out.rules.push(k as u32);
+                        out.kept.push(at + 1);
+                        stopped = true;
+                    }
+                }
+                if stopped {
+                    break 'iters;
                 }
             }
         }
-        Ok((stop_rids, stop_rules, missing))
+        Ok(out)
     }
 
     /// `stop_loops_batched` without the send: the rids whose loops stopped,
@@ -420,10 +484,11 @@ impl GraphRuntime {
                     &pp.partition, &pp.node_name, &pp.graph_walk, &pp.rids,
                     pp.tokens.as_ref(), &pp.row_rids,
                 );
-                if let Ok((stop_rids, stop_rules, missing)) = checked {
-                    if missing.is_empty() {
+                if let Ok(found) = checked {
+                    if found.missing.is_empty() {
                         let loops = self.stop_rule_loops(&pp.node_name, &pp.graph_walk);
-                        let found: Vec<(u32, Vec<String>)> = stop_rids.iter().zip(&stop_rules)
+                        pp.kept = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
+                        let found: Vec<(u32, Vec<String>)> = found.rids.iter().zip(&found.rules)
                             .map(|(&r, &k)| (r, vec![loops[k as usize].clone()]))
                             .collect();
                         pp.stops = Some(merged_stops([&pp.known_stops, &found]));
@@ -431,6 +496,7 @@ impl GraphRuntime {
                 }
             }
             if pp.stops.is_none() {
+                pp.refuse_repeated("check_stop")?;
                 return Ok(self.pp_park(pp, NEED_STOPS));
             }
             pp.stopped = self.pp_stop_loops(py, &pp)?;
@@ -451,8 +517,13 @@ impl GraphRuntime {
         }
         let values = pp.inline.as_ref().and_then(|(_, col)| col.values_for(&pp.rids, &pp.row_rids));
         let Some(values) = values else {
+            pp.refuse_repeated("store")?;
             return Ok(self.pp_park(pp, NEED_STORE));
         };
+        let tails = pp.inline.as_ref()
+            .filter(|(_, col)| col.width > 1)
+            .and_then(|(_, col)| col.tails_for(&pp.rids, &pp.row_rids, &pp.kept))
+            .unwrap_or_default();
         // Inline: nothing stored, so nothing here touches Python.
         let n = pp.rids.len() * pp.output_signals.len();
         let signal = pp.inline.as_ref().map(|(s, _)| s.clone());
@@ -460,7 +531,7 @@ impl GraphRuntime {
         let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
             let route = self.complete_and_route_batch(pp.route_arg(Stored {
                 tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
-                inline_values: values.into_iter().map(Some).collect(), logprobs: Vec::new(),
+                inline_values: values.into_iter().map(Some).collect(), inline_tails: tails, logprobs: Vec::new(),
             }))?;
             pp.completion_id = route.completion_id;
             if pp.send_needs_python(&route) {

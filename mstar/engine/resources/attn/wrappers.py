@@ -607,6 +607,15 @@ class FlashInferDecodeWrapper:
         if self.accelerator_graph and kv_lens is not None:
             self._planner_args = self._direct_planner_args(n_req)
 
+    @property
+    def lengths_move(self) -> bool:
+        """Whether a plan for longer rows still serves shorter ones, the lengths
+        moving between replays: the tensor-core kernel takes a row's length off
+        ``last_page_len`` at run time and clamps each planned chunk to it. A plan
+        fixes only pages and chunks. The CUDA-core kernel's chunk size underflows
+        on a chunk past the row's end."""
+        return _decode_direct_variant(self.attn_wrapper) == _TENSOR_CORE_DECODE
+
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
         indptr (and, for tensor-core decode, the lengths), when its plan

@@ -7,6 +7,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
     LoopbackState,
@@ -464,6 +465,21 @@ class SamplerResource(Resource):
 
     # Resident planning: the scalars as cells of the planner's rows, by its
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
+
+    def max_repeats(self, step, ctx) -> int:
+        """One for a step whose draws read or update state outside the graph
+        (a penalty, a history window, an RNG offset scattered on the host) or
+        with a row that wants log-probs or doesn't keep its draw. The rule state
+        a forward stores (``loopback_writes``) is overwritten each replay, and
+        commit persists the last one, so it doesn't count."""
+        bufs = self._cg_buffers
+        if (
+            bufs is None or not bufs.ingraph_scatter or self._penalty_live or self._history is not None
+            or (self._logprob_rids and not self._logprob_rids.isdisjoint(ctx.request_ids))
+            or self._kept_rids_of(step, ctx) is not None
+        ):
+            return 1
+        return ANY_REPEATS
 
     def resident_refusal(self) -> str | None:
         # never holds a node back: without a planner it stages its rows on the host

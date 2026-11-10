@@ -45,7 +45,7 @@ its positions under ``POS_KEY`` (``ROPE`` by default).
 
 import functools
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import replace
 from time import perf_counter
 from typing import Any
@@ -172,9 +172,26 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def device_loopback(self) -> DeviceLoopback | None:
         """The decode walk reads its input ids off the sampler's slot masters;
         a model that reads them off the routed token sets this None."""
+        return self._decode_loopback()
+
+    def _decode_loopback(self) -> DeviceLoopback:
         return DeviceLoopback(
             walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
+
+    def enable_repeats(self, walks: Collection[str]) -> None:
+        """Decode reads its token off the sampler and its rows' positions off the
+        position resource (`preprocess`), so a walk asked to repeat may run on
+        resident tables and loop its token back, even where the node's own path
+        doesn't: Canary keeps main's routed token, a measured choice of its own,
+        unless a deployment asks."""
+        super().enable_repeats(walks)
+        if self.DECODE_WALK in self._repeat_walks and self.device_loopback is None:
+            self.device_loopback = self._decode_loopback()
+
+    def resident_walks(self) -> frozenset[str]:
+        # decode alone: the walk ``enable_repeats`` vouches for
+        return self._repeat_walks & {self.DECODE_WALK}
 
     # ------------------------------------------------------------------
     # What a model declares
