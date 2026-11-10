@@ -150,6 +150,8 @@ class TestCarry(unittest.TestCase):
          [live_test("fail"), live_test("unavailable")], "ahead", full("targeted", "failed")),
         ("fail, then no verdict", True, "targeted", ["correctness"], [live_test("fail"), live_test("none")], "ahead",
          full("targeted", "failed")),
+        ("fail, then a verdict it doesn't know", True, "targeted", ["correctness"],
+         [live_test("fail"), live_test("skipped")], "ahead", full("targeted", "failed")),
         ("pass on an ancestor, then unavailable", True, "targeted", ["correctness"],
          [live_test("pass"), live_test("unavailable")], "ahead",
          {"run": "targeted", "checks": "correctness", "since": "a" * 40}),

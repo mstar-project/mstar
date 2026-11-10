@@ -555,7 +555,8 @@ jobs:
 
       # Nothing runs while the review left an open P0–P2 finding (by the review's own judgement, as
       # the status line counts them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
-      # call stands unless the PR's last conclusive live test failed or was partial: then the live
+      # call stands unless the PR's last conclusive live test failed or was partial (an unavailable
+      # or verdict-less run leaves the call alone unless a conclusive one before it failed): then the live
       # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
       # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), which the approval never counts as a pass.

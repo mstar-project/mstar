@@ -640,7 +640,7 @@ def last_live_test(comments):
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
-        if m and c["user"] in BOT_USERS and m[2] not in ("unavailable", "none"):
+        if m and c["user"] in BOT_USERS and m[2] in ("pass", "partial", "fail"):
             last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
     return last
 
