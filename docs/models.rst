@@ -116,6 +116,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
        SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
        flow-matching vocoder for speech. Half-duplex only.
+   * - ``step_audio2`` *(Beta)*
+     - ``stepfun-ai/Step-Audio-2-mini``
+     - Speech and text chat (text/audio in, text and speech out): Qwen2.5-7B over a
+       Whisper-large-v3 tower and adapter; its speech ids stream to CosyVoice2's token2wav.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -961,6 +965,34 @@ float16; its residual stream, its norms' arithmetic, the Euler solver, the token
 and HiFT stay float32. Its mel is within about 0.1% of a float32 DiT's, and the served
 speech's Whisper WER is unchanged. HiFT up to its spectrum is compiled (``compile_regions``),
 and the TTS's decode capture runs cuBLAS GEMMs (``compile_mode="default"``).
+
+Step-Audio-2-mini (``step_audio2``)
+-----------------------------------
+
+Text and audio in; text, or text and 24 kHz speech, out, as the reference's ``StepAudio2``
+chat: one LLM (Qwen2.5-7B) writes the reply, and a spoken one interleaves each text token
+with four speech ids, which stream to the vocoder (CosyVoice2's token2wav, shared with
+MiniCPM-o) in the reference client's windows: 28 codes, advancing by 25, then the rest
+once the reply ends. Ask for speech with ``output_modalities`` (or OpenAI ``modalities``)
+including ``"audio"``; the client's text leaves out the speech ids and special tokens. A
+request without a system message gets ``You are a helpful assistant.`` (``system_prompt``
+replaces it). Sampling defaults to the reference's: temperature 0.7, top-p 0.9 and a
+repetition penalty of 1.05 (prompt ids included, as in HF ``generate``). A spoken reply is
+capped at 2048 tokens, which keeps the vocoder's conformer caches (whole, as the reference
+keeps them) within their size; a request asking for more is a 400.
+
+Voices are reference clips in the serving config's ``model_kwargs.voices_dir``, named by
+file stem; nothing is downloaded. Put the GitHub repo's ``assets/default_female.wav`` (the
+default) and ``default_male.wav`` there, or set ``voices_dir`` elsewhere. Startup refuses a
+config without one. Cloning a voice from a request's own ``ref_audio`` is not served yet
+(both frontends and ``/generate`` refuse it with a 400). Tool calls, the think mode and
+video input are not supported.
+
+``configs/step_audio2.yaml`` runs two workers on one GPU under MPS (the audio tower and the
+LLM, and the vocoder). Each spoken reply holds a slot of each ``t2w_*`` resource (~0.55 GiB
+in all with the default voices) while it speaks, so their ``max_slots`` cap the replies
+being voiced at once; ``t2w_state`` has one more than each ``t2w_*_kv`` (its sink), and
+startup refuses counts that disagree. Every node runs eagerly for now (no CUDA graphs).
 
 Command A+ (``command_a_plus``)
 -------------------------------
