@@ -212,7 +212,7 @@ Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to fu
 
 ### Running the CPU suite
 
-It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If it is taking much longer, something is wrong; don't wait it out.
+It takes 4 to 5 minutes on 8 CPUs from a local disk; CI splits it over two 4-CPU runners, about 5 minutes each. If it is taking much longer, something is wrong; don't wait it out.
 
 - **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
 - **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.
