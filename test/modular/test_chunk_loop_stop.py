@@ -18,9 +18,10 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import CHUNK_LOOP_END
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.chunk_loops import ChunkLoops
-from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
+from mstar.worker.step_executor import StepExecutor
 
 NODE = "LLM"
 
@@ -100,7 +101,7 @@ def test_a_mid_prefill_row_keys_no_prefix():
     """
     import inspect
 
-    src = inspect.getsource(Worker._postprocess_batch)
+    src = inspect.getsource(StepExecutor.postprocess)
     assert "engine.step_finished(" in src, "the prefix chain is never extended"
     call = src[src.index("engine.step_finished("):]
     call = call[: call.index("\n        )")]
@@ -213,11 +214,12 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
     from types import SimpleNamespace
 
     ready = [SimpleNamespace(node_name=NODE, graph_walk=walk) for walk in ("prefill", "decode")]
-    w = Worker.__new__(Worker)
-    w._graph_runtime = SimpleNamespace(speculate_node=lambda *args: ready)
-    w.chunk_loops = ChunkLoops([(NODE, "prefill")])
+    w = make_worker(
+        graph_runtime=SimpleNamespace(speculate_node=lambda *args: ready),
+        chunk_loops=ChunkLoops([(NODE, "prefill")]),
+    )
 
-    target = w._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
+    target = w.speculator._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
 
     assert target.info.graph_walk == "decode" and target.walk_rids == [2]
 
@@ -225,20 +227,20 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
 def test_a_submitted_step_carries_its_nodes_chunk_loop_walks():
     """Every step reaches the GPU thread through ``_submit_gpu_step``, so the
     stamp there is what the step's strides read, speculated or not."""
-    w = Worker.__new__(Worker)
-    w.chunk_loops = ChunkLoops({(NODE, "prefill")})
-    w._execute_on_gpu_thread = lambda *a: None
+    executor = make_worker(chunk_loops=ChunkLoops({(NODE, "prefill")})).executor
+    executor._body = lambda *a: None
     batch = _batch({1: "prefill"})
     node_batch = type("_NodeBatch", (), {})()
 
-    class _Executor:
+    class _Pool:
         def submit(self, fn, *args):
             from concurrent.futures import Future
             f = Future()
             f.set_result(fn(*args))
             return f
 
-    w._submit_gpu_step(_Executor(), batch, node_batch, None)
+    executor._gpu_pool = _Pool()
+    executor._submit_gpu_step(batch, node_batch, None, CHAIN_LANE)
 
     assert batch.chunk_loop_walks == {"prefill"}
     assert batch.loop_strides([1]) == [CHUNK_LOOP_END]

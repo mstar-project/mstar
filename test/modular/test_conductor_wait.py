@@ -13,6 +13,7 @@ pytest.importorskip("mstar_rust")
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.api_server.request_types import ConductorStatus  # noqa: E402
+from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
 from mstar.communication.rust_communicator import RustZMQCommunicator  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
@@ -30,7 +31,20 @@ TIMED_CHECKS = {
     "drain": lambda c, at: c._draining_deadlines.append((at, "r")),
     "early_reads_done": lambda c, at: c._early_reads_done_deadlines.append((at, "r")),
     "early_abort": lambda c, at: c._early_abort_deadlines.append((at, "r")),
+    "lora_op": lambda c, at: setattr(c, "_lora_ops_cache", _lora_op_due(at)),
 }
+
+
+def _lora_op_due(at):
+    """A runtime LoRA unload no worker has answered, given up on at ``at``."""
+    from types import SimpleNamespace
+
+    from mstar.conductor.lora_ops import LoraAdapterOps, _PendingOp
+    from mstar.utils.ipc_format import UnloadLoraAdapter
+
+    ops = LoraAdapterOps(SimpleNamespace(runtime_update_timeout_s=FAR_S, adapters={}), ["w"], lambda *_: None)
+    ops._pending["op"] = _PendingOp(UnloadLoraAdapter(op_id="op", lora_name="a"), waiting={"w"}, deadline=at)
+    return ops
 
 
 class _StopLoop(BaseException):
@@ -44,7 +58,7 @@ def _communicator(my_id, prefix):
 def _conductor(comm):
     """The state ``run`` reads; ``_worker_processes`` empty, so nothing is dead."""
     c = Conductor.__new__(Conductor)
-    c.communicator = comm
+    c.communicator = OutboxCommunicator(comm)  # as make_communicator builds it
     c.worker_ids, c._worker_processes = [], []
     c.enable_nvtx = False
     c._startup_message_backlog = []
@@ -75,7 +89,7 @@ def test_a_message_or_a_timed_check_ends_the_wait(check, in_flight, tmp_path, mo
     prefix = str(tmp_path) + "/"
     comm = _communicator("conductor", prefix)
     peer = _communicator("peer", prefix)
-    comm.send = lambda entity, msg: None
+    comm.try_send_bytes = lambda entity, data: True
     c = _conductor(comm)
     if in_flight:
         c.requests["in flight"] = object()
@@ -128,6 +142,56 @@ def test_a_message_or_a_timed_check_ends_the_wait(check, in_flight, tmp_path, mo
         assert passes[2] >= due - 0.001
         time.sleep(0.05)
         assert len(passes) <= 4, "the loop must go back to waiting"
+    finally:
+        stop.set()
+        peer.send("conductor", ConductorMessage(ConductorMessageType.READS_DONE, ReadsDone("y", "peer")))
+        thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+
+def test_a_worker_that_is_not_reading_does_not_stop_the_loop(tmp_path, monkeypatch):
+    """A worker blocked sending to the conductor stops reading. The conductor's
+    sends to it must queue rather than block, so the loop keeps draining the
+    worker's messages, and what was queued goes once the worker reads again."""
+    monkeypatch.setattr(conductor_mod, "freeze_after_setup", lambda _name: None)
+    prefix = str(tmp_path) + "/"
+    peer = _communicator("peer", prefix)
+    c = _conductor(_communicator("conductor", prefix))
+    burst = 3000  # past the transport's high-water mark toward an unread peer
+
+    def route(message, done):
+        rid = message.body.request_id
+        for _ in range(burst):
+            c.communicator.send("worker_0", message)
+        c._early_reads_done[rid] = message.body
+
+    c._route_message = route
+    stop = threading.Event()
+    liveness = c._poll_worker_liveness
+
+    def stop_when_told():
+        liveness()
+        if stop.is_set():
+            raise _StopLoop
+
+    c._poll_worker_liveness = stop_when_told
+
+    def run():
+        try:
+            c.run()
+        except _StopLoop:
+            pass
+
+    c._next_liveness_check = c._next_status = time.perf_counter() + FAR_S
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        for rid in ("a", "b"):
+            peer.send("conductor", ConductorMessage(ConductorMessageType.READS_DONE, ReadsDone(rid, "peer")))
+            assert _wait_until(lambda rid=rid: rid in c._early_reads_done), f"the loop stopped before {rid}"
+        worker = _communicator("worker_0", prefix)
+        received = []
+        assert _wait_until(lambda: received.extend(worker.get_all_new_messages()) or len(received) == 2 * burst)
     finally:
         stop.set()
         peer.send("conductor", ConductorMessage(ConductorMessageType.READS_DONE, ReadsDone("y", "peer")))

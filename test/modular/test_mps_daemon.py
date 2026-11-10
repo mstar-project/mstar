@@ -17,6 +17,7 @@ d=$CUDA_MPS_PIPE_DIRECTORY
 if [ "$1" = "-f" ]; then
   [ -n "$FAKE_MPS_FAIL" ] && exit 1
   echo $$ > "$d/daemon"
+  echo "$CUDA_VISIBLE_DEVICES" > "$d/visible"
   while [ ! -e "$d/quit" ]; do sleep 0.02; done
   rm -f "$d/daemon"; exit 0
 fi
@@ -50,6 +51,19 @@ def test_the_daemon_runs_in_its_own_directory_until_stopped(fake_control, tmp_pa
     assert proc.poll() == 0  # quit through the pipe, not killed
     assert not os.path.exists(tmp_path / "mps")
     mps.stop()  # idempotent: shutdown can run twice
+
+
+def test_the_daemon_sees_the_host_devices_and_clients_index_its_list(fake_control, tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    mps = MpsDaemon(str(tmp_path / "a"))
+    mps.start()
+    pipe = mps.client_env["CUDA_MPS_PIPE_DIRECTORY"]
+    with open(os.path.join(pipe, "visible")) as f:
+        assert f.read().strip() == "2,5"
+    assert mps.client_env["CUDA_VISIBLE_DEVICES"] == "0,1"
+    mps.stop()
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    assert "CUDA_VISIBLE_DEVICES" not in MpsDaemon(str(tmp_path / "b")).client_env
 
 
 def test_a_daemon_that_does_not_come_up_is_an_error(fake_control, tmp_path, monkeypatch):

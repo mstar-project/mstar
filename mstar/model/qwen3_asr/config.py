@@ -13,6 +13,7 @@ from pathlib import Path
 
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
+from mstar.model.keys import KV_CACHE, ROPE, SAMPLER  # noqa: F401 - the LLM's resources, under the scaffold's keys
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: F401 - the model's modules import it from here
 
 # ---------------------------------------------------------------------------
@@ -21,16 +22,10 @@ from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: F401 - the mod
 # audio_encoder node: cacheless windowed attention
 AUT_ATTN = "aut_attn"
 # LLM node
-KV_CACHE = "kv_cache"
 ATTN = "attn"
-ROPE = "rope"
-SAMPLER = "sampler"
 
 ENCODER_NODE = "audio_encoder"
 LLM_NODE = "LLM"
-PREFILL_WALK = "prefill"
-DECODE_WALK = "decode"
-DECODE_LOOP = "decode_loop"
 
 # The model writes ``language {Name}<asr_text>{transcript}``. A forced
 # language is pre-filled into the assistant turn in that same form.
@@ -78,6 +73,15 @@ class Qwen3ASRModelConfig:
     @property
     def stop_token_ids(self) -> frozenset[int]:
         return frozenset({self.eos_token_id, self.im_end_token_id})
+
+    # what the shared decoder scaffold reads off a model's config
+    @property
+    def hidden_size(self) -> int:
+        return self.text.hidden_size
+
+    @property
+    def max_position_embeddings(self) -> int:
+        return self.text.max_position_embeddings
 
     @property
     def max_audio_samples(self) -> int:

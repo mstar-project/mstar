@@ -7,14 +7,13 @@ stalls the speculative preparation of the next one. These loops read the step fr
 the engine's per-batch loop counter instead, as the DiT scaffold does, and Cosmos3
 keeps its timesteps as a host list.
 
-Each test walks a short schedule (including the async-overshoot step the
-prepare vetoes) and checks, per step:
+Each test walks a short schedule and checks, per step:
 
 * no host read of any tensor (``item`` / ``tolist`` / ``int()`` / ...) happens
   while preparing with the loop counter set, as the engine sets it;
-* for OmniVoice, the prepared inputs equal those of the edge-reading path, which
-  callers that pass no loop counter still use. Cosmos3 and Wan 2.2 carry no such
-  edge, so a missing counter is an error there.
+* for OmniVoice, the prepared inputs are the same without the loop counter, as
+  callers that pass none (tests, harnesses) prepare them. Cosmos3 and Wan 2.2
+  carry no step edge, so a missing counter is an error there.
 
 No weights. The whole Wan 2.2 and Cosmos3 steps also run under CUDA's sync-debug
 mode, which needs a GPU; everything else is CPU only.
@@ -103,17 +102,13 @@ def _same(a, b) -> bool:
 
 
 def _check_schedule(prepare, walk_fwd, edge_inputs, loop, steps):
-    """Prepare steps 1..steps (the last one is the overshoot) with and without
-    the loop counter; the counter path reads nothing and matches the edge path."""
-    for k in range(1, steps + 1):
+    """Prepare steps 1..steps-1 with and without the loop counter; the counter
+    path reads nothing and matches the edge path."""
+    for k in range(1, steps):
         with _HostReads() as counter_path:
             got = prepare(walk_fwd(loop, k), edge_inputs(k))
         assert counter_path.reads == [], f"step {k}: host reads {counter_path.reads}"
-        with _HostReads() as edge_path:
-            want = prepare(walk_fwd(None, None), edge_inputs(k))
-        # the edge path is the old derivation: it reads the step off the device edge
-        assert edge_path.reads, f"step {k}: the edge path should read the step on the host"
-        _assert_same(got, want)
+        _assert_same(got, prepare(walk_fwd(None, None), edge_inputs(k)))
 
 
 # ---------------------------------------------------------------- Wan 2.2
@@ -152,9 +147,6 @@ def test_wan22_step_prep_reads_no_tensor():
         assert host.reads == [], f"step {k}: host reads {host.reads}"
         assert got.tensor_inputs.keys() == {*_wan22_loop_inputs(shape, k), "timestep"}
         assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
-    with _HostReads() as host:
-        assert prepare(steps) is None  # overshoot vetoed
-    assert host.reads == []
 
 
 def test_wan22_step_prep_fails_without_the_loop_counter():
@@ -273,7 +265,6 @@ def test_omnivoice_step_prep_reads_no_tensor(clone):
         return sub.prepare_inputs("speech_gen", fwd_info, inp)
 
     _check_schedule(prepare, fwd, lambda k: _omnivoice_inputs(cfg, k, clone=clone), UNMASK_LOOP_NAME, steps)
-    assert prepare(fwd(UNMASK_LOOP_NAME, steps), _omnivoice_inputs(cfg, steps)) is None
 
 
 def test_omnivoice_first_step_prep_reads_no_tensor():
@@ -285,9 +276,11 @@ def test_omnivoice_first_step_prep_reads_no_tensor():
     sub, cfg = _omnivoice()
     model = OmniVoiceModel.__new__(OmniVoiceModel)
     model.config = cfg
-    first = model.get_initial_forward_pass_args(
-        "default", ["text"], ["audio"], {"prefix_ids": [None]}, model_kwargs={"target_len": 6},
-    )
+    from test_ingest_unpersist import plan_step
+
+    signals = {"prefix_ids": [None]}
+    plan = model.walk_plan("default", ["text"], ["audio"], signals, {"target_len": 6})
+    first = plan_step(model, plan, 0, signals)
     assert {edge.name for edge in first.inputs} == {"prefix_ids", "prefix_audio_mask", "audio_tokens", "step_index"}
     inputs = _omnivoice_inputs(cfg, 0)
     del inputs["audio_tokens"], inputs["step_index"]
@@ -394,13 +387,10 @@ def test_cosmos3_step_prep_reads_no_tensor(walk, loop, edges, extra, cfg):
         out.update({name: [torch.zeros(1)] for name in SOLVER_STATE})
         return out
 
-    for k in range(1, steps + 1):
+    for k in range(1, steps):
         with _HostReads() as host:
             got = sub.prepare_inputs(walk, _fwd("r", walk, {}, loop, k), inputs(k))
         assert host.reads == [], f"step {k}: host reads {host.reads}"
-        if k == steps:
-            assert got is None  # overshoot vetoed
-            continue
         assert got.tensor_inputs.keys() >= {*edges, *SOLVER_STATE}
         assert torch.equal(got.tensor_inputs["latents"], inputs(k)["latents"][0])
     with pytest.raises(KeyError, match=loop):
@@ -430,11 +420,11 @@ def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
         return sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, _fwd("r", C.VIDEO_GEN_AR_WALK, {}, VIDEO_GEN_AR_LOOP, k), inputs)
 
     prepare(1)  # the per-statics mask cache is filled on first use
-    for k in range(1, 10):
+    for k in range(1, 9):
         with _HostReads() as host:
             got = prepare(k)
         assert host.reads == [], f"step {k}: host reads {host.reads}"
-        assert (got is None) == (k == 9)
+        assert got is not None
     ni = prepare(4)
     assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
     assert torch.equal(ni.tensor_inputs["vision_timesteps"],
@@ -603,11 +593,11 @@ def test_cosmos3_cfg_active_uses_host_timesteps():
     sub = _cosmos3()
     sched = sub._new_scheduler(8, "cpu", flow_shift=3.0)
     st = {"uncond": {}, "guidance_interval": (400.0, 1000.0), "scheduler": sched}
-    for k in range(9):
+    for k in range(8):
         with _HostReads() as reads:
             active = sub._cfg_active(st, k)
         assert reads.reads == []
-        want = k < len(sched.timesteps) and 400.0 <= float(sched.timesteps[k].item()) <= 1000.0
+        want = 400.0 <= float(sched.timesteps[k].item()) <= 1000.0
         assert active == want
 
 
@@ -641,8 +631,9 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     meta device stands in for the accelerator; on it the row stager takes its host branch, so
     the pinned upload itself is not exercised here."""
     from mstar.engine.resources.sampler.resource import SamplerResource
-    from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
+    from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.keys import SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     class _Sampler:
@@ -667,21 +658,20 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
 
 
 def test_higgs_encoder_prep_reads_no_tensor():
-    """The audio encoder's per-chunk embedding counts come from the step
-    metadata ``process_prompt`` filled, not off a lengths tensor."""
+    """The audio encoder's per-chunk embedding counts come from the clip's
+    ``MEDIA_LAYOUT`` grid ``process_prompt`` filled, not off a lengths tensor."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
     from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
+    from mstar.model.multimodal import MEDIA_LAYOUT
 
     config = HiggsAudioModelConfig()
     lens = [400, 400, 123]
     valid = [config.encoder_output_length(n) for n in lens]
-    model = SimpleNamespace(config=config, INTERNAL_KWARGS=HiggsAudioModel.INTERNAL_KWARGS)
-    (key,) = model.INTERNAL_KWARGS
     sub = HiggsAudioEncoderSubmodule(None, None, config)
     features = torch.zeros(len(lens), config.audio_num_mel_bins, 400)
+    layout = {"grid": [lens], "output": ["audio_embeds"]}
     with _HostReads() as reads:
-        row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio", {key: lens}), {
+        row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio", {MEDIA_LAYOUT: layout}), {
             "audio_features": [features],
         })
     assert reads.reads == []

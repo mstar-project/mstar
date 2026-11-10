@@ -78,7 +78,23 @@ gets faster on a GPU without a change to model code.
   count.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
-  per-pair tiles by token count, then the grouped `"*"` row.
+  per-pair tiles by token count, then the grouped `"*"` row. Its `bfloat16` entries are
+  `fused_experts`' per-pair path (Qwen3-Omni): up to which token count it runs, and its tiles
+  (`gate_up` `bj, bk, warps`; `down` `bn, bc, warps`; no router). An entry of the `"*"` row
+  alone runs the grouped GEMMs at every count. The sweep times fp8 only, so a bf16 entry is
+  measured end to end, its provenance naming how.
+- `ragged_attention`: a cacheless self-attention's kernel by one rank's head geometry
+  (`--shape num_qo_heads=...,num_kv_heads=...,head_dim=...`), rows by the longest query segment:
+  torch's cuDNN SDPA (`cudnn`) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),
+  each timed through the resource's graph-mode wrapper at 1 and 8 segments of the bucket's length.
+  `python -m benchmark.kernels.ragged_attention --heads 24 --seq 4608` prints a wider table at
+  one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
+  table was written with `--arch`, which names the file for the architecture, not the GPU model.
+  Each entry's provenance note says which sizes a served model ran on its rows (the image DiTs
+  up to 4608 tokens, LTX-2.5's video self-attention at 8160, Wan2.2 at 3510 and 18480) and which
+  `measured` times are kernel-level only. An entry whose larger sizes no served model has run bounds them with a
+  numeric last row and a `"*"` row naming `flashinfer`, the resource's default; a sweep writes
+  its last bucket's winner as `"*"`, so bound such an entry by hand.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
   `w8a16`, `flashinfer` or `cublas`; `--shape N=...,K=...,glu=0|1`, N per half with glu). Tables
   only for now: its sweep is not ported.

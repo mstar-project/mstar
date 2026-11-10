@@ -40,6 +40,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.engine import make_engine
 
 PAGE = 16
 
@@ -249,17 +250,13 @@ class _Sub:
 
 
 def _engine(resources: dict) -> Engine:
-    eng = Engine.__new__(Engine)
-    eng._runner = StepRunner(resources)
-    eng._enable_nvtx = False
-    eng._enable_profile = False
-    eng._device = torch.device("cpu")
-    eng._tp_follower_nodes = set()
-    eng._pre_plan_done = {}
-    eng._submodules = {"n": SubmoduleManagement(
-        submodule=_Sub(list(resources)), forward=None, forward_batched=None,
-        joint_comm_group=None, resources=resources,
-    )}
+    eng = make_engine(
+        _runner=StepRunner(resources),
+        _submodules={"n": SubmoduleManagement(
+            submodule=_Sub(list(resources)), forward=None, forward_batched=None,
+            joint_comm_group=None, resources=resources,
+        )},
+    )
     return eng
 
 
@@ -364,6 +361,32 @@ def test_a_per_request_forward_that_raises_fails_only_its_row():
     kv.remove_request(2)
     assert kv._arena.num_free == free - 4, "only rows 1 and 3 hold pages"
     assert not any(rid == 2 for rid, _ in kv._admit_reserved_pages)
+
+
+def test_each_per_request_row_keeps_its_walk_of_a_combined_step(monkeypatch):
+    """A combined step's rows each run under their own walk; the per-row
+    fallback must say so to the resources, not hand them the combined one."""
+    kv = _kv("kv", pages=16)
+    eng = _engine({"kv": kv})
+    eng._submodules["n"].submodule = _RaisingSub.__new__(_RaisingSub)
+    eng._submodules["n"].forward = _forward_raising_on(None)
+    for rid in (1, 2):
+        kv.ingest_request(rid, None)
+    walks = {}
+    admit = kv.admit
+
+    def recording_admit(step, ctx):
+        walks.update({rid: ctx.walk_of(rid) for rid in ctx.request_ids})
+        return admit(step, ctx)
+
+    monkeypatch.setattr(kv, "admit", recording_admit)
+    batch = _per_request_batch([1, 2], PAGE)
+    batch.inputs = [SimpleNamespace(input_seq_len=PAGE, tensor_inputs={}, kwargs={})] * 2
+    batch.step_context.graph_walk = "mixed"
+    batch.step_context.request_walks = {1: "prefill", 2: "decode"}
+    eng._exec_per_request(batch)
+    assert not batch.failed_requests
+    assert walks == {1: "prefill", 2: "decode"}
 
 
 # --- the recurrent pool gives back the slots a refused step took --------------

@@ -168,7 +168,7 @@ def test_sequential_long_form_keeps_split_characters_per_window(client_and_stub)
         _text("<|zh|>", "<|0.00|>") + _split(" 真正的") + _text("<|29.50|>"),
         _text("<|0.00|>") + _split(" 存在😀") + _text("<|15.00|>"),
     ]
-    body = _post(client, {"response_format": "verbose_json"}, seconds=45).json()
+    body = _post(client, {"response_format": "verbose_json", "long_form": "sequential"}, seconds=45).json()
     assert body["text"] == "真正的 存在😀"
     assert [s["text"] for s in body["segments"]] == ["真正的", "存在😀"]
     assert len(stub.submits) == 2

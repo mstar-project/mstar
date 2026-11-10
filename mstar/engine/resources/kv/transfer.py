@@ -870,8 +870,8 @@ class KVTransferManager:
         # cache data is ready at the producer end before the consumer reads it. Pytorch
         # does not currently support transmitting Event objects over IPC, so we opt to
         # use the following contract: the producer always default-stream-syncs before
-        # publishing seq_info (this currently happens in worker.py, right before sending
-        # outputs). Once torch.Event supports the interprocess flag (it's present in the
+        # publishing seq_info (this currently happens in StepExecutor.postprocess, right
+        # before sending outputs). Once torch.Event supports the interprocess flag (it's present in the
         # function signature but currently a no-op), this path can be refatored to wait
         # on an event on the reader end instead.
         return self._kv_transfer_engine.read_batched_async(
