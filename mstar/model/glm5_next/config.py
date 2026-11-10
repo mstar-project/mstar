@@ -329,7 +329,9 @@ class Glm5NextModelConfig:
         return AuxPlanes(num_layers=self.num_kv_planes, width=3 * self.index_head_dim)
 
     def check_long_context(self, page_size: int | None = None) -> None:
-        """Refuse a dsa_long_context setup the index planes cannot hold."""
+        """Refuse a dsa_long_context setup the model cannot serve, and with the cache's
+        ``page_size`` one an MTP block does not fit (the DSA resource refuses the cache it
+        cannot use)."""
         if not self.dsa_long_context:
             return
         if self.max_seq_len <= self.index_topk:
@@ -339,22 +341,11 @@ class Glm5NextModelConfig:
                 f"model_kwargs.max_seq_len is {self.max_seq_len}")
         if self.prefill_window_tokens < 1:
             raise ValueError(f"prefill_window_tokens={self.prefill_window_tokens} must be >= 1")
-        if page_size is not None and page_size % self.index_kpool:
-            raise ValueError(
-                f"page_size={page_size} must be a multiple of index_kpool={self.index_kpool}")
-        if page_size is not None and (page_size // self.index_kpool) & (
-                page_size // self.index_kpool - 1):
-            # flashinfer's page-table transform takes power-of-two pools per page
-            raise ValueError(f"page_size={page_size} over index_kpool={self.index_kpool} "
-                             "must be a power of two")
         if self.mtp_trims and page_size is not None and page_size < self.mtp_num_draft_tokens + 2:
             # padding requests write the sink page's first k + 1 rows; its last row is the
             # masked one a sparse plan's spare entries attend
             raise ValueError(f"page_size={page_size} must exceed an MTP block of "
                              f"{self.mtp_num_draft_tokens + 1} rows")
-        from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
-
-        check_flashinfer()
 
     @property
     def mtp_trims(self) -> bool:

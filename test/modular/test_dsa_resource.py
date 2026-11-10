@@ -1,6 +1,7 @@
 """The DSA resource on CPU: its build over an MLA cache with index planes, the rows its declared
 step plans from the KV plan (``plan``), and the plan the layers read (``current``, ``rows`` /
 ``pick`` / ``dense``)."""
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -29,19 +30,21 @@ def _spec(topk=TOPK, **config) -> DSASpec:
                    config=DSAConfig(kv_cache=KV, topk=topk, **config))
 
 
-def _kv_spec(index_planes: bool = True, width: int = D) -> KVSpec:
+def _kv_spec(index_planes: bool = True, width: int = D, page_size: int = PAGE) -> KVSpec:
     return KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=MAX_SEQ_LEN,
-        max_num_pages=32, page_size=PAGE, num_qo_heads=HEADS, layout=KVLayout.MLA,
+        max_num_pages=32, page_size=page_size, num_qo_heads=HEADS, layout=KVLayout.MLA,
         kv_lora_rank=32, qk_rope_head_dim=16,
         aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=width)} if index_planes else {}))
 
 
-def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK) -> DSAManager:
+def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK, page_size: int = PAGE,
+             device: str = "cpu", kv_dtype: torch.dtype = torch.bfloat16) -> DSAManager:
     """The resource as the engine builds it, from its spec and its cache's spec."""
     info = EngineResourceInfo(
-        device=torch.device("cpu"), joint_comm_group=SimpleNamespace(world_size=world_size),
-        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D)})
+        device=torch.device(device), kv_dtype=kv_dtype,
+        joint_comm_group=SimpleNamespace(world_size=world_size),
+        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D, page_size=page_size)})
     return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1), info)
 
 
@@ -99,6 +102,43 @@ def test_a_cache_without_index_planes_is_refused():
                               dependencies={KV: _kv_spec(index_planes=False)})
     with pytest.raises(ValueError, match=INDEX_PLANES):
         build_resource(_spec(), info)
+
+
+@pytest.mark.parametrize("kpool, page_size, match", [
+    (4, 18, "multiple of index_kpool"),  # pools would straddle pages
+    (4, 12, "power of two"),  # 3 pools a page, which flashinfer's page-table transform cannot take
+    (1, 96, "kv page_size=96 must be a power of two"),
+])
+def test_a_page_size_the_pools_cannot_take_is_refused_at_build(kpool, page_size, match):
+    with pytest.raises(ValueError, match=match):
+        _manager(kpool=kpool, page_size=page_size)
+
+
+def test_a_non_bf16_cache_on_cuda_is_refused_at_build():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the resource refuses it at load rather than serving slow."""
+    with pytest.raises(ValueError, match="bf16"):
+        _manager(device="cuda", kv_dtype=torch.float16)
+    _manager(kv_dtype=torch.float16)  # CPU runs the torch paths on any dtype
+
+
+@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False)])
+def test_a_flashinfer_without_page_size_is_refused_at_build_on_cuda(monkeypatch, version, refused):
+    """FlashInfer's top-k transform takes ``page_size`` from 0.6.18. Only the CUDA paths call
+    it, so a CPU build never asks."""
+    from mstar.engine.resources.attn import flashinfer_mla
+
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(__version__=version))
+    flashinfer_mla._flashinfer_at_least.cache_clear()  # it remembers the installed version
+    try:
+        _manager()
+        if refused:
+            with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+                _manager(device="cuda")
+        else:
+            _manager(device="cuda")
+    finally:
+        flashinfer_mla._flashinfer_at_least.cache_clear()
 
 
 # ---------------------------------------------------------------------------

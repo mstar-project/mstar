@@ -184,9 +184,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             logger.warning("%s: %d usable pages of %d tokens hold less than max_seq_len=%d: a "
                            "request that long waits for pages until it times out", KV_RESOURCE,
                            kv.max_num_pages - 1, kv.tokens_per_page, cfg.max_seq_len)
-        if kv.tokens_per_page & (kv.tokens_per_page - 1):
-            # flashinfer's page-table transform takes power-of-two pages
-            raise ValueError(f"{KV_RESOURCE} page_size={kv.tokens_per_page} must be a power of two")
 
     def declare_step(
         self,
