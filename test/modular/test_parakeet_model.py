@@ -192,7 +192,7 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     """A whole clip runs its one walk, and a live call the two stream walks,
     each in its own partition; the partitions a request doesn't use are done
     from the start, so a clip's graph is the same as before."""
-    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live=True)
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
     assert {p.name for p in model.get_partitions()} == {"default", "Encoder", "Decoder"}
     client = model.get_partition_topology().client_connections()
     assert [c.audio.frame_samples for c in client] == [1280 * model.chunk_frames]
@@ -210,12 +210,11 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     assert out.new_input_tensors == {} and out.metadata == {PROMPT_ID: 2}
 
 
-
-
 def test_a_deployment_hears_live_calls_only_when_it_asks(tmp_path):
     """Off by default: a cache-aware checkpoint serves whole clips on the one
-    walk, with no live partitions or stream state for every request to carry;
-    live on a checkpoint that can't stream is refused at load."""
+    walk, with no live partitions or stream state for every request to carry.
+    A live lookahead the checkpoint doesn't support, or on a checkpoint that
+    can't stream, is refused at load."""
     (tmp_path / "n").mkdir()
     (tmp_path / "p").mkdir()
     clip = ParakeetModel(str(_snapshot(tmp_path / "n", nemotron=True)))
@@ -223,20 +222,33 @@ def test_a_deployment_hears_live_calls_only_when_it_asks(tmp_path):
     assert not clip.get_partition_topology().client_connections()
     assert set(clip.get_graph_walk_graphs()) == {WALK}
     with pytest.raises(ValueError, match="cache-aware"):
-        ParakeetModel(str(_snapshot(tmp_path / "p", nemotron=False)), live=True)
+        ParakeetModel(str(_snapshot(tmp_path / "p", nemotron=False)), live_lookahead=3)
+    for bad in (5, True, 3.0, "3"):
+        with pytest.raises(ValueError, match="live_lookahead"):
+            ParakeetModel(str(tmp_path / "n"), live_lookahead=bad)
 
-def test_a_live_checkpoint_loads_its_encoder_once(tmp_path, monkeypatch):
+
+def test_a_live_deployment_shares_its_encoder_at_two_lookaheads(tmp_path, monkeypatch):
     """The clip's and the live call's encoder nodes run the same layers
-    (``forward`` / ``forward_stream``): one copy of the weights, not two."""
+    (``forward`` / ``forward_stream``): one copy of the weights, not two. Clips
+    keep the checkpoint's widest lookahead while live calls stream at the
+    deployment's, with stream state sized for its chunk."""
     from mstar.model.components.fastconformer import FastConformerEncoder
+    from mstar.model.components.fastconformer_stream import front_state_blocks
+    from mstar.model.parakeet.config import STREAM_FRONT
 
     monkeypatch.setattr(
         FastConformerEncoder, "load",
         classmethod(lambda cls, config, weights, *, device, dtype=None, **keys: cls(config, **keys)),
     )
-    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live=True)
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)), live_lookahead=3)
     clip, live = (model.get_submodule(node) for node in ("audio_encoder", "stream_encoder"))
     assert clip.encoder is live.encoder
+    assert clip.encoder.config.lookahead == 13
+    assert live.chunk_frames == model.chunk_frames == 4
+    front = next(spec for spec in model.get_node_resources() if spec.resource_key == STREAM_FRONT)
+    assert front.config.blocks == front_state_blocks(live.config, 160)
+
 
 def test_startup_refuses_more_requests_than_slots(tmp_path):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=False)))

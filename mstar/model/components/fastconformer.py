@@ -254,9 +254,9 @@ class RelPositionAttention(nn.Module):
         h, d = config.num_heads, config.head_dim
         self.num_heads, self.head_dim = h, d
         self.layer_idx, self._kv_key = layer_idx, kv_key
-        self.left_context, self.chunk = config.left_context, config.lookahead + 1
-        self.kv = None
-        self.band = None
+        self.left_context = config.left_context
+        # a stream's: its KV, its chunk and the frames it keeps (``bind_stream``)
+        self.kv = self.band = self.chunk = self.retained = None
         self.qkv_proj = nn.Linear(config.hidden_size, 3 * h * d, bias=config.attention_bias)
         self.o_proj = nn.Linear(h * d, config.hidden_size, bias=config.attention_bias)
         self.relative_k_proj = nn.Linear(config.hidden_size, h * d, bias=False)
@@ -269,19 +269,24 @@ class RelPositionAttention(nn.Module):
         # checks it is there (`FastConformerStreamSubmodule.bind_node_resources`).
         if self._kv_key in resources:
             self.kv = resources[self._kv_key]
-            # every distance a stream's frame sees, ascending, projected in the
-            # weights' dtype, which is what autocast computes it in: fixed weights,
-            # so once, here, before any capture. Frame by frame (a chunk of one)
-            # those are 0..left_context. A chunk's frames also see each other, and
-            # a stream's last step can run into a chunk more (its end pads a few
-            # frames), so the widest step is two chunks
-            w = self.relative_k_proj.weight
-            self.retained = stream_retained_frames(self.left_context, self.chunk)
-            widest = 1 if self.chunk == 1 else 2 * self.chunk
-            n = self.retained + 2 * widest - 1
-            with torch.no_grad():
-                band = rel_positional_encoding(self.retained + widest, w.shape[1], w.device, w.dtype)[:n].flip(0)
-                self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
+
+    def bind_stream(self, chunk: int) -> None:
+        """The stream node's chunk, ``chunk`` frames a step, which may be
+        narrower than the offline node's (the config's lookahead). Every
+        distance a stream's frame sees, ascending, is projected here, in the
+        weights' dtype, which is what autocast computes it in: fixed weights,
+        so once, at bind, before any capture. Frame by frame (a chunk of one)
+        those are 0..left_context. A chunk's frames also see each other, and a
+        stream's last step can run into a chunk more (its end pads a few
+        frames), so the widest step is two chunks."""
+        self.chunk = chunk
+        self.retained = stream_retained_frames(self.left_context, chunk)
+        w = self.relative_k_proj.weight
+        widest = 1 if chunk == 1 else 2 * chunk
+        n = self.retained + 2 * widest - 1
+        with torch.no_grad():
+            band = rel_positional_encoding(self.retained + widest, w.shape[1], w.device, w.dtype)[:n].flip(0)
+            self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
 
     def _qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, _ = x.shape
@@ -498,8 +503,9 @@ class FastConformerEncoder(nn.Module):
     then ``blocks``, the split NeMo's ``bypass_pre_encode`` makes.
 
     A causal encoder also runs as a stream, a few frames at a time:
-    ``blocks_stream`` attends in the bounded KV ``kv_key`` names (each frame
-    over the ``left_context`` before it) and continues each conv from the
+    ``blocks_stream`` attends in the bounded KV ``kv_key`` names (each chunk
+    over the whole chunks within ``left_context`` behind it, at the chunk the
+    stream node binds, ``bind_stream``) and continues each conv from the
     recurrent-state pool ``conv_key`` names, which hold a stream's state
     between steps."""
 
@@ -586,6 +592,13 @@ class FastConformerEncoder(nn.Module):
         for layer in self.layers:
             x = layer.forward_stream(x, tails)
         return x
+
+    def bind_stream(self, chunk: int) -> None:
+        """Bind the stream node's chunk, ``chunk`` frames a step, to each
+        layer's attention (``RelPositionAttention.bind_stream``); the offline
+        ``blocks`` keep the config's lookahead."""
+        for layer in self.layers:
+            layer.self_attn.bind_stream(chunk)
 
     # ------------------------------------------------------------------
     # weights

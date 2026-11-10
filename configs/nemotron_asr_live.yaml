@@ -11,7 +11,7 @@ node_groups:
   - node_names: [audio_encoder, stream_encoder, transducer, transducer_stream]
     ranks: [0]
 model_kwargs:
-  live: true
-  # A live call hears lookahead + 1 encoder frames at a time, so this sets its
-  # latency: 3 is 320 ms (13, the checkpoint's widest, is 1.12 s). Clips use it too.
-  lookahead: 3
+  # Live calls on, at this lookahead: a live call hears live_lookahead + 1 encoder
+  # frames at a time, so it sets their latency: 3 is 320 ms (13, the checkpoint's
+  # widest, is 1.12 s). Clips keep `lookahead`, the widest unless set.
+  live_lookahead: 3

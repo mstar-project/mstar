@@ -27,6 +27,8 @@ bounded KV (``encoder_kv_config``).
 """
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 
@@ -168,6 +170,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     has no graph for its streams, those streams run eagerly too.
 
     Used by Nemotron VoiceChat's duplex model and by Nemotron ASR's live walks.
+    ``lookahead`` sets the stream's chunk when it is narrower than the encoder
+    config's, which the offline node keeps (Nemotron ASR streams at 3 and hears
+    clips at 13); build the node's resources from a config at that lookahead.
     Construction refuses ``normalize=True``: a per-clip normalization can't be
     streamed. A stream's audio comes one chunk per step: its client stream cuts
     it on ``chunk_samples``, and only the first and last chunks can differ.
@@ -195,9 +200,12 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         front_key: str,
         batch_sizes: list[int],
         item_per_step: bool = False,
+        lookahead: int | None = None,
     ):
         super().__init__()
-        c = encoder.config
+        # the stream's chunk is lookahead + 1 frames: the encoder's own unless
+        # given, so a deployment can stream narrower than its offline node runs
+        c = encoder.config if lookahead is None else dataclasses.replace(encoder.config, lookahead=lookahead)
         frame_samples = log_mel.hop_length * c.subsampling_factor
         unsupported = {
             name: value for name, value, ok in (
@@ -218,6 +226,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                              f"conv pool, an unnormalized featurizer with a preemphasis and "
                              f"n_fft <= {frame_samples}, and capture batch sizes; got {unsupported}")
         self.encoder = encoder
+        self.config = c
         self.log_mel = log_mel
         self.projection = projection
         self.input_edge, self.output_edge, self.front_key = input_edge, output_edge, front_key
@@ -241,8 +250,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         frame: frame ``j`` reads mel frames up to ``8 * j``. At the end, every
         frame offline would produce."""
         if final:
-            return int(self.encoder.config.output_lengths(self.log_mel.num_frames(samples)))
-        return (mels - 1) // self.encoder.config.subsampling_factor + 1
+            return int(self.config.output_lengths(self.log_mel.num_frames(samples)))
+        return (mels - 1) // self.config.subsampling_factor + 1
 
     def new_frames(self, st: StreamState, samples: int, final: bool) -> int:
         """The encoder frames a step makes final for a stream at ``st`` that
@@ -274,6 +283,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             raise ValueError(f"the stream encoder's node has no resources {missing}")
         super().bind_node_resources(resources)
         self.front = resources[self.front_key]
+        self.encoder.bind_stream(self.chunk_frames)
 
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as
@@ -397,7 +407,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         and the blocks alone for any step with a whole chunk for every stream that
         has a frame (``LAYERS_REGION``)."""
         del tp_world_size
-        hidden, frames = self.encoder.config.hidden_size, self.chunk_frames
+        hidden, frames = self.config.hidden_size, self.chunk_frames
 
         def step_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
             return {"chunk": torch.zeros(shape.bs, self.chunk_samples, dtype=torch.float32, device=device)}
@@ -456,7 +466,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         frames from ``8k - 9`` and encoder frames ``k - 1 .. k + c - 2``, whose
         subsampling window is the 15 mel frames before them plus them (outputs
         2 on)."""
-        fs, f, c = self.frame_samples, self.encoder.config.subsampling_factor, self.chunk_frames
+        fs, f, c = self.frame_samples, self.config.subsampling_factor, self.chunk_frames
         hop, pad = self.log_mel.hop_length, self.log_mel.n_fft // 2
         last, sig = self.front.gather("last"), self.front.gather("sig")
         mel_tail = self.front.gather("mel")
@@ -469,7 +479,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         new = self.encoder.subsample(window)[:, 2:2 + c]
         self.front.scatter_("sig", y[:, -fs:])
         self.front.scatter_("last", x[:, -1:])
-        self.front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -_mel_tail(self.encoder.config):])
+        self.front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -_mel_tail(self.config):])
         return self._blocks_stream(new, chunk.new_full((chunk.shape[0],), c, dtype=torch.long))
 
     def _front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool],
@@ -478,8 +488,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         (``new_frames``, counted before the step), ``(B, max(n), hidden)``
         zero-padded, or None when no stream has one. A stream with no chunk and
         not at its end is left as it is."""
-        f = self.encoder.config.subsampling_factor
-        keep_sig, keep_mel = self.frame_samples, _mel_tail(self.encoder.config)
+        f = self.config.subsampling_factor
+        keep_sig, keep_mel = self.frame_samples, _mel_tail(self.config)
         busy = [i for i, (ch, fin) in enumerate(zip(chunks, final, strict=True))
                 if fin or (ch is not None and ch.numel())]
         if not busy:
@@ -623,7 +633,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             for row, i in enumerate(steady):
                 st = states[i]
                 st.samples += self.chunk_samples
-                st.mels += self.encoder.config.subsampling_factor * self.chunk_frames
+                st.mels += self.config.subsampling_factor * self.chunk_frames
                 st.frames += self.chunk_frames
                 frames[i] = y[row]
         # One stream item per frame unless the consumer decodes a chunk's frames

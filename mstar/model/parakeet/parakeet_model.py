@@ -20,8 +20,9 @@ Graph walk:
                  each iteration's tokens to the client, until the cursor
                  passes the clip's last frame
 
-A cache-aware checkpoint adds two walks, one partition each, for a live call:
-    encode_stream — stream_encoder, one step per chunk (lookahead + 1 frames)
+With ``live_lookahead`` (a cache-aware checkpoint), two walks more, one partition
+each, for a live call:
+    encode_stream — stream_encoder, one step per chunk (live_lookahead + 1 frames)
                     of the client's audio
     decode_stream — transducer_stream, one step per chunk of frames, its tokens
                     to the client; both end with the client's stream
@@ -91,23 +92,22 @@ class ParakeetModel(Model):
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
-    # whether the deployment also hears live calls; set by __init__ from its `live` kwarg
-    live = False
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
-        lookahead: int | None = None, compile_step: bool = True, live: bool = False, **kwargs,
+        lookahead: int | None = None, compile_step: bool = True, live_lookahead: int | None = None, **kwargs,
     ):
+        """``lookahead`` is the clips' (the checkpoint's widest by default);
+        ``live_lookahead``, one the checkpoint supports, also serves live calls
+        at it (configs/nemotron_asr_live.yaml). Without it the graph is the
+        whole-clip one alone: a live path costs every clip's request its extra
+        partitions and the deployment its stream state."""
         self.model_path_hf = model_path_hf
         self.compile_step = compile_step
         self.local_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=CHECKPOINT_FILES)
-        self.config = ParakeetModelConfig.from_pretrained(self.local_dir, lookahead=lookahead)
-        if live and not self.config.encoder.causal:
-            raise ValueError(f"live: true needs a cache-aware (causal) checkpoint; {model_path_hf} is not one")
-        # A deployment that also hears live calls (configs/nemotron_asr_live.yaml). Off, the
-        # graph is the whole-clip one alone: a live path costs every clip's request its extra
-        # partitions and the deployment its stream state.
-        self.live = bool(live)
+        self.config = ParakeetModelConfig.from_pretrained(
+            self.local_dir, lookahead=lookahead, live_lookahead=live_lookahead,
+        )
         tokenizer = json.loads((self.local_dir / "tokenizer.json").read_text())
         self._detokenizer = SentencePieceDetokenizer(
             tokenizer, extra_skip_ids={self.config.transducer.blank_token_id},
@@ -117,9 +117,14 @@ class ParakeetModel(Model):
         self._modules: dict[tuple[str, str], torch.nn.Module] = {}
 
     @property
+    def live(self) -> bool:
+        """Whether the deployment also hears live calls."""
+        return self.config.live_encoder is not None
+
+    @property
     def chunk_frames(self) -> int:
         """Encoder frames a live step takes: its attention's chunk."""
-        return self.config.encoder.lookahead + 1
+        return self.config.live_encoder.lookahead + 1
 
     def checkpoint_path(self) -> str:
         return str(self.local_dir)
@@ -152,7 +157,7 @@ class ParakeetModel(Model):
         from mstar.model.components.fastconformer_stream import stream_node_resources
 
         return stream_node_resources(
-            self.config.encoder, HOP_LENGTH, "stream_encoder", self.MAX_CONCURRENT_REQUESTS,
+            self.config.live_encoder, HOP_LENGTH, "stream_encoder", self.MAX_CONCURRENT_REQUESTS,
             kv_key=STREAM_KV, conv_key=STREAM_CONV, front_key=STREAM_FRONT,
         )
 
@@ -361,6 +366,7 @@ class ParakeetModel(Model):
                 NemoLogMel(num_mel_bins=self.config.encoder.num_mel_bins, normalize=False, device=device), None,
                 input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
                 batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
+                lookahead=self.config.live_encoder.lookahead,
             )
         if node_name in ("transducer", "transducer_stream"):
             from mstar.model.parakeet.submodules import TransducerSubmodule

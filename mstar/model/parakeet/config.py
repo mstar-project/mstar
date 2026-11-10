@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mstar.model.components.fastconformer import FastConformerConfig
@@ -46,6 +46,9 @@ class ParakeetModelConfig:
     model_type: str
     encoder: FastConformerConfig
     transducer: TransducerConfig
+    # a live call's encoder: the clip's at the deployment's live lookahead
+    # (None: the deployment hears no live calls)
+    live_encoder: FastConformerConfig | None = None
     # offline checkpoints standardize each mel bin over the clip; streaming
     # ones cannot (the clip isn't known yet) and don't
     normalize_features: bool = True
@@ -59,7 +62,9 @@ class ParakeetModelConfig:
         return self.transducer.num_prompts > 0
 
     @classmethod
-    def from_pretrained(cls, local_dir: str | Path, lookahead: int | None = None) -> ParakeetModelConfig:
+    def from_pretrained(
+        cls, local_dir: str | Path, lookahead: int | None = None, live_lookahead: int | None = None,
+    ) -> ParakeetModelConfig:
         local_dir = Path(local_dir)
         hf = json.loads((local_dir / "config.json").read_text())
         model_type = hf["model_type"]
@@ -75,10 +80,21 @@ class ParakeetModelConfig:
         elif lookahead is not None and supported and lookahead not in supported:
             raise ValueError(f"lookahead {lookahead} is not one of the checkpoint's {supported}")
         encoder = FastConformerConfig.from_hf(hf["encoder_config"], lookahead=lookahead)
+        live_encoder = None
+        if live_lookahead is not None:
+            if not encoder.causal:
+                raise ValueError(f"live_lookahead needs a cache-aware (causal) checkpoint; {model_type} is not one")
+            allowed = supported or [hf["encoder_config"].get("default_num_lookahead_tokens", 0)]
+            # an int, not a bool (False would read as 0) or a float (3.0 would be found)
+            if type(live_lookahead) is not int or live_lookahead not in allowed:
+                raise ValueError(f"live_lookahead must be one of the checkpoint's lookaheads {sorted(allowed)}; "
+                                 f"got {live_lookahead!r}")
+            live_encoder = replace(encoder, lookahead=live_lookahead)
         prompts = dict(proc.get("prompt_dictionary", {}))
         return cls(
             model_type=model_type,
             encoder=encoder,
+            live_encoder=live_encoder,
             transducer=TransducerConfig.from_hf(hf, start_token_id=gen["decoder_start_token_id"]),
             normalize_features=not encoder.causal,
             default_prompt_id=hf.get("default_prompt_id", prompts.get("auto", 0)),
