@@ -963,10 +963,11 @@ class Cosmos3Model(Model):
     def max_input_files(self) -> dict[str, int]:
         # the data worker refuses audio before decoding it. The reasoner takes
         # any number of images and videos; generation conditions on one image
-        # or one video, which only a deployment without the reasoner can say here
+        # or one video (process_prompt refuses both), which only a deployment
+        # without the reasoner can say here
         if self._reasoner_enabled():
             return {"audio": 0}
-        return {"image": 1, "audio": 0, "video": 0}
+        return {"image": 1, "audio": 0, "video": 1}
 
     def process_prompt(
         self,
@@ -981,6 +982,12 @@ class Cosmos3Model(Model):
         if "text" in (output_modalities or []):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
+            )
+        conditions = [*(tensors or {}).get("image_inputs", ()), *(tensors or {}).get("video_inputs", ())]
+        if len(conditions) > 1:
+            # generation reads the first video, else the first image
+            raise ValueError(
+                f"Cosmos3 generation conditions on one image or one video; got {len(conditions)} files"
             )
         # The DiT prefill waits on text_inputs, so no prompt means the empty
         # prompt (as in the reference), not a missing edge. /generate sends an

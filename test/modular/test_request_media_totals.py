@@ -1,5 +1,6 @@
 """A request's media is refused by what its files add up to, and by the
 model's per-modality file count, before the data worker decodes the files."""
+import contextlib
 import importlib
 import queue
 import struct
@@ -209,6 +210,30 @@ def test_a_model_refuses_files_it_does_not_take_before_decoding(tmp_path, module
         wt._process_input(request)
     assert loaded == []
     assert _status(wt, info.value) == 400
+
+
+def test_cosmos3_generation_takes_one_image_or_one_video(tmp_path):
+    """Without the reasoner, a video-to-video or inverse-dynamics upload was
+    refused by a ``video: 0`` declaration; two conditions were decoded and all
+    but the first dropped (200)."""
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    model = object.__new__(Cosmos3Model)
+    model.config = types.SimpleNamespace(serves_reasoner=False, enable_reasoner=False)
+    loaded = []
+    model.load_video = lambda path, device: loaded.append(path) or torch.zeros(1, 3, 8, 8)
+    (tmp_path / "clip").write_bytes(b"")
+    request = PreprocessInput(
+        request_id="r1", text="a cat", file_paths={"video": [str(tmp_path / "clip")]},
+        input_modalities=["video", "text"], output_modalities=["video"], model_kwargs={},
+    )
+    with contextlib.suppress(Exception):  # only the count check is under test
+        _preprocess_thread(model)._process_input(request)
+    assert loaded == [str(tmp_path / "clip")]
+    two = {"image_inputs": [torch.zeros(3, 8, 8)], "video_inputs": [torch.zeros(1, 3, 8, 8)]}
+    with pytest.raises(ValueError, match="one image or one video; got 2"):
+        model.process_prompt("a cat", ["image", "video", "text"], ["video"], tensors=two)
 
 
 def test_audio_clips_share_the_audio_limit(tmp_path, headers, monkeypatch):
