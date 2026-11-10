@@ -707,6 +707,16 @@ def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(KokoroModel, config=KokoroModelConfig())
 
 
+def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+    config = MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
+    )
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
+
+
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.orpheus.orpheus_model import OrpheusModel, OrpheusModelConfig
     return _bare(OrpheusModel, config=OrpheusModelConfig())
@@ -898,6 +908,7 @@ _FACTORIES = {
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
+    "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
     "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,
