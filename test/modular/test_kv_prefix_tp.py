@@ -485,52 +485,74 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert leader.plans_ahead(spec("other", True)), "a node with no followers keeps its pre-plan"
 
 
-@pytest.mark.parametrize("rank_0_leases_first", [True, False])
-def test_ranks_count_a_shared_window_page_alike_whether_a_lease_or_its_payers_release_lands_first(rank_0_leases_first):
-    """Rank 0 leases c's hit, whose window pages a holds, as it sends c's step, and a's commit that rolls those pages
-    out of a's window can land before or after that on rank 0, and the other way round on a follower. Once c's admit
-    converts the lease, every rank counts the same pages lent and the same allotments."""
+# Each rank's own order of c's lease (L), a's commit that rolls the shared pages out of a's window (R), c's admit
+# that converts the lease (C) and c's next step once converted (G): rank 0's, then the follower's.
+@pytest.mark.parametrize("order", ["LR/RL", "RL/LR", "CR/RC", "RC/CR", "GR/RG", "RG/GR"])
+def test_ranks_count_a_shared_window_page_alike_whether_a_lease_or_its_payers_release_lands_first(order):
+    """c leases a hit whose window pages a holds, and a's commit that rolls those pages out of a's window lands
+    before or after c's lease, c's admit, or c's next step, in one order on rank 0 and in the other on a follower.
+    Every rank ends up counting the same pages lent, the same allotments and the same room."""
+    there, here = order.split("/")
     ranks = leader, follower = _manager(0, window=24, max_num_pages=64), _manager(1, window=24, max_num_pages=64)
     shared, rest = _tokens(6 * PAGE_SIZE, seed=3), _tokens(52, seed=4)
     prompt = shared + _tokens(20, seed=5)
     runner = StepRunner({"kv": leader}, node_resources={NODE: ["kv"]})
     for kv in ranks:
         _ingest(kv, "a", shared, rest)
-        _ingest(kv, "c", prompt)
+        kv.ingest_request("c", _config([prompt], decode=4 * PAGE_SIZE))
     assert runner.admit_retrieve("a", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "a", leader._allotments["a"].pages, [])
     rolls = {}
     for kv in ranks:
         kv.commit(_step(kv, "a", len(shared)), _ctx("a"))
+        window = set(kv._streams["a"]["main"].later[0].page_indices)
         # a's next step rolls the window pages c leases out of a's window
         rolls[kv] = _step(kv, "a", len(rest))
     assert runner.admit_retrieve("c", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "c", leader._allotments["c"].pages, [])
 
-    if rank_0_leases_first:
-        head = _send(leader, "c")
-        lease = head.prefix_hits["wire-c"]["kv"]
-        assert set(lease.lent) & set(lease.groups[1]), "rank 0 lent c none of the window pages a holds"
-        leader.commit(rolls[leader], _ctx("a"))
-        follower.commit(rolls[follower], _ctx("a"))
-        assert _follow(follower, head)
-    else:
-        leader.commit(rolls[leader], _ctx("a"))
-        assert _follow(follower, _send(leader, "c"))
-        follower.commit(rolls[follower], _ctx("a"))
-    for kv in ranks:
-        _step(kv, "c", len(prompt))
+    def land(kv: KVManager, event: str) -> None:
+        if event == "L":
+            if kv is leader:
+                heads.append(_send(leader, "c"))
+                assert set(heads[0].prefix_hits["wire-c"]["kv"].groups[1]) & window, "c leases none of a's window pages"
+            else:
+                assert _follow(follower, heads[0])
+        elif event == "R":
+            kv.commit(rolls[kv], _ctx("a"))
+        elif event == "C":
+            _step(kv, "c", len(prompt))
+        else:
+            assert kv.admit(KVStep(segments=(Segment("c", "main", PAGE_SIZE),)), _ctx("c", "decode")).ok
 
-    window = set(leader._streams["c"]["main"].later[0].page_indices)
-    assert leader._index.page_for(leader._window_key(leader._streams["c"]["main"].chain.rooted[5], 1, 11)) in window, (
-        "c's window missed the pages a cached"
-    )
+    heads = []
+    if "L" not in there:
+        for kv in ranks:
+            land(kv, "L")
+        # c's allotment has room for nothing past what it holds, or once converted for just as many pages as it
+        # holds of a's window
+        for kv in ranks:
+            if "G" in there:
+                kv.commit(_step(kv, "c", len(prompt)), _ctx("c"))
+            held = len(set(kv._streams["c"]["main"].pages()) & window) if "G" in there else 0
+            kv._allotments["c"].pages = kv._held("c") + held
+            kv._recount("c")
+        assert leader._allotments["c"] == follower._allotments["c"]
+    for event in there:
+        land(leader, event)
+    for event in here:
+        land(follower, event)
+    if "L" in there:
+        for kv in ranks:
+            land(kv, "C")
+
     assert not window & set(leader._streams["a"]["main"].later[0].page_indices), "a still holds c's window"
-    assert not window & leader._streams["c"]["main"].lent, "c lends window pages no other request pays for"
     for rid in "ac":
         assert follower._streams[rid]["main"].lent == leader._streams[rid]["main"].lent, f"{rid} lends other pages"
         assert follower._allotments[rid] == leader._allotments[rid], f"{rid}'s allotment differs between the ranks"
-    assert follower._unused == leader._unused, "the follower's room differs from rank 0's"
+    assert (follower._unused, follower._room()) == (leader._unused, leader._room()), (
+        "the follower's room differs from rank 0's"
+    )
     for kv in ranks:
         kv.assert_pages_conserved()
 

@@ -487,7 +487,8 @@ def test_repeats_of_one_cached_prompt_on_a_window_pool_fit_the_capture_bound():
     pool holds; a captured wrapper's index buffer holds them all (it was once sized by the pool)."""
     from mstar.engine.resources.attn.base import captured_page_capacity
 
-    kv = _window_manager(max_num_pages=16)
+    # room for the window pages they share too, which each repeat rolls out into pages of its own (`_shared`)
+    kv = _window_manager(max_num_pages=20)
     shared = list(range(6 * PAGE_SIZE))
     rids = [f"r{i}" for i in range(10)]
     for i, rid in enumerate(rids):
@@ -518,6 +519,25 @@ def test_a_repeat_on_a_window_pool_takes_the_window_pages_the_first_request_left
         "the repeat's window doesn't stand where writing the prompt would have left it"
     )
     kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("removed", ["b", "a"])
+def test_a_removed_holder_gives_back_the_room_kept_for_the_window_pages_two_streams_hold(removed):
+    """b leases the window pages a still holds, so the pool keeps room for the second holder (`_shared`). Removing
+    either, b before admit converts its lease, gives that room back."""
+    kv = _window_manager()
+    tokens = list(range(100))
+    _write(kv, "a", tokens)
+    room = kv._room()
+    kv.ingest_request("b", KVReqConfig(prefix_keys={"main": _keys(tokens)}, kv_layout=_layout(100)))
+    assert kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=100)).tokens == 96
+    assert kv._room() < room, "b leases none of the window pages a holds"
+
+    kv.remove_request(removed)
+
+    kv.assert_pages_conserved()
+    if removed == "b":
+        assert kv._room() == room, "the pool still keeps room for window pages only a holds"
 
 
 def test_a_window_page_missing_from_the_cache_moves_the_hit_back_below_it():
@@ -559,18 +579,21 @@ class _Capping(StubResource):
         return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
 
 
-@pytest.mark.parametrize(("other", "gone", "served"), [
-    (_Holding(0), None, 0),
+@pytest.mark.parametrize(("other", "gone", "served", "held"), [
+    (_Holding(0), None, 0, False),
     # the lease ends at 96 and holds the window of tokens 72-96, but the index still holds 56-80's
-    (_Holding(80), None, 80),
+    (_Holding(80), None, 80, False),
+    # and a still holds 72-96's, so the cut gives back the room kept for b's holding them too (`_shared`)
+    (_Holding(80), None, 80, True),
     # the window page of tokens 64-72 is gone, so the cache serves 64, and the cap is asked again at 64
-    (_Capping(80), 8, 64),
-], ids=["declined", "shorter", "capped"])
-def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served):
+    (_Capping(80), 8, 64, False),
+], ids=["declined", "shorter", "shorter_while_held", "capped"])
+def test_a_window_lease_cut_below_its_end_serves_what_the_index_holds_there(other, gone, served, held):
     kv = _window_manager()
     tokens = list(range(100))
     _write(kv, "a", tokens)
-    kv.remove_request("a")
+    if not held:
+        kv.remove_request("a")
     if gone is not None:
         rooted = [fingerprint(ROOT, key) for key in _keys(tokens)]
         kv._index._remove(kv._index.page_for(kv._window_key(rooted[kv._ends_on(1, gone)], 1, gone)))

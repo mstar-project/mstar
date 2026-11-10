@@ -843,9 +843,9 @@ def test_a_cut_lease_refunds_only_the_pages_that_go_back_to_the_evictable_set():
 @pytest.mark.parametrize("b_decodes", [False, True], ids=["b_in_its_prompt", "b_decoded_through_its_allotment"])
 def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_out(b_decodes: bool):
     """Two repeats lease the same cached window pages. When the first's window rolls them out before its prompt
-    ends, the second still holds them, so they don't come back as room. The second's allotment takes them over
-    while it has room left, and the first still takes pages in their place; once the second has decoded through
-    its allotment, nothing takes them over, so the first's allotment can't count on them either."""
+    ends, the second still holds them, so they don't come back as room. The room the pool kept for the second
+    holding them (`_shared`) covers them, so the first's allotment still has the pages its window takes in their
+    place, whether or not the second has decoded through its allotment."""
     kv = _window_manager()
     shared = list(range(100))
     _write(kv, "seed", shared)
@@ -878,10 +878,7 @@ def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_
     pages = kv._allotments["a"].pages
     _grow(kv, "a", 40)
     kv.assert_pages_conserved()
-    assert (kv._allotments["a"].pages < pages) is b_decodes, (
-        "\"a\"'s allotment kept room for a page \"b\" holds but has no room to take over" if b_decodes
-        else "\"a\"'s allotment gave up room \"b\" took over"
-    )
+    assert kv._allotments["a"].pages == pages, "\"a\"'s allotment gave up room for pages \"b\" still holds"
 
     # and "a"'s allotment still covers the pages its window takes in their place through the rest of its prompt
     _grow(kv, "a", 24)

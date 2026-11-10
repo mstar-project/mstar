@@ -960,9 +960,9 @@ def test_a_request_dropped_on_a_pool_that_keeps_a_window_returns_with_its_window
 def test_a_drop_of_a_request_sharing_cached_window_pages_keeps_the_count_and_its_rebuild_hits_the_window(
     monkeypatch, dropped,
 ):
-    """a and b hit the same cached window pages: a pays for them and b holds them lent. Preemption drops either one,
-    the other decodes its window past those pages, and the dropped one's rebuild probes the window pool again and
-    hits it, with every page counted throughout."""
+    """a and b hit the same cached window pages, so the pool keeps room for the second holder (`_shared`). Preemption
+    drops either one, which gives that room back, the other decodes its window past those pages, and the dropped
+    one's rebuild probes the window pool again and hits it, with every page counted throughout."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _cached_window_manager()
     shared = list(range(100))
@@ -982,7 +982,7 @@ def test_a_drop_of_a_request_sharing_cached_window_pages_keeps_the_count_and_its
         for _ in range(4):
             _grow_kv(kv, rid, 1)
     window = [set(kv._streams[rid]["main"].later[0].page_indices) for rid in prompts]
-    assert window[0] & window[1] & kv._streams["b"]["main"].lent, "b holds none of a's window pages lent"
+    assert window[0] & window[1] and kv._shared, "a and b share none of the cached window pages"
     kept = "b" if dropped == "a" else "a"
 
     _drop(kv, dropped)
