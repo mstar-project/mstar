@@ -40,6 +40,7 @@ from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs,
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation
@@ -279,7 +280,7 @@ class GpuStepBody:
 class StepExecutor:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
-        lockstep: Lockstep, lifecycle: RequestLifecycle, *,
+        lockstep: Lockstep, lifecycle: RequestLifecycle, preemption: Preemption, *,
         wakeup_event=None, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None,
         device_capability: DeviceCapability | None = None,
@@ -298,6 +299,7 @@ class StepExecutor:
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
+        self.preemption = preemption
         self.wakeup_event = wakeup_event
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
@@ -664,16 +666,19 @@ class StepExecutor:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
+        landed = {
+            rid: cursor for rid in rebuild
+            if rid in ran and (cursor := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
         if landed:
             # the step's kernels read the prepared input released here
             self.wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, cursor in landed.items():
+                if not cursor.resumes_prefill:
+                    engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
+                self.preemption.rebuilt(rid, node, cursor.total)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)

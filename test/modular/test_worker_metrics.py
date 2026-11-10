@@ -138,7 +138,7 @@ def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=T
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     m = WorkerMetrics(
         "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler, rebuilds or Rebuilds({}, {}),
-        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
+        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     if counting:
         m.start_counting()
@@ -345,7 +345,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse, metrics_on=True):
 
     metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
                             SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
-                            enable_transfers=lambda: EdgeTransfers("SHM"))
+                            enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={})
     metrics.start_counting()
     w = make_worker(
         worker_id="worker_0", metrics=metrics if metrics_on else None,
@@ -721,7 +721,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
         SimpleNamespace(pending_rows=lambda: {NODE: pending}), Rebuilds({}, {}), send=None,
-        enable_transfers=lambda: EdgeTransfers("SHM"),
+        enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(worker_metrics, "time", clock)
