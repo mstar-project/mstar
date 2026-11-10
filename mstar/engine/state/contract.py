@@ -193,6 +193,10 @@ class Rope:
 
 @dataclass(frozen=True, kw_only=True)
 class Positions:
+    """Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
+    and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by
+    ``ArrayStep.position_ids``. It forks and takes prefix hits with its array."""
+
     rope: Rope | None = None    # None: a counter only
 
 
