@@ -14,7 +14,7 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-from mstar.engine.state.adapters import node_resources, sdpa_resources, spec_overrides
+from mstar.engine.state.adapters import StateSetup, node_resources, spec_overrides, state_setup
 from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
@@ -116,19 +116,17 @@ def validate_deployment(
     # a model may read checkpoint files here (LTX-2.5): its failure joins the
     # problems found so far, and only the checks that need the specs are skipped
     specs = None
-    sdpa: frozenset[str] = frozenset()
-    if not malformed and resources_readable:
-        try:
-            sdpa = sdpa_resources(config)
-        except ValueError as e:
-            problems.append(str(e))
     try:
         declaration_problems = state_declaration_problems(model)
         problems += declaration_problems
         if declaration_problems:
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
-            specs = node_resources(model, sdpa=sdpa)
+            setup = StateSetup()
+            if not malformed and resources_readable:
+                setup, setup_problems = state_setup(config, model.declare_state())
+                problems += setup_problems
+            specs = node_resources(model, setup=setup)
             if resources_readable:
                 # a worker graph's `tp_size` is the instance's, TP times SP
                 head_shards = {} if deployment is None else {
@@ -143,7 +141,7 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("declaring the node resources", e))
-    checked_config = spec_overrides(config, sdpa)
+    checked_config = spec_overrides(config) if resources_readable else config
     # a `resources:` block check_resources refuses turns no LoRA on
     if specs is not None and resources_readable and lora_enabled(config):
         lora = None

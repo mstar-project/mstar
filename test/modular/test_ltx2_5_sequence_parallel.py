@@ -17,7 +17,7 @@ sys.path.insert(0, ".")
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.engine.state.adapters import node_handles, node_resources, state_steps  # noqa: E402
+from mstar.engine.state.adapters import node_handles, node_resources, state_setup, state_steps  # noqa: E402
 from mstar.model.ltx2_5.components.transformer import LTX2DiT, build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
 from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
@@ -61,7 +61,9 @@ def _opened_on_sdpa(dit, cfg, group, shape, rows):
     config = dataclasses.replace(LTX25Config(), transformer=cfg)
     model = LTX25Model(skip_weight_loading=True)
     model.set_config(config)
-    handles = node_handles(model, "dit", {}, sp_group=group, sdpa={spec.resource_key for spec in node_resources(model)})
+    on_sdpa = {spec.resource_key: {"backend": "sdpa"} for spec in node_resources(model)}
+    setup, _ = state_setup({"resources": on_sdpa}, model.declare_state())
+    handles = node_handles(model, "dit", {}, sp_group=group, setup=setup)
     for module in dit.modules():
         if hasattr(module, "bind_state"):
             module.bind_state(handles)

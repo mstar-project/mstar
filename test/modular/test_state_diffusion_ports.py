@@ -28,7 +28,7 @@ from mstar.engine.resources.lora.config import LoraStep
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
-from mstar.engine.state.adapters import build_handle, node_handles, node_resources, state_steps
+from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, node_resources, state_setup, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.components.diffusion.attention import dit_entry
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
@@ -88,9 +88,12 @@ def _ltx(**kwargs) -> LTX25Model:
     return model
 
 
-def _on_sdpa(model) -> frozenset[str]:
-    """Every resource ``model`` declares, which on a DiT is each attention's."""
-    return frozenset(spec.resource_key for spec in node_resources(model))
+def _on_sdpa(model) -> StateSetup:
+    """SDPA on every resource ``model`` declares, which on a DiT is each attention's."""
+    on_sdpa = {spec.resource_key: {"backend": "sdpa"} for spec in node_resources(model)}
+    setup, problems = state_setup({"resources": on_sdpa}, model.declare_state())
+    assert not problems, problems
+    return setup
 
 
 def _wan_reference() -> RaggedAttentionSpec:
@@ -148,7 +151,7 @@ def test_specs_equal_the_hand_written_one_after_yaml_overrides(name):
 @pytest.mark.parametrize("name", MODELS)
 def test_sdpa_builds_no_spec_as_the_hand_written_model_did(name):
     model = MODELS[name][0]()
-    assert node_resources(model, sdpa=_on_sdpa(model)) == []
+    assert node_resources(model, setup=_on_sdpa(model)) == []
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -253,7 +256,7 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
 def test_a_step_on_sdpa_is_none_as_the_hand_written_model_returned():
     model = _klein()
     sub = KleinDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP, compile_transformer=False)
-    handles = node_handles(model, "dit", {}, sdpa=_on_sdpa(model))
+    handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("gen", [0], [_inputs(_klein_key())]), handles) is None
 
 
@@ -378,7 +381,7 @@ def test_ltx_specs_equal_the_hand_written_four_after_yaml_overrides():
 
 
 def test_ltx_on_sdpa_builds_no_spec_and_its_declarations_have_no_problems():
-    assert node_resources(_ltx(), sdpa=_on_sdpa(_ltx())) == []
+    assert node_resources(_ltx(), setup=_on_sdpa(_ltx())) == []
     assert state_declaration_problems(_ltx()) == []
 
 
@@ -448,5 +451,5 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
     model = _ltx()
     sub = LTXDenoiseSubmodule(None, model.config, loop_name=DENOISE_LOOP)
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    handles = node_handles(model, "dit", {}, sdpa=_on_sdpa(model))
+    handles = node_handles(model, "dit", {}, setup=_on_sdpa(model))
     assert state_steps(sub.declare_step("generate_av", [0], [_inputs(shape)]), handles) is None

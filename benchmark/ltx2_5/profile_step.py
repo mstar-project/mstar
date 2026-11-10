@@ -28,21 +28,22 @@ def open_attention(dit, config, shape, batch, device, attention, comm_group=None
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.step import StepContext
-    from mstar.engine.state.adapters import node_handles, node_resources, state_steps
+    from mstar.engine.state.adapters import node_handles, node_resources, state_setup, state_steps
     from mstar.model.ltx2_5 import submodules as S
     from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
     from mstar.model.submodule_base import NodeInputs
 
     model = LTX25Model(skip_weight_loading=True)
     model.set_config(config)
-    sdpa = frozenset(spec.resource_key for spec in node_resources(model)) if attention == "sdpa" else frozenset()
+    on_sdpa = [spec.resource_key for spec in node_resources(model)] if attention == "sdpa" else []
+    setup, _ = state_setup({"resources": {key: {"backend": "sdpa"} for key in on_sdpa}}, model.declare_state())
     joint = JointGroups(tp_group=comm_group or CommGroup.trivial(), sp_group=sp_group or CommGroup.trivial())
     info = EngineResourceInfo(device=device, kv_dtype=torch.bfloat16, joint_comm_group=joint)
     resources = {
         spec.resource_key: build_resource(spec, info)
-        for spec in node_resources(model, sdpa=sdpa)
+        for spec in node_resources(model, setup=setup)
     }
-    handles = node_handles(model, "dit", resources, sp_group=sp_group, sdpa=sdpa)
+    handles = node_handles(model, "dit", resources, sp_group=sp_group, setup=setup)
     for module in dit.modules():
         if hasattr(module, "bind_state"):
             module.bind_state(handles)

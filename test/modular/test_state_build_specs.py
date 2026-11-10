@@ -40,7 +40,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, build_specs, node_resources
+from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, StateSetup, build_specs, node_resources
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources
 from mstar.validation import DeploymentError
@@ -457,7 +457,7 @@ def test_a_declared_name_clashing_with_a_hand_written_key_is_caught_on_the_joine
 
 
 def test_enabled_resources_builds_from_the_declarations():
-    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {})
+    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {}, StateSetup())
     assert {spec.resource_key for spec in specs} == {"kv", "attn", "sampler"}
 
 
@@ -469,7 +469,7 @@ def test_kernel_settings_with_no_declarations_are_refused():
 def test_enabled_resources_raises_the_first_problem():
     model = _Declaring(_kv(nodes={"dit"}), _kv(nodes={"sit"}))
     with pytest.raises(ValueError, match="the name 'kv' is declared twice"):
-        enabled_resources(model, {})
+        enabled_resources(model, {}, StateSetup())
 
 
 def _validation_problems(model, tmp_path, **config) -> list[str]:

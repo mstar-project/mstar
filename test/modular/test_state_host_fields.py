@@ -18,7 +18,14 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
-from mstar.engine.state.adapters import build_handle, build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state.adapters import (
+    StateSetup,
+    build_handle,
+    build_specs,
+    kv_layouts,
+    node_handles,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.host import HostFields, is_host_value
 
@@ -33,7 +40,7 @@ def _handle(array=None, *requests) -> ArrayHandle:
     array = array or _flags()
     fields = HostFields()
     model = SimpleNamespace(declare_state=lambda: [array])
-    handle = node_handles(model, "talker", {}, host_fields=fields)[array.name]
+    handle = node_handles(model, "talker", {}, setup=StateSetup(host_fields=fields))[array.name]
     for request in requests or (RID,):
         fields.open(request)
     return handle

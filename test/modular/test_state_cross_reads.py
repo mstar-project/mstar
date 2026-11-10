@@ -25,12 +25,14 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, Value, adapters
 from mstar.engine.state.adapters import (
+    SDPA,
     WITHIN_STEP,
+    StateSetup,
     WithinStepHandle,
     _bindings,
     build_specs,
     node_handles,
-    sdpa_resources,
+    state_setup,
     state_steps,
 )
 from mstar.engine.state.analysis import deployment_problems
@@ -97,10 +99,18 @@ def _within(array, ragged, **within) -> WithinStepHandle:
     return WithinStepHandle(array, {next(iter(array.reads)): ragged}, None, _bindings(WITHIN_STEP, array), **within)
 
 
-def _handles(arrays, *, group=None, sdpa=frozenset()) -> dict[str, WithinStepHandle]:
+def _on_sdpa(*reads) -> StateSetup:
+    return StateSetup(dict.fromkeys(reads, SDPA[WITHIN_STEP, Attend]))
+
+
+def _sdpa_config(*keys) -> dict:
+    return {"resources": {key: {"backend": "sdpa"} for key in keys}}
+
+
+def _handles(arrays, *, group=None, setup=None) -> dict[str, WithinStepHandle]:
     specs = build_specs(arrays)
     return node_handles(
-        _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, sdpa=sdpa,
+        _Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, sp_group=group, setup=setup,
     )
 
 
@@ -394,66 +404,77 @@ def test_ulysses_gets_one_callable_per_array_never_one_per_layer(monkeypatch):
 
 
 def test_a_resource_on_sdpa_builds_no_spec():
-    assert build_specs([_array("a")], sdpa={"a_read"}) == []
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read")) == []
 
 
 def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
-    assert build_specs([_array("a")], sdpa={"a_read"}, kernel_settings={"a_read": {"workspace_mb": 1}}) == []
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"workspace_mb": 1}}) == []
     with pytest.raises(ValueError, match="it may set only"):
-        build_specs([_array("a")], sdpa={"a_read"}, kernel_settings={"a_read": {"backend": "dense"}})
+        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
 
 
-def test_sdpa_on_a_resource_no_read_runs_on_is_refused():
-    with pytest.raises(ValueError, match=r"resources \['vae'\]: backend sdpa, and no read runs on them"):
-        build_specs([_array("a")], sdpa={"a_read", "vae"})
+def test_sdpa_on_a_resource_no_read_runs_on_is_refused_and_left_out():
+    setup, problems = state_setup(_sdpa_config("a_read", "vae"), [_array("a")])
+    assert problems == ["resources.vae: backend sdpa, and no read runs on it, of the resources ['a_read']"]
+    assert setup.by_read == {"a_read": SDPA[WITHIN_STEP, Attend]}, "the rest of the config should still bind"
+
+
+def test_sdpa_on_a_read_that_shares_another_reads_resource_names_that_resource():
+    arrays = [_array("a"), _array("b", label="b")]
+    (problem,) = state_setup(_sdpa_config("b_read"), arrays)[1]
+    assert problem.startswith("resources.b_read: backend sdpa, and the read 'b_read' runs on 'a_read'"), problem
 
 
 def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
-    handle = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})["a"]
+    handle = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
     with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
                                          "SdpaAttend takes no kernel settings"):
         kernel_setting(handle, "a_read", "max_segments_per_request")
 
 
 def test_a_step_of_reads_on_sdpa_is_no_step_at_all():
-    handles = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})
+    handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
     step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
     assert state_steps(step, handles) is None, "a step on sdpa declares no step, and its forward still runs"
 
 
 def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
     q, k, v = (torch.randn(2, 4, HEADS, DIM) for _ in range(3))
-    h = node_handles(_Model(_array("a")), "dit", {}, sdpa={"a_read"})["a"]
+    h = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
     h.add(0, k=k, v=v)
     assert torch.equal(h.read(0, q), sdpa_attention(q, k, v))
 
 
 def test_a_read_on_sdpa_refuses_packed_tokens():
     with pytest.raises(ValueError, match="Array 'a': no layout yet: reads\\['a_read'\\] runs SDPA, which can't tell"):
-        node_handles(_Model(_array("a", packed=True)), "dit", {}, sdpa={"a_read"})
+        node_handles(_Model(_array("a", packed=True)), "dit", {}, setup=_on_sdpa("a_read"))
 
 
-def test_the_setting_is_read_per_resource_from_its_block():
-    config = {"resources": {"a_read": {"backend": "sdpa"}, "b_read": {"backend": "dense"}, "kv": {"page_size": 8}}}
-    assert sdpa_resources(config) == {"a_read"}
+def test_the_setting_is_read_per_resource_and_binds_every_read_on_it():
+    arrays = [_array("a"), _array("b", label="b"), _array("c", nodes=("x",))]
+    config = {"resources": {"a_read": {"backend": "sdpa"}, "c_read": {"backend": "dense"}, "kv": {"page_size": 8}}}
+    setup, problems = state_setup(config, arrays)
+    assert problems == [] and setup.by_read.keys() == {"a_read", "b_read"}, "b's read shares a's resource"
 
 
 @pytest.mark.parametrize("config, cause", [
     ({"node_groups": [{"node_names": ["dit"], "attention_backend": "sdpa"}]},
-     "node_groups\\[0\\].attention_backend: the backend is a resource's setting"),
+     "node_groups[0].attention_backend: the backend is a resource's setting"),
     ({"resources": {"a_read": {"backend": "sdpa", "max_segments_per_step": 2}}},
      "resources.a_read: backend sdpa builds no resource, so it takes no other setting"),
 ])
 def test_a_bad_setting_is_refused_naming_the_cause(config, cause):
-    with pytest.raises(ValueError, match=cause):
-        sdpa_resources(config)
+    (problem,) = state_setup(config, [_array("a")])[1]
+    assert problem.startswith(cause), problem
 
 
 def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     array = Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
                   reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
-    with pytest.raises(ValueError, match="Array 'kv': no layout yet: reads\\['r'\\].mask must be Block, the only mask"):
-        build_specs([array], sdpa={"r"})
+    setup, problems = state_setup(_sdpa_config("r"), [array])
+    assert problems == [
+        "resources.r: backend sdpa runs only an Attend read within a step, and Array 'kv'.reads['r'] isn't one",
+    ] and setup.by_read == {}, "a paged read takes no SDPA"
 
 
 def test_a_read_sharded_on_both_sides_needs_heads_that_divide_by_tp_times_sp():
