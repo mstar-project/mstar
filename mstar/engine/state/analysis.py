@@ -85,9 +85,6 @@ def _array_problems(array: Array) -> list[str]:
         if None in llama31 and any(factor is not None for factor in llama31):
             problems.append(f"{where}.positions.rope: low_freq_factor, high_freq_factor and old_context_len are "
                             f"all set or all None, and they are {llama31}")
-    kinds = [type(update) for update in array.updates.values()]
-    for kind in sorted({kind for kind in kinds if kinds.count(kind) > 1}, key=lambda kind: kind.__name__):
-        problems.append(f"{where}.updates: it carries {kinds.count(kind)} updates of type {kind.__name__}")
     return problems
 
 

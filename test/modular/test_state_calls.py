@@ -51,7 +51,8 @@ from mstar.engine.state import (
     rope,
     sample,
 )
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, WithinStepHandle
+from mstar.engine.state.adapters import WithinStepHandle, build_handle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 
 LAYERS, SLOTS, HEADS, DIM = 4, 64, 2, 8
 TOKENS = 3
@@ -193,7 +194,7 @@ def _array(**overrides) -> Array:
 def _kv_handle(array=None, kv=None, attn=None) -> ArrayHandle:
     array = array or _array()
     resources = {"kv": kv or _StubKV(len(array.layers)), **{key: attn or _StubAttn() for key in array.reads}}
-    return ArrayHandle(array, resources, None)
+    return build_handle(array, resources)
 
 
 def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
@@ -207,18 +208,18 @@ def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
         "state": torch.zeros(2, SLOTS, HEADS, DIM, DIM),
         "conv": torch.zeros(2, SLOTS, 3 * HEADS * DIM, 3),
     })
-    return ArrayHandle(array, {"gdn": pool, "c": None, "d": _StubLinear()}, None)
+    return build_handle(array, {"gdn": pool, "c": None, "d": _StubLinear()})
 
 
 def _within_handle(ragged=None) -> WithinStepHandle:
     array = _array(max_len=0, reads={"vision": Read(mask=Block(), op=Attend(q_heads=HEADS))})
-    return WithinStepHandle(array, {"vision": ragged or _StubRagged()}, None)
+    return build_handle(array, {"vision": ragged or _StubRagged()})
 
 
 def _sampler_handle(draws=1) -> SamplerHandle:
     resource = SamplerResource(vocab_size=8, enable_repetion_penalty=True, device=torch.device("cpu"))
     resource.ingest_request(1, None)
-    return SamplerHandle(Sampler("sampler", nodes={"LLM"}, vocab_size=8, draws=draws), resource)
+    return build_handle(Sampler("sampler", nodes={"LLM"}, vocab_size=8, draws=draws), {"sampler": resource})
 
 
 def _tensors(n=TOKENS):
@@ -340,7 +341,7 @@ def test_updates_run_on_the_layers_own_field_and_write_it_in_place():
 def test_positions_read_the_resource_at_the_steps_label():
     pos = _StubPositions()
     array = _array(labels={"main", "cfg"}, positions=Positions(rope=Rope(dtype=torch.bfloat16)))
-    h = ArrayHandle(array, {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos}, "rope")
+    h = build_handle(array, {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos})
     _begin(h, segments=[Segment(1, "cfg", TOKENS)])
     assert position(h, 1, "cfg") == 5
     assert torch.equal(positions(h), pos.ids)
@@ -352,7 +353,7 @@ def test_positions_read_the_resource_at_the_steps_label():
 def test_rope_with_no_declared_dtype_rotates_in_qs():
     pos = _StubPositions()
     resources = {"kv": _StubKV(), "attn": _StubAttn(), "rope": pos}
-    h = ArrayHandle(_array(positions=Positions(rope=Rope())), resources, "rope")
+    h = build_handle(_array(positions=Positions(rope=Rope())), resources)
     _begin(h)
     q, k, _ = _tensors()
     rope(h, q.double(), k)
@@ -815,10 +816,10 @@ def test_every_call_reads_the_steps_label():
     _begin(gdn, segments=[Segment(1, "cfg", TOKENS)])
     causal_conv(gdn, 1, torch.randn(TOKENS, 3 * HEADS * DIM), weight=torch.ones(3 * HEADS * DIM, 4))
     gated_delta_net(gdn, 1, q, k, v, q, q, q, q)
-    assert gdn._linear.labels == ["cfg", "cfg"]
+    assert gdn._runners[GatedDeltaNet].labels == ["cfg", "cfg"]
     ragged = _StubRagged()
     array = _array(max_len=0, labels={"main", "cfg"}, reads={"vision": Read(mask=Block(), op=Attend(q_heads=HEADS))})
-    within = WithinStepHandle(array, {"vision": ragged}, None)
+    within = build_handle(array, {"vision": ragged})
     _begin(within, segments=[Segment(1, "cfg", TOKENS)])
     within.add(0, k=k, v=v)
     within.read(0, q)
@@ -874,9 +875,10 @@ def test_every_update_runs_behind_a_graph_break():
         return gated_delta_net(h, 5, x, k, v, x, x, x, x)
 
     def record(note):
-        conv, delta, scatter = h._linear.run_conv, h._linear.run, h._pool.scatter_
-        h._linear.run_conv = lambda *args, **kwargs: (note(), conv(*args, **kwargs))[1]
-        h._linear.run = lambda *args, **kwargs: (note(), delta(*args, **kwargs))[1]
+        linear = h._runners[GatedDeltaNet]
+        conv, delta, scatter = linear.run_conv, linear.run, h._pool.scatter_
+        linear.run_conv = lambda *args, **kwargs: (note(), conv(*args, **kwargs))[1]
+        linear.run = lambda *args, **kwargs: (note(), delta(*args, **kwargs))[1]
         h._pool.scatter_ = lambda *args, **kwargs: (note(), scatter(*args, **kwargs))[1]
 
     assert _compiling_at_each_kernel(updates, record) == [False, False, False]

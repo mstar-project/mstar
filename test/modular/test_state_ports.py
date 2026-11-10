@@ -49,9 +49,9 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep, Layout, Span
-from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources, sampling_configs
+from mstar.engine.state.adapters import build_handle, kv_layouts, node_handles, node_resources, sampling_configs
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.calls import ArrayHandle, causal_conv
+from mstar.engine.state.calls import causal_conv
 from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
@@ -631,8 +631,8 @@ def _qwen3_5_stack(blocks: int = 2):
     stack.config, stack.vision_config = config, None
     declared = {d.name: d for d in stack.declare_state()}
     kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
-    kv = ArrayHandle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, ROPE)
-    gdn = ArrayHandle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()}, None)
+    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None})
+    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()})
     for module in model.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})
