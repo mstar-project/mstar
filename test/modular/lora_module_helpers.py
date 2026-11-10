@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -530,16 +530,17 @@ def bind(model, rows: _Rows, resources: dict, doubles: dict | None = None):
 
 
 @contextmanager
-def step_over(llm, rows: _Rows):
-    """A step of one row per ``rows.lengths``, with ``llm``'s array handles open, as the engine opens them around a
-    forward."""
+def step_over(llm, rows: _Rows, arrays: Sequence[str] | None = None):
+    """A step of one row per ``rows.lengths``, with ``llm``'s handles on ``arrays`` (Qwen3.5's by default) open, as
+    the engine opens them around a forward."""
     from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
 
+    arrays = arrays or (KV_CACHE, GDN_STATE)
     step = SubmoduleStep(
         segments=[Segment(rid, "main", n) for rid, n in enumerate(rows.lengths)],
-        state={KV_CACHE: ArrayStep(), GDN_STATE: ArrayStep()},
+        state={name: ArrayStep() for name in arrays},
     )
-    step.set_state_handles((llm.state_handles[KV_CACHE], llm.state_handles[GDN_STATE]))
+    step.set_state_handles(tuple(llm.state_handles[name] for name in arrays))
     step.set_ctx(StepContext(tuple(range(len(rows.lengths))), "prefill_text", 0, False))
     step.begin_calls()
     try:
@@ -727,12 +728,45 @@ def _higgs():
     )
 
 
+class _NoRotation:
+    """The positions of a step at position 0, which rotate nothing, as the stack ran with no position resource."""
+
+    def apply_qk(self, q, k, *, label, rope_dtype):
+        return q, k
+
+
 def _omni():
     """Layer 0 is MoE (its routed experts take no delta), layer 1 a dense MLP."""
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, ThinkerTextConfig
+    from mstar.model.qwen3_omni.config import (
+        THINKER_ATTN,
+        THINKER_KV,
+        THINKER_POS,
+        THINKER_SAMPLER,
+        Qwen3OmniModelConfig,
+        ThinkerTextConfig,
+    )
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on the Thinker's declared state bound over stubs of the kernels, which read
+        ``rows``."""
+        declaring = model_object(Qwen3OmniModel, sub.config, local_dir=None)
+        resources = {
+            THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(rows), THINKER_POS: _NoRotation(), THINKER_SAMPLER: None,
+        }
+        sub.bind_node_state(node_handles(declaring, "Thinker", resources))
+        return sub
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.model.embed_tokens(torch.cat(rows))
+        with step_over(sub, lengths, (THINKER_KV,)):
+            hidden = sub.model(input_embeds=x)[0]
+        return _per_row(hidden, sub.model.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     def weights(c):
         tc = c.thinker_text
@@ -763,13 +797,13 @@ def _omni():
             mlp_only_layers=[1],
         )),
         lora_spec=lambda c: _declared(model_object(Qwen3OmniModel, c)),
-        build=lambda c, group, w: ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c),
+        build=lambda c, group, w: stub_cores(
+            ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c), _Rows(),
+        ),
         weights=weights,
         a1=lambda c: {**adapted(c), "lm_head": (c.thinker_text.vocab_size, c.thinker_text.hidden_size)},
         a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "up_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.embed_tokens(ids),
-                     lambda s, x: s.model(input_embeds=x, label="main")[0], lambda s, x: s.model.lm_head(x)),
-        declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
+        run=run_, declare=_declare("prefill_text"), inputs=_tokens(lambda c: c.thinker_text.vocab_size),
         released=lambda: (model_object(Qwen3OmniModel, full),
                           lambda c, g: Qwen3OmniThinkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"thinker.{m}",  # the full model's checkpoint naming

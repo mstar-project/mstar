@@ -28,6 +28,7 @@ from mstar.engine.resources.attn.ragged import kernels as kernels_module
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, uniform_segments
 from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager, FlashInferRaggedManager
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.state.adapters import node_resources
 from mstar.kernels import Choice, DeviceKey
 from mstar.kernels import registry as registry_module
 from mstar.kernels.registry import reset_lookups
@@ -351,20 +352,20 @@ def _image_dit(model: str):
         from mstar.model.flux2_klein.config import Flux2KleinConfig
         from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
 
-        m = Flux2KleinModel(model_path_hf="test/flux2_klein", skip_weight_loading=True, attention_backend="flashinfer")
+        m = Flux2KleinModel(model_path_hf="test/flux2_klein", skip_weight_loading=True)
         m.set_config(Flux2KleinConfig())
         return m
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.z_image_model import ZImageModel
 
-    m = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True, attention_backend="flashinfer")
+    m = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True)
     m.set_config(ZImageConfig())
     return m
 
 
 @pytest.mark.parametrize("model", ["flux2_klein", "z_image"])
 def test_the_image_dits_leave_their_kernel_to_the_table(model):
-    (resource,) = _image_dit(model).get_node_resources()
+    (resource,) = node_resources(_image_dit(model))
     assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 
