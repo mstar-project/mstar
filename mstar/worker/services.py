@@ -15,8 +15,7 @@ from mstar.worker.engine_manager import refuse_combined_walks_across_tp_groups
 from mstar.worker.scheduling_policy import WalkPriority, resolve_walk_priorities
 
 if TYPE_CHECKING:
-    from mstar.communication.base import BaseCommunicator
-
+    from mstar.communication.communicator import BaseCommunicator
     from mstar.communication.tensors import TensorCommunicationManager
     from mstar.distributed.base import ShardingConfig
     from mstar.distributed.communication import WorkerParallelGroups
