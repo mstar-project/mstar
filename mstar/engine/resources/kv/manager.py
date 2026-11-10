@@ -378,8 +378,9 @@ class Allotment:
     took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, and
     ``grown_from`` the allotment's pages before. `unreserve` puts back the first and the last. ``taken_back`` counts
     the pages of ``remaining`` a guaranteed request took back from borrowers, which it writes first and lends no
-    more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining`` for a guaranteed request
-    in a pool that `KVManager.moves`, and none otherwise. `KVManager._count` sets all three."""
+    more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining`` for a guaranteed
+    request in a pool whose requests the worker moves (`KVManager.moves`), and none otherwise. `KVManager._count`
+    sets all three."""
     pages: int
     remaining: int = 0
     asks_again: int = 0
@@ -704,8 +705,9 @@ class KVManager(AttentionResource):
         # `_asks` holds the pages each waiting request asks for: what `ask` counted for one with no allotment yet,
         #   which its allotment is sized from, or the shortage one that holds its allotment waits on (`_wait`).
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
-        # `moves` is whether the worker moves requests off the device when one runs short on any of `_nodes`, set by
-        #   the worker. Only a move takes back what a guaranteed request lent, so without it none lends.
+        # `_moves` is whether the worker moves requests off the device when one runs short on any of `_nodes`, which
+        #   the worker sets through `moves`. Only a move takes back what a guaranteed request lent, so without it none
+        #   lends.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted once they start,
         #   decided at their first `ask`, or later when the host has no room to set aside for their move.
@@ -725,7 +727,7 @@ class KVManager(AttentionResource):
         #   ask again. Each returns as it passed, so it takes none of `_kept`.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
-        self.moves = True
+        self._moves = True
         self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
@@ -3385,6 +3387,19 @@ class KVManager(AttentionResource):
     # Eviction
 
     @property
+    def moves(self) -> bool:
+        return self._moves
+
+    @moves.setter
+    def moves(self, moves: bool) -> None:
+        lending = sorted(rid for rid in self._allotments if rid in self._guaranteed)
+        assert moves == self._moves or not lending, (
+            f"KV {self.name}: whether the worker moves requests changed after guaranteed {lending} were admitted, "
+            "and what their allotments lend still follows the old answer"
+        )
+        self._moves = moves
+
+    @property
     def supports_eviction(self):
         return self._cpu_pool is not None
 
@@ -4271,7 +4286,7 @@ class KVManager(AttentionResource):
                 assert allotment.taken_back <= allotment.remaining, (
                     f"{rid} took back {allotment.taken_back} pages but has {allotment.remaining} left to write"
                 )
-                if rid in self._guaranteed and self.moves:
+                if rid in self._guaranteed and self._moves:
                     borrowable += allotment.remaining - allotment.taken_back
             assert unused == self._unused, (
                 f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
@@ -4717,7 +4732,7 @@ class KVManager(AttentionResource):
         that back."""
         if not guaranteed:
             room = self._room() + (0 if self._taking_back() else self._borrowable)
-        elif self.moves:
+        elif self._moves:
             # Under the lock even from `grew_since`, since the GPU thread opens a label in `_streams` during an admit.
             # The room is read under it too, so a page freed between the two reads isn't counted in both.
             with self._lock:
@@ -5310,7 +5325,7 @@ class KVManager(AttentionResource):
     def _count(self, rid: str, allotment: Allotment, remaining: int, taken_back: int) -> None:
         """Set ``allotment``'s ``remaining`` and ``taken_back``, and what it lends, `_unused` and `_borrowable` with
         them."""
-        lends = remaining - taken_back if rid in self._guaranteed and self.moves else 0
+        lends = remaining - taken_back if rid in self._guaranteed and self._moves else 0
         self._changes += 1
         self._unused += remaining - allotment.remaining
         self._borrowable += lends - allotment.lends
