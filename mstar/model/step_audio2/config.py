@@ -35,6 +35,63 @@ STOP_TOKEN_IDS = (EOT, TTS_END, ENDOFTEXT)
 # A spoken reply interleaves one text token with this many speech ids.
 SPEECH_IDS_PER_TEXT = 4
 
+
+def is_speech_id(token: int) -> bool:
+    """Whether an LLM id is a speech code's (``<audio_0>`` .. ``<audio_6560>``). The
+    tokenizer has ids past those too, which the reference drops before its vocoder
+    (``examples.py``, ``x < 6561``)."""
+    return SPEECH_BASE <= token < SPEECH_BASE + NUM_SPEECH_CODES
+
+
+# -- resource keys --------------------------------------------------------------
+LLM_KV = "llm_kv"
+LLM_ATTN = "llm_attn"
+LLM_POS = "llm_pos"
+LLM_SAMPLER = "llm_sampler"
+AUDIO_ATTN = "audio_attn"
+T2W_STATE = "t2w_state"
+# token2wav's attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
+T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
+
+# -- walks ------------------------------------------------------------------------
+PREFILL_TEXT = "prefill_text"
+PREFILL_AUDIO = "prefill_audio"
+PREFILL_WALKS = frozenset({PREFILL_TEXT, PREFILL_AUDIO})
+# The LLM's decode loop and its walks: a text reply's, whose token loops back on the
+# device, and a spoken reply's, which also streams its speech ids to the vocoder. Their
+# rows share a step as DECODE_MIXED.
+DECODE_LOOP = "decode_loop"
+DECODE = "decode"
+DECODE_SPOKEN = "decode_spoken"
+DECODE_MIXED = "decode_mixed"
+DECODE_WALKS = frozenset({DECODE, DECODE_SPOKEN, DECODE_MIXED})
+# the vocoder's walk, in its own partition
+T2W_CHUNK = "t2w_chunk"
+
+# -- signals ------------------------------------------------------------------------
+# the request's clips' log-mels, end to end along time
+AUDIO_MELS = "audio_mels"
+AUDIO_EMBEDS = "audio_embeds"
+# the spoken walk's stream to the vocoder: the sampled ids that are speech
+SPEECH_IDS = "speech_ids"
+
+# -- step_metadata keys ------------------------------------------------------------
+# each clip's mel frames, which the audio tower lays its segments out by (read off a
+# routed tensor, they would wait on the device)
+AUDIO_MEL_FRAMES = "audio_mel_frames"
+# a spoken reply's token cap (``get_max_output_tokens``), a default rather than a length
+# kwarg, so admission still fits it to the prompt
+SPEECH_MAX_TOKENS = "speech_max_tokens"
+
+# The reference's sampling (``examples.py``, ``examples-vllm-stream.py``).
+DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.9, repetition_penalty=1.05)
+# the sampler knobs a request may set
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "repetition_penalty", "penalize_prompt", "ignore_eos",
+    "return_logprobs", "logprobs_mode",
+)
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
 # -- audio input --------------------------------------------------------------
 SAMPLE_RATE = 16_000
 # audio is encoded in windows of 25 s (``stepaudio2.py:113``)
