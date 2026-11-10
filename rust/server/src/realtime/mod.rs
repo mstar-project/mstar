@@ -833,7 +833,10 @@ impl<D: ItemDecoder> Realtime<D> {
                     }
                     continue;
                 }
-                Message::Close(_) => return,
+                Message::Close(_) => {
+                    crate::ws::answer_close(&mut self.socket).await;
+                    return;
+                }
                 _ => continue,
             };
             let event = match serde_json::from_str::<Value>(&text) {

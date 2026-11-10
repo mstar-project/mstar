@@ -575,7 +575,10 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
         };
         let observation = match message {
             Message::Binary(b) => Ok(b),
-            Message::Close(_) => return,
+            Message::Close(_) => {
+                super::answer_close(&mut socket).await;
+                return;
+            }
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Text(_) => Err(Failure::Refused("an observation is a binary msgpack frame".into())),
         };

@@ -68,7 +68,7 @@ class _Server:
 
     def submit_request(self, *, text=None, file_paths=None, input_modalities, output_modalities, model_kwargs=None,
                        prompt_parts=None, streaming=True, request_id=None, model=None, end_input=True,
-                       file_streams=None, raw_inputs=None):
+                       file_streams=None, raw_inputs=None, report_usage=False):
         if text == "refuse me":
             raise ValueError("the model refuses this text")
         rid = request_id or f"gen-{len(self.submitted)}"
@@ -361,6 +361,15 @@ def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch,
         rust = (e.code, json.loads(e.read()))
     assert rust == (py.status_code, py.json())
 
+
+
+def test_a_client_that_closes_gets_the_close_handshake(stacks):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    _, port = stacks(False)
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/generate/ws", compression=None)
+    ws.close()
+    assert ws.close_code == 1000
 
 
 # what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb

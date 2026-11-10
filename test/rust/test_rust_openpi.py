@@ -331,6 +331,16 @@ def test_healthz_answers_as_openpi_does(stack):
 TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
 
 
+def test_a_client_that_closes_gets_the_close_handshake(stack):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    _, port = stack
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/", compression=None, max_size=None)
+    ws.recv(timeout=30)  # the metadata frame
+    ws.close()
+    assert ws.close_code == 1000
+
+
 def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
     with _rust(_Server(), MSTAR_WS_MAX_BYTES="1000") as port:
         url = f"ws://127.0.0.1:{port}/"

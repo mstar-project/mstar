@@ -1,8 +1,11 @@
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
+from mstar.engine.resources.base import CachedLease, MoveKind
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
@@ -176,12 +179,26 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
+class Move(NamedTuple):
+    rid: str
+    kind: MoveKind
+    # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
+    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE or a WAIT asks for,
+    # 1 for an UNRESERVE whose RESERVE made the allotment rather than grew it, and the tokens a DROP's rebuild writes.
+    pool: str = ""
+    count: int = 0
+    victims: tuple[str, ...] = ()
+    node: str = ""
+
+
 @dataclass
 class OffloadDelta:
-    """A rank's offloads and reloads, in the order it made them.
+    """A rank's moves, in the order the followers replay them.
 
-    Ordered so the follower replays the leader's decisions in the same order: a
-    sequence that worked for the leader works for the followers too.
+    That is the order the leader made them in, so a sequence that worked for the
+    leader works for the followers too, except that a node's offload goes ahead of
+    the moves its pools made as it freed room (`add` with ``at``). A follower can
+    replay those only after the offload.
 
     Holds WIRE request ids, not worker-local handles: a handle is minted per
     worker, so rank 0's would name different requests on the follower.
@@ -194,56 +211,86 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    # parallel lists, one entry per `Move`
     rids: list[str] = field(default_factory=list)
-    is_offload: list[bool] = field(default_factory=list)
+    kinds: list[MoveKind] = field(default_factory=list)
+    pools: list[str] = field(default_factory=list)
+    counts: list[int] = field(default_factory=list)
+    victims: list[list[str]] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
         return cls()
 
-    def add_offloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(True)
+    def add(
+        self, kind: MoveKind, rid: str, pool: str = "", count: int = 0, victims: Sequence[str] = (), node: str = "",
+        at: int | None = None,
+    ):
+        """Append the move, or put it ahead of the moves from index ``at`` on."""
+        at = len(self) if at is None else at
+        self.rids.insert(at, rid)
+        self.kinds.insert(at, kind)
+        self.pools.insert(at, pool)
+        self.counts.insert(at, count)
+        self.victims.insert(at, list(victims))
+        self.nodes.insert(at, node)
 
-    def add_reloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(False)
+    def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
+        """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move
+        was dropped."""
+        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)) or self.victims[-1]:
+            return False
+        for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
+            column.pop()
+        return True
 
     def __len__(self):
         return len(self.rids)
 
-    def peek_left(self) -> tuple[str, bool] | None:
+    def peek_left(self) -> Move | None:
         if not len(self):
             return
-        return (self.rids[0], self.is_offload[0])
+        return Move(
+            self.rids[0], self.kinds[0], self.pools[0], self.counts[0], tuple(self.victims[0]), self.nodes[0],
+        )
 
-    def pop_left(self) -> tuple[str, bool] | None:
+    def pop_left(self) -> Move | None:
         if not len(self):
             return None
-        return (self.rids.pop(0), self.is_offload.pop(0))
+        return Move(
+            self.rids.pop(0), self.kinds.pop(0), self.pools.pop(0), self.counts.pop(0), tuple(self.victims.pop(0)),
+            self.nodes.pop(0),
+        )
 
     def copy(self) -> "OffloadDelta":
         """An independent queue holding the same moves.
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.is_offload))
+        return OffloadDelta(
+            list(self.rids), list(self.kinds), list(self.pools), list(self.counts), list(self.victims),
+            list(self.nodes),
+        )
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
 
         Copies and clears rather than rebinding, so a holder of this delta (the
-        engine keeps its journal in a dict) sees it emptied.
+        engine keeps its journal) sees it emptied.
         """
         taken = self.copy()
-        self.rids.clear()
-        self.is_offload.clear()
+        for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
+            column.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
-        self.is_offload.extend(other.is_offload)
+        self.kinds.extend(other.kinds)
+        self.pools.extend(other.pools)
+        self.counts.extend(other.counts)
+        self.victims.extend(other.victims)
+        self.nodes.extend(other.nodes)
 
 
 @dataclass
@@ -260,8 +307,8 @@ class ScheduleTPNode(MessageBody):
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
-    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
-    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    prefix_hits: dict[str, dict[str, CachedLease]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
@@ -320,6 +367,9 @@ class NewRequestConductor(MessageBody):
     # A client stream the opening leaves open: a live call, which is refused
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
+    streaming: bool = False
+    # the prompt's token count, echoed on RequestComplete for the response's usage
+    prompt_tokens: int | None = None
 
 
 @dataclass

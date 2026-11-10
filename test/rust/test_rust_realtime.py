@@ -66,20 +66,36 @@ def _pcm(audio: np.ndarray) -> str:
     return base64.b64encode(pcm).decode()
 
 
-def _tokenizer():
-    try:
-        from transformers import AutoTokenizer
+class _ByteTokenizer:
+    """A byte-level BPE with no merges, so one token is one byte: a stable
+    prefix holds back ``unfixed_tokens`` bytes and backs off inside a
+    multi-byte character, the same on every machine and with nothing to
+    download. It has what the realtime route and the bridge use of a fast HF
+    tokenizer: ``encode``, ``decode``, and the ``backend_tokenizer`` the
+    bridge saves for mstar-server."""
 
-        return AutoTokenizer.from_pretrained("Qwen/Qwen3-ASR-1.7B", local_files_only=True)
-    except Exception:  # noqa: BLE001 — not cached: partials hold nothing back on either side
-        return None
+    is_fast = True
+
+    def __init__(self):
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
+        vocab = {ch: i for i, ch in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+        self.backend_tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+        self.backend_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        self.backend_tokenizer.decoder = decoders.ByteLevel()
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return self.backend_tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def decode(self, ids: list[int]) -> str:
+        return self.backend_tokenizer.decode(ids)
 
 
 class _Model:
     live_transcription_stream = None   # re-decoded, not heard as it comes
 
     def __init__(self):
-        self.tokenizer = _tokenizer()
+        self.tokenizer = _ByteTokenizer()
 
     def request_kwargs(self):
         return None
@@ -413,6 +429,16 @@ def test_a_model_without_realtime_is_closed_with_pythons_reason(stack, monkeypat
 
 # what uvicorn (websockets) closes a socket with when a frame passes ws_max_message_mb
 TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
+
+
+def test_a_client_that_closes_gets_the_close_handshake(stack):
+    """A client's Close is answered with one, as uvicorn answers it; without the
+    answer the client sees the connection drop (1006)."""
+    _, port = stack
+    ws = websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription", compression=None)
+    ws.recv(timeout=30)  # transcription_session.created
+    ws.close()
+    assert ws.close_code == 1000
 
 
 def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():

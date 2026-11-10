@@ -112,7 +112,8 @@ class _ASRStub:
         self.released: list = []
 
     def submit_request(self, *, text=None, file_paths=None, input_modalities, output_modalities,
-                       model_kwargs=None, prompt_parts=None, streaming=True, request_id=None, model=None):
+                       model_kwargs=None, prompt_parts=None, streaming=True, request_id=None, model=None,
+                       report_usage=False):
         path = (file_paths or {}).get("audio", [None])[0]
         try:
             info = sf.info(path)

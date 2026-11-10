@@ -48,6 +48,7 @@ impl OpenAIAdapter for Qwen3Omni {
         }
         Ok(SubmitArgs {
             tokens: None,
+            report_usage: false,
             text,
             file_paths,
             input_modalities: in_mods,

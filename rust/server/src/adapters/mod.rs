@@ -76,6 +76,8 @@ pub struct SubmitArgs {
     pub model_kwargs: Map<String, Value>,
     /// A chat's parts, in order; empty on every other path.
     pub parts: Vec<Part>,
+    /// End the result stream with a `usage` chunk (set by the chat handler).
+    pub report_usage: bool,
     /// Decoded inputs that go to the model without a file (`submit_request`'s
     /// `raw_inputs`): openpi's camera images.
     pub raw_inputs: BTreeMap<String, Vec<RawArray>>,
@@ -99,6 +101,7 @@ impl Default for SubmitArgs {
         Self {
             text: None,
             tokens: None,
+            report_usage: false,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],

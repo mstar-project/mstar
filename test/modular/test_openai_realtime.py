@@ -107,6 +107,38 @@ class _ContinuingAdapter(adapters.OpenAIAdapter):
         return Transcript(text=text.strip(), language=language or req.language)
 
 
+def test_cancelled_step_leaves_request_release_to_collect_results(monkeypatch):
+    from mstar.api_server.openai.protocol import TranscriptionRequest
+
+    stub = _StubAPI()
+    released = []
+    monkeypatch.setattr(stub, "release_request", released.append, raising=False)
+    session = serving_realtime.RealtimeSession("cancel", TranscriptionRequest(model="rt_test"))
+    session.heard.append(np.zeros(160, dtype=np.float32))
+
+    async def cancel():
+        waiting = asyncio.Event()
+
+        async def collect(request_id):
+            waiting.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                stub.release_request(request_id)  # collect_results owns this release
+                raise
+
+        monkeypatch.setattr(stub, "collect_results", collect)
+        task = asyncio.create_task(serving_realtime._run_step(stub, _ContinuingAdapter(), session, ""))
+        await waiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    assert released == [stub.submits[0]["request_id"]]
+    assert not list(stub.upload_dir.iterdir())
+
+
 @pytest.fixture
 def client_and_stub(monkeypatch):
     import mstar.api_server

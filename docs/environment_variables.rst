@@ -314,7 +314,7 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
        ``server_vad`` turn detection, read by
        ``realtime_vad.silero_weights``. Unset, the copy bundled with the
-       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       ``silero-vad`` package (``mstar-ai[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
    * - ``MSTAR_SMART_TURN_PATH``
@@ -831,7 +831,8 @@ Worker scheduling
        the streams holding the pages, the reservations against the free and evictable
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
-       footprint at removal. Tests and debugging only.
+       footprint at removal. Above one rank, each follower stops if the reservations it
+       admits a step from differ from rank 0's. Tests and debugging only.
 
 Compilation
 -----------

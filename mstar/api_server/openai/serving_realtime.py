@@ -577,9 +577,6 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
         )
         try:
             chunks = await api.collect_results(request_id)
-        except asyncio.CancelledError:
-            api.release_request(request_id)
-            raise
         except HTTPException as exc:
             # a request the engine failed: the status says whose fault it was
             raise StepError(str(exc.detail), exc.status_code) from exc
