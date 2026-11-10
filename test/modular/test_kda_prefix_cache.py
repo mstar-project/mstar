@@ -46,6 +46,7 @@ from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ChunkingPolicy, InputSeqLenInfo
 from mstar.testing_utils.worker import make_scheduler
 from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.worker.batch_builder import fill_token_budget_in_start_order
 
 NODE, WALK, ROOT = "LLM", "prefill", b"a root"
 # a page is the KDA prefill's 64-token chunk, so snapshots sit on chunk ends
@@ -148,14 +149,22 @@ class _Node:
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
 
-    def run(self, rows: dict[str, list[int]], windows: list[int] | None = None,
-            ) -> tuple[torch.Tensor, Callable[[], None]]:
-        """One prefill step over ``rows`` (rid -> the tokens it runs), admitted, planned and run;
-        its outputs and its commit. ``windows``: the packed offsets the forward cuts windows at."""
+    def declare(self, rows: dict[str, list[int]], after: dict[str, int] | None = None) -> SubmoduleStep:
+        """A prefill step over ``rows``, with the context the engine binds to it."""
         segments = [Segment(rid, "main", len(tokens)) for rid, tokens in rows.items()]
         steps = {"kv": KVStep(), "state": RecurrentStep()} | ({} if self.gdn else {"kda": LinearAttnStep()})
         step = SubmoduleStep(steps=steps, segments=segments)
-        step.set_ctx(StepContext(request_ids=tuple(rows), graph_walk=WALK, slot=0, capture=False))
+        step.set_ctx(StepContext(
+            request_ids=tuple(rows), graph_walk=WALK, slot=0, capture=False, chunk_tokens_after=after or {},
+        ))
+        return step
+
+    def run(self, rows: dict[str, list[int]], windows: list[int] | None = None,
+            after: dict[str, int] | None = None) -> tuple[torch.Tensor, Callable[[], None]]:
+        """One prefill step over ``rows`` (rid -> the tokens it runs), admitted, planned and run;
+        its outputs and its commit. ``windows``: the packed offsets the forward cuts windows at.
+        ``after``: the tokens a chunked row runs after this step, as the engine stamps them."""
+        step = self.declare(rows, after)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
         if self.gdn:
@@ -414,30 +423,44 @@ class _ChunkedPrompt(_Submodule):
 
 def _chunking_engine(node: _Node, tokens: list[int]) -> Engine:
     engine = _engine(node)
-    engine._submodules[NODE] = SimpleNamespace(submodule=_ChunkedPrompt(tokens), resources={})
+    engine._submodules[NODE] = SimpleNamespace(
+        submodule=_ChunkedPrompt(tokens), resources=dict(node.runner._resources),
+    )
     engine._chunking = ChunkingManagement(engine._submodules)
     engine._chunking.set_policies({(NODE, WALK): ChunkingPolicy(walks=(WALK,), chunkable=True)})
+    engine._chunk_alignment = {}
     engine._tp_leader_nodes = {NODE} if node.rank == 0 else set()
     return engine
 
 
-def _run_chunk(node: _Node, engine: Engine, rid: str, tokens: list[int], chunk: ChunkRange) -> Callable[[], None]:
-    """Prepare and run one chunk of ``rid``'s prompt; its commit."""
+def _prepare(engine: Engine, rid: str, chunk: ChunkRange) -> dict[str, int]:
+    """Prepare one chunk of ``rid``'s prompt; the tokens it runs after it, as `Engine` stamps a
+    chunked step's context."""
     batch = SimpleNamespace(
         node_name=NODE, per_request_info_wrapped={rid: None}, per_request_input_tensors={},
         final_stream_rids=set(), per_request_input_metadata={}, first_chunk_rids=set(),
     )
     part = engine._prepare_chunk(batch, rid, WALK, chunk)
     assert (part.chunk_start, part.input_seq_len) == (chunk.start, chunk.end - chunk.start)
-    _, commit = node.run({rid: tokens[chunk.start:chunk.end]})
+    return {} if part.is_final_chunk else {rid: part.chunk_total - part.chunk_start - part.input_seq_len}
+
+
+def _run_chunk(node: _Node, engine: Engine, rid: str, tokens: list[int], chunk: ChunkRange) -> Callable[[], None]:
+    """Prepare and run one chunk of ``rid``'s prompt; its commit."""
+    after = _prepare(engine, rid, chunk)
+    _, commit = node.run({rid: tokens[chunk.start:chunk.end]}, after=after)
     return commit
 
 
-def _chunks(engine: Engine, rid: str, total: int) -> tuple[ChunkRange, ChunkRange]:
-    """Rank 0's measure of ``rid`` cut into two chunks, as the scheduler cuts them."""
-    start = engine.input_sequence_len(NODE, WALK, None, {}, rid=rid).cached_prefix
-    first = ChunkRange(start, start + BUDGET, total, start + BUDGET)
-    return first, ChunkRange(first.end, total, total, total - first.end)
+def _chunks(engine: Engine, rid: str, total: int, budget: int = BUDGET) -> tuple[ChunkRange, ChunkRange]:
+    """Rank 0's measure of ``rid`` cut into two chunks by the scheduler's cut, on the node's alignment."""
+    info = engine.input_sequence_len(NODE, WALK, None, {}, rid=rid)
+    align = engine.chunk_alignment(NODE)
+    take, _ = fill_token_budget_in_start_order(
+        [rid], {rid: info.seq_len}, {rid}, budget, engine.min_chunk_tokens(budget, align), {}, align,
+    )
+    end = info.cached_prefix + take[rid]
+    return ChunkRange(info.cached_prefix, end, total, end), ChunkRange(end, total, total, total - end)
 
 
 def _prefill_in_chunks(ranks: tuple[_Node, _Node], engines: dict, rid: str, tokens: list[int],
@@ -506,3 +529,86 @@ def test_a_later_chunk_takes_no_lease_after_its_first_declined_one(_gdn_ranks):
 
     assert chunks[0].start == 0
     _agree(ranks, "b")
+
+
+def _held(node: _Node) -> tuple:
+    """What a rank's eviction reads: each page's owners, and the snapshots a lease holds."""
+    arena = node.kv._arena
+    return arena.owners_of(range(arena.max_num_pages)), dict(node.pool._snap_refs), set(node.pool._leases)
+
+
+def test_each_chunks_end_is_kept_alike_on_every_rank_and_a_resend_restores_the_last(_gdn_ranks):
+    """Above one rank the pool keeps snapshots, so it declares its page as the chunk alignment
+    there too: rank 0 cuts whole pages, every rank keeps each chunk's end, and the later chunk's
+    makes the earlier one's the first to evict. A resend is leased at the later chunk's end."""
+    ranks = leader, follower = _gdn_ranks
+    b = _tokens(5 * PAGE + 10, seed=12)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b), budget=3 * PAGE + 20)
+    assert chunks[0].end == 3 * PAGE, "rank 0 cut b off a page"
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    _agree(ranks, "b")
+    for node in ranks:
+        ends = node.snapshot("b", 3 * PAGE), node.snapshot("b", 5 * PAGE)
+        assert [node.pool._snap_meta[snap][1] for snap in ends] == [True, False]
+    # in eviction order
+    assert list(leader.pool._snap_meta.items()) == list(follower.pool._snap_meta.items())
+
+    c = b[:5 * PAGE] + _tokens(20, seed=13)
+    for node in ranks:
+        node.ingest("c", c)
+    head = _send(leader, "c")
+    assert head.prefix_hits["wire-c"]["state"] == [leader.snapshot("b", 5 * PAGE), 5 * PAGE, 5 * PAGE]
+    assert _follow(follower, head)
+    for node in ranks:
+        assert node.probe("c", c) == 5 * PAGE
+        node.step({"c": c[5 * PAGE:]})
+    _agree(ranks, "c")
+
+
+def test_rank_0_gives_back_what_it_leased_for_a_row_its_step_leaves_out(_gdn_ranks):
+    """Rank 0 leases a chunkable row's prefix as it measures the row. Left out of the step, the
+    row waits holding nothing the other ranks don't, and the step that takes it leases again."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=14)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    assert engines[leader].input_sequence_len(NODE, WALK, None, {}, rid="b").cached_prefix == 2 * PAGE
+    assert _held(leader) != _held(follower)
+
+    assert engines[leader].give_back_cached_prefix(NODE, "b", WALK)
+
+    assert _held(leader) == _held(follower)
+    assert not engines[follower].give_back_cached_prefix(NODE, "b", WALK), "a follower measured a row"
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert chunks[0].start == 2 * PAGE
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+    _agree(ranks, "b")
+
+
+def test_a_row_measured_past_pages_no_snapshot_ends_on_waits_holding_nothing(_gdn_ranks):
+    """b shares a's first page, where no snapshot sits, so the pool cuts the hit to nothing: rank 0
+    measures b from 0 and holds no page for it until its step is sent. That send leases the page
+    on every rank, and each keeps the state at the hit's end for the next prompt."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:PAGE] + _tokens(350 - PAGE, seed=15)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert chunks[0].start == 0
+    assert _held(leader) == _held(follower), "rank 0 holds a's page while b waits"
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    _agree(ranks, "b")
+    assert leader.snapshot("b", PAGE) == follower.snapshot("b", PAGE)
