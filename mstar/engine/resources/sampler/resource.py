@@ -17,6 +17,7 @@ from mstar.engine.resources.sampler.config import (
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
+    FusedDrawArgs,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
@@ -24,7 +25,6 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
-from mstar.engine.state.contract import FusedDrawArgs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter

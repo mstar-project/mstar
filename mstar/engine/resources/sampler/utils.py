@@ -27,7 +27,6 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.state.contract import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import H2DMirror, PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import sampler_slots
@@ -758,6 +757,21 @@ def _fused_sample_kernel(
 # Vocabularies up to this size draw in one ``_fused_sample_kernel`` launch, one
 # program per row holding the whole row; larger ones through FlashInfer.
 FUSED_SAMPLE_MAX_VOCAB = 4096
+# The widest row `draw_row` draws as `sample` does: `fused_sample` launches 4
+# warps up to here, and 8 past it.
+FUSED_DRAW_MAX_VOCAB = 2048
+
+
+class FusedDrawArgs(NamedTuple):
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, for a kernel in the forward
+    that draws its own tokens. Row r's i-th draw is ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one
+    draw from the row's random stream, exactly as one `sample` call does."""
+
+    temperature: torch.Tensor    # [rows] float32
+    top_k: torch.Tensor          # [rows] int32, 0 is off
+    top_p: torch.Tensor          # [rows] float32
+    seed: torch.Tensor           # [rows] int64
+    offset: torch.Tensor         # [rows] int64, this kernel's first draw
 
 
 def fused_sample(

@@ -10,17 +10,9 @@ from typing import Any
 
 import torch
 
+from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import StepHandle
-from mstar.engine.state.contract import (
-    FUSED_DRAW_MAX_VOCAB,
-    Array,
-    ArrayStep,
-    CausalConv,
-    FusedDrawArgs,
-    GatedDeltaNet,
-    Op,
-    Sampler,
-)
+from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
 
 
 class ArrayHandle(StepHandle):
