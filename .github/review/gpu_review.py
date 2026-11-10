@@ -415,9 +415,10 @@ PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
 
 
 def exact_lines(values):
-    """The non-empty lines of each of `values`: what text redacted line by line is redacted of, since a value with a
-    newline in it is never whole in one line."""
-    return [part for value in values for part in value.split("\n") if part]
+    """What the box's text is redacted of, the same everywhere: the non-empty lines of each of `values`, since text
+    redacted line by line never holds a value with a newline in it whole; longest first, so a value that holds
+    another is replaced before it."""
+    return sorted({part for value in values for part in value.split("\n") if part}, key=len, reverse=True)
 
 
 def print_progress(lines, exact):
@@ -542,7 +543,7 @@ def wait(out, runner_temp):
     show_rest(results / "progress.log", seen, exact)
     gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
-    print("collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))
+    print("collected: " + bot.log_value(sorted(bot.redact(p.name, exact=exact) for p in results.iterdir())))
     box_cost(results / "claude.json")
     if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
         unavailable(out, lt, f"The GPU box ended with no results: {st}.\n"
@@ -917,7 +918,7 @@ def redact(out, runner_temp, s2="", s3=""):
     First, anything but a regular file at a path the artifact uploads (UPLOADED) goes: redact would skip it,
     and the upload would take a directory's files unredacted."""
     lt = Path(runner_temp, "lt")
-    exact = (s2, s3)
+    exact = exact_lines((s2, s3))
     for path in (lt / "results" / name for name in UPLOADED):
         if path.is_symlink() or not path.is_file():
             remove(path)
@@ -929,9 +930,8 @@ def redact(out, runner_temp, s2="", s3=""):
         out_f = tempfile.NamedTemporaryFile("w", dir=runner_temp, delete=False)  # outside what the box wrote
         try:
             with out_f, open(log, "rb") as f:
-                lined = exact_lines(exact)
-                for line in log_lines(f, lined):
-                    out_f.write(bot.redact(line, exact=lined) + "\n")
+                for line in log_lines(f, exact):
+                    out_f.write(bot.redact(line, exact=exact) + "\n")
             os.replace(out_f.name, log)
         except BaseException:
             Path(out_f.name).unlink(missing_ok=True)
