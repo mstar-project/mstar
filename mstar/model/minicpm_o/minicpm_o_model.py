@@ -75,6 +75,11 @@ AUDIO = "audio_encoder"
 
 # Upstream's `chat` defaults when sampling.
 DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalty=1.02)
+# the sampler knobs a request may set
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
+    "return_logprobs", "logprobs_mode",
+)
 
 
 
@@ -164,7 +169,7 @@ class MiniCPMOModel(Model):
             ),
             SamplerSpec(
                 resource_key=LLM_SAMPLER, nodes={LLM},
-                vocab_size=llm.vocab_size, enable_repetion_penalty=True,
+                vocab_size=llm.vocab_size, enable_repetition_penalty=True,
                 # upstream's `chat` hands min_p to HF `generate`, which honours it
                 enable_min_p=True,
             ),
@@ -198,13 +203,12 @@ class MiniCPMOModel(Model):
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        keys = (
-            "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
-            "return_logprobs", "logprobs_mode",
-        )
-        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in keys if k in model_kwargs}}
+        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs}}
         # upstream generates from embeddings, so its penalty sees only generated tokens
         return {LLM_SAMPLER: SamplingReqConfig(**knobs, penalize_prompt=False)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({*SAMPLING_KEYS, "enable_thinking", "max_slice_nums", "system_prompt"})
 
     # ------------------------------------------------------------------
     # Graph
