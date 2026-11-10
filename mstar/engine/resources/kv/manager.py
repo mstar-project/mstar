@@ -403,8 +403,8 @@ class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
     their own, already given back their allotment to ask again. When no move covers the shortage, ``to_host``
     holds the request that ran short if the host takes it whole, and otherwise ``waits`` is the pages it asks
-    the pool for instead. ``waits`` is 0 otherwise. ``takes_back`` is set when the request is guaranteed, so the
-    moves take back pages it lent."""
+    the pool for instead. ``waits`` is 0 otherwise. ``takes_back`` is set when the request lends pages, so the
+    moves take back what it lent (`KVManager._takes_back`)."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
@@ -4842,8 +4842,8 @@ class KVManager(AttentionResource):
                 pages = self._host_pages(rid)
                 if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
                     self._host(rid, [rid])
-                    return Victims([rid], [], [])
-                return Victims([], [], [], waits=short.pages, takes_back=rid in self._guaranteed)
+                    return Victims([rid], [], [], takes_back=self._takes_back(rid))
+                return Victims([], [], [], waits=short.pages, takes_back=self._takes_back(rid))
             self._claim(rid, claim)
             return self._earmark(Earmark(rid, max(pages_short, self._allotments[rid].lends), set()), victims)
 
@@ -4966,7 +4966,13 @@ class KVManager(AttentionResource):
             self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
         self._host(earmark.rid, victims.to_host)
-        return victims._replace(takes_back=earmark.rid in self._guaranteed)
+        return victims._replace(takes_back=self._takes_back(earmark.rid))
+
+    def _takes_back(self, rid: str) -> bool:
+        """Whether moves made for ``rid`` now take back pages it lent. A guaranteed request that lends nothing runs
+        short only past its footprint, and the pages the moves free go first to what it lent (`_allot`)."""
+        allotment = self._allotments.get(rid)
+        return allotment is not None and allotment.lends > 0
 
     def _mark_victims(self, earmark: Earmark, victims: list[str]) -> None:
         """Earmark what ``victims`` free for ``earmark.rid``. A victim that holds no page of its own gives back its
