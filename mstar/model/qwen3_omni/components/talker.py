@@ -24,7 +24,14 @@ from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNo
 from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
+from mstar.model.qwen3_omni.config import (
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_ROPE_THETA,
+    Qwen3OmniModelConfig,
+    TalkerTextConfig,
+)
 
 # ---------------------------------------------------------------------------
 # Projection MLP (Thinker -> Talker)
@@ -73,7 +80,7 @@ class Qwen3OmniTalkerLayer(DecoderLayer):
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
                 head_dim=config.head_dim,
-                rope_theta=1_000_000.0,
+                rope_theta=TALKER_ROPE_THETA,
                 rms_norm_eps=rms_norm_eps,
                 use_mrope=False,
                 comm_group=comm_group,

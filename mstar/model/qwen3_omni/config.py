@@ -32,6 +32,8 @@ VISION_ATTN = "vision_attn"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
+# the Talker layers rotate with this theta, which its text config does not carry
+TALKER_ROPE_THETA = 1_000_000.0
 
 THINKER_SAMPLER = "thinker_sampler"
 # combined walk of the Thinker's text/audio prefill and decode

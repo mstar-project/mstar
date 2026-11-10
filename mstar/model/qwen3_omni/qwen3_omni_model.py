@@ -92,6 +92,7 @@ from mstar.model.qwen3_omni.config import (
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
+    TALKER_ROPE_THETA,
     TALKER_SAMPLER,
     THINKER_ATTN,
     THINKER_KV,
@@ -329,14 +330,14 @@ class Qwen3OmniModel(Model):
                 resource_key=THINKER_POS,
                 nodes={"Thinker"},
                 config=PositionConfig(
-                    kv_cache=THINKER_KV
+                    kv_cache=THINKER_KV, rope_theta=self.config.thinker_text.rope_theta,
                 )
             ),
             PositionSpec(
                 resource_key=TALKER_POS,
                 nodes={"Talker"},
                 config=PositionConfig(
-                    kv_cache=TALKER_KV
+                    kv_cache=TALKER_KV, rope_theta=TALKER_ROPE_THETA,
                 )
             ),
             SamplerSpec(
