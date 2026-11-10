@@ -592,10 +592,7 @@ request or the server. A request no drop can free, because it holds KV made from
 media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
 it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
 grows with each page the request takes after that, so its move always fits. Bagel generations, which
-write a label per guidance, and requests with media above one rank are such requests. So is a
-request with images or video from the step it samples an image or video pad id, which its host
-copies have no row for: the host pool then sets room aside for the pages it holds, and with no host
-pool the request reserves its whole footprint once the device has room for it. When the host
+write a label per guidance, and requests with media above one rank are such requests. When the host
 pool has no room for it at admission, or later once the device has room for the rest of its
 footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
 host pool logs it. While the device has no room for that either, nothing is logged: newer requests

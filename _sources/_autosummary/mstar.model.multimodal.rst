@@ -23,7 +23,7 @@ mstar.model.multimodal
       media_grids
       media_layout
       media_prefill_step
-      media_rows_between
+      media_rows
       media_walk_name
       media_walk_names
       media_walks
@@ -47,6 +47,7 @@ mstar.model.multimodal
    
       MediaEncoder
       MediaPads
+      MediaRun
       MediaSpan
       PromptPart
       Turn

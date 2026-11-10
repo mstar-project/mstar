@@ -4075,14 +4075,17 @@ Glimmer and Ripple-65B return <code class="docutils literal notranslate"><span c
 and Qwen3-ASR until one has run through its captured prefill. A model without text prompts
 (<code class="docutils literal notranslate"><span class="pre">TEXT_PROMPTS</span> <span class="pre">=</span> <span class="pre">False</span></code>) is rebuilt on its media walks alone. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
 <code class="docutils literal notranslate"><span class="pre">MediaIntake</span></code> per attachment modality: its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> (modalities may share one),
-its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id, the sentinels a template leaves to its processor, how many
-placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs</span></code>, one by default; a Qwen3.5 video fills one per
-temporal group), and <code class="docutils literal notranslate"><span class="pre">prepare</span></code>, which turns an attachment into the encoder’s input
+its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id (intakes may share one: the nth placeholder of a pad goes to the
+nth attachment of that pad in the order of the prompt’s parts, which is where <code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code>
+renders each), the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs(attachment,</span> <span class="pre">metadata)</span></code>, one by default; a Qwen3.5 video fills one
+per temporal group), and <code class="docutils literal notranslate"><span class="pre">prepare</span></code>, which turns an attachment into the encoder’s input
 tensors and each placeholder’s tokens (a <code class="docutils literal notranslate"><span class="pre">PreparedMedia</span></code>). <code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> renders and
 tokenizes the whole prompt once. <code class="docutils literal notranslate"><span class="pre">intake</span></code> then refuses a prompt whose placeholders don’t
 match its attachments, prepares each attachment in prompt order, expands each placeholder
-to one pad per token with <code class="docutils literal notranslate"><span class="pre">expand_media_pads</span></code>, and <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns the pads’
-layout as <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> metadata and <code class="docutils literal notranslate"><span class="pre">&quot;kv_layout&quot;:</span> <span class="pre">self.kv_layout(layout,</span> <span class="pre">length)</span></code>.
+to its run (a <code class="docutils literal notranslate"><span class="pre">MediaRun</span></code>) with <code class="docutils literal notranslate"><span class="pre">expand_media_pads</span></code> (one pad per token, read from the run’s encoder output,
+with its grid), and <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns the pads’ layout as <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code>
+metadata and <code class="docutils literal notranslate"><span class="pre">&quot;kv_layout&quot;:</span> <span class="pre">self.kv_layout(layout,</span> <span class="pre">length)</span></code>.
 The layout’s runs say which encoders the prompt runs (<code class="docutils literal notranslate"><span class="pre">media_encoders</span></code>), for the prefill
 schedule’s walk and the KV layout’s alike. <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code> lays a media prompt’s text out as
 <code class="docutils literal notranslate"><span class="pre">ids</span></code> spans and each run of pads as a <code class="docutils literal notranslate"><span class="pre">rows</span></code> span, which moves the position counter by
@@ -4099,13 +4102,15 @@ and never syncs on the device.</p>
 (decode, packed text prefill, mixed, and one packed capture every media walk replays,
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders’ outputs into the prompt’s embeddings inside the forward
-(<code class="docutils literal notranslate"><span class="pre">where(pad,</span> <span class="pre">media[cumsum(pad)</span> <span class="pre">-</span> <span class="pre">1],</span> <span class="pre">embed(ids))</span></code>), the step declaration around the
+(<code class="docutils literal notranslate"><span class="pre">where(mask,</span> <span class="pre">media[cumsum(mask)</span> <span class="pre">-</span> <span class="pre">1],</span> <span class="pre">embed(ids))</span></code>, the media in prompt order and the mask
+of their tokens laid out from <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code>, not found by pad id, so media may share a
+placeholder token), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> over the prefill walks and decode. A stop id on a decode row ends the
 loop; a stop id on the prefill row (the step the walk plan marks <code class="docutils literal notranslate"><span class="pre">FINAL_PREFILL</span></code>), or
 a one-token budget, ends the partition before decode runs. The loop’s cap,
-<code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>, is the only budget. A media row’s tensor holds exactly the pads in its
-ids, checked against the layout in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>. A prompt’s ids, pads and
+<code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>, is the only budget. Each encoder’s rows match the tokens of
+its runs in the layout, checked in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>. A prompt’s ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LLMSubmodule</span><span class="p">(</span><span class="n">SampledTokenDecoder</span><span class="p">):</span>

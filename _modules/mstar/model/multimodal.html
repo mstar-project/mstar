@@ -1038,7 +1038,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1406,19 +1406,32 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="MediaRun">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaRun">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">MediaRun</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One placeholder's run: ``tokens`` pads, read from encoder ``output``,</span>
+<span class="sd">    with its ``grid`` (empty without one)."""</span>
+
+    <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">output</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">grid</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span></div>
+
+
+
 <div class="viewcode-block" id="MediaPads">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaPads">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MediaPads</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""A prompt with each media placeholder expanded to its tokens, and where</span>
-<span class="sd">    each expanded run sits. The lists run in prompt order, one entry a run."""</span>
+<span class="sd">    each expanded run sits. The lists run in prompt order, one entry a run:</span>
+<span class="sd">    the columns of its ``MEDIA_LAYOUT`` (`media_layout`)."""</span>
 
     <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="c1"># the run's pad id, and its index among that pad's runs</span>
-    <span class="n">pad</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
-    <span class="n">index</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="c1"># the run's first pad position in ``ids``, and its length</span>
     <span class="n">offset</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
-    <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span></div>
+    <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># the encoder output it is read from, and its grid (empty without one)</span>
+    <span class="n">output</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">grid</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span></div>
 
 
 
@@ -1426,31 +1439,32 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.expand_media_pads">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">expand_media_pads</span><span class="p">(</span>
     <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">counts</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+    <span class="n">pad_runs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaRun</span><span class="p">]],</span>
     <span class="n">sentinels</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">MediaPads</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Expand the nth occurrence of each pad id in ``ids`` to ``counts[pad][n]``</span>
-<span class="sd">    pads, wrapped in ``sentinels[pad]`` when given (a template that writes a</span>
-<span class="sd">    bare pad, as the processor's ``replace_*_token`` then wraps it).</span>
+<span class="w">    </span><span class="sd">"""Expand the nth occurrence of each pad id in ``ids`` to its run</span>
+<span class="sd">    ``pad_runs[pad][n]``, wrapped in ``sentinels[pad]`` when given (a</span>
+<span class="sd">    template that writes a bare pad, as the processor's ``replace_*_token``</span>
+<span class="sd">    then wraps it).</span>
 
-<span class="sd">    Raises ``ValueError`` when a pad occurs other than once per count: user</span>
+<span class="sd">    Raises ``ValueError`` when a pad occurs other than once per run: user</span>
 <span class="sd">    text that spells a placeholder token, or a layout naming an attachment</span>
 <span class="sd">    the request did not carry. ``ids`` are host ids, straight from the</span>
 <span class="sd">    tokenizer.</span>
 <span class="sd">    """</span>
     <span class="n">sentinels</span> <span class="o">=</span> <span class="n">sentinels</span> <span class="ow">or</span> <span class="p">{}</span>
     <span class="c1"># a loop over the placeholders, not the tokens: a text-only prompt has none</span>
-    <span class="n">hits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">isin</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">counts</span><span class="p">)))</span><span class="o">.</span><span class="n">nonzero</span><span class="p">()</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span> <span class="k">if</span> <span class="n">counts</span> <span class="k">else</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-    <span class="n">seen</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">counts</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">hits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">isin</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">pad_runs</span><span class="p">)))</span><span class="o">.</span><span class="n">nonzero</span><span class="p">()</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span> <span class="k">if</span> <span class="n">pad_runs</span> <span class="k">else</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">seen</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">pad_runs</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
     <span class="n">pieces</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">layout</span> <span class="o">=</span> <span class="n">MediaPads</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[])</span>
     <span class="n">cursor</span> <span class="o">=</span> <span class="n">size</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">hits</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">ids</span><span class="p">[</span><span class="n">hits</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
         <span class="n">n</span> <span class="o">=</span> <span class="n">seen</span><span class="p">[</span><span class="n">token</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">]):</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">pad_runs</span><span class="p">[</span><span class="n">token</span><span class="p">]):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"the prompt holds more placeholders </span><span class="si">{</span><span class="n">token</span><span class="si">}</span><span class="s2"> than the "</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">])</span><span class="si">}</span><span class="s2"> attachments it has tokens for"</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pad_runs</span><span class="p">[</span><span class="n">token</span><span class="p">])</span><span class="si">}</span><span class="s2"> attachments it has tokens for"</span>
             <span class="p">)</span>
         <span class="n">seen</span><span class="p">[</span><span class="n">token</span><span class="p">]</span> <span class="o">=</span> <span class="n">n</span> <span class="o">+</span> <span class="mi">1</span>
         <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="n">cursor</span><span class="p">:</span><span class="n">i</span><span class="p">])</span>
@@ -1459,18 +1473,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">([</span><span class="n">start</span><span class="p">]))</span>
             <span class="n">size</span> <span class="o">+=</span> <span class="mi">1</span>
-        <span class="n">tokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">][</span><span class="n">n</span><span class="p">])</span>
-        <span class="n">layout</span><span class="o">.</span><span class="n">pad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
-        <span class="n">layout</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="n">tokens</span><span class="p">,</span> <span class="n">output</span><span class="p">,</span> <span class="n">grid</span> <span class="o">=</span> <span class="n">pad_runs</span><span class="p">[</span><span class="n">token</span><span class="p">][</span><span class="n">n</span><span class="p">]</span>
+        <span class="n">tokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
         <span class="n">layout</span><span class="o">.</span><span class="n">offset</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">size</span><span class="p">)</span>
         <span class="n">layout</span><span class="o">.</span><span class="n">tokens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">grid</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">grid</span><span class="p">)</span>
         <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_full</span><span class="p">((</span><span class="n">tokens</span><span class="p">,),</span> <span class="n">token</span><span class="p">))</span>
         <span class="n">size</span> <span class="o">+=</span> <span class="n">tokens</span>
         <span class="k">if</span> <span class="n">end</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">([</span><span class="n">end</span><span class="p">]))</span>
             <span class="n">size</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="n">cursor</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span>
-    <span class="n">short</span> <span class="o">=</span> <span class="p">{</span><span class="n">pad</span><span class="p">:</span> <span class="p">(</span><span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="k">for</span> <span class="n">pad</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">counts</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="p">)}</span>
+    <span class="n">short</span> <span class="o">=</span> <span class="p">{</span><span class="n">pad</span><span class="p">:</span> <span class="p">(</span><span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">r</span><span class="p">))</span> <span class="k">for</span> <span class="n">pad</span><span class="p">,</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">pad_runs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">r</span><span class="p">)}</span>
     <span class="k">if</span> <span class="n">short</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"placeholder counts in the prompt (found, expected) per pad id: </span><span class="si">{</span><span class="n">short</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">pieces</span><span class="p">:</span>
@@ -1498,53 +1513,57 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""An encoder node of the media walks, as data.</span>
 
 <span class="sd">    ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);</span>
-<span class="sd">    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad</span>
-<span class="sd">    of ``pad_ids`` in the prompt, in prompt order. ``walk`` names the walk a</span>
-<span class="sd">    prompt carrying this medium alone prefills on, for a model whose graph</span>
-<span class="sd">    already calls it something else (walk names are read by configs and</span>
-<span class="sd">    metrics).</span>
+<span class="sd">    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per token</span>
+<span class="sd">    of the ``MEDIA_LAYOUT`` runs it fills, in prompt order. The layout, not a</span>
+<span class="sd">    placeholder id, places each row, so encoders may share a placeholder</span>
+<span class="sd">    token. ``walk`` names the walk a prompt carrying this medium alone</span>
+<span class="sd">    prefills on, for a model whose graph already calls it something else</span>
+<span class="sd">    (walk names are read by configs and metrics).</span>
 <span class="sd">    """</span>
 
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">node</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">inputs</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">output</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">pad_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
-    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">:</span>
-            <span class="c1"># the splice would have no pad to fill</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"media encoder </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> names no pad ids"</span><span class="p">)</span>
-
-<div class="viewcode-block" id="MediaEncoder.pads">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaEncoder.pads">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">pads</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Which of ``ids`` are this encoder's pads."""</span>
-        <span class="n">pad</span> <span class="o">=</span> <span class="n">ids</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-        <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">[</span><span class="mi">1</span><span class="p">:]:</span>
-            <span class="n">pad</span> <span class="o">=</span> <span class="n">pad</span> <span class="o">|</span> <span class="p">(</span><span class="n">ids</span> <span class="o">==</span> <span class="n">p</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">pad</span></div>
-</div>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="splice_media">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.splice_media">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">splice_media</span><span class="p">(</span><span class="n">embeds</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">pad</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">media</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``,</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">splice_media</span><span class="p">(</span><span class="n">embeds</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">media</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``embeds`` with the nth token that ``mask`` marks replaced by ``media[n]``,</span>
 <span class="sd">    an index past the end taking the last row. Static shapes and no host sync,</span>
 <span class="sd">    so it runs inside a captured forward."""</span>
-    <span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">pad</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">clamp_</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">media</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">pad</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="n">media</span><span class="p">[</span><span class="n">index</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">embeds</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">embeds</span><span class="p">)</span></div>
+    <span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">clamp_</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">media</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">mask</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="n">media</span><span class="p">[</span><span class="n">index</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">embeds</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">embeds</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="media_rows">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_rows">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_rows</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">MediaRun</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""A prompt's media placement from its ``MEDIA_LAYOUT``: a host bool mask</span>
+<span class="sd">    of its ``length`` tokens, True on every run's tokens, and the runs in</span>
+<span class="sd">    prompt order. The splice reads the encoders' rows in that order</span>
+<span class="sd">    (`splice_media`)."""</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">length</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+    <span class="n">runs</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">offset</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">output</span><span class="p">,</span> <span class="n">grid</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"offset"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tokens"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"grid"</span><span class="p">,</span> <span class="p">()),</span>
+        <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">mask</span><span class="p">[</span><span class="n">offset</span><span class="p">:</span><span class="n">offset</span> <span class="o">+</span> <span class="n">tokens</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">runs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">MediaRun</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="n">output</span><span class="p">,</span> <span class="n">grid</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">mask</span><span class="p">,</span> <span class="n">runs</span></div>
 
 
 
 <div class="viewcode-block" id="vision_encoder">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.vision_encoder">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">vision_encoder</span><span class="p">(</span><span class="n">pad_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">MediaEncoder</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">vision_encoder</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">MediaEncoder</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The ``vision_encoder`` node every VLM here declares."""</span>
-    <span class="k">return</span> <span class="n">MediaEncoder</span><span class="p">(</span><span class="s2">"vision"</span><span class="p">,</span> <span class="s2">"vision_encoder"</span><span class="p">,</span> <span class="p">(</span><span class="s2">"pixel_values"</span><span class="p">,),</span> <span class="s2">"vision_embeds"</span><span class="p">,</span> <span class="n">pad_ids</span><span class="p">)</span></div>
+    <span class="k">return</span> <span class="n">MediaEncoder</span><span class="p">(</span><span class="s2">"vision"</span><span class="p">,</span> <span class="s2">"vision_encoder"</span><span class="p">,</span> <span class="p">(</span><span class="s2">"pixel_values"</span><span class="p">,),</span> <span class="s2">"vision_embeds"</span><span class="p">)</span></div>
 
 
 
@@ -1570,25 +1589,17 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="media_layout">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_layout">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">media_layout</span><span class="p">(</span>
-    <span class="n">pads</span><span class="p">:</span> <span class="n">MediaPads</span><span class="p">,</span>
-    <span class="n">output_of</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span>
-    <span class="n">grids</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_layout</span><span class="p">(</span><span class="n">pads</span><span class="p">:</span> <span class="n">MediaPads</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's</span>
 <span class="sd">    ``offset`` and ``tokens``, the encoder ``output`` it is read from, and</span>
-<span class="sd">    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one). Plain lists: it rides</span>
-<span class="sd">    the step's control message, so every node of the walk reads it on the</span>
-<span class="sd">    host (`media_grids`)."""</span>
-    <span class="n">grids</span> <span class="o">=</span> <span class="n">grids</span> <span class="ow">or</span> <span class="p">{}</span>
+<span class="sd">    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one).</span>
+<span class="sd">    Plain lists: it rides the step's control message, so every node of the</span>
+<span class="sd">    walk reads it on the host (`media_grids`)."""</span>
     <span class="k">return</span> <span class="p">{</span>
         <span class="s2">"offset"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">offset</span><span class="p">),</span>
         <span class="s2">"tokens"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">tokens</span><span class="p">),</span>
-        <span class="s2">"output"</span><span class="p">:</span> <span class="p">[</span><span class="n">output_of</span><span class="p">[</span><span class="n">p</span><span class="p">]</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">pads</span><span class="o">.</span><span class="n">pad</span><span class="p">],</span>
-        <span class="s2">"grid"</span><span class="p">:</span> <span class="p">[</span>
-            <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">grids</span><span class="p">[</span><span class="n">p</span><span class="p">][</span><span class="n">i</span><span class="p">]]</span> <span class="k">if</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">grids</span> <span class="k">else</span> <span class="p">[]</span>
-            <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">pad</span><span class="p">,</span> <span class="n">pads</span><span class="o">.</span><span class="n">index</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="p">],</span>
+        <span class="s2">"output"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">output</span><span class="p">),</span>
+        <span class="s2">"grid"</span><span class="p">:</span> <span class="p">[[</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">grid</span><span class="p">]</span> <span class="k">for</span> <span class="n">grid</span> <span class="ow">in</span> <span class="n">pads</span><span class="o">.</span><span class="n">grid</span><span class="p">],</span>
     <span class="p">}</span></div>
 
 
@@ -1602,28 +1613,6 @@ window.runMermaid = runMermaid;</script>
         <span class="nb">tuple</span><span class="p">(</span><span class="n">grid</span><span class="p">)</span> <span class="k">for</span> <span class="n">grid</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"grid"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">out</span> <span class="o">==</span> <span class="n">output</span>
     <span class="p">]</span></div>
-
-
-
-<div class="viewcode-block" id="media_rows_between">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_rows_between">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">media_rows_between</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">"""The rows ``[a, b)`` of each encoder output that the pads among tokens</span>
-<span class="sd">    ``[start, end)`` of a ``MEDIA_LAYOUT``'s prompt read, by output; an</span>
-<span class="sd">    output with no pad there is left out. An output's runs fill its rows in</span>
-<span class="sd">    prompt order, so the rows a token range reads are one slice."""</span>
-    <span class="n">rows</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
-    <span class="n">filled</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-    <span class="k">for</span> <span class="n">off</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
-        <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"offset"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tokens"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">):</span>
-        <span class="n">base</span> <span class="o">=</span> <span class="n">filled</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">off</span><span class="p">,</span> <span class="n">start</span><span class="p">),</span> <span class="nb">min</span><span class="p">(</span><span class="n">off</span> <span class="o">+</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">hi</span> <span class="o">&gt;</span> <span class="n">lo</span><span class="p">:</span>
-            <span class="n">first</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="n">out</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">out</span> <span class="ow">in</span> <span class="n">rows</span> <span class="k">else</span> <span class="n">base</span> <span class="o">+</span> <span class="n">lo</span> <span class="o">-</span> <span class="n">off</span>
-            <span class="n">rows</span><span class="p">[</span><span class="n">out</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">first</span><span class="p">,</span> <span class="n">base</span> <span class="o">+</span> <span class="n">hi</span> <span class="o">-</span> <span class="n">off</span><span class="p">)</span>
-        <span class="n">filled</span><span class="p">[</span><span class="n">out</span><span class="p">]</span> <span class="o">=</span> <span class="n">base</span> <span class="o">+</span> <span class="n">tokens</span>
-    <span class="k">return</span> <span class="n">rows</span></div>
 
 
 
