@@ -128,3 +128,33 @@ def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
     assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {
         "conversation": {"streams": 1, "turn_tokens": False, "channels": 1}}
     assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("signame", ["SIGINT", "SIGTERM"])
+def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame):
+    """As uvicorn stops on either: a server started as a background job inherits
+    SIGINT ignored, where asyncio.run would leave the bridge's loop running."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    pytest.importorskip("mstar_rust")
+    script = (
+        "import sys, types\n"
+        "from mstar.api_server.rust_frontend import RustFrontendBridge\n"
+        f"bridge = RustFrontendBridge(types.SimpleNamespace(), {str(tmp_path)!r})\n"
+        "print('serving', flush=True)\n"
+        "bridge.run()\n"
+        "print('stopped', flush=True)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
+                            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+    try:
+        assert proc.stdout.readline().strip() == "serving"
+        time.sleep(0.5)  # the loop is running
+        proc.send_signal(getattr(signal, signame))
+        out, _ = proc.communicate(timeout=10)
+    finally:
+        proc.kill()
+    assert "stopped" in out and proc.returncode == 0
