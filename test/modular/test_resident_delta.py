@@ -49,6 +49,7 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
     MessageSource,
@@ -172,11 +173,8 @@ def test_an_empty_delta_is_falsy():
 # --- the engine's journal and replay ----------------------------------------
 
 
-class _Resource:
+class _Resource(StubResource):
     supports_eviction = True
-    supports_preplan = False
-    force_double_buffer = False
-    lean_capture = False
 
     def __init__(self):
         self.offloaded: set[str] = set()
