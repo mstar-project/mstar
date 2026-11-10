@@ -591,6 +591,9 @@ jobs:
         id: wait
         continue-on-error: true
         timeout-minutes: 340
+        env:
+          # to redact the box's progress lines it prints (the redact step's S2; S3 is in the job's env)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 .github/review/gpu_review.py wait
 
       # What the box and the providers wrote, redacted in place before anything reads it, so the
@@ -701,6 +704,7 @@ jobs:
           path: |
             ${{ runner.temp }}/lt/results/report.md
             ${{ runner.temp }}/lt/results/result.json
+            ${{ runner.temp }}/lt/results/progress.log
           retention-days: 30
           if-no-files-found: ignore
 

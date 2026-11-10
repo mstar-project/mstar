@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -245,6 +246,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   noise, and a control arm only when a claim needs one. Test the PR's head against its base: this
   overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
   on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
+- As you go, append one short line per milestone to `$LIVE_PR_OUT/progress.log`, as `HH:MM <what>`:
+  the plan written (with its estimated time), bootstrap done, each check started and finished with its
+  outcome, writing the report. The workflow's log shows them while you run.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
   change needs; about two hours once compile caches are warm (compiling doesn't count) is the most a
@@ -397,13 +401,56 @@ def box_cost(path):
           if usable else "The box left no usable report of its Claude cost.")
 
 
+PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
+
+
+def show_progress(key, seen, final=False):
+    """Print the lines the box's session added to progress.log since the `seen` lines already printed, to the
+    job's log; the new count. Whole lines, at most 50 a poll, and on the `final` read the last line too; a line
+    longer than the read's cap counts as one, cut, once wc counts it. Each is redacted with the exact secrets the
+    redact step uses, then cut and quoted, since the session wrote them. A file that got shorter is read once
+    more, from its start. The box caps the read (a FIFO or a huge line can't hold it), and so does this; a read
+    that fails, times out or gives no line count changes nothing."""
+    log = f"{ERAS_OUT}/progress.log"
+
+    def read(start):  # (the file's line count, what follows line `start`), or None
+        try:
+            r = gpu("ssh", key, f"timeout 60 wc -l {log} && timeout 60 tail -n +{start + 1} {log} | head -n 50 "
+                                f"| head -c {PROGRESS_CAP}", check=False, timeout=120)
+            total = int(r.stdout.split(maxsplit=1)[0])
+        except (subprocess.TimeoutExpired, ValueError, IndexError):
+            return None
+        return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
+
+    got = read(seen)
+    if got and got[0] < seen:  # rewritten shorter
+        seen, got = 0, read(0)
+    if got is None:
+        return seen
+    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+    # The box's caps again here, should it not have kept them.
+    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+    # The last piece is a line still being written, or nothing. It is shown on the final read, and when it is one
+    # line past the cap that wc already counts (so a line still being written isn't shown at every poll).
+    whole = len(lines) == 1 and len(raw) >= PROGRESS_CAP and total > seen
+    if not lines[-1] or not (final or whole):
+        lines = lines[:-1]
+    lines = lines[:50]
+    exact = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY")]
+    for line in lines:
+        print(bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
+    return seen + len(lines)
+
+
 def wait(out, runner_temp):
-    """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
-    `unavailable` set, when the box left no results (Eras refused the Pod, say): the status, which carries
-    the platform's failure code and message, goes in the comment."""
+    """Until the box's session finishes, printing its new progress lines at every poll (show_progress); then copy
+    its results back and let the box go. Exits 3, with `unavailable` set, when the box left no results (Eras
+    refused the Pod, say): the status, which carries the platform's failure code and message, goes in the
+    comment."""
     lt = Path(runner_temp, "lt")
     key, e = instance(lt)
     cfg = gpu_py.load_config()
+    seen = 0
     while True:
         try:
             st, host, port = gpu_py.status(e, cfg)
@@ -416,9 +463,11 @@ def wait(out, runner_temp):
             with gpu_py.ledger_txn() as d:
                 d[key].update(host=host, port=port)
             e.update(host=host, port=port)
-        if state.startswith("run ") or state in ("ended", "releasing"):
-            break  # the Pod is gone, and its results with it
-        if host and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0:
+        # the Pod is gone, and its results with it, or the session is done
+        done = state.startswith("run ") or state in ("ended", "releasing") \
+            or bool(host) and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0
+        seen = show_progress(key, seen, final=done)
+        if done:
             break
         time.sleep(60)
     results = lt / "results"
@@ -789,7 +838,7 @@ def redact(out, runner_temp, s2="", s3=""):
     holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key."""
     lt = Path(runner_temp, "lt")
     exact = (s2, s3)
-    for f in (lt / "results/report.md", lt / "unavailable.md"):
+    for f in (lt / "results/report.md", lt / "results/progress.log", lt / "unavailable.md"):
         if f.is_file():
             f.write_text(bot.redact(f.read_text(), exact=exact))
     verdict = lt / "results/result.json"

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -809,15 +810,65 @@ class TestEras(unittest.TestCase):
                                   status=lambda e, cfg: ("active", "box.example", 2222))
         (temp / "lt/results").mkdir()
         (temp / "lt/results/claude.json").write_text('{"total_cost_usd": 2}')
+        key = "sk-ant-api03-" + "Ab1_-" * 8
+        polls, logs = [], ["09:00 plan written, about 40 min\n09:01 boots", None,  # None: the read fails
+                           "timeout",  # the read outlives its timeout
+                           f"09:00 plan written, about 40 min\n09:01 bootstrap done\n09:02 env {key}\n09:03 report"]
+
+        def ssh(argv, stdin):
+            command = argv[-1]
+            if command.startswith("test -f"):
+                polls.append(1)
+                return "" if len(polls) == len(logs) else Fail()
+            if command.startswith("timeout 60 wc -l"):
+                log = logs[len(polls) - 1]
+                if log == "timeout":
+                    raise subprocess.TimeoutExpired(argv, 120)
+                start = int(command.split("tail -n +")[1].split()[0])
+                return Fail() if log is None else f"{log.count(chr(10))} progress.log\n" + "".join(
+                    log.splitlines(True)[start - 1:])
+            return ""
         printed = io.StringIO()
-        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed):
-            step(gpu_review.wait, {"gpu.py *": ""}, runner_temp=str(temp))
+        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed), \
+                unittest.mock.patch.object(gpu_review.time, "sleep"):
+            step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py *": ""}, runner_temp=str(temp))
+        shown = [line for line in printed.getvalue().splitlines() if line.startswith('"09:')]
+        self.assertEqual(shown, ['"09:00 plan written, about 40 min"', '"09:01 bootstrap done"',
+                                 '"09:02 env [REDACTED]"', '"09:03 report"'],
+                         "the job's log would show nothing for hours, a line twice or half-written, or the box's key")
         self.assertIn("$2.0000", printed.getvalue(), "the job's log wouldn't show what the box's session cost")
         self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
                          "gpu.py ssh and pull would die with 'run gpu.py wait first'")
         ssh = gpu_review.gpu_py.ssh_base({**e, "host": "box.example", "port": 2222},
                                          {"identity_file": "~/.ssh/live_pr"})
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
+
+    def test_a_progress_read_survives_a_shrunk_log_a_bad_count_and_an_endless_line(self):
+        def show(log, seen, count=None, final=False, caps=True):
+            """show_progress on a box whose progress.log is `log` (its line count `count`, default wc's), with
+            `head`'s caps kept or not; what it printed and the count it returned."""
+            def ssh(argv, stdin):
+                start = int(argv[-1].split("tail -n +")[1].split()[0])
+                rest = log.splitlines(True)[start - 1:]
+                body = "".join(rest[:50])[:gpu_review.PROGRESS_CAP] if caps else "".join(rest)
+                return f"{log.count(chr(10)) if count is None else count} progress.log\n" + body
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                out, _ = step(lambda o: o.update(n=gpu_review.show_progress("eras:i-1", seen, final)),
+                              {"gpu.py ssh": ssh})
+            return printed.getvalue().splitlines(), out["n"]
+
+        self.assertEqual(show("09:00 a\n09:01 b\n", 5), (['"09:00 a"', '"09:01 b"'], 2),
+                         "a log rewritten shorter would print nothing for the rest of the run")
+        self.assertEqual(show("09:00 a\n", 1, count=-1), ([], 1), "a bad line count would recurse until wait dies")
+        long = "x" * (gpu_review.PROGRESS_CAP + 10)
+        lines, n = show(long + "\n09:02 c\n", 0)
+        self.assertEqual((len(lines), n), (1, 1), "one line past the cap would stall the progress for good")
+        self.assertEqual(show(long + "\n09:02 c\n", 1), (['"09:02 c"'], 2))
+        self.assertEqual(show(long, 0), ([], 0), "a long line still being written would be shown at every poll")
+        self.assertEqual(len(show(long, 0, final=True)[0]), 1, "the last line would be lost when the box ends")
+        many = "".join(f"09:00 line {i}\n" for i in range(5000))
+        self.assertEqual(show(many, 0, caps=False)[1], 50, "a box that ignores head could flood the job's log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",
