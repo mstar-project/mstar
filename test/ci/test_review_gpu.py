@@ -383,18 +383,20 @@ class TestComment(unittest.TestCase):
             endless = b"x " * gpu_review.LINE_CAP * 4
             key = "ant/key+secret=="  # held only by the job, not in its environment; cut where it starts
             split = b"y" * (gpu_review.LINE_CAP - 9) + b" " + key.encode() * 300
-            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key plaintoken123\n"
-                                                   + split + b"\n")
+            lined = "dop_v1_abc/def\nghi+jkl=="  # a key with a newline in it, never whole in one line
+            (results / "progress.log").write_bytes(b"09:00 caf\xe9\n" + endless + b"\n09:01 key " + lined.encode()
+                                                   + b"\n" + split + b"\n")
             (results / "progress.log.redacted").mkdir()  # the box's, in the way of a fixed temporary name
-            gpu_review.redact({}, temp, s2=key, s3="plaintoken123")
+            gpu_review.redact({}, temp, s2=key, s3=lined)
             self.assertEqual((results / "progress.log").read_text(),
                              "09:00 caf\ufffd\n" + "x " * (gpu_review.LINE_CAP // 2) + "…\n09:01 key [REDACTED]\n"
-                             + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
+                             "[REDACTED]\n" + "y" * (gpu_review.LINE_CAP - 9) + " …\n",
                              "a stray byte would fail the step; a line of any length is read whole into memory; "
-                             "a cut would show the start of a key")
-            with unittest.mock.patch.object(gpu_review.bot, "redact", side_effect=RuntimeError):
-                self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
-            self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
+                             "a cut would show the start of a key; a key with a newline in it would stay")
+            for failing in ((gpu_review.bot, "redact"), (gpu_review.os, "replace")):
+                with unittest.mock.patch.object(*failing, side_effect=RuntimeError):
+                    self.assertRaises(RuntimeError, gpu_review.redact, {}, temp)
+                self.assertEqual(os.listdir(temp), ["lt"], "a redact that failed would leave its temporary file")
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
@@ -844,7 +846,8 @@ class TestEras(unittest.TestCase):
         key = "sk-ant-api03-" + "Ab1_-" * 8
         polls, logs = [], ["09:00 plan written, about 40 min\n09:01 boots", None,  # None: the read fails
                            "timeout",  # the read outlives its timeout
-                           f"09:00 plan written, about 40 min\n09:01 bootstrap done\n09:02 env {key}\n09:03 report"]
+                           f"09:00 plan written, about 40 min\n09:01 bootstrap done\n09:02 env {key}\n09:03 report "
+                           "eras/k3y +tail=="]
 
         def ssh(argv, stdin):
             command = argv[-1]
@@ -861,15 +864,17 @@ class TestEras(unittest.TestCase):
             return ""
         printed = io.StringIO()
         with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(printed), \
-                unittest.mock.patch.object(gpu_review.time, "sleep"):
+                unittest.mock.patch.object(gpu_review.time, "sleep"), \
+                unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "eras/k3y\n+tail=="}):
             def pull(argv, stdin):  # the box's log as it ended
                 Path(argv[-1], "progress.log").write_text(logs[-1])
                 return ""
             step(gpu_review.wait, {"gpu.py ssh": ssh, "gpu.py pull": pull, "gpu.py *": ""}, runner_temp=str(temp))
         shown = [line for line in printed.getvalue().splitlines() if line.startswith('"09:')]
         self.assertEqual(shown, ['"09:00 plan written, about 40 min"', '"09:01 bootstrap done"',
-                                 '"09:02 env [REDACTED]"', '"09:03 report"'],
-                         "the job's log would show nothing for hours, a line twice or half-written, or the box's key")
+                                 '"09:02 env [REDACTED]"', '"09:03 report [REDACTED] [REDACTED]"'],
+                         "the job's log would show nothing for hours, a line twice or half-written, the box's key, "
+                         "or the job's Eras key, whose lines it shows one by one")
         self.assertIn("$2.0000", printed.getvalue(), "the job's log wouldn't show what the box's session cost")
         self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
                          "gpu.py ssh and pull would die with 'run gpu.py wait first'")
