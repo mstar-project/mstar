@@ -329,7 +329,8 @@ class Resource(ResidentHooks, ABC):
         """
         Takes the output of publish, possibly from another device, and kicks
         of a retrieval if needed (e.g., PD disaggregation KV transfer).
-        Returns whether the retrieve has completed.
+        Returns whether the retrieve has completed. Not ready also covers
+        per-request state the resource is still preparing (a grammar compiling).
         """
         return ADMIT_OK
 

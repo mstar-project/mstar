@@ -42,7 +42,7 @@ def _resource(graph: bool, comm_group=None) -> GrammarSamplerResource:
     )
     res = GrammarSamplerResource(
         vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
-        text_output=text_output, comm_group=comm_group,
+        text_output=text_output, grammar_cache_mb=16, comm_group=comm_group,
     )
     if graph:
         res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=4, max_seq_len=1)
@@ -279,5 +279,5 @@ def test_enable_grammar_on_a_sampler_narrower_than_the_text_vocabulary_is_refuse
     with pytest.raises(ValueError, match="belongs on the text sampler"):
         GrammarSamplerResource(
             vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
-            text_output=text_output,
+            text_output=text_output, grammar_cache_mb=16,
         )
