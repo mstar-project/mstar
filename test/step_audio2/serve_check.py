@@ -16,8 +16,8 @@ Run a server first (Python or ``--rust-frontend``; the checks are the same), the
 * **text, speech in, speech out**: a sampled request of each kind, with the reference's
   sampling, through ``/generate`` and ``/v1/chat/completions``; a spoken reply's audio is
   saved as WAV, and must be non-silent and last about as long as its speech ids say (40 ms
-  a code). With ``--asr``, the WAVs are transcribed by a local Whisper and compared with the
-  reply's text.
+  a code). With ``--asr``, the WAVs are transcribed (``self``: by the served model's own ASR
+  prompt; or a local Whisper) next to the reply's text (``--asr self``: the served model's own ASR).
 * **edges**: ``max_output_tokens`` 1 and 2 return that many steps; a malformed field and a
   ``ref_audio`` are 400s, and the server serves normally afterwards.
 * **two identical seeded spoken requests**: whether their text and audio match (reported).
@@ -123,7 +123,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--asr", default=None, help="a local Whisper checkpoint to transcribe the WAVs with")
+    ap.add_argument("--asr", default=None,
+                    help="'self' to transcribe the WAVs with the server's own ASR, or a local Whisper checkpoint")
     ap.add_argument("--skip-chat", action="store_true")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -247,13 +248,29 @@ def main() -> None:
         verdict.check(False, f"seeded pair: {[s for s, _ in pair]}")
 
     if args.asr:
-        from transformers import pipeline
+        # Step-Audio2's own ASR (the reference's ``asr_test`` prompt), greedy, on the server
+        # under test, unless a local Whisper checkpoint is named
+        pipe = None
+        if args.asr != "self":
+            from transformers import pipeline
 
-        asr = pipeline("automatic-speech-recognition", model=args.asr, device=0)
+            pipe = pipeline("automatic-speech-recognition", model=args.asr, device=0)
         for wav in sorted(args.out.glob("*.wav")):
-            heard = asr(str(wav))["text"]
+            if pipe is not None:
+                heard = pipe(str(wav))["text"]
+            else:
+                audio = base64.b64encode(wav.read_bytes()).decode()
+                status, body = chat(base, [
+                    {"role": "system", "content": "请记录下你所听到的语音内容。"},
+                    {"role": "user", "content": [
+                        {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}},
+                    ]},
+                ], spoken=False, temperature=0, max_tokens=512, repetition_penalty=1.0)
+                heard = body["choices"][0]["message"]["content"] if status == 200 else f"<{status}: {body}>"
             said = (args.out / f"{wav.stem}.txt").read_text() if (args.out / f"{wav.stem}.txt").exists() else ""
             print(f"ASR {wav.name}: {heard!r}\n    reply text: {said!r}")
+            if said:
+                (args.out / f"{wav.stem}.asr.txt").write_text(heard)
     print("\ngreedy agreement (steps agreeing, of, the reference's own spread):", report)
     verdict.finish()
 
