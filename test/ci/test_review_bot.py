@@ -1019,7 +1019,7 @@ class TestImprove(unittest.TestCase):
     def test_an_empty_list_opens_no_issue(self):
         out, fake = self.post('{"improvements": []}')
         self.assertNotIn("exit", out)
-        self.assertEqual(fake.writes(), [], "an empty week opened an issue")
+        self.assertEqual(fake.writes(), [], "an empty list opened an issue")
 
     def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
         secret = "sk-ant-" + "a1b2c3d4" * 3
@@ -1033,7 +1033,7 @@ class TestImprove(unittest.TestCase):
         [(key, stdin)] = fake.writes()
         self.assertEqual(key, "POST repos/o/r/issues")
         issue = json.loads(stdin)
-        self.assertEqual(issue["title"], "Review bot: what to improve, week of 2026-11-02")
+        self.assertEqual(issue["title"], "Review bot: what to improve, 2026-11-06 to 2026-11-08")
         self.assertNotIn(secret, stdin)
         self.assertIn("[REDACTED]", issue["body"])
         self.assertFalse(any(secret in " ".join(argv) for argv, _ in fake.calls), "text reached the command line")
