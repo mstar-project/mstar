@@ -1035,6 +1035,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"check_ref_audio", rid, sub, path, decoder, bare}</span>
 <span class="sd">                       | {t:"voices", rid, sub}</span>
 <span class="sd">                       | {t:"windows", rid, sub, op, plan, ...}</span>
+<span class="sd">                       | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}</span>
+<span class="sd">                       | {t:"end_of_turn", rid, sub, audio(bin)}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}</span>
 <span class="sd">                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}</span>
 <span class="sd">                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}</span>
@@ -1043,6 +1045,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"checked", rid, sub, error?, status?}</span>
 <span class="sd">                       | {t:"voices", rid, sub, metadata:{voices?}}</span>
 <span class="sd">                       | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}</span>
+<span class="sd">                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}</span>
+<span class="sd">                       | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}</span>
+
+<span class="sd">A ``live`` request is one operation on a ``/generate/ws`` live call, the</span>
+<span class="sd">submission ``call`` names: ``taking`` (``taking_input``), ``append``</span>
+<span class="sd">(``stream_input``) or ``reject`` (``reject_input``). An append the model finds</span>
+<span class="sd">late is sent later as a ``chunk`` (modality ``late``) on the socket's</span>
+<span class="sd">``notice`` route, its ``tag`` echoed in the metadata.</span>
 
 <span class="sd">A ``windows`` request is one operation on a transcription upload's</span>
 <span class="sd">``WindowPlanner`` (``serving_transcriptions``), kept here under the frontend's</span>
@@ -1217,6 +1227,14 @@ window.runMermaid = runMermaid;</script>
 <span class="n">SERVED_MODELS_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_SERVED_MODELS"</span>
 <span class="c1">#: What ``/v1/audio/transcriptions`` needs from the model, as JSON (``transcription_facts``).</span>
 <span class="n">TRANSCRIPTION_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_TRANSCRIPTION"</span>
+<span class="c1">#: The deployment's openpi policy, as JSON (``openpi_facts``); unset serves no openpi socket.</span>
+<span class="n">OPENPI_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_OPENPI"</span>
+<span class="c1">#: The largest WebSocket message, in bytes (the config's ``ws_max_message_mb``).</span>
+<span class="n">WS_MAX_BYTES_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_WS_MAX_BYTES"</span>
+<span class="c1">#: The model's client streams, as JSON: a request to a model with any is a live call.</span>
+<span class="n">CLIENT_STREAMS_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_CLIENT_STREAMS"</span>
+<span class="c1">#: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).</span>
+<span class="n">REALTIME_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_REALTIME"</span>
 
 
 <div class="viewcode-block" id="WindowOp">
@@ -1228,6 +1246,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">AT</span> <span class="o">=</span> <span class="s2">"at"</span>         <span class="c1"># the window that starts at ``offset``</span>
     <span class="n">CUT</span> <span class="o">=</span> <span class="s2">"cut"</span>       <span class="c1"># ``duration`` seconds from ``offset``</span>
     <span class="n">CLOSE</span> <span class="o">=</span> <span class="s2">"close"</span>   <span class="c1"># the request ended: delete the upload and its windows</span></div>
+
+
+
+<div class="viewcode-block" id="LiveOp">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.LiveOp">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">LiveOp</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A ``live`` request's operation on a live call."""</span>
+    <span class="n">TAKING</span> <span class="o">=</span> <span class="s2">"taking"</span>   <span class="c1"># taking_input: whether the call still takes input</span>
+    <span class="n">APPEND</span> <span class="o">=</span> <span class="s2">"append"</span>   <span class="c1"># stream_input: text, files, model_kwargs or samples, maybe ending streams</span>
+    <span class="n">REJECT</span> <span class="o">=</span> <span class="s2">"reject"</span>   <span class="c1"># reject_input: end the call with the client's error</span></div>
 
 
 
@@ -1299,18 +1327,123 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="openpi_facts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.openpi_facts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">openpi_facts</span><span class="p">(</span><span class="n">policy</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``OPENPI_ENV``'s value for an ``OpenpiPolicy``: the block as the API server</span>
+<span class="sd">    checked it against its model, its metadata frame packed as this side packs</span>
+<span class="sd">    it. ``None`` (no ``openpi:`` block) serves no socket at ``/``."""</span>
+    <span class="k">if</span> <span class="n">policy</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openpi</span><span class="w"> </span><span class="kn">import</span> <span class="n">pack</span>
+
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">"image_keys"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">image_keys</span><span class="p">),</span> <span class="s2">"state_keys"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">state_keys</span><span class="p">),</span>
+        <span class="s2">"state_kwarg"</span><span class="p">:</span> <span class="n">policy</span><span class="o">.</span><span class="n">state_kwarg</span><span class="p">,</span> <span class="s2">"action_horizon"</span><span class="p">:</span> <span class="n">policy</span><span class="o">.</span><span class="n">action_horizon</span><span class="p">,</span>
+        <span class="s2">"action_dim"</span><span class="p">:</span> <span class="n">policy</span><span class="o">.</span><span class="n">action_dim</span><span class="p">,</span> <span class="s2">"action_dims"</span><span class="p">:</span> <span class="n">policy</span><span class="o">.</span><span class="n">action_dims</span><span class="p">,</span>
+        <span class="s2">"metadata"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">pack</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">metadata</span><span class="p">))</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="onnxruntime_library">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.onnxruntime_library">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">onnxruntime_library</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The ONNX Runtime library the ``onnxruntime`` package loads, for mstar-server</span>
+<span class="sd">    to score turn detection with the same runtime; ``None`` without it."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">onnxruntime</span>
+    <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="c1"># the versioned name (libonnxruntime.so.1.31.1) is the file itself</span>
+    <span class="n">libs</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">onnxruntime</span><span class="o">.</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">joinpath</span><span class="p">(</span><span class="s2">"capi"</span><span class="p">)</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="s2">"libonnxruntime.so*"</span><span class="p">),</span>
+                  <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">p</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">))</span>
+    <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">libs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span> <span class="k">if</span> <span class="n">libs</span> <span class="k">else</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="conversation_facts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.conversation_facts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">conversation_facts</span><span class="p">(</span><span class="n">server</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What a ``/v1/realtime`` conversation needs from a model with a</span>
+<span class="sd">    ``ClientAudio`` client stream, as the Python route reads it off the model:</span>
+<span class="sd">    how many such streams, whether it has turn tokens and its output channels</span>
+<span class="sd">    (which decide whether it converses), and, for one that does, its stream</span>
+<span class="sd">    and the reply settings. ``None`` for a model with no such stream."""</span>
+    <span class="n">audio</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="s2">"client_audio"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[])</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">audio</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">model</span>
+    <span class="n">facts</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"streams"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">),</span> <span class="s2">"turn_tokens"</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="s2">"turn_tokens"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
+             <span class="s2">"channels"</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">get_output_audio_channels</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)}</span>
+    <span class="k">if</span> <span class="n">facts</span><span class="p">[</span><span class="s2">"turn_tokens"</span><span class="p">]</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">facts</span><span class="p">[</span><span class="s2">"channels"</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">stream</span> <span class="o">=</span> <span class="n">audio</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">facts</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+            <span class="n">stream</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">edge_name</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">audio</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">,</span> <span class="n">frame_samples</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">audio</span><span class="o">.</span><span class="n">frame_samples</span><span class="p">,</span>
+            <span class="n">output_rate</span><span class="o">=</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">),</span> <span class="n">voice</span><span class="o">=</span><span class="n">model</span><span class="o">.</span><span class="n">get_default_voice</span><span class="p">(),</span>
+            <span class="n">idle_steps</span><span class="o">=</span><span class="n">model</span><span class="o">.</span><span class="n">turn_idle_steps</span><span class="p">,</span> <span class="n">silence_rms</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">turn_silence_rms</span><span class="p">),</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">facts</span></div>
+
+
+
+<div class="viewcode-block" id="realtime_facts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.realtime_facts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">realtime_facts</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">directory</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.</span>
+<span class="sd">    ``conversation`` is ``conversation_facts``'. For a realtime transcription</span>
+<span class="sd">    surface: ONNX Runtime's library and Silero's weights (``None`` where this</span>
+<span class="sd">    server has none, which leaves server_vad off as it is here), why Smart</span>
+<span class="sd">    Turn did not load (``None`` when it did), and the model's tokenizer,</span>
+<span class="sd">    saved under ``directory`` for the stable prefix. ``None`` for any other</span>
+<span class="sd">    model."""</span>
+    <span class="n">conversation</span> <span class="o">=</span> <span class="n">conversation_facts</span><span class="p">(</span><span class="n">server</span><span class="p">)</span>
+    <span class="n">transcribes</span> <span class="o">=</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"supports_realtime_transcription"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">transcribes</span> <span class="ow">and</span> <span class="n">conversation</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">facts</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"conversation"</span><span class="p">:</span> <span class="n">conversation</span><span class="p">}</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">transcribes</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">facts</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">realtime_vad</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">file</span><span class="p">(</span><span class="n">path</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">if</span> <span class="n">path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">is_file</span><span class="p">()</span> <span class="k">else</span> <span class="kc">None</span>
+
+    <span class="c1"># semantic_vad's end-of-turn model runs here, over the bridge (``_end_of_turn``)</span>
+    <span class="n">facts</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+        <span class="s2">"onnxruntime"</span><span class="p">:</span> <span class="n">onnxruntime_library</span><span class="p">(),</span>
+        <span class="s2">"silero"</span><span class="p">:</span> <span class="n">file</span><span class="p">(</span><span class="n">realtime_vad</span><span class="o">.</span><span class="n">silero_weights</span><span class="p">()),</span>
+        <span class="s2">"smart_turn_problem"</span><span class="p">:</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">realtime_vad</span><span class="o">.</span><span class="n">smart_turn</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">realtime_vad</span><span class="o">.</span><span class="n">smart_turn_problem</span><span class="p">(),</span>
+        <span class="s2">"tokenizer"</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">})</span>
+    <span class="n">tokenizer</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="s2">"model"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="s2">"tokenizer"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">,</span> <span class="s2">"is_fast"</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">directory</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"tokenizer.json"</span>
+        <span class="n">tokenizer</span><span class="o">.</span><span class="n">backend_tokenizer</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">))</span>
+        <span class="n">facts</span><span class="p">[</span><span class="s2">"tokenizer"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">facts</span></div>
+
+
+
 <div class="viewcode-block" id="launch_rust_server">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.launch_rust_server">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">launch_rust_server</span><span class="p">(</span><span class="n">binary</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                        <span class="n">bridge_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                        <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">served_models</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                       <span class="n">transcription</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
+                       <span class="n">transcription</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">openpi</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                       <span class="n">ws_max_bytes</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">client_streams</span><span class="o">=</span><span class="p">(),</span>
+                       <span class="n">realtime</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate</span>
 <span class="sd">    (``get_output_sample_rate``); ``None`` leaves the frontend's own default.</span>
 <span class="sd">    ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a</span>
 <span class="sd">    request's ``model`` selects; ``None`` serves the base model alone.</span>
-<span class="sd">    ``transcription`` is ``transcription_facts``' for the served model."""</span>
+<span class="sd">    ``transcription`` is ``transcription_facts``' for the served model, ``openpi``</span>
+<span class="sd">    ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket</span>
+<span class="sd">    message limit, ``client_streams`` the model's (``APIServer.client_streams``), and</span>
+<span class="sd">    ``realtime`` ``realtime_facts``' for its realtime surface."""</span>
     <span class="c1"># The key goes through the environment, not argv, which any local user</span>
     <span class="c1"># can read from the process list. ``api_key`` is the resolved setting, so</span>
     <span class="c1"># an inherited MSTAR_API_KEY must not override it.</span>
@@ -1330,6 +1463,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">TRANSCRIPTION_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">transcription</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">env</span><span class="p">[</span><span class="n">TRANSCRIPTION_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">transcription</span><span class="p">)</span>
+    <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">OPENPI_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">openpi</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">env</span><span class="p">[</span><span class="n">OPENPI_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">openpi</span><span class="p">)</span>
+    <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">WS_MAX_BYTES_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">ws_max_bytes</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">env</span><span class="p">[</span><span class="n">WS_MAX_BYTES_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">ws_max_bytes</span><span class="p">))</span>
+    <span class="n">env</span><span class="p">[</span><span class="n">CLIENT_STREAMS_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">client_streams</span><span class="p">))</span>
+    <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">REALTIME_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">realtime</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">env</span><span class="p">[</span><span class="n">REALTIME_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">realtime</span><span class="p">)</span>
     <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">LIBSNDFILE_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="p">(</span><span class="n">libsndfile</span> <span class="o">:=</span> <span class="n">soundfile_library</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">env</span><span class="p">[</span><span class="n">LIBSNDFILE_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">libsndfile</span>
@@ -1339,6 +1482,26 @@ window.runMermaid = runMermaid;</script>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Rust frontend started (pid=</span><span class="si">%d</span><span class="s2">, port=</span><span class="si">%d</span><span class="s2">)"</span><span class="p">,</span> <span class="n">proc</span><span class="o">.</span><span class="n">pid</span><span class="p">,</span> <span class="n">port</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">proc</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_stream_and_raw_inputs</span><span class="p">(</span><span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A submit's ``end_input``, ``file_streams`` and ``raw_inputs``, those it</span>
+<span class="sd">    carries: the frontend sends each only when set, so the others keep</span>
+<span class="sd">    ``submit_request``'s defaults. ``raw_inputs`` arrive as numpy's</span>
+<span class="sd">    ``(dtype.str, shape, bytes)`` and go on as the tensors the model loads."""</span>
+    <span class="n">extra</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">msg</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"end_input"</span><span class="p">,</span> <span class="s2">"file_streams"</span><span class="p">)</span> <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">raw</span> <span class="o">:=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"raw_inputs"</span><span class="p">):</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+        <span class="n">extra</span><span class="p">[</span><span class="s2">"raw_inputs"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">modality</span><span class="p">:</span> <span class="p">[</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="s2">"data"</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">dtype</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="s2">"dtype"</span><span class="p">]))</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="s2">"shape"</span><span class="p">])</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
+                <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">arrays</span>
+            <span class="p">]</span>
+            <span class="k">for</span> <span class="n">modality</span><span class="p">,</span> <span class="n">arrays</span> <span class="ow">in</span> <span class="n">raw</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+    <span class="k">return</span> <span class="n">extra</span>
 
 
 <div class="viewcode-block" id="RustFrontendBridge">
@@ -1378,6 +1541,13 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_err</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sub</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">detail</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"err"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"msg"</span><span class="p">:</span> <span class="n">detail</span><span class="p">})</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_refuse</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sub</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``submit_request`` refused the submission: an in-band error chunk, the</span>
+<span class="sd">        only reply that carries a status, marked ``refused`` since the request</span>
+<span class="sd">        never had its id (``/generate/ws`` answers an unnamed one with null)."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"chunk"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">:</span> <span class="s2">"error"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">text</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">),</span>
+                    <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="n">status</span><span class="p">,</span> <span class="s2">"refused"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}})</span>
+
 <div class="viewcode-block" id="RustFrontendBridge.relay">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.relay">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">relay</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">chunks</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1397,8 +1567,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tokens"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># The Python preprocess worker owns tokenization; run the</span>
             <span class="c1"># frontend without MSTAR_TOKENIZER so it sends text.</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"pre-tokenized ingest is not supported by this "</span>
-                                <span class="s2">"backend (unset MSTAR_TOKENIZER)"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_refuse</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"pre-tokenized ingest is not supported by this "</span>
+                                   <span class="s2">"backend (unset MSTAR_TOKENIZER)"</span><span class="p">,</span> <span class="mi">500</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="n">parts</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"prompt_parts"</span><span class="p">)</span>
@@ -1412,6 +1582,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"streaming"</span><span class="p">,</span> <span class="kc">True</span><span class="p">)),</span>
                 <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
                 <span class="n">report_usage</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"report_usage"</span><span class="p">)),</span>
+                <span class="o">**</span><span class="n">_stream_and_raw_inputs</span><span class="p">(</span><span class="n">msg</span><span class="p">),</span>
             <span class="p">)</span>
         <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="c1"># a refused input: an in-band error chunk carries its 400 to the client.</span>
@@ -1422,29 +1593,21 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">text</span> <span class="o">=</span> <span class="n">scrub_paths</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"submit </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span>
-                <span class="s2">"t"</span><span class="p">:</span> <span class="s2">"chunk"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">:</span> <span class="s2">"error"</span><span class="p">,</span>
-                <span class="s2">"data"</span><span class="p">:</span> <span class="n">text</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">),</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="mi">400</span><span class="p">},</span>
-            <span class="p">})</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_refuse</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">text</span><span class="p">,</span> <span class="mi">400</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — one bad request must not kill the loop</span>
             <span class="n">status</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
                 <span class="c1"># An HTTPException (not imported: this bridge runs without</span>
-                <span class="c1"># fastapi), e.g. the 409 for a rid still in flight. An in-band</span>
-                <span class="c1"># error chunk is the only reply that carries a status; `t="err"`</span>
-                <span class="c1"># always surfaces as a 500.</span>
+                <span class="c1"># fastapi), e.g. the 409 for a rid still in flight.</span>
                 <span class="n">detail</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"submit </span><span class="si">%s</span><span class="s2"> refused (</span><span class="si">%d</span><span class="s2">): </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">status</span><span class="p">,</span> <span class="n">detail</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span>
-                    <span class="s2">"t"</span><span class="p">:</span> <span class="s2">"chunk"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">:</span> <span class="s2">"error"</span><span class="p">,</span>
-                    <span class="s2">"data"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">(),</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="n">status</span><span class="p">},</span>
-                <span class="p">})</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_refuse</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">),</span> <span class="n">status</span><span class="p">)</span>
                 <span class="k">return</span>
             <span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span>
                 <span class="n">e</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"submit </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">text</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_refuse</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">text</span><span class="p">,</span> <span class="mi">500</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="c1"># Bound to this submission now, not when the task first runs: a later</span>
         <span class="c1"># submit in the same receive batch may reuse the rid.</span>
@@ -1545,6 +1708,85 @@ window.runMermaid = runMermaid;</script>
                             <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="mi">500</span><span class="p">}})</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">answer</span><span class="p">())</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_live</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One operation on a live call (``/generate/ws``, or a ``/v1/realtime``</span>
+<span class="sd">        conversation, whose appends carry ``audio``: float32 samples for the</span>
+<span class="sd">        ``ClientAudio`` stream ``stream``), answered as the Python route would</span>
+<span class="sd">        act on it. The call is the submission its ``call`` names; one that has</span>
+<span class="sd">        ended has no key and takes nothing."""</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"call"</span><span class="p">))</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"live"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rid"</span><span class="p">),</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{}}</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">op</span> <span class="o">=</span> <span class="n">LiveOp</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"op"</span><span class="p">))</span>
+            <span class="k">if</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">LiveOp</span><span class="o">.</span><span class="n">TAKING</span><span class="p">:</span>
+                <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"taking"</span><span class="p">:</span> <span class="n">key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">taking_input</span><span class="p">(</span><span class="n">key</span><span class="p">)}</span>
+            <span class="k">elif</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">LiveOp</span><span class="o">.</span><span class="n">REJECT</span><span class="p">:</span>
+                <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"rejected"</span><span class="p">:</span> <span class="n">key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">reject_input</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"error"</span><span class="p">],</span> <span class="nb">int</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"status"</span><span class="p">]))}</span>
+            <span class="k">elif</span> <span class="n">key</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"accepted"</span><span class="p">:</span> <span class="kc">False</span><span class="p">}</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">notice</span><span class="p">,</span> <span class="n">tag</span><span class="p">,</span> <span class="n">loop</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"notice"</span><span class="p">),</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tag"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{},</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span>
+
+                <span class="k">def</span><span class="w"> </span><span class="nf">on_late</span><span class="p">(</span><span class="n">error</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># from the preprocess thread: sent from this loop</span>
+                    <span class="n">late</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"chunk"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">notice</span><span class="p">,</span> <span class="s2">"modality"</span><span class="p">:</span> <span class="s2">"late"</span><span class="p">,</span>
+                            <span class="s2">"data"</span><span class="p">:</span> <span class="n">error</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">),</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="n">tag</span><span class="p">}</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">loop</span><span class="o">.</span><span class="n">call_soon_threadsafe</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">,</span> <span class="n">late</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+                        <span class="k">pass</span>  <span class="c1"># the loop has closed, and the frontend with it</span>
+
+                <span class="n">audio</span><span class="p">,</span> <span class="n">samples</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">),</span> <span class="p">{}</span>
+                <span class="k">if</span> <span class="n">audio</span><span class="p">:</span>
+                    <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+                    <span class="c1"># copied: torch.from_numpy warns on a read-only buffer</span>
+                    <span class="n">samples</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"samples"</span><span class="p">:</span> <span class="p">{</span><span class="n">msg</span><span class="p">[</span><span class="s2">"stream"</span><span class="p">]:</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">audio</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;f4"</span><span class="p">)</span><span class="o">.</span><span class="n">copy</span><span class="p">()}}</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">accepted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">stream_input</span><span class="p">(</span>
+                        <span class="n">key</span><span class="p">,</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"file_paths"</span><span class="p">)</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">,</span> <span class="n">end_input</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"end_input"</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+                        <span class="n">text</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text"</span><span class="p">),</span> <span class="n">file_streams</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"file_streams"</span><span class="p">),</span>
+                        <span class="n">model_kwargs</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"model_kwargs"</span><span class="p">),</span> <span class="n">on_late</span><span class="o">=</span><span class="n">on_late</span> <span class="k">if</span> <span class="n">notice</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                        <span class="o">**</span><span class="n">samples</span><span class="p">,</span>
+                    <span class="p">)</span>
+                    <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"accepted"</span><span class="p">:</span> <span class="n">accepted</span><span class="p">}</span>
+                <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># the client's fault</span>
+                    <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="n">scrub_paths</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)),</span> <span class="s2">"status"</span><span class="p">:</span> <span class="mi">400</span><span class="p">}</span>
+                <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — the append fails, the bridge goes on</span>
+                    <span class="n">route</span> <span class="o">=</span> <span class="s2">"realtime"</span> <span class="k">if</span> <span class="n">audio</span> <span class="k">else</span> <span class="s2">"generate/ws"</span>
+                    <span class="n">text</span><span class="p">,</span> <span class="n">error_id</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">route</span><span class="si">}</span><span class="s2"> append failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                    <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="n">text</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">:</span> <span class="mi">500</span><span class="p">,</span> <span class="s2">"error_id"</span><span class="p">:</span> <span class="n">error_id</span><span class="p">}</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — an unknown op included</span>
+            <span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"live </span><span class="si">{</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'op'</span><span class="p">)</span><span class="si">!r}</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="n">text</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">:</span> <span class="mi">500</span><span class="p">}</span>
+        <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="n">meta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_end_of_turn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``semantic_vad``'s end-of-turn probability of a turn's last audio</span>
+<span class="sd">        (float32), by this side's Smart Turn: its int8 model moves by tenths</span>
+<span class="sd">        when its features move by 1e-5, so the frontend asks rather than</span>
+<span class="sd">        computing the features itself. Off this loop: a call is about 45 ms."""</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"end_of_turn"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rid"</span><span class="p">),</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{}}</span>
+
+        <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+                <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">realtime_vad</span>
+
+                <span class="n">model</span> <span class="o">=</span> <span class="n">realtime_vad</span><span class="o">.</span><span class="n">smart_turn</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">realtime_vad</span><span class="o">.</span><span class="n">smart_turn_problem</span><span class="p">())</span>
+                <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;f4"</span><span class="p">)</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"p"</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">audio</span><span class="p">))}</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — the session goes on without the model</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"bridge: the end-of-turn model failed"</span><span class="p">)</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">}</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">run</span><span class="p">())</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_in_uploads</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">path</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">is_relative_to</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">())</span>
@@ -1662,6 +1904,10 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_voices</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"windows"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_windows</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"live"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_live</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"end_of_turn"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_end_of_turn</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"bridge: unknown message type </span><span class="si">%r</span><span class="s2">"</span><span class="p">,</span> <span class="n">t</span><span class="p">)</span>
 

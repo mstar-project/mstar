@@ -1135,7 +1135,8 @@ Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and t
 55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
 costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
-event loop, not the network, is the bottleneck.</p></td>
+event loop, not the network, is the bottleneck. The Rust frontend
+(<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>) offers no deflate, whatever this says.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code></p></td>
 <td><p><em>(optional)</em> The largest WebSocket message the server reads, in MiB, on every

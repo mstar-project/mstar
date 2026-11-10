@@ -4345,8 +4345,8 @@ streams, a list of names only those. The consumer gets <code class="docutils lit
 and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
 Over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> a client that opens with <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">false</span></code> appends and ends
 input explicitly (see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>), and a <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> conversation keeps it open
-for the call’s life; every other request ends the input as soon as it is submitted. <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>
-and <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> are on the Python frontend only, not <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>.</p></li>
+for the call’s life; every other request ends the input as soon as it is submitted. Both
+frontends serve <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>.</p></li>
 <li><p>The API server’s data worker is the stream’s producer. The conductor tells it the
 consuming node and its ranks once per call, when it dispatches the request, and the data
 worker sends each append’s items to every one of those ranks itself, and then the

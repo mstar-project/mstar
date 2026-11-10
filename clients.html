@@ -948,8 +948,7 @@ not the end of a request, and the call goes on. A live call that opens while the
 is at <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> ends at once with <code class="docutils literal notranslate"><span class="pre">status</span></code> 503, rather than wait for a
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore <code class="docutils literal notranslate"><span class="pre">end_input</span></code>, and an append to them is rejected.
-Live input needs the Python frontend: <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> serves no <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>
-or <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>. On either route, a model that declares its audio frame (Nemotron
+On either route, a model that declares its audio frame (Nemotron
 VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call’s audio in whole frames: each
 whole frame of an append goes on as a step of its own and the rest waits for the next
 append, or goes with the stream’s end, so appends of any size keep the call on the steps
@@ -999,8 +998,8 @@ gets a fresh seed.</p></li>
 server does, and with <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> the handshake takes <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Api-Key</span> <span class="pre">&lt;key&gt;</span></code>
 (what the client sends for <code class="docutils literal notranslate"><span class="pre">api_key</span></code>) as well as <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. Every other route still
 takes only <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. A server without the block has none of this: it refuses the
-handshake and has no <code class="docutils literal notranslate"><span class="pre">/healthz</span></code>. Only the Python frontend serves this route;
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> and the Dynamo worker log a warning and serve without it.</p>
+handshake and has no <code class="docutils literal notranslate"><span class="pre">/healthz</span></code>. Both of <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>’s frontends serve this
+route; the Dynamo worker logs a warning and serves without it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">openpi_client</span></code> sets no size limit on its messages, but the server does:
 <code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code> (by default <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A larger
 observation closes the socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> and no error frame, so a deployment whose robots

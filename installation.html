@@ -1317,9 +1317,14 @@ frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_R
 ported class is served. Chat, speech, images, videos and transcriptions are
 served for every model the Python frontend serves them for; a transcription’s
 upload is decoded and cut into windows by the API server’s <code class="docutils literal notranslate"><span class="pre">WindowPlanner</span></code>,
-over the bridge, so both frontends read the same formats. The realtime
-WebSocket route is not ported yet; there <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> has no route, and
-<code class="docutils literal notranslate"><span class="pre">/generate</span></code> still works.</p>
+over the bridge, so both frontends read the same formats. The WebSocket
+routes are served too: <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (conversations with
+full-duplex models, and transcription, whose server turn detection runs Silero
+through the ONNX Runtime library <code class="docutils literal notranslate"><span class="pre">onnxruntime</span></code> ships; <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> asks the
+API server’s Smart Turn), and openpi’s socket at
+<code class="docutils literal notranslate"><span class="pre">/</span></code> where the config has an <code class="docutils literal notranslate"><span class="pre">openpi:</span></code> block. <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> does not
+offer per-message deflate, so <code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code> has no effect there:
+a client that asks for it gets uncompressed frames.</p>
 </section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>

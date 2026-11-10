@@ -1210,6 +1210,34 @@ pydantic version its error text cites. Not for deployments to set:
 <code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">transcription_facts</span></code> for a model
 with a transcription surface, and drops an inherited value.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OPENPI</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>The deployment’s openpi policy (its <code class="docutils literal notranslate"><span class="pre">openpi:</span></code> block as the API server
+checked it, the metadata frame packed), as JSON; unset serves no socket
+at <code class="docutils literal notranslate"><span class="pre">/</span></code>. Not for deployments to set: <code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it from
+<code class="docutils literal notranslate"><span class="pre">openpi_facts</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WS_MAX_BYTES</span></code></p></td>
+<td><p>the body limit</p></td>
+<td><p>The largest WebSocket message the Rust frontend reads, in bytes: the
+config’s <code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code>. Not for deployments to set:
+<code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_CLIENT_STREAMS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
+<td><p>The model’s client streams, as JSON: on <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> a request to a
+model with any is a live call. Not for deployments to set:
+<code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">APIServer.client_streams</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REALTIME</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>What the Rust frontend’s <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> runs with, as JSON: for a
+model with an audio client stream, what a conversation needs from it
+(<code class="docutils literal notranslate"><span class="pre">conversation_facts</span></code>); for realtime transcription, the ONNX Runtime
+library <code class="docutils literal notranslate"><span class="pre">onnxruntime</span></code> loads, Silero’s weights, why Smart Turn did not
+load (if it didn’t), and the model’s tokenizer. Not for deployments to
+set: <code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">realtime_facts</span></code>.</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>Allow <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> media URLs in requests, fetched server-side by both
@@ -1283,9 +1311,10 @@ ingest.</p></td>
 </div>
 <section id="rust-frontend-limitations">
 <h3>Rust frontend limitations<a class="headerlink" href="#rust-frontend-limitations" title="Link to this heading">#</a></h3>
-<p>The Rust frontend serves no <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, so a model’s live client input
-(appends to a running request, see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>) needs the Python frontend;
-over <code class="docutils literal notranslate"><span class="pre">/generate</span></code> such a model’s input ends when the request is submitted.</p>
+<p>The Rust frontend serves every route the Python frontend serves but LoRA’s
+runtime updates (<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>, see
+<a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>): <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> refuses <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> with
+<code class="docutils literal notranslate"><span class="pre">runtime_updates:</span> <span class="pre">true</span></code>.</p>
 </section>
 </section>
 <section id="request-media">
