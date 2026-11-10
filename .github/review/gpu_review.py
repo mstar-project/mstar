@@ -613,23 +613,35 @@ def show_progress(box, seen, label):
     # wc already counts (so a line still being written isn't shown at every poll).
     tail = lines.pop()
     whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
-    lines = [*lines, *([tail] if tail and whole else [])][:50]
+    lines = [*lines, *([cut_short(tail)] if tail and whole else [])][:50]
     print_progress(lines, label)
     return seen + len(lines)
 
 
 PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+
+
+def cut_short(line):
+    """A progress line that was cut short at a cap, before it is redacted: without the run of token characters it
+    ends in, which may be the start of a secret the cut split (too short for the redaction to know), and marked."""
+    return line.rstrip(TOKEN_CHARS) + "…"
 LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
 
 
 def log_lines(f):
-    """The lines of the binary file `f`, without their newline, each cut to LINE_CAP bytes, the rest of it read past
-    in such pieces: only "\\n" ends a line, as wc counts them, so a bare "\\r" (a progress bar) doesn't."""
+    """The lines of the binary file `f`, without their newline, each cut to LINE_CAP bytes (cut_short), the rest of
+    it read past in such pieces: only "\\n" ends a line, as wc counts them, so a bare "\\r" (a progress bar)
+    doesn't."""
     while line := f.readline(LINE_CAP):
+        cut = False
         if not line.endswith(b"\n"):  # longer than the cap, or the last line, unended
-            while (more := f.readline(LINE_CAP)) and not more.endswith(b"\n"):
-                pass
-        yield line.removesuffix(b"\n").decode("utf-8", "replace")
+            while more := f.readline(LINE_CAP):
+                cut = True
+                if more.endswith(b"\n"):
+                    break
+        text = line.removesuffix(b"\n").decode("utf-8", "replace")
+        yield cut_short(text) if cut else text
 
 
 def show_rest(path, seen, label):
@@ -638,8 +650,12 @@ def show_rest(path, seen, label):
     if not path.is_file():
         return
     with open(path, "rb") as f:
-        lines = list(itertools.islice(log_lines(f), seen + PROGRESS_REST))
-    print_progress(lines[seen:] if len(lines) >= seen else lines[:PROGRESS_REST], label)
+        it = log_lines(f)
+        if sum(1 for _ in itertools.islice(it, seen)) < seen:  # rewritten shorter: from its start
+            f.seek(0)
+            it = log_lines(f)
+        lines = list(itertools.islice(it, PROGRESS_REST))
+    print_progress(lines, label)
 
 
 def wait(out, runner_temp):

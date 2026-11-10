@@ -1113,7 +1113,12 @@ class TestEras(unittest.TestCase):
         self.assertEqual(rest(b"09:00 a 50%\r100%\n09:01 b\n09:02 c", 2), ['"09:02 c"'],
                          "a progress bar's \\r would split a line, and lines already printed would be printed again")
         self.assertEqual(rest("09:00 a\n", 5), ['"09:00 a"'], "a log rewritten shorter would print nothing")
-        self.assertEqual(len(rest("x" * 100000 + "\n09:01 b\n", 0)), 2, "one long line would swallow the next")
+        hf_token = "hf_" + "Q1w2E3r4T5y6U7i8O9p0" * 3
+        for cap, show_cut in ((gpu_review.LINE_CAP, lambda text: rest(text, 0)),
+                              (gpu_review.PROGRESS_CAP, lambda text: show(text, 0)[0])):
+            with self.subTest(cap=cap):  # a line cut at a cap, a token straddling the cut
+                cut = show_cut("sk-ant-" + "A" * (cap - 26) + " " + hf_token + "\n09:02 c\n")
+                self.assertNotIn("hf_", "".join(cut), "the start of a token the cut split would reach the log")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
         run = {"status": "failed", "failure": {"code": "launch_refused",
