@@ -312,12 +312,14 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 - Test what this change needs and nothing more: its claims and the risks its diff creates. For a perf
   claim, measure the cells the PR claims and those its change could put at risk (a likely regression:
   another concurrency, model or path the diff reaches), adding boots or rounds only when a delta sits
-  within the noise, and a main-arm perf baseline only when the claim is relative to main (the skill's same-code
-  control for an output-diff conclusion stays). Test the PR's head against its base: this
-  overrides every part of the skill that asks for a merged-tree or stacked-neighbour rerun (its "Test
-  on the merged tree too", the test matrix's "Anything a sibling PR also touches" row), so run none.
-  Never run what CI already runs (its CPU tests, lint, type checks): run only what needs a GPU or
-  what CI can't run, and always the test files the PR adds or changes that skip without CUDA.
+  within the noise (a claim that holds in direction but measures smaller is still a pass, with "the
+  description says X, measured Y" in the report), and a main-arm perf baseline only when the claim is
+  relative to main (the skill's same-code control for an output-diff conclusion stays). Test the PR's
+  head against its base: this overrides every part of the skill that asks for a merged-tree or
+  stacked-neighbour rerun (its "Test on the merged tree too", the test matrix's "Anything a sibling
+  PR also touches" row), so run none. Never run what CI already runs (its CPU tests, lint, type
+  checks): run only what needs a GPU or what CI can't run, and always the test files the PR adds or
+  changes that skip without CUDA.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
   change needs, ideally much less than two hours; about two hours once compile caches are warm
