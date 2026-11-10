@@ -1199,6 +1199,10 @@ class Qwen3OmniModel(Model):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
         return split_spans(out, self.MEDIA_SPANS, kv_layout)
 
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
+        return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
+
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
 

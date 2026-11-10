@@ -368,6 +368,8 @@ class NewRequestConductor(MessageBody):
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
     streaming: bool = False
+    # the prompt's token count, echoed on RequestComplete for the response's usage
+    prompt_tokens: int | None = None
 
 
 @dataclass
