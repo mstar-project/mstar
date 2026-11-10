@@ -38,6 +38,7 @@ from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+from mstar.model.step_audio2.constants import REF_AUDIO_REFUSAL as STEP_AUDIO2_REF_AUDIO_REFUSAL
 from mstar.model.whisper.config import WORDS_MARKER
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
@@ -275,6 +276,14 @@ def _apply_sampling(
     return mk
 
 
+def _chat_voice(req) -> str | None:
+    """A chat's voice: its ``audio.voice``, else a top-level ``voice`` (``extra_body``)."""
+    audio_cfg = getattr(req, "audio", None) or {}
+    if isinstance(audio_cfg, dict) and audio_cfg.get("voice") is not None:
+        return audio_cfg["voice"]
+    return getattr(req, "voice", None)
+
+
 class OpenAIAdapter:
     """Base adapter. A model subclasses this and implements the surfaces it
     supports; an unimplemented surface raises and the endpoint returns 404.
@@ -477,12 +486,6 @@ class Qwen3OmniAdapter(OpenAIAdapter):
     supports_speech = True
     supports_realtime = True
 
-    def _voice(self, req) -> str | None:
-        audio_cfg = getattr(req, "audio", None) or {}
-        if isinstance(audio_cfg, dict) and audio_cfg.get("voice") is not None:
-            return audio_cfg["voice"]
-        return getattr(req, "voice", None)
-
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         _refuse_unserved_chat(req, mk)
@@ -491,7 +494,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         want_audio = bool(req.modalities and "audio" in req.modalities)
         out_mods = ["text", "audio"] if want_audio else ["text"]
         _apply_sampling(req, mk, temperature_key="thinker_temperature", top_p_key="thinker_top_p")
-        voice = self._voice(req)
+        voice = _chat_voice(req)
         # is-not-None: an empty voice reaches the model, which refuses it
         if voice is not None:
             mk["voice"] = voice
@@ -517,6 +520,39 @@ class Qwen3OmniAdapter(OpenAIAdapter):
             input_modalities=["text"],
             output_modalities=["text", "audio"],
             model_kwargs=mk,
+        )
+
+
+class StepAudio2Adapter(OpenAIAdapter):
+    """Step-Audio2: speech and text chat, text out, or text and speech with
+    ``modalities: ["text", "audio"]``. The model has one sampler, so the plain keys
+    (``temperature``, ``top_p``, ``max_tokens``, ``seed``; ``top_k`` and
+    ``repetition_penalty`` via ``extra_body``) set it. ``audio.voice`` (or ``voice``) names
+    one of the deployment's voices; a ``ref_audio`` clip to clone is refused, not served yet.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        # before the attachments are saved
+        if mk.get("ref_audio"):
+            raise ValueError(STEP_AUDIO2_REF_AUDIO_REFUSAL)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        # a spoken reply also emits its text
+        want_audio = bool(req.modalities and "audio" in req.modalities)
+        _apply_sampling(req, mk)
+        voice = _chat_voice(req)
+        if voice is not None:
+            mk["voice"] = voice
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text", "audio"] if want_audio else ["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
         )
 
 
@@ -1744,6 +1780,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "fish_s2_pro": FishS2ProAdapter(),
     "cosyvoice3": CosyVoice3Adapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
+    "step_audio2": StepAudio2Adapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
     "qwen3_tts": Qwen3TTSAdapter(),

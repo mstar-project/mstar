@@ -345,6 +345,7 @@ pub struct RefAudio {
 pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("BagelAdapter", &Bagel),
     ("Qwen3OmniAdapter", &Qwen3Omni),
+    ("StepAudio2Adapter", &StepAudio2),
     ("Qwen3_5Adapter", &Qwen3_5),
     ("OrpheusAdapter", &Orpheus),
     ("Cosmos3Adapter", &Cosmos3),
