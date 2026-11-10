@@ -243,7 +243,8 @@ def test_a_request_can_turn_its_prefix_cache_off():
 
 
 @pytest.mark.parametrize("effort, glm52, glm53", [
-    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("max", "max", "max"),
+    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("xhigh", "max", "max"),
+    ("max", "max", "max"),
 ])
 def test_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
     from mstar.api_server.openai import adapters, serving_messages
