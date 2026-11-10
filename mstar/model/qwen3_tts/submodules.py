@@ -194,8 +194,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
         self._prefill_ids: dict[tuple[int, ...], torch.Tensor] = {}
-        # prefill embeddings that are the same for every request (special text
-        # tokens, the assistant role, codec tags), built once from the weights
+        # embeddings that are the same for every request (special text tokens,
+        # the assistant role, codec tags, TTS PAD), built once from the weights
         self._fixed_embeds: dict[tuple, torch.Tensor] = {}
         # zero text condition for a mixed step's prompt rows, sliced per row
         self._zero_rows: torch.Tensor | None = None
@@ -273,8 +273,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         return tensor
 
     def _fixed_embed(self, key: tuple, build: Callable[[], torch.Tensor]) -> torch.Tensor:
-        """``build()``, once per key: a prefill embedding no request changes, so
-        a prompt's prefill does not re-run its lookups and projections."""
+        """``build()``, once per key: an embedding no request changes, so a
+        step does not re-run its lookups and projections."""
         embed = self._fixed_embeds.get(key)
         if embed is None:
             embed = self._fixed_embeds[key] = build()
@@ -483,7 +483,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         # the step's own iteration, so a step prepared again feeds the same text token and counts the same frames
         step = input_metadata.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
         text = inputs[TALKER_TEXT][0]
-        text_condition = text[min(step, text.shape[0] - 1)]
+        # Past the text, every frame adds TTS PAD, the text's last row, so take the cached row instead of indexing the
+        # text on every row of every step.
+        text_condition = text[step] if step < text.shape[0] - 1 else self._fixed_embed(
+            ("pad", text.dtype), lambda: self._special_text_embeds(text.dtype)[2][0, 0],
+        )
         # ``talker_input_embeds`` is the recurrent graph edge emitted by
         # the previous frame, not a token ID that needs another lookup.
         # The text condition is added for the whole batch in

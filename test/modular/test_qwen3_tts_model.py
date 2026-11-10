@@ -921,7 +921,9 @@ def test_qwen3_tts_decode_feeds_its_iterations_text_token_however_often_it_is_pr
     config = _tiny_model_config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     hidden = config.talker.hidden_size
-    trailing, pad = torch.randn(3, hidden), torch.randn(hidden)
+    # a prefill's text ends on the TTS PAD row, as `_build_prefill` lays it out
+    pad = submodule._special_text_embeds(torch.float32)[2][0, 0]
+    trailing = torch.randn(3, hidden)
     text = torch.cat([trailing, pad[None]])
 
     def text_condition(iteration: int) -> torch.Tensor:
