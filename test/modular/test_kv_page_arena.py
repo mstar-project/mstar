@@ -191,3 +191,28 @@ def test_pages_given_back_go_out_again_first_and_in_their_order(backend):
     arena.retain(held)
     with pytest.raises(AssertionError):
         arena.give_back(held)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_change_count_moves_with_every_owner_count_and_page_list_change(backend):
+    """The KV pool keeps what moving its preemptible requests would free until this count moves. A change the
+    count missed would let the pool admit a guaranteed request against pages no move frees anymore."""
+    arena = new_page_arena(8, backend)
+    stream = arena.new_stream()
+    pages = arena.acquire(3)
+    changes = [
+        lambda: arena.acquire(1),
+        lambda: arena.retain(pages[:1]),
+        lambda: arena.release(pages[:1]),
+        lambda: arena.give_back(pages[2:]),
+        lambda: stream.extend(pages[:2]),
+        lambda: stream.assign(pages[:1]),
+        lambda: stream.__delitem__(0),
+        lambda: stream.extend(pages[:1]),
+        stream.clear,
+        stream.free,
+    ]
+    for at, change in enumerate(changes):
+        before = arena.changes
+        change()
+        assert arena.changes > before, f"change {at} left the count where it was"

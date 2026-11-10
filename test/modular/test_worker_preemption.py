@@ -303,6 +303,16 @@ def test_a_pool_where_no_move_can_take_back_lends_nothing():
     assert not _ready(kv, "g2"), "g2 was admitted against what moving o would free, which no move can"
 
 
+def test_whether_a_pool_moves_requests_cant_change_once_one_is_admitted():
+    """g's allotment lends by whether the pool moves requests. Changing that after g was admitted left the count of
+    what guaranteed requests lend at the old answer."""
+    kv = _pool()
+    _running(kv, "g", 1, arrival=0, guaranteed=True)
+
+    with pytest.raises(AssertionError, match="whether the worker moves requests changed after guaranteed"):
+        kv.moves = False
+
+
 def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
         kv, w = _preempting("nothing to drop")
