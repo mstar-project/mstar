@@ -386,9 +386,7 @@ class MiniCPMOModel(Model):
             AttentionSpec(resource_key=TTS_ATTN, nodes={TTS}, config=AttentionConfig(kv_cache=TTS_KV)),
             PositionSpec(
                 resource_key=TTS_POS, nodes={TTS},
-                # a TTS step is a few small kernels a layer: fused RoPE saved 5-10% of its
-                # GPU time per step (4e880c21d1: 1 x H100, TTS alone), not re-measured since
-                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta, fused=True),
+                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta),
             ),
             # upstream's TTS sampling (see TTSSubmodule)
             SamplerSpec(
