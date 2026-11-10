@@ -173,7 +173,8 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
 @pytest.mark.parametrize("failure", ["compile", "refused draw"])
 def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
     """A grammar that fails to compile, or a draw it refuses, is the request's
-    error at its next admit, not a reply that silently stops following it."""
+    error at its next admit, not a reply that silently stops following it: past
+    a refused draw the row may only stop."""
     res = _resource(graph=True)
     lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
     step = SamplerStep(apply_penalty=False)
@@ -188,6 +189,9 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
         res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"x"))
         res.commit(step, ctx)
         res.plan(step, ctx)
+        logits = torch.zeros(4, V)
+        logits[:, VOCAB.index(b"x")] = 1.0
+        assert res.sample([0], logits)[0].item() == EOS, "the reply went on past its grammar"
     ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
     outcome = res.admit(step, ctx)
     assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}

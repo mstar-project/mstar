@@ -230,6 +230,11 @@ class GrammarRows:
             self.info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=size, stop_token_ids=stop)
         self.vocab_size = size
         self.words = math.ceil(size / 32)
+        # the mask of a row whose grammar failed, until its request fails: only a stop
+        bits = torch.zeros(self.words * 32, dtype=torch.int64)
+        bits[stop] = 1
+        words = (bits.view(-1, 32) << torch.arange(32)).sum(-1)
+        self._stops = torch.where(words >= 1 << 31, words - (1 << 32), words).to(torch.int32) if stop else None
         # sized by the CPUs this worker may use, which xgrammar's own "auto" doesn't read
         cpus = usable_cpus()
         self._compiler = xgr.GrammarCompiler(self.info, max_threads=min(8, cpus), cache_limit_bytes=cache_bytes)
@@ -292,7 +297,7 @@ class GrammarRows:
 
     def fill(self, rids) -> torch.Tensor:
         """The host bitmask for a step's rows, after accepting every draw so far:
-        all ones for a free row."""
+        all ones for a free row, and only the stop ids for a failed one."""
         self._accept_pending()
         if len(set(rids)) != len(rids):
             raise ValueError("a constrained request has two rows in one step (speculative decoding is not served)")
@@ -300,8 +305,14 @@ class GrammarRows:
         matchers, index = [], []
         for i, rid in enumerate(rids):
             row = self._rows.get(rid)
-            if row is not None and row.constrained:
-                matchers.append(row.matcher)
+            if row is None:
+                continue
+            matcher = row.matcher
+            if matcher is None:
+                if self._stops is not None:
+                    mask[i] = self._stops
+            elif not matcher.is_terminated():
+                matchers.append(matcher)
                 index.append(i)
         if len(matchers) == 1:
             matchers[0].fill_next_token_bitmask(mask, index[0])
