@@ -85,6 +85,8 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
+    host_allowance: StepAllowance | None = None
 
     @property
     def head_shards(self) -> int:
@@ -116,6 +118,24 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+@dataclass
+class CachedLease:
+    """Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its ``pages``, and the
+    ones it ``lent``, which another request holds and so take no room."""
+    pages: list[int]
+    lent: list[int]
+
+
+@dataclass
+class CachedSnapshot:
+    """Rank 0's lease of the recurrent state under a stream's cached prefix, which a TP follower takes as given:
+    the snapshot ``slot`` (-1 where none fits), the ``tokens`` it restores and the KV cache's ``hit`` it was cut
+    from."""
+    slot: int
+    tokens: int
+    hit: int
+
+
 class Residency(IntEnum):
     """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
     from its ids. Ordered by how far the state is from the device."""
@@ -125,10 +145,36 @@ class Residency(IntEnum):
 
 
 class Rebuild(NamedTuple):
-    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
-    The last id is the one the next decode step reads."""
-    walk: str
-    ids: Sequence[int]
+    """What a dropped request's rebuild writes past its layout: the ids it ``sampled`` since the layout was laid out,
+    but the newest, which the next decode step reads."""
+    sampled: Sequence[int]
+
+
+# What a step may queue for the host. The device has one device-to-host copy engine, which runs copies in the order
+# they were queued whatever their stream or priority, and the copies queue behind the step's own output copy. This
+# bounds how long a step's copies to the host hold the copy engine before the next step's output copy can run (about
+# 1 ms on an H100).
+_WRITE_BYTES_PER_STEP = 32 << 20
+
+
+class StepAllowance:
+    """What a step may still queue for the host once its outputs are sent, shared by every copy to the host on the
+    device: the worker's host copies for rebuilds first, then each pool's cached pages. The engine refills it once
+    the pools have taken theirs, and the worker refills it for its host copies on a pass of its loop that runs no
+    step, once its last copy has landed."""
+
+    def __init__(self, nbytes: int = _WRITE_BYTES_PER_STEP) -> None:
+        self._per_step = nbytes
+        self.left = nbytes
+
+    def spend(self, nbytes: int) -> int:
+        """Take up to ``nbytes`` of what is left, and return how many were taken."""
+        taken = min(nbytes, self.left)
+        self.left -= taken
+        return taken
+
+    def refill(self) -> None:
+        self.left = self._per_step
 
 
 class KeyedWalks(NamedTuple):
@@ -136,6 +182,21 @@ class KeyedWalks(NamedTuple):
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
     writes: tuple[str, ...]
     growth: tuple[str, ...] = ()
+
+
+class MoveKind(IntEnum):
+    """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
+    OFFLOAD = 0
+    RELOAD = 1
+    RESERVE = 2
+    UNRESERVE = 3
+    EARMARK = 4
+    DROP = 5
+    LAND = 6
+    GUARANTEE = 7
+    ALLOT = 8
+    WAIT = 9
+    FORGET = 10
 
 
 class Resource(ResidentHooks, ABC):
@@ -261,15 +322,17 @@ class Resource(ResidentHooks, ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> CachedLease | CachedSnapshot | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, or None."""
+        return the lease, or None."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease | CachedSnapshot, caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        """On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and
         raises if it still lacks them once ``caught_up``."""
         return True
 
@@ -277,9 +340,10 @@ class Resource(ResidentHooks, ABC):
         """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
         return
 
-    def page_trail(self) -> tuple[int, int] | None:
-        """How many page allocations this resource has made and a hash of their pages in
-        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+    def page_trail(self) -> tuple[int, ...] | None:
+        """What a TP follower checks against rank 0's before each step, such as how many page
+        allocations this resource has made and a hash of their pages in order. None where it
+        keeps no trail."""
         return None
 
     @classmethod
@@ -344,6 +408,19 @@ class Resource(ResidentHooks, ABC):
         """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
         against for `grew_since`."""
         return None
+
+    def reserve_past(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+    ) -> object | None:
+        """`reserve` for ``rid`` ahead of an earlier request that can't start: take what ``rid`` asked for, or
+        return a mark. When this resource refused that request and hasn't grown since, it leaves that request what
+        it needs. The runner calls it only while ``rid`` passes, or takes nothing, at the resource that refused that
+        request, or whose queue the oldest request holds back while it waits to return. The base refuses, so a
+        resource that doesn't override it admits in order.
+
+        A resource that overrides it asks nothing more of a waiting request (`ask` returns None) only once `reserve`
+        would take nothing for it, and the request may then start wherever it stands in this resource's queue."""
+        return 0
 
     def unreserve(self, rid: str) -> None:
         """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
@@ -515,9 +592,9 @@ class Resource(ResidentHooks, ABC):
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
 
-    def check_drop(self, rid: str, tokens: int) -> None:
-        """Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""
-        return
+    def check_drop(self, rid: str, tokens: int) -> str | None:
+        """Why ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens, or None. Changes nothing."""
+        return None
 
     def drop(self, rid: str, tokens: int) -> int:
         """Discard the request's state that can be recomputed from the ``tokens``
@@ -529,11 +606,17 @@ class Resource(ResidentHooks, ABC):
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's rebuild has run its last chunk."""
+        """The dropped request's rebuild has run its last chunk, and that chunk's commit has run, so the resource
+        holds everything the rebuild wrote."""
         return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def can_offload(self, rid: str) -> bool:
+        """Whether the request may be moved off the device to free room. If this is False, the request is no
+        eviction candidate however much it holds."""
         return True
 
     def can_reload(self, rid: str) -> bool:

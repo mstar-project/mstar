@@ -29,7 +29,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Rebuild, Residency, Resource
+from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Rebuild, Residency, Resource, StepAllowance
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     AuxPlanes,
@@ -131,6 +131,7 @@ __all__ = [
     "SamplingReqConfig",
     "Segment",
     "SlotLease",
+    "StepAllowance",
     "StepContext",
     "StepRunner",
     "SubmoduleStep",

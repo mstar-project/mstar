@@ -111,6 +111,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_8_27b``
      - ``Qwen/Qwen3.8-27B``
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
+   * - ``minicpm_o`` *(Beta)*
+     - ``openbmb/MiniCPM-o-4_5``
+     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
+       resampler and a Whisper-medium encoder. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -263,7 +267,9 @@ Notes
   model's config. BAGEL and Orpheus are the exception: their files are the
   backbone's chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
   ``do_sample: false`` is read and the recipes stay (BAGEL temperature 0.6,
-  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8).
+  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8). MiniCPM-o keeps
+  upstream ``chat``'s recipe over its file (temperature 0.7, top_p 0.8, top_k
+  100, repetition_penalty 1.02).
 - Qwen3-Omni's Talker cap comes from ``talker_max_new_tokens``, 4096 on the
   released checkpoint (it was 2048). Plain sampling keys target the Thinker, except
   on ``/v1/audio/speech``, where ``temperature`` and ``top_p`` set the Talker;
@@ -389,7 +395,7 @@ Higgs Audio notes
 - The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
   cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
-  embeddings go into the KV cache as one span.
+  embeddings go into the KV cache as three spans.
 - Decode keeps each request's last token in the sampler's slot master and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
@@ -577,8 +583,9 @@ GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
 - GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
   ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
   ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
-  so ``max_tokens`` above 2048 is a 400 rather than being shortened; under MTP, a
-  ``max_tokens`` past the room the prompt leaves is refused too.
+  unless ``dsa_long_context`` serves up to ``max_seq_len``. A ``max_tokens`` past the window
+  is a 400 rather than being shortened; under MTP, a ``max_tokens`` past the room the
+  prompt leaves is refused too.
 
 Muse Glimmer (``muse_glimmer``)
 -------------------------------
@@ -982,8 +989,8 @@ GLM-5.3-Flash on 4x H200 (1024 in, 256 out) gains 53%, 38%, 21% and 15% output t
 32 and 64 concurrent requests; GLM-5.2 on 8x H200 (1024 in, 512 out) 47%, 36%, 26% and 26%.
 The drafts are verified greedily, so on a deployment with MTP a request that sets no
 ``temperature`` runs greedy, and one with a ``temperature`` above 0 or a
-``repetition_penalty`` other than 1 is a 400. That holds until sampled MTP lands (#406) or
-sampled rows fall back to plain decode per request. A GLM-5.3 verify step books its whole
+``repetition_penalty`` other than 1 is a 400: MTP serves no sampled request, so a workload
+that samples needs a deployment without this override. A GLM-5.3 verify step books its whole
 block of k + 1 cache rows, so its pool is four times the plain one; GLM-5.2 overwrites its
 rejected rows and needs one more page a request:
 
@@ -1047,7 +1054,7 @@ GLM-5.2 serves 256k (the model's own window is 1M; the pool is what 141 GB GPUs 
      dsa_long_context: true
      max_seq_len: 262144
      # rows per trunk pass of a long prefill, which bounds its activations
-     prefill_chunk_tokens: 8192
+     prefill_window_tokens: 8192
      dsa_shard_prefill: true
    resources:
      kv:
@@ -1062,10 +1069,10 @@ GLM-5.2 serves 256k (the model's own window is 1M; the pool is what 141 GB GPUs 
      - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
      - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
 
-With long context the pool holds about one full window and cannot evict or preempt (the
-index planes rule out ``cpu_offload_pages``): once the live contexts outgrow it, the requests
-that need a page wait until one finishes, times out or is cancelled, and when every decoding
-request needs one, decode stops until the first times out. With MTP, a GLM-5.3 verify step
+With long context the pool holds about one full window and cannot evict or preempt: the
+index planes rule out ``cpu_offload_pages`` and the GLMs declare no rebuild policy. So each
+request reserves its whole footprint, its prompt and ``max_tokens``, when it is admitted, and
+waits in the queue until that fits (see :doc:`serving`). With MTP, a GLM-5.3 verify step
 books k + 1 rows of the window, so ``max_tokens`` may be at most a quarter of what the prompt
 leaves.
 ``python -m benchmark.glm.longctx_probe`` measures decode speed and passkey retrieval by

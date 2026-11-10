@@ -219,8 +219,10 @@ class LabelLayout(NamedTuple):
 
     ``spans`` are the committed writes known at intake, in walk order. Each
     ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
-    loop. ``scratch`` is the most one non-committing step writes past the
-    committed length, and ``retention`` the policy the label's committing steps declare.
+    loop, and ``max_growth``, when set, is the most slots ``growth`` writes in all,
+    for loops that end before their caps. ``scratch`` is the most one
+    non-committing step writes past the committed length, and ``retention`` the
+    policy the label's committing steps declare.
     """
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
@@ -228,6 +230,7 @@ class LabelLayout(NamedTuple):
     retention: RetentionPolicy | None = None
     # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
+    max_growth: int | None = None
 
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
@@ -235,7 +238,7 @@ class LabelLayout(NamedTuple):
         return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
-        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        """The layout as ``[spans, growth, scratch, retention, keyed spans, max growth]``, a span as
         ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
         keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
         preprocess worker keys the span."""
@@ -263,6 +266,7 @@ class LabelLayout(NamedTuple):
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
+            self.max_growth,
         ]
 
 
@@ -638,6 +642,10 @@ class Model(ABC):
     ENGINE_KWARGS: tuple[str, ...] = (
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
     )
+    # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
+    # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
+    # overrides it.
+    UNPAUSABLE_OUTPUTS: frozenset[str] = frozenset({"audio"})
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -1033,6 +1041,14 @@ class Model(ABC):
         """
         pass
 
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        """A response's ``usage.prompt_tokens``: the positions the prompt fills,
+        attachments included, as OpenAI and vLLM count them. ``tensors`` and
+        ``kv_layout`` are what `process_prompt` returned. By default the ids in
+        ``text_inputs``, which hold each attachment's pads in place; a model
+        that splits ``text_inputs`` around its attachments adds theirs."""
+        return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before
@@ -1112,8 +1128,7 @@ class Model(ABC):
     def text_output(self) -> TextOutput | None:
         """How this model's text output, token ids, becomes bytes, or None for a
         model that encodes text in its own ``postprocess``. ``postprocess`` and
-        ``postprocess_inline`` derive their text paths from it, and the data
-        worker reads its stop ids, once, to tell the API why a reply ended."""
+        ``postprocess_inline`` derive their text paths from it."""
         return None
 
     _text_detokenizer: TextChunkDetokenizer | None = None

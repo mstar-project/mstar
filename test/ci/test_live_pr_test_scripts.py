@@ -9,6 +9,7 @@ import itertools
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -18,7 +19,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / ".claude/skills/live-pr-test/scripts"
-GPU = runpy.run_path(str(SCRIPTS / "gpu.py"))
+sys.path.insert(0, str(SCRIPTS))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 HEALTH = runpy.run_path(str(SCRIPTS / "gpu_health.py"))
 CFG = {"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_total_usd": 100}, "ssh_public_key": "/dev/null",
        "runpod": {"image": "img", "hf_home": "/workspace/hf"}}
@@ -46,7 +50,7 @@ class Reply:
 
 class TestGpu(unittest.TestCase):
     def setUp(self):
-        self.g = GPU["http"].__globals__
+        self.g = GPU
         saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer",
                                         "eras")}
         self.addCleanup(self.g.update, saved)
@@ -290,6 +294,25 @@ class TestBootstrap(unittest.TestCase):
                                env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
+
+    def test_a_cache_refresh_starts_from_an_empty_compile_directory(self):
+        for flags, restored in (([], True), (["--no-restore"], False)):
+            home = Path(tempfile.mkdtemp())
+            fake = home / "bin"
+            fake.mkdir()
+            for tool in ("git", "uv", "cargo", "curl", "nvidia-smi"):  # nothing is installed or fetched
+                (fake / tool).write_text("#!/bin/sh\nexit 1\n")
+                (fake / tool).chmod(0o755)
+            (home / "seed/compile").mkdir(parents=True)
+            (home / "seed/compile/old").write_text("")
+            (home / "vol/live-pr-compile-cache").mkdir(parents=True)
+            tarball = home / "vol/live-pr-compile-cache/smunknown.tar"
+            subprocess.run(["tar", "-C", str(home / "seed"), "-cf", str(tarball), "compile"], check=True)
+            subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), "1", *flags, "--workdir", f"{home}/w", "--hf-home",
+                            f"{home}/vol/hf"], capture_output=True, check=False,
+                           env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+            self.assertEqual((home / ".cache/compile/old").exists(), restored,
+                             "a refresh would keep kernels for mains and torches no box runs any more")
 
     def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
         home = Path(tempfile.mkdtemp())

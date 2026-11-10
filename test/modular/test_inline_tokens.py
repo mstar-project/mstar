@@ -201,7 +201,7 @@ def test_turn_tokens_stamp_read_text_and_audio_with_their_step():
     worker.tensor_uuid_to_metadata_per_request = {"req": {"t": {}, "a": {}}}
     assert worker._process_read_tensors() is True
     text, audio = worker.out_queue.get_nowait(), worker.out_queue.get_nowait()
-    assert text.metadata == {"step": 3, "turn": ["start"], "tokens": 1}
+    assert text.metadata == {"step": 3, "turn": ["start"]}
     assert audio.modality == "audio" and audio.metadata["step"] == 5
 
 
@@ -231,8 +231,7 @@ def test_inline_logprobs_land_in_their_chunks_metadata():
     worker._draining_rids.add("gone")
     worker.result_tensor_queue.put(InlineTokens(["gone", "req", "quiet"], [1, 11, 12], "text", [-0.1, -0.5, None]))
     chunks = {c.request_id: c.metadata for c in _run_until(worker, stop, 2)}
-    # every text chunk also carries its usage (#397)
-    assert chunks == {"req": {"logprobs": [-0.5], "tokens": 1}, "quiet": {"tokens": 1}}
+    assert chunks == {"req": {"logprobs": [-0.5]}, "quiet": {}}
 
 
 def test_a_request_that_asks_gets_each_text_chunks_token_ids():
@@ -240,8 +239,8 @@ def test_a_request_that_asks_gets_each_text_chunks_token_ids():
     worker.request_model_kwargs = {"req": {"return_token_ids": True}}
     worker.result_tensor_queue.put(InlineTokens(["req", "other"], [11, 12], "text", [-0.5, None]))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
-    assert chunks["req"].metadata == {"logprobs": [-0.5], "token_ids": [11], "tokens": 1}
-    assert chunks["other"].metadata == {"tokens": 1}
+    assert chunks["req"].metadata == {"logprobs": [-0.5], "token_ids": [11]}
+    assert chunks["other"].metadata == {}
     # a tensor chunk's ids too, and nothing on another modality or a float text tensor (Whisper's alignment)
     ids = torch.tensor([[5, 151645]])
     assert worker._with_token_ids("req", "text", ids, {}) == {"token_ids": [5, 151645]}

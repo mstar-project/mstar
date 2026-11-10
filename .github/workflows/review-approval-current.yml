@@ -1,0 +1,51 @@
+name: Review bot approval current
+
+# A bot approval counts only for the commit it reviewed. A required check on `main`, it runs no model and no PR code:
+# on a pull request it passes at once (a required check must report there too); in the merge queue, main's copy of
+# bot.py reads the queued PR's reviews and fails unless a person's latest review stands APPROVED or the bot's latest
+# approval is on the PR's current head (bot.py, approval_current). Any read error fails it. It reads the head when the
+# PR enters the queue: GitHub takes a PR out of the queue on a push, so a push after that can't ride on this check.
+#
+# A PR that edits this file runs its own copy in the merge queue. That is accepted: the bot approves only a PR whose
+# author and requester have write access and whose branch is on this repository or on a write-access owner's fork, and
+# everyone who can push to that branch (write-access members, or people that fork's owner lets push) is trusted not to
+# defeat this check. It guards against a bot approval carrying an unreviewed later push, not against them.
+
+on:
+  pull_request:
+  merge_group:
+
+permissions: {}
+
+jobs:
+  check:
+    name: review-bot-approval-current
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Pass on a pull request
+        if: github.event_name == 'pull_request'
+        run: exit 0
+
+      # Trusted: main's scripts, never the merge branch's, which has the PR's bot.py.
+      - name: Check out main's scripts
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/review
+          persist-credentials: false
+
+      - name: Check the approval is for the current commit
+        if: github.event_name == 'merge_group'
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          # When set, only the app's login counts as the bot (render_summary.BOTS).
+          REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
+        run: python3 .github/review/bot.py approval_current

@@ -23,6 +23,7 @@ import pytest
 
 pytest.importorskip("mstar_rust")
 
+from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.rust_frontend import (
     OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
@@ -40,15 +41,20 @@ pytestmark = pytest.mark.skipif(
     BINARY is None, reason="mstar-server binary not built")
 
 
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality = modality
-        self.data = data
-        self.metadata = metadata or {}
+class _Chunk(ResultChunk):
+    """A result chunk, its request's id left out."""
+
+    def __init__(self, modality, data, metadata=None, **fields):
+        super().__init__(request_id="r", modality=modality, data=data, metadata=metadata or {}, **fields)
+
+
+# what the data plane ends a ``report_usage`` submission with
+_USAGE = {"prompt_tokens": 3, "completion_tokens": 2, "finish_reason": "length"}
 
 
 class _StubAPIServer:
-    """Scripted data plane: echoes the prompt back in two text chunks."""
+    """Scripted data plane: echoes the prompt back in two text chunks, and a
+    ``usage`` chunk when the submission asked for one."""
 
     def __init__(self):
         self.submitted = []
@@ -62,7 +68,7 @@ class _StubAPIServer:
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
                        model_kwargs=None, prompt_parts=None, streaming=True,
-                       request_id=None):
+                       request_id=None, report_usage=False):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.texts[request_id] = text
@@ -70,7 +76,7 @@ class _StubAPIServer:
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
             "mk": model_kwargs, "files": file_paths, "parts": prompt_parts,
-            "streaming": streaming,
+            "streaming": streaming, "report_usage": report_usage,
         })
         return request_id
 
@@ -82,9 +88,11 @@ class _StubAPIServer:
             sink, tag = self.sinks[request_id]
             sink.relay([tag, tag, tag], [_Chunk("text", b) for b in (b"caf\xc3", b"\xa9 ", b"\xf0\x9f")])
             yield _Chunk("text", b"\x99\x82")
-            return
-        yield _Chunk("text", b"Hello ")
-        yield _Chunk("text", b"world")
+        else:
+            yield _Chunk("text", b"Hello ")
+            yield _Chunk("text", b"world")
+        if any(s["rid"] == request_id and s["report_usage"] for s in self.submitted):
+            yield _Chunk("usage", b"", _USAGE)
 
     def relay_chunks_to(self, key, sink, tag):
         self.sinks[key] = (sink, tag)
@@ -166,6 +174,28 @@ def test_chat_roundtrip(stack):
     (sub,) = stub.submitted
     assert "Say hello." in sub["text"]
     assert sub["out"] == ["text"]
+
+
+def test_a_chat_reports_the_data_planes_usage_and_finish_reason(stack):
+    """A chat asks the bridge for usage; its reply carries it, and so does a
+    stream that sets ``stream_options.include_usage``. ``/generate`` asks for none."""
+    port, stub, _bridge, _proc = stack
+    out = _chat(port, "Say hello.")
+    assert out["choices"][0]["finish_reason"] == "length"
+    assert out["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    body = {"model": "qwen3_omni", "stream": True, "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "Say hello."}]}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        events = [json.loads(ln[6:]) for ln in r.read().decode().splitlines() if ln.startswith("data: {")]
+    assert "".join(e["choices"][0]["delta"].get("content", "") for e in events[:-1]) == "Hello world"
+    assert events[-2]["choices"][0]["finish_reason"] == "length"
+    assert events[-1]["choices"] == [] and events[-1]["usage"]["total_tokens"] == 5
+    _generate(port, urlencoded=True)
+    assert [s["report_usage"] for s in stub.submitted] == [True, True, False]
+    assert all(s["mk"].get("stream_options") is None for s in stub.submitted), "stream_options leaked into model_kwargs"
 
 
 def test_batched_chunks_and_split_characters_reach_the_client(stack):

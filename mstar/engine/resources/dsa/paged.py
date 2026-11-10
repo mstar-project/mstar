@@ -21,14 +21,21 @@ from __future__ import annotations
 import bisect
 import dataclasses
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.config import INDEX_PLANES
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig
 
-# Bytes of fp32 prefill scores per launch: a chunk of rows is as wide as its last row's pools.
-PREFILL_SCORE_BYTES = 256 << 20
+
+class DSASpan(NamedTuple):
+    """One request's rows of a step: ``rows`` of them from row ``start``, for request
+    ``request`` of the step's."""
+
+    start: int
+    rows: int
+    request: int
 
 
 @dataclass
@@ -37,8 +44,8 @@ class DSAContext:
 
     Device, per step row: ``pos`` its position (keys it sees are ``[0, pos]``), ``row_req`` its
     request. Per request: ``page_start`` its first entry in ``pages``, the flat page list of
-    the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` ((first row,
-    rows, request) per request, in row order) and ``host_page_start``. ``max_pools`` is the
+    the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` (each
+    request's ``DSASpan``, in row order) and ``host_page_start``. ``max_pools`` is the
     score width (the step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the
     graph slot's plan, or the eager one the first layer builds through ``eager``.
 
@@ -53,7 +60,7 @@ class DSAContext:
     pages: torch.Tensor
     page_start: torch.Tensor
     host_pos: list[int] | None
-    spans: list[tuple[int, int, int]] | None
+    spans: list[DSASpan] | None
     host_page_start: list[int] | None
     max_pools: int
     page_size: int
@@ -107,7 +114,7 @@ class DSAContext:
         for r0, n, req in self.spans:
             a, b = max(r0, c0), min(r0 + n, c1)
             if a < b:
-                spans.append((a - c0, b - a, req))
+                spans.append(DSASpan(a - c0, b - a, req))
         return self._subset(slice(c0, c1), self.host_pos[c0:c1], spans)
 
     def pick(self, rows: list[int]) -> DSAContext:
@@ -117,9 +124,9 @@ class DSAContext:
         req = [self.spans[bisect.bisect_right(starts, r) - 1][2] for r in rows]
         idx = torch.tensor(rows, device=self.pos.device)
         return self._subset(idx, [self.host_pos[r] for r in rows],
-                            [(i, 1, q) for i, q in enumerate(req)])
+                            [DSASpan(i, 1, q) for i, q in enumerate(req)])
 
-    def _subset(self, idx, host_pos: list[int], spans: list[tuple[int, int, int]]) -> DSAContext:
+    def _subset(self, idx, host_pos: list[int], spans: list[DSASpan]) -> DSAContext:
         return dataclasses.replace(
             self, pos=self.pos[idx], row_req=self.row_req[idx], host_pos=host_pos, spans=spans,
             max_pools=max(1, (max(host_pos) + 1) // self.kpool), needs_selection=True,
@@ -206,14 +213,17 @@ def _pool_keys_torch(view: torch.Tensor, ctx: DSAContext, ape: torch.Tensor,
 # -- selection ---------------------------------------------------------------------------------
 
 def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
-           ctx: DSAContext, group=None, keep_pools: bool = False) -> torch.Tensor:
+           ctx: DSAContext, group=None, keep_pools: bool = False, *,
+           score_bytes: int = DSAConfig.prefill_score_bytes,
+           shard_min_rows: int = DSAConfig.shard_min_rows) -> torch.Tensor:
     """``[rows, width]`` int32 MLA-cache slots each row attends: the tokens of its top ``topk /
     kpool`` pools, then its tail; entries past ``attn_lens`` are unused. ``q (rows, NH, D)``,
     ``w (rows, NH)`` fp32 with the scales folded in, ``view`` the layer's index plane
     (``kv.aux_view(INDEX_PLANES, plane)``). Single-row spans (decode) score in one launch,
     longer spans (prefill) in chunks of one request's rows; a TP ``group`` splits a prefill's
     rows across ranks (``sparse_mla.select_rows``). ``keep_pools``: one-launch rows leave
-    their top pools in ``ctx.last_pools`` (None on the other paths)."""
+    their top pools in ``ctx.last_pools`` (None on the other paths). ``score_bytes`` and
+    ``shard_min_rows`` are the resource's ``DSAConfig`` sizing."""
     if ctx.decode_rows or ctx.spans is None or all(n == 1 for _, n, _ in ctx.spans):
         scores = _decode_scores(q, w, view, ctx, ctx.pos, ctx.row_req, max(ctx.max_pools, 1))
         if not keep_pools:
@@ -233,8 +243,9 @@ def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
     for r0, n, req in ctx.spans:
         if n > 1:
             out[r0:r0 + n] = sparse_mla.select_rows(
-                lambda a, b, req=req: _select_rows(q, w, view, ctx, req, a, b),
-                r0, r0 + n, ctx.width, q.device, group, _request_pages(ctx, req))
+                lambda a, b, req=req: _select_rows(q, w, view, ctx, req, a, b, score_bytes),
+                r0, r0 + n, ctx.width, q.device, group, _request_pages(ctx, req),
+                min_rows=shard_min_rows)
     return out
 
 
@@ -244,12 +255,12 @@ def _request_pages(ctx: DSAContext, req: int) -> sparse_mla.RequestPages:
     return sparse_mla.RequestPages(ctx.pages[starts[req]:end], ctx.page_size)
 
 
-def _select_rows(q, w, view, ctx, req, r0, r1):
+def _select_rows(q, w, view, ctx, req, r0, r1, score_bytes):
     """Rows ``[r0, r1)`` of request ``req``'s prefill, in chunks as wide as their last row's
-    pools and at most ``PREFILL_SCORE_BYTES`` of scores."""
+    pools and at most ``score_bytes`` of fp32 scores."""
     out = torch.empty(r1 - r0, ctx.width, dtype=torch.int32, device=q.device)
     last = ctx.host_pos[r1 - 1]
-    chunk = max(1, PREFILL_SCORE_BYTES // (4 * max(1, (last + 1) // ctx.kpool)))
+    chunk = max(1, score_bytes // (4 * max(1, (last + 1) // ctx.kpool)))
     for c0 in range(r0, r1, chunk):
         c1 = min(c0 + chunk, r1)
         pools = max(1, (ctx.host_pos[c1 - 1] + 1) // ctx.kpool)  # causal: the last row's
@@ -365,16 +376,15 @@ def expand_slots(pool_first: torch.Tensor, ctx: DSAContext, rows=slice(None)) ->
 def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,
                   slots: torch.Tensor, ctx: DSAContext, sm_scale: float) -> torch.Tensor:
     """Absorbed MLA of each row over its slots: ``[rows, heads, kv_lora_rank]``. ``latent`` is
-    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``."""
+    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``. An eager step on the
+    kernel plans through ``ctx.eager``, the resource's reused plans."""
     if not sparse_mla.uses_kernel(q_nope, latent):
         lens = ctx.attn_lens() if ctx.host_pos is not None else attn_lens(
             ctx.pos.tolist(), ctx.topk, ctx.kpool)
         return sparse_mla.reference(q_nope, q_pe, latent, slots, lens, sm_scale)
     if ctx.sparse_plan is None:  # eager: every layer of the forward shares one plan
-        args = (ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
-                sm_scale)
-        ctx.sparse_plan = (ctx.eager.plan(*args) if ctx.eager is not None
-                           else sparse_mla.EagerSparsePlan(*args, q_nope.device))
+        ctx.sparse_plan = ctx.eager.plan(ctx.attn_lens(), ctx.width, q_nope.shape[1],
+                                         q_nope.shape[-1], q_pe.shape[-1], sm_scale)
     if ctx.valid is not None:
         return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots, ctx.valid, ctx.pad_slot)
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)

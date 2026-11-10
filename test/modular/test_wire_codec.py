@@ -20,6 +20,7 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultTensors
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.base import CachedLease, CachedSnapshot
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -28,7 +29,9 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     FailRequests,
     InputSignals,
+    MoveKind,
     NewRequest,
+    OffloadDelta,
     ScheduleTPNode,
     StopLoops,
     WorkerGraphsDone,
@@ -168,6 +171,32 @@ def test_polymorphic_body_dispatch():
         got = roundtrip(WorkerMessage(message_type=mtype, body=body))
         assert type(got.body) is type(body)
         assert got.message_type is mtype
+
+
+def test_rank_0s_moves_round_trip_typed():
+    delta = OffloadDelta.new()
+    delta.add(MoveKind.EARMARK, "r", "kv", 1, ["v"])
+    delta.add(MoveKind.DROP, "v", count=8, node="llm")
+    body = ScheduleTPNode("llm", "decode", ["r", "w"], spec_seq=3, resident_delta=delta)
+
+    got = roundtrip(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=body)).body
+
+    assert got.resident_delta == delta, "a follower would replay other moves"
+    assert type(got.resident_delta.kinds[0]) is MoveKind, "the kinds came back untyped"
+
+
+def test_rank_0s_leases_and_page_trails_round_trip_typed():
+    body = ScheduleTPNode(
+        "llm", "decode", ["r"],
+        prefix_hits={"r": {"kv": CachedLease([4, 5, 6], [4]), "state": CachedSnapshot(7, 128, 192)}},
+        page_trails={"kv": (3, 17, 2, 0, 1)},
+    )
+
+    got = roundtrip(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=body)).body
+
+    assert got.prefix_hits == body.prefix_hits, "a follower would take another lease than rank 0's"
+    assert type(got.prefix_hits["r"]["state"]) is CachedSnapshot, "the snapshot lease came back untyped"
+    assert got.page_trails == body.page_trails, "a follower would check another trail than rank 0's"
 
 
 def test_unregistered_payloads_still_round_trip():

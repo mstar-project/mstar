@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 import torch
 
-from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
@@ -28,7 +27,6 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.dsa.config import INDEX_PLANES
-from mstar.engine.resources.dsa.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
@@ -47,14 +45,13 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import PromptPart, render_chat_template
+from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
-    ByteIdDetokenizer,
-    ByteLevelDetokenizer,
-    TextOutput,
+    ByteLevelTextOutput,
     capture_ladder,
     load_snapshot_tokenizer,
+    long_context_kwargs,
     read_fp8_block_quant_config,
     resolve_checkpoint,
 )
@@ -78,7 +75,7 @@ QUANT_METHODS = ("fp8",)
 DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
 
-class Glm52Model(Model):
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
     DECODE_LOOP = "decode_loop"
@@ -111,20 +108,7 @@ class Glm52Model(Model):
         if "num_hidden_layers" in kwargs:
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
-        long_only = sorted(k for k in ("max_seq_len", "prefill_chunk_tokens", "dsa_shard_prefill")
-                           if k in kwargs)
-        if long_only and not kwargs.get("dsa_long_context", False):
-            # they size and split the long-context path only; without it they would be dropped
-            raise ValueError(f"{long_only} apply only with dsa_long_context")
-        for key in ("dsa_long_context", "dsa_shard_prefill"):
-            # bool("false") is True
-            if key in kwargs and not isinstance(kwargs[key], bool):
-                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
-        for key in ("max_seq_len", "prefill_chunk_tokens"):
-            # int() would take True as 1 and 2.5 as 2
-            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
-                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
-        if kwargs.get("dsa_long_context", False):
+        if long_context_kwargs(kwargs):
             # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
@@ -133,10 +117,9 @@ class Glm52Model(Model):
                     "dsa_long_context requires mla_absorb: the sparse path "
                     "gathers selected latents from the paged MLA cache"
                 )
-            check_flashinfer()
             self.config.dsa_long_context = True
-            if "prefill_chunk_tokens" in kwargs:
-                self.config.prefill_chunk_tokens = int(kwargs["prefill_chunk_tokens"])
+            if "prefill_window_tokens" in kwargs:
+                self.config.prefill_window_tokens = int(kwargs["prefill_window_tokens"])
             self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
@@ -288,7 +271,7 @@ class Glm52Model(Model):
                 resource_key=DSA_RESOURCE, nodes=nodes,
                 config=DSAConfig(
                     kv_cache=KV_RESOURCE, topk=self.config.index_topk,
-                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True,
+                    sm_scale=self.config.softmax_scale, dense_below_topk=True,
                     index_head_dim=self.config.index_head_dim),
             ))
         return specs
@@ -383,21 +366,13 @@ class Glm52Model(Model):
                     f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
                 )
         if self._tokenizer_mode == "byte":
-            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO;
+            # the reply prefix (a forced tool call) follows the prompt
             vocab = self.config.vocab_size
-            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
+            text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
+            input_ids = torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
         else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
-        if prefix := kwargs.get("reply_prefix"):
-            # what the reply opens with, after the generation prompt (a forced tool call)
-            if self._tokenizer_mode == "byte":
-                prefix_ids = [min(b, self.config.vocab_size - 1) for b in prefix.encode("utf-8")]
-            else:
-                prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
-            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, GLM_TEMPLATE_KWARGS)
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:
@@ -449,18 +424,6 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    # built on first use: the tokenizer it reads loads lazily
-    _text_output: TextOutput | None = None
-
-    def text_output(self) -> TextOutput:
-        if self._text_output is None:
-            # a reduced model's byte ids never touch the HF tokenizer
-            detokenizer = (
-                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
-            )
-            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
-        return self._text_output
 
     def postprocess(
         self,

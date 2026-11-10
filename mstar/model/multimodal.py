@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 
 TEXT = "text"
 VIDEO = "video"
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,11 @@ def messages_from_parts(
     return messages
 
 
+# What GLM-5.2's and GLM-5.3's chat templates read of ``chat_template_kwargs``; other keys
+# are dropped, as some would collide with apply_chat_template's own arguments.
+GLM_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
+
+
 def render_chat_template(
     tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict,
     switches: tuple[str, ...] = (),
@@ -150,8 +158,24 @@ def render_chat_template(
     """Token ids of a chat through ``tokenizer``'s chat template, with the assistant turn
     opened: the chat API's ``messages`` and ``tools``, else the prompt's turns, each in its
     own role. ``chat_template_kwargs`` may set only ``switches``; other keys collide with
-    ``apply_chat_template``'s own arguments. A malformed chat, or one the template refuses,
-    is a ValueError, which reaches the client as a 400."""
+    ``apply_chat_template``'s own arguments. A tokenizer with no chat template tokenizes
+    ``prompt`` as it is. The ids of ``reply_prefix``, what the reply opens with (a forced
+    tool call), follow either. A malformed chat, or one the template refuses, is a
+    ValueError, which reaches the client as a 400."""
+    if getattr(tokenizer, "chat_template", None):
+        input_ids = _apply_chat_template(tokenizer, prompt, prompt_parts, request_kwargs, switches)
+    else:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+    if prefix := request_kwargs.get("reply_prefix"):
+        # no special tokens: the template's opening ones would land mid prompt
+        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
+    return input_ids
+
+
+def _apply_chat_template(
+    tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict, switches: tuple[str, ...],
+) -> torch.Tensor:
     messages = request_kwargs.get("messages")
     if messages and not isinstance(messages, list):
         raise ValueError("messages must be a list of chat messages")

@@ -27,7 +27,9 @@ TRUNCATED = PIECES[:-1] + [PIECES[-1][:-1]]  # the stream ends inside 😀
 
 
 def _chunk(data, modality="text", metadata=None):
-    return SimpleNamespace(modality=modality, data=data, metadata=metadata or {})
+    from mstar.api_server.request_types import ResultChunk
+
+    return ResultChunk(request_id="r", modality=modality, data=data, metadata=metadata or {})
 
 
 # ----------------------------------------------------------------------

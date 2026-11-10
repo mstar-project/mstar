@@ -73,8 +73,24 @@ def _error(status: int, message: str, type_: str | None = None) -> JSONResponse:
     )
 
 
+class RouteError(Exception):
+    """Why a route refuses a request, before any protocol shapes it: ``_error``
+    writes OpenAI's envelope and ``_anthropic_error`` Anthropic's. ``type`` is
+    OpenAI's error type where it is not the status's own."""
+
+    def __init__(self, status: int, message: str, type_: str | None = None):
+        super().__init__(message)
+        self.status, self.message, self.type = status, message, type_
+
+
 def _exception_error(e: Exception, route: str) -> JSONResponse:
-    """The error envelope for an exception a route's handler raised.
+    """OpenAI's error envelope for an exception a route's handler raised (:func:`_route_error`)."""
+    err = _route_error(e, route)
+    return _error(err.status, err.message, err.type)
+
+
+def _route_error(e: Exception, route: str) -> RouteError:
+    """The status and message for an exception a route's handler raised.
 
     An ``HTTPException`` was raised on purpose and keeps its status and
     detail. A ``ValueError`` is a refusal: a 400 with server paths cut to
@@ -88,32 +104,39 @@ def _exception_error(e: Exception, route: str) -> JSONResponse:
     """
     status, detail = getattr(e, "status_code", None), getattr(e, "detail", None)
     if isinstance(status, int) and detail is not None:
-        return _error(status, str(detail))
+        return RouteError(status, str(detail))
     if isinstance(e, ValueError):
         logger.info("%s request refused: %s", route, e)
-        return _error(status if isinstance(status, int) else 400, scrub_paths(str(e)))
+        return RouteError(status if isinstance(status, int) else 400, scrub_paths(str(e)))
     text, _ = client_error_text(e, f"{route} request failed", log=logger, type_name=False)
     if not isinstance(status, int):
         status = 400 if isinstance(e, TypeError) else 500
-    return _error(status, text)
+    return RouteError(status, text)
 
 
-def _resolve(require: str):
-    """Return (api, model_name, adapter, error_response). ``error`` is non-None
-    when the loaded model can't serve ``require`` (e.g. 'supports_chat')."""
+def _serving(require: str):
+    """(api, model_name, adapter) of the loaded model, or a :class:`RouteError`
+    when it can't serve ``require`` (e.g. 'supports_chat')."""
     api = _api()
     if api is None:
-        return None, None, None, _error(503, "Server not ready")
+        raise RouteError(503, "Server not ready")
     adapter = get_adapter(api.model_name)
     if adapter is None:
-        return api, api.model_name, None, _error(
+        raise RouteError(
             404, f"Model {api.model_name!r} has no OpenAI-compatible adapter; use POST /generate", "model_not_found"
         )
     if not getattr(adapter, require, False):
-        return api, api.model_name, adapter, _error(
-            404, f"Model {api.model_name!r} does not support this endpoint"
-        )
-    return api, api.model_name, adapter, None
+        raise RouteError(404, f"Model {api.model_name!r} does not support this endpoint")
+    return api, api.model_name, adapter
+
+
+def _resolve(require: str):
+    """``_serving`` for a route that answers in OpenAI's shape: (api, model_name,
+    adapter, error_response), the error non-None when the model can't serve it."""
+    try:
+        return (*_serving(require), None)
+    except RouteError as e:
+        return None, None, None, _error(e.status, e.message, e.type)
 
 
 @router.get("/v1/models")
@@ -196,9 +219,10 @@ def _anthropic_error(status: int, message: str) -> JSONResponse:
 async def _anthropic(require: str, raw_request: Request, handle):
     """Runs ``handle(api, model_name, adapter, body)`` for an Anthropic route,
     its errors in Anthropic's shape."""
-    api, model_name, adapter, err = _resolve(require)
-    if err is not None:
-        return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
+    try:
+        api, model_name, adapter = _serving(require)
+    except RouteError as e:
+        return _anthropic_error(e.status, e.message)
     try:
         body = _json_body(await raw_request.body())
     except ValueError as e:
@@ -206,8 +230,8 @@ async def _anthropic(require: str, raw_request: Request, handle):
     try:
         result = await handle(api, model_name, adapter, body)
     except Exception as e:  # noqa: BLE001 — surface as an Anthropic error
-        err = _exception_error(e, raw_request.url.path)
-        return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
+        err = _route_error(e, raw_request.url.path)
+        return _anthropic_error(err.status, err.message)
     if isinstance(result, dict):
         return JSONResponse(result)
     return result  # serving_messages builds the streaming response
