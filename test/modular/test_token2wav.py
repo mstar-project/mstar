@@ -425,8 +425,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
 
     model = copy.deepcopy(random_token2wav).to(device)
     # The CUDA path's attention kernel multiplies in TF32, as served: the DiT's conv caches
-    # drift from the reference state by up to ~1.1e-3 (values ~4) over the utterance, either
-    # way round the conformer's relative-position band is read.
+    # drift from the reference state by up to ~1.1e-3 absolute, near-zero entries included.
     tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=2e-3)
     p = 50
     torch.manual_seed(1)
@@ -609,8 +608,8 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_batched_flow_matches_the_driver_on_the_real_weights():
     """The served (bounded-cache) flow against the one-request driver on MiniCPM-o's own
-    weights and voice, where the conformer's relative-position term is large: reading its
-    band backwards put window mels up to 4 off (mel peaks ~7.5)."""
+    weights and voice, where the conformer's relative-position term is large enough to
+    show in the mel."""
     import soundfile as sf
 
     from mstar.model.components.token2wav.model import load_token2wav
@@ -629,7 +628,7 @@ def test_batched_flow_matches_the_driver_on_the_real_weights():
             state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
             got = model.window_flow(state, bank, ids, tokens, kv, last)
             commit()
-            # loose for TF32 in the served attention kernel, far under the 1.6-4 the bug gave
+            # TF32 in the served attention kernel; a misplaced position term moves mels by > 1
             assert (got.float() - want.float()).abs().max().item() < 0.15
 
 
