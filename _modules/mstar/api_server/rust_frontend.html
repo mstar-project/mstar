@@ -1034,6 +1034,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"metrics", rid, sub, refusals:{route, status, count}}</span>
 <span class="sd">                       | {t:"check_ref_audio", rid, sub, path, decoder, bare}</span>
 <span class="sd">                       | {t:"voices", rid, sub}</span>
+<span class="sd">                       | {t:"windows", rid, sub, op, plan, ...}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}</span>
 <span class="sd">                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}</span>
 <span class="sd">                       | {t:"err", rid, sub, msg} | {t:"done", rid, sub}</span>
@@ -1041,6 +1042,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                       | {t:"metrics", rid, sub, data(bin), metadata}</span>
 <span class="sd">                       | {t:"checked", rid, sub, error?, status?}</span>
 <span class="sd">                       | {t:"voices", rid, sub, metadata:{voices?}}</span>
+<span class="sd">                       | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}</span>
+
+<span class="sd">A ``windows`` request is one operation on a transcription upload's</span>
+<span class="sd">``WindowPlanner`` (``serving_transcriptions``), kept here under the frontend's</span>
+<span class="sd">``plan`` id: ``plan`` makes it (and decodes an upload that will be windowed),</span>
+<span class="sd">``fixed``, ``at`` and ``cut`` cut windows, and ``close`` deletes the upload</span>
+<span class="sd">and its windows, with no reply. The model's own loader decodes the upload,</span>
+<span class="sd">which no Rust decoder matches.</span>
 
 <span class="sd">A ``metrics`` request carries the frontend's cumulative refusal counts as</span>
 <span class="sd">three parallel lists (route template, status, count), which the API server</span>
@@ -1091,6 +1100,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">sysconfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">StrEnum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.auth</span><span class="w"> </span><span class="kn">import</span> <span class="n">API_KEY_ENV</span>
@@ -1205,6 +1215,20 @@ window.runMermaid = runMermaid;</script>
 <span class="n">LIBSNDFILE_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_LIBSNDFILE"</span>
 <span class="c1">#: ``ServedModels`` as JSON: the names that select the base model, and the LoRA adapters.</span>
 <span class="n">SERVED_MODELS_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_SERVED_MODELS"</span>
+<span class="c1">#: What ``/v1/audio/transcriptions`` needs from the model, as JSON (``transcription_facts``).</span>
+<span class="n">TRANSCRIPTION_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_TRANSCRIPTION"</span>
+
+
+<div class="viewcode-block" id="WindowOp">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.WindowOp">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">WindowOp</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A ``windows`` request's operation on a transcription upload's ``WindowPlanner``."""</span>
+    <span class="n">PLAN</span> <span class="o">=</span> <span class="s2">"plan"</span>     <span class="c1"># read the upload, and check it against the route's caps</span>
+    <span class="n">FIXED</span> <span class="o">=</span> <span class="s2">"fixed"</span>   <span class="c1"># fixed-length windows over the whole upload</span>
+    <span class="n">AT</span> <span class="o">=</span> <span class="s2">"at"</span>         <span class="c1"># the window that starts at ``offset``</span>
+    <span class="n">CUT</span> <span class="o">=</span> <span class="s2">"cut"</span>       <span class="c1"># ``duration`` seconds from ``offset``</span>
+    <span class="n">CLOSE</span> <span class="o">=</span> <span class="s2">"close"</span>   <span class="c1"># the request ended: delete the upload and its windows</span></div>
+
 
 
 <div class="viewcode-block" id="soundfile_library">
@@ -1236,16 +1260,57 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="transcription_facts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.transcription_facts">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">transcription_facts</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">adapter</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``TRANSCRIPTION_ENV``'s value: what mstar-server's transcription route needs</span>
+<span class="sd">    that only this side knows. The model's declared kwargs (``request_kwargs``,</span>
+<span class="sd">    which decide what the long-form drivers add), the deployment's</span>
+<span class="sd">    ``max_concurrent_requests`` (which parallel uploads share), the language</span>
+<span class="sd">    tables the adapter checks against, and the URL pydantic's error text cites.</span>
+<span class="sd">    ``None`` for a model with no transcription surface."""</span>
+    <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">adapter</span><span class="o">.</span><span class="n">supports_transcriptions</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">pydantic.version</span><span class="w"> </span><span class="kn">import</span> <span class="n">version_short</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">adapters</span>
+
+    <span class="n">model</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="s2">"model"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="n">declared</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">request_kwargs</span><span class="p">()</span> <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">facts</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">"request_kwargs"</span><span class="p">:</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">declared</span><span class="p">)</span> <span class="k">if</span> <span class="n">declared</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">"max_concurrent_requests"</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="s2">"max_concurrent_requests"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+        <span class="s2">"errors_url"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"https://errors.pydantic.dev/</span><span class="si">{</span><span class="n">version_short</span><span class="p">()</span><span class="si">}</span><span class="s2">/v/"</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="n">adapters</span><span class="o">.</span><span class="n">CanaryAdapter</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.canary.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LANGUAGES</span>
+
+        <span class="n">facts</span><span class="p">[</span><span class="s2">"languages"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">LANGUAGES</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="n">adapters</span><span class="o">.</span><span class="n">TransducerAdapter</span><span class="p">)</span> <span class="ow">and</span> <span class="n">adapter</span><span class="o">.</span><span class="n">detects_language</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">GRANARY_LANGUAGES</span>
+
+        <span class="n">facts</span><span class="p">[</span><span class="s2">"languages"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">GRANARY_LANGUAGES</span><span class="p">)</span>
+        <span class="n">facts</span><span class="p">[</span><span class="s2">"detects_language"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="n">adapters</span><span class="o">.</span><span class="n">Qwen3ASRAdapter</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.qwen3_asr.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LANGUAGE_CODES</span>
+
+        <span class="n">facts</span><span class="p">[</span><span class="s2">"language_codes"</span><span class="p">]</span> <span class="o">=</span> <span class="p">[[</span><span class="n">code</span><span class="p">,</span> <span class="n">name</span><span class="p">]</span> <span class="k">for</span> <span class="n">code</span><span class="p">,</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">LANGUAGE_CODES</span><span class="o">.</span><span class="n">items</span><span class="p">()]</span>
+    <span class="k">return</span> <span class="n">facts</span></div>
+
+
+
 <div class="viewcode-block" id="launch_rust_server">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.launch_rust_server">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">launch_rust_server</span><span class="p">(</span><span class="n">binary</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                        <span class="n">bridge_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                        <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                       <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">served_models</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
+                       <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">served_models</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                       <span class="n">transcription</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate</span>
 <span class="sd">    (``get_output_sample_rate``); ``None`` leaves the frontend's own default.</span>
 <span class="sd">    ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a</span>
-<span class="sd">    request's ``model`` selects; ``None`` serves the base model alone."""</span>
+<span class="sd">    request's ``model`` selects; ``None`` serves the base model alone.</span>
+<span class="sd">    ``transcription`` is ``transcription_facts``' for the served model."""</span>
     <span class="c1"># The key goes through the environment, not argv, which any local user</span>
     <span class="c1"># can read from the process list. ``api_key`` is the resolved setting, so</span>
     <span class="c1"># an inherited MSTAR_API_KEY must not override it.</span>
@@ -1262,6 +1327,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">SERVED_MODELS_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">served_models</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">env</span><span class="p">[</span><span class="n">SERVED_MODELS_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">served_models_json</span><span class="p">(</span><span class="n">served_models</span><span class="p">)</span>
+    <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">TRANSCRIPTION_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">transcription</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">env</span><span class="p">[</span><span class="n">TRANSCRIPTION_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">transcription</span><span class="p">)</span>
     <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">LIBSNDFILE_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="p">(</span><span class="n">libsndfile</span> <span class="o">:=</span> <span class="n">soundfile_library</span><span class="p">())</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">env</span><span class="p">[</span><span class="n">LIBSNDFILE_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">libsndfile</span>
@@ -1299,6 +1367,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># set by _serve; the API server's message thread schedules relay() on it</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">AbstractEventLoop</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># a transcription upload's WindowPlanner, by the frontend's plan id, until it closes</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
 
     <span class="c1"># -- outbound ----------------------------------------------------------</span>
 
@@ -1476,6 +1546,104 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">answer</span><span class="p">())</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_in_uploads</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">path</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">is_relative_to</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">())</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_windows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One operation on a transcription upload's ``WindowPlanner``, off this</span>
+<span class="sd">        loop since it decodes and writes. A failure is answered as the Python</span>
+<span class="sd">        route answers it: its status and message (an ``HTTPException``'s, or</span>
+<span class="sd">        ``client_error_text``'s), and the exception's type for a stream's</span>
+<span class="sd">        ``transcription failed (&lt;type&gt;)``."""</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">op</span> <span class="o">=</span> <span class="n">WindowOp</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"op"</span><span class="p">))</span>
+        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+            <span class="n">op</span> <span class="o">=</span> <span class="kc">None</span>   <span class="c1"># answered with an error below</span>
+        <span class="n">plan</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"plan"</span><span class="p">)</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"windows"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rid"</span><span class="p">),</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sub"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{}}</span>
+
+        <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
+
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">serving_transcriptions</span> <span class="k">as</span> <span class="n">st</span>
+
+            <span class="k">if</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">WindowOp</span><span class="o">.</span><span class="n">CLOSE</span><span class="p">:</span>
+                <span class="n">planner</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">plan</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">planner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">planner</span><span class="o">.</span><span class="n">cleanup</span><span class="p">)</span>
+                <span class="k">elif</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"path"</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_in_uploads</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"path"</span><span class="p">])):</span>
+                    <span class="n">Path</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"path"</span><span class="p">])</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">missing_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">return</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">op</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"unknown windows operation </span><span class="si">{</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'op'</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">WindowOp</span><span class="o">.</span><span class="n">PLAN</span><span class="p">:</span>
+                    <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"path"</span><span class="p">])</span>
+                    <span class="c1"># the planner deletes the upload, so only one the frontend saved under upload_dir</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_in_uploads</span><span class="p">(</span><span class="n">path</span><span class="p">):</span>
+                        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"upload </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2"> is outside the upload directory"</span><span class="p">)</span>
+                    <span class="n">planner</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span>
+                        <span class="n">st</span><span class="o">.</span><span class="n">WindowPlanner</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"max_seconds"</span><span class="p">],</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">),</span>
+                        <span class="n">balanced</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="s2">"balanced"</span><span class="p">]),</span> <span class="n">search_seconds</span><span class="o">=</span><span class="n">msg</span><span class="p">[</span><span class="s2">"search_seconds"</span><span class="p">],</span>
+                        <span class="n">frame_seconds</span><span class="o">=</span><span class="n">msg</span><span class="p">[</span><span class="s2">"frame_seconds"</span><span class="p">],</span> <span class="n">whole_seconds</span><span class="o">=</span><span class="n">msg</span><span class="p">[</span><span class="s2">"whole_seconds"</span><span class="p">],</span>
+                    <span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="p">[</span><span class="n">plan</span><span class="p">]</span> <span class="o">=</span> <span class="n">planner</span>
+                    <span class="n">windows</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare</span><span class="p">(</span><span class="n">planner</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">st</span><span class="p">,</span> <span class="n">media_io</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">planner</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="p">[</span><span class="n">plan</span><span class="p">]</span>
+                    <span class="k">if</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">WindowOp</span><span class="o">.</span><span class="n">FIXED</span><span class="p">:</span>
+                        <span class="n">windows</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">planner</span><span class="o">.</span><span class="n">fixed</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">op</span> <span class="ow">is</span> <span class="n">WindowOp</span><span class="o">.</span><span class="n">AT</span><span class="p">:</span>
+                        <span class="n">windows</span> <span class="o">=</span> <span class="p">[</span><span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">planner</span><span class="o">.</span><span class="n">window_at</span><span class="p">,</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"offset"</span><span class="p">])]</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">windows</span> <span class="o">=</span> <span class="p">[</span><span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">planner</span><span class="o">.</span><span class="n">cut</span><span class="p">,</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"offset"</span><span class="p">],</span> <span class="n">msg</span><span class="p">[</span><span class="s2">"duration"</span><span class="p">])]</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+                    <span class="s2">"duration"</span><span class="p">:</span> <span class="n">planner</span><span class="o">.</span><span class="n">duration</span><span class="p">,</span> <span class="s2">"single"</span><span class="p">:</span> <span class="n">planner</span><span class="o">.</span><span class="n">single</span><span class="p">,</span>
+                    <span class="s2">"windows"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"path"</span><span class="p">:</span> <span class="n">w</span><span class="o">.</span><span class="n">path</span><span class="p">,</span> <span class="s2">"offset"</span><span class="p">:</span> <span class="n">w</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="s2">"duration"</span><span class="p">:</span> <span class="n">w</span><span class="o">.</span><span class="n">duration</span><span class="p">}</span> <span class="k">for</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">windows</span><span class="p">],</span>
+                <span class="p">}</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — the request fails, the bridge goes on</span>
+                <span class="n">status</span><span class="p">,</span> <span class="n">detail</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">detail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">message</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">message</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span>
+                        <span class="n">exc</span><span class="p">,</span> <span class="s2">"/v1/audio/transcriptions request failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">status</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+                        <span class="n">status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
+                <span class="n">reply</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">"status"</span><span class="p">:</span> <span class="n">status</span><span class="p">,</span> <span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span>
+                    <span class="s2">"http"</span><span class="p">:</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">HTTPException</span><span class="p">),</span> <span class="s2">"type"</span><span class="p">:</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span>
+                <span class="p">}}</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">run</span><span class="p">())</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_prepare</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">planner</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">st</span><span class="p">,</span> <span class="n">media_io</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``create_transcription``'s checks on a new upload: past the cap by its</span>
+<span class="sd">        header, then decoded when it will be windowed; a refusal deletes it."""</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">refuse</span><span class="p">(</span><span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">detail</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">plan</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="n">planner</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+            <span class="k">return</span> <span class="n">HTTPException</span><span class="p">(</span><span class="n">status_code</span><span class="o">=</span><span class="n">status</span><span class="p">,</span> <span class="n">detail</span><span class="o">=</span><span class="n">detail</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">planner</span><span class="o">.</span><span class="n">duration</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">planner</span><span class="o">.</span><span class="n">duration</span> <span class="o">&gt;</span> <span class="n">st</span><span class="o">.</span><span class="n">MAX_DURATION_SECONDS</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="n">refuse</span><span class="p">(</span><span class="mi">413</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"audio is </span><span class="si">{</span><span class="n">planner</span><span class="o">.</span><span class="n">duration</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> s; the limit is </span><span class="si">{</span><span class="n">st</span><span class="o">.</span><span class="n">MAX_DURATION_SECONDS</span><span class="si">}</span><span class="s2"> s"</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">planner</span><span class="o">.</span><span class="n">decodes</span><span class="p">:</span>
+                <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">planner</span><span class="o">.</span><span class="n">prepare</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">media_io</span><span class="o">.</span><span class="n">AudioTooLongError</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="n">refuse</span><span class="p">(</span><span class="mi">413</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"audio is longer than the </span><span class="si">{</span><span class="n">st</span><span class="o">.</span><span class="n">MAX_DURATION_SECONDS</span><span class="si">}</span><span class="s2"> s limit"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+        <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="n">refuse</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+        <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">plan</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="n">planner</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+            <span class="k">raise</span>
+        <span class="k">return</span> <span class="p">[]</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_handle</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">msg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">t</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"t"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"submit"</span><span class="p">:</span>
@@ -1492,6 +1660,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_check_ref_audio</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"voices"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_voices</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">t</span> <span class="o">==</span> <span class="s2">"windows"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_windows</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"bridge: unknown message type </span><span class="si">%r</span><span class="s2">"</span><span class="p">,</span> <span class="n">t</span><span class="p">)</span>
 
@@ -1547,7 +1717,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RustFrontendBridge.stop">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.stop">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">False</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="c1"># the uploads of transcriptions still running go with the frontend</span>
+        <span class="k">for</span> <span class="n">planner</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="o">.</span><span class="n">values</span><span class="p">()):</span>
+            <span class="n">planner</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planners</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
 </div>
 
 </pre></div>

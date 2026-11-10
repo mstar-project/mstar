@@ -1040,9 +1040,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        dim: embedding dimension. Must be even.</span>
 <span class="sd">        fraction: ``(dim // 2,)`` frequency ladder, caller-owned so it is</span>
 <span class="sd">            allocated once rather than per step (see</span>
-<span class="sd">            ``Pi05LLMSubmodule._get_timestep_emb_fraction``).</span>
+<span class="sd">            ``Pi05ActionSubmodule._get_timestep_emb_fraction``).</span>
 <span class="sd">        output_buffer: ``(len(t), dim)`` destination, written in place and</span>
-<span class="sd">            returned; preallocated so the action-gen step stays capturable.</span>
+<span class="sd">            returned.</span>
 <span class="sd">        min_period / max_period: frequency range for the sinusoidal basis.</span>
 
 <span class="sd">    Returns:</span>

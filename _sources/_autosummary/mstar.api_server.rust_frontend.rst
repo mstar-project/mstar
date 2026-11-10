@@ -14,6 +14,7 @@ mstar.api\_server.rust\_frontend
       REQUEST_TIMEOUT_ENV
       LIBSNDFILE_ENV
       SERVED_MODELS_ENV
+      TRANSCRIPTION_ENV
    
    
 
@@ -28,6 +29,7 @@ mstar.api\_server.rust\_frontend
       openai_adapter_class
       served_models_json
       soundfile_library
+      transcription_facts
    
    
 
@@ -38,6 +40,7 @@ mstar.api\_server.rust\_frontend
    .. autosummary::
    
       RustFrontendBridge
+      WindowOp
    
    
 

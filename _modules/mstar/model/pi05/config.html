@@ -1027,6 +1027,10 @@ window.runMermaid = runMermaid;</script>
 <span class="n">LLM_KV</span> <span class="o">=</span> <span class="s2">"kv"</span>
 <span class="n">LLM_ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 <span class="n">LLM_POS</span> <span class="o">=</span> <span class="s2">"rope"</span>
+<span class="c1"># The prefix expert and the action expert read and write one KV cache.</span>
+<span class="n">LLM_NODES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="s2">"action_expert"</span><span class="p">)</span>
+<span class="c1"># The one graph walk: camera images and prompt in, an action chunk out.</span>
+<span class="n">CHUNK_WALK</span> <span class="o">=</span> <span class="s2">"action_chunk"</span>
 
 
 <div class="viewcode-block" id="Pi05Config">
