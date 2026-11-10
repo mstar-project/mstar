@@ -592,7 +592,8 @@ a shard that never splits (``none``, or ``auto`` over KV stored by position) sto
 
 A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
 so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
-for Qwen3-Omni's Thinker, estimated from its geometry and unmeasured). Chunked prefill stays off on SP ranks.
+for Qwen3-Omni's Thinker, estimated from its geometry; the measured peaks are in
+:doc:`adding_models`). Chunked prefill stays off on SP ranks.
 **Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
 how to pick, and what is refused.
 

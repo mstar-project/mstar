@@ -2882,8 +2882,7 @@ Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` ab
      - by position
      - striped pass-Q ring, eager only
      - partials merged
-     - attention is the step's peak memory: past a per-model crossover (below, estimated and
-       unmeasured)
+     - attention is the step's peak memory: past a per-model crossover (below)
    * - ``none``
      - by head
      - refused at load: the SP ranks would only share heads
@@ -2910,10 +2909,14 @@ stored positions to stripe by, so it fails at plan on a ring node. A step's peak
 larger of its attention and its MLP (or MoE) phase. All-gather's attention phase holds the
 whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone, and
 two fp32 copies of their result while a round merges. So ring lowers the peak only once attention
-outgrows the MLP phase. Estimated from allocation sites
-and unmeasured: for the Thinker's geometry from about ``P = 4`` (at ``P = 2`` the MoE phase is
-larger and the peaks equal), and sooner for dense models, whose MLP phase lacks the top-k
-expansion. Which is faster is unmeasured too.
+outgrows the MLP phase. Estimated from allocation sites: for the Thinker's geometry from about
+``P = 4`` (at ``P = 2`` the MoE phase is larger and the peaks equal), and sooner for dense
+models, whose MLP phase lacks the top-k expansion (not measured). The Thinker at 128K tokens on
+8 H100s, measured before this code's last merge of main (a rerun is pending), peaked at 58.8 GB per
+GPU under ring and 57.9 GB under all-gather at TP4 x SP2, and at 66.8 GB and 70.5 GB at
+TP2 x SP4; ring prefilled faster in both (2.52 against 2.79 s, and 2.69 against 3.26 s). Ring
+merges ``P`` bf16 partials per query, and on 2 H200s at TP1 x SP2 changed 15 of 48 long greedy
+summaries against the copied path, where all-gather changed none.
 Chunked prefill stays off on SP ranks either way, so a long prompt prefills in one step.
 
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
