@@ -335,6 +335,8 @@ class KPoolDSA(Resource):
             # a row is [key | gate | key of the pool ending there]
             raise ValueError(f"DSA's {INDEX_PLANES} rows are 3 x index_head_dim ({d}) wide; "
                              f"{spec.config.kv_cache} declares {planes.width}")
+        if spec.config.sm_scale is None:
+            raise ValueError("DSA attends at DSAConfig.sm_scale: declare it")
         page, kpool = kv_config.tokens_per_page, spec.config.kpool
         if page % kpool:
             # a pool's key sits in its last token's row: pools must not straddle pages
@@ -566,7 +568,8 @@ class KPoolDSA(Resource):
                             self.current(label), group)
 
     def attend(self, plane: int, q_nope: torch.Tensor, q_pe: torch.Tensor, slots: torch.Tensor,
-               sm_scale: float, label: str = _MAIN) -> torch.Tensor:
-        """Absorbed MLA of each row over its ``slots`` of ``plane``'s latents."""
+               *, label: str = _MAIN) -> torch.Tensor:
+        """Absorbed MLA of each row over its ``slots`` of ``plane``'s latents, at
+        ``config.sm_scale`` whether the step is captured or eager."""
         return paged.sparse_attend(q_nope, q_pe, self._need_kv().layer_view(plane), slots,
-                                   self.current(label), sm_scale, self._eager)
+                                   self.current(label), self.config.sm_scale, self._eager)

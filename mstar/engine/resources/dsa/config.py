@@ -24,7 +24,7 @@ class DSAConfig:
     topk: int
     # tokens per pooled key (GLM-5.3's k-pool indexer: paged.py); 1 scores every token's key
     kpool: int = 1
-    # the absorbed MLA's softmax scale, for the sparse-attention plans the resource makes
+    # the absorbed MLA's softmax scale, which every sparse attention runs at
     sm_scale: float | None = None
     # kpool > 1: the indexer's key width; an INDEX_PLANES row is three of them wide
     index_head_dim: int | None = None
