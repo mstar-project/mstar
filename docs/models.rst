@@ -751,8 +751,9 @@ The grammar compiles in the background, on every rank, while its request waits a
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one
 without a constrained row (the lean twin), and a step holding a constrained row waits for its
 rows' last draws to reach the host before it launches. A grammar that fails to compile, or
-refuses a drawn token, fails its request with an error rather than letting the reply go
-unconstrained: past a refused token the reply may only draw a stop token until then. Not served
+refuses a drawn token, fails its request with an error at its next step rather than letting
+the reply go unconstrained; a step pre-planned before the refused token reached the host may
+draw only a stop token. Not served
 with it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
 sampler), resident planning, and a text sampler whose walks run on different ranks (a
 prefill/decode split); the deployment is refused at startup for the last, and for

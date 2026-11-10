@@ -5,8 +5,8 @@ choice list, EBNF; xgrammar underneath).
 The sampler resource owns it, beside its other per-request draw state. A step
 that holds a constrained row stages each row's bitmask before it launches, from
 the tokens the rows drew in their last step: the sampler copies those to the
-host at commit, and the next step's plan waits for that copy alone (step N's
-draw, not the worker's postprocess), accepts them and fills the masks. The draw
+host at commit, and the next step waits for that copy alone (step N's draw,
+not the worker's postprocess), accepts them and fills the masks. The draw
 then applies the mask before either sampling path, so a captured step bakes the
 apply over the slot's static mask buffer.
 """
@@ -274,7 +274,7 @@ class GrammarRows:
 
     def note_draws(self, rids, tokens: torch.Tensor, kept) -> None:
         """Queue the copy of this step's drawn tokens for its constrained rows
-        (``kept`` None keeps every row); the next ``stage`` accepts them."""
+        (``kept`` None keeps every row); the next ``accept_draws`` accepts them."""
         index = [i for i, rid in enumerate(rids) if rid in self._rows and (kept is None or rid in kept)]
         if not index:
             return
@@ -289,7 +289,8 @@ class GrammarRows:
         event.record()
         self._pending.append((rows, host, event))
 
-    def _accept_pending(self) -> None:
+    def accept_draws(self) -> None:
+        """Advance every row by its draws still on their way to the host, waiting for them."""
         for rows, host, event in self._pending:
             if event is not None:
                 event.synchronize()
@@ -300,7 +301,7 @@ class GrammarRows:
     def fill(self, rids) -> torch.Tensor:
         """The host bitmask for a step's rows, after accepting every draw so far:
         all ones for a free row, and only the stop ids for a failed one."""
-        self._accept_pending()
+        self.accept_draws()
         if len(set(rids)) != len(rids):
             raise ValueError("a constrained request has two rows in one step (speculative decoding is not served)")
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
