@@ -217,16 +217,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             True: tuple(range(len(guidance.branches)))[my_rows(self.cfg_group, len(guidance.branches))]
             if guidance is not None else (0,),
         }
-        # The step scalars the base slices per step: the scheduler's, and a guided model's scales, each staged
-        # under its own name (``_guidance_sources``).
+        # The step scalars the base slices per step: the scheduler's, and a guided model's scales. A scale is an
+        # input under its own name, beside the step scalars and the loop-back edges; its fill is staged in the
+        # request's state under ``guidance:<name>`` (``_guidance_sources``), apart from the schedule's sources
+        # and the base's own keys.
         scales = guidance.scales if guidance is not None else ()
-        shadowed = set(scales) & set(self.STEP_SCALARS)
+        shadowed = set(scales) & {*self.STEP_SCALARS, *self.loop_back_names}
         if shadowed:
             raise ValueError(
-                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with STEP_SCALARS"
+                f"{type(self).__name__}: guidance scale(s) {sorted(shadowed)} share a name with a step scalar "
+                f"or loop-back input"
             )
         self.step_scalars: Mapping[str, StepScalar] = {
-            **self.STEP_SCALARS, **{name: StepScalar(name, broadcast=False) for name in scales},
+            **self.STEP_SCALARS, **{name: StepScalar(f"guidance:{name}", broadcast=False) for name in scales},
         }
 
     @property
@@ -544,14 +547,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _guidance_sources(
         self, fwd_info: CurrentForwardPassInfo, num_steps: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
-        """The request's fill of each guidance scale, one value per step (``GUIDANCE.at``), staged under the scale's
-        name as its step scalar's source."""
+        """The request's fill of each guidance scale, one value per step (``GUIDANCE.at``), staged as its step
+        scalar's source."""
         guidance = self.GUIDANCE
         if guidance is None:
             return {}
         fill = [guidance.at(fwd_info.step_metadata, k) for k in range(num_steps)]
         return {
-            name: to_device_nonblocking(torch.tensor([float(at[name]) for at in fill], dtype=torch.float32), device)
+            self.step_scalars[name].source:
+                to_device_nonblocking(torch.tensor([float(at[name]) for at in fill], dtype=torch.float32), device)
             for name in guidance.scales
         }
 

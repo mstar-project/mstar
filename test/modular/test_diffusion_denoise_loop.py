@@ -719,7 +719,7 @@ def test_guidance_turns_on_and_off_per_step_from_the_requests_fill():
             kwargs.pop(name)
         preds.append(sub.guided_output(engine_inputs, keys[-1], torch.zeros(1, 8, 4), kwargs.pop("timestep"), **kwargs))
     assert [key.guided for key in keys] == [False, True, True, False]
-    assert torch.equal(sub.request_state(_handle("a"))["guidance_scale"], torch.tensor([1.0, 3.0, 3.0, 1.0]))
+    assert torch.equal(sub.request_state(_handle("a"))["guidance:guidance_scale"], torch.tensor([1.0, 3.0, 3.0, 1.0]))
     for k in (0, 3):
         assert torch.equal(preds[k], torch.full((1, 8, 4), 2.0))  # the conditional prediction alone
     assert torch.equal(preds[1], torch.full((1, 8, 4), 1.0 + 3.0 * (2.0 - 1.0)))
@@ -733,18 +733,34 @@ def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_constructi
         GuidedToy(cfg_group=_Group(3))
 
 
-def test_a_guidance_scale_that_shadows_a_step_scalar_is_refused_at_construction():
-    class TimestepCfg:
-        scales = ("timestep",)
+def _renamed_scale(name):
+    """GuidedToy with its one scale knob named ``name``."""
+
+    class RenamedCfg:
+        scales = (name,)
 
         def __call__(self, preds, scales):
-            return cfg(preds, {"guidance_scale": scales["timestep"]})
+            return cfg(preds, {"guidance_scale": scales[name]})
 
-    class Shadowing(GuidedToy):
-        GUIDANCE = GuidedToy.GUIDANCE._replace(combine=TimestepCfg())
+    class Renamed(GuidedToy):
+        GUIDANCE = GuidedToy.GUIDANCE._replace(combine=RenamedCfg())
 
-    with pytest.raises(ValueError, match="timestep"):
-        Shadowing()
+    return Renamed
+
+
+@pytest.mark.parametrize("name", ["timestep", LATENTS])
+def test_a_guidance_scale_that_shadows_a_staged_input_is_refused_at_construction(name):
+    with pytest.raises(ValueError, match=name):
+        _renamed_scale(name)()
+
+
+def test_a_guidance_scale_named_like_a_schedule_source_stages_beside_it():
+    sub = _renamed_scale("sigmas")()
+    info = _info("a", 0)
+    info.step_metadata["sigmas"] = 3.0
+    staged = sub.prepare_inputs(WALK, info, _guided_inputs(2.0, 1.0)).tensor_inputs
+    assert torch.equal(staged["sigmas"], torch.tensor([3.0]))
+    assert torch.equal(staged["sigma"], sub.request_state(_handle("a"))["schedule"].sigmas[:1])
 
 
 def test_guided_capture_buckets_stage_the_scale_and_both_keys():
