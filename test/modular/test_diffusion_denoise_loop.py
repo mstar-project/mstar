@@ -734,13 +734,14 @@ def test_branches_that_do_not_split_over_the_cfg_group_are_refused_at_constructi
 
 
 def test_a_guidance_scale_that_shadows_a_step_scalar_is_refused_at_construction():
-    def combine(preds, scales):
-        return cfg(preds, {"guidance_scale": scales["timestep"]})
+    class TimestepCfg:
+        scales = ("timestep",)
 
-    combine.scales = ("timestep",)
+        def __call__(self, preds, scales):
+            return cfg(preds, {"guidance_scale": scales["timestep"]})
 
     class Shadowing(GuidedToy):
-        GUIDANCE = GuidedToy.GUIDANCE._replace(combine=combine)
+        GUIDANCE = GuidedToy.GUIDANCE._replace(combine=TimestepCfg())
 
     with pytest.raises(ValueError, match="timestep"):
         Shadowing()

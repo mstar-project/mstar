@@ -3327,13 +3327,14 @@ guided, and the guidance branches this rank runs), so they read the model's fiel
 The default ``denoise`` is the Euler step of ``model_output``. A model that steps itself
 (two streams, a model-specific update) overrides ``denoise`` instead. Guidance is a
 declaration: ``GUIDANCE`` names, per branch, the request inputs that branch reads, and a
-``combine`` function (``guidance.cfg`` or ``guidance.cfg_renorm``). A guided step runs each
+``combine`` (``guidance.cfg`` or ``guidance.cfg_renorm``). A guided step runs each
 branch as a row of ``model_output``, splits the branches over the node's ``cfg_size``
 ranks, gathers their predictions and combines them with the request's scales, each a step
 scalar, so rows at different scales share a forward. ``combine`` receives them as
 ``{name: tensor}`` and names the knobs it reads in its own ``scales`` (``cfg``:
-``guidance_scale``), so they are declared once. ``Guidance.active`` is the one rule for
-whether guidance is on: for a request, which the text encoder also asks before it encodes
+``guidance_scale``), so they are declared once: a combine is an object with its ``scales``
+and a ``__call__``, as ``guidance.Cfg`` is, and a model with other knobs subclasses it or
+writes its own. ``Guidance.active`` is the one rule for whether guidance is on: for a request, which the text encoder also asks before it encodes
 a negative prompt, and for each step, at the scales ``Guidance.at(step_metadata, step)``
 gives it. That field is the request's per-step fill (default: its knobs at every step); a
 model with guidance on an interval of steps declares its own, and its other steps run
