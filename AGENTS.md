@@ -128,7 +128,7 @@ To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platfo
 
 **Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed. A tuning value a deployment may reasonably want to change (e.g., a per-step token budget) belongs in the serving config, not in an env var added for testing.
 
-The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
+The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help an SLO (throughput, latency, streaming viability, host time during a step, etc.) rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
 
 ### 10. Performance claims come from the repo's own harnesses
 
