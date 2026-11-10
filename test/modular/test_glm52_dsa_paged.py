@@ -179,13 +179,13 @@ def test_prefill_chunks_join_at_their_boundaries():
 
 
 def test_long_prefill_runs_in_row_chunks():
-    """A prefill past prefill_chunk_tokens runs the trunk in row chunks, with the one-pass
+    """A prefill past prefill_window_tokens runs the trunk in row chunks, with the one-pass
     logits, and plans no dense attention."""
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=3), config=cfg)
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    cfg.prefill_chunk_tokens = 3
+    cfg.prefill_window_tokens = 3
     passes = []
     hidden = sub._hidden
     sub._hidden = lambda ids, *a, **k: passes.append(ids.shape[0]) or hidden(ids, *a, **k)
@@ -210,7 +210,7 @@ def test_batched_long_prefill_chunks_cut_across_requests(monkeypatch):
     rids = ["a", "b"]
 
     def run(chunk):
-        cfg.prefill_chunk_tokens = chunk
+        cfg.prefill_window_tokens = chunk
         resources, runner = build_cpu_resources(cfg, rids, page_size=4)
         sub.bind_node_resources(resources)
         ars = [ARNodeInputs(input_ids=p, input_seq_len=p.shape[0]) for p in prompts]

@@ -17,13 +17,13 @@ model_kwargs:
   # k=3 was the best of k=2..4 at short context on an 8xH200 node
   mtp_num_draft_tokens: 3
   max_seq_len: 262144
-  prefill_chunk_tokens: 8192
+  prefill_window_tokens: 8192
   dsa_shard_prefill: true
 resources:
   kv:
     max_num_pages: 2304
     page_size: 128
-# Every prefill runs eager (in row chunks past prefill_chunk_tokens) and its kernels compile on
+# Every prefill runs eager (in row chunks past prefill_window_tokens) and its kernels compile on
 # first use: four lengths (1k, 6k, 12.5k and 20k tokens) compile them before the server binds.
 warmup_requests:
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}

@@ -240,8 +240,8 @@ def test_model_kwarg_dsa_long_context():
 @pytest.mark.parametrize("kwargs", [
     {"dsa_long_context": "false"},
     {"dsa_long_context": True, "dsa_shard_prefill": "false"},
-    {"dsa_long_context": True, "prefill_chunk_tokens": 2.5},
-    {"dsa_long_context": True, "prefill_chunk_tokens": True},
+    {"dsa_long_context": True, "prefill_window_tokens": 2.5},
+    {"dsa_long_context": True, "prefill_window_tokens": True},
     {"dsa_long_context": True, "max_seq_len": 4096.5},
 ])
 def test_model_kwarg_dsa_long_context_refuses_a_knob_it_would_misread(kwargs):

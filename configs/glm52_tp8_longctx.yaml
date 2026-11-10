@@ -23,7 +23,7 @@ model_kwargs:
   # the context guard and the KV sizing input: the pages below, less the sink, must hold it
   max_seq_len: 262144
   # rows per trunk pass of a long prefill, which bounds its activations
-  prefill_chunk_tokens: 8192
+  prefill_window_tokens: 8192
   # TP ranks split a long prompt's selection (the indexer's cost grows as the prompt squared)
   dsa_shard_prefill: true
   prefill_capture_batch_sizes: [1, 4, 16]
