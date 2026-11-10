@@ -357,6 +357,12 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
     # the signal loops back only on its own walk; elsewhere it is routed
     other = {NODE: SimpleNamespace(token_stop=stop, device_loopback=loopback._replace(walk="other"))}
     _refuse_unroutable_withholds(other, graph(StreamingGraphEdge(next_node="Codec", name="token")))
+    # the graph runtime's own stop check never withholds, so the walk must keep check_stop
+    runtime = {NODE: SimpleNamespace(token_stop=stop, device_loopback=None, get_stop_policies=lambda walk: {})}
+    with pytest.raises(ValueError, match="get_stop_policies"):
+        _refuse_unroutable_withholds(runtime, graph(StreamingGraphEdge(next_node="Codec", name="audio")))
+    kept = {NODE: SimpleNamespace(token_stop=stop, device_loopback=None, get_stop_policies=lambda walk: None)}
+    _refuse_unroutable_withholds(kept, graph(StreamingGraphEdge(next_node="Codec", name="audio")))
 
 
 def test_a_by_value_stream_goes_by_value_only_where_its_signal_rides_inline():

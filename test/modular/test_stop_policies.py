@@ -90,13 +90,16 @@ def test_a_token_stop_names_the_walks_that_end_its_loop():
     assert both.stops_on("a") and both.stops_on("b") and not both.stops_on("c")
 
 
-def test_a_withholding_token_stop_refuses_the_runtime_check():
-    """The runtime's check never calls ``check_stop``, which is what withholds."""
+def test_a_withholding_token_stop_may_leave_its_other_walks_to_the_runtime():
+    """The runtime's check never calls ``check_stop``, which is what withholds, so only a
+    walk with a withheld output must keep ``check_stop``: startup checks that per walk
+    (``_refuse_unroutable_withholds``, ``test_output_spans.py``), and the stop itself takes
+    both, as Step-Audio2's LLM does for its text and its spoken decode."""
     from mstar.model.submodule_base import TokenStop
 
-    with pytest.raises(ValueError, match="runtime_check"):
-        TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
-                  withhold=("codes",), runtime_check=True)
+    stop = TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
+                     withhold=("codes",), runtime_check=True)
+    assert stop.withhold == ("codes",) and stop.runtime_check
 
 
 def test_a_nodes_stop_limits_come_from_its_own_partitions_info():

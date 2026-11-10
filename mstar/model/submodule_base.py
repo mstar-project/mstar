@@ -79,13 +79,11 @@ class TokenStop:
     withhold: tuple[str, ...] = ()
     # the graph runtime checks ``walk``'s stop ids itself, without calling
     # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
-    # check_stop, which can end the partition
+    # check_stop, which can end the partition. The runtime's check never
+    # withholds, so a walk with a withheld output must keep check_stop (its
+    # ``get_stop_policies`` None), which startup checks per walk
+    # (``engine_manager._refuse_unroutable_withholds``)
     runtime_check: bool = False
-
-    def __post_init__(self):
-        if self.withhold and self.runtime_check:
-            # the runtime's check never calls check_stop, which is what withholds
-            raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
 
     def stops_on(self, graph_walk: str) -> bool:
         """Whether a row of ``graph_walk`` can stop the loop."""
