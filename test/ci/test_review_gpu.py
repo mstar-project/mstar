@@ -600,27 +600,49 @@ class TestApprove(unittest.TestCase):
             return {"ref": ref, "priority": p, "status": status, "why": "w",
                     **({"fixed_in": 9} if status == "fixed_above" else {})}
 
-        # name, the earlier state's items, this run's items, its verdicts, the tag of bot thread 4, untouched files,
-        # what the checklist says (None: approved)
-        for name, earlier, new, verdicts, tag, untouched, says in (
+        def run(earlier, new, verdicts, pages, untouched):
+            """One re-review as post makes it: carried, with the earlier items whose file nothing touched."""
+            return {**render_summary.carried({"outside_diff": new, "prior_findings": verdicts, "questions": []},
+                                             {"outside_diff": earlier}, False, pages),
+                    "untouched": earlier if untouched else []}
+
+        # name, the earlier state's items, this run's items, its verdicts, the tag of bot thread 4, whether a.py is
+        # untouched since the last review, how many re-reviews run, what the checklist says (None: approved)
+        for name, earlier, new, verdicts, tag, untouched, runs, says in (
                 ("a P1 thread the re-review calls P2, fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P1",
-                 (), must),
-                ("a P2 thread fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P2", (), None),
-                ("an earlier P1 restated as P2, fixed above", [item("P1", None)], [item("P2")], [], None, (), must),
+                 False, 1, must),
+                ("a P2 thread fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P2", False, 1, None),
+                ("a P3 thread the re-review disputes at P1", [], [], [verdict("4", "P1", "disputed")], "P3", False, 1,
+                 "disputed"),
+                ("an earlier P1 restated as P2, fixed above", [item("P1", None)], [item("P2")], [], None, False, 1,
+                 must),
                 ("the most severe of two earlier items at one place", [item("P1", None, "x"), item("P2", None, "y")],
-                 [item("P2")], [], None, (), must),
+                 [item("P2")], [], None, False, 1, must),
                 ("an earlier P2 judged P1 and fixed above", [item("P2", None)], [],
-                 [verdict("a.py:1", "P1", "fixed_above")], None, (), must),
+                 [verdict("a.py:1", "P1", "fixed_above")], None, False, 1, must),
                 ("an earlier P1 judged fixed at P3, its file untouched", [item("P1", None)], [],
-                 [verdict("a.py:1", "P3", "fixed")], None, ("a.py:1",), "disputed"),
+                 [verdict("a.py:1", "P3", "fixed")], None, True, 1, "disputed"),
+                ("an earlier P1 judged fixed twice, its file untouched", [item("P1", None)], [],
+                 [verdict("a.py:1", "P1", "fixed")], None, True, 2, "disputed"),
+                ("a new P3 where an untouched earlier P1 was judged fixed", [item("P1", None)],
+                 [item("P3", None, "new")], [verdict("a.py:1", "P1", "fixed")], None, True, 1, "disputed"),
+                ("a P2 fixed above where an untouched earlier P1 was judged moot", [item("P1", None)], [item("P2")],
+                 [verdict("a.py:1", "P1", "moot")], None, True, 1, "disputed"),
                 ("a new P3 where an earlier P1 was fixed", [item("P1", None)], [item("P3", None, "new")],
-                 [verdict("a.py:1", "P1", "fixed")], None, (), None)):
+                 [verdict("a.py:1", "P1", "fixed")], None, False, 1, None)):
             with self.subTest(name):
                 pages = [threads_page(*([thread(4, f"**[{tag}]** x")] if tag else []))]
-                review = render_summary.carried({"outside_diff": new, "prior_findings": verdicts, "questions": []},
-                                                {"outside_diff": earlier}, False, pages)
+                review = run(earlier, new, verdicts, pages, untouched)
+                if runs == 2:  # the next re-review at the same head, from the state this one saved
+                    state = render_summary.read_state(render_summary.render(
+                        {**review, "since_last": "", "description_problems": [], "skipped": [], "types": ["bug"],
+                         "checked": [], "design": [], "latent": [],
+                         "risk": {"level": "low", "reason": "r", "look_at": []}},
+                        pages, "0123456789", "full", [9]))["outside_diff"]
+                    held = {f["location"] for f in state}
+                    review = run(state, new, [v for v in verdicts if v["ref"] in held], pages, untouched)
                 text, _, writes = self.approve({"value": "on"}, above=above, outside=review["outside_diff"],
-                                               prior=review["prior_findings"], untouched=untouched,
+                                               prior=review["prior_findings"], untouched=review["untouched"],
                                                extra={**still, "POST graphql": pages[0]})
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], says is None,
                                  f"{name}: a re-review would lower a P1 and approve, or a P2/P3 would block")
