@@ -593,6 +593,29 @@ def error_event(message: str, kind: str = "invalid_request_error", code: str | N
     return server_event("error", error=error)
 
 
+def _open_call(api, session_id: str, relay, **submit) -> tuple[str, asyncio.Task]:
+    """Open a realtime call's engine request, its input left open, and start
+    ``relay`` on its result stream, bound now (see ``APIServer._bind``): its
+    submission key and the relay's task. A refused call raises what
+    ``submit_request`` raises (``HTTPException``, ``ValueError``); see
+    ``_call_error``."""
+    request_id = api.submit_request(streaming=True, end_input=False, request_id=rid(f"rt-{session_id}"), **submit)
+    return api.submission_key(request_id), asyncio.create_task(relay(api.iter_result_chunks(request_id)))
+
+
+def _call_error(failure, upload_dir) -> tuple[dict, int]:
+    """The ``error`` event for a realtime call's failure, and its HTTP status:
+    a refused opening (``HTTPException`` or ``ValueError``), the
+    ``HTTPException`` its result stream raised, or its in-band error chunk."""
+    if isinstance(failure, HTTPException):
+        return error_event(str(failure.detail), kind=error_type(failure.status_code)), failure.status_code
+    if isinstance(failure, ValueError):
+        return error_event(_clip(_scrub_paths(str(failure), upload_dir))), 400
+    status = int((failure.metadata or {}).get("status") or 500)
+    message = bytes(failure.data).decode("utf-8", "replace")
+    return error_event(_clip(_scrub_paths(message, upload_dir)), kind=error_type(status)), status
+
+
 def response_object(response_id: str, status: str, modalities: list[str], output: list | None = None,
                     status_details: dict | None = None) -> dict:
     """A GA ``realtime.response``, as ``response.created`` / ``.done`` carry it."""
@@ -951,7 +974,9 @@ class RealtimeLiveTranscription(RealtimeTranscription):
     """A transcription session on a model that hears audio as it comes (one
     ``ClientAudio`` client stream and no turn tokens): each item is one engine
     request, opened by its first audio and ended by its commit, whose tokens go
-    out as deltas; nothing is re-decoded."""
+    out as deltas; nothing is re-decoded. If the item's call fails (or can't
+    open), the client gets an ``error``, the rest of the item's audio is
+    dropped, and its commit reports it failed."""
 
     def __init__(self, api, model_name: str, adapter, websocket: WebSocket, stream: Connection):
         super().__init__(api, model_name, adapter, websocket)
@@ -963,6 +988,8 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             self.session.max_item_seconds = stream.limits.max_items / stream.audio.sample_rate
         self.key: str | None = None
         self.relay_task: asyncio.Task | None = None
+        # the error event of this item's failed call (None: not failed)
+        self.failure: dict | None = None
 
     async def run(self) -> None:
         try:
@@ -978,22 +1005,25 @@ class RealtimeLiveTranscription(RealtimeTranscription):
         if key is not None:
             self.api.abort_submission(key)
 
+    async def _fail(self, event: dict) -> None:
+        """The item's call failed, or ended before its commit: it has ended, so
+        it takes no more of the item's audio."""
+        self.key = None
+        if self.failure is None:
+            self.failure = event
+            await self.send(event)
+
     async def _open(self) -> bool:
         s = self.session
         kwargs = {"language": s.request.language} if s.request.language else None
         try:
-            request_id = self.api.submit_request(
-                text=None, input_modalities=[], output_modalities=["text"], streaming=True, model_kwargs=kwargs,
-                request_id=rid(f"rt-{s.session_id}"), model=s.request.model, end_input=False,
+            self.key, self.relay_task = _open_call(
+                self.api, s.session_id, self.relay, text=None, input_modalities=[], output_modalities=["text"],
+                model_kwargs=kwargs, model=s.request.model,
             )
-        except HTTPException as exc:
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+        except (HTTPException, ValueError) as exc:
+            await self._fail(_call_error(exc, self.api.upload_dir)[0])
             return False
-        except ValueError as exc:
-            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
-            return False
-        self.key = self.api.submission_key(request_id)
-        self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(request_id)))
         return True
 
     async def relay(self, chunks) -> None:
@@ -1014,23 +1044,25 @@ class RealtimeLiveTranscription(RealtimeTranscription):
                         created=now(),
                     ))
                 elif chunk.modality == "error":
-                    http_status = int((chunk.metadata or {}).get("status") or 500)
-                    message = bytes(chunk.data).decode("utf-8", "replace")
-                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
-                                                kind=error_type(http_status)))
+                    await self._fail(_call_error(chunk, self.api.upload_dir)[0])
         except HTTPException as exc:   # the request failed, so it has ended too
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            await self._fail(_call_error(exc, self.api.upload_dir)[0])
+            return
+        if self.key is not None:   # not ended by the commit
+            await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
 
     async def step(self, chunk: np.ndarray, final: bool = False) -> None:
         s = self.session
-        if self.key is None and not await self._open():
+        if self.failure is not None or (self.key is None and not await self._open()):
+            return   # the item has failed: its error is sent, and its commit reports it
+        try:
+            if not self.api.stream_input(self.key, samples={self.stream: chunk}):
+                return   # the call has ended: its relay reports why
+        except ValueError as exc:  # past the call's input budget: the item ends with it
+            self.api.reject_input(self.key, f"append rejected: {exc}", 400)
             return
         s.streamed_samples += int(chunk.size)
         s.chunk_id += 1
-        try:
-            self.api.stream_input(self.key, samples={self.stream: chunk})
-        except ValueError as exc:  # past the call's input budget: the item ends with it
-            self.api.reject_input(self.key, f"append rejected: {exc}", 400)
 
     async def commit(self) -> None:
         """End the item: its stream ends, and the rest of its tokens arrive."""
@@ -1040,20 +1072,30 @@ class RealtimeLiveTranscription(RealtimeTranscription):
             await self.step(tail, final=True)
         key, task = self.key, self.relay_task
         self.key = self.relay_task = None
-        if key is not None:
-            self.api.stream_input(key, end_input=True)
+        ended = key is None or self.api.stream_input(key, end_input=True)
+        if task is not None:
             await task
-        await self.emit(self.current_text(), hold=0)
+        if not ended:
+            await self._fail(error_event("this item's transcription ended before its commit", kind="server_error"))
         await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id))
-        await self.send(server_event(
-            "conversation.item.input_audio_transcription.completed",
-            item_id=s.item_id, transcript=self.current_text(),
-        ))
+        if self.failure is not None:
+            await self.send(server_event(
+                "conversation.item.input_audio_transcription.failed",
+                item_id=s.item_id, content_index=0, error=self.failure["error"],
+            ))
+        else:
+            await self.emit(self.current_text(), hold=0)
+            await self.send(server_event(
+                "conversation.item.input_audio_transcription.completed",
+                item_id=s.item_id, transcript=self.current_text(),
+            ))
+        self.failure = None
         s.clear()
 
     def clear_item(self) -> None:
         """A clear drops the item's call too: what it heard can't be unheard."""
         self._abort()
+        self.failure = None
         super().clear_item()
 
 
@@ -1120,7 +1162,6 @@ class RealtimeConversation:
         self.instructions = ""
         self.turn_detection = "server_vad"
         self.odd_byte = b""
-        self.request_id: str | None = None
         self.key: str | None = None
         self.relay_task: asyncio.Task | None = None
         self.clock_task: asyncio.Task | None = None
@@ -1379,19 +1420,13 @@ class RealtimeConversation:
         the server refused it (at capacity, say)."""
         text = self.instructions or None
         try:
-            self.request_id = self.api.submit_request(
+            self.key, self.relay_task = _open_call(
+                self.api, self.session_id, self.relay,
                 text=text, input_modalities=["text"] if text else [], output_modalities=["text", "audio"],
-                streaming=True, request_id=rid(f"rt-{self.session_id}"), end_input=False,
             )
-        except HTTPException as exc:
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+        except (HTTPException, ValueError) as exc:
+            await self.send(_call_error(exc, self.api.upload_dir)[0])
             return False
-        except ValueError as exc:
-            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
-            return False
-        self.key = self.api.submission_key(self.request_id)
-        # bound now, before anything else runs (see APIServer._bind)
-        self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(self.request_id)))
         self.played_until = time.monotonic()
         self.clock_task = asyncio.create_task(self._clock())
         return True
@@ -1408,15 +1443,13 @@ class RealtimeConversation:
                 elif chunk.modality == "audio":
                     await self._on_audio(chunk)
                 elif chunk.modality == "error":
-                    http_status = int((chunk.metadata or {}).get("status") or 500)
-                    message = bytes(chunk.data).decode("utf-8", "replace")
-                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
-                                           kind=error_type(http_status)))
+                    event, http_status = _call_error(chunk, self.api.upload_dir)
+                    await self.send(event)
                     status, code = "failed", 1011 if http_status >= 500 else 1000
             self.call_over = True
         except HTTPException as exc:   # the request failed, so it has ended too
             self.call_over = True
-            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            await self.send(_call_error(exc, self.api.upload_dir)[0])
             status, code = "failed", 1011
         except Exception as exc:  # noqa: BLE001 — the socket must still close
             error_id = uuid.uuid4().hex[:12]

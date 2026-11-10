@@ -1735,27 +1735,37 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
 
 
 class _LiveTranscriptionAPI(_DuplexAPI):
-    """A model with one audio client stream and no turn marks: one call per item."""
+    """A model with one audio client stream and no turn marks: one call per
+    item, whose output ends once its input does, or after an error chunk."""
 
     def __init__(self, outputs=()):
-        super().__init__(outputs, end=True)
+        super().__init__(outputs)
         self.model.turn_tokens = None
         self.ended: list = []
+        self.input_ended: asyncio.Event | None = None
 
     def stream_input(self, key, file_paths=None, end_input=False, *, samples=None, **kw):
         assert file_paths is None
         if end_input:
             self.ended.append(key)
+            self.input_ended.set()
         else:
             self.appends.append(samples["audio_in"])
         return True
 
+    async def _chunks(self):
+        self.input_ended = asyncio.Event()
+        for chunk in self.outputs:
+            yield chunk
+            if chunk.modality == "error":
+                return
+        await self.input_ended.wait()
 
-def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
+
+def _live_socket(monkeypatch, api, path="/v1/realtime?intent=transcription"):
     import mstar.api_server
     from mstar.api_server.openai import router as router_module
 
-    api = _LiveTranscriptionAPI([_text(0, b" hello"), _text(1, b" world")])
     fake_ep = types.ModuleType("mstar.api_server.entrypoint")
     fake_ep.api_server = api
     monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
@@ -1763,7 +1773,12 @@ def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
     monkeypatch.setattr(router_module, "get_adapter", lambda name: adapters.TransducerAdapter())
     app = FastAPI()
     app.include_router(router_module.router)
-    with TestClient(app).websocket_connect("/v1/realtime?intent=transcription") as ws:
+    return TestClient(app).websocket_connect(path)
+
+
+def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
+    api = _LiveTranscriptionAPI([_text(0, b" hello"), _text(1, b" world")])
+    with _live_socket(monkeypatch, api) as ws:
         assert ws.receive_json()["type"] == "transcription_session.created"
         ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
         ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
@@ -1777,3 +1792,26 @@ def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
         ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
         _recv_until(ws, "conversation.item.input_audio_transcription.completed")
         assert len(api.submits) == 2
+
+
+def test_a_live_item_whose_call_fails_is_reported_failed(monkeypatch):
+    """A call that fails mid-item sends its error; the rest of the item's
+    audio goes nowhere, its commit reports it failed, not completed, and the
+    next item opens a call of its own."""
+    api = _LiveTranscriptionAPI([_text(0, b" hello"), _Chunk("error", b"boom", {"status": 500})])
+    with _live_socket(monkeypatch, api) as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        assert _recv_until(ws, "error")[-1]["error"] == {"type": "server_error", "message": "boom"}
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        _recv_until(ws, "input_audio_buffer.committed")
+        failed = ws.receive_json()
+        assert failed["type"] == "conversation.item.input_audio_transcription.failed"
+        assert failed["error"]["message"] == "boom"
+        assert len(api.appends) == 1 and not api.ended
+        api.outputs = [_text(0, b" again")]
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.1)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        done = _recv_until(ws, "conversation.item.input_audio_transcription.completed")[-1]
+        assert done["transcript"] == "again" and len(api.submits) == 2

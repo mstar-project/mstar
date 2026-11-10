@@ -585,7 +585,11 @@ Per-model notes:
   opened by its first append and ended by its commit, so its text streams as
   ``conversation.item.input_audio_transcription.delta`` events while the audio is still
   arriving, and ``mstar.transcription.partial`` events report the audio covered so far. No
-  ``chunk_seconds`` applies, and an item holds up to the model's bound on a live call.
+  ``chunk_seconds`` applies, and an item holds up to the model's bound on a live call. If an
+  item's request fails (or can't open), the server sends an ``error``, drops the rest of the
+  item's audio, and answers its commit with
+  ``conversation.item.input_audio_transcription.failed``; the next item opens a request of its
+  own.
 - **Realtime turn detection** — by default the client ends each utterance with
   ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
   server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),
