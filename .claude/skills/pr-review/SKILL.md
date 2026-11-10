@@ -617,12 +617,14 @@ judgement, as the summary's status line counts them) and no skipped file. Otherw
 and asks for `/review` again; an open question and the design risk don't hold it back, though both
 still stop approval.
 
-The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
+The bot overrides the review's call in three cases: when the PR's last live test didn't pass on an
 ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
 the live test runs in full, with both kinds of check, whatever the review asked for, so a failure is
 never hidden behind a narrower run; and so does a re-review's `targeted` when no live test ran
 before it, since no GPU run covered the commits that review built on, and its `none` too unless the
-PR changes only docs, tests and benchmarks. A re-review with `untestable` set is exempt from both:
+PR changes only docs, tests and benchmarks; and so does any call when the last pass didn't run on every GPU
+vendor this run needs (NVIDIA only, on a PR that names AMD hardware). A re-review with `untestable` set
+(beyond what an AMD box covers) is exempt from all three:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
 run" with your reason, and a person approves.
