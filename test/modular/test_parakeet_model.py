@@ -206,8 +206,14 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     assert done({"audio": [_pointer(1)]}) == {"default": False, "Encoder": True, "Decoder": True}
     assert done({}) == {"default": True, "Encoder": False, "Decoder": False}
     # a live call opens with no audio: nothing for the data worker to load, only the prompt
-    out = model.process_prompt(None, [], ["text"], tensors={}, language="de")
+    out = model.process_prompt(None, [], ["text"], tensors={}, language="de", open_streams=frozenset({"audio_in"}))
     assert out.new_input_tensors == {} and out.metadata == {PROMPT_ID: 2}
+    # a live call that opens with a clip, or a one-shot call with no audio, is refused
+    clip = {"audio_inputs": [torch.zeros(16000)]}
+    with pytest.raises(ValueError, match="stream"):
+        model.process_prompt(None, ["audio"], ["text"], tensors=clip, open_streams=frozenset({"audio_in"}))
+    with pytest.raises(ValueError, match="exactly one audio input"):
+        model.process_prompt(None, [], ["text"], tensors={}, open_streams=frozenset())
 
 
 def test_a_deployment_hears_live_calls_only_when_it_asks(tmp_path):

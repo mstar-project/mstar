@@ -318,9 +318,13 @@ class ParakeetModel(Model):
         exist, and Nemotron's language prompt from ``language`` (a locale such
         as ``en-US``, a bare code, or ``auto``, the default). Parakeet-TDT
         detects the language itself and refuses only a ``language`` it
-        doesn't know. A live call has no clip: its audio comes on the client
-        stream."""
-        if self.live and not (tensors or {}).get("audio_inputs"):
+        doesn't know. A live call (a client stream left open) has no clip: its
+        audio comes on the stream."""
+        if self.live and kwargs.get("open_streams"):
+            if (tensors or {}).get("audio_inputs"):
+                # the clip would take the whole-clip walk, and the stream's appends find no consumer
+                raise ValueError("a live call's audio comes on its stream: open it with no audio and append it, "
+                                 "or send a whole clip with end_input: true")
             return ProcessPromptOutput({}, {PROMPT_ID: self.config.prompt_id(kwargs.get("language"))})
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "this model")
         metadata = {NUM_FRAMES: self._num_frames(samples.shape[0])}
