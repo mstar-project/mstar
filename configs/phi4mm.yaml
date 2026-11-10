@@ -11,3 +11,7 @@ resources:
   lora:
     max_slots: 2
     max_rank: 320
+# A step's host work on the main thread: at c=128 the GPU and plan threads slowed
+# every phase of the step (5.5 against 7.1 ms a step, H200); level at c<=64.
+knobs:
+  step_threads: serial
