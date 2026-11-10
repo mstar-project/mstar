@@ -21,10 +21,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.config import INDEX_PLANES
-
-# Bytes of fp32 prefill scores per launch: a chunk of rows is as wide as its last row's pools.
-PREFILL_SCORE_BYTES = 256 << 20
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig
 
 
 class DSASpan(NamedTuple):
@@ -128,18 +125,22 @@ def _pool_keys_torch(view: torch.Tensor, ctx: KPoolContext, ape: torch.Tensor,
 # -- selection ---------------------------------------------------------------------------------
 
 def select(q: torch.Tensor, w: torch.Tensor, view: torch.Tensor,
-           ctx: KPoolContext, group=None) -> torch.Tensor:
+           ctx: KPoolContext, group=None, *,
+           score_bytes: int = DSAConfig.prefill_score_bytes,
+           shard_min_rows: int = DSAConfig.shard_min_rows) -> torch.Tensor:
     """``[rows, width]`` int32 cache slots each row attends: its top pools' tokens, then its
     tail; entries past ``attn_lens`` are unused. ``w (rows, NH)`` is fp32 with the scales
-    folded in, ``view`` the layer's index plane. A TP ``group`` splits a prefill's rows."""
+    folded in, ``view`` the layer's index plane. A TP ``group`` splits a prefill's rows.
+    ``score_bytes`` and ``shard_min_rows`` are the resource's ``DSAConfig`` sizing."""
     if ctx.spans is None or all(n == 1 for _, n, _ in ctx.spans):  # decode: capturable
         scores = _decode_scores(q, w, view, ctx)
         return expand_slots(top_pools(scores, ctx), ctx)
     out = torch.empty(q.shape[0], ctx.width, dtype=torch.int32, device=q.device)
     for r0, n, req in ctx.spans:
         out[r0:r0 + n] = sparse_mla.select_rows(
-            lambda a, b, req=req: _select_rows(q, w, view, ctx, req, a, b),
-            r0, r0 + n, ctx.width, q.device, group, _request_pages(ctx, req))
+            lambda a, b, req=req: _select_rows(q, w, view, ctx, req, a, b, score_bytes),
+            r0, r0 + n, ctx.width, q.device, group, _request_pages(ctx, req),
+            min_rows=shard_min_rows)
     return out
 
 
@@ -149,12 +150,12 @@ def _request_pages(ctx: KPoolContext, req: int) -> sparse_mla.RequestPages:
     return sparse_mla.RequestPages(ctx.pages[starts[req]:end], ctx.page_size)
 
 
-def _select_rows(q, w, view, ctx, req, r0, r1):
+def _select_rows(q, w, view, ctx, req, r0, r1, score_bytes):
     """Rows ``[r0, r1)`` of request ``req``'s prefill, in chunks as wide as their last row's
-    pools and at most ``PREFILL_SCORE_BYTES`` of scores."""
+    pools and at most ``score_bytes`` of fp32 scores."""
     out = torch.empty(r1 - r0, ctx.width, dtype=torch.int32, device=q.device)
     last = ctx.host_pos[r1 - 1]
-    chunk = max(1, PREFILL_SCORE_BYTES // (4 * max(1, (last + 1) // ctx.kpool)))
+    chunk = max(1, score_bytes // (4 * max(1, (last + 1) // ctx.kpool)))
     for c0 in range(r0, r1, chunk):
         c1 = min(c0 + chunk, r1)
         pools = max(1, (ctx.host_pos[c1 - 1] + 1) // ctx.kpool)  # causal: the last row's
