@@ -27,7 +27,7 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
     samples_greedy,
 )
-from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
+from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, AdmitRuntimeError, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -436,6 +436,20 @@ class SamplerResource(Resource):
     def grew_since(self, mark: int) -> bool:
         return self._cg_buffers.free_rows > mark
 
+    def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
+        """Fail the rows whose grammar can no longer be served (it failed to
+        compile, or refused a drawn token): an error to the client rather than a
+        reply its constraint stopped holding. The same on every rank, which
+        compile and accept the same tokens."""
+        if self._grammar is None or not self._grammar.any_of(ctx.request_ids):
+            return ADMIT_OK
+        failed = self._grammar.failures(ctx.request_ids)
+        if not failed:
+            return ADMIT_OK
+        return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
+            message="; ".join(sorted(set(failed.values()))), request_ids=frozenset(failed),
+        ))
+
     def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
         """Settle this step's two penalty flags (and whether it filters).
         """
@@ -741,10 +755,6 @@ class SamplerResource(Resource):
             tokens = self._eager_draw if self._cg_sampler is None else self._cg_sampler.last_token_buf
             if tokens is not None:
                 self._grammar.note_draws(ctx.request_ids, tokens, self._kept_rids_of(step, ctx))
-            else:
-                # the forward drew without `sample` (a draft verify's argmax): the mask
-                # never applied, so the rows go free rather than track tokens they never saw
-                self._grammar.release(ctx.request_ids, "this step drew its tokens outside the sampler")
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return

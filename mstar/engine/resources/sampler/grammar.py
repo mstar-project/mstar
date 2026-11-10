@@ -14,7 +14,6 @@ apply over the slot's static mask buffer.
 from __future__ import annotations
 
 import json
-import logging
 import math
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -24,8 +23,6 @@ import torch
 
 if TYPE_CHECKING:
     from mstar.model.utils import TextOutput
-
-logger = logging.getLogger(__name__)
 
 # The request field: vLLM's ``structured_outputs`` shape (one of these keys), plus
 # ``after``, the text that opens the constrained part (a reasoning model's think-end tag).
@@ -158,45 +155,35 @@ def response_format_request(response_format: Any) -> dict | None:
 
 
 class _Row:
-    """One request's matcher, compiled in the background: the first step that
-    needs it waits for the compile (usually done by then: the prefill runs first)."""
-    __slots__ = ("_compiled", "_matcher", "active")
+    """One request's matcher, compiled in the background, and ``error``: why
+    the row can no longer be served, which fails its request at its next admit."""
+    __slots__ = ("_compiled", "_matcher", "error")
 
     def __init__(self, compiled: Future):
         self._compiled = compiled
         self._matcher = None
-        self.active = True
+        self.error: str | None = None
 
     @property
     def matcher(self):
-        if self._matcher is None:
-            try:
+        """None once the row failed; the first use waits for the compile."""
+        if self._matcher is None and self.error is None:
+            failed = self._compiled.exception()
+            if failed is not None:
+                self.error = f"structured_outputs grammar failed to compile: {failed}"
+            else:
                 self._matcher = _xgr().GrammarMatcher(self._compiled.result())
-            except Exception:
-                # checked tokenizer-free at the conductor already; a compile that
-                # still fails leaves the row free rather than failing its batch
-                logger.exception("structured_outputs grammar failed to compile; the row draws freely")
-                self.active = False
-                raise
-        return self._matcher
+        return None if self.error is not None else self._matcher
 
     @property
     def constrained(self) -> bool:
-        if not self.active:
-            return False
-        try:
-            return not self.matcher.is_terminated()
-        except Exception:
-            return False
+        matcher = self.matcher
+        return matcher is not None and not matcher.is_terminated()
 
     def accept(self, token: int) -> None:
-        if not self.constrained:
-            return
-        if not self.matcher.accept_token(token):
-            # the mask allowed it, so this is a row the mask did not cover; its
-            # output is not checked
-            logger.warning("grammar refused token %d; the row's constraint is off from here", token)
-            self.active = False
+        if self.constrained and not self._matcher.accept_token(token):
+            # the mask allowed it, so the draw was not the one the mask covered
+            self.error = f"structured_outputs grammar refused drawn token {token}"
 
 
 class GrammarRows:
@@ -244,12 +231,10 @@ class GrammarRows:
     def remove(self, rid) -> None:
         self._rows.pop(rid, None)
 
-    def release(self, rids, why: str) -> None:
-        """Stop constraining ``rids``: their draws can no longer be tracked."""
-        for rid in rids:
-            row = self._rows.pop(rid, None)
-            if row is not None:
-                logger.error("structured_outputs dropped for request %r: %s", rid, why)
+    def failures(self, rids) -> dict:
+        """Why each of ``rids`` that can no longer be served can't, by rid."""
+        rows = self._rows
+        return {rid: row.error for rid in rids if (row := rows.get(rid)) is not None and row.matcher is None}
 
     def note_draws(self, rids, tokens: torch.Tensor, kept) -> None:
         """Queue the copy of this step's drawn tokens for its constrained rows

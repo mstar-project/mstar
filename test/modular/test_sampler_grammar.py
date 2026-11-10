@@ -15,7 +15,7 @@ from mstar.api_server.openai.adapters import _constrain_after_thinking, _refuse_
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.engine.resources.sampler import utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
-from mstar.engine.resources.sampler.grammar import grammar_request  # noqa: E402
+from mstar.engine.resources.sampler.grammar import GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.engine.resources.step import SlotLease, StepContext  # noqa: E402
 
@@ -130,6 +130,29 @@ def test_a_replay_commits_the_draw_of_the_graph_it_replays():
     logits = torch.zeros(4, V)
     logits[:, a] = 1.0
     assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
+
+
+@pytest.mark.parametrize("failure", ["compile", "refused draw"])
+def test_a_grammar_that_can_no_longer_hold_fails_its_request(failure):
+    """A grammar that fails to compile, or a draw it refuses, is the request's
+    error at its next admit, not a reply that silently stops following it."""
+    res = _resource(graph=True)
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    if failure == "compile":
+        # past the tokenizer-free check, as a grammar xgrammar compiles differently would be
+        res.ingest_request(0, SamplingReqConfig(grammar=GrammarRequest("grammar", "root ::= undefined_rule")))
+    else:
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+        res.plan(step, ctx)
+        # a replay whose draw the mask did not cover
+        res._cg_sampler.last_token_buf.fill_(VOCAB.index(b"x"))
+        res.commit(step, ctx)
+        res.plan(step, ctx)
+    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    outcome = res.admit(step, ctx)
+    assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}
 
 
 def test_after_starts_the_grammar_once_the_reply_holds_its_text():

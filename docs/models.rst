@@ -745,9 +745,10 @@ JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``gr
 that text, so a reasoning model thinks freely first. An unsupported schema is a 400, and
 so is a request on a deployment without ``enable_grammar``. The captured sampler then applies
 a bitmask every step, and a step holding a constrained row waits for its rows' last draws to
-reach the host before it launches. Not served with it yet: speculative decoding (a node whose
-decode drafts and verifies outside the sampler, as GLM's MTP does, drops the constraint with an
-error in the log), resident planning, and a text sampler split across prefill and decode workers.
+reach the host before it launches. A grammar that fails to compile, or refuses a drawn token,
+fails its request with an error rather than letting the reply go unconstrained. Not served with
+it yet: speculative decoding (no model that declares ``text_output()`` drafts outside its
+sampler), resident planning, and a text sampler split across prefill and decode workers.
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
