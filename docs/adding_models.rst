@@ -2831,7 +2831,7 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    preprocess_workers: 2
 
 The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
-V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
+V-JEPA2, Cosmos3, Parakeet, Nemotron ASR and Omnilingual ASR declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
 and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs set 1, since
 a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
