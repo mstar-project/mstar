@@ -762,8 +762,8 @@ and tool calls split out, streamed or whole. Any ``model`` name gets the loaded 
 (with LoRA adapters served, ``model`` picks one as on chat completions), ``count_tokens`` counts the prompt as the same request would render it, and responses are
 stateless.
 
-- **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages)
-  match the answer only, not the reasoning or a call's arguments. The first to appear ends
+- **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages,
+  at most 16 of at most 256 characters) match the answer only, not the reasoning or a call's arguments. The first to appear ends
   the reply before it (``finish_reason: "stop"``, ``stop_reason: "stop_sequence"``) and stops
   the request in the engine.
 - **Forced calls.** ``tool_choice`` ``"required"`` or a named function (Messages: ``any`` or
