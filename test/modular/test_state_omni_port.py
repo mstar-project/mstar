@@ -28,7 +28,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import host
 from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, sampling_configs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.host_fields import HostFields
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.code_predictor_kernels import DepthKV

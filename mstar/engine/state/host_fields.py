@@ -7,7 +7,7 @@ and a step that never runs commits nothing, so applying them any earlier would c
 from collections.abc import Collection, Mapping
 from typing import NamedTuple, get_args, get_origin
 
-from mstar.engine.state.contract import Array, ArrayStep, FrozenMap, is_value
+from mstar.engine.state.contract import Array, ArrayStep, FrozenMap
 
 
 def is_host_value(value: object, kind: type) -> bool:
@@ -45,7 +45,6 @@ class HostFields:
         self._fields: dict[int, dict[EntryKey, FrozenMap]] = {}
 
     def declare(self, array: Array) -> None:
-        assert is_value(array), f"Array {array.name!r}: only a Value holds host fields"
         self._arrays[array.name] = array
 
     def open(self, request: int) -> None:

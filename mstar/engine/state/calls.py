@@ -12,7 +12,6 @@ import torch
 
 from mstar.engine.resources.step import StepHandle
 from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
-from mstar.engine.state.host import HostFields, is_host_value
 
 
 class ArrayHandle(StepHandle):
@@ -28,12 +27,8 @@ class ArrayHandle(StepHandle):
     # whether a step that lists the array has anything to do for it
     needs_step = True
 
-    def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None,
-        host_fields: HostFields | None = None,
-    ):
+    def __init__(self, array: Array, resources: Mapping[str, Any], positions_key: str | None):
         self.array = array
-        self.host_fields = host_fields
         # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
         self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
@@ -109,33 +104,14 @@ class ArrayHandle(StepHandle):
                                 "adds on others, and every layer stays the same length")
 
     def commit_step(self, step) -> None:
-        if self.host_fields is not None:
-            self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
+        """Nothing: the resources hold what a step keeps of the array."""
 
     def end_step(self, step) -> None:
         self._open = False
         self._held = self._held_layer = None
 
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
-        if self.host_fields is None:
-            raise self._refusal("a host write, and the array declares no host fields")
-        if not declared.keep:
-            raise self._refusal("a host write on a step that keeps nothing, which has no commit to apply it at")
-        for (row, label, layer), written in declared.host.items():
-            where = f"a host write on row {row}, label {label!r}, layer {layer}"
-            if not ctx.is_real_row(row):
-                raise self._refusal(f"{where}, and that row isn't one of the step's requests")
-            if label not in self.array.labels or layer not in self.array.layers:
-                raise self._refusal(f"{where}, and the array declares labels {sorted(self.array.labels)} and layers "
-                                    f"{sorted(self.array.layers)}")
-            if not self.host_fields.is_open(row):
-                raise self._refusal(f"{where}, and that request has no open fields")
-            for field, value in written.items():
-                kind = self.array.entry.host.get(field)
-                if kind is None:
-                    raise self._refusal(f"{where}: field {field!r} isn't declared, of {sorted(self.array.entry.host)}")
-                if not is_host_value(value, kind):
-                    raise self._refusal(f"{where}: field {field!r} takes {kind}, and got {value!r}")
+        raise self._refusal("a host write, and the array declares no host fields")
 
     def _check_step(self, declared: ArrayStep, segments, ctx) -> None:
         declared_labels = self.array.labels
@@ -232,6 +208,9 @@ class ArrayHandle(StepHandle):
         field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
+    def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
+        raise self._unsupported("host")
+
 
 class SamplerHandle(StepHandle):
     """A node's calls on one declared sampler. Its rows are the step's, padding included."""
@@ -290,11 +269,7 @@ def gated_delta_net(
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:
     """One entry's host fields on the host, as the last committed step left them."""
-    layer = h._layer_id(layer)
-    fields = None if h.host_fields is None else h.host_fields.fields(request, h.name, label, layer)
-    if fields is None:
-        raise h._refusal(f"no host fields for request {request}, label {label!r}, layer {layer}")
-    return fields
+    return h._host(request, label, h._layer_id(layer))
 
 
 def position(h: ArrayHandle, rid_handle: int, label: str) -> int:

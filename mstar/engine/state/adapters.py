@@ -59,7 +59,7 @@ from mstar.engine.state.contract import (
     Window,
     is_value,
 )
-from mstar.engine.state.host import HostFields
+from mstar.engine.state.host_fields import HostFields, is_host_value
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
@@ -722,11 +722,10 @@ class ValueHandle(ArrayHandle):
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
-        host_fields: HostFields | None = None,
     ):
-        super().__init__(array, resources, positions_key, host_fields)
+        super().__init__(array, resources, positions_key)
         self._bindings = bindings
-        self._pool = resources[array.name] if array.entry.tensors else None
+        self._pool = resources[array.name]
         self._blocks = {
             field: {layer: self._pool.block(field, i) for layer, i in self._pool_layer.items()}
             for field in array.entry.tensors
@@ -735,7 +734,7 @@ class ValueHandle(ArrayHandle):
         self._layouts = _field_layouts(bindings)
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
-        if not declared.keep and self.array.updates:
+        if not declared.keep:
             raise self._refusal("keep=False on an array with updates, whose kernels write in place, until saved "
                                 "copies exist")
         super()._check_storage(declared, segments, ctx)
@@ -766,6 +765,47 @@ class ValueHandle(ArrayHandle):
         view = self.block(field, layer)
         self._record_update(field, layer)
         return runner, view
+
+
+class HostValueHandle(ArrayHandle):
+    """The calls on a Value of host fields only, which ``host_fields`` holds rather than a resource."""
+
+    def __init__(self, array: Array, host_fields: HostFields):
+        super().__init__(array, EMPTY, None)
+        self._bindings: tuple[BoundOp, ...] = ()
+        self.host_fields = host_fields
+        host_fields.declare(array)
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+
+    def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
+        if not declared.keep:
+            raise self._refusal("a host write on a step that keeps nothing, which has no commit to apply it at")
+        for (row, label, layer), written in declared.host.items():
+            where = f"a host write on row {row}, label {label!r}, layer {layer}"
+            if not ctx.is_real_row(row):
+                raise self._refusal(f"{where}, and that row isn't one of the step's requests")
+            if label not in self.array.labels or layer not in self.array.layers:
+                raise self._refusal(f"{where}, and the array declares labels {sorted(self.array.labels)} and layers "
+                                    f"{sorted(self.array.layers)}")
+            if not self.host_fields.is_open(row):
+                raise self._refusal(f"{where}, and that request has no open fields")
+            for field, value in written.items():
+                kind = self.array.entry.host.get(field)
+                if kind is None:
+                    raise self._refusal(f"{where}: field {field!r} isn't declared, of {sorted(self.array.entry.host)}")
+                if not is_host_value(value, kind):
+                    raise self._refusal(f"{where}: field {field!r} takes {kind}, and got {value!r}")
+
+    def commit_step(self, step) -> None:
+        self.host_fields.commit(self.array, step.state[self.name], step.ctx.request_ids)
+
+    def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
+        fields = self.host_fields.fields(request, self.name, label, layer)
+        if fields is None:
+            raise self._refusal(f"no host fields for request {request}, label {label!r}, layer {layer}")
+        return fields
 
 
 class WithinStepHandle(ArrayHandle):
@@ -986,19 +1026,7 @@ class ValueStorage(Storage):
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         return Resolved({array.name: self._specs(array, declared) for array in arrays}, {}, {})
 
-    def handle(
-        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
-    ) -> ArrayHandle:
-        if not array.entry.host:
-            return super().handle(array, resources, setup, resolved, sp_group)
-        setup.host_fields.declare(array)
-        return ValueHandle(array, resources, None, (), setup.host_fields)
-
     def _specs(self, array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
-        if array.entry.host and not array.entry.tensors:
-            # the engine holds a host field, so no resource does
-            return []
         if array.reads:
             raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
         if array.seq_sharded:
@@ -1029,10 +1057,26 @@ class ValueStorage(Storage):
         return [pool, *_op_specs(array, bound)]
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, steps: dict[str, Any]) -> None:
-        if not handle.array.entry.tensors:
-            return
         pre, post, rows = _forks(handle.array, declared)
         steps[handle.name] = RecurrentStep(segments=declared.segments, pre_forks=pre, post_forks=post, fork_rids=rows)
+
+
+class HostValueStorage(Storage):
+    """A Value of host fields only, which the engine holds, so it has no spec, no step and no layout."""
+
+    handle_class = HostValueHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        for array in arrays:
+            if array.reads or array.updates:
+                raise _no_layout(array, "a Value of host fields only takes no read or update")
+        return Resolved({array.name: [] for array in arrays}, {}, {})
+
+    def handle(
+        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
+        sp_group: CommGroup | None,
+    ) -> ArrayHandle:
+        return HostValueHandle(array, setup.host_fields)
 
 
 class WithinStepStorage(Storage):
@@ -1082,13 +1126,14 @@ class WithinStepStorage(Storage):
 
 PAGED = PagedStorage()
 VALUE = ValueStorage()
+HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
 
 
 def storage_of(array: Array) -> Storage:
     """The storage today's resources keep ``array`` in."""
     if is_value(array):
-        return VALUE
+        return VALUE if array.entry.tensors else HOST_VALUE
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     return PAGED if array.max_len else WITHIN_STEP

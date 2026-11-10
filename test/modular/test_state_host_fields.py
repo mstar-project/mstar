@@ -27,7 +27,7 @@ from mstar.engine.state.adapters import (
     state_steps,
 )
 from mstar.engine.state.calls import ArrayHandle
-from mstar.engine.state.host import HostFields, is_host_value
+from mstar.engine.state.host_fields import HostFields, is_host_value
 
 RID = 3
 
