@@ -939,6 +939,26 @@ def test_qwen3_tts_decode_feeds_its_iterations_text_token_however_often_it_is_pr
     assert torch.equal(text_condition(9), pad)   # and stays used up
 
 
+def test_qwen3_tts_decode_past_the_text_adds_one_cached_pad_row():
+    """Every frame past the text adds TTS PAD. Indexing the text for it would cost host time on every row of every
+    step, so each such row takes the one row the Talker caches."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
+    hidden = config.talker.hidden_size
+    text = torch.cat([torch.randn(2, hidden), submodule._special_text_embeds(torch.float32)[2][0]])
+
+    def text_condition(iteration: int) -> torch.Tensor:
+        return submodule.prepare_inputs(
+            "talker_decode", SimpleNamespace(request_id="r", rid_handle="r"),
+            {"talker_input_embeds": [torch.zeros(1, hidden)], TALKER_TEXT: [text]},
+            input_metadata=InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": iteration}),
+        ).kwargs["text_condition"]
+
+    past = [text_condition(iteration) for iteration in (2, 3, 9)]
+    assert all(condition is past[0] for condition in past), "a frame past the text indexed it again"
+    assert torch.equal(past[0], text[-1]), "the cached row is the text's last"
+
+
 def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
