@@ -85,8 +85,8 @@ class Transcript:
 
 
 def _content_part(part) -> tuple[str, str | dict]:
-    """A chat content part's type and its content: the text of a ``text`` part,
-    else the part's object (``{"url"}``, or ``input_audio``'s ``{"data", "format"}``).
+    """A chat content part's type and its content: the text of a ``text`` or
+    ``refusal`` part, else the part's object (``{"url"}``, or ``input_audio``'s ``{"data", "format"}``).
     A part that is empty, malformed or of a type no model here reads is refused."""
     ptype = part.get("type") if isinstance(part, dict) else None
     if ptype is not None and not isinstance(ptype, str):
@@ -95,6 +95,10 @@ def _content_part(part) -> tuple[str, str | dict]:
         if not isinstance(part.get("text"), str) or not part["text"]:
             raise ValueError("a text content part needs a non-empty 'text' string")
         return ptype, part["text"]
+    if ptype == "refusal":
+        if not isinstance(part.get("refusal"), str) or not part["refusal"]:
+            raise ValueError("a refusal content part needs a non-empty 'refusal' string")
+        return ptype, part["refusal"]
     if ptype in ("image_url", "video_url", "audio_url"):
         body = part.get(ptype)
         if not isinstance(body, dict) or not isinstance(body.get("url"), str) or not body["url"]:
@@ -164,7 +168,9 @@ def flatten_messages(
             for part in content:
                 # an empty or unknown part is refused, as OpenAI does, not dropped
                 ptype, body = _content_part(part)
-                if ptype == "text":
+                if ptype == "refusal" and role != "assistant":
+                    raise ValueError("only an assistant message takes a refusal part")
+                if ptype in ("text", "refusal"):  # a replayed OpenAI history's refusal is what the assistant said
                     add_text(body, role)
                     continue
                 if role == "system":

@@ -55,10 +55,13 @@ def test_a_chat_request_keeps_each_message_role(tmp_path):
         {"role": "user", "content": "Name a color."},
         {"role": "assistant", "content": "Blue."},
         {"role": "user", "content": "Another."},
+        # a replayed OpenAI history: the assistant's refusal is what it said (it was a 400)
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I can't."}]},
     ])
     sa = adapters.BagelAdapter().chat_to_request(req, tmp_path)
     assert [(p.role, p.text) for p in sa.prompt_parts] == [
         ("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+        ("assistant", "I can't."),
     ], "a ChatMessage's role was dropped, so the chat reaches the model as one user turn"
 
 
@@ -400,6 +403,8 @@ _IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR
     ("user", {"text": "no type"}, "unsupported content part type None"),
     # worded as the Rust frontend words it
     ("user", {"type": True}, "a content part's 'type' must be a string"),
+    ("user", {"type": "refusal", "refusal": "No."}, "only an assistant message takes a refusal part"),
+    ("assistant", {"type": "refusal", "refusal": ""}, "a refusal content part needs a non-empty 'refusal' string"),
     # a system image reached the model as a user's attachment, which it then refused for another reason
     ("system", _IMAGE, "a system message takes text parts only"),
     ("developer", _IMAGE, "a system message takes text parts only"),

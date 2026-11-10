@@ -21,12 +21,13 @@ fn a_reply_stays_its_own_part() {
         r#"[{"role":"system","content":"Be brief."},
             {"role":"user","content":"Name a color."},
             {"role":"assistant","content":"Blue."},
-            {"role":"user","content":"Another."}]"#,
+            {"role":"user","content":"Another."},
+            {"role":"assistant","content":[{"type":"refusal","refusal":"I can't."}]}]"#,
         Path::new("/unused"),
     )
     .unwrap();
-    assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother."));
-    assert_eq!(in_mods, ["text", "text", "text", "text"]);
+    assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother.\nI can't."));
+    assert_eq!(in_mods, ["text", "text", "text", "text", "text"]);
     assert_eq!(
         described(&parts),
         [
@@ -34,6 +35,8 @@ fn a_reply_stays_its_own_part() {
             ("text", "user", Some("Name a color."), 0),
             ("text", "assistant", Some("Blue."), 0),
             ("text", "user", Some("Another."), 0),
+            // a replayed OpenAI history: the assistant's refusal is what it said
+            ("text", "assistant", Some("I can't."), 0),
         ],
         "text merged across a role change, so the reply lands inside a user turn"
     );
@@ -85,6 +88,8 @@ fn an_empty_unknown_or_misplaced_chat_part_is_refused() {
         ("user", r#"{"type":"text","text":""}"#, "a text content part needs a non-empty 'text' string"),
         ("user", r#"{"type":"file","file":{"file_id":"f"}}"#, "unsupported content part type 'file'; parts are text, image_url, video_url, audio_url or input_audio"),
         ("user", r#"{"type":true}"#, "a content part's 'type' must be a string"),
+        ("user", r#"{"type":"refusal","refusal":"No."}"#, "only an assistant message takes a refusal part"),
+        ("assistant", r#"{"type":"refusal","refusal":""}"#, "a refusal content part needs a non-empty 'refusal' string"),
         ("system", image, "a system message takes text parts only, not 'image_url'"),
         ("developer", image, "a system message takes text parts only, not 'image_url'"),
     ] {

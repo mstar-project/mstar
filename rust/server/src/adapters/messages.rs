@@ -46,6 +46,11 @@ pub fn flatten_messages(
             // an empty or unknown part is refused, as OpenAI does, not dropped
             match content_part(part)? {
                 ContentPart::Text(t) => add_text(&mut parts, t, role),
+                ContentPart::Refusal(_) if role != "assistant" => {
+                    return Err("only an assistant message takes a refusal part".to_string())
+                }
+                // a replayed OpenAI history's refusal is what the assistant said
+                ContentPart::Refusal(t) => add_text(&mut parts, t, role),
                 _ if role == "system" => {
                     // it would reach the model as a user's attachment
                     let ptype = part.get("type").and_then(Value::as_str).unwrap_or("");
@@ -80,6 +85,7 @@ pub fn flatten_messages(
 /// A chat content part's content (`_content_part` in `api_server/openai/adapters.py`).
 enum ContentPart<'a> {
     Text(&'a str),
+    Refusal(&'a str),
     Url { ptype: &'a str, url: &'a str },
     InputAudio { data: &'a str, format: &'a str },
 }
@@ -94,6 +100,9 @@ fn content_part(part: &Value) -> Result<ContentPart<'_>, String> {
         Some("text") => non_empty(part.get("text"))
             .map(ContentPart::Text)
             .ok_or_else(|| "a text content part needs a non-empty 'text' string".to_string()),
+        Some("refusal") => non_empty(part.get("refusal"))
+            .map(ContentPart::Refusal)
+            .ok_or_else(|| "a refusal content part needs a non-empty 'refusal' string".to_string()),
         Some(p @ ("image_url" | "video_url" | "audio_url")) => non_empty(part.get(p).and_then(|b| b.get("url")))
             .map(|url| ContentPart::Url { ptype: p, url })
             .ok_or_else(|| format!("the {p} content part needs a non-empty 'url' string")),
