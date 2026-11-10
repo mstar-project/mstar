@@ -489,8 +489,9 @@ Endpoints and model coverage:
        ``reasoning_content`` and ``tool_calls`` (not on ``--rust-frontend``). ``n`` or
        ``best_of`` above 1, ``stop`` (the GLMs serve it, see :ref:`coding-agents`), ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
        ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
-       other than text are refused. ``parallel_tool_calls``, ``user``, ``store``,
-       ``metadata`` and ``service_tier`` are accepted and have no effect; a stream ends
+       other than text are refused. ``user``, ``store``, ``metadata`` and ``service_tier``
+       are accepted and have no effect, and so is ``parallel_tool_calls`` except on the
+       GLMs, where ``false`` ends the reply at its first call; a stream ends
        with a usage chunk when ``stream_options`` sets ``include_usage``.
    * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
      - ``glm52``, ``glm5_next``
