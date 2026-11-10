@@ -55,7 +55,7 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 4. **`ERAS_RUN_SECRET_ID`**: save the box's own Anthropic key as an Eras secret and put its id in this repository variable. No GitHub secret holds it.
 5. **Both Anthropic keys in one Anthropic workspace with a spend limit.** The bot has no cap of its own.
 
-**Also before merge:** turn on "Require review from Code Owners" in `main`'s branch protection. `.github/CODEOWNERS` names who must approve a change under `.github/` or `.claude/` or to `.mcp.json` or `.claude.json` (the jobs that hold the keys import `.claude/`'s scripts and load its settings and MCP config), so a pushed workflow or skill can't reach the `review-bot` environment's keys on a bot approval alone (bot approvals don't count for code owners, and pushes don't dismiss them).
+**A change to the bot's own code** (anything under `.github/` or `.claude/`, `.mcp.json` or `.claude.json`, which the jobs that hold the keys run or load) needs a person's approval to merge. The approval rule never approves a PR touching those paths (`NEVER_DIRS`, `NEVER_ANY_DEPTH` and `NEVER_FILES` in `gpu_review.py`, counted against the default branch). A bot approval from before a push stops counting in the merge queue (`review-bot-approval-current`, below). Until the change merges, the environment's default-branch rule (item 1) keeps a workflow pushed on the PR's branch from reading the keys. Anyone with write access can give that approval: `.github/CODEOWNERS` only requests review from the people it names, and doesn't limit who can approve.
 
 **At merge, in this order** (nothing checks this order, so it is the only thing keeping it):
 
