@@ -470,14 +470,18 @@ def test_a_window_page_another_request_holds_is_no_room_once_the_first_rolls_it_
             break
         _remove(kv, "c")
 
+    pages = kv._allotments["a"].pages
     _grow(kv, "a", 40)
     kv.assert_pages_conserved()
+    assert (kv._allotments["a"].pages < pages) is b_decodes, (
+        "\"a\"'s allotment kept room for a page \"b\" holds but has no room to take over" if b_decodes
+        else "\"a\"'s allotment gave up room \"b\" took over"
+    )
 
-    if not b_decodes:
-        # and "a"'s allotment still covers the pages its window takes in their place through the rest of its prompt
-        _grow(kv, "a", 24)
-        _grow(kv, "a", 40)
-        kv.assert_pages_conserved()
+    # and "a"'s allotment still covers the pages its window takes in their place through the rest of its prompt
+    _grow(kv, "a", 24)
+    _grow(kv, "a", 40)
+    kv.assert_pages_conserved()
 
 
 def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node():
