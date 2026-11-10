@@ -818,7 +818,13 @@ The spec types are:
        pass to dense attention.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
-       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale, which every sparse
+       attention runs at. The build refuses a cache it cannot use: a page size that is not
+       a power-of-two multiple of ``kpool``, and on CUDA a cache that is not bf16 or a
+       FlashInfer before 0.6.18. A deployment sizes the resource under ``resources:``:
+       ``workspace_mb`` (the floor of each FlashInfer workspace), ``prefill_score_bytes``
+       (an eager prefill's scores per launch) and ``shard_min_rows`` (the rows per rank
+       from which a prefill's selection splits across TP ranks).
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
