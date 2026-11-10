@@ -499,7 +499,7 @@ def for_approval(review, pages):
 def fixed_only_above(review, pages, stacked):
     """The P0/P1 findings judged fixed in a PR stacked above, as a reason not to approve (none when there are
     none): a PR must fix its own P0/P1s. Their priority is the one judged gives them, at least the bot's own tag;
-    the checklist's "fixed above" lines already say the bot won't approve them."""
+    the checklist's "fixed above" lines already say each must be fixed in this PR."""
     review = render_summary.judged(review, pages, stacked)
     found = [*[(f["ref"], f["priority"]) for f in render_summary.prior_above(review)],
              *[(f["location"], f["priority"]) for f in review["outside_diff"] if f.get("fixed_in")]]

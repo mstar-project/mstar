@@ -248,28 +248,23 @@ def judged(review, pages, stacked):
     """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
     when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
     is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it.
-    A re-review's verdict on an earlier finding can raise its priority but never lower it: the verdict counts
-    at least at the tag the bot posted on its thread (`pages`) or at the outside-the-diff item's priority, and
-    that item at least at the verdict's."""
+    A re-review's verdict on an inline finding counts at least at the tag the bot posted on its thread
+    (`pages`); an earlier finding outside the diff keeps its own priority as a floor (carried)."""
     tags = inline_findings(pages)
-    verdicts = {f["ref"]: f["priority"] for f in review.get("prior_findings", [])}
-    items = {f["location"]: f["priority"] for f in review["outside_diff"]}
 
     def unchecked(f, text):
         note = f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
         return text if note in text else f"{text} {note}"
 
-    def outside(f):
-        f = {**f, "priority": min(f["priority"], verdicts.get(f["location"], "P3"))}
-        return f if not f.get("fixed_in") or f["fixed_in"] in stacked else \
-            {**{k: v for k, v in f.items() if k != "fixed_in"}, "detail": unchecked(f, f["detail"])}
-
     def prior(f):
-        f = {**f, "priority": min(f["priority"], tags.get(f["ref"], "P3"), items.get(f["ref"], "P3"))}
+        f = {**f, "priority": min(f["priority"], tags.get(f["ref"], "P3"))}
         return f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else \
             {**f, "status": "open", "why": unchecked(f, f["why"])}
 
-    return {**review, "outside_diff": [outside(f) for f in review["outside_diff"]],
+    return {**review,
+            "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
+                             {**{k: v for k, v in f.items() if k != "fixed_in"},
+                              "detail": unchecked(f, f["detail"])} for f in review["outside_diff"]],
             "prior_findings": [prior(f) for f in review.get("prior_findings", [])]}
 
 
@@ -291,7 +286,8 @@ def carried(review, earlier, answered):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
-    still open loses any `fixed_in` from before); its risk level as a floor, with the `look_at` that names
+    still open loses any `fixed_in` from before), and one this review restates keeps the earlier priority as a
+    floor; its risk level as a floor, with the `look_at` that names
     the decision, unless a maintainer other than the author has commented since (`answered`), when this review's
     judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
     (`answered_questions`), so one comment can't drop the rest; and what the live test can't exercise
@@ -300,6 +296,7 @@ def carried(review, earlier, answered):
     earlier = earlier or {}
     verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
+    floor = {f["location"]: f["priority"] for f in earlier.get("outside_diff", [])}
 
     def with_verdict(f):
         verdict = verdicts.get(f["location"])
@@ -309,7 +306,8 @@ def carried(review, earlier, answered):
         fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
         return {**kept, "fixed_in": fixed_in} if fixed_in else kept
 
-    review = {**review, "outside_diff": [*review["outside_diff"], *[
+    review = {**review, "outside_diff": [
+        *[{**f, "priority": min(f["priority"], floor.get(f["location"], "P3"))} for f in review["outside_diff"]], *[
         with_verdict(f) for f in earlier.get("outside_diff", []) if f["location"] not in locations
         and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
     if not answered:
@@ -410,7 +408,7 @@ def prior_above(review):
 
 
 def above(finding):
-    must = " The bot won't approve this PR until it's fixed in this PR." if finding["priority"] in MUST_FIX_HERE \
+    must = " A P0/P1 has to be fixed in this PR itself, not only above." if finding["priority"] in MUST_FIX_HERE \
         else ""
     return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it.{must}"
 
