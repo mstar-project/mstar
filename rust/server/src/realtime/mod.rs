@@ -1192,7 +1192,7 @@ pub async fn realtime(
     let converses = audio.is_some() && no_conversation.is_none();
     let limit = crate::ws::max_message_bytes();
     let ws = ws.max_message_size(limit).max_frame_size(limit);
-    if let (Some(facts), None | Some("transcription")) = (audio.filter(|f| f.live_transcription()), intent) {
+    if let (Some(facts), None | Some("transcription")) = (audio.and_then(|f| f.live.as_ref()), intent) {
         if let Some(adapter) = crate::adapters::from_python(&st.python_adapter) {
             let s = Session::new(&st, adapter);
             return ws.on_upgrade(move |socket| live::Live::session(st, adapter, socket, s, facts).run());
@@ -1233,7 +1233,7 @@ pub async fn realtime(
 
 /// Whether the model hears transcription as it comes (`Model.live_transcription_stream`).
 pub fn live_transcription() -> bool {
-    conversation::facts().is_some_and(conversation::Facts::live_transcription)
+    conversation::facts().is_some_and(|f| f.live.is_some())
 }
 
 /// Load the turn detection models once at startup, so a missing one is a

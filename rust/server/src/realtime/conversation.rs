@@ -55,13 +55,13 @@ pub struct Facts {
     pub streams: usize,
     pub turn_tokens: bool,
     pub channels: i64,
-    /// the stream, for a model that converses or hears transcription as it comes
+    /// the stream of a model that hears transcription as it comes
+    /// (`Model.live_transcription_stream`); `None`: it doesn't
+    pub(super) live: Option<LiveFacts>,
+    /// the rest only for a model that converses: its stream, and how it replies
     pub(super) stream: String,
     pub(super) rate: usize,
     pub(super) frame_samples: usize,
-    /// the most samples the stream takes in a call, for a live transcription model (`None`: no bound)
-    pub(super) max_items: Option<usize>,
-    /// the rest only for a model that converses
     output_rate: usize,
     voice: Option<String>,
     idle_steps: Option<i64>,
@@ -76,14 +76,20 @@ pub fn facts() -> Option<&'static Facts> {
             let all: Value = serde_json::from_str(&std::env::var("MSTAR_REALTIME").ok()?).ok()?;
             let f = all.get("conversation")?.as_object()?;
             let int = |k: &str| f.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+            let live = f.get("live").and_then(Value::as_object).map(|l| LiveFacts {
+                stream: l.get("stream").and_then(Value::as_str).unwrap_or_default().to_string(),
+                rate: l.get("rate").and_then(Value::as_u64).unwrap_or(0) as usize,
+                frame_samples: l.get("frame_samples").and_then(Value::as_u64).unwrap_or(0) as usize,
+                max_items: l.get("max_items").and_then(Value::as_u64).map(|n| n as usize),
+            });
             Some(Facts {
                 streams: int("streams"),
                 turn_tokens: f.get("turn_tokens").and_then(Value::as_bool).unwrap_or(false),
                 channels: f.get("channels").and_then(Value::as_i64).unwrap_or(1),
+                live,
                 stream: f.get("stream").and_then(Value::as_str).unwrap_or_default().to_string(),
                 rate: int("rate"),
                 frame_samples: int("frame_samples"),
-                max_items: f.get("max_items").and_then(Value::as_u64).map(|n| n as usize),
                 output_rate: int("output_rate"),
                 voice: f.get("voice").and_then(Value::as_str).map(str::to_string),
                 idle_steps: f.get("idle_steps").and_then(Value::as_i64),
@@ -93,13 +99,16 @@ pub fn facts() -> Option<&'static Facts> {
         .as_ref()
 }
 
-impl Facts {
-    /// `Model.live_transcription_stream` is not None: one `ClientAudio` stream
-    /// and no turn tokens, so the stream's text is a transcript.
-    pub fn live_transcription(&self) -> bool {
-        !self.turn_tokens && !self.stream.is_empty()
-    }
+/// `conversation_facts`' `live`: the stream a live transcription hears.
+pub(super) struct LiveFacts {
+    pub(super) stream: String,
+    pub(super) rate: usize,
+    pub(super) frame_samples: usize,
+    /// the most samples the stream takes in a call (`None`: no bound)
+    pub(super) max_items: Option<usize>,
+}
 
+impl Facts {
     /// Why this model can't hold a conversation, as the Python route words it; `None`: it can.
     pub fn problem(&self) -> Option<String> {
         if !self.turn_tokens {

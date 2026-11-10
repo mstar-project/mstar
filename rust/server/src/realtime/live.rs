@@ -13,7 +13,7 @@ use axum::extract::ws::WebSocket;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use super::conversation::{truthy, Facts};
+use super::conversation::{truthy, LiveFacts};
 use super::vad::SAMPLE_RATE;
 use super::{call_error, error_event, event, object, open_call, stream_audio, ItemDecoder, Realtime, Session};
 use crate::adapters::{OpenAIAdapter, SubmitArgs};
@@ -27,7 +27,7 @@ const ENDED_EARLY: &str = "this item's transcription ended before its commit";
 
 /// The open item's call.
 pub(super) struct Live {
-    facts: &'static Facts,
+    facts: &'static LiveFacts,
     /// the call's submission while it takes the item's audio
     sub: Option<u64>,
     /// the call's output, until it ends
@@ -39,7 +39,7 @@ pub(super) struct Live {
 
 impl Live {
     /// A transcription session on `facts`' stream.
-    pub(super) fn session(st: AppState, adapter: &'static dyn OpenAIAdapter, socket: WebSocket, mut s: Session, facts: &'static Facts) -> Realtime<Live> {
+    pub(super) fn session(st: AppState, adapter: &'static dyn OpenAIAdapter, socket: WebSocket, mut s: Session, facts: &'static LiveFacts) -> Realtime<Live> {
         // the stream's own bound on one item's length, not the re-decoding path's
         if let Some(max_items) = facts.max_items {
             s.max_item_seconds = max_items as f64 / facts.rate as f64;

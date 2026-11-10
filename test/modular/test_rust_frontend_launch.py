@@ -137,8 +137,8 @@ def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
         "output_rate": 24000, "voice": "Aria", "idle_steps": 25, "silence_rms": 0.01,
     }}
     server.model.turn_tokens = None
-    live = {"streams": 1, "turn_tokens": False, "channels": 1, "stream": "audio_in", "rate": 16000,
-            "frame_samples": 1280, "max_items": 16000 * 60}
+    live = {"streams": 1, "turn_tokens": False, "channels": 1, "live": {
+        "stream": "audio_in", "rate": 16000, "frame_samples": 1280, "max_items": 16000 * 60}}
     assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": live}
     facts = rust_frontend.realtime_facts(server, get_adapter("nemotron_asr"), str(tmp_path))
     assert facts["conversation"] == live and {"onnxruntime", "silero", "smart_turn_problem"} <= set(facts)
