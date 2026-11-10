@@ -1196,13 +1196,13 @@ def reap(cfg: dict) -> list[str]:
     return released
 
 
-def release_by_name(cfg: dict, pr: int, tag: str) -> None:
-    """End whatever this tool launched for `pr` and `tag` on any enabled provider, by its name, for a launch
+def release_by_name(cfg: dict, names: list[str]) -> None:
+    """End whatever this tool launched with these names (job_name) on any enabled provider, for a launch
     cancelled before its instance was recorded. Every provider is tried; the first error is raised after."""
     failed = None
     for p in enabled_providers(cfg):
         try:
-            for iid in p.named(job_name(pr, tag)):
+            for iid in [i.id for i in p.instances() if i.name in names]:
                 p.release(iid, {})
         except ApiError as err:
             print(f"{p.name}: {err}", file=sys.stderr)

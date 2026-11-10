@@ -1,4 +1,4 @@
-"""Check live-pr-test's gpu.py: the Eras Cloud provider."""
+"""Check live-pr-test's gpu.py: the Eras Cloud and DigitalOcean providers, and what every provider shares."""
 
 import argparse
 import base64

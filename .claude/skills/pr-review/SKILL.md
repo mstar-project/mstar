@@ -604,8 +604,9 @@ the last review.
   (one line): the input your trace found, the config that takes the changed branch. Short strings,
   no commands. Empty when you have none. The live test folds them into its risk map.
 - `untestable`: what in this PR the live test can't exercise, as a short string; empty when there is
-  nothing. It names anything of the kind: hardware the bot's GPUs aren't (AMD, Intel, Apple, TPU, a
-  GPU type no offer provides), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
+  nothing. It names anything of the kind: hardware the bot's GPUs aren't (Intel, Apple, TPU, a GPU
+  type no offer provides; not AMD, whose code the bot runs on an MI300X box of its own when the
+  diff names AMD hardware), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
   layout), weights or services it can't get, anything else. When the live test can reach none of the
   change, `run` is `none`, even for a change to what a model does on that hardware; when shared code
   changes too, the live test still runs for what it can reach. It doesn't gate the GPU run. It stops
