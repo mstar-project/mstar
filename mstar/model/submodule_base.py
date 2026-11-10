@@ -6,7 +6,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import torch
 
@@ -31,8 +31,6 @@ class HostRows(NamedTuple):
 
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
-    # ``BatchedModelOutput.run_replays`` on the host; None on any other step
-    ran: torch.Tensor | None = None
 
     def first_values(self, name: str, request_ids: Sequence[str]):
         """``(rid, value)`` for each of ``request_ids`` that has a row, where
@@ -46,6 +44,18 @@ class HostRows(NamedTuple):
         # padded rows past the real ones fall off the zip
         value_of = dict(zip(self.request_ids, buffer.reshape(buffer.shape[0], -1)[:, 0].tolist(), strict=False))
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
+
+
+class Landing(Protocol):
+    """A repeated step's iterations as they land on the host while it runs,
+    their stop buffers' columns with them: a host run's replay events
+    (``ReplayEvents``), a device run's count (``RunState``)."""
+
+    def landed(self, after: int, wait_s: float) -> int:
+        """How many iterations have landed, once more than ``after`` have (a
+        device run waits at most ``wait_s``, then says how many it saw). This
+        thread's reads of their columns come after it."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -304,9 +314,9 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
-    # A device run's iterations, [1] int64, on the device; None on any other
-    # step. Its host copy is ``HostRows.ran``.
-    run_replays: torch.Tensor | None = None
+    # A repeated step's iterations as they land on the host; None on any
+    # other step.
+    landing: Landing | None = None
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
@@ -356,6 +366,10 @@ class BatchedModelOutput:
         """
         if self.check_stop_buffers is None:
             return None
+        if self.landing is not None:
+            # a repeated step's columns, on the host as they land: no replay
+            # overwrites them, and a copy now would miss what lands later
+            return dict(self.check_stop_buffers)
         rows = self.row_outputs or {}
         clones = {
             id(rows[name]): clone for name, clone in (reuse or {}).items()

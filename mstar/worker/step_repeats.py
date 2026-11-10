@@ -147,6 +147,10 @@ class StepRepeats:
     def loop_back(self, node: str, walk: str) -> frozenset[str]:
         return self.loops[(node, walk)].loop_back
 
+    def limit(self, node: str) -> int:
+        """The most iterations a step of ``node`` stands for."""
+        return self._configs[node].max
+
     def may_repeat(self, node: str, walk: str) -> bool:
         return (node, walk) in self._walks
 

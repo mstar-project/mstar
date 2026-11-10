@@ -79,27 +79,31 @@ def test_ready_rows_wait_only_for_the_one_run_owed(ready_waits, repeats, owed, w
 
 def test_a_device_run_starts_with_only_real_rows_live_and_keeps_a_column_an_iteration():
     state = RunState(4, 3, {2}, torch.device("cpu"))
+    state.ran[0] = 3
     state.stage(2, [False, True], limit=3)
     assert state.marks.tolist() == [False, False, True, True], "padding rows start stopped"
     assert (state.continuation.item(), state.limit.item(), state.immune.tolist()) == (1, 3, [False, True, False, False])
+    assert state.ran.item() == 0, "the last run on the slot no longer counts"
 
-    state.tokens[:] = 0
-    for token in ([[5], [6], [0], [0]], [[7], [8], [0], [0]]):
-        state.keep_token(torch.tensor(token).reshape(-1))
-        state.index += 1
-    results = state.results(3, ("new_token",))
-    assert results["new_token"][:2, :2].tolist() == [[5, 7], [6, 8]]
-    assert state.index.item() == 2
+    # as ``run_stop`` lands them: an iteration's column, then the count
+    state.tokens[0], state.tokens[1] = torch.tensor([5, 6, 0, 0]), torch.tensor([7, 8, 0, 0])
+    state.ran[0] = 2
+    state.names = ("new_token",)
+    results, landing = state.results(2)
+    assert results["new_token"][:2].tolist() == [[5, 7], [6, 8]]
+    assert landing is state
 
 
 def test_a_device_run_that_ended_short_settles_its_width_before_anything_reads_it():
     """A run ended short wrote only the columns it ran, so the host cuts them
     to that width and reads the step as the width it really had."""
-    rows = HostRows((1, 2), {"new_token": torch.tensor([[5, 9, 0], [6, 2, 0]])}, torch.tensor([2]))
+    rows = HostRows((1, 2), {"new_token": torch.tensor([[5, 9, 0], [6, 2, 0]])})
     ctx = SimpleNamespace(repeats=3)
     batch_n = SimpleNamespace(node_batch=SimpleNamespace(step_context=ctx), graph_walk=WALK)
+    run = RunState(2, 3, {2}, torch.device("cpu"))
+    run.ran[0] = 2
 
-    StepExecutor._settle_device_run(batch_n, rows)
+    StepExecutor._settle_run(batch_n, rows, run)
 
     assert rows.buffers["new_token"].tolist() == [[5, 9], [6, 2]]
     assert ctx.repeats == 2

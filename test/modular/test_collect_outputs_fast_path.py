@@ -11,7 +11,6 @@ import torch
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
-from mstar.testing_utils.worker import make_worker
 
 
 class _Sub(NodeSubmodule):
@@ -162,17 +161,16 @@ def test_rows_only_collect_takes_no_clone():
 
 
 @pytest.mark.parametrize("rows_only", [True, False], ids=["rows_only", "per_rid"])
-def test_a_device_runs_count_reaches_the_host_rows(rows_only):
-    """The count is a field every construction of the output has to carry; lost,
+def test_a_repeated_steps_landing_reaches_the_collected_output(rows_only):
+    """The landing is a field every construction of the output has to carry; lost,
     the step would count iterations that never ran."""
     columns = {"new_token": torch.ones(2, 3).long()}
-    run = SimpleNamespace(index=torch.tensor([2]), results=lambda repeats, names: columns)
+    run = SimpleNamespace(results=lambda repeats: (columns, run))
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    runner.slot_for = lambda lease: SimpleNamespace(run=run, run_names=("new_token",))
+    runner.slot_for = lambda lease: SimpleNamespace(run=run)
     runner._repeat_carries = {}
     raw = runner.repeat(SimpleNamespace(bucket=SimpleNamespace(graph_walk="w")), BatchedModelOutput(), 3)
 
     out = make_engine()._collect_outputs(make_mgmt(_Sub()), None, raw, [], {}, [1, 2], (1, 2), "w", rows_only=rows_only)
-    make_worker().executor._host_copies.stage_host_rows(out)
 
-    assert out.host_rows.ran.tolist() == [2]
+    assert out.landing is run

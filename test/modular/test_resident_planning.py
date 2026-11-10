@@ -281,7 +281,8 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
 
 def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_replay():
     """A replay overwrites its stop buffers and reads its static input, so a step
-    that repeats hands each replay the token before it and keeps every one."""
+    that repeats hands each replay the token before it and keeps every one, on
+    the host while the next step on its slot (here its only one) replays."""
     tokens = torch.tensor([5, 7])
     ids = torch.zeros(2, 1, dtype=torch.long)
 
@@ -293,11 +294,16 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     slot = SimpleNamespace(run=None, graph=Graph(), static_inputs={"input_ids": ids}, static_outputs=outputs)
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    runner._repeat_carries = {WALK: {"new_token": "input_ids"}}
+    runner._device, runner._repeat_carries = torch.device("cpu"), {}
+    runner._buckets = {"bucket": SimpleNamespace(config=SimpleNamespace(capture_graph_walk=WALK), slots=[slot])}
+    runner.accept_repeats(WALK, {"new_token": "input_ids"}, 3)
     lease = SimpleNamespace(bucket=SimpleNamespace(graph_walk=WALK))
     wide = runner.repeat(lease, outputs, 3).check_stop_buffers
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
+    tokens.copy_(torch.tensor([1, 2]))
+    assert runner.repeat(lease, outputs, 3).check_stop_buffers["new_token"].tolist() == [[1, 2, 3], [2, 3, 4]]
+    assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]], "the next step landed its own columns"
 
 
 @pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [

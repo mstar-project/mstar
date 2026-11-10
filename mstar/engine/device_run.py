@@ -4,8 +4,9 @@ is reached.
 
 A run ends short only when every row has stopped, so a row still running always
 ran all of them, and what the host reserved and committed for the step stands.
-The host learns how many iterations ran from the output's ``run_replays`` when
-the step lands.
+Each iteration's token column lands in pinned host memory, then the count of
+iterations run (``RunState.ran``), so the host can send a row's tokens as
+they land, and knows how many ran when the step lands.
 A row's stop stays decided by the graph runtime, from the tokens that run kept;
 the device only decides when to end.
 
@@ -21,6 +22,7 @@ from collections.abc import Collection, Mapping, Sequence
 from typing import NamedTuple
 
 import torch
+from mstar_rust import wait_count
 
 from mstar.utils.h2d import PinnedStager
 
@@ -31,20 +33,28 @@ extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphC
 extern "C" __global__ void run_stop(
     const long long* tokens, int stride, int rows, const long long* stop_ids, int num_ids,
     const unsigned char* immune, unsigned char* marks,
-    long long* index, const long long* limit, long long* continuation
+    long long* index, const long long* limit, long long* continuation,
+    long long* column, int* ran
 ) {
     int done = 0;
+    long long at = *index;
     for (int row = 0; row < rows; ++row) {
+        long long token = tokens[row * stride];
+        column[at * rows + row] = token;
         if (!immune[row]) {
             for (int i = 0; i < num_ids; ++i) {
-                if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
+                if (token == stop_ids[i]) marks[row] = 1;
             }
         }
         done += marks[row];
     }
-    long long next = *index + 1;
+    long long next = at + 1;
     *index = next;
     *continuation = done < rows && next < *limit ? 1 : 0;
+    // the host reads the count, then the columns below it: they must be
+    // visible to it first, over PCIe or C2C (a system-scope fence and release)
+    __threadfence_system();
+    asm volatile("st.release.sys.s32 [%0], %1;" :: "l"(ran), "r"((int)next) : "memory");
 }
 
 extern "C" __global__ void set_graph_condition(
@@ -76,9 +86,11 @@ class RunAsk(NamedTuple):
 
 class RunState:
     """A capture slot's run, on the device. ``marks``: a row's stop in this
-    run, padding rows set, so an earlier EOS doesn't end it. ``tokens``: one
-    column an iteration, outside the capture's memory pool, where the next
-    iteration's scratch would land on them."""
+    run, padding rows set, so an earlier EOS doesn't end it. ``tokens``: each
+    iteration's token column, ``[limit, bs]`` in pinned host memory, where the
+    device writes it as the iteration ends; then ``ran``, the iterations run so
+    far. The slot owns both: a step on the other slot can't touch them while
+    the host reads this one's."""
 
     def __init__(self, bs: int, limit: int, stop_ids: Collection[int], device: torch.device):
         self.index = torch.zeros(1, dtype=torch.long, device=device)
@@ -86,17 +98,23 @@ class RunState:
         self.limit = torch.ones(1, dtype=torch.long, device=device)
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
-        self.tokens = torch.empty(bs, limit, dtype=torch.long, device=device)
+        pinned = device.type != "cpu"
+        self.tokens = torch.zeros(limit, bs, dtype=torch.long, pin_memory=pinned)
+        self.ran = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
         self._rows = torch.arange(bs, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self._staged: tuple | None = None
+        # the stop buffers' names, once the capture has named them
+        self.names: tuple[str, ...] = ()
 
     def stage(self, real: int, immune: Sequence[bool], limit: int) -> None:
         """Before the launch, on its stream. A staged value keeps its address:
         the graph reads it."""
         self.index.zero_()
         self.continuation.fill_(1)
+        # on the host: the last step on this slot has landed and been read
+        self.ran.zero_()
         key = (real, tuple(immune), limit)
         if key != self._staged:
             self._staged = key
@@ -104,14 +122,17 @@ class RunState:
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
         torch.ge(self._rows, real, out=self.marks)
 
-    def keep_token(self, token: torch.Tensor) -> None:
-        """Inside the body: this iteration's token column."""
-        self.tokens.index_copy_(1, self.index, token.unsqueeze(1).to(self.tokens.dtype))
+    def results(self, repeats: int) -> tuple[dict[str, torch.Tensor], "RunState"]:
+        """After the launch: the stop buffers on the host, a column an
+        iteration, and this run as its landing. ``ran`` holds how many ran."""
+        return {name: self.tokens[:repeats].t() for name in self.names}, self
 
-    def results(self, repeats: int, names: Collection[str]) -> dict[str, torch.Tensor]:
-        """After the launch: the stop buffers, a column an iteration. ``index``
-        holds how many ran."""
-        return {name: self.tokens[:, :repeats] for name in names}
+    def landed(self, after: int, wait_s: float) -> int:
+        """The run as its iterations land (``Landing``): ``ran`` once it
+        passes ``after``, else as it stands after ``wait_s``, waited with the
+        GIL released. An acquire load, which the device's release store pairs
+        with: this thread's reads of the columns below it come after it."""
+        return wait_count(self.ran.data_ptr(), after, int(wait_s * 1e6))
 
 
 class CudaWhile:
@@ -180,6 +201,13 @@ class CudaWhile:
             self._kernels = stop, condition
         return self._kernels
 
+    def device_pointer(self, host: torch.Tensor) -> int:
+        """Where the device reaches pinned ``host``: not always its own address
+        (a ``cudaHostRegister``ed allocator, ``pinned_use_cuda_host_register``)."""
+        pointer = ctypes.c_void_p()
+        self.call("cudaHostGetDevicePointer", ctypes.byref(pointer), ctypes.c_void_p(host.data_ptr()), ctypes.c_uint(0))
+        return pointer.value
+
     def stop(self, state: RunState, tokens: torch.Tensor, stream: int) -> None:
         """Inside the step's capture: ``run_stop`` on ``stream``."""
         row = tokens.reshape(len(state.marks), -1)
@@ -189,6 +217,7 @@ class CudaWhile:
             ctypes.c_void_p(state.immune.data_ptr()), ctypes.c_void_p(state.marks.data_ptr()),
             ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
             ctypes.c_void_p(state.continuation.data_ptr()),
+            ctypes.c_void_p(self.device_pointer(state.tokens)), ctypes.c_void_p(self.device_pointer(state.ran)),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(

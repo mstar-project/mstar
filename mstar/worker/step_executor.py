@@ -30,7 +30,7 @@ from mstar.graph.runtime.base import (
     RouteTensors,
     SendInput,
 )
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, chunk_loop_name
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, Landing, chunk_loop_name
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.utils import cpus, knobs
 from mstar.utils.containers import ParallelList
@@ -821,8 +821,8 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        if host_rows is not None and host_rows.ran is not None:
-            self._settle_device_run(batch_N, host_rows)
+        if host_rows is not None and outputs.landing is not None:
+            self._settle_run(batch_N, host_rows, outputs.landing)
         self._rebuilds.keep_prompts(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
@@ -921,10 +921,12 @@ class StepExecutor:
         _pp_stage("after_output_copy")
 
     @staticmethod
-    def _settle_device_run(batch_N: PendingBatch, host_rows: HostRows) -> None:
-        """A device run that ended short (every row stopped) wrote only the
-        columns it ran; everything after this reads the width it really had."""
-        ran = int(host_rows.ran[0])
+    def _settle_run(batch_N: PendingBatch, host_rows: HostRows, landing: Landing) -> None:
+        """A run's landed width: a device run that ended short (every row
+        stopped) wrote only the columns it ran, and a host run lands every
+        replay, so its width stands. Everything after this reads the width the
+        run really had, which the step's wait has landed."""
+        ran = landing.landed(0, 0)
         phase_record(f"repeats.{batch_N.graph_walk}.ran#", ran)
         for name, column in host_rows.buffers.items():
             host_rows.buffers[name] = column[:, :ran]
@@ -942,8 +944,9 @@ class StepExecutor:
         signals = self._graph_runtime.get_output_signals(node_name, graph_walk)
         if not self._body.all_on_device(engine, node_name, graph_walk, signals):
             return "node: an output of it doesn't stay on the device between steps"
+        repeats = self._layout.step_repeats
         return engine.repeat_refusal(
-            node_name, graph_walk, self._layout.step_repeats.loop_back(node_name, graph_walk),
+            node_name, graph_walk, repeats.loop_back(node_name, graph_walk), repeats.limit(node_name),
         )
 
     def _runtime_stop_column(
