@@ -282,9 +282,9 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
     tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
     requests = {"a": [2502, 225], "b": [380]}
     inputs = [
-        tower.prepare_inputs(PREFILL_AUDIO, SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}),
+        tower.prepare_inputs(PREFILL_AUDIO, SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}, rid_handle=rid),
                              {AUDIO_MELS: [torch.zeros(128, sum(frames))]})
-        for frames in requests.values()
+        for rid, frames in requests.items()
     ]
     step = tower.declare_step(PREFILL_AUDIO, list(requests), inputs).steps[AUDIO_ATTN]
     want = [(rid, c) for rid, frames in requests.items() for c in request_layout(frames)]
@@ -292,6 +292,45 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
     assert step.key_lens == tuple(c.key_len for _, c in want)
     # the short clip is laid out against its own request's longest, not the other request's
     assert want[1][1] != request_layout([225])[0] and want[2][1] == request_layout([380])[0]
+
+
+def test_a_leased_tower_step_leaves_attention_to_the_block_loop_which_reads_the_clips_key_lens():
+    """Leased, the captured block loop declares the request's attention itself: each clip a
+    segment attending its valid keys, as the eager step does. Its capture's padding row,
+    which no request owns, attends all of its frames."""
+    from mstar.model.step_audio2.components.audio import request_layout
+    from mstar.model.step_audio2.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
+
+    tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
+    frames = [2502, 225]
+    info = SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}, rid_handle=7)
+    inp = tower.prepare_inputs(PREFILL_AUDIO, info, {AUDIO_MELS: [torch.zeros(128, sum(frames))]})
+    assert tower.declare_step(PREFILL_AUDIO, [7], [inp], piecewise_leases={AUDIO_BLOCK_LOOP: object()}) is None
+    region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
+    layout = request_layout(frames)
+    step = region.region_step([7], [c.frames for c in layout]).steps[AUDIO_ATTN]
+    eager = tower.declare_step(PREFILL_AUDIO, [7], [inp]).steps[AUDIO_ATTN]
+    assert step.segments == eager.segments and step.key_lens == eager.key_lens
+    assert step.key_lens == tuple(c.key_len for c in layout) != tuple(c.frames for c in layout)
+    pad = region.region_step([-1], [512]).steps[AUDIO_ATTN]
+    assert pad.key_lens == (512,)
+
+
+def test_the_towers_block_loop_leases_within_the_resources_segment_limit():
+    """A replay's plan holds the attention resource's ``max_segments_per_request`` clips, as
+    configured: a request with more gets no lease and runs eagerly."""
+    from mstar.model.step_audio2.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
+    tower.bind_node_resources({AUDIO_ATTN: SimpleNamespace(max_segments_per_request=2)})
+    region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
+
+    def request(clips):
+        return [NodeInputs(input_seq_len=100 * clips, kwargs={"layout": [None] * clips})]
+
+    assert region.can_lease(request(2)) and not region.can_lease(request(3))
+    assert tower.max_batch_size(PREFILL_AUDIO) == 1
 
 
 def test_every_decode_walk_replays_the_decode_capture_and_both_prefills_the_prefill_capture():
