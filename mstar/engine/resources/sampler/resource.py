@@ -177,8 +177,8 @@ class SamplerResource(Resource):
         self._step_index: torch.Tensor | None = None
         # Grammar-constrained rows (`sampler/grammar.py`), when the spec enables them.
         # The mask this step applies (None: none), the static mask buffer of each cg
-        # slot the captures apply, the slots holding a constrained row's mask, and
-        # each step's drawn tokens (by (cg slot, greedy) under capture, None eager).
+        # slot the captures apply, the slots holding a constrained row's mask, and an
+        # eager step's drawn tokens (a captured step's are its slot's last-token row).
         self._grammar: GrammarRows | None = None
         if enable_grammar:
             if text_output is None:
@@ -188,7 +188,7 @@ class SamplerResource(Resource):
         self._grammar_masks: dict[int, torch.Tensor] = {}
         self._grammar_dirty: set[int] = set()
         self._grammar_stager = PinnedStager(torch.int32) if enable_grammar else None
-        self._drawn: dict = {}
+        self._eager_draw: torch.Tensor | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -599,6 +599,7 @@ class SamplerResource(Resource):
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
             if self._grammar is not None:
+                self._eager_draw = None
                 self._stage_grammar(ctx)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
@@ -735,9 +736,9 @@ class SamplerResource(Resource):
 
     def commit(self, step: SamplerStep, ctx: StepContext):
         if self._grammar is not None and self._grammar.any_of(ctx.request_ids):
-            # the drawn tokens go to the host for the next step's masks
-            key = None if self._cg_sampler is None else (self._step_slot, self._greedy_this_step)
-            tokens = self._drawn.pop(None, None) if key is None else self._drawn.get(key)
+            # the drawn tokens go to the host for the next step's masks. A replay never
+            # calls `sample`, but every graph on its slot writes the slot's last-token row
+            tokens = self._eager_draw if self._cg_sampler is None else self._cg_sampler.last_token_buf
             if tokens is not None:
                 self._grammar.note_draws(ctx.request_ids, tokens, self._kept_rids_of(step, ctx))
             else:
@@ -815,16 +816,12 @@ class SamplerResource(Resource):
             # under capture it has to match what every later replay will run.
             # `_penalty_needed_this_step` only ever suppresses work that cannot
             # change the result, so leaving the kernel on costs nothing.
-            tokens = self._cg_sampler.sample(
+            return self._cg_sampler.sample(
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
                 greedy=self._greedy_this_step,
             )
-            if self._grammar is not None:
-                # a replay rewrites this tensor, so commit reads each replay's draw from it
-                self._drawn[(self._step_slot, self._greedy_this_step)] = tokens
-            return tokens
         bufs = self._cg_buffers
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
         slots = offsets = None
@@ -847,7 +844,7 @@ class SamplerResource(Resource):
         if self._keep_last_token and by_slot:
             bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
         if self._grammar is not None:
-            self._drawn[None] = tokens
+            self._eager_draw = tokens
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:

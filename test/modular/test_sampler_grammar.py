@@ -86,6 +86,41 @@ def test_a_constrained_row_draws_its_grammar_beside_a_free_row(graph):
     assert any(t >= len(VOCAB) for t in out["free"]), "the free row was masked too"
 
 
+def test_a_replay_commits_the_draw_of_the_graph_it_replays():
+    """Two graphs captured on one slot at one batch size (a decode and a mixed
+    bucket, say) each draw into their own tensor; a replay of the first must
+    advance the grammar by the first's tokens, not the second's."""
+    res = _resource(graph=True)
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    pads = ("p0", "p1", "p2", "p3")
+    for rid in pads:
+        res.ingest_capture_row(rid)
+    a, b, x = VOCAB.index(b"a"), VOCAB.index(b"b"), VOCAB.index(b"x")
+    drawn = []
+    for favoured in (a, x):  # capture the first bucket, then the second
+        ctx = StepContext(request_ids=pads, graph_walk="w", slot=0, capture=True, slot_lease=lease)
+        res.plan(step, ctx)
+        logits = torch.zeros(4, V)
+        logits[:, favoured] = 1.0
+        drawn.append(res.sample(list(pads), logits))
+        res.commit(step, ctx)
+
+    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab", "ba"]})))
+    ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    res.plan(step, ctx)
+    # replay the first graph: it rewrites its own draw and the slot's last-token row
+    replayed = torch.full((4,), a)
+    drawn[0].copy_(replayed)
+    res._cg_sampler.last_token_buf.copy_(replayed)
+    res.commit(step, ctx)
+
+    res.plan(step, ctx)
+    logits = torch.zeros(4, V)
+    logits[:, a] = 1.0
+    assert res.sample([0], logits)[0].item() == b, "the grammar advanced by another graph's draw"
+
+
 def test_after_starts_the_grammar_at_its_token():
     res = _resource(graph=False)
     res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"], "after": "</think>"})))
