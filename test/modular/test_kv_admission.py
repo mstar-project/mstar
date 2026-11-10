@@ -238,7 +238,8 @@ def test_a_filed_page_tries_no_guaranteed_request_whose_footprint_cant_fit_besid
                 (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
             )},
         ))
-        assert not _ready(kv, f"w{n}")
+        # w0's room counts what moving r and fill would free, and no other footprint fits beside w0's
+        assert _ready(kv, f"w{n}") is (n == 0)
     tried, past = [], KVManager.reserve_past
     monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
     kv._index.filed += 1

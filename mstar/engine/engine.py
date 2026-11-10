@@ -3365,6 +3365,10 @@ class Engine:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
 
+    def older_than(self, request_id: int) -> list[str]:
+        """The requests the conductor numbered before the request, newest first (`Admission.older_than`)."""
+        return self._runner.older_than(request_id)
+
     def refusals(self) -> "list[Refusal]":
         """The waiting requests that didn't fit, oldest first, as `Admission.refusals` gives them."""
         return self._runner.refusals()

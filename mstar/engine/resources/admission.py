@@ -95,6 +95,13 @@ class Admission:
             return None
         return self._numbered[bisect.bisect_right(self._numbered, arrival, key=self._arrival.__getitem__):][::-1]
 
+    def older_than(self, rid: str) -> list[str]:
+        """The requests numbered before ``rid``, newest first, or none when the conductor gave ``rid`` no number."""
+        arrival = self._arrival.get(rid)
+        if arrival is None or arrival[0]:
+            return []
+        return self._numbered[:bisect.bisect_left(self._numbered, arrival, key=self._arrival.__getitem__)][::-1]
+
     def admitted(self, rid: str, node_name: str) -> bool:
         return node_name in self._admitted.get(rid, ())
 

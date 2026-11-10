@@ -67,8 +67,8 @@ class Preemption:
         if kv is None or not self._moves(kv, node_name):
             return False
         reason, engine = node_batch.admit_error, self._engine_manager.get_engine(node_name)
-        newer = engine.newer_than(reason.request_id)
-        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, self._droppable(kv, engine))
+        newer, older = engine.newer_than(reason.request_id), engine.older_than(reason.request_id)
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, older, self._droppable(kv, engine))
         if victims is None:
             return False
         if victims.waits:
@@ -107,7 +107,9 @@ class Preemption:
             if kv is None or not self._moves(kv, refusal.node_name):
                 continue
             newer = engine.newer_than(refusal.rid)
-            victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
+            victims = None if newer is None else kv.cache.make_room(
+                refusal.mark, newer, engine.older_than(refusal.rid), self._droppable(kv, engine),
+            )
             if victims is not None:
                 self._move(kv, self.counts[refusal.node_name], victims, refusal.rid)
                 return

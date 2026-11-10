@@ -226,9 +226,14 @@ def test_a_request_with_images_that_samples_a_pad_id_never_leaves_an_older_one_w
 
     for _ in range(2):
         _kv_step(kv, R, PAGE_SIZE)
-    assert all(_kv_step(kv, A, PAGE_SIZE).ok for _ in range(4)), (
-        "A ran short beside an older request that can't move it, and each waits for the other"
-    )
+    for _ in range(4):
+        outcome = _kv_step(kv, A, PAGE_SIZE)
+        if not outcome.ok:
+            # R borrowed what A lends, and A takes it back
+            assert kv.preempt(A, outcome.reason.pages_short, [], [R], lambda rid: True).to_drop == [R]
+            kv.drop(R, kv._laid_out_tokens(R))
+            outcome = _kv_step(kv, A, PAGE_SIZE)
+        assert outcome.ok, "A ran short beside an older request that can't move it, and each waits for the other"
 
 
 @pytest.mark.parametrize("build", ["executing", "speculative"])

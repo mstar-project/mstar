@@ -1407,7 +1407,8 @@ def _counts(kv) -> tuple:
 
 def _preempt(kv, rid: str, droppable: bool):
     """Rank 0's choice of victims for ``rid``'s shortage of one page, newest first."""
-    return kv.preempt(rid, 1, _ENGINES[id(kv)]._runner.newer_than(rid), lambda other: droppable)
+    runner = _ENGINES[id(kv)]._runner
+    return kv.preempt(rid, 1, runner.newer_than(rid), runner.older_than(rid), lambda other: droppable)
 
 
 def _waits(kv, rid: str) -> None:
@@ -1748,9 +1749,9 @@ def test_only_rank_0_moves_requests_for_the_ones_that_wait(monkeypatch):
     _ingest((leader, follower), "o", 2, arrival=2)
     assert not _admits(leader, "o")
     (refusal,) = lead._runner.refusals()
-    newer = lead._runner.newer_than("o")
-    assert follower.make_room(refusal.mark, newer, bool) is None, "a follower chose v to move for o"
-    assert leader.make_room(refusal.mark, newer, bool).to_drop == ["v"]
+    newer, older = lead._runner.newer_than("o"), lead._runner.older_than("o")
+    assert follower.make_room(refusal.mark, newer, older, bool) is None, "a follower chose v to move for o"
+    assert leader.make_room(refusal.mark, newer, older, bool).to_drop == ["v"]
 
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
@@ -1858,7 +1859,8 @@ def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     outcome = _step(leader, "r", 3 * PAGE_SIZE)
     assert not outcome.ok and not _step(follower, "r", 3 * PAGE_SIZE).ok
-    victims = leader.preempt("r", outcome.reason.pages_short, _ENGINES[id(leader)]._runner.newer_than("r"), bool)
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("r", outcome.reason.pages_short, runner.newer_than("r"), runner.older_than("r"), bool)
     assert victims.to_drop == ["v"]
     lead.drop_request(NODE, "v", 5 * PAGE_SIZE)
 
@@ -1912,7 +1914,9 @@ def _make_room(kv, droppable: bool = False):
     droppable only if ``droppable``."""
     runner = _ENGINES[id(kv)]._runner
     for refusal in runner.refusals():
-        victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
+        victims = kv.make_room(
+            refusal.mark, runner.newer_than(refusal.rid), runner.older_than(refusal.rid), lambda other: droppable,
+        )
         if victims is not None:
             return victims
     return None
@@ -2148,15 +2152,15 @@ def test_a_waiting_request_admitted_before_its_last_victim_lands_takes_no_more_r
     assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 left it with"
 
 
-def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_its_footprint_on_every_rank(
+def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_takes_its_footprint_on_every_rank(
     monkeypatch,
 ):
     """v1's move covers o's prompt, but the host v1 filled has no room for it, so o, which no drop can free, turns
-    guaranteed and asks for its 6-page footprint on every rank. v2's drop then covered the prompt again, and every
-    rank admitted o, guaranteed, with 2 pages."""
+    guaranteed and is admitted with its 6-page footprint on every rank. v2's drop then covered the prompt again, and
+    every rank admitted o, guaranteed, with 2 pages."""
     (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=False)
     lead.offload_request(NODE, "v1")
-    assert "o" in leader._guaranteed and "o" not in leader._allotments
+    assert "o" in leader._guaranteed and leader._allotments["o"].pages == 6
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert follower._guaranteed == leader._guaranteed, "o is preemptible here and guaranteed on rank 0"
     assert _counts(follower) == _counts(leader), "o's earmark here waits for other than its footprint"
@@ -2165,7 +2169,7 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_i
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     for kv in (leader, follower):
-        assert "o" not in kv._allotments, "o was admitted guaranteed with less than its footprint"
+        assert kv._allotments["o"].pages == 6, "o was admitted guaranteed with other than its footprint"
     assert _counts(follower) == _counts(leader), "the follower holds other room for o than rank 0"
 
 

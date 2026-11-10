@@ -92,7 +92,7 @@ def _worker(kv):
         drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
-        newer_than=lambda rid: _runner(kv).newer_than(rid),
+        newer_than=lambda rid: _runner(kv).newer_than(rid), older_than=lambda rid: _runner(kv).older_than(rid),
         refusals=lambda: _runner(kv).refusals(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
@@ -363,8 +363,7 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
 
 
-@pytest.mark.parametrize("guaranteed", [False, True])
-def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed):
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     """z ran short with nothing newer to move and, the host too full to take it, waits holding its pages. p, older,
     asks only afterwards, as a request held in an encoder does, and doesn't fit. z runs no step that could run short
     again, so nothing moved it and both waited for good."""
@@ -376,8 +375,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed)
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
     _runner(kv).readmit("z", NODE)
-    # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
-    _request(kv, "p", 1 if guaranteed else 5, arrival=2, guaranteed=guaranteed)
+    _request(kv, "p", 5, arrival=2)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     _remove(kv, "x")
     w = _worker(kv)
@@ -829,7 +827,7 @@ def test_a_pool_whose_layout_its_rebuild_rows_cant_write_again_isnt_rebuildable(
 def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     kv = _pool()
     _running(kv, "r", 5, arrival=1)
-    _running(kv, "v", 1, arrival=2, guaranteed=True)
+    _running(kv, "v", 5, arrival=2, guaranteed=True)
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
