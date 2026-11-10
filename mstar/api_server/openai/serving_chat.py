@@ -3,7 +3,8 @@
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 ``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
-``image_url`` data-URL content parts. An adapter's output parser splits a text
+``image_url`` data-URL content parts, and the closing ``usage`` chunk into
+``usage`` and ``finish_reason``. An adapter's output parser splits a text
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 """
 
@@ -65,31 +66,6 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     return _build_response(model_name, request_id, chunks, sample_rate, audio_format, parser)
 
 
-class _Usage:
-    """Token counts and why the reply ended, from the text chunks' metadata
-    (see the data worker's ``_text_usage``)."""
-
-    def __init__(self):
-        self.prompt = self.completion = 0
-        self.stopped = True
-
-    def add(self, chunk) -> None:
-        meta = chunk.metadata or {}
-        self.prompt = meta.get("prompt_tokens", self.prompt)
-        self.completion += meta.get("tokens", 0)
-        if "stop_token" in meta:
-            self.stopped = meta["stop_token"]
-
-    def finish_reason(self, parser) -> str:
-        if parser is not None and parser.finish_reason == "tool_calls":
-            return "tool_calls"
-        return "stop" if self.stopped else "length"
-
-    def as_dict(self) -> dict:
-        return {"prompt_tokens": self.prompt, "completion_tokens": self.completion,
-                "total_tokens": self.prompt + self.completion}
-
-
 def _audio_format(req, sample_rate: int) -> str:
     """The container ``message.audio`` is sent in, from OpenAI's ``audio.format``: a speech
     container, with ``pcm16`` naming raw PCM. Stream deltas are raw PCM16, so a stream takes only that."""
@@ -102,19 +78,34 @@ def _audio_format(req, sample_rate: int) -> str:
     return "pcm" if fmt == "pcm16" else fmt
 
 
+def _usage(reported: dict | None) -> dict:
+    """OpenAI ``usage`` from a ``usage`` chunk's metadata; zeros without one."""
+    prompt = (reported or {}).get("prompt_tokens", 0)
+    completion = (reported or {}).get("completion_tokens", 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _finish_reason(reported: dict | None, parser=None) -> str:
+    """``tool_calls`` when the reply's parser read whole calls, else the ``usage`` chunk's."""
+    if parser is not None and parser.finish_reason == "tool_calls":
+        return "tool_calls"
+    return (reported or {}).get("finish_reason", "stop")
+
+
 def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", parser=None) -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
-    usage = _Usage()
+    usage = None
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
-            usage.add(c)
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
             images.append(c.data)
+        elif c.modality == USAGE:
+            usage = c.metadata
 
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
@@ -143,8 +134,8 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": usage.finish_reason(parser)}],
-        "usage": usage.as_dict(),
+        "choices": [{"index": 0, "message": message, "finish_reason": _finish_reason(usage, parser)}],
+        "usage": _usage(usage),
     }
 
 
@@ -167,9 +158,9 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
     # first chunk, so nothing may go out before the model has produced one.
     role = {"role": "assistant"}
     failed = False
+    usage = None
     # a byte-level BPE token's bytes can end inside a character: hold them
     text = Utf8Stream()
-    usage = _Usage()
     try:
         # One yield per batch of text chunks: the tokens a request had waiting
         # when its handler ran go out as one body frame (one write), which is
@@ -179,7 +170,6 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
-                    usage.add(c)
                     content = text.feed(c.data)
                     if not content:
                         continue
@@ -189,6 +179,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
                         role = {}
                     continue
                 if c.modality == USAGE:
+                    usage = c.metadata
                     continue
                 if text_events:
                     yield "".join(text_events)
@@ -222,15 +213,20 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
     if not failed:
         tail = text.flush()
         if parser is None:
-            yield chunk({**role, "content": tail} if tail else role, finish=usage.finish_reason(None))
+            yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage))
         else:
             deltas = parser.feed(tail) + parser.finish()
             for delta in deltas[:-1]:
                 yield chunk({**role, **delta})
                 role = {}
-            yield chunk({**role, **(deltas[-1] if deltas else {})}, finish=usage.finish_reason(parser))
+            yield chunk({**role, **(deltas[-1] if deltas else {})}, finish=_finish_reason(usage, parser))
         if include_usage:
-            # OpenAI's stream_options.include_usage: one last chunk, no choices
-            yield sse({"id": request_id, "object": "chat.completion.chunk", "created": created,
-                       "model": model_name, "choices": [], "usage": usage.as_dict()})
+            yield sse({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [],
+                "usage": _usage(usage),
+            })
     yield SSE_DONE
