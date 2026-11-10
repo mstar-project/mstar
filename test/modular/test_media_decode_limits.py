@@ -563,7 +563,7 @@ def test_flux2_still_reads_the_formats_pillow_decodes(tmp_path, fmt):
     Image.new("RGB", (64, 64), (200, 20, 30)).save(path, format=fmt)
     out = _flux2().load_image(str(path), "cpu")
     assert tuple(out.data.shape) == (3, 64, 64)
-    assert out.data[:, 0, 0].mul(255).round().tolist() == [200, 20, 30]
+    assert out.data[:, 0, 0].tolist() == [200, 20, 30]
 
 
 @pytest.mark.parametrize("fmt", ["BMP", "TIFF"])
@@ -586,7 +586,7 @@ def _lingbot():
 _IMAGE_LOADERS = pytest.mark.parametrize("load", [
     lambda path: read_image(path).float() / 255,
     lambda path: read_image(path, rgb=True).float() / 255,
-    lambda path: _flux2().load_image(path, "cpu").data,
+    lambda path: _flux2().load_image(path, "cpu").data.float() / 255,
     lambda path: _lingbot().load_image(path, "cpu").data.float() / 255,
 ], ids=["read_image", "read_image_rgb", "flux2_pillow", "lingbot_pillow"])
 
