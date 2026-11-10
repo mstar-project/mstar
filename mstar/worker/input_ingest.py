@@ -249,8 +249,8 @@ class InputIngest:
                 # tears down what else the request has here
                 self._fail_intake([rid], err, what)
             else:
-                # Raised before the request had a handle here, so the lifecycle
-                # can't report it: tell the conductor by its wire id.
+                # Raised before the lifecycle took the request in, so it can't
+                # report it: tell the conductor by its wire id.
                 text, _ = client_error_text(err, f"Worker {self._worker_id}: {what}", log=logger)
                 self._communicator.send("conductor", ConductorMessage(
                     message_type=ConductorMessageType.FAIL_REQUESTS,
