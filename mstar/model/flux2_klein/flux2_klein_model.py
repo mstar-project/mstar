@@ -190,7 +190,7 @@ class Flux2KleinModel(Model):
         return [Array(
             JOINT_TOKENS, nodes={"dit"}, layers=frozenset(range(t.num_layers + t.num_single_layers)), max_len=0,
             entry=dit_entry(t.num_attention_heads, t.attention_head_dim),
-            reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=t.num_attention_heads))},
+            reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=t.num_attention_heads), packed=False)},
         )]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

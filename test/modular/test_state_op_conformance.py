@@ -23,6 +23,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, KVEntry, Read
+from mstar.engine.state.adapters import build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.state_op import STATE_OPS, bind_state_ops, conformance_problems
 from mstar.model.qwen3_omni.components import attention as omni_attention
@@ -72,7 +73,7 @@ def _opened_step(kv: KVManager, lengths: dict[int, int]) -> ArrayHandle:
     step = KVStep(segments=segments)
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
-    handle = ArrayHandle(_array(), {"kv": kv, "attn": SimpleNamespace(requires_kv_write=True)}, None)
+    handle = build_handle(_array(), {"kv": kv, "attn": SimpleNamespace(requires_kv_write=True)})
     bind_state_ops({"kv": handle})
     contract_step = SubmoduleStep(segments=segments, state={"kv": ArrayStep()})
     contract_step.set_ctx(ctx)

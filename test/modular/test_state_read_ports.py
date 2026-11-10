@@ -41,9 +41,15 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec,
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources, sampling_configs, state_steps
+from mstar.engine.state.adapters import (
+    build_handle,
+    kv_layouts,
+    node_handles,
+    node_resources,
+    sampling_configs,
+    state_steps,
+)
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.engine.state.calls import ArrayHandle
 from mstar.model.base import LabelLayout, serving_resources
 from mstar.model.canary.canary_model import CanaryModel
 from mstar.model.canary.config import (
@@ -461,7 +467,7 @@ def _pi05_expert(expert_class, num_layers: int = TINY_PI05.num_layers):
     generator = torch.Generator().manual_seed(0)
     for parameter in expert.parameters():
         parameter.data.normal_(0, 0.02, generator=generator)
-    handle = ArrayHandle(array, {LLM_KV: _QwenKV(array), LLM_ATTN: _QwenAttn(), ROPE: _Positions()}, ROPE)
+    handle = build_handle(array, {LLM_KV: _QwenKV(array), LLM_ATTN: _QwenAttn(), ROPE: _Positions()})
     expert.eval()
     for module in expert.modules():
         if hasattr(module, "bind_state"):
@@ -488,10 +494,11 @@ def _canary_stack(num_layers: int = 2):
     generator = torch.Generator().manual_seed(0)
     for parameter in decoder.parameters():
         parameter.data.normal_(0, 0.02, generator=generator)
-    kv = ArrayHandle(self_array, {KV_CACHE: _QwenKV(self_array), ATTN: _QwenAttn(), ROPE: None}, ROPE)
-    context = ArrayHandle(
-        cross_array, {CROSS_KV_CACHE: _QwenKV(cross_array), CROSS_ATTN: _QwenAttn()}, None, queried=self_array,
-    )
+    handles = node_handles(SimpleNamespace(declare_state=lambda: [self_array, cross_array]), "decoder", {
+        KV_CACHE: _QwenKV(self_array), ATTN: _QwenAttn(), ROPE: None,
+        CROSS_KV_CACHE: _QwenKV(cross_array), CROSS_ATTN: _QwenAttn(),
+    })
+    kv, context = handles[KV_CACHE], handles[CROSS_KV_CACHE]
     for module in decoder.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, CROSS_KV_CACHE: context})

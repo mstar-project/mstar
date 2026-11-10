@@ -17,10 +17,19 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Entry, Fork, KVEntry, Value, host
-from mstar.engine.state.adapters import build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state import Array, ArrayStep, Attend, Causal, Entry, Fork, KVEntry, Read, Value, host
+from mstar.engine.state.adapters import (
+    HOST_VALUE,
+    StateSetup,
+    build_handle,
+    build_specs,
+    kv_layouts,
+    node_handles,
+    state_steps,
+    storage_of,
+)
 from mstar.engine.state.calls import ArrayHandle
-from mstar.engine.state.host import HostFields, is_host_value
+from mstar.engine.state.host_fields import HostFields, is_host_value
 
 RID = 3
 
@@ -33,7 +42,7 @@ def _handle(array=None, *requests) -> ArrayHandle:
     array = array or _flags()
     fields = HostFields()
     model = SimpleNamespace(declare_state=lambda: [array])
-    handle = node_handles(model, "talker", {}, host_fields=fields)[array.name]
+    handle = node_handles(model, "talker", {}, setup=StateSetup(host_fields=fields))[array.name]
     for request in requests or (RID,):
         fields.open(request)
     return handle
@@ -60,6 +69,14 @@ def test_a_value_of_host_fields_builds_no_spec_and_no_step():
     assert build_specs([_flags()]) == []
     step = _step(_handle(), host={(RID, "main", 0): {"sent": True}})
     assert step.steps == {}, "no resource holds a host field"
+
+
+def test_a_value_of_host_fields_only_has_its_own_storage_whose_handle_refuses_a_read_by_name():
+    assert storage_of(_flags()) is HOST_VALUE, "a Value with no tensor has no pool to hold"
+    step = _step(_handle())
+    assert step.steps == {} and len(step.state_handles) == 1, "the step runs, to commit the writes, with no resource"
+    with pytest.raises(ValueError, match="Array 'flags': no layout yet: read on a HostValueHandle"):
+        step.state_handles[0].read(0, torch.zeros(1))
 
 
 def test_a_value_of_host_fields_has_no_layout():
@@ -199,8 +216,9 @@ def test_a_write_for_a_request_with_no_open_fields_is_refused():
 
 
 def test_a_write_on_an_array_that_holds_no_host_fields_is_refused():
-    array = Array("kv", nodes={"talker"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=8)
-    h = ArrayHandle(array, {"kv": SimpleNamespace(layer_view=lambda i: None)}, None)
+    array = Array("kv", nodes={"talker"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=8,
+                  reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))})
+    h = build_handle(array, {"kv": SimpleNamespace(layer_view=lambda i: None), "attn": SimpleNamespace()})
     declared = ArrayStep(host={(RID, "main", 0): {"sent": True}})
     step = SubmoduleStep(segments=(Segment(RID, "main", 1),), state={"kv": declared})
     step.set_ctx(StepContext(request_ids=[RID], graph_walk="decode", slot=0, capture=False))

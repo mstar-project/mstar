@@ -663,6 +663,10 @@ An array whose calls carry each rank's share of its tokens under sequence parall
 on every rank, and the two flags pick the exchange: Ulysses with both sides sharded, none with
 only the queries sharded, and a merge of the ranks' partial attentions with only the keys.
 
+A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
+pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
+``packed=False``, and a packed call to it is refused.
+
 A ``Value`` may hold only host fields, small values a step changes, as
 ``Entry({}, host={"eos_sent": bool})``. Each starts at its type's zero value. ``host(h, request,
 label, layer)`` reads them, and ``ArrayStep(host={(row, label, layer): {field: value}})`` writes

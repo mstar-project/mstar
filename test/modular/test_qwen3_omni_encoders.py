@@ -31,8 +31,11 @@ from mstar.engine.resources import RaggedAttentionSpec  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.engine.state import Array, Attend, Block, KVEntry, Read  # noqa: E402
-from mstar.engine.state.adapters import node_resources, state_steps  # noqa: E402
-from mstar.engine.state.within_step import WithinStepHandle  # noqa: E402
+from mstar.engine.state.adapters import (  # noqa: E402
+    build_handle,
+    node_resources,
+    state_steps,
+)
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule  # noqa: E402
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
@@ -92,7 +95,7 @@ def _bind(sub, name, read, ragged, heads, head_dim, layers) -> None:
     array = Array(name, nodes={"encoder"}, layers=frozenset(range(layers)), max_len=0,
                   entry=KVEntry(heads=heads, head_dim=head_dim),
                   reads={read: Read(mask=Block(), op=Attend(q_heads=heads))})
-    sub.bind_node_state({name: WithinStepHandle(array, {read: ragged}, None)})
+    sub.bind_node_state({name: build_handle(array, {read: ragged})})
 
 
 @contextmanager
