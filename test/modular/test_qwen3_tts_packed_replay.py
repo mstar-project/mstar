@@ -13,10 +13,11 @@ from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, autocast_scope
-from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
+from mstar.engine.resources import StepContext, StepRunner, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs
+from mstar.engine.state.adapters import node_handles, sampling_configs
+from mstar.model.base import serving_resources
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
@@ -81,8 +82,8 @@ class _Node:
         model = Qwen3TTSModel.__new__(Qwen3TTSModel)
         model.config = config
         model.codec_dtype = torch.float32
-        specs = [spec for spec in node_resources(model) if NODE in spec.nodes]
-        apply_yaml_overrides(specs, {"resources": {TALKER_KV: {"max_num_pages": 64, "page_size": 16}}})
+        deployment = {"resources": {TALKER_KV: {"max_num_pages": 64, "page_size": 16}}}
+        specs = [spec for spec in serving_resources(model, deployment) if NODE in spec.nodes]
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(

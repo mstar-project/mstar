@@ -118,31 +118,22 @@ def exactness(args) -> dict:
     return report
 
 
-class _NoResources:
-    """The engine step runner a node without resources sees at capture."""
-
-    def build_accelerator_graph_buffers(self, *args, **kwargs) -> None:
-        pass
-
-    def ingest_capture_row(self, rid) -> None:
-        pass
-
-
 def captured_runners(wmk: AudioSealWatermarker, batch_sizes=CAPTURE_BATCH_SIZES) -> dict:
     """The engine's captures of the codec's watermark lengths, as Qwen3-TTS's
     ``get_piecewise_accelerator_graph_configs`` declares them (CUDA only)."""
     from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.engine.resources import StepRunner
 
     configs = wmk.piecewise_configs([f * FRAME for f in {*SCHEDULE, CHUNK}], batch_sizes)
     pool = get_accelerator_graph_backend(wmk.device).graph_pool_handle()
     runners = {}
     for label, config in configs.items():
         runner = PiecewiseAcceleratorGraphRunner(
-            label=label, config=config, resources={}, step_runner=_NoResources(), device=wmk.device,
+            label=label, config=config, resources={}, step_runner=StepRunner({}), device=wmk.device,
             autocast_dtype=None, num_slots=1, memory_pool=pool,
         )
-        runner.warmup_and_capture()
+        runner.warmup_and_capture(None)
         runners[label] = runner
     return runners
 

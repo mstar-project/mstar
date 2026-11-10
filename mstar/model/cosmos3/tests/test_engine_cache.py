@@ -1107,7 +1107,7 @@ def _run_accelerator_graph_denoise(ctx):
         autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
         joint_comm_group=groups, num_slots=1, head_shards=groups.world_size,
     )
-    cg_runner.warmup_and_capture()
+    cg_runner.warmup_and_capture(None)
     assert cg_runner.any_graphs, "no CUDA graph captured for cosmos3 image_gen"
 
     fwd.graph_walk = "image_gen"

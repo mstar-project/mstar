@@ -162,7 +162,7 @@ class _WanStubTransformer(nn.Module):
 
     dtype = torch.bfloat16
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
         return hidden_states * (timestep[:, None, :, None, None] * 1e-3 + encoder_hidden_states.mean())
 
 
@@ -194,7 +194,6 @@ def _wan22_steps(sub, walk, steps, latents, image_latent):
     return latents
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the host sync is a CUDA stream sync")
 @pytest.mark.parametrize("walk", ["video_gen", "video_gen_i2v"])
 def test_wan22_forward_takes_no_host_sync(walk):
     """A step that waits on the GPU keeps the worker from queueing it behind the one
@@ -207,7 +206,12 @@ def test_wan22_forward_takes_no_host_sync(walk):
     latents = torch.randn(shape, generator=gen)
     image_latent = torch.randn(shape, generator=gen) if walk == sub._I2V_WALK else None
     want = _wan22_steps(sub, walk, 4, latents, image_latent)
+    if not torch.cuda.is_available():
+        # only after the host run, which calls the step and its stub: CI has no GPU
+        pytest.skip("the host sync is a CUDA stream sync")
 
+    # a node of its own: a node stages each schedule once, on the device of its first step
+    sub = _wan22_sub(_WanStubTransformer(), in_channels=4, compile_dit=False)
     latents = latents.cuda()
     image_latent = None if image_latent is None else image_latent.cuda()
     torch.cuda.synchronize()

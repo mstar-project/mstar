@@ -416,16 +416,10 @@ def test_engine_captures_replay_the_eager_watermark_bit_for_bit():
     Detection is unchanged either way."""
     from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.engine.resources import StepRunner
     from mstar.platforms import current_platform
 
     padded_bound = 2 if current_platform.has_cuda_capability(9, 0) else 33
-
-    class NoResources:
-        def build_accelerator_graph_buffers(self, *args, **kwargs):
-            pass
-
-        def ingest_capture_row(self, rid):
-            pass
 
     frame = 320 * 6
     wmk = AudioSealWatermarker(_random_generator().cuda(), AudioWatermarkConfig(enabled=True, message=0xBEEF),
@@ -435,10 +429,10 @@ def test_engine_captures_replay_the_eager_watermark_bit_for_bit():
     runners = {}
     for label, config in configs.items():
         runner = PiecewiseAcceleratorGraphRunner(
-            label=label, config=config, resources={}, step_runner=NoResources(), device=wmk.device,
+            label=label, config=config, resources={}, step_runner=StepRunner({}), device=wmk.device,
             autocast_dtype=None, num_slots=1, memory_pool=pool,
         )
-        runner.warmup_and_capture()
+        runner.warmup_and_capture(None)
         assert runner.any_graphs and not runner.dropped_shapes
         runners[label] = runner
     pcm = [(_speechlike(7 * frame, seed=s).clamp(-1, 1) * 32767).to(torch.int16).cuda() for s in range(30, 34)]
