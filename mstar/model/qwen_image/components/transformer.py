@@ -216,10 +216,10 @@ class QwenImageJointAttention(nn.Module):
                             txt_freqs, layout.img_freqs)
         k = self._norm_rope(heads(self.add_k_proj(txt)), heads(self.to_k(img)), self.norm_added_k, self.norm_k,
                             txt_freqs, layout.img_freqs)
-        v = torch.cat([heads(self.add_v_proj(txt)), heads(self.to_v(img))], dim=1)
+        v = heads(_joint_linear(self.add_v_proj, txt, self.to_v, img))
         out = attend(q, k, v).flatten(2, 3).to(q.dtype)
         num_txt = txt.shape[1]
-        return self.to_out[0](out[:, num_txt:].contiguous()), self.to_add_out(out[:, :num_txt].contiguous())
+        return _rows_linear(self.to_out[0], out[:, num_txt:]), _rows_linear(self.to_add_out, out[:, :num_txt])
 
     @staticmethod
     def _norm_rope(txt, img, txt_norm, img_norm, txt_freqs, img_freqs) -> torch.Tensor:
@@ -229,6 +229,39 @@ class QwenImageJointAttention(nn.Module):
                 txt, img, txt_norm.weight, img_norm.weight, txt_freqs, img_freqs, txt_norm.eps,
             )
         return torch.cat([apply_rope(txt_norm(txt), txt_freqs), apply_rope(img_norm(img), img_freqs)], dim=1)
+
+
+def _plain(linear: nn.Module, cls: type) -> bool:
+    """A plain tensor-parallel linear (not a LoRA twin) whose forward is its GEMM with the bias."""
+    return type(linear) is cls and linear.bias is not None and not linear.skip_bias_add
+
+
+def _joint_linear(txt_linear: ColumnParallelLinear, txt: torch.Tensor, img_linear: ColumnParallelLinear,
+                  img: torch.Tensor) -> torch.Tensor:
+    """``cat([txt_linear(txt), img_linear(img)], dim=1)``, each row's GEMMs writing straight into its slice of the
+    joint ``[R, Lt + Li, N]`` (a column shard is a local GEMM on every rank)."""
+    if not (txt.is_cuda and _plain(txt_linear, ColumnParallelLinear) and _plain(img_linear, ColumnParallelLinear)
+            and not txt_linear._local_output_start and not img_linear._local_output_start
+            and not (txt_linear.gather_output and txt_linear.tp_size > 1)
+            and not (img_linear.gather_output and img_linear.tp_size > 1)):
+        return torch.cat([txt_linear(txt), img_linear(img)], dim=1)
+    lt = txt.shape[1]
+    out = img.new_empty(img.shape[0], lt + img.shape[1], img_linear.weight.shape[0])
+    for r in range(img.shape[0]):
+        torch.addmm(txt_linear.bias, txt[r], txt_linear.weight.t(), out=out[r, :lt])
+        torch.addmm(img_linear.bias, img[r], img_linear.weight.t(), out=out[r, lt:])
+    return out
+
+
+def _rows_linear(linear: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    """``linear(x)`` for a token slice ``x [R, L, K]`` of a larger tensor, one GEMM per row from its contiguous
+    rows instead of a copy of the slice (one GPU; under TP the row shard's all-reduce runs as usual)."""
+    if not (x.is_cuda and _plain(linear, RowParallelLinear) and linear.tp_size == 1 and x[0].is_contiguous()):
+        return linear(x.contiguous())
+    out = x.new_empty(*x.shape[:2], linear.weight.shape[0])
+    for r in range(x.shape[0]):
+        torch.addmm(linear.bias, x[r], linear.weight.t(), out=out[r])
+    return out
 
 
 def _by_token(fn, split: int, tokens: tuple[torch.Tensor, ...], params: tuple[torch.Tensor, ...]) -> torch.Tensor:
