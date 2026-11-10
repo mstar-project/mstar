@@ -183,6 +183,10 @@ def spec_overrides(config: Mapping[str, Any]) -> Mapping[str, Any]:
     return {**config, "resources": {key: block for key, block in config["resources"].items() if key not in sdpa}}
 
 
+def _positions_key(array: Array) -> str | None:
+    return None if array.positions is None else position_key(array)
+
+
 def _no_layout(array: Array, missing: str) -> ValueError:
     return ValueError(f"Array {array.name!r}: no layout yet: {missing}")
 
@@ -256,9 +260,6 @@ def _apply_kernel_settings(
         array, binding = owners[key]
         # an update's settings go on its own spec, and a read on SDPA has no spec to set
         spec = by_key.get(resource_of.get(key, key))
-        if isinstance(spec, CrossAttentionSpec) and settings:
-            raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(settings)}; a cross read on "
-                             "a kept array takes no setting yet")
         if binding is not None:
             allowed = binding.kernel_settings
         elif isinstance(spec, KVSpec):
@@ -360,7 +361,7 @@ def _forks(array: Array, declared: ArrayStep) -> tuple[tuple, tuple, frozenset |
     )
 
 
-def _queries_step(handle: "PagedArrayHandle | WithinStepHandle", step: SubmoduleStep) -> ArrayStep:
+def _queries_step(handle: "PagedCrossHandle | WithinStepHandle", step: SubmoduleStep) -> ArrayStep:
     """What ``step`` lists for the array whose segments lay out the queries of ``handle``'s cross read."""
     queries = step.state.get(handle.queried.name)
     if queries is None:
@@ -370,7 +371,7 @@ def _queries_step(handle: "PagedArrayHandle | WithinStepHandle", step: Submodule
 
 
 def _query_segments(
-    handle: "PagedArrayHandle | WithinStepHandle", step: SubmoduleStep, segments: Sequence[Segment],
+    handle: "PagedCrossHandle | WithinStepHandle", step: SubmoduleStep, segments: Sequence[Segment],
 ) -> Sequence[Segment]:
     """The segments that lay out the queries of ``handle``'s cross read in ``step``, refused unless they name the
     requests of ``segments``, the array's own, in their order."""
@@ -558,23 +559,8 @@ class PagedAttend(OpBinding):
                                     "AttentionConfig has")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since AttentionConfig has no walk")
-        if read.queries is None:
-            return
-        if len(array.labels) != 1:
-            raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
-                                    f"context_label, and it has {sorted(array.labels)}")
-        if len(array.reads) != 1:
-            raise _no_layout(array, f"reads[{key!r}] reads another array's queries, and a cross read's array takes no "
-                                    "other read yet; declare that read on an array of its own")
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
-        if read.queries is not None:
-            return [CrossAttentionSpec(
-                resource_key=key, nodes=array.nodes,
-                config=CrossAttentionConfig(
-                    kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
-                ),
-            )]
         windowed = isinstance(read.mask, Window)
         # the pool holds only the array's layers, so AttentionConfig.layers counts among them
         kv_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
@@ -589,6 +575,31 @@ class PagedAttend(OpBinding):
 
     def steps(self, key: str, read: Read, segments, steps: dict[str, Any]) -> None:
         steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Bidirectional))
+
+
+class PagedCrossAttend(OpBinding):
+    """`Attend` with ``queries`` on a paged array: a `CrossAttentionSpec` over the array's pool, planned by the queried
+    array's segments. It takes no kernel setting yet."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Bidirectional):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional, the mask CrossAttentionConfig has")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
+        if len(array.labels) != 1:
+            raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
+                                    f"context_label, and it has {sorted(array.labels)}")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        return [CrossAttentionSpec(
+            resource_key=key, nodes=array.nodes,
+            config=CrossAttentionConfig(
+                kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
+            ),
+        )]
+
+    def steps(self, key: str, read: Read, segments, steps: dict[str, Any]) -> None:
+        steps[key] = AttentionStep(segments=segments, causal=False)
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -713,19 +724,13 @@ class ConvOnLinearAttn(OpBinding):
 
 
 class PagedArrayHandle(ArrayHandle):
-    """Adds and reads through the KV pages of an array that keeps entries.
-
-    ``queried`` is the array whose segments lay out the queries of a cross read.
-    """
+    """Adds and reads through the KV pages of an array that keeps entries."""
 
     def __init__(
-        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
-        queried: Array | None = None,
+        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...],
     ):
         super().__init__(array, resources, positions_key)
         self._bindings = bindings
-        self.queried = queried
-        self._query_label = "main"
         self.reads = {bound.key: bound.binding.bind(array, bound.key, resources) for bound in bindings}
         self.first_read = next(iter(self.reads.values()))
         self._attn = {
@@ -747,11 +752,6 @@ class PagedArrayHandle(ArrayHandle):
         self._grows = not (declared.eager_add and step.ctx.capture) and any(
             segment.span and (segment.request_id, segment.label) not in declared.placeholders for segment in segments
         )
-        if self.queried is None:
-            return
-        queries = _query_segments(self, step, segments)
-        if queries:
-            self._query_label = queries[0].label
 
     def check_step(self, step) -> None:
         super().check_step(step)
@@ -771,10 +771,7 @@ class PagedArrayHandle(ArrayHandle):
                                     "which it didn't open")
 
     def _holds(self, layer: int) -> bool:
-        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages. A
-        cross read attends the pages, and its resource has no ``requires_kv_write``."""
-        if self.queried is not None:
-            return False
+        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages."""
         attn = self._attn.get(layer)
         return attn is not None and not attn.requires_kv_write
 
@@ -795,9 +792,9 @@ class PagedArrayHandle(ArrayHandle):
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
         self._record_read(layer)
-        if self.queried is not None:
-            # the cross resource keys its plans by the query side's label
-            return self._attn[layer].run(q, label=self._query_label, kv_cache_layer=self._views[layer])
+        return self._run(layer, q)
+
+    def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
         return self._attn[layer].run(
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
@@ -805,13 +802,43 @@ class PagedArrayHandle(ArrayHandle):
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         self._check_open("at_last_token")
-        if self.queried is not None:
-            raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid "
-                                f"out by {self.queried.name!r}; call it on that array")
         return self.first_read.select_last_hidden(x, label=self.label)
 
     def _kernel_setting(self, read: str, field: str) -> Any:
         return getattr(self.reads[read], field)
+
+
+class PagedCrossHandle(PagedArrayHandle):
+    """A paged array read with the queries of ``queried``, whose segments lay them out. Its adds go to the pages, and
+    its read runs under the query side's label, which the cross resource keys its plans by."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], positions_key: str | None, bindings: tuple[BoundOp, ...], *,
+        queried: Array,
+    ):
+        super().__init__(array, resources, positions_key, bindings)
+        self.queried = queried
+        self._query_label = "main"
+
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        if step.ctx.replays:
+            return
+        queries = _query_segments(self, step, step.state[self.name].segments or step.segments or ())
+        if queries:
+            self._query_label = queries[0].label
+
+    def _holds(self, layer: int) -> bool:
+        """Never: a cross read attends the pages, and its resource has no ``requires_kv_write``."""
+        return False
+
+    def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
+        return self._attn[layer].run(q, label=self._query_label, kv_cache_layer=self._views[layer])
+
+    def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
+        self._check_open("at_last_token")
+        raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out "
+                            f"by {self.queried.name!r}; call it on that array")
 
 
 class ValueHandle(ArrayHandle):
@@ -1045,8 +1072,7 @@ class Storage(ABC):
         sp_group: CommGroup | None,
     ) -> ArrayHandle:
         """``array``'s handle over a node's built ``resources``."""
-        key = None if array.positions is None else position_key(array)
-        return self.handle_class(array, resources, key, _bindings(self, array, setup.by_read))
+        return self.handle_class(array, resources, _positions_key(array), _bindings(self, array, setup.by_read))
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         """Add the step of the array's own resource, under its name, for ``declared`` in ``step``."""
@@ -1069,20 +1095,10 @@ class PagedStorage(Storage):
     handle_class = PagedArrayHandle
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        by_name = {array.name: array for array in declared}
-        resolved = Resolved({}, {}, {})
-        for array in arrays:
-            resolved.specs[array.name] = self._specs(array, setup)
-            for key, read in array.reads.items():
-                resolved.resource_of[key] = key
-                if read.queries is None:
-                    continue
-                queried = by_name[read.queries]
-                if not isinstance(storage_of(queried), PagedStorage):
-                    raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, "
-                                            "which isn't an append-only array that keeps entries")
-                resolved.queried[key] = queried
-        return resolved
+        return Resolved(
+            {array.name: self._specs(array, setup) for array in arrays},
+            {key: key for array in arrays for key in array.reads}, {},
+        )
 
     def _specs(self, array: Array, setup: "StateSetup") -> list[NodeResourceSpec]:
         heads, head_dim = _kv_shape(array)
@@ -1103,18 +1119,7 @@ class PagedStorage(Storage):
         )
         return [pool, *_op_specs(array, bound)]
 
-    def handle(
-        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
-        sp_group: CommGroup | None,
-    ) -> ArrayHandle:
-        key = None if array.positions is None else position_key(array)
-        # a cross read is the array's only read
-        queried = next((resolved.queried[read] for read in array.reads if read in resolved.queried), None)
-        return PagedArrayHandle(array, resources, key, _bindings(self, array, setup.by_read), queried=queried)
-
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        if handle.queried is not None:
-            _queries_step(handle, step)
         pre, post, rows = _forks(handle.array, declared)
         steps[handle.name] = KVStep(
             segments=declared.segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
@@ -1130,6 +1135,44 @@ class PagedStorage(Storage):
             )
             for label, layout in by_label.items()
         }
+
+
+class PagedCrossStorage(PagedStorage):
+    """An append-only array that keeps entries, read with another array's queries: a cross resource over its pages,
+    which plans the queries by the queried array's segments in each step. Its handle holds one queried array, so for
+    now the array takes no other read."""
+
+    handle_class = PagedCrossHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        for array in arrays:
+            if len(array.reads) != 1:
+                raise _no_layout(array, f"reads {sorted(array.reads)}, and a cross read's array takes no other read "
+                                        "yet; declare each other read on an array of its own")
+        by_name = {array.name: array for array in declared}
+        resolved = super().resolve(arrays, declared, setup)
+        for array in arrays:
+            ((key, read),) = array.reads.items()
+            queried = by_name[read.queries]
+            if not isinstance(storage_of(queried), PagedStorage):
+                raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, "
+                                        "which isn't an append-only array that keeps entries")
+            resolved.queried[key] = queried
+        return resolved
+
+    def handle(
+        self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
+        sp_group: CommGroup | None,
+    ) -> ArrayHandle:
+        (key,) = array.reads
+        return PagedCrossHandle(
+            array, resources, _positions_key(array), _bindings(self, array, setup.by_read),
+            queried=resolved.queried[key],
+        )
+
+    def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+        _queries_step(handle, step)
+        super().steps(handle, declared, step, steps)
 
 
 class ValueStorage(Storage):
@@ -1152,7 +1195,9 @@ class ValueStorage(Storage):
             raise _no_layout(array, f"updates is empty, and today's resources hold a Value only for a linear attention "
                                     f"update ({LinearAttnBinding.kinds()})")
         bound = _bindings(self, array)
-        holders = [other for other in arrays if storage_of(other) is PAGED and other.nodes & array.nodes]
+        holders = [
+            other for other in arrays if isinstance(storage_of(other), PagedStorage) and other.nodes & array.nodes
+        ]
         if len(holders) != 1 or not array.nodes <= holders[0].nodes:
             raise _no_layout(array, f"its nodes must hold one append-only array, the one RecurrentStateConfig.kv_cache "
                                     f"links to, and they hold {[other.name for other in holders]}")
@@ -1243,6 +1288,7 @@ class WithinStepStorage(Storage):
 
 
 PAGED = PagedStorage()
+PAGED_CROSS = PagedCrossStorage()
 VALUE = ValueStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
@@ -1254,13 +1300,16 @@ def storage_of(array: Array) -> Storage:
         return VALUE if array.entry.tensors else HOST_VALUE
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
-    return PAGED if array.max_len else WITHIN_STEP
+    if not array.max_len:
+        return WITHIN_STEP
+    return PAGED_CROSS if any(read.queries is not None for read in array.reads.values()) else PAGED
 
 
-# `Attend` is an `AttentionSpec` on a paged array and a `RaggedAttentionSpec` within a step, so a binding is per storage
-# and op type.
+# `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
+# `RaggedAttentionSpec` within a step, so a binding is per storage and op type.
 BINDINGS: dict[tuple[Storage, type[Op]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (PAGED_CROSS, Attend): PagedCrossAttend(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),

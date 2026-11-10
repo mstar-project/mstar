@@ -44,7 +44,7 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import PagedArrayHandle, build_handle, build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import PagedCrossHandle, build_handle, build_specs, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
 from mstar.model.components.distributed.attention import ParallelCrossAttention
@@ -211,7 +211,7 @@ def test_a_kept_cross_read_with_no_layout_yet_is_refused_by_name(arrays, cause):
 
 def test_a_kept_cross_read_takes_no_kernel_setting_yet():
     arrays = [_self_array(), _context_array()]
-    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] sets \['decode_fmha'\]; a cross read"):
+    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] names no read .* of \['attn', 'context', 'kv'\]"):
         build_specs(arrays, kernel_settings={"cross": {"decode_fmha": True}})
     built = build_specs(arrays, kernel_settings={"context": {"max_num_pages": 9}})
     assert next(spec for spec in built if spec.resource_key == "context").config.max_num_pages == 9
@@ -406,7 +406,7 @@ def test_at_last_token_on_a_cross_array_is_refused_by_name():
 
 def test_a_handles_queried_array_is_keyword_only():
     with pytest.raises(TypeError):
-        PagedArrayHandle(_context_array(), {"context": _StubKV(), "cross": _StubCross()}, None, (), _self_array())
+        PagedCrossHandle(_context_array(), {"context": _StubKV(), "cross": _StubCross()}, None, (), _self_array())
 
 
 # State ops and the pages
