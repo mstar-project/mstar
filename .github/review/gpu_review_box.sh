@@ -57,6 +57,7 @@ VERDICT=no-result
 # The session stops at run.json's end_by, a margin before the box's deadline, so what it wrote (the report it
 # writes as it goes, progress.log) is collected rather than lost with the box; one that ran out of time is partial.
 END_BY=$(field end_by) NOW=$(date +%s)
+[[ $END_BY =~ ^[0-9]+$ ]] || finish "run.json has no end_by"
 timeout --kill-after=60 "$(( END_BY > NOW ? END_BY - NOW : 1 ))" "$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
   --model "$(field model)" --effort high --max-turns "$(field turns)" --output-format json \
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \

@@ -1297,6 +1297,19 @@ class TestEras(unittest.TestCase):
                 self.assertEqual(sorted(a[3] for a, _ in fake.calls if a[2] == "terminate"),
                                  ["digitalocean:9", "eras:i-1"], "a box would bill on after its run")
 
+    def test_a_box_dropped_from_the_ledger_after_the_read_is_still_finished_cleanly(self):
+        box = Path(tempfile.mkdtemp(), "nvidia")
+        box.mkdir()
+        (box / "instance").write_text("digitalocean:9\n")
+
+        @contextlib.contextmanager
+        def ledger_txn():  # the watchdog dropped the entry after finished() read it
+            yield {}
+        g = types.SimpleNamespace(ledger=lambda: {"digitalocean:9": {"provider": "digitalocean", "instance_id": "9"}},
+                                  ledger_txn=ledger_txn, status=lambda e, cfg: ("ended", "203.0.113.9", 22))
+        with unittest.mock.patch.object(gpu_review, "gpu_py", g):
+            self.assertEqual(gpu_review.finished(box, {}), "ended", "a KeyError would end the wait step")
+
     def test_cleanup_releases_every_vendors_box_by_name(self):
         released = []
         g = types.SimpleNamespace(ledger=dict, load_config=dict, job_name=gpu_review.gpu_py.job_name,
