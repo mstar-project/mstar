@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, GrammarRequest, grammar_request
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -116,14 +116,21 @@ class SamplerSpec(NodeResourceSpec):
     # one (greedy, no constrained row), asked or not, so a deployment turns it on in its
     # ``resources:`` block, on its text sampler.
     enable_grammar: bool = False
+    # The most host memory, in MiB, the worker's compiled grammars are kept in
+    # (xgrammar's compile cache, keyed by each request's grammar text).
+    grammar_cache_mb: int = 512
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
         greedy_capture: bool | None = None, enable_grammar: bool | None = None,
+        grammar_cache_mb: int | None = None,
     ) -> None:
         if enable_grammar is not None:
             check_bool_knob("enable_grammar", enable_grammar)
             self.enable_grammar = enable_grammar
+        if grammar_cache_mb is not None:
+            check_sizes({"grammar_cache_mb": grammar_cache_mb})
+            self.grammar_cache_mb = grammar_cache_mb
         if greedy_capture is not None:
             check_bool_knob("greedy_capture", greedy_capture)
             self.greedy_capture = greedy_capture

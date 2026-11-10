@@ -1103,7 +1103,7 @@ Each spec declares which keys it accepts. An unknown key raises an error at load
 | `KVSpec` with `PagedKVConfig` | `max_num_pages`, `page_size`, `max_seq_len`, `cpu_offload_pages`, `prefix_cache`, `prefix_cache_salt` |
 | `KVSpec` with `RingKVConfig` | `num_sessions` |
 | `BoundedKVSpec` | `max_slots` |
-| `SamplerSpec` | `enable_logprobs`, `enable_processed_logprobs` (see `SamplingReqConfig`), `greedy_capture` (`true` / `false`; by default a sampler past the one-kernel draw takes each row's argmax in a step whose rows all sample greedily, in a twin of each batched capture) |
+| `SamplerSpec` | `enable_logprobs`, `enable_processed_logprobs` (see `SamplingReqConfig`), `greedy_capture` (`true` / `false`; by default a sampler past the one-kernel draw takes each row's argmax in a step whose rows all sample greedily, in a twin of each batched capture), `enable_grammar` and `grammar_cache_mb` (see **Structured output** in models) |
 | `RecurrentStateSpec` | `max_slots`, `state_dtype`, `prefix_slots` (see **Cross-request prefix reuse**). `max_slots` counts the sink unless `disable_sink_slot`; a value that leaves no slot for a request is refused at startup. |
 | `AttentionSpec` | `backend` (`auto` / `flashinfer` / `dense` / `flex` / `xpu_paged`), `flashinfer_backend` (`auto` / `fa2` / `fa3`), `decode_tensor_cores` (`true` / `false`), `decode_fmha` (`true` / `false`) |
 | `CrossAttentionSpec` | `backend` (`auto` / `flashinfer`), `flashinfer_backend` (`auto` / `fa2` / `fa3`), `decode_tensor_cores` (`true` / `false`) |

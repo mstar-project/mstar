@@ -63,6 +63,7 @@ class SamplerResource(Resource):
         greedy_capture: bool | None = None,
         enable_grammar: bool = False,
         text_output=None,
+        grammar_cache_mb: int = 512,
     ):
         self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
@@ -184,7 +185,7 @@ class SamplerResource(Resource):
         if enable_grammar:
             if text_output is None:
                 raise ValueError("enable_grammar needs a model that declares text_output()")
-            self._grammar = GrammarRows(text_output, vocab_size, device)
+            self._grammar = GrammarRows(text_output, vocab_size, device, grammar_cache_mb << 20)
         self._grammar_mask: torch.Tensor | None = None
         self._grammar_masks: dict[int, torch.Tensor] = {}
         self._grammar_dirty: set[int] = set()
@@ -222,6 +223,7 @@ class SamplerResource(Resource):
             greedy_capture=spec.greedy_capture,
             enable_grammar=spec.enable_grammar,
             text_output=info.text_output() if spec.enable_grammar and info.text_output is not None else None,
+            grammar_cache_mb=spec.grammar_cache_mb,
         )
 
     def build_accelerator_graph_buffers(

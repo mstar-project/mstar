@@ -195,7 +195,7 @@ class GrammarRows:
     """The sampler's constrained rows: one matcher per request, the drawn tokens
     still on their way to the host, and the bitmask each step applies."""
 
-    def __init__(self, text_output: TextOutput, vocab_size: int | None, device: torch.device):
+    def __init__(self, text_output: TextOutput, vocab_size: int | None, device: torch.device, cache_bytes: int):
         xgr = _xgr()
         self._xgr = xgr
         detok = text_output.detokenizer
@@ -217,7 +217,7 @@ class GrammarRows:
             self.info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=size, stop_token_ids=stop)
         self.vocab_size = size
         self.words = math.ceil(size / 32)
-        self._compiler = xgr.GrammarCompiler(self.info, max_threads=8)
+        self._compiler = xgr.GrammarCompiler(self.info, max_threads=8, cache_limit_bytes=cache_bytes)
         # compiles run off the worker's threads (xgrammar releases the GIL)
         self._compile_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="grammar-compile")
         self._batch = xgr.BatchGrammarMatcher()

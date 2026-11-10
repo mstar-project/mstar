@@ -518,7 +518,8 @@ them by that name:
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
      sampler:
-       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs, enable_grammar
+       greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs, enable_grammar,
+                                # grammar_cache_mb (512)
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
