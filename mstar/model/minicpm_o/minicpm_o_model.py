@@ -751,14 +751,6 @@ class MiniCPMOModel(Model):
     def text_output(self) -> TextOutput:
         return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
 
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        if modality == TEXT:
-            return super().postprocess(output, modality, request_kwargs)
-        if modality == "audio":
-            pcm = (output.reshape(-1).float().clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
-            return pcm.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for MiniCPM-o: {modality!r}")
-
     # ------------------------------------------------------------------
     # Walks
     # ------------------------------------------------------------------
