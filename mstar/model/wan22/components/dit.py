@@ -285,18 +285,12 @@ class Wan22DiT(nn.Module):
     ``to_empty(device)`` -> checkpoint load).
 
     ``sp_group`` runs it under Ulysses sequence parallelism: each rank keeps a
-    contiguous slice of the post-patchify tokens, self-attention all-to-alls
-    them around the kernel, and the slices are gathered before unpatchify."""
+    contiguous slice of the post-patchify tokens, the self-attention's array
+    exchanges them around the kernel, and the slices are gathered before unpatchify."""
 
     def __init__(self, config: Wan22Config, sp_group: CommGroup | None = None):
         super().__init__()
         self.sp_group = sp_group or CommGroup.trivial()
-        if config.num_attention_heads % self.sp_group.world_size:
-            # Ulysses gives each rank an equal share of the heads
-            raise ValueError(
-                f"sp_size {self.sp_group.world_size} must divide the dit's "
-                f"{config.num_attention_heads} attention heads"
-            )
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
             # Wan22DiTBlock (across-heads q/k RMSNorm, affine norm2 before
