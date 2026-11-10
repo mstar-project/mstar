@@ -18,13 +18,12 @@ from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform
 from mstar.utils.fused_moe.backend import (
     FusedMoEBackend,
     MoEBackend,
-    MoEProblem,
     TritonFusedMoE,
     make_moe_backend,
 )
 
-THINKER = MoEProblem(num_experts=128, intermediate_size=768, hidden_size=2048, top_k=8)
-TALKER_TP2 = MoEProblem(num_experts=128, intermediate_size=192, hidden_size=1024, top_k=6)
+THINKER = 768  # the Thinker's per-expert intermediate size
+TALKER_TP2 = 192  # the Talker's at TP2
 
 
 @pytest.fixture
@@ -71,8 +70,8 @@ def test_aiter_without_the_package_is_an_error(on_platform, monkeypatch):
 
 
 class _RecordingBackend(FusedMoEBackend):
-    def __init__(self, problem):
-        super().__init__(problem)
+    def __init__(self, intermediate_size):
+        super().__init__(intermediate_size)
         self.prepared = []
 
     def prepare_weights(self, w1, w2):
@@ -93,9 +92,9 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
     on_platform(CpuPlatform())
     built = []
 
-    def fake_make(kind, problem):
-        built.append((kind, problem))
-        return _RecordingBackend(problem)
+    def fake_make(kind, intermediate_size):
+        built.append((kind, intermediate_size))
+        return _RecordingBackend(intermediate_size)
 
     monkeypatch.setattr(moe_module, "make_moe_backend", fake_make)
     kwargs = dict(hidden_size=64, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
@@ -104,7 +103,7 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
         kwargs["shared_expert"] = GatedMLP(hidden_size=64, intermediate_size=32, activation="silu")
     with torch.device("meta"):
         block = getattr(moe_module, block_name)(**kwargs)
-    assert built == [("triton", MoEProblem(4, 32, 64, 2))]
+    assert built == [("triton", 32)]
 
     container = torch.nn.Sequential(block)
     moe_module.prepare_moe_weights(container)
@@ -119,9 +118,9 @@ def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatc
     on_platform(CpuPlatform())
     built = []
 
-    def fake_make(kind, problem):
+    def fake_make(kind, intermediate_size):
         built.append(kind)
-        return _RecordingBackend(problem)
+        return _RecordingBackend(intermediate_size)
 
     monkeypatch.setattr(moe_module, "make_moe_backend", fake_make)
     with torch.device("meta"):

@@ -91,7 +91,7 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe import MoeAlignment, moe_block_m
-    from mstar.utils.fused_moe.backend import MoEProblem, make_moe_backend
+    from mstar.utils.fused_moe.backend import make_moe_backend
     from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
     from mstar.utils.fused_moe.runner import runs_per_pair
 
@@ -102,12 +102,11 @@ except Exception as e:  # pragma: no cover -- exercised only when triton missing
     logger.warning(f"Could not load fused MoE kernel: {e}")
 
 
-def _make_experts_backend(moe_backend: str, num_experts: int, intermediate_size: int,
-                          hidden_size: int, top_k: int):
+def _make_experts_backend(moe_backend: str, intermediate_size: int):
     """The block's fused backend, or None where the fused path cannot load."""
     if make_moe_backend is None:
         return None
-    return make_moe_backend(moe_backend, MoEProblem(num_experts, intermediate_size, hidden_size, top_k))
+    return make_moe_backend(moe_backend, intermediate_size)
 
 
 class TopKRouter(nn.Module):
@@ -479,9 +478,7 @@ class SparseMoeBlock(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, moe_intermediate_size)
         )
-        self.experts_backend = _make_experts_backend(
-            moe_backend, num_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
-        )
+        self.experts_backend = _make_experts_backend(moe_backend, moe_intermediate_size)
 
     def forward(
         self,
@@ -545,9 +542,7 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, moe_intermediate_size)
         )
-        self.experts_backend = _make_experts_backend(
-            moe_backend, num_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
-        )
+        self.experts_backend = _make_experts_backend(moe_backend, moe_intermediate_size)
         self.shared_expert = shared_expert
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
 
@@ -722,9 +717,7 @@ class ParallelSparseMoeBlock(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, shard_inter)
         )
-        self.experts_backend = _make_experts_backend(
-            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok,
-        )
+        self.experts_backend = _make_experts_backend(moe_backend, shard_inter)
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
     def _attach_weight_loaders(self, tp_rank: int, tp_size: int, full_inter: int):
@@ -839,9 +832,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, shard_inter)
         )
-        self.experts_backend = _make_experts_backend(
-            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok,
-        )
+        self.experts_backend = _make_experts_backend(moe_backend, shard_inter)
         self.shared_expert = shared_expert
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
@@ -1021,9 +1012,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(self.num_local_experts, hidden_size, moe_intermediate_size)
         )
-        self.experts_backend = _make_experts_backend(
-            moe_backend, self.num_local_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
-        )
+        self.experts_backend = _make_experts_backend(moe_backend, moe_intermediate_size)
         self._attach_weight_loaders()
 
     def _attach_weight_loaders(self):

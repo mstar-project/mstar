@@ -32,12 +32,6 @@ def _seed():
     torch.manual_seed(0)
 
 
-def _problem(dims):
-    from mstar.utils.fused_moe.backend import MoEProblem
-
-    return MoEProblem(*dims)
-
-
 def _inputs(dims, num_tokens, seed=0):
     e, inter, hidden, top_k = dims
     g = torch.Generator(device=DEV).manual_seed(seed)
@@ -142,7 +136,7 @@ def test_triton_backend_matches_reference(dims, num_tokens):
 
     x, w1, w2, weights, ids = _inputs(dims, num_tokens)
     ref = _reference(x, w1, w2, weights, ids)
-    backend = TritonFusedMoE(_problem(dims))
+    backend = TritonFusedMoE(dims[1])
     _assert_matches(backend(x, w1, w2, weights, ids), ref)
     e, inter, hidden, top_k = dims
     default = get_default_config(M=num_tokens, E=e, N=2 * inter, K=hidden, top_k=top_k)
@@ -156,7 +150,7 @@ def test_triton_backend_is_bitwise_reproducible(dims, num_tokens):
     from mstar.utils.fused_moe.backend import TritonFusedMoE
 
     x, w1, w2, weights, ids = _inputs(dims, num_tokens)
-    backend = TritonFusedMoE(_problem(dims))
+    backend = TritonFusedMoE(dims[1])
     first = backend(x, w1, w2, weights, ids).clone()
     for _ in range(10):
         assert torch.equal(backend(x, w1, w2, weights, ids), first)
@@ -220,7 +214,7 @@ def test_every_shipped_config_matches_reference():
 def _aiter_backend(dims, w1, w2):
     from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
 
-    backend = AiterFusedMoE(_problem(dims))
+    backend = AiterFusedMoE(dims[1])
     p1, p2 = torch.nn.Parameter(w1.clone(), requires_grad=False), torch.nn.Parameter(w2.clone(), requires_grad=False)
     backend.prepare_weights(p1, p2)
     return backend, p1, p2
@@ -237,11 +231,10 @@ def test_aiter_backend_matches_reference(dims, num_tokens):
 
 @pytest.mark.skipif(not HAS_AITER, reason="aiter not installed")
 def test_aiter_backend_refuses_unaligned_intermediate():
-    from mstar.utils.fused_moe.backend import MoEProblem
     from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
 
     with pytest.raises(ValueError, match="multiple of 128"):
-        AiterFusedMoE(MoEProblem(128, 192, 1024, 6))  # the Talker's experts at TP2
+        AiterFusedMoE(192)  # the Talker's experts at TP2
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +245,7 @@ def test_aiter_backend_refuses_unaligned_intermediate():
 def _backends(dims, w1, w2):
     from mstar.utils.fused_moe.backend import TritonFusedMoE
 
-    out = [("triton", TritonFusedMoE(_problem(dims)), w1, w2)]
+    out = [("triton", TritonFusedMoE(dims[1]), w1, w2)]
     if HAS_AITER:
         backend, p1, p2 = _aiter_backend(dims, w1, w2)
         out.append(("aiter", backend, p1, p2))
