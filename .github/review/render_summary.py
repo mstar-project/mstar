@@ -1,32 +1,78 @@
-#!/usr/bin/env python3
 """Render the review's summary comment from its structured output.
 
 The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
-in them. The status line counts the bot's inline findings from the PR's review
-threads, so a finding from an earlier run counts until its thread is resolved or
-a commit changes its lines. Run by claude-review.yml with the default branch
-checked out:
-
-    python3 .github/review/render_summary.py --schema     # for --json-schema
-    python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json < output.json
+in them. The status line counts the open findings (`open_findings`), so a finding
+from an earlier run counts until a later review judges it fixed, fixed above or moot.
+bot.py passes SCHEMA to the review, posts what `render` makes of its fields, and starts
+a re-review from what `read_state` reads back.
 """
-import argparse
+import base64
+import itertools
 import json
+import os
 import re
-import sys
+from pathlib import Path
 
-# Lets the workflow find earlier summaries to hide as outdated.
+# Lets the bot find earlier summaries to hide as outdated.
 MARKER = "<!-- claude-review-summary -->"
-# The bot's GraphQL logins: the review app's, and github-actions', which it posted as before the app.
-BOTS = ("mstar-review", "github-actions")
+# What a re-review starts from (head, findings outside the diff, risk), base64 JSON,
+# so model text can't close the HTML comment. Read back only from the bot's own comments.
+STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
+# Every login the bot posts as: the app, and github-actions, the job's own token, when the app has no token to
+# give (bot.post falls back to it, and everything before the app). Enough for something a forged post can only
+# add to, such as an inline finding.
+POSTING_BOTS = ("mstar-review", "github-actions")
+# Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
+# workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
+BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
+# fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
+# PR is one the review was given the diff of (stacked-above.json).
+STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
+STILL_OPEN = ("open", "disputed")
+# What takes an earlier finding outside the diff out of the state (`carried`).
+CLEARS = ("fixed", "moot")
+# Handoffs saved before the modes were renamed carry the old names (current_mode).
+RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
+# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
+# `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
+MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
+                    r"(?!\u200b)")
+# A live-test report's fenced code, read as GitHub's CommonMark does (`report_blocks`): lines end at \n, \r or \r\n,
+# which isn't str.splitlines.
+LINE = re.compile(r"[^\r\n]*(?:\r\n?|\n|\Z)")
+FENCE_OPEN = re.compile(r"( {0,3})(?:(`{3,})([^`]*)|(~{3,})(.*))")
+FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+# The start of a run that could open a fence, and only the start: splitting it there leaves no run a fence can open,
+# and a run already split isn't matched again.
+FENCE_RUN = re.compile(r"(?<![\u200b`~])([`~])(?=\1\1)")
+LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]|$)")
+# The HTML a report may keep, exactly so, for a folded section. At the start of a line it opens an HTML block
+# that lasts until a blank line.
+BARE_TAG = re.compile(r"</?(?:details|summary)>")
+# A fence language GitHub leaves as code. These it draws instead, and anything else (`&#109;ermaid`) may spell them.
+PLAIN_LANGUAGE = re.compile(r"[A-Za-z0-9_+.-]*")
+DRAWN_LANGUAGES = ("mermaid", "geojson", "topojson", "stl", "math")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
     "properties": {
+        # Findings on lines of pr.diff, posted by the workflow (bot.post_inline), never by the model.
+        "inline_comments": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "line": {"type": "integer", "minimum": 1, "description": "the line, or the last line of a range"},
+                "start_line": {"type": "integer", "minimum": 1, "description": "the first line, for a range"},
+                "side": {"type": "string", "enum": ["RIGHT", "LEFT"], "description": "LEFT for a deleted line"},
+                "body": {"type": "string"},
+            },
+            "required": ["path", "line", "body"],
+        }},
         "outside_diff": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -34,38 +80,208 @@ SCHEMA = {
                 "claim": {"type": "string"},
                 "location": {"type": "string", "description": "path:line"},
                 "detail": {"type": "string"},
+                # Set only when a PR stacked above, whose code the review read, fixes it for real.
+                "fixed_in": {"type": "integer", "minimum": 1, "description": "that PR number"},
             },
             "required": ["priority", "claim", "location", "detail"],
         }},
         "since_last": {"type": "string"},
         "description_problems": STRINGS,
-        "questions": STRINGS,
+        "questions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "path:line it applies to, or empty for the whole PR"},
+                "text": {"type": "string"},
+            },
+            "required": ["location", "text"],
+        }},
         "checked": STRINGS,
-        "skipped": STRINGS,
+        "skipped": {**STRINGS, "description": "files not reviewed: only with a small turn cap (a contributor run) "
+                                              "and a diff too large for it; else empty"},
         "types": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True,
                   "items": {"type": "string", "enum": list(TYPES)}},
+        "prior_findings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "inline comment id, or the outside_diff location"},
+                "priority": {"type": "string", "enum": list(PRIORITIES)},
+                "status": {"type": "string", "enum": list(STATUSES)},
+                "fixed_in": {"type": "integer", "minimum": 1,
+                             "description": "with fixed_above: the PR stacked above that fixes it"},
+                "why": {"type": "string"},
+            },
+            "required": ["ref", "priority", "status", "why"],
+        }},
+        "design": STRINGS,
+        # Bugs in code the PR didn't write or worsen: reported, never counted or blocking.
+        "latent": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "path:line"},
+                "detail": {"type": "string"},
+                "priority": {"type": "string", "enum": list(PRIORITIES)},
+                "issue": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+                          "description": "the open issue that tracks it (open-issues.json), or null"},
+                "issue_title": {"type": "string", "description": "with no issue: a title for one"},
+            },
+            "required": ["location", "detail", "priority", "issue", "issue_title"],
+        }},
+        "risk": {"type": "object", "properties": {
+            "level": {"type": "string", "enum": ["low", "medium", "high"]},
+            "reason": {"type": "string"},
+            # The design or direction decisions left to a human, when the risk isn't low: where each lives and why.
+            "look_at": {"type": "array", "items": {"type": "object", "properties": {
+                "location": {"type": "string", "description": "path:line, or a function or class"},
+                "why": {"type": "string"},
+            }, "required": ["location", "why"]}},
+        }, "required": ["level", "reason", "look_at"]},
     },
-    "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types"],
+    "required": ["inline_comments", "outside_diff", "since_last", "description_problems", "questions", "checked",
+                 "skipped", "types", "prior_findings", "design", "latent", "risk"],
 }
 FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 
 
-def open_priorities(pages):
-    """The priority of each of the bot's inline findings whose thread is neither resolved nor outdated."""
-    found = []
+def inert(value):
+    """Untrusted text, or the strings in a list or dict of it, with a zero-width space after the first character of
+    every `@`, `#`, `<`, `&`, `\\`, `](`, `]:`, `![`, `://`, `GH-` and `www.`, in any case. (`#` before whitespace,
+    another `#` or the end of the text is left alone: that's a heading or plain, and can't reference anything.) So it
+    can't ping anyone, mark another issue's timeline, link (inline or by a reference definition), load an image, open
+    HTML or a comment, or spell any of those as an entity or a backslash escape. Nothing is escaped, so text in a code
+    span still reads right and a second pass changes nothing."""
+    if isinstance(value, str):
+        return MARKUP.sub("\\g<0>\u200b", value)
+    if isinstance(value, list):
+        return [inert(v) for v in value]
+    if isinstance(value, dict):
+        return {k: inert(v) for k, v in value.items()}
+    return value
+
+
+def report_blocks(text):
+    """`text`, at the top level of a comment, as ([piece, in a fence] for each run of lines, the fence left open or
+    ""). A fenced code block by CommonMark's rule is left out of `inert` only where GitHub is sure to read it as one.
+    An opener that isn't sure ends that for the rest of the text, which is then just `inert`, fence or not, with
+    every run that could open a fence split, so GitHub opens none either and none swallows the bot's text after the
+    report: one indented under what may be a list item (the item's end also ends the fence, so the next line is
+    outside it), one in the HTML block a bare tag opens (no fence at all), one GitHub draws instead of showing.
+    Skipping only that line wouldn't do: if GitHub does read it as a fence, GitHub's closing line would look like an
+    opener here, and the text after it, outside any fence, would go through unneutralised."""
+    lines, fence, sure, listed, html = [], "", True, False, False
+    for line in LINE.findall(text):
+        body, code = line.rstrip("\r\n"), bool(fence)
+        if fence:
+            close = FENCE_CLOSE.fullmatch(body)
+            if close and close[1][0] == fence[0] and len(close[1]) >= len(fence):
+                fence = ""
+        else:
+            opener = FENCE_OPEN.fullmatch(body) if sure else None
+            if opener:
+                language = re.match(r"[^ \t]*", (opener[3] or opener[5] or "").strip(" \t"))[0]
+                sure = not (opener[1] and listed or html or not PLAIN_LANGUAGE.fullmatch(language)
+                            or language.lower() in DRAWN_LANGUAGES)
+                if sure:
+                    fence, code = opener[2] or opener[4], True
+            listed = listed or bool(LIST_ITEM.match(body))
+            html = bool(BARE_TAG.search(body)) or (html and body.strip(" \t") != "")
+        lines.append((line if sure else FENCE_RUN.sub("\\1\u200b", line), code))
+    return [("".join(line for line, _ in run), code) for code, run in itertools.groupby(lines, lambda x: x[1])], fence
+
+
+def inert_report(text):
+    """The box's report as `inert` makes it, except what GitHub shows as written anyway: its fenced code (so a command
+    in one still copies) and the exact tags `<details>`, `</details>`, `<summary>` and `</summary>`. A fence can't
+    ping, link or load anything, but the bot reads its markers from a comment's raw text, so `<!--` is split there
+    too. Leading byte order marks go first: GitHub skips one at the start of a comment, and a fence after it would
+    open there and not here. A second pass changes nothing."""
+    def neutral(m):
+        return m[0] if m[0] == "<" and BARE_TAG.match(m.string, m.start()) else m[0] + "\u200b"
+
+    return "".join(piece.replace("<!--", "<\u200b!--") if code else MARKUP.sub(neutral, piece)
+                   for piece, code in report_blocks(text.lstrip("\ufeff"))[0])
+
+
+def stacked_above(path):
+    """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
+    bot.collect leaves out when a fetch failed. [] without it."""
+    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if path and Path(path).exists() else []
+
+
+def judged(review, stacked):
+    """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
+    when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
+    is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it."""
+    def unchecked(f, text):
+        note = f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+        return text if note in text else f"{text} {note}"
+    return {**review,
+            "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
+                             {**{k: v for k, v in f.items() if k != "fixed_in"},
+                              "detail": unchecked(f, f["detail"])} for f in review["outside_diff"]],
+            "prior_findings": [f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else
+                               {**f, "status": "open", "why": unchecked(f, f["why"])}
+                               for f in review.get("prior_findings", [])]}
+
+
+def carried(review, earlier):
+    """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
+    the last review's outside_diff. Only `fixed` and `moot` clear one: "a finding left out stays open", and
+    stays in the state for the next re-review to judge. One this run judged fixed above carries that
+    `fixed_in` (judged checks it), and one it judged still open loses any `fixed_in` from before."""
+    verdicts = {f["ref"]: f for f in review["prior_findings"]}
+    locations = {f["location"] for f in review["outside_diff"]}
+
+    def with_verdict(f):
+        verdict = verdicts.get(f["location"])
+        if verdict is None:
+            return f
+        kept = {k: v for k, v in f.items() if k != "fixed_in"}
+        fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
+        return {**kept, "fixed_in": fixed_in} if fixed_in else kept
+
+    return {**review, "outside_diff": [*review["outside_diff"], *[
+        with_verdict(f) for f in earlier if f["location"] not in locations
+        and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
+
+
+def open_findings(review, pages, stacked):
+    """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
+    run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
+    later review judged still open. A thread someone resolved stays open: only a later review that judged
+    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
+    unknown. A finding a PR stacked above fixes isn't open: it lands with that PR, when that PR is one of
+    `stacked` (judged). `pages` are the pages of the PR's review threads (GraphQL)."""
+    review = judged(review, stacked)
+    prior = review["prior_findings"]
+    cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
+    disputed = {f["ref"]: f["why"] for f in prior if f["status"] == "disputed"}
+
+    def what(ref, text):
+        return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
+
+    found, counted = [], {f["location"] for f in review["outside_diff"]}
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            if thread["isResolved"] or thread["isOutdated"]:
-                continue
             first = thread["comments"]["nodes"][0]
+            ref = str(first.get("databaseId", ""))
+            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
+                continue
             match = TAG.match(first["body"])
-            if match and first["author"] and first["author"]["login"] in BOTS:
-                found.append(match[1])
+            where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
+            found.append((where, match[1] if match else "P2",
+                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
+            counted.add(ref)
+    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+              for f in review["outside_diff"] if not f.get("fixed_in")]
+    # Judged still open, with no thread or outside_diff item here to count it by.
+    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+              if f["status"] in STILL_OPEN and f["ref"] not in counted]
     return found
 
 
-def status(review, inline, head, mode):
-    found = inline + [f["priority"] for f in review["outside_diff"]]
+def status(review, pages, head, mode, stacked):
+    found = [p for _, p, _ in open_findings(review, pages, stacked)]
+    review = inert(judged(review, stacked))
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -73,20 +289,84 @@ def status(review, inline, head, mode):
         icon = "🟡"
     else:
         icon = "🟢"
-    text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No findings"
-    return f"{icon} **{text}** on `{head[:7]}`, {mode} review"
+    outside = {f["location"] for f in review["outside_diff"]}  # `carried` keeps one judged fixed above in both lists
+    fixed_above = sum(f["status"] == "fixed_above" and f["ref"] not in outside for f in review["prior_findings"]) \
+        + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
+    text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No open findings" + (
+        f"; {fixed_above} fixed above" if fixed_above else "")
+    line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
+    if review.get("risk"):
+        line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
+    return line
 
 
-def render(review, inline, head, mode):
-    """``inline`` is the priority of each open inline finding, from `open_priorities`."""
-    parts = [f"{MARKER}\n### Automated review", status(review, inline, head, mode)]
+def above(finding):
+    return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it."
+
+
+def latent(bug):
+    issue = f"Tracked in #{bug['issue']}." if bug.get("issue") else \
+        f"No issue yet; suggested title: {bug['issue_title']}"
+    return f"**[{bug['priority']}]** `{bug['location']}`: {bug['detail']} {issue}"
+
+
+def checklist(review, pages, stacked, extra=()):
+    """The "What's left for you" list: what a human must decide before approving, most important first,
+    one line each with its place: open P0/P1, then `extra` (what the live-test job's rule found), the
+    design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
+    ten lines the rest fold away, so a question or decision, whose only home this is, is never lost."""
+    found = open_findings(review, pages, stacked)
+    review = inert(judged(review, stacked))
+
+    def where(item):
+        return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
+
+    def findings(*priorities):
+        return [f"**[{p}]** `{inert(w)}`: {inert(what)}"
+                for wanted in priorities for w, p, what in found if p == wanted]
+
+    items = [*findings("P0", "P1"), *inert(list(extra)),
+             *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
+             *[f"{where(q)}: {q['text']}" for q in review["questions"]],
+             *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
+    title = "#### What's left for you"
+    if not items:
+        return f"{title}\nNothing left from the review."
+    # Model text and file names: kept to one line (`inert` above, so unable to open an HTML comment).
+    lines = [f"- [ ] {' '.join(str(item).split())}" for item in items]
+    text = "\n".join([title, *lines[:10]])
+    if lines[10:]:
+        rest = "\n".join(lines[10:])
+        text += f"\n\n<details><summary>and {len(lines) - 10} more</summary>\n\n{rest}\n\n</details>"
+    return f"{text}\n\nApprove if you're OK with these."
+
+
+def render(review, pages, head, mode, stacked):
+    """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above)."""
+    parts = ["### Automated review", status(review, pages, head, mode, stacked)]
+    raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
+    review = inert(raw)
     if review["since_last"]:
         parts.append(review["since_last"])
+    prior = review.get("prior_findings", [])
+    outside = {f["location"] for f in review["outside_diff"]}
+    if prior:
+        tally = ", ".join(f"{sum(f['status'] == s for f in prior)} {s.replace('_', ' ')}" for s in STATUSES)
+        parts.append(f"Earlier findings: {tally}.")
     sections = [
+        ("Still open from earlier", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
+                                     for f in prior if f["status"] == "open" and f["ref"] not in outside]),
+        ("Disputed: a person decides", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
+                                        for f in prior if f["status"] == "disputed"]),
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
-                              for f in review["outside_diff"]]),
+                              for f in review["outside_diff"] if not f.get("fixed_in")]),
+        ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
+                                 for f in prior if f["status"] == "fixed_above" and f["ref"] not in outside]
+         + [f"**[{f['priority']}]** `{f['location']}`: {f['claim']} {above(f)}\n\n  {f['detail']}"
+            for f in review["outside_diff"] if f.get("fixed_in")]),
         ("Description", review["description_problems"]),
-        ("Questions", review["questions"]),
+        ("Design", review.get("design", [])),
+        ("Latent bugs on main (not from this PR)", [latent(b) for b in review.get("latent", [])]),
     ]
     for title, items in sections:
         if items:
@@ -96,24 +376,38 @@ def render(review, inline, head, mode):
         parts.append(f"<details><summary>What the review checked</summary>\n\n{checked}\n\n</details>")
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
+    parts.append(checklist(raw, pages, stacked))
     parts.append(FOOTER)
-    return "\n\n".join(parts) + "\n"
+    risk = raw.get("risk")  # its rating, not the look_at prose the summary already shows
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
+             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": raw.get("latent", [])}
+    # `inert` keeps model text from opening an HTML comment, so it can't forge a marker this bot or the workflow reads.
+    text = "\n\n".join(parts)
+    return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--schema", action="store_true", help="print the fields the review returns, as a JSON schema")
-    ap.add_argument("--head")
-    ap.add_argument("--mode")
-    ap.add_argument("--threads", help="the PR's review threads, from `gh api graphql --paginate --slurp`")
-    a = ap.parse_args()
-    if a.schema:
-        print(json.dumps(SCHEMA, separators=(",", ":")))
-    else:
-        with open(a.threads) as f:
-            inline = open_priorities(json.load(f))
-        sys.stdout.write(render(json.load(sys.stdin), inline, a.head, a.mode))
+def current_mode(mode):
+    """`mode` by its current name: handoffs saved before the modes were renamed carry the old one."""
+    return RENAMED_MODES.get(mode, mode)
 
 
-if __name__ == "__main__":
-    main()
+def saved_state(body):
+    """The state a summary comment carries (its last), decoded; else None."""
+    found = STATE.findall(body)
+    try:
+        state = json.loads(base64.b64decode(found[-1])) if found else None
+    except ValueError:
+        return None
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def read_state(body):
+    """The saved state, when a re-review can build on it; else None, and that run reviews the whole PR. Not
+    when it doesn't decode or the earlier review skipped files. Any mode can build on any other, since every
+    mode runs every pass."""
+    state = saved_state(body)
+    if state is None or state.get("skipped"):
+        return None
+    return state
