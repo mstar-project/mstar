@@ -217,7 +217,16 @@ impl Silero {
     pub fn new() -> Silero {
         Silero { state: vec![0.0; STATE_LEN], context: vec![0.0; CONTEXT] }
     }
+}
 
+/// A stream's speech probability, one `FRAME` at a time: Silero in the server,
+/// a script in the tests.
+trait SpeechProbability: Send {
+    fn prob(&mut self, frame: &[f32]) -> f64;
+    fn reset(&mut self);
+}
+
+impl SpeechProbability for Silero {
     fn prob(&mut self, frame: &[f32]) -> f64 {
         let mut x = self.context.clone();
         x.extend_from_slice(frame);
@@ -270,7 +279,7 @@ pub enum Op {
 /// eagerness' pause asks the end-of-turn model once over the turn's last 8 s.
 /// A turn holds at most `max_turn` samples. A partial frame waits for the next feed.
 pub struct TurnSegmenter {
-    vad: Silero,
+    vad: Box<dyn SpeechProbability>,
     max_turn: usize,
     threshold: f64,
     neg: f64,
@@ -291,6 +300,16 @@ pub struct TurnSegmenter {
 
 impl TurnSegmenter {
     pub fn new(cfg: &TurnDetection, max_turn: usize, pos: i64, end_of_turn: Option<EndOfTurn>) -> TurnSegmenter {
+        Self::with_vad(Box::new(Silero::new()), cfg, max_turn, pos, end_of_turn)
+    }
+
+    fn with_vad(
+        vad: Box<dyn SpeechProbability>,
+        cfg: &TurnDetection,
+        max_turn: usize,
+        pos: i64,
+        end_of_turn: Option<EndOfTurn>,
+    ) -> TurnSegmenter {
         let (threshold, prefix_ms, silence_ms, eot, eot_threshold, pause_ms) = match cfg {
             TurnDetection::Semantic(s) => {
                 let (pause, p, silence) = eagerness(&s.eagerness).unwrap_or((300, 0.5, 4000));
@@ -299,7 +318,7 @@ impl TurnSegmenter {
             TurnDetection::Server(v) => (v.threshold, v.prefix_padding_ms as usize, v.silence_duration_ms as usize, None, 0.0, 0),
         };
         TurnSegmenter {
-            vad: Silero::new(),
+            vad,
             max_turn,
             threshold,
             neg: (threshold - HYSTERESIS).max(0.01),
