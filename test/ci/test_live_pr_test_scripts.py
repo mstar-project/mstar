@@ -9,6 +9,7 @@ import itertools
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -18,7 +19,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / ".claude/skills/live-pr-test/scripts"
-GPU = runpy.run_path(str(SCRIPTS / "gpu.py"))
+sys.path.insert(0, str(SCRIPTS))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 HEALTH = runpy.run_path(str(SCRIPTS / "gpu_health.py"))
 CFG = {"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_total_usd": 100}, "ssh_public_key": "/dev/null",
        "runpod": {"image": "img", "hf_home": "/workspace/hf"}}
@@ -46,7 +50,7 @@ class Reply:
 
 class TestGpu(unittest.TestCase):
     def setUp(self):
-        self.g = GPU["http"].__globals__
+        self.g = GPU
         saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer",
                                         "eras")}
         self.addCleanup(self.g.update, saved)
