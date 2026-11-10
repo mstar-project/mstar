@@ -168,14 +168,14 @@ class SequenceShard(Resource):
     ``scatter`` / ``gather``. Holds no per-request state and no device buffers: its plan is
     host-only, from the declared step and the lease, the same on every rank. Off its defaults:
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
-    (its dependents pre-plan); it keeps ``supports_context_parallel`` False (it depends on no pool),
+    (its dependents pre-plan), ``resident_refusal`` (None: a one-token-a-row step, what resident
+    planning replays, is never split); it keeps ``supports_context_parallel`` False (it depends on no pool),
     ``can_capture`` True and ``force_double_buffer`` False (nothing staged)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
 
     def resident_refusal(self) -> str | None:
-        # no per-request state, and a one-token-a-row step (what resident planning replays) is never split
         return None
 
     def __init__(

@@ -227,11 +227,11 @@ def _shard(world: int = 2, rank: int = 0, labels=("main",), axis: int = 0, **spe
     return spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
 
 
-def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=None, rows=None, capture=False):
+def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=None, rows=None):
     """The shard's plan of a step of ``segments`` ((request, label, span)), as label -> (counts, rows)
     when it splits, None when copied."""
     rids = rows or sorted({rid for rid, _, _ in segments})
-    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=capture, slot_lease=lease,
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, slot_lease=lease,
                       force_prefill=force_prefill)
     # declared once on the submodule step, as a model does, which hands it to every resource step
     step = SubmoduleStep(
