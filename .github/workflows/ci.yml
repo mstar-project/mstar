@@ -203,6 +203,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # pip's download cache, keyed on this file, which holds the pins below
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
       - name: Install libzmq and ffmpeg
         # ffmpeg: the video parity tests mux a generated sound track, which skip without it
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev ffmpeg
