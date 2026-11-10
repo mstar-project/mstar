@@ -72,6 +72,9 @@ SPREAD = 1.5
 # mels and seed. 16-bit PCM units; bit-exactness is checked under deterministic cuDNN.
 HIFT_NONDET_LSB = 8
 CONTROL_MIN = 1000
+# default_female's token 85 sits 3e-5 from a rounding boundary of the tokenizer's quantizer,
+# on the CPU and on CUDA alike
+VOICE_TOKEN_FLIPS = 1
 
 
 def pcm_bytes(speech: torch.Tensor) -> bytes:
@@ -318,20 +321,21 @@ def main() -> None:
     verdict.check(c_pcm_worst > CONTROL_MIN,
                   f"negative control (MiniCPM-o's knobs) diverges: pcm max diff {c_pcm_worst}")
 
-    # the M* voice prompt encoder on the clip, against the reference's prompt pieces
-    import soundfile as sf
-    import torchaudio
+    # the M* voice prompt encoder on the clip as the model serves it, against the reference's
+    # prompt pieces: the mel from the clip's own rate must be exact; a token past a rounding
+    # near-tie may flip
+    from mstar.model.step_audio2.step_audio2_model import _load_voice_clip
 
-    wav, sr = sf.read(str(ASSETS / "default_female.wav"), dtype="float32", always_2d=True)
-    wav16 = torchaudio.functional.resample(torch.from_numpy(wav.T[0].copy()), sr, 16000)
     model.voice_encoder.cpu()
-    mine = model.voice_encoder(wav16)
-    same_tokens = mine.tokens.shape == prompt.tokens.shape and (mine.tokens.cpu() == prompt.tokens.cpu()).float().mean()
-    print(f"voice encoder: tokens {tuple(mine.tokens.shape)} vs {tuple(prompt.tokens.shape)}, agreement {same_tokens}; "
-          f"x-vector max abs {(mine.spk_emb.cpu() - prompt.spk_emb.cpu()).abs().max().item():.3e}; "
-          f"mel {tuple(mine.mel.shape)} vs {tuple(prompt.mel.shape)}")
-    if mine.mel.shape == prompt.mel.shape:
-        print(f"  mel max abs {(mine.mel.cpu() - prompt.mel.cpu()).abs().max().item():.3e}")
+    mine = model.voice_encoder(*_load_voice_clip(ASSETS / "default_female.wav"))
+    differ = int((mine.tokens.cpu() != prompt.tokens.cpu()).sum()) if mine.tokens.shape == prompt.tokens.shape else -1
+    xvec = (mine.spk_emb.cpu() - prompt.spk_emb.cpu()).abs().max().item()
+    print(f"voice encoder: tokens {tuple(mine.tokens.shape)} vs {tuple(prompt.tokens.shape)}, {differ} differ; "
+          f"x-vector max abs {xvec:.3e}")
+    verdict.check(mine.mel.shape == prompt.mel.shape and torch.equal(mine.mel.cpu(), prompt.mel.cpu()),
+                  "voice encoder: the prompt mel, taken from the clip's own rate, is bit-exact")
+    verdict.check(0 <= differ <= VOICE_TOKEN_FLIPS and xvec < 1e-4,
+                  f"voice encoder: tokens agree but for {differ} (at most {VOICE_TOKEN_FLIPS}), x-vector to 1e-4")
     verdict.finish()
 
 

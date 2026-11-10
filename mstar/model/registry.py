@@ -32,6 +32,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "omnilingual_asr_ctc_3b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnilingual_asr_ctc_7b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
+    "step_audio2": ("mstar.model.step_audio2.step_audio2_model", "StepAudio2Model"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "minimax_h3": ("mstar.model.minimax_h3.minimax_h3_model", "H3Model"),
@@ -210,6 +211,8 @@ HF_MODELS: dict[str, dict] = {
     "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
     # MiniCPM-o 4.5: Qwen3-8B over SigLIP image slices and Whisper audio, half-duplex chat.
     "minicpm_o": {"model_path_hf": "openbmb/MiniCPM-o-4_5"},
+    # Step-Audio-2-mini: Qwen2.5-7B over a Whisper-large-v3 audio tower; speech through token2wav.
+    "step_audio2": {"model_path_hf": "stepfun-ai/Step-Audio-2-mini"},
     # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
     # FLUX.1 VAE), text-to-image only. Apache-2.0.
     "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
