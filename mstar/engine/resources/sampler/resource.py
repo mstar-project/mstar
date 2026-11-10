@@ -14,6 +14,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sampler.grammar import GrammarRows
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
@@ -59,6 +60,8 @@ class SamplerResource(Resource):
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         greedy_capture: bool | None = None,
+        enable_grammar: bool = False,
+        text_output=None,
     ):
         self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
@@ -172,6 +175,20 @@ class SamplerResource(Resource):
         # its sampler rows on the device; None on a host-planned step
         self._step_rows: tuple | None = None
         self._step_index: torch.Tensor | None = None
+        # Grammar-constrained rows (`sampler/grammar.py`), when the spec enables them.
+        # The mask this step applies (None: none), the static mask buffer of each cg
+        # slot the captures apply, the slots holding a constrained row's mask, and
+        # each step's drawn tokens (by (cg slot, greedy) under capture, None eager).
+        self._grammar: GrammarRows | None = None
+        if enable_grammar:
+            if text_output is None:
+                raise ValueError("enable_grammar needs a model that declares text_output()")
+            self._grammar = GrammarRows(text_output, vocab_size, device)
+        self._grammar_mask: torch.Tensor | None = None
+        self._grammar_masks: dict[int, torch.Tensor] = {}
+        self._grammar_dirty: set[int] = set()
+        self._grammar_stager = PinnedStager(torch.int32) if enable_grammar else None
+        self._drawn: dict = {}
 
     @property
     def _penalty_live(self) -> bool:
@@ -202,6 +219,8 @@ class SamplerResource(Resource):
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
+            enable_grammar=spec.enable_grammar,
+            text_output=info.text_output,
         )
 
     def build_accelerator_graph_buffers(
@@ -230,6 +249,13 @@ class SamplerResource(Resource):
             **self._scalar_options(),
         )
         self._cg_buffers.cells = self._cells
+        if self._grammar is not None:
+            for slot in range(self._cg_slots):
+                buf = self._grammar_masks.get(slot)
+                if buf is None or buf.shape[0] < self._cg_max_bs:
+                    self._grammar_masks[slot] = torch.full(
+                        (self._cg_max_bs, self._grammar.words), -1, dtype=torch.int32, device=self._device,
+                    )
 
     def _scalar_options(self) -> dict:
         """What decides the scalars a captured sampler reads per row."""
@@ -274,6 +300,16 @@ class SamplerResource(Resource):
         if problem is not None:
             self._sampler.remove_request(rid)
             raise ValueError(f"request {rid!r} {problem}")
+        grammar = overrides.grammar if overrides is not None else None
+        if grammar is not None:
+            try:
+                if self._grammar is None:
+                    raise ValueError(f"request {rid!r} asks for structured_outputs but the node's "
+                                     "SamplerSpec has enable_grammar=False")
+                self._grammar.add(rid, grammar)
+            except ValueError:
+                self._sampler.remove_request(rid)
+                raise
         # after the refusals, so a refused request leaves no stale entry
         if resolved.presence_penalty != 1.0:
             self._penalty_rids.add(rid)
@@ -368,6 +404,8 @@ class SamplerResource(Resource):
         self._logprob_rids.discard(rid)
         self._sampled_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
+        if self._grammar is not None:
+            self._grammar.remove(rid)
         if self._history is not None:
             self._history.unregister(rid)
         if self._cg_buffers is not None:
@@ -466,7 +504,9 @@ class SamplerResource(Resource):
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
 
     def resident_refusal(self) -> str | None:
-        # never holds a node back: without a planner it stages its rows on the host
+        # never holds a node back otherwise: without a planner it stages its rows on the host
+        if self._grammar is not None:
+            return "its grammar masks are staged by the host's rows (enable_grammar)"
         return None
 
     def bind_resident(self, planner: ResidentPlanner, key: str) -> None:
@@ -558,6 +598,8 @@ class SamplerResource(Resource):
             self._set_greedy_flag(ctx)
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
+            if self._grammar is not None:
+                self._stage_grammar(ctx)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -638,6 +680,29 @@ class SamplerResource(Resource):
             self._cg_sampler = sampler
             self._step_slot = (cg_slot, padded_bs)
 
+    def _stage_grammar(self, ctx: StepContext) -> None:
+        """This step's grammar masks, from every token its rows drew so far: into
+        the leased slot's static buffer, which the capture applies whatever it
+        holds (all ones when no row is constrained), or into a fresh tensor for an
+        eager step with a constrained row."""
+        grammar = self._grammar
+        lease = ctx.slot_lease
+        constrained = grammar.any_of(ctx.request_ids)
+        buf = self._grammar_masks.get(lease.slot) if lease is not None else None
+        if buf is None:
+            self._grammar_mask = (
+                grammar.fill(ctx.request_ids).to(self._device, non_blocking=True) if constrained else None
+            )
+            return
+        rows = buf[:lease.bucket.bs]
+        self._grammar_mask = rows
+        if constrained:
+            self._grammar_stager.copy_(rows, grammar.fill(ctx.request_ids).numpy().reshape(-1), pad_value=-1)
+            self._grammar_dirty.add(lease.slot)
+        elif lease.slot in self._grammar_dirty:
+            rows.fill_(-1)
+            self._grammar_dirty.discard(lease.slot)
+
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
         generation history, if any) into this step's slot, inline so they
@@ -669,6 +734,12 @@ class SamplerResource(Resource):
             self._history.gather_step(ctx.request_ids, padded_bs)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
+        if self._grammar is not None and self._grammar.any_of(ctx.request_ids):
+            # the drawn tokens go to the host for the next step's masks
+            key = None if self._cg_sampler is None else (self._step_slot, self._greedy_this_step)
+            tokens = self._drawn.pop(None, None) if key is None else self._drawn.get(key)
+            if tokens is not None:
+                self._grammar.note_draws(ctx.request_ids, tokens, self._kept_rids_of(step, ctx))
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
@@ -731,18 +802,25 @@ class SamplerResource(Resource):
             if self._sampled_this_step:
                 raise RuntimeError("log-probs need one sample() per step, and this node's forward samples again")
             self._sampled_this_step = True
+        if self._grammar_mask is not None:
+            # before either draw, so a capture bakes it over the slot's buffer
+            self._grammar.apply(logits, self._grammar_mask)
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
             # under capture it has to match what every later replay will run.
             # `_penalty_needed_this_step` only ever suppresses work that cannot
             # change the result, so leaving the kernel on costs nothing.
-            return self._cg_sampler.sample(
+            tokens = self._cg_sampler.sample(
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
                 greedy=self._greedy_this_step,
             )
+            if self._grammar is not None:
+                # a replay rewrites this tensor, so commit reads each replay's draw from it
+                self._drawn[(self._step_slot, self._greedy_this_step)] = tokens
+            return tokens
         bufs = self._cg_buffers
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
         slots = offsets = None
@@ -764,6 +842,8 @@ class SamplerResource(Resource):
         # by request, so the next step can still read its token on the device.
         if self._keep_last_token and by_slot:
             bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
+        if self._grammar is not None:
+            self._drawn[None] = tokens
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
@@ -799,7 +879,10 @@ class SamplerResource(Resource):
         `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
         filter, write or broadcast besides the draw. The kernel's caller advances the offsets with
         `advance_offsets`."""
-        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
+        if (
+            self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token
+            or self._grammar is not None
+        ):
             return None
         return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
 

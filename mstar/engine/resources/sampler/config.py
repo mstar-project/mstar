@@ -7,11 +7,12 @@ step without pulling them in behind it.
 
 import hashlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
 
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, GrammarRequest, grammar_request
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
@@ -110,11 +111,18 @@ class SamplerSpec(NodeResourceSpec):
     # always. The twins cost capture memory and time, so a deployment that never
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
+    # Allows ``structured_outputs`` (grammar-constrained sampling, ``sampler/grammar.py``)
+    # on this node. The captured sampler then applies a bitmask every step, asked or
+    # not, so a deployment turns it on in its ``resources:`` block, on its text sampler.
+    enable_grammar: bool = False
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
-        greedy_capture: bool | None = None,
+        greedy_capture: bool | None = None, enable_grammar: bool | None = None,
     ) -> None:
+        if enable_grammar is not None:
+            check_bool_knob("enable_grammar", enable_grammar)
+            self.enable_grammar = enable_grammar
         if greedy_capture is not None:
             check_bool_knob("greedy_capture", greedy_capture)
             self.greedy_capture = greedy_capture
@@ -126,6 +134,19 @@ class SamplerSpec(NodeResourceSpec):
             self.enable_processed_logprobs = enable_processed_logprobs
         if self.enable_processed_logprobs and not self.enable_logprobs:
             raise ValueError("enable_processed_logprobs needs enable_logprobs")
+
+    def request_config(
+        self, model_kwargs: dict | None, current: ResourceReqConfig | None = None,
+    ) -> "SamplingReqConfig | None":
+        """The model's sampler config with the request's grammar, when this node
+        serves ``structured_outputs`` and the request asks for one."""
+        if not self.enable_grammar:
+            return None
+        grammar = grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
+        if grammar is None:
+            return None
+        base = current if isinstance(current, SamplingReqConfig) else SamplingReqConfig()
+        return replace(base, grammar=grammar)
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -166,6 +187,8 @@ class SamplingReqConfig(ResourceReqConfig):
     # "processed", the distribution it was drawn from (0 for greedy).
     return_logprobs: bool = False
     logprobs_mode: str = "raw"
+    # The request's grammar (``structured_outputs``); needs the spec's enable_grammar.
+    grammar: GrammarRequest | None = None
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(
@@ -198,6 +221,8 @@ class SamplingReqConfig(ResourceReqConfig):
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
+        if self.grammar is not None and not spec.enable_grammar:
+            raise ValueError("this deployment does not serve structured_outputs")
         if self.return_logprobs and not spec.enable_logprobs:
             raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
         if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:

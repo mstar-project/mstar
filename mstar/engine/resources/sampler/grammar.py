@@ -1,0 +1,254 @@
+"""Grammar-constrained sampling: a request's constraint on which token ids it
+may draw next, advanced by the tokens it drew (JSON schema, JSON object, regex,
+choice list, EBNF; xgrammar underneath).
+
+The sampler resource owns it, beside its other per-request draw state. A step
+that holds a constrained row stages each row's bitmask before it launches, from
+the tokens the rows drew in their last step: the sampler copies those to the
+host at commit, and the next step's plan waits for that copy alone (step N's
+draw, not the worker's postprocess), accepts them and fills the masks. The draw
+then applies the mask before either sampling path, so a captured step bakes the
+apply over the slot's static mask buffer.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+if TYPE_CHECKING:
+    from mstar.model.utils import TextOutput
+
+logger = logging.getLogger(__name__)
+
+# The request field: vLLM's ``structured_outputs`` shape (one of these keys), plus
+# ``after``, the text that opens the constrained part (a reasoning model's think-end tag).
+STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
+GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
+
+
+def _xgr():
+    try:
+        import xgrammar
+    except ImportError as e:  # pragma: no cover - a dependency
+        raise ValueError("structured output needs the xgrammar package") from e
+    return xgrammar
+
+
+@dataclass(frozen=True)
+class GrammarRequest:
+    """A request's constraint: ``kind`` (one of ``GRAMMAR_KINDS``) and its text
+    (a JSON schema as JSON, a regex, an EBNF grammar, a choice list as JSON).
+    ``after`` names one token whose draw starts the constraint; until then the
+    request draws freely."""
+    kind: str
+    value: str
+    after: str | None = None
+
+    def grammar(self):
+        """The xgrammar ``Grammar``; tokenizer-free, so it checks the request
+        anywhere. ``ValueError`` names what is unsupported."""
+        xgr = _xgr()
+        try:
+            if self.kind == "json":
+                return xgr.Grammar.from_json_schema(self.value)
+            if self.kind == "json_object":
+                return xgr.Grammar.builtin_json_grammar()
+            if self.kind == "regex":
+                return xgr.Grammar.from_regex(self.value)
+            if self.kind == "choice":
+                choices = json.loads(self.value)
+                return xgr.Grammar.from_regex("|".join(_regex_escape(c) for c in choices))
+            return xgr.Grammar.from_ebnf(self.value)
+        except (RuntimeError, ValueError) as e:
+            raise ValueError(f"structured_outputs {self.kind}: {e}") from e
+
+
+def _regex_escape(text: str) -> str:
+    return "".join("\\" + c if c in r"\^$.|?*+()[]{}/" else c for c in text)
+
+
+def grammar_request(value: Any) -> GrammarRequest | None:
+    """The request's ``structured_outputs`` as a ``GrammarRequest``, checked; None
+    when unset. ``ValueError`` (the client's 400) for a bad shape or grammar."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"structured_outputs must be an object; got {value!r}")
+    unknown = set(value) - {*GRAMMAR_KINDS, "after"}
+    if unknown:
+        raise ValueError(f"structured_outputs takes one of {GRAMMAR_KINDS} and 'after'; got {sorted(unknown)}")
+    kinds = [k for k in GRAMMAR_KINDS if value.get(k) not in (None, False)]
+    if len(kinds) != 1:
+        raise ValueError(f"structured_outputs takes exactly one of {GRAMMAR_KINDS}; got {kinds or 'none'}")
+    kind, raw = kinds[0], value[kinds[0]]
+    if kind == "json":
+        if isinstance(raw, (dict, bool)):
+            raw = json.dumps(raw)
+        elif not isinstance(raw, str):
+            raise ValueError("structured_outputs json must be a JSON schema")
+    elif kind == "json_object":
+        raw = ""
+    elif kind == "choice":
+        if not isinstance(raw, list) or not raw or not all(isinstance(c, str) for c in raw):
+            raise ValueError("structured_outputs choice must be a non-empty list of strings")
+        raw = json.dumps(raw)
+    elif not isinstance(raw, str):
+        raise ValueError(f"structured_outputs {kind} must be a string")
+    after = value.get("after")
+    if after is not None and (not isinstance(after, str) or not after):
+        raise ValueError("structured_outputs after must be a non-empty string")
+    request = GrammarRequest(kind, raw, after)
+    request.grammar()
+    return request
+
+
+def response_format_request(response_format: Any) -> dict | None:
+    """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
+    text. ``ValueError`` for another type."""
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError(f"response_format must be an object; got {response_format!r}")
+    kind = response_format.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"json_object": True}
+    if kind == "json_schema":
+        spec = response_format.get("json_schema")
+        if not isinstance(spec, dict) or spec.get("schema") is None:
+            raise ValueError("response_format json_schema needs json_schema.schema")
+        return {"json": spec["schema"]}
+    raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
+
+
+class _Row:
+    __slots__ = ("matcher", "after_id", "active")
+
+    def __init__(self, matcher, after_id: int | None):
+        self.matcher = matcher
+        self.after_id = after_id
+        self.active = after_id is None
+
+    def accept(self, token: int) -> None:
+        if not self.active:
+            self.active = token == self.after_id
+            return
+        if self.matcher.is_terminated():
+            return
+        if not self.matcher.accept_token(token):
+            # the mask allowed it, so this is a row the mask did not cover (a
+            # draw before the row was constrained); its output is not checked
+            logger.warning("grammar refused token %d; the row's constraint is off from here", token)
+            self.active = False
+            self.after_id = -1
+
+
+class GrammarRows:
+    """The sampler's constrained rows: one matcher per request, the drawn tokens
+    still on their way to the host, and the bitmask each step applies."""
+
+    def __init__(self, text_output: TextOutput, vocab_size: int | None, device: torch.device):
+        xgr = _xgr()
+        self._xgr = xgr
+        detok = text_output.detokenizer
+        stop = sorted(int(t) for t in text_output.stop_token_ids)
+        tokenizer = getattr(detok, "tokenizer", None)
+        if tokenizer is not None:
+            size = vocab_size or len(tokenizer)
+            self.info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=size, stop_token_ids=stop or None)
+        else:
+            if vocab_size is None:
+                raise ValueError("enable_grammar needs the SamplerSpec's vocab_size for this model's detokenizer")
+            size = vocab_size
+            vocab = [detok.token_bytes(i) for i in range(size)]
+            self.info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=size, stop_token_ids=stop)
+        self.vocab_size = size
+        self.words = math.ceil(size / 32)
+        self._compiler = xgr.GrammarCompiler(self.info, max_threads=8)
+        self._device = device
+        self._rows: dict[Any, _Row] = {}
+        # (rids, host tokens, event) per committed step not yet accepted, oldest first
+        self._pending: list[tuple[list, torch.Tensor, Any]] = []
+        self._token_ids: dict[bytes, int] | None = None
+        self._shifts = torch.arange(32, dtype=torch.int32, device=device)
+
+    def __contains__(self, rid) -> bool:
+        return rid in self._rows
+
+    def any_of(self, rids) -> bool:
+        return bool(self._rows) and any(r in self._rows for r in rids)
+
+    def add(self, rid, request: GrammarRequest) -> None:
+        compiled = self._compiler.compile_grammar(request.grammar())
+        after_id = None if request.after is None else self._single_token(request.after)
+        self._rows[rid] = _Row(self._xgr.GrammarMatcher(compiled), after_id)
+
+    def remove(self, rid) -> None:
+        self._rows.pop(rid, None)
+
+    def _single_token(self, text: str) -> int:
+        if self._token_ids is None:
+            self._token_ids = {}
+            for i, tok in enumerate(self.info.decoded_vocab):
+                self._token_ids.setdefault(bytes(tok), i)
+        token = self._token_ids.get(text.encode())
+        if token is None:
+            raise ValueError(f"structured_outputs after={text!r} is not one token of this model")
+        return token
+
+    def note_draws(self, rids, tokens: torch.Tensor, kept) -> None:
+        """Queue the copy of this step's drawn tokens for its constrained rows
+        (``kept`` None keeps every row); the next ``stage`` accepts them."""
+        index = [i for i, rid in enumerate(rids) if rid in self._rows and (kept is None or rid in kept)]
+        if not index:
+            return
+        rows = [rids[i] for i in index]
+        picked = tokens.reshape(-1)[torch.tensor(index, device=tokens.device)]
+        if picked.device.type == "cpu":
+            self._pending.append((rows, picked.clone(), None))
+            return
+        host = torch.empty(picked.shape, dtype=picked.dtype, pin_memory=True)
+        host.copy_(picked, non_blocking=True)
+        event = torch.Event(picked.device)
+        event.record()
+        self._pending.append((rows, host, event))
+
+    def _accept_pending(self) -> None:
+        for rids, host, event in self._pending:
+            if event is not None:
+                event.synchronize()
+            for rid, token in zip(rids, host.tolist()):
+                row = self._rows.get(rid)
+                if row is not None:
+                    row.accept(token)
+        self._pending.clear()
+
+    def fill(self, rids) -> torch.Tensor:
+        """The host bitmask for a step's rows, after accepting every draw so far:
+        all ones for a free row."""
+        self._accept_pending()
+        if len(set(rids)) != len(rids):
+            raise ValueError("a constrained request has two rows in one step (speculative decoding is not served)")
+        mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
+        for i, rid in enumerate(rids):
+            row = self._rows.get(rid)
+            if row is not None and row.active and not row.matcher.is_terminated():
+                row.matcher.fill_next_token_bitmask(mask, i)
+        return mask
+
+    def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
+        """Set every disallowed logit to -inf, in place; capturable (no host
+        reads). Columns past the vocabulary the mask covers are disallowed."""
+        rows, width = logits.shape[0], logits.shape[-1]
+        allowed = ((mask[:rows].unsqueeze(-1) >> self._shifts) & 1).reshape(rows, -1)
+        covered = min(width, allowed.shape[-1])
+        logits[:, :covered].masked_fill_(allowed[:, :covered] == 0, float("-inf"))
+        if width > covered:
+            logits[:, covered:] = float("-inf")

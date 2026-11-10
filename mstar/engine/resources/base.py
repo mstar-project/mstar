@@ -15,6 +15,7 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
+    from mstar.model.utils import TextOutput
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
     from mstar.engine.accelerator_graph_config import (
@@ -85,6 +86,9 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # the model's text output declaration (``Model.text_output``), for a resource that
+    # reasons over its token vocabulary (the sampler's grammars); None for a model without one
+    text_output: "TextOutput | None" = None
 
     @property
     def head_shards(self) -> int:

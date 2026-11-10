@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, response_format_request
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
@@ -179,7 +180,9 @@ CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", 
 
 def _refuse_unserved_chat(req, mk: dict) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
-    sequences, log probs, sampling penalties, a response format, or a tool call.
+    sequences, log probs, sampling penalties, or a tool call. A JSON
+    ``response_format`` becomes ``structured_outputs``, which the deployment's
+    text sampler serves or the conductor refuses.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
     fields (``logprobs: false``, ``tools: []``) is dropped from it, before any
     ``chat_template_kwargs`` key is merged in.
@@ -204,8 +207,12 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
             raise ValueError(f"{name} is not supported")
     if mk.pop("best_of", None) not in (None, 1):
         raise ValueError("best_of is not supported; this model returns one choice")
-    if mk.pop("response_format", None) not in (None, {"type": "text"}):
-        raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+    # json_object / json_schema become the engine's grammar request (``structured_outputs``)
+    structured = response_format_request(mk.pop("response_format", None))
+    if structured is not None:
+        if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
+            raise ValueError("send response_format or structured_outputs, not both")
+        mk[STRUCTURED_OUTPUTS_KWARG] = structured
     choice = mk.get("tool_choice")
     function_call = mk.get("function_call")
     if (

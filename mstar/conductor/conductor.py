@@ -37,6 +37,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
@@ -769,9 +770,17 @@ class Conductor:
         # each declared resource builds its own config from the request's kwargs (a LoRA
         # pool's from the adapter it names), so a model needs no request code for one
         for spec in self._node_resources():
-            config = spec.request_config(model_kwargs)
+            config = spec.request_config(model_kwargs, configs.get(spec.resource_key))
             if config is not None:
-                configs.setdefault(spec.resource_key, config)
+                configs[spec.resource_key] = config
+        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:
+            constrained = sum(getattr(cfg, "grammar", None) is not None for cfg in configs.values())
+            if constrained != 1:
+                raise ValueError(
+                    "this deployment does not serve structured_outputs; turn it on with "
+                    "`resources: {<text sampler>: {enable_grammar: true}}`" if not constrained else
+                    "structured_outputs is on for more than one sampler; enable_grammar belongs on the text sampler only"
+                )
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())
