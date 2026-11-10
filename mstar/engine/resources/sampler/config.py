@@ -80,7 +80,7 @@ class SamplerSpec(NodeResourceSpec):
     # apply a repetition penalty, which decides both the seen-token buffers and
     # the kernel variant baked into the captured graph. Whether the penalty
     # actually runs on a given step is settled per step from the resident
-    # requests' `repetition_penalty` — see `SamplerResource.admit`.
+    # requests. `repetition_penalty` — see `SamplerResource._set_penalty_flags`.
     enable_repetition_penalty: bool = True
     # Same kind of capability for min-p: whether the node's sampler (eager and
     # graph-captured) carries the filter. It costs two passes over ``[B, V]``

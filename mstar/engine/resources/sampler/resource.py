@@ -927,17 +927,14 @@ class GrammarSamplerResource(SamplerResource):
         """Fail the rows whose grammar can no longer be served (it failed to
         compile, or refused a drawn token): an error to the client rather than a
         reply its constraint stopped holding. The same on every rank, which
-        compile and accept the same tokens.
+        compile and accept the same tokens, each in its plan.
 
-        A step's own admit first accepts the draws on their way to the host,
-        which its plan would wait for next anyway, so a refused draw fails its
-        request before it draws again. A pre-plan's admit waits for none (that
-        would hold the pre-plan until the last step finished): a draw refused
-        after it leaves its row only a stop token."""
+        A refused draw is found where the next plan accepts it, so it fails its
+        request at the admit after that; meanwhile its row may draw only a stop
+        token. Admit accepts no draws itself: a pre-admitted step skips its full
+        admit on one rank and not another, and the ranks would disagree."""
         if not self._grammar.any_of(ctx.request_ids):
             return ADMIT_OK
-        if not ctx.is_preplan:
-            self._grammar.accept_draws()
         failed = self._grammar.failures(ctx.request_ids)
         if not failed:
             return ADMIT_OK
