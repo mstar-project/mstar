@@ -378,8 +378,8 @@ class Allotment:
     took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, and
     ``grown_from`` the allotment's pages before. `unreserve` puts back the first and the last. ``taken_back`` counts
     the pages of ``remaining`` a guaranteed request took back from borrowers, which it writes first and lends no
-    more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining``, or none for a
-    preemptible request. `KVManager._count` sets all three."""
+    more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining`` for a guaranteed request
+    in a pool that `KVManager.moves`, and none otherwise. `KVManager._count` sets all three."""
     pages: int
     remaining: int = 0
     asks_again: int = 0
