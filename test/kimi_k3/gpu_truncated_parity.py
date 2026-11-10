@@ -687,7 +687,7 @@ class Stepper:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         sub.bind_node_resources(self.resources)
         self.sub, self.model = sub, model
-        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=sub, resources=self.resources, step_runner=self.runner,
             device=self.dev, autocast_dtype=None, joint_comm_group=trivial, num_slots=2)
