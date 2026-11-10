@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from typing import NamedTuple
 
 import torch
 
@@ -36,16 +37,17 @@ class _LazyPerRid(Mapping):
     and the inline emit read the rows directly, so in the common decode step
     nobody does, and the per-request dicts are never built."""
 
-    __slots__ = ("_host", "_request_ids", "_built")
+    __slots__ = ("_host", "_request_ids", "_spans", "_built")
 
-    def __init__(self, host: dict, request_ids: list[int]):
+    def __init__(self, host: dict, request_ids: list[int], spans: "_HostSpans | None" = None):
         self._host = host
         self._request_ids = request_ids
+        self._spans = spans
         self._built: dict | None = None
 
     def _dict(self) -> dict:
         if self._built is None:
-            self._built = rows_to_per_rid(self._host, self._request_ids)
+            self._built = rows_to_per_rid(self._host, self._request_ids, self._spans)
         return self._built
 
     def __getitem__(self, key):
@@ -145,11 +147,26 @@ class _LazyHostRow(Mapping):
         return len(self._row)
 
 
+class _HostSpans(NamedTuple):
+    """A step's output spans on the host and the request of each of their rows."""
+
+    spans: dict[str, torch.Tensor]
+    request_ids: tuple
+
+    @classmethod
+    def of(cls, outputs: "BatchedModelOutput") -> "_HostSpans | None":
+        spans = outputs.host_spans or outputs.output_spans
+        return cls(spans, outputs.span_request_ids) if spans else None
+
+
 def rows_to_per_rid(
-    host: dict, request_ids: list[int],
+    host: dict, request_ids: list[int], spans: _HostSpans | None = None,
 ) -> dict[int, NameToTensorList]:
     """Slice row-addressed buffers into the per-rid form ``check_stop``
-    reads: row i goes to ``request_ids[i]``."""
+    reads: row i goes to ``request_ids[i]``. A buffer named like a spanned
+    output is cut to each row's span, as ``crop_to_spans`` cuts the output:
+    the stop check reads what the store sends, and a host transport sends
+    this copy of it."""
     # One ``split`` per buffer makes every row view in a single call.
     rows = {
         name: buf.split(1)
@@ -161,6 +178,14 @@ def rows_to_per_rid(
         out[rid] = {
             name: [views[i]] for name, views in rows.items() if i < len(views)
         }
+    for name, span in (spans.spans.items() if spans is not None else ()):
+        if name not in rows:
+            continue
+        starts, ends = span.t().tolist()
+        for rid, start, end in zip(spans.request_ids, starts, ends, strict=True):
+            row = out.get(rid, {}).get(name)
+            if row and (start > 0 or end < row[0].shape[-1]):
+                row[0] = row[0][..., max(start, 0):max(end, 0)]
     return out
 
 
@@ -354,7 +379,7 @@ class HostCopies:
         if landed is not None and completion_event is not None:
             # staged by the gpu thread behind the step; the caller has waited
             # on the completion event, so the rows are here
-            return _LazyPerRid(landed.buffers, list(landed.request_ids)), landed
+            return _LazyPerRid(landed.buffers, list(landed.request_ids), _HostSpans.of(outputs)), landed
         if (
             completion_event is None
             or not self.device_capability.is_available
@@ -363,7 +388,7 @@ class HostCopies:
                 # host tensors already (a CPU device): only the re-keying
                 host = outputs.check_stop_buffers
                 return (
-                    rows_to_per_rid(host, row_rids),
+                    rows_to_per_rid(host, row_rids, _HostSpans.of(outputs)),
                     HostRows(tuple(row_rids), host),
                 )
             return source, None
@@ -378,7 +403,7 @@ class HostCopies:
         if outputs.check_stop_buffers is not None and row_rids is not None:
             host = self._d2h_batched(outputs.check_stop_buffers, side)
             return (
-                _LazyPerRid(host, row_rids),
+                _LazyPerRid(host, row_rids, _HostSpans.of(outputs)),
                 HostRows(tuple(row_rids), host),
             )
 
