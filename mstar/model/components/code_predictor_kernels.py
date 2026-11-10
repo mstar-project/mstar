@@ -54,13 +54,16 @@ EMBED_BLOCK = 256
 
 @functools.cache
 def _shared_memory_per_block(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).shared_memory_per_block
+    """The shared memory limit Triton compiles against: the opt-in per-block
+    limit on NVIDIA (torch's ``shared_memory_per_block`` is the 48 KB default),
+    the per-block LDS on AMD."""
+    return triton.runtime.driver.active.utils.get_device_properties(device.index)["max_shared_mem"]
 
 
 def _stages_that_fit(block_m: int, block_n: int, block_k: int, operands: int, stages: int, device: torch.device) -> int:
     """``stages`` cut to what the device's shared memory holds: the pipeline keeps
     ``stages - 1`` tiles of ``x`` and of each weight operand resident (an H200
-    has 228 KB of it, an MI325X 64 KB)."""
+    has 227 KB of it, an MI325X 64 KB)."""
     per_stage = (block_m + operands * block_n) * block_k * 2
     return max(2, min(stages, _shared_memory_per_block(device) // per_stage + 1))
 

@@ -5,8 +5,8 @@ import torch
 
 from mstar.model.components import code_predictor_kernels as cpk
 
-# shared memory per block, bytes
-H200, MI325X = 233472, 65536
+# the shared memory limit Triton compiles against (`max_shared_mem`), bytes
+H200, MI325X = 232448, 65536
 
 
 @pytest.mark.parametrize(
