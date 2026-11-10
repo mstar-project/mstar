@@ -36,6 +36,7 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS
 from mstar.model.components.diffusion.guidance import GUIDANCE_SCALE
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
+from mstar.model.qwen_image.components.transformer import ROPE_POSITIONS
 from mstar.model.qwen_image.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -213,10 +214,10 @@ class QwenImageModel(Model):
             raise ValueError("true_cfg_scale is not a knob of this server: send the CFG scale as guidance_scale")
         steps = kwargs.get("num_inference_steps")
         steps = recipe.default_steps if steps is None else steps
-        if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= self.config.max_denoise_steps:
-            raise ValueError(
-                f"num_inference_steps must be an integer in [1, {self.config.max_denoise_steps}]; got {steps!r}"
-            )
+        # the schedule's stretch to shift_terminal needs two steps (one is NaN in the reference)
+        fewest, most = 1 if self.config.scheduler.shift_terminal is None else 2, self.config.max_denoise_steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or not fewest <= steps <= most:
+            raise ValueError(f"num_inference_steps must be an integer in [{fewest}, {most}]; got {steps!r}")
         scale = kwargs.get(GUIDANCE_SCALE)
         scale = recipe.default_guidance_scale if scale is None else scale
         if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
@@ -268,7 +269,7 @@ class QwenImageModel(Model):
             condition.append(pil.resize(calculate_dimensions(recipe.condition_area, ratio), Image.Resampling.LANCZOS))
             resized = pil.resize(calculate_dimensions(recipe.vae_area, ratio), Image.Resampling.LANCZOS)
             vae_images.append(torch.from_numpy(np.array(resized)).permute(2, 0, 1).contiguous())
-        self._resolve_size(kwargs, tuple(vae_images[-1].shape[-2:]))
+        size = self._resolve_size(kwargs, tuple(vae_images[-1].shape[-2:]))
         prefix = "".join(PICTURE_PREFIX.format(i + 1) for i in range(len(images)))
         processor = self._processor_for()
 
@@ -280,6 +281,16 @@ class QwenImageModel(Model):
         prompts = [positive["input_ids"][0]]
         if QwenImageDenoiseSubmodule.GUIDANCE.active(knobs):
             prompts.append(encode(knobs["negative_prompt"])["input_ids"][0])
+        # The text's rotary positions start past the widest image axis's half, in a table of ROPE_POSITIONS (the
+        # reference's too, which fails the same request mid-run); a longer half also overruns the image's own.
+        grids = [self.config.latent_grid(*size), *(self.config.latent_grid(*t.shape[-2:]) for t in vae_images)]
+        start = max(max(h // 2, w // 2) for h, w in grids)
+        text = max(len(ids) for ids in prompts) - recipe.drop_tokens
+        if start + text > ROPE_POSITIONS:
+            raise ValueError(
+                f"Qwen-Image-Edit: a {text}-token prompt after a {start}-token half image axis exceeds the "
+                f"transformer's {ROPE_POSITIONS} rotary positions; shorten the prompt or the image's longer side"
+            )
         tensors_out = {TEXT_INPUTS: prompts, VL_PIXELS: [positive["pixel_values"]], IMAGE_INPUTS: vae_images}
         return ProcessPromptOutput(tensors_out, {VL_GRIDS: positive["image_grid_thw"].tolist()})
 

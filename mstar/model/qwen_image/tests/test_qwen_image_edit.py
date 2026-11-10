@@ -284,6 +284,19 @@ def test_intake_plans_the_edit_and_refuses_what_it_cannot_serve():
         model.process_prompt("x", ["text"], ["image"], tensors={})
 
 
+@pytest.mark.parametrize("prompt,kwargs,match", [
+    ("x", {"num_inference_steps": 1}, r"num_inference_steps must be an integer in \[2, "),
+    ("x" * 5000, {}, "rotary positions"),
+    ("x", {"height": 16, "width": 262144}, "rotary positions"),  # within max_image_area
+], ids=["one-step-shift-terminal", "long-prompt", "long-axis"])
+def test_intake_refuses_what_the_dit_would_fail_mid_run(prompt, kwargs, match):
+    """A 400 at intake, not a failed request after the encoders: a one-step schedule stretched to shift_terminal,
+    and text whose rotary positions run past the table's end."""
+    images = [torch.zeros(3, 300, 400, dtype=torch.uint8)]
+    with pytest.raises(ValueError, match=match):
+        _model().process_prompt(prompt, ["image", "text"], ["image"], tensors={IMAGE_INPUTS: images}, **kwargs)
+
+
 @pytest.mark.skipif(not os.environ.get("QWEN_IMAGE_EDIT_SNAPSHOT"), reason="needs a checkpoint's processor files")
 def test_prompts_match_the_pipelines_processor_call():
     """With the checkpoint's processor: the token ids, patches and grids the pipeline's ``encode_prompt`` makes
