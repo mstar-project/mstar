@@ -40,7 +40,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.adapters import build_specs, node_resources
+from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, build_specs, node_resources
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources
 from mstar.validation import DeploymentError
@@ -337,6 +337,52 @@ def test_what_todays_specs_cant_hold_is_refused_naming_what_is_missing(name):
     with pytest.raises(ValueError, match=f"Array '{array}': no layout yet") as refused:
         build_specs(arrays())
     assert missing in str(refused.value), f"should name {missing!r}: {refused.value}"
+
+
+def test_a_second_update_of_one_type_is_refused_as_no_layout_yet():
+    with pytest.raises(ValueError, match=re.escape(
+        "Array 'gdn': no layout yet: updates['a'] and updates['b'] are both GatedDeltaNet, and an update call finds "
+        "its op by type",
+    )):
+        build_specs([_kv(), _gdn(updates={"a": GatedDeltaNet(), "b": GatedDeltaNet()})])
+
+
+@dataclass(frozen=True)
+class _OtherRecurrence(Op):
+    """A second recurrence on the state, so a Value can carry two linear attention updates."""
+
+    reads = writes = ("state",)
+
+
+class _OtherLinear(LinearAttnBinding):
+    """Binds `_OtherRecurrence` as a linear attention update, as `GDN` binds a `GatedDeltaNet`."""
+
+
+def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
+    refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
+
+
+def test_a_within_step_read_of_another_mask_is_refused_as_no_layout_yet():
+    within = Array("vision", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                   reads={"vision_attn": _read(mask=Causal())})
+    refusal = "Array 'vision': no layout yet: reads['vision_attn'].mask must be Block"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        build_specs([within])
+
+
+@pytest.mark.parametrize("updates, linear", [
+    ({"conv": CausalConv()}, "[]"),
+    ({"conv": CausalConv(), "delta": GatedDeltaNet(), "other": _OtherRecurrence()}, "['delta', 'other']"),
+], ids=["none", "two"])
+def test_a_conv_needs_exactly_one_linear_attention_update_to_run_inside(monkeypatch, updates, linear):
+    monkeypatch.setitem(BINDINGS, (VALUE, _OtherRecurrence), _OtherLinear())
+    with pytest.raises(ValueError, match=re.escape(
+        f"Array 'gdn': no layout yet: updates['conv'] is a CausalConv, which today's resources run inside one linear "
+        f"attention update (GatedDeltaNet, _OtherRecurrence), and the array has {linear}",
+    )):
+        build_specs([_kv(), _gdn(updates=updates)])
 
 
 def test_kernel_settings_set_the_two_fields_on_the_spec_under_the_key():
