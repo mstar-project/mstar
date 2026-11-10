@@ -962,11 +962,13 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
                 "or a fork owned by someone with write access; this review stands without it.\n")
     elif gated == "true":
         reasons = render_summary.inert(Path(runner_temp, "gate.txt").read_text()).rstrip("\n")
+        unfinished = ("the files the review left are the bot's to finish, not yours. Comment `/review` again, after "
+                      "fixing any open finding named here.")
         body = (f"No live test yet ({reasons}): a finding's thread was edited after the bot posted it, so another "
-                "`/review` can't clear it and a person has to decide.\n" if render_summary.EDITED in reasons else
-                f"No live test yet ({reasons}): the files the review left are the bot's to finish, not yours. "
-                "Comment `/review` again, after fixing any open finding named here.\n"
-                if render_summary.UNFINISHED in reasons else
+                "`/review` can't clear it and a person has to decide."
+                + (f" Also, {unfinished}" if render_summary.UNFINISHED in reasons else "") + "\n"
+                if render_summary.EDITED in reasons else
+                f"No live test yet ({reasons}): {unfinished}\n" if render_summary.UNFINISHED in reasons else
                 f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n")
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
