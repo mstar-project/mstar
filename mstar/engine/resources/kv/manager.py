@@ -4488,11 +4488,14 @@ class KVManager(AttentionResource):
         growth that admission leaves to the room fit in the room less `_kept`. A request that holds an allotment
         waits for its shortage in order."""
         with self._lock:
+            if rid in self._allotments:
+                # no room is larger than the pool, so this mark never grows
+                return PassMark(rid in self._guaranteed, self.config.request_pages, None, None)
             mark = self._pass_mark(rid)
             # When even the fewest pages ``rid`` can take don't fit, no page the index files helps, so only the room
             # moves the mark.
             least = (self._fixed_need(rid) or 0) + self._footprint(rid) - self._asks[rid]
-            if rid in self._allotments or least > mark.room:
+            if least > mark.room:
                 return mark
             chains = [] if self._index is None or self._on_host(rid) else [
                 stream.chain for stream in self._streams[rid].values()
@@ -4514,8 +4517,7 @@ class KVManager(AttentionResource):
             return None
 
     def _pass_mark(self, rid: str, filed: int | None = None, taken: int | None = None) -> PassMark:
-        """The mark of passing ``rid``, whose own room is the room of its class. One that holds an allotment is
-        refused whatever the room, and is tried again with the others of its class."""
+        """The mark of passing ``rid``, which holds no allotment, so its own room is the room of its class."""
         guaranteed = rid in self._guaranteed
         return PassMark(guaranteed, self._class_room(guaranteed, passing=True), filed, taken)
 
