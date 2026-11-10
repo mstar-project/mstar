@@ -47,6 +47,7 @@ from mstar.model.step_audio2.config import (
     audio_tokens,
     is_speech_id,
 )
+from mstar.model.step_audio2.step_audio2_model import SPEECH_MAX_OUTPUT_TOKENS
 from mstar.model.submodule_base import END_PARTITION, BatchedStopCheck, HostRows, StopCheck
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -233,7 +234,7 @@ def test_the_runtime_checks_only_a_text_decodes_stop_ids():
     spoken rows keeps it."""
     llm = an_llm()
     assert set(llm.get_stop_policies(DECODE)) == {DECODE_LOOP}
-    for walk in (DECODE_SPOKEN, DECODE_MIXED, PREFILL_TEXT, PREFILL_AUDIO):
+    for walk in (DECODE_SPOKEN, PREFILL_TEXT, PREFILL_AUDIO):
         assert llm.get_stop_policies(walk) is None
 
 
@@ -307,9 +308,9 @@ def reference_windows(codes: list[int]) -> list[tuple[list[int], bool]]:
     return out
 
 
-# 0: an empty spoken reply; 2047: the most a reply at its cap streams (its first token is
-# the prefill's, which does not stream)
-@pytest.mark.parametrize("n", [0, 1, 3, 25, 27, 28, 29, 53, 54, 100, 160, 2047])
+# 0: an empty spoken reply; the last: the most a reply at its cap streams (its first token
+# is the prefill's, which does not stream)
+@pytest.mark.parametrize("n", [0, 1, 3, 25, 27, 28, 29, 53, 54, 100, 160, SPEECH_MAX_OUTPUT_TOKENS - 1])
 def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp_path, n):
     """The spoken walk's speech ids through the stream's policy and ``prepare_inputs`` are the
     reference client's windows, every code voiced once, each window's caches holding what the
@@ -354,11 +355,9 @@ def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp
     rows = node.preprocess(T2W_CHUNK, None, prepared)["rows"]
     assert [r[0][0].tolist() for r in rows] == [w for w, _ in served]
     # within what the conformer's caches hold (``Token2WavStreaming.conformer_reply_tokens``)
-    from mstar.model.step_audio2.step_audio2_model import SPEECH_MAX_OUTPUT_TOKENS
     from mstar.model.step_audio2.token2wav import CONFORMER_REPLY_TOKENS
 
     assert sum(window_tokens(len(w), last) for w, last in served) <= CONFORMER_REPLY_TOKENS
-    assert n <= SPEECH_MAX_OUTPUT_TOKENS - 1
 
 
 def test_a_stream_without_an_offset_hands_its_codes_over_as_they_are():
@@ -396,7 +395,6 @@ def test_the_batched_stop_check_reads_the_tokens_once():
 def test_startup_checks_the_spoken_streams_withhold(tmp_path):
     """The stream is declared withheld, so startup checks the edge can go without an item,
     and that the walk leaves its stops to check_stop, which is what withholds."""
-    from mstar.model.submodule_base import ARNodeSubmodule
     from mstar.worker.engine_manager import _refuse_unroutable_withholds
 
     llm = an_llm()
@@ -404,7 +402,7 @@ def test_startup_checks_the_spoken_streams_withhold(tmp_path):
     model = a_model(tmp_path)
     _refuse_unroutable_withholds({"LLM": llm}, model)
     # were the runtime to check the spoken walk's stops itself, nothing would withhold
-    llm.get_stop_policies = lambda walk: ARNodeSubmodule.get_stop_policies(llm, walk)
+    llm.get_stop_policies = lambda walk: {}
     with pytest.raises(ValueError, match="get_stop_policies"):
         _refuse_unroutable_withholds({"LLM": llm}, model)
 
@@ -442,8 +440,30 @@ def test_audio_just_over_a_multiple_of_25_s_is_served_without_its_empty_window(t
     assert ids.count(AUDIO_START) == full + 1 and ids.count(AUDIO_PATCH) == full * audio_tokens(2502)
     last_start = len(ids) - 1 - ids[::-1].index(AUDIO_START)
     assert ids[last_start + 1] == AUDIO_END
-    with pytest.raises(ValueError, match="too short"):
-        model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [audio[:40]]})
+
+
+def test_an_audio_with_no_window_of_rows_is_served_as_its_empty_run(tmp_path):
+    """Under 321 samples an audio has no rows; the reference renders it as an empty run
+    and serves the rest of the request, as here: beside a real clip only that clip is
+    encoded, and alone the request prefills as text."""
+    model = a_model(tmp_path)
+    short, real = torch.randn(320), torch.randn(16000 * 2)
+    mixed = model.process_prompt(None, ["audio", "audio"], ["text"], tensors={"audio_inputs": [short, real]})
+    ids = mixed.new_input_tensors["text_inputs"][0].tolist()
+    assert mixed.metadata[AUDIO_MEL_FRAMES] == [202]
+    assert ids.count(AUDIO_START) == 2 and ids.count(AUDIO_PATCH) == audio_tokens(202)
+    assert ids[ids.index(AUDIO_START) + 1] == AUDIO_END
+    alone = model.process_prompt("what is this?", ["text", "audio"], ["text"], tensors={"audio_inputs": [short]})
+    assert AUDIO_MELS not in alone.new_input_tensors and AUDIO_MEL_FRAMES not in alone.metadata
+    ids = alone.new_input_tensors["text_inputs"][0].tolist()
+    assert ids[ids.index(AUDIO_START) + 1] == AUDIO_END
+    (layout,) = alone.metadata["kv_layout"].values()
+    assert layout["main"].spans[0].walk == PREFILL_TEXT
+    # and the plan follows what was sent: no mels, the text prefill
+    from mstar.model.step_audio2.step_audio2_model import MAIN
+
+    plan = model.walk_plan(MAIN, ["text", "audio"], ["text"], {}, {})
+    assert plan[0].walk == PREFILL_TEXT
 
 
 @pytest.mark.parametrize("with_audio", [False, True])
@@ -459,7 +479,6 @@ def test_an_audio_placeholder_written_in_the_text_is_refused(tmp_path, with_audi
 
 
 def test_a_spoken_reply_is_capped_to_what_the_vocoders_caches_hold(tmp_path):
-    from mstar.model.step_audio2.step_audio2_model import SPEECH_MAX_OUTPUT_TOKENS
     from mstar.model.step_audio2.token2wav import CONFORMER_REPLY_TOKENS
 
     model = a_model(tmp_path)
