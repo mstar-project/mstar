@@ -505,8 +505,7 @@ class TextOutput(NamedTuple):
     derive their text paths from it."""
 
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
-    # ids that end a reply, dropped unless the request sets ``ignore_eos``; a reply
-    # that ends on none is reported as cut at its budget (``finish_reason: "length"``)
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
 
 

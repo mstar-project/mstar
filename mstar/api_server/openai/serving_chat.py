@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.request_types import USAGE
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
@@ -23,12 +24,6 @@ from mstar.utils.utf8_stream import Utf8Stream
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    # checked before the adapter saves any upload, which only the finally below removes,
-    # and before submit, after which a raise leaves the request running with no reader
-    stream_options = getattr(req, "stream_options", None) or {}
-    if not isinstance(stream_options, dict):
-        raise ValueError("stream_options must be an object")
-    include_usage = bool(stream_options.get("include_usage"))
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     audio_format = _audio_format(req, sample_rate)
     # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
@@ -53,10 +48,12 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
+            report_usage=True,
         )
         if req.stream:
             # a request the engine refuses gets its status, not a 200
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return ReleasingStreamingResponse(
                 _stream_events(batches, model_name, request_id, sample_rate, parser, include_usage),
                 release=lambda: api.release_request(request_id),
@@ -190,6 +187,8 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
                     for delta in deltas:
                         text_events.append(chunk({**role, **delta}))
                         role = {}
+                    continue
+                if c.modality == USAGE:
                     continue
                 if text_events:
                     yield "".join(text_events)

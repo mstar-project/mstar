@@ -877,6 +877,10 @@ class BagelModel(Model):
         result, metadata["kv_layout"] = split_spans(result, self.SPANS, {"kv": layout})
         return ProcessPromptOutput(result, metadata)
 
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each image, whose spans in the layout count its sentinels and patches
+        return sum(span.length for span in kv_layout["kv"]["main"].spans)
+
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
         output_modalities: list[str], params: dict, window: CFGWindow | None, role_turns: bool,
