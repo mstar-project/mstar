@@ -13,7 +13,6 @@ scaffold's ``joint_attention`` over a ragged attention resource, or
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
@@ -21,16 +20,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.attention import Attend
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-
-# ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
-# ``L``); see ``mstar.model.components.diffusion.attention``.
-Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class RotaryTable(NamedTuple):
@@ -42,13 +38,6 @@ class RotaryTable(NamedTuple):
     def heads(self, start: int, count: int) -> "RotaryTable":
         """This rank's slice of the heads (tensor parallelism shards them)."""
         return RotaryTable(self.cos[:, :, start:start + count], self.sin[:, :, start:start + count])
-
-
-def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """``diffusers.models.normalization.RMSNorm(elementwise_affine=False)``: the
-    variance in fp32, the product promoted to fp32, then back to the input dtype."""
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    return (x * torch.rsqrt(variance + eps)).to(x.dtype)
 
 
 def apply_split_rope(x: torch.Tensor, rope: RotaryTable) -> torch.Tensor:

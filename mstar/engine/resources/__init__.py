@@ -16,6 +16,7 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
+    BlockCausalAttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -28,7 +29,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Rebuild, Residency, Resource, StepAllowance
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVConfig,
@@ -86,6 +87,7 @@ __all__ = [
     "RequestOffloading",
     "AttentionConfig",
     "AttentionSpec",
+    "BlockCausalAttentionSpec",
     "AttentionStep",
     "AttnBackend",
     "BucketKey",
@@ -114,6 +116,8 @@ __all__ = [
     "RaggedBlockCausalAttentionSpec",
     "RaggedCrossAttentionSpec",
     "RaggedCrossAttentionStep",
+    "Rebuild",
+    "Residency",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
@@ -128,6 +132,7 @@ __all__ = [
     "SeqShardSpec",
     "SeqShardStep",
     "SlotLease",
+    "StepAllowance",
     "StepContext",
     "StepRunner",
     "SubmoduleStep",

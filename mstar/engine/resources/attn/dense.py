@@ -176,6 +176,8 @@ class DenseAttentionManager(AttentionManager):
 
     # attends the K/V it is handed, which an exchange hands it whole
     supports_split_steps = True
+    # the gathered prefix is keyed on the stream's generation, which the KV's drop moves on
+    supports_drop = True
 
     def __init__(
         self,

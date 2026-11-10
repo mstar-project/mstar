@@ -12,11 +12,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from mstar.model.components import moe  # noqa: E402
-from mstar.model.components.moe import (  # noqa: E402
-    ParallelSparseMoeBlock,
-    ParallelSparseMoeBlockWithSharedExpert,
-    TopKRouter,
-)
+from mstar.model.components.moe import ParallelSparseMoeBlock, TopKRouter  # noqa: E402
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="runs Triton kernels")
 
@@ -39,36 +35,22 @@ def test_a_cpu_batch_takes_the_eager_router_with_the_flag_set():
     assert torch.equal(weights, ref_weights / ref_weights.sum(dim=-1, keepdim=True))
 
 
+@pytest.mark.parametrize("shared", [False, True], ids=["routed", "shared-expert"])
 @pytest.mark.parametrize(("world", "masked", "aligns"), [(1, False, True), (1, True, False), (2, False, False)])
-def test_a_block_offers_its_weights_only_where_it_can_use_the_alignment(monkeypatch, world, masked, aligns):
+def test_a_block_offers_its_weights_only_where_it_can_use_the_alignment(monkeypatch, shared, world, masked, aligns):
     block = ParallelSparseMoeBlock(
         hidden_size=8, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=8,
-        comm_group=SimpleNamespace(world_size=world, rank=0),
+        shared_expert=torch.nn.Identity() if shared else None,
+        comm_group=SimpleNamespace(world_size=world, rank=0, all_reduce=lambda t: t),
     )
     seen = []
     real = moe._route
     monkeypatch.setattr(moe, "_route", lambda gate, flat, w1, states: seen.append(w1) or real(gate, flat, w1, states))
-    monkeypatch.setattr(moe, "_dispatch", lambda flat, *args, **kwargs: torch.zeros_like(flat))
-    block._dispatch_tp = lambda flat, *args, **kwargs: torch.zeros_like(flat)
+    block.experts._dispatch = lambda flat, *args, **kwargs: torch.zeros_like(flat)
     x = torch.randn(3, 8)
     block(x, token_valid=torch.ones(3, dtype=torch.bool) if masked else None)
     assert (seen[0] is block.experts.gate_up_proj) is aligns
     assert (seen[0] is None) is not aligns
-
-
-@pytest.mark.parametrize(("world", "aligns"), [(1, True), (2, False)])
-def test_a_shared_expert_block_offers_its_weights_on_one_rank(monkeypatch, world, aligns):
-    block = ParallelSparseMoeBlockWithSharedExpert(
-        hidden_size=8, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=8,
-        shared_expert=torch.nn.Identity(), comm_group=SimpleNamespace(world_size=world, rank=0),
-    )
-    seen = []
-    real = moe._route
-    monkeypatch.setattr(moe, "_route", lambda gate, flat, w1, states: seen.append(w1) or real(gate, flat, w1, states))
-    monkeypatch.setattr(moe, "_dispatch", lambda flat, *args, **kwargs: torch.zeros_like(flat))
-    block._dispatch_tp = lambda flat, *args, **kwargs: torch.zeros_like(flat)
-    block(torch.randn(3, 8))
-    assert (seen[0] is block.experts.gate_up_proj) is aligns
 
 
 @cuda
@@ -175,14 +157,15 @@ def test_with_nothing_to_align_against_it_takes_router_topk():
 
 @cuda
 def test_a_batch_fused_experts_runs_per_pair_takes_router_topk():
-    """Up to ``ROUTED_MAX_TOKENS`` tokens of a shape the per-pair GEMVs fit, ``fused_experts`` reads no
-    alignment, so the router doesn't build one; past that the batch takes the one-kernel route."""
+    """Up to the routed path's crossover, on a shape the per-pair GEMVs fit, ``fused_experts`` reads
+    no alignment, so the router doesn't build one; past that the batch takes the one-kernel route."""
     from mstar.utils.fused_moe import decode
 
     router = _router(hidden=1024, device="cuda")
     w1 = torch.zeros(128, 256, 1024, device="cuda", dtype=torch.bfloat16)
-    assert decode.routed_fits(1024, 128)
-    small = torch.randn(decode.ROUTED_MAX_TOKENS, 1024, device="cuda", dtype=torch.bfloat16)
+    crossover = decode.routed_tuning(w1, w1, router.top_k).pair_max_tokens
+    assert crossover and decode.routed_fits(1024, 128, decode.routed_tuning(w1, w1, router.top_k))
+    small = torch.randn(crossover, 1024, device="cuda", dtype=torch.bfloat16)
     assert _takes_router_topk(router, small, w1)
-    larger = torch.randn(decode.ROUTED_MAX_TOKENS + 1, 1024, device="cuda", dtype=torch.bfloat16)
+    larger = torch.randn(crossover + 1, 1024, device="cuda", dtype=torch.bfloat16)
     assert router.route(larger, w1)[2] is not None

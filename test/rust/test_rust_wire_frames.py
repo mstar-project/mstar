@@ -114,8 +114,7 @@ class _Mesh:
             ],
         })
         args = dict(
-            request_infos=[(rid, None)], new_token_counts=[],
-            stream_tokens_consumed=[], profiling=[],
+            request_infos=[(rid, None)], new_token_counts=[], profiling=[],
         )
         args.update(send_kwargs)
         _send(self.rt, out.completion_id, **args)
@@ -135,15 +134,12 @@ def _send(rt, completion_id, **aos):
 
     info_rids, infos = split("request_infos")
     ntc_rids, ntc = split("new_token_counts")
-    con_rids, con = split("stream_tokens_consumed")
     prof_rids, prof = split("profiling")
     publish_rids, publications = split("publications")
     rt.send_outputs(
         completion_id=completion_id,
         info_rids=info_rids, request_infos=infos,
         ntc_rids=ntc_rids, new_token_counts=[dict(c) for c in ntc],
-        consumed_rids=con_rids,
-        stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
         skip_rids=aos.get("skip_rids", []),
@@ -1086,7 +1082,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
         "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1],
     })
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
-          new_token_counts=[], stream_tokens_consumed=[], profiling=[])
+          new_token_counts=[], profiling=[])
 
     done = {
         m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)

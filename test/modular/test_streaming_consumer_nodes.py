@@ -6,15 +6,15 @@ single ``GraphNode`` matched, but a decode ``Loop`` whose inner node consumes
 the streamed edge did not. Its chunks were then routed to ``next_node=""`` and
 its ``StreamBuffer`` was never created (``KeyError`` when routing the edge).
 """
-from types import SimpleNamespace
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, StreamingGraphEdge
+from mstar.testing_utils.model import make_model
+from mstar.worker.services import innermost_loops, partition_nodes
 from mstar.worker.stream_buffers import consumer_nodes
-from mstar.worker.worker import Worker
 
 
 def _model():
@@ -41,12 +41,11 @@ def _model():
     ])
     walks = {"produce": producer, "consume": consumer_loop, "decode_audio": codec_chunk}
     partitions = [
-        PartitionDefinition(name="A", graph_walks={"produce"}, initial_walk="produce"),
-        PartitionDefinition(name="B", graph_walks={"consume"}, initial_walk="consume", producer_partitions=["A"]),
-        PartitionDefinition(name="C", graph_walks={"decode_audio"}, initial_walk="decode_audio",
-                            producer_partitions=["B"]),
+        PartitionDefinition(name="A", graph_walks={"produce"}),
+        PartitionDefinition(name="B", graph_walks={"consume"}),
+        PartitionDefinition(name="C", graph_walks={"decode_audio"}),
     ]
-    return SimpleNamespace(
+    return make_model(
         get_graph_walk_graphs=lambda: walks,
         get_partitions=lambda: partitions,
     )
@@ -63,12 +62,11 @@ def _connections():
 
 def test_partition_nodes_recurse_into_loops_and_sequentials():
     model = _model()
-    # ``self`` is unused by the lookup, so call it unbound on a stub.
-    assert Worker._get_node_names_for_partition(None, "A", model) == ["producer"]
+    assert partition_nodes("A", model) == ["producer"]
     # the Loop's inner node, not the Loop's own name
-    assert Worker._get_node_names_for_partition(None, "B", model) == ["consumer"]
-    assert set(Worker._get_node_names_for_partition(None, "C", model)) == {"codec", "post"}
-    assert Worker._get_node_names_for_partition(None, "missing", model) == []
+    assert partition_nodes("B", model) == ["consumer"]
+    assert set(partition_nodes("C", model)) == {"codec", "post"}
+    assert partition_nodes("missing", model) == []
 
 
 def test_consumer_node_cache_finds_nested_consumers():
@@ -77,7 +75,7 @@ def test_consumer_node_cache_finds_nested_consumers():
 
 
 def test_innermost_loop_cache_maps_only_nodes_inside_a_loop():
-    cache = Worker._build_innermost_loop_cache(_model().get_graph_walk_graphs())
+    cache = innermost_loops(_model().get_graph_walk_graphs())
     assert cache == {("consume", "consumer"): "consumer_loop"}
     # Nodes outside any loop get no entry, so no stop is ever synthesised.
     assert ("produce", "producer") not in cache
@@ -92,5 +90,5 @@ def test_innermost_loop_cache_picks_the_inner_loop_when_nested():
         max_iters=4, outputs=[],
     )
     outer = Loop(name="outer_loop", section=inner, max_iters=2, outputs=[])
-    cache = Worker._build_innermost_loop_cache({"w": outer})
+    cache = innermost_loops({"w": outer})
     assert cache == {("w", "deep"): "inner_loop"}
