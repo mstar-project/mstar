@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -26,13 +27,22 @@ from mstar.engine.resources.dsa.config import INDEX_PLANES
 PREFILL_SCORE_BYTES = 256 << 20
 
 
+class DSASpan(NamedTuple):
+    """One request's rows of a step: ``rows`` of them from row ``start``, for request
+    ``request`` of the step's."""
+
+    start: int
+    rows: int
+    request: int
+
+
 @dataclass
 class KPoolContext:
     """One step's DSA rows, as ``KPoolDSA.plan`` builds them from the KV plan.
 
     Per row: ``pos`` (it sees keys ``[0, pos]``) and ``row_req``. Per request: ``page_start``, its
     first entry in the flat page list ``pages``. The host fields are set only for an eager step;
-    ``spans`` is (first row, rows, request) per request. ``max_pools`` is the score width, fixed
+    ``spans`` is each request's ``DSASpan``. ``max_pools`` is the score width, fixed
     under a graph; ``sparse_plan`` is the graph slot's, or the eager one the first layer builds."""
 
     pos: torch.Tensor
@@ -40,7 +50,7 @@ class KPoolContext:
     pages: torch.Tensor
     page_start: torch.Tensor
     host_pos: list[int] | None
-    spans: list[tuple[int, int, int]] | None
+    spans: list[DSASpan] | None
     host_page_start: list[int] | None
     max_pools: int
     page_size: int
@@ -63,7 +73,7 @@ class KPoolContext:
         host_pos = self.host_pos[start:end]
         return dataclasses.replace(
             self, pos=self.pos[start:end], row_req=self.row_req[start:end], host_pos=host_pos,
-            spans=[(a - start, b - a, req) for a, b, req in pieces],
+            spans=[DSASpan(a - start, b - a, req) for a, b, req in pieces],
             max_pools=(max(host_pos) + 1) // self.kpool, sparse_plan=None)
 
 

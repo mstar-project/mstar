@@ -457,9 +457,9 @@ class KPoolDSA(Resource):
         topk, kpool = self.config.topk, self.config.kpool
         pos: list[int] = []
         row_req: list[int] = []
-        spans: list[tuple[int, int, int]] = []
+        spans: list[paged.DSASpan] = []
         for i, view in enumerate(kv_out.views):
-            spans.append((len(pos), view.to_compute, i))
+            spans.append(paged.DSASpan(len(pos), view.to_compute, i))
             pos.extend(range(view.length - view.to_compute, view.length))
             row_req.extend([i] * view.to_compute)
         n_real = len(pos)
