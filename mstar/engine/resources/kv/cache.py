@@ -56,6 +56,11 @@ class PageAllocator:
             for page in pages:
                 self.free_pages.put(page)
 
+    def give_back(self, pages: list[int]) -> None:
+        """Put ``pages`` back at the front, so the next allocation hands them out first, in this order."""
+        with self._lock:
+            self.free_pages.queue.extendleft(reversed(pages))
+
     @property
     def num_free(self) -> int:
         return self.free_pages.qsize()

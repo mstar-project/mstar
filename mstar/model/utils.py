@@ -1,9 +1,11 @@
 
 import json
 import logging
+import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -48,6 +50,9 @@ def load_weights_from_file(
 ):
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
+    refuse_unserved_quantization(safetensors_file)
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -64,17 +69,12 @@ def load_weights_from_file(
     # Temporary per-module state dicts
     state_dicts = [dict() for _ in modules]
 
-    # safetensors can't take cuda:0 etc
-    st_device = "cuda" if str(device).startswith("cuda") else device
-
-    with safe_open(safetensors_file, framework="pt", device=st_device) as f:
+    # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+    with safe_open(safetensors_file, framework="pt", device=str(device)) as f:
         for k in f.keys():
             for i, (_mod, _prefix, key_map) in enumerate(module_key_maps):
                 if k in key_map:
-                    tensor = f.get_tensor(k)
-                    if device != st_device:
-                        tensor = tensor.to(device, non_blocking=True)
-                    state_dicts[i][key_map[k]] = tensor
+                    state_dicts[i][key_map[k]] = f.get_tensor(k)
                     break
 
     # Load modules
@@ -259,7 +259,10 @@ def load_weights_from_hf_shards(
     """
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
     repo_dir = Path(repo_dir)
+    refuse_unserved_quantization(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
@@ -304,20 +307,17 @@ def load_weights_from_hf_shards(
         shard_to_hf_keys.setdefault(weight_map[k], []).append(k)
 
     hf_key_to_tensor = {}
-    st_device = "cuda" if str(device).startswith("cuda") else device
 
     # load in tensors to get {mod_key}
     for shard_file, keys_in_shard in shard_to_hf_keys.items():
         shard_path = str(repo_dir / shard_file)
         keys_set = set(keys_in_shard)
-        with safe_open(shard_path, framework="pt", device=st_device) as f:
+        # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+        with safe_open(shard_path, framework="pt", device=str(device)) as f:
             for k in f.keys():
                 if k not in keys_set:
                     continue
-                tensor = f.get_tensor(k)
-                if device != st_device:
-                    tensor = tensor.to(device, non_blocking=True)
-                hf_key_to_tensor[k] = tensor
+                hf_key_to_tensor[k] = f.get_tensor(k)
 
     # Temporary per-module state dicts
     state_dicts: list[dict[str, torch.Tensor]] = [dict() for _ in modules]
@@ -458,14 +458,72 @@ class TextChunkDetokenizer:
         return data
 
 
+class ByteIdDetokenizer:
+    """Token ids that are bytes, as a reduced model's byte tokenizer
+    (``tokenizer_mode: byte``) makes them: an id is its low byte."""
+
+    @staticmethod
+    def to_bytes(token_ids: list[int]) -> bytes:
+        return bytes(t & 0xFF for t in token_ids)
+
+    @staticmethod
+    def token_bytes(token_id: int) -> bytes:
+        return bytes((token_id & 0xFF,))
+
+
+class SentencePieceDetokenizer:
+    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
+    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
+    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
+    per token, so a character split across byte pieces reassembles client-side.
+    """
+
+    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
+        vocab = tokenizer_json["model"]["vocab"]
+        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
+            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
+        vocab = dict(vocab)
+        for added in tokenizer_json.get("added_tokens", []):
+            vocab[added["content"]] = added["id"]
+        self.pieces = {idx: piece for piece, idx in vocab.items()}
+        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        piece = self.pieces.get(token_id)
+        if piece is None or token_id in self.skip_ids:
+            return b""
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+            return bytes([int(piece[3:5], 16)])
+        return piece.replace("▁", " ").encode("utf-8")
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return b"".join(self.token_bytes(i) for i in token_ids)
+
+
 class TextOutput(NamedTuple):
     """How a model's text output, token ids, becomes bytes: ``Model.text_output``
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+
+
+class ByteLevelTextOutput:
+    """``Model.text_output`` for a model over a byte-level BPE tokenizer: each
+    token's raw bytes with special tokens dropped, ``config.eos_token_ids``
+    ending a reply. Built on first use, as the host's ``tokenizer`` may load
+    lazily; a reduced model's byte ids (``_tokenizer_mode`` of ``"byte"``)
+    never touch it."""
+
+    @cached_property
+    def _text_output(self) -> TextOutput:
+        detokenizer = ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+        return TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+
+    def text_output(self) -> TextOutput:
+        return self._text_output
 
 
 def drop_stop_tokens(
@@ -496,6 +554,7 @@ _KNOBS = {
 
 def load_generation_defaults(
     checkpoint_dir: str | Path | None, prefix: str = "", stage: str = "",
+    switch_only: bool = False,
 ) -> dict:
     """The sampling defaults ``checkpoint_dir/generation_config.json`` declares.
 
@@ -503,6 +562,8 @@ def load_generation_defaults(
     ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads
     ``talker_temperature``) and ``stage`` prefixes the returned names
     (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.
+    ``switch_only`` reads ``do_sample`` alone, for a file that is the backbone's
+    chat preset rather than the model's own recipe.
     Returns ``{}`` when there is no file, so the caller's own defaults apply.
     """
     if checkpoint_dir is None:
@@ -516,7 +577,7 @@ def load_generation_defaults(
         logger.warning("Unreadable %s; using the model's own defaults", path)
         return {}
     out = {}
-    for hf_key, knob in _KNOBS.items():
+    for hf_key, knob in ({} if switch_only else _KNOBS).items():
         value = config.get(prefix + hf_key)
         if value is not None:
             out[stage + knob] = value
@@ -626,6 +687,14 @@ def capture_ladder(key: str, value) -> list[int]:
     return list(value)
 
 
+def warn_retired_ladder_env(name: str, setting: str) -> None:
+    """Warn that the environment variable ``name``, a capture ladder the serving config's
+    ``prefill_token_buckets`` replaced, is set but no longer read; ``setting`` is the
+    serving config entry that sets it."""
+    if name in os.environ:
+        logger.warning("%s is no longer read; set the ladder in the serving config: %s", name, setting)
+
+
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
     """Raise unless ``loaded`` names every parameter of ``module``: one built on
     ``meta`` and filled by a loader would otherwise serve uninitialized memory."""
@@ -684,32 +753,3 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
                 f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
-
-
-class SentencePieceDetokenizer:
-    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
-    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
-    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
-    per token, so a character split across byte pieces reassembles client-side.
-    """
-
-    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
-        vocab = tokenizer_json["model"]["vocab"]
-        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
-            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
-        vocab = dict(vocab)
-        for added in tokenizer_json.get("added_tokens", []):
-            vocab[added["content"]] = added["id"]
-        self.pieces = {idx: piece for piece, idx in vocab.items()}
-        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
-
-    def piece_bytes(self, token_id: int) -> bytes:
-        piece = self.pieces.get(token_id)
-        if piece is None or token_id in self.skip_ids:
-            return b""
-        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
-            return bytes([int(piece[3:5], 16)])
-        return piece.replace("▁", " ").encode("utf-8")
-
-    def to_bytes(self, token_ids: list[int]) -> bytes:
-        return b"".join(self.piece_bytes(i) for i in token_ids)

@@ -72,6 +72,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     """Compute one ``[BLOCK_SIZE_M, BLOCK_SIZE_N]`` tile of the MoE output.
 
@@ -86,6 +87,9 @@ def fused_moe_kernel(
     holds the permuted slot indices (< ``num_valid_tokens`` for real
     tokens, >= for padding) and ``expert_ids`` maps each ``BLOCK_SIZE_M``
     block to the expert index.
+
+    ``ACCUMULATE`` adds the tile into ``C`` instead of overwriting it (a
+    LoRA delta onto a base GEMM's output).
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -137,11 +141,12 @@ def fused_moe_kernel(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
-
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if ACCUMULATE:
+        accumulator += tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+    accumulator = accumulator.to(compute_type)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -283,6 +288,7 @@ def invoke_fused_moe_kernel(
     top_k: int,
     config: Dict[str, Any],
     compute_type: tl.dtype,
+    accumulate: bool = False,
 ) -> None:
     """Launch :func:`fused_moe_kernel` with the right grid size.
 
@@ -296,7 +302,7 @@ def invoke_fused_moe_kernel(
         Output buffer, shape ``(M*topk, N)`` for GEMM-1 or reshape-viewed
         ``(M*topk, hidden)`` for GEMM-2.
     topk_weights, topk_ids : torch.Tensor
-        Router output, shapes ``(M, top_k)``.  ``topk_ids`` must be int32.
+        Router output, shapes ``(M, top_k)``.  ``topk_ids`` int32 or int64.
     sorted_token_ids, expert_ids, num_tokens_post_padded : torch.Tensor
         Outputs of :func:`moe_align_block_size`.
     mul_routed_weight : bool
@@ -310,6 +316,8 @@ def invoke_fused_moe_kernel(
         Tile sizes; output of :func:`get_default_config`.
     compute_type : triton.language.dtype
         Dtype for the accumulator store.
+    accumulate : bool
+        Add into ``C`` rather than overwrite it.
     """
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -347,6 +355,7 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=even_Ks,
+        ACCUMULATE=accumulate,
         **config,
     )
 
@@ -517,6 +526,74 @@ def act_and_mul_triton(
         ACTIVATION_TYPE=activation,
         HAS_SWIGLU_CLAMP=swiglu_limit is not None,
     )
+
+
+@triton.jit
+def act_and_mul_quant_fp8_kernel(
+    gateup_output_ptr,
+    q_ptr,
+    s_ptr,
+    inter,
+    SWIGLU_LIMIT,
+    eps,
+    fp8_min,
+    fp8_max,
+    GROUP: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUPS_P2: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+    HAS_SWIGLU_CLAMP: tl.constexpr,
+):
+    """One slot's :func:`act_and_mul_kernel` row, quantized to e4m3 in ``GROUP``-wide groups as
+    :func:`mstar.utils.quant_fp8.per_token_group_quant_fp8_kernel` quantizes it: the same
+    values bit for bit, without the bf16 intermediate's round trip through memory."""
+    in_dtype = gateup_output_ptr.dtype.element_ty
+    row = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, GROUPS_P2)
+    offs = g[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+    mask = (g < NUM_GROUPS)[:, None]
+    gate = tl.load(gateup_output_ptr + row * 2 * inter + offs, mask=mask, other=0.0)
+    up = tl.load(gateup_output_ptr + row * 2 * inter + inter + offs, mask=mask, other=0.0)
+    if HAS_SWIGLU_CLAMP:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
+    y = (activated * up).to(in_dtype).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
+    y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max).to(q_ptr.dtype.element_ty)
+    tl.store(q_ptr + row * inter + offs, y_q, mask=mask)
+    tl.store(s_ptr + row * NUM_GROUPS + g, y_s, mask=g < NUM_GROUPS)
+
+
+def act_and_mul_quant_fp8(
+    gateup_output: torch.Tensor,
+    group_size: int,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`act_and_mul_triton` then ``per_token_group_quant_fp8(_, group_size)`` in one
+    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``."""
+    assert gateup_output.is_contiguous() and gateup_output.dim() == 2
+    M, two_inter = gateup_output.shape
+    inter = two_inter // 2
+    assert inter % group_size == 0, f"inter {inter} must be a multiple of group_size {group_size}"
+    finfo = torch.finfo(FP8_DTYPE)
+    q = torch.empty((M, inter), dtype=FP8_DTYPE, device=gateup_output.device)
+    s = torch.empty((M, inter // group_size), dtype=torch.float32, device=gateup_output.device)
+    if M:
+        groups = inter // group_size
+        act_and_mul_quant_fp8_kernel[(M,)](
+            gateup_output, q, s, inter,
+            0.0 if swiglu_limit is None else swiglu_limit,
+            eps, finfo.min, finfo.max,
+            GROUP=group_size,
+            NUM_GROUPS=groups,
+            GROUPS_P2=triton.next_power_of_2(groups),
+            ACTIVATION_TYPE=activation,
+            HAS_SWIGLU_CLAMP=swiglu_limit is not None,
+        )
+    return q, s
 
 
 # ---------------------------------------------------------------------------

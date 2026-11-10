@@ -132,8 +132,8 @@ def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
 def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
     calls = []
 
-    def fake_download(repo_id, filename):
-        calls.append((repo_id, filename))
+    def fake_download(repo_id, filename, cache_dir=None):
+        calls.append((repo_id, filename, cache_dir))
         return f"/cache/{repo_id}/{filename}"
 
     import huggingface_hub
@@ -144,11 +144,13 @@ def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
         entrypoint._resolve_warmup_path("hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg")
         == "/cache/nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg"
     )
-    assert calls == [("nvidia/Cosmos3-Edge", "assets/example_i2v_input.jpg")]
+    assert calls == [("nvidia/Cosmos3-Edge", "assets/example_i2v_input.jpg", None)]
     fake = _FakeServer()
     spec = {"files": ["hf://nvidia/Cosmos3-Edge/assets/x.jpg"], "output_modalities": ["video"]}
-    entrypoint._run_warmup_requests(fake, [spec])
+    # from --cache-dir, as the weights are: a read-only default cache left the server cold
+    entrypoint._run_warmup_requests(fake, [spec], cache_dir="/models")
     assert fake.submitted[0]["file_paths"] == {"image": ["/cache/nvidia/Cosmos3-Edge/assets/x.jpg"]}
+    assert calls[-1] == ("nvidia/Cosmos3-Edge", "assets/x.jpg", "/models")
     # a malformed reference is a failed warmup, not a crash
     entrypoint._run_warmup_requests(fake, [{"files": ["hf://nvidia.jpg"], "output_modalities": ["video"]}])
     assert len(fake.submitted) == 1

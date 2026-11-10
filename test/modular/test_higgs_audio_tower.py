@@ -40,8 +40,8 @@ def test_a_short_clip_embeds_the_frames_its_prompt_counts(width, frames):
     embedding."""
     from types import SimpleNamespace
 
-    from mstar.model.higgs_audio.config import AUDIO_FEATURE_LENS_KEY
     from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
+    from mstar.model.multimodal import MEDIA_LAYOUT
 
     torch.manual_seed(0)
     config = HiggsAudioModelConfig(
@@ -52,7 +52,8 @@ def test_a_short_clip_embeds_the_frames_its_prompt_counts(width, frames):
     tower, projector = HiggsAudioTower(config).eval(), HiggsAudioFeatureProjector(config).eval()
     sub = HiggsAudioEncoderSubmodule(tower, projector, config, graphs=False)
     clip = torch.randn(1, config.audio_num_mel_bins, width)
-    fwd = SimpleNamespace(step_metadata={AUDIO_FEATURE_LENS_KEY: [frames]})
+    # the clip's grid in the walk's media layout: its one chunk's frames
+    fwd = SimpleNamespace(step_metadata={MEDIA_LAYOUT: {"output": ["audio_embeds"], "grid": [[frames]]}})
     engine_inputs = SimpleNamespace(request_ids=["r"], piecewise_runners={})
     with torch.no_grad():
         row = sub.prepare_inputs("prefill_audio", fwd, {"audio_features": [clip]})

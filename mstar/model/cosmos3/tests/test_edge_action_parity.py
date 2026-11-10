@@ -56,7 +56,8 @@ def test_edge_policy_step_matches_diffusers() -> None:
     )
     assert torch.equal(static["position_ids"].to(rec["position_ids"].dtype), rec["position_ids"])
     assert static["num_noisy_action_tokens"] == chunk
-    domain = torch.tensor([resolve_action_domain_id(None, rec["domain_name"])], dtype=torch.long)
+    domain_id = resolve_action_domain_id(None, rec["domain_name"], cfg.num_embodiment_domains)
+    domain = torch.tensor([domain_id], dtype=torch.long)
     assert int(domain) == int(rec["domain_id"])
 
     with torch.device("meta"):

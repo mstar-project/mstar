@@ -11,6 +11,7 @@ from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import StubModel
 from mstar.worker.engine_manager import EngineManager
 
 
@@ -38,8 +39,8 @@ class _OptedOut(_Override):
 _NODES = {"inherit": _Node, "override": _Override, "opted_out": _OptedOut}
 
 
-class _Model:
-    """What ``EngineManager.build`` reads off a model, with no resources."""
+class _Model(StubModel):
+    """Builds each node from ``_NODES``, under the dtype the test gives."""
 
     def __init__(self, dtype):
         self._dtype = dtype
@@ -49,27 +50,6 @@ class _Model:
 
     def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
         return _NODES[node_name]()
-
-    def get_node_resources(self):
-        return []
-
-    def kv_labels(self):
-        return {}
-
-    def get_graph_walk_graphs(self):
-        return {}
-
-    def combined_walk_of(self):
-        return {}
-
-    def chunking_policy_of(self):
-        return {}
-
-    def checkpoint_path(self):
-        return None
-
-    def preprocess_fingerprint(self):
-        return ""
 
 
 def _build(model, parallel_groups: WorkerParallelGroups | None = None) -> EngineManager:
@@ -130,6 +110,8 @@ def test_a_node_placing_its_kv_positions_over_its_sp_ranks_loads_without_the_sp_
     ))]
     model.get_default_sharding_config = lambda: ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
     groups = WorkerParallelGroups(num_workers=2, global_rank=0)
-    groups.add_sp("inherit", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
+    sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    groups.add("inherit", sp, "sp")
+    groups.node_to_instance_comm["inherit"] = sp
     _build(model, groups).shutdown()
     assert "sp_group" not in kwargs["inherit"]

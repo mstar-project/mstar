@@ -18,9 +18,9 @@ from test_output_failure_teardown import _Model, _TensorManager, _thread
 from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ConductorMessageType
-from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler
-from mstar.worker.worker import Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE
 
 USER = getpass.getuser()
 ERROR_ID = re.compile(r"error id ([0-9a-f]{12})\)")
@@ -63,7 +63,7 @@ def test_a_decoder_failure_on_an_upload_reaches_the_client_as_an_error_id(tmp_pa
     with pytest.raises(OSError) as raised:
         Image.open(path)
     assert path in str(raised.value)  # the decoder names the upload
-    wt._fail_request("r1", raised.value, "preprocessing", abort=False)
+    wt._fail_request("r1", raised.value, "preprocessing", abort=False, intake=True)
 
     chunk = wt.out_queue.get_nowait()
     text = chunk.data.decode()
@@ -77,7 +77,7 @@ def test_a_deliberate_decoder_refusal_keeps_its_message_without_the_path(tmp_pat
     path = _upload(tmp_path, "3f2a9c_clip.mp4")
     wt = _data_worker()
     wt._fail_request(
-        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False,
+        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False, intake=True,
     )
 
     chunk = wt.out_queue.get_nowait()
@@ -106,27 +106,26 @@ def test_an_arena_io_error_reaches_the_client_as_an_error_id(caplog):
 
 
 def _worker(rids=("r1",)):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.sent = []
-    w.communicator = SimpleNamespace(send=lambda entity, msg: w.sent.append(msg))
-    w.request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
-    w._graph_runtime = SimpleNamespace(
-        get_rid_string=lambda h: h, set_in_flight=lambda *args: None,
+    sent = []
+    request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
+    runtime = SimpleNamespace(get_rid_string=lambda h: h, set_in_flight=lambda *args: None)
+    scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity, msg: sent.append(msg)),
+        request_state=request_state, graph_runtime=runtime,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
-    w.scheduler = MicroScheduler.__new__(MicroScheduler)
-    w.scheduler.failed_rids = set()
-    w.scheduler.held_until = {}
-    w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
-    w._hold_rows(CHAIN_LANE, rids)
+    w.sent = sent
+    for rid in rids:
+        w.lifecycle.add(rid, rid)
+    w.pipeline._hold_rows(CHAIN_LANE, rids)
     return w
 
 
 def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1_audio.pt"
     w = _worker()
-    w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
+    w.pipeline._handle_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
 
     (message,) = w.sent
     text = message.body.errors["r1"]
@@ -182,11 +181,32 @@ def test_the_generate_catch_all_answers_with_an_error_id(monkeypatch, caplog):
     assert segment in _logged(caplog, _error_id(detail)).getMessage()
 
 
-def test_the_generate_catch_all_keeps_a_deliberate_refusal(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", _FailingServer(ValueError("Unsupported modality: 'smell'")))
-    response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Unsupported modality: 'smell'"}
+def _bridge(server) -> RustFrontendBridge:
+    """A Rust frontend bridge that records what it sends."""
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.sent = []
+    bridge._send = bridge.sent.append
+    bridge._keys = {}
+    bridge.server = server
+    return bridge
+
+
+@pytest.mark.parametrize("path", ["generate", "rust-frontend"])
+def test_a_refusal_reaches_the_client_without_its_directory(monkeypatch, path):
+    """As the OpenAI routes cut it: /generate and the Rust frontend sent it whole."""
+    server = _FailingServer(ValueError("cannot read /tmp/x/a.wav"))
+    if path == "generate":
+        monkeypatch.setattr(entrypoint, "api_server", server)
+        response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
+        assert response.status_code == 400
+        text = response.json()["detail"]
+    else:
+        bridge = _bridge(server)
+        bridge._submit({"rid": "r1", "text": "hi"})
+        [message] = bridge.sent
+        assert message["metadata"] == {"status": 400}
+        text = message["data"].decode()
+    assert text == "cannot read a.wav"
 
 
 def test_generate_ws_answers_with_an_error_id(monkeypatch, tmp_path, caplog):
@@ -205,11 +225,7 @@ def test_generate_ws_answers_with_an_error_id(monkeypatch, tmp_path, caplog):
 
 def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1.pt"
-    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
-    bridge.sent = []
-    bridge._send = bridge.sent.append
-    bridge._keys = {}
-    bridge.server = _FailingServer(FileNotFoundError(f"cannot open {tensor_file}"))
+    bridge = _bridge(_FailingServer(FileNotFoundError(f"cannot open {tensor_file}")))
 
     bridge._submit({"rid": "r1", "text": "hi"})
     asyncio.run(bridge._relay("r2", None, bridge.server.iter_result_chunks("r2")))
@@ -219,6 +235,18 @@ def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
         assert message["t"] == "err"
         _assert_clean(message["msg"])
         assert tensor_file in _logged(caplog, _error_id(message["msg"])).getMessage()
+
+
+def test_the_rust_frontend_bridge_logs_a_type_error_s_traceback(caplog):
+    """Still a 400, but maybe a bug in the bridge, so it keeps its stack, as on the router."""
+    bridge = _bridge(_FailingServer(TypeError("PromptPart.__init__() got an unexpected keyword argument 'x'")))
+
+    bridge._submit({"rid": "r1", "text": "hi"})
+
+    [message] = bridge.sent
+    assert message["metadata"] == {"status": 400}
+    [record] = [r for r in caplog.records if "submit r1" in r.getMessage()]
+    assert record.exc_info is not None, "a TypeError from submit logged no traceback"
 
 
 @pytest.mark.parametrize("raw,scrubbed", [

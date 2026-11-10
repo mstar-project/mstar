@@ -5,6 +5,7 @@ holds). With no mirror that is the replica serving the fewest live requests, so
 concurrent requests spread over the replicas instead of landing on one at random,
 and ties go to the replica picked longest ago, so requests that never overlap take
 turns."""
+import itertools
 import math
 from collections import Counter
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.request_info import WalkStep  # noqa: E402
 from mstar.conductor.routing import ReplicaRouter, RoutingWeights, routing_cost  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import (  # noqa: E402
@@ -35,6 +37,7 @@ from mstar.engine.resources.spec import RoutingContext, RoutingFacts  # noqa: E4
 from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
+from mstar.testing_utils.model import StubModel, make_model  # noqa: E402
 
 PAGE = 4
 
@@ -64,7 +67,7 @@ def _wg(group_id, ranks, sp_size=1, nodes=("llm",), walk="prefill"):
     )
 
 
-class _Model:
+class _Model(StubModel):
     """What the router reads of a model: its partitions, and the walks that key each KV label."""
 
     def __init__(self, keyed=None, partitions=None):
@@ -383,25 +386,31 @@ def test_a_request_that_runs_none_of_a_resources_nodes_takes_no_part_in_its_mirr
     )
 
 
-def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
+def _refused_plan(*args):
+    raise ValueError("no walk for this request")
+
+
+@pytest.mark.parametrize("plan", [lambda *args: [WalkStep("prefill")], _refused_plan], ids=["validate", "plan"])
+def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors(plan):
+    """Refused in the resource configs' validation, or by the model's walk plan
+    (which runs before the replica pick)."""
     conductor = _kv_conductor()
-    walk = SimpleNamespace(request_done=False, step_metadata={}, full_metadata=SimpleNamespace(
-        graph_walk="prefill", kwargs={},
-    ))
-    conductor.model = SimpleNamespace(
+    conductor.model = make_model(
         LENGTH_KWARGS=("max_output_tokens",),
         get_partitions=lambda: [SimpleNamespace(name="default", graph_walks={"prefill"})],
         get_partition_topology=lambda: SimpleNamespace(connections=[]),
-        get_initial_forward_pass_args=lambda **kw: walk,
+        walk_plan=plan,
         get_max_output_tokens=lambda **kw: 8,
         get_loop_caps=lambda **kw: {},
-        get_request_resource_configs=lambda **kw: {},
+        get_request_resource_configs=lambda *args: {},
         # what ingest reads for the partitions a keyed node streams into
         kv_labels=_Model().kv_labels,
-        get_graph_walk_graphs=lambda: {},
     )
     conductor._status_interval_s = None
     conductor._loop_max_iters = {}
+    conductor._arrivals = itertools.count()
+    conductor._walk_inputs = {"prefill": []}
+    conductor.producer_triggered_partitions = set()
     conductor._kv_labels = {"kv": ("main",)}
     conductor._build_request_sharding_config = lambda workers: None
     refused = []
@@ -409,7 +418,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
     conductor._admit_request(SimpleNamespace(
         # 80 prompt positions, past the pool's max_seq_len of 64: a 400 in validate
         request_id="a", client_request_id=None, model_kwargs=_prompt("P", unkeyed=64), initial_signals={},
-        initial_input_modalities=["text"], initial_output_modalities=["text"],
+        initial_input_modalities=["text"], initial_output_modalities=["text"], streaming=False,
     ))
     assert refused == [400] and not conductor.requests
     (mirror,) = _mirrors(conductor._router)

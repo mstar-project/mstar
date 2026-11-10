@@ -7,8 +7,10 @@ import pytest
 import torch
 
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.host_copies import _LazyHostOutputs, _LazyPerRid, rows_to_per_rid
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import PendingBatch, Worker, _LazyHostOutputs, _LazyPerRid
+from mstar.worker.step_executor import PendingBatch
 
 
 def test_lazy_per_rid_builds_on_first_read_only():
@@ -18,7 +20,7 @@ def test_lazy_per_rid_builds_on_first_read_only():
     assert lazy._built is None
     assert len(lazy) == 3 and bool(lazy)
     assert lazy._built is None, "len and truth must not build the dicts"
-    eager = Worker._rows_to_per_rid(host, rids)
+    eager = rows_to_per_rid(host, rids)
     assert lazy.get(8).keys() == eager[8].keys()
     for name in eager[8]:
         assert torch.equal(lazy.get(8)[name][0], eager[8][name][0])
@@ -85,11 +87,11 @@ def test_a_host_transport_gets_each_routed_output_in_one_copy(host_transport):
         landed.update(cpu_tensors)
         raise _ReachedStoreError
 
-    worker = Worker.__new__(Worker)
-    worker._phase_period = 0
-    worker._graph_runtime = SimpleNamespace(supports_inline_emit=False)
-    worker.tensor_manager = SimpleNamespace(
-        needs_cpu_tensor=host_transport, store_and_return_tensor_info_batch=store,
+    worker = make_worker(
+        graph_runtime=SimpleNamespace(supports_inline_emit=False),
+        tensor_manager=SimpleNamespace(
+            get_tensor=None, needs_cpu_tensor=host_transport, store_and_return_tensor_info_batch=store,
+        ),
     )
     pending = PendingBatch(
         batch=ScheduledBatch(
@@ -100,7 +102,7 @@ def test_a_host_transport_gets_each_routed_output_in_one_copy(host_transport):
         graph_walk="w", future=Future(),
     )
     with pytest.raises(_ReachedStoreError):
-        worker._store_outputs(
+        worker.executor._store_outputs(
             pending, BatchedModelOutput(per_rid_outputs=source),
             SimpleNamespace(output_signals=["new_token", "latents"], graph_walk="w", walks=None),
             SimpleNamespace(wg_ids=SimpleNamespace(keys=[1, 2]), rid_walk_idx=None), lazy,

@@ -14,15 +14,20 @@
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
-//!       streaming, accepts_chunks}, `prompt_parts` present for a chat only
+//!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
+//!       chat only, `report_usage` only when set
 //!                        | {t:"abort", rid, sub}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
+//!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
+//!                        | {t:"voices", rid, sub}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
+//!                        | {t:"checked", rid, sub, error?, status?}
+//!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -34,6 +39,10 @@
 //! order: one message per pass of the API server's message thread rather than
 //! one per request.
 //!
+//! A submission with `report_usage` ends with a `chunk` of modality `usage`
+//! before its `done`: `metadata` holds `prompt_tokens`, `completion_tokens`
+//! and `finish_reason`.
+//!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
 //! can cross the retry), so routes and aborts go by `sub`. A `rid` with a
@@ -41,6 +50,7 @@
 //! abort is sent before its `rid` is freed, so it reaches the backend before
 //! any retry's submit.
 
+use crate::media::RefAudioCheck;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,13 +109,17 @@ struct SubmitMsg<'a> {
     #[serde(skip_serializing_if = "no_parts")]
     prompt_parts: &'a [Part],
     streaming: bool,
+    /// `submit_request`'s `report_usage`; left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    report_usage: bool,
 }
 
 fn no_parts(parts: &&[Part]) -> bool {
     parts.is_empty()
 }
 
-/// A `ping` or `metrics` request; only `metrics` carries `refusals`.
+/// A `ping`, `metrics`, `check_ref_audio` or `voices` request; only `metrics`
+/// carries `refusals`, and only `check_ref_audio` the clip.
 #[derive(Serialize)]
 struct ProbeMsg<'a> {
     t: &'a str,
@@ -113,6 +127,8 @@ struct ProbeMsg<'a> {
     sub: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     refusals: Option<&'a Snapshot>,
+    #[serde(flatten)]
+    check: Option<&'a RefAudioCheck>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -129,6 +145,11 @@ struct Inbound {
     metadata: Value,
     #[serde(default)]
     msg: String, // error message for t == "err"
+    // t == "checked": the refusal of a ref_audio clip, if it was refused
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
     // t == "chunks": one entry per chunk
     #[serde(default)]
     subs: Vec<u64>,
@@ -311,6 +332,7 @@ impl Bridge {
             model_kwargs: &args.model_kwargs,
             prompt_parts: &args.parts,
             streaming,
+            report_usage: args.report_usage,
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         if self.mbox.send("bridge", &payload).is_err() {
@@ -333,13 +355,14 @@ impl Bridge {
         &self,
         t: &str,
         refusals: Option<&Snapshot>,
+        check: Option<&RefAudioCheck>,
         timeout: Duration,
     ) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals };
+        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -351,16 +374,42 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", None, timeout).await.is_some()
+        self.round_trip("ping", None, None, timeout).await.is_some()
     }
 
     /// The API server's `/metrics` reply, asked with this frontend's refusal
     /// counts: the rendered text in `data` and, when metrics are on, its
     /// `content_type` in `metadata`. None on timeout.
     pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", Some(refusals), timeout).await? {
+        match self.round_trip("metrics", Some(refusals), None, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
+        }
+    }
+
+    /// `GET /v1/audio/voices`' body from the model, asked per request as the
+    /// Python route asks it (a model's list can change while it serves): `Ok(None)`
+    /// when the model publishes no list, `Err` on timeout or a failure there.
+    pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
+        match self.round_trip("voices", None, None, timeout).await {
+            Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
+            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
+    /// Have the API server check a saved reference clip with the model's
+    /// loader (`media_io.check_saved_ref_audio`): `Ok`, or the refusal's
+    /// `(status, message)`, as the Python adapter refuses it. A refused clip is
+    /// deleted there.
+    pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
+        let start = std::time::Instant::now();
+        match self.round_trip("check_ref_audio", None, Some(check), timeout).await {
+            Some(StreamItem::Done) => Ok(()),
+            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            // the request's budget ran out, as the Python frontend's request would
+            None if start.elapsed() >= timeout => Err((500, "Request timed out".to_string())),
+            _ => Err((500, "the server could not check ref_audio".to_string())),
         }
     }
 
@@ -420,9 +469,13 @@ fn deliver(routes: &Routes, msg: Inbound) {
         "done" => (Some(StreamItem::Done), true),
         // Liveness reply: completes the ping's route like a request.
         "pong" => (Some(StreamItem::Done), true),
-        "metrics" => (
+        "checked" => match msg.error {
+            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
+            None => (Some(StreamItem::Done), true),
+        },
+        "metrics" | "voices" => (
             Some(StreamItem::Chunk(ResultChunk {
-                modality: "metrics".to_string(),
+                modality: msg.t,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
             })),
@@ -466,6 +519,10 @@ mod tests {
     use serde_json::json;
 
     fn encoded(parts: &[Part]) -> Value {
+        encoded_with(parts, false)
+    }
+
+    fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
         let msg = SubmitMsg {
@@ -482,6 +539,7 @@ mod tests {
             model_kwargs: &model_kwargs,
             prompt_parts: parts,
             streaming: true,
+            report_usage,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
     }
@@ -495,10 +553,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_submit_that_reports_usage_carries_the_key() {
+        assert_eq!(encoded_with(&[], true)["report_usage"], json!(true));
+        assert!(encoded(&[]).get("report_usage").is_none());
+    }
+
+    #[test]
     fn a_chat_submit_carries_each_part_by_name() {
         let parts = [
-            Part { modality: "image".into(), text: None, index: 0, role: "user".into() },
-            Part { modality: "text".into(), text: Some("what is it".into()), index: 0, role: "user".into() },
+            Part { modality: "image".into(), text: None, index: 0, role: Some("user".into()) },
+            Part { modality: "text".into(), text: Some("what is it".into()), index: 0, role: Some("user".into()) },
         ];
         assert_eq!(
             encoded(&parts)["prompt_parts"],
@@ -665,13 +729,18 @@ mod tests {
         };
         let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
         assert_eq!(
-            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap) }),
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None }),
             json!({"t": "metrics", "rid": "m", "sub": 4,
                    "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
         );
         assert_eq!(
-            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None }),
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None }),
             json!({"t": "ping", "rid": "p", "sub": 5})
+        );
+        let check = RefAudioCheck { path: "/u/a.wav".into(), decoder: "soundfile", bare: true };
+        assert_eq!(
+            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check) }),
+            json!({"t": "check_ref_audio", "rid": "c", "sub": 6, "path": "/u/a.wav", "decoder": "soundfile", "bare": true})
         );
     }
 
