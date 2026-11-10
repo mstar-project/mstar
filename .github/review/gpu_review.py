@@ -951,8 +951,9 @@ def write_gallery(pr, sha, lt, vendors, site):
         f"<h1>PR #{pr}, live test of {sha[:7]}</h1>" + "".join(rows))
 
 
-# A run's verdict is its boxes' worst: a pass only when every box passed.
-WORST_FIRST = ("fail", "partial", "unavailable", "none", "pass")
+# A run's verdict is its boxes' worst: a pass only when every box passed. No valid verdict (`none`) counts as a
+# failure later (bot.last_live_test), so it outranks `unavailable`, which says nothing.
+WORST_FIRST = ("fail", "partial", "none", "unavailable", "pass")
 
 
 def render_comment(sha, lt, vendors, media_url=""):

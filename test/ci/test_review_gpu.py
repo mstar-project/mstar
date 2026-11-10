@@ -663,9 +663,9 @@ class TestComment(unittest.TestCase):
             self.assertNotIn("$", printed.getvalue())
 
     def test_a_run_on_two_boxes_passes_only_when_both_do(self):
-        def render(amd_result=None, amd_unavailable=None):
+        def render(amd_result=None, amd_unavailable=None, nvidia_result='{"verdict": "pass", "summary": "ok"}'):
             out = Path(tempfile.mkdtemp())
-            for vendor, result in (("nvidia", '{"verdict": "pass", "summary": "ok"}'), ("amd", amd_result)):
+            for vendor, result in (("nvidia", nvidia_result), ("amd", amd_result)):
                 (out / vendor / "results/media").mkdir(parents=True)
                 (out / vendor / "results/media/a.png").write_bytes(b"0")
                 (out / vendor / "results/report.md").write_text(f"{vendor} report ![a](media/a.png)\n")
@@ -693,6 +693,9 @@ class TestComment(unittest.TestCase):
                                                 "vendors=nvidia,amd -->"),
                                 "the next run couldn't tell what this one covered")
         self.assertIn("on AMD: unavailable.**\n\nNo AMD GPUs @\u200bteam", text, "the PR wouldn't see why")
+        self.assertEqual(render(None, "No AMD GPUs", nvidia_result='{"verdict": "maybe"}')[0], "none",
+                         "an NVIDIA box with no valid verdict would hide behind the AMD box's unavailable, and stop "
+                         "counting against the PR")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
         cap = unittest.mock.patch.object(gpu_review, "MEDIA_CAP", 1000)
