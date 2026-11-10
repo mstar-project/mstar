@@ -39,9 +39,6 @@ def thinker(config):
     thinker.model = SimpleNamespace(model=SimpleNamespace(
         embed_tokens=_CountingEmbedding(max(config.thinker_text.vocab_size, *ids) + 1, HIDDEN),
     ))
-    # the code before `_audio_row` cached the sentinel embeddings here; set as its
-    # __init__ did, so on that code only the call count fails
-    thinker._audio_bos_embed = thinker._audio_eos_embed = None
     thinker.__dict__["_cached_device"] = torch.device("cpu")
     thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: START)}
     return thinker
