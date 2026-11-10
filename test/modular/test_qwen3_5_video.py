@@ -885,7 +885,8 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from mstar.engine.resources.position.config import PositionConfig, PositionStep
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.engine.resources.step import Segment
-    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.engine.state.adapters import kv_layouts
+    from mstar.model.qwen3_5.config import KV_CACHE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     from mstar.worker.executing_batch import build_executing_batch
     from mstar.worker.host_pool import HostPool
@@ -902,13 +903,14 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         prompt_parts=parts_from_modalities(modalities, texts),
         input_metadata={"video_inputs": [metadata for _, metadata in videos]},
     )
-    tensors, kv_layout = out.new_input_tensors, out.metadata["kv_layout"][KV_CACHE]["main"]
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
+    tensors, kv_layout = out.new_input_tensors, layouts[KV_CACHE]["main"]
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     rows = sum(out.metadata[MEDIA_LAYOUT]["tokens"])
     copied = {"vision_embeds": [torch.full((rows, model.config.hidden_size), IMAGE_MARK)]}
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
-    llm.node_resources = {ROPE: rope}
+    llm.kv = SimpleNamespace(positions=rope)
     metadata = {"is_prefill": True, **step.step_metadata}
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=16),
@@ -919,7 +921,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     def write(walk, row=None):
         """A decode step when ``row`` is None, else a ``step.walk`` row."""
         span = 1 if row is None else row.input_seq_len
-        advance = None if row is None else llm.declare_step(walk, [R], [row]).steps[ROPE].advance
+        advance = None if row is None else llm.declare_step(walk, [R], [row]).state[KV_CACHE].advance
         segments = (Segment(R, "main", span),)
         kv_step, ctx = KVStep(segments=segments), StepContext((R,), walk, 0, False)
         assert kv.admit(kv_step, ctx).ok

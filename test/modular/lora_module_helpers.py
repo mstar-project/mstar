@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -24,7 +25,8 @@ from mstar.engine.resources.lora import LoraReqConfig, LoraSpec
 from mstar.engine.resources.lora.checkpoint import read_lora_file
 from mstar.engine.resources.lora.identity import adapter_digest
 from mstar.engine.resources.lora.pool import LoraAdapterPool
-from mstar.engine.resources.step import ResourceStep, Segment, StepContext
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
 
@@ -270,6 +272,44 @@ class _DeltaRuleStub(CausalAttend):
         return torch.stack(out)
 
 
+class _AttendCore:
+    """``CausalAttend`` as the KV array's read runs it, on the k and v its add held."""
+
+    requires_kv_write = False
+
+    def __init__(self, rows: _Rows):
+        self.attend = CausalAttend(rows)
+
+    def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
+        return self.attend(q, k, v)
+
+
+class _DeltaCore:
+    """``_DeltaRuleStub`` as the delta-net's ``causal_conv`` and ``gated_delta_net`` run it."""
+
+    def __init__(self, rows: _Rows):
+        self.rule = _DeltaRuleStub(rows)
+
+    def run_conv(self, x, *, conv_layer, weight, bias, label):
+        return self.rule.conv(x, weight, bias)
+
+    def run(self, q, k, v, a, b, *, state_layer, a_log, dt_bias, label):
+        return self.rule(q, k, v, a, b, a_log, dt_bias)
+
+
+class _Unread:
+    """The KV pages and the recurrent blocks, which no stubbed core reads."""
+
+    def layer_view(self, i):
+        return torch.empty(0)
+
+    def block(self, field, i):
+        return torch.empty(0)
+
+    def opens_label(self, rid, label):
+        return True
+
+
 # -- Llama-shaped checkpoints -------------------------------------------------------------------
 
 def llama_layers(c, prefix: str) -> dict[str, tuple[int, int]]:
@@ -462,30 +502,62 @@ def build_stack(weights: dict[str, torch.Tensor], comm_group: CommGroup | None =
     return _loaded(model, weights)
 
 
-def _stub_cores(model, rows: _Rows) -> None:
-    from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention
+def _stub_cores(llm, rows: _Rows, doubles: dict | None = None):
+    """``llm`` with its handles on Qwen3.5's declared state bound over stubs of the kernels, which read ``rows``.
+    ``doubles`` replaces a resource under its key, such as the position resource or the sampler."""
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.keys import ROPE
+    from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN, SAMPLER
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
-    for layer in model.model.layers:
-        if isinstance(layer.self_attn, Qwen3_5Attention):
-            layer.self_attn.attend = CausalAttend(rows)
-        else:
-            layer.self_attn.mix = _DeltaRuleStub(rows)
+    declaring = model_object(Qwen3_5DenseModel, llm.config, vision_config=None, sampling_defaults={})
+    unread = _Unread()
+    resources = {
+        KV_CACHE: unread, GDN_STATE: unread, ATTN: _AttendCore(rows), LINEAR_ATTN: _DeltaCore(rows), ROPE: None,
+        SAMPLER: None, **(doubles or {}),
+    }
+    llm.bind_node_state(node_handles(declaring, "LLM", resources))
+    return llm
 
 
-def bind(model, rows: _Rows, resources: dict):
-    """The LLM node over ``model``, ``resources`` bound and the kernels stubbed."""
+def bind(model, rows: _Rows, resources: dict, doubles: dict | None = None):
+    """The LLM node over ``model``, ``resources`` bound and the kernels stubbed (``_stub_cores``)."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     llm = LLMSubmodule(model, model.config)
     llm.bind_node_resources(resources)
-    _stub_cores(model, rows)
-    return llm
+    return _stub_cores(llm, rows, doubles)
 
 
-def run(model, rows: _Rows, embeds_per_row: list[torch.Tensor]) -> torch.Tensor:
+@contextmanager
+def step_over(llm, rows: _Rows):
+    """A step of one row per ``rows.lengths``, with ``llm``'s array handles open, as the engine opens them around a
+    forward."""
+    from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
+
+    step = SubmoduleStep(
+        segments=[Segment(rid, "main", n) for rid, n in enumerate(rows.lengths)],
+        state={KV_CACHE: ArrayStep(), GDN_STATE: ArrayStep()},
+    )
+    step.set_state_handles((llm.state_handles[KV_CACHE], llm.state_handles[GDN_STATE]))
+    step.set_ctx(StepContext(tuple(range(len(rows.lengths))), "prefill_text", 0, False))
+    step.begin_calls()
+    try:
+        yield
+    finally:
+        step.end_calls()
+
+
+def no_rope(stack, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The rotary tables at position 0, which rotate nothing, as the stack ran with no position resource."""
+    return stack.build_text_cos_sin(torch.zeros(tokens, dtype=torch.long), dtype=DTYPE)
+
+
+def run(llm, rows: _Rows, embeds_per_row: list[torch.Tensor]) -> torch.Tensor:
     rows.lengths = [e.shape[0] for e in embeds_per_row]
-    with torch.no_grad():
-        return model.model(torch.cat(embeds_per_row), label="main")
+    x = torch.cat(embeds_per_row)
+    with torch.no_grad(), step_over(llm, rows):
+        return llm.model.model(x, cos_sin=no_rope(llm.model.model, x.shape[0]))
 
 
 # -- every enabled model's LLM node, as the parity tests drive it -----------------------------
@@ -832,14 +904,16 @@ def _qwen3_5():
         return {**every, "lm_head": (c.vocab_size, HIDDEN), f"{TEXT}embed_tokens": (HIDDEN, c.vocab_size)}
 
     def run_(sub, rows):
-        lengths, lm = [len(r) for r in rows], sub.model
-        _stub_cores(lm, _Rows(lengths))
-        hidden = lm.model(lm.model.embed_tokens(torch.cat(rows)), label="main")
-        return _per_row(hidden, lm.lm_head(_last(hidden, lengths)), lengths)
+        lengths, lm = _Rows([len(r) for r in rows]), sub.model
+        _stub_cores(sub, lengths)
+        x = lm.model.embed_tokens(torch.cat(rows))
+        with step_over(sub, lengths):
+            hidden = lm.model(x, cos_sin=no_rope(lm.model, x.shape[0]))
+        return _per_row(hidden, lm.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
         config=tiny_config, lora_spec=qwen3_5_lora_spec,
-        build=lambda c, group, w: LLMSubmodule(build_stack(w, group, c), c),
+        build=lambda c, group, w: _stub_cores(LLMSubmodule(build_stack(w, group, c), c), _Rows()),
         weights=lambda c: hf_text_weights(), a1=a1,
         # leaves `in_proj_qkv` and `in_proj_a` out: slices of one fused target on and off it
         a2=lambda c: _subset(a1(c), "q_proj", "v_proj", "down_proj", "in_proj_z", "in_proj_b",
