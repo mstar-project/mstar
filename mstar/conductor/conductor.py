@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import itertools
 import logging
 import math
 import multiprocessing as mp
@@ -477,6 +478,7 @@ class Conductor:
         ``model_config_file``, which the model's placement methods read in any case. A
         LoRA adapter without its digest is refused either way."""
         self.requests: dict[str, RequestData] = {}
+        self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
@@ -1407,6 +1409,7 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        arrival = next(self._arrivals)
         # process_prompt's {stream edge: context-only lead items}; each worker
         # primes the streams its own partition consumes
         stream_lead_items = kwargs.get("stream_lead_items") or {}
@@ -1523,7 +1526,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(

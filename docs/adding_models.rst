@@ -3476,6 +3476,11 @@ calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
+``MIXED_MEDIA = True`` lets media prompt rows join mixed steps too (the model lists its
+media walks in its combined walk), and ``CHUNKS_MEDIA = True`` reports a media row's length
+so a token budget can cut it: a chunk takes its slice of the mask with its ids, and the
+media rows the mask marks there. A decode row's sampled id never takes a media row, since
+only the layout's tokens are masked. Cosmos3-Edge's reasoner sets both.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): up to ``MAX_BATCH_SIZE`` requests per

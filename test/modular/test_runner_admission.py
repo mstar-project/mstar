@@ -15,23 +15,19 @@ from collections.abc import Collection
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, AdmitRuntimeError
+from mstar.testing_utils.resource import StubResource
 
 NODE, WALK = "llm", "prefill"
 
 
-class _StubPool(Resource):
+class _StubPool(StubResource):
     """Hands out one unit of capacity per request unless ``needs`` says more, refuses the requests in
     ``refuses``, and counts the calls it gets."""
 
     def __init__(self, units: int, needs: dict[str, int] | None = None, refuses: Collection[str] = ()):
         self.free, self.held, self.calls, self.retrieved = units, set(), Counter(), []
         self.needs, self.refuses, self.published = needs or {}, refuses, []
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def ask(self, rid, node_name, graph_walk):
         self.calls["ask"] += 1
@@ -187,3 +183,22 @@ def test_a_request_one_pool_refuses_keeps_no_place_in_another_pools_queue():
 
     assert runner.admit_waiting(_nothing) == [(NODE, "next")], "a refused request kept the next one waiting"
     assert slots.held == {"next"}
+
+
+def test_a_return_holds_back_its_pools_newer_prompts_while_an_older_request_holds_another_pool():
+    """A return holds back newer prompts once it is the oldest. Taking the oldest across the runner, a request older
+    than it in another pool, or one that finished there and lives on for its later stages, let every newer prompt in
+    its own pool pass it for that request's whole life."""
+    other, own = _StubPool(1), _StubPool(3, needs={"r": 2})
+    runner = _runner({"vit": ["other"], NODE: ["own"]}, other=other, own=own)
+    for rid, arrival in (("o", 0), ("r", 1), ("q", 2), ("p", 3)):
+        runner.ingest_request(rid, arrival=arrival)
+    assert runner.admit_retrieve("o", "vit", WALK).ready
+    for rid in ("r", "q"):
+        assert runner.admit_retrieve(rid, NODE, WALK).ready
+    # r is dropped and returns with its history and a page
+    own.unreserve("r")
+    own.needs["r"] = 3
+    runner.readmit("r", NODE)
+
+    assert runner.admit_retrieve("p", NODE, WALK).queued, "p passed r, the oldest request in its pool"
