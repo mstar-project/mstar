@@ -18,6 +18,9 @@ class EagerPastCachedPrefix:
     """
 
     def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        # start > 0 is a cached prefix only because the GLMs declare no chunking policy. Under
+        # chunked prefill (#1254) the engine calls this for every chunk with that chunk's
+        # start, and a later chunk would count its tokens as cached a second time.
         if start > 0:
             self.request_state(fwd_info.rid_handle).add(CACHED, start)
         return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
