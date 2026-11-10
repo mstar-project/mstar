@@ -1,7 +1,7 @@
 """A row whose sampled token is dropped must leave no sampler state behind.
 
 Prefill walks that only keep the last prefill's token (BAGEL, the Qwen3-Omni
-Thinker, Higgs Audio) still sample every row under a captured graph. Without
+Thinker) still sample every row under a captured graph. Without
 ``SamplerStep.kept_rids`` the dropped draws advanced the RNG offset and, under a
 repetition penalty, marked the dropped token as seen, so seeded output depended
 on how the prompt was split into steps.
@@ -24,6 +24,8 @@ from mstar.engine.resources.step import SlotLease, StepContext
 V = 64
 KEPT, DROPPED = 0, 1
 
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+
 
 @pytest.fixture(params=["cuda", "xpu"])
 def device(request):
@@ -44,7 +46,7 @@ def buffer_device(request):
 
 def _resource(graph: bool, device: torch.device) -> SamplerResource:
     res = SamplerResource(
-        vocab_size=V, enable_repetion_penalty=True, device=device,
+        vocab_size=V, enable_repetition_penalty=True, device=device,
     )
     if graph:
         res.build_accelerator_graph_buffers(
@@ -119,6 +121,76 @@ def test_dropped_steps_do_not_shift_the_kept_stream(graph, device):
     got = _step(split, SamplerStep(), graph)[0].item()
 
     assert got == want
+
+
+def test_an_eager_step_leaves_a_dropped_rows_last_token(device):
+    res = _resource(True, device)
+    res.enable_device_loopback_reader()
+    bufs = res._cg_buffers
+    # past the vocab, so no draw can equal them
+    bufs.write_last_tokens([KEPT, DROPPED], torch.tensor([V + 1, V + 2], device=device))
+
+    _step(res, SamplerStep(kept_rids=frozenset({KEPT})), graph=False)
+
+    assert bufs.last_tokens_for([KEPT]).item() < V, "the kept row's sample never reached the token its next step reads"
+    assert bufs.last_tokens_for([DROPPED]).item() == V + 2, "a discarded sample overwrote the token its next step reads"
+
+
+@requires_cuda
+def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch):
+    """Under the in-graph scatter the replay writes each row's token and advanced RNG offset to the masters, a
+    row outside ``kept_rids`` to the trash row. The engine takes a rebuild row out of ``kept_rids``, so its
+    request's next decode step reads the token, offset and history count it had before the rebuild."""
+    pytest.importorskip("flashinfer")
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
+    device = torch.device("cuda")
+    res = SamplerResource(vocab_size=V, enable_repetition_penalty=False, max_repetition_window=4, device=device)
+    res.enable_device_loopback_reader()
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=2, max_seq_len=1)
+    bufs = res._cg_buffers
+    assert bufs.ingraph_scatter
+    for rid in (KEPT, DROPPED):
+        res.ingest_request(rid, SamplingReqConfig(temperature=1.0))
+        assert res.reserve(rid, "llm", "prefill", None) is None
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=2))
+    pads = (-1, -2)
+    for pad in pads:
+        res.ingest_capture_row(pad)
+    capture = StepContext(request_ids=pads, graph_walk="prefill", slot=0, capture=True, slot_lease=lease)
+    res.plan(SamplerStep(), capture)
+    logits = torch.zeros(2, V, device=device)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):  # Triton autotune and FlashInfer JIT outside capture
+            res.sample(list(pads), logits)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        res.sample(list(pads), logits)
+    res.commit(SamplerStep(), capture)
+
+    def replay(rebuild: frozenset = frozenset()) -> None:
+        ctx = StepContext(request_ids=(KEPT, DROPPED), graph_walk="prefill", slot=0, capture=False, slot_lease=lease,
+                          rebuild_rids=rebuild)
+        res.plan(SamplerStep(), ctx)
+        logits.copy_(torch.randn(2, V, device=device))
+        graph.replay()
+        res.commit(SamplerStep(), ctx)
+        torch.cuda.synchronize()
+
+    def state(rid: int) -> tuple[int, int, int]:
+        slot, history = bufs._rid_to_slot[rid], res._history
+        count = history.count[history._rid_to_slot[rid]]
+        return bufs.last_token.master[slot].item(), bufs.offset.master[slot].item(), count.item()
+
+    replay()  # both requests decode once
+    kept, rebuilt = state(KEPT), state(DROPPED)
+    replay(frozenset({DROPPED}))
+
+    assert state(KEPT)[1] > kept[1], "the step never drew for its kept row"
+    assert state(DROPPED) == rebuilt, "the rebuild row's sample overwrote state decode reads next"
 
 
 @pytest.mark.parametrize(

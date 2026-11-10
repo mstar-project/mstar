@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components import SparseMoeBlock, TopKRouter
+from mstar.model.components import ParallelSparseMoeBlock, TopKRouter
 
 
 class _StatefulRouter(nn.Module):
@@ -48,7 +48,7 @@ class _StatefulRouter(nn.Module):
 
 
 def _make_block(router=None):
-    return SparseMoeBlock(
+    return ParallelSparseMoeBlock(
         hidden_size=32,
         num_experts=8,
         num_experts_per_tok=2,

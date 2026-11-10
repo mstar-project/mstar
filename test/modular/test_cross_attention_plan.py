@@ -182,6 +182,22 @@ def test_the_eager_wrapper_is_unsized():
     assert "batch_size" not in built
 
 
+@pytest.mark.parametrize("leased", [True, False])
+def test_rows_sharing_context_pages_plan_past_the_pool_size(leased):
+    """Requests with one cached context (the same audio twice) name its pages each, so the step's
+    index list outgrows the 64-page pool; an assert on the pool size failed the whole batch."""
+    ctx = _ctx(("r0", "r1"), _query([1, 1]))
+    shared = [SequenceView(request_id=rid, label=CONTEXT, page_idxs=list(range(1, 41)), length=40 * 16,
+                           to_compute=0) for rid in ("r0", "r1")]
+    ctx.plan_results[CTX_KV] = KVPlanOutputs({CONTEXT: _plan_output(shared)})
+    if not leased:
+        ctx.slot_lease = None
+    _manager().plan(AttentionStep(causal=False), ctx)
+    (built,) = _RecordingWrapper.built
+    if leased:
+        assert built["max_num_pages"] >= 80, "the captured index buffer holds every row's pages"
+
+
 def test_one_token_rows_plan_the_decode_kernel_and_longer_rows_the_prefill_kernel():
     """A decoder's cross attention queries one token per request every step;
     a prompt prefill queries several."""
@@ -246,6 +262,21 @@ def test_an_unchanged_step_is_not_planned_again():
     manager.plan(AttentionStep(causal=False), moved)
     assert wrapper.plans == 2
 
+
+
+def test_a_dropped_preplan_leaves_no_plan_to_skip_to():
+    """A preplan that never runs is dropped: the step that runs in its place on
+    the same slot, over the same pages, plans again rather than reusing a plan
+    whose copies went on the plan stream with nothing ordering them."""
+    manager = _manager()
+    pre = _ctx(("r0", "r1"), _query([1, 1]))
+    pre.is_preplan = True
+    manager.plan(AttentionStep(causal=False), pre)
+    wrapper = manager._preplan_states["main"]
+    assert wrapper.plans == 1
+    manager.clear_preplan()
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    assert manager._current_plan_states["main"] is wrapper and wrapper.plans == 2
 
 def test_a_captured_key_keeps_its_kind():
     manager = _manager()

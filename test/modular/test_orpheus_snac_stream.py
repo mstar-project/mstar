@@ -44,7 +44,7 @@ def _tokens(config: OrpheusModelConfig, frames: int, seed: int = 0, eos: bool = 
     codes = torch.randint(0, 4096, (frames, TPF), generator=generator)
     tokens = (codes + 4096 * torch.arange(TPF) + config.custom_token_base_id + 10).flatten()
     if eos:
-        tokens = torch.cat([tokens, torch.tensor([config.stop_token_id])])
+        tokens = torch.cat([tokens, torch.tensor([*config.stop_token_ids])])
     return tokens
 
 
@@ -80,18 +80,23 @@ def _stream_batched(
             keys.append(submodule.cg_key_info(
                 "snac_chunk", {rid: fwd_infos[rid] for rid in rids}, per_request_input_metadata=meta,
             ))
-            engine_inputs = ModelInputsFromEngine(
-                request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=False,
-            )
-            items = [
-                submodule.prepare_inputs(
+            prepared = {
+                rid: submodule.prepare_inputs(
                     "snac_chunk", fwd_infos[rid],
                     # as the worker routes it: an empty chunk carries no tensor
                     {"new_token": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
                     input_metadata=meta[rid], is_final_stream_chunk=chunks[rid].is_final,
                 )
                 for rid in rids
-            ]
+            }
+            # as the engine does: a declined chunk runs no forward
+            rids = [rid for rid in rids if prepared[rid] is not None]
+            if not rids:
+                continue
+            items = [prepared[rid] for rid in rids]
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=False,
+            )
             assert submodule.can_batch(None, items)
             packed = submodule.preprocess("snac_chunk", engine_inputs, items)
             with torch.no_grad():
@@ -350,13 +355,14 @@ def test_no_context_geometry_captures_only_decodable_windows():
 
 def test_no_context_stream_cut_at_a_chunk_boundary_ends_cleanly():
     """No context and no EOS (the token limit hit on a chunk boundary): the
-    buffer drains to empty, so the final flush carries no tokens at all."""
+    buffer drains to empty, so the final flush carries no tokens at all and
+    is declined: no forward, no empty audio chunk."""
     config = OrpheusModelConfig(snac_chunk_schedule=(4,), snac_left_context_frames=0,
                                 snac_right_context_frames=0)
     submodule = SNACDecoderSubmodule(_NeighbourDecoder(), config)
     tokens = _tokens(config, 8)
     chunks = _stream(submodule, tokens)
-    assert chunks[-1].numel() == 0
+    assert all(chunk.numel() for chunk in chunks)
     assert sum(chunk.numel() for chunk in chunks) == 8 * HOP
 
 

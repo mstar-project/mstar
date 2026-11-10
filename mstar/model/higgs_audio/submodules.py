@@ -1,17 +1,14 @@
-# ---------------------------------------------------------------------------
-# NodeSubmodule wrappers for Higgs-Audio STT
-# ---------------------------------------------------------------------------
-#
-# Two submodules:
-#   1. HiggsAudioEncoderSubmodule  (stateless) — checkpoint's Whisper-style
-#      audio_tower + audio_encoder_proj MLP projector, one-shot at prefill
-#   2. HiggsAudioLLMSubmodule      (KV/attention/positions/sampler) — dense Qwen3 LLM
-# ---------------------------------------------------------------------------
+"""Higgs-Audio STT's node submodules.
+
+- ``HiggsAudioEncoderSubmodule``: the checkpoint's Whisper-style audio tower
+  and its MLP projector, once per request, stateless.
+- ``HiggsAudioLLMSubmodule``: the dense Qwen3 LLM, on the shared
+  `SampledTokenDecoder`; the prompt prefills as one row with the encoder's
+  output spliced in at its audio pads.
+"""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -21,43 +18,19 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
-    PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.higgs_audio.config import (
-    ATTN,
-    AUDIO_FEATURE_LENS_KEY,
-    KV_CACHE,
-    ROPE,
-    SAMPLER,
-    HiggsAudioModelConfig,
-)
-from mstar.model.submodule_base import (
-    ARNodeInputs,
-    ARNodeSubmodule,
-    BatchedModelOutput,
-    DeviceLoopback,
-    ModelInputsFromEngine,
-    NodeInputs,
-    NodeSubmodule,
-    TokenStop,
-)
+from mstar.engine.resources import AttentionStep, KVStep
+from mstar.engine.resources.step import ResourceStep
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
+from mstar.model.keys import KV_CACHE
+from mstar.model.multimodal import MEDIA_LAYOUT, media_grids
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
-
-logger = logging.getLogger(__name__)
-
-
-# ===================================================================
-# 1. HiggsAudioEncoderSubmodule (stateless)
-# ===================================================================
 
 
 class HiggsAudioEncoderSubmodule(NodeSubmodule):
@@ -115,8 +88,10 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         features = inputs["audio_features"][0]
         if features.dim() == 2:
             features = features.unsqueeze(0)  # (1, num_mel_bins, T)
-        # each chunk's valid mel frames, known on the host since process_prompt
-        frames = list(fwd_info.step_metadata[AUDIO_FEATURE_LENS_KEY])
+        # each chunk's valid mel frames, known on the host since process_prompt:
+        # the clip's grid in the walk's media layout (one clip a request)
+        (frames,) = media_grids(fwd_info.step_metadata[MEDIA_LAYOUT], "audio_embeds")
+        frames = list(frames)
         return NodeInputs(
             tensor_inputs={"audio_features": features},
             kwargs={
@@ -248,240 +223,16 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
 
 
-# ===================================================================
-# 2. HiggsAudioLLMSubmodule (KV cache + attention + positions + sampler)
-# ===================================================================
-
-
-class HiggsAudioLLMSubmodule(ARNodeSubmodule):
-    """Dense Qwen3 LLM.
-
-    Dispatches on graph_walk:
-      - prefill_audio: the ChatML text around the encoder's audio
-        embeddings, one span into the KV cache.
-      - decode:        embed the previous token, single-step decode.
-
-    Every walk samples a token; ``postprocess`` drops it for a prefill step
-    that is not the last one, so the captured graph's output keys stay the
-    same whatever the step metadata says. Prefill replays a packed capture
-    keyed on ``input_embeds``, while decode carries bare ``input_ids`` and
-    embeds inside the graph.
-    """
-
-    PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+class HiggsAudioLLMSubmodule(SampledTokenDecoder):
+    ATTN_KEY = ATTN
+    # the ladders higgs captured before moving onto the scaffold
+    PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
+    PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def __init__(self, llm: nn.Module, config: HiggsAudioModelConfig):
-        super().__init__()
-        self.model = llm
-        self.config = config
-        # the prefill samples the reply's first token
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_audio"}),
-        )
-        # decode reads its input ids off the sampler's slot masters
-        self.device_loopback = DeviceLoopback(
-            walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
-        )
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # max-autotune until the default compile level (mstar serve -O) is measured on this model
+        return "max-autotune-no-cudagraphs"
 
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        return [
-            BatchedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="decode",
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1,
-                ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
-            PackedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="prefill_audio",
-                make_node_input=lambda n: ARNodeInputs(
-                    input_seq_len=n,
-                    input_embeds=torch.zeros(
-                        (n, self.config.hidden_size),
-                        device=device, dtype=torch.bfloat16,
-                    ),
-                ),
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
-        ]
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        has_loopback: bool = False,
-        **kwargs,
-    ) -> ARNodeInputs:
-        device = self.get_device()
-
-        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-            # the token is read off the sampler's slot master in `preprocess`
-            return row
-
-        if graph_walk == "prefill_audio":
-            # the audio between the ChatML text around it, prefilled as one span
-            audio = inputs["audio_embeds"][0].to(device)
-            pre, post = (
-                self.model.embed_tokens(inputs[name][0].to(device).reshape(-1))
-                if inputs.get(name) else None
-                for name in ("text_pre", "text_post")
-            )
-            dtype = (pre if pre is not None else audio).dtype
-            embeds = torch.cat([t.to(dtype) for t in (pre, audio, post) if t is not None], dim=0)
-            return ARNodeInputs(
-                input_seq_len=embeds.shape[0],
-                input_embeds=embeds,
-            )
-
-        # decode: embedding happens inside the captured graph; a decode row
-        # is one id, so staging it costs 8 bytes instead of a hidden vector
-        token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
-        return ARNodeInputs(input_seq_len=1, input_ids=token_ids)
-
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None,
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
-        **kwargs,
-    ) -> SubmoduleStep:
-        kept_rids = None
-        if graph_walk != "decode":
-            # only the last prefill's token survives `postprocess`
-            info = per_request_info or {}
-            kept_rids = frozenset(
-                rid for rid in request_ids
-                if rid in info and info[rid].step_metadata.get("is_last_prefill", False)
-            )
-        return SubmoduleStep(
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                ) for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(apply_penalty=False, kept_rids=kept_rids),
-                ROPE: PositionStep(),
-            },
-        )
-
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
-        if graph_walk == "decode":
-            if all(inp.input_ids is not None for inp in inputs):
-                return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
-            # device loop-back: each row's last sampled token, read by slot
-            return self.loopback_inputs(engine_inputs, inputs)
-        return {
-            "input_embeds": torch.cat(
-                [inp.input_embeds for inp in inputs], dim=0
-            ),
-        }
-
-    def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor | None,
-        input_embeds: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run the backbone and sample one token per request."""
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-
-        if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens()
-        if input_embeds is None:
-            input_embeds = self.model.embed_tokens(input_ids)
-        hidden = self.model(input_embeds=input_embeds, label="main")
-
-        if graph_walk != "decode":
-            # packed prefill: one hidden per request, at its last token
-            hidden = attn.select_last_hidden(hidden)
-
-        logits = self.model.lm_head(hidden)
-        return sampler.sample(logits)
-
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> NameToTensorList:
-        return {
-            "new_token": [self._forward(
-                graph_walk=graph_walk,
-                engine_inputs=engine_inputs,
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-            )]
-        }
-
-    def can_batch(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs],
-    ) -> bool:
-        return True
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> BatchedModelOutput:
-        new_tokens = self._forward(
-            graph_walk=graph_walk,
-            engine_inputs=engine_inputs,
-            input_ids=input_ids,
-            input_embeds=input_embeds,
-        )
-        # row i is request i: one clone and one device-to-host copy per step
-        return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
-        )
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        # Prefill samples on every step so the captured graph's outputs are
-        # fixed; only the last prefill's token is a real one.
-        if request_info.graph_walk != "decode" and \
-                not request_info.step_metadata.get("is_last_prefill", False):
-            outputs.pop("new_token", None)
-            return
-        if "new_token" not in outputs:
-            return
-        outputs["text_inputs"] = outputs["new_token"]
-
+    def layer_steps(self) -> dict[str, ResourceStep]:
+        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

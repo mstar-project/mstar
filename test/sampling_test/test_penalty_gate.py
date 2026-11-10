@@ -39,7 +39,7 @@ class _RecordingSampler:
     def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
-    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True, greedy=False):
         self.sampled_with.append(apply_penalty)
         return torch.zeros(len(request_ids), dtype=torch.long)
 
@@ -85,7 +85,7 @@ class _RecordingBuffers:
 def _resource(*, capable: bool = True) -> SamplerResource:
     res = SamplerResource(
         vocab_size=VOCAB,
-        enable_repetion_penalty=capable,
+        enable_repetition_penalty=capable,
         device=torch.device("cpu"),
     )
     # Skip build_cuda_graph_buffers: the real buffers would allocate a

@@ -75,10 +75,10 @@ def _stub_model(sub, seen):
         seen["n"] = len(inputs)
         return torch.zeros(3, len(inputs))
 
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
+    )
     sub._position_ids_3d = _position_ids_3d
 
 
@@ -138,10 +138,10 @@ def test_captured_decode_drops_only_the_staged_tables():
     # every row routed: each request's first decode step, or the knob off
     routed = [_prepare(sub, "decode", {"text_inputs": [torch.tensor([t])]}, has_loopback=False) for t in (5, 6)]
     leased = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["r1", "r2"], captured=True)
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
+    )
     sub._position_ids_3d = lambda inputs: torch.zeros(3, len(inputs))
     out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" not in out
@@ -160,29 +160,32 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
 
     calls = {}
 
-    class _Embed:
-        weight = torch.zeros(1)
+    def build_text_cos_sin(pos, dtype):
+        calls["built"] = pos
+        return pos, pos
 
-        def __call__(self, ids):
+    class _Decoder:
+        """The decoder contract: embed, the stack, logits."""
+
+        embed_dtype = torch.float32
+        model = SimpleNamespace(build_text_cos_sin=build_text_cos_sin)
+
+        def embed(self, ids):
             calls["ids"] = ids.tolist()
             return ids.float()
-
-    class _Inner:
-        embed_tokens = _Embed()
 
         def __call__(self, embeds, label, cos_sin):
             calls["cos"] = cos_sin[0]
             return embeds
 
-        def build_cos_sin(self, pos, dtype):
-            calls["built"] = pos
-            return pos, pos
+        def logits(self, hidden):
+            return hidden
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sampler.sample = lambda logits: "sampled"
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
-    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
+    sub.model = _Decoder()
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
     def run(captured):
@@ -197,7 +200,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
         return dict(calls)
 
     c = run(True)
-    assert c["ids"] == [9, 9] and c["built"].tolist() == [[10, 20]] * 3 and c["cos"] is not static_cos
+    assert c["ids"] == [9, 9] and c["built"].tolist() == [10, 20] and c["cos"] is not static_cos
     # no lease (an eager step): the inputs are used
     c = run(False)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
@@ -210,13 +213,13 @@ def test_sampler_keeps_slot_masters_only_for_a_node_that_reads_them(monkeypatch)
     from mstar.engine.resources.sampler.resource import SamplerResource
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    res = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     assert res._keep_last_token is False
     assert res.has_slot_masters is False
     res.enable_device_loopback_reader()
     assert res._keep_last_token is True
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    off = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    off = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     off.enable_device_loopback_reader()
     assert off._keep_last_token is False

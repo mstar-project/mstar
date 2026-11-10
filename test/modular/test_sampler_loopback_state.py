@@ -99,7 +99,7 @@ def test_a_reused_slot_starts_again_at_the_default():
 def _resource(monkeypatch):
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
+        vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"),
         loopback_state={"rules": STATE},
     )
     res.enable_device_loopback_reader()
@@ -115,7 +115,7 @@ def _ctx(rids, padded_bs=None, slot=0):
     return SimpleNamespace(
         request_ids=list(rids), padded_request_ids=list(rids) + ["pad"] * ((padded_bs or len(rids)) - len(rids)),
         slot_lease=lease, is_preplan=False, plan_phase="res.plan", slot=slot, is_padding_row=lambda rid: rid == "pad",
-        chunk_tokens_after={},
+        chunk_tokens_after={}, rebuild_rids=frozenset(), lean=frozenset(),
     )
 
 

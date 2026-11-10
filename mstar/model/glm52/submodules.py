@@ -17,7 +17,6 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -64,21 +63,19 @@ class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
         self.max_row_tokens = max_row_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths
-                if distribute_tokens(n, bs)[0] <= self.max_row_tokens]
+        return [n for n in super().get_total_tokens(bs)
+                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__(config.prefill_token_buckets)
+        super().__init__()
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # what get_accelerator_graph_configs fits to its captures
-        self._recompile_limit: int | None = None
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -128,6 +125,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # a decoder layer's frames are traced once per layer kind: dense, MoE, and the last one
+    # on the sampled rows
+    compiled_entries_per_shape = 3
     # an MTP row costs k+1 tokens, so the decode capture pads less coarsely
     MTP_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
 
@@ -282,12 +282,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        groups = [(self.PREFILL_TOKEN_BUCKETS, prefill_batch_sizes)]
-        batched = self.config.prefill_batched_token_buckets
-        if batched:
-            # one request's buckets and a batch's apart, so each can be fine or coarse
-            groups = [(self.PREFILL_TOKEN_BUCKETS, [bs for bs in prefill_batch_sizes if bs == 1]),
-                      (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -299,41 +293,19 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *(
-                _PackedPrefillConfig(
-                    max_row_tokens=self._context_limit(),
-                    capture_graph_walk="prefill",
-                    capture_token_lengths=list(buckets),
-                    make_node_input=lambda n: ARNodeInputs(
-                        input_ids=torch.zeros(n, dtype=torch.long, device=device),
-                        input_seq_len=n,
-                    ),
-                    capture_batch_sizes=list(sizes),
-                    **flags,
-                )
-                for buckets, sizes in groups if sizes
+            _PackedPrefillConfig(
+                max_row_tokens=self._context_limit(),
+                capture_graph_walk="prefill",
+                capture_token_lengths=list(self.PREFILL_TOKEN_BUCKETS),
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n,
+                ),
+                capture_batch_sizes=list(prefill_batch_sizes),
+                **flags,
             ),
         ]
-        self._fit_recompile_limit(configs)
         return configs
-
-    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """The recompile limit these captures take: a decoder layer's frames hold an entry per
-        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
-        the shapes past the limit capture uncompiled."""
-        tokens = {
-            n for config in configs
-            for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
-            for n in config.get_total_tokens(bs)
-        }
-        need = 3 * len(tokens) + 16  # and the engine's compiled fallback
-        if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
-                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
-        self._recompile_limit = need
-
-    def dynamo_recompile_limit(self) -> int | None:
-        return self._recompile_limit
 
     # ── per-step contract ──
 

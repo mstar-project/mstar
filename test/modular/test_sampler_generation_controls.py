@@ -153,7 +153,7 @@ def _logits(bs: int, step: int, device) -> torch.Tensor:
 
 def _resource(**kwargs) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=CPU, **kwargs,
+        vocab_size=None, enable_repetition_penalty=True, device=CPU, **kwargs,
     )
 
 
@@ -331,7 +331,7 @@ class _ProbsSpy:
 
 def _capable(device) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=device,
+        vocab_size=None, enable_repetition_penalty=True, device=device,
         max_repetition_window=WINDOW, min_tokens_stop_ids=(EOS,),
         enable_top_p_first=True,
     )
@@ -626,8 +626,8 @@ def test_fused_sample_draws_from_the_filtered_distribution(vocab):
     FlashInfer's order: no token outside the kept set is ever drawn, the
     empirical distribution over 4096 draws per setting is within sampling
     noise of it, temperature 0 is the argmax, and a (seed, offset) draws the
-    same token at any batch position."""
-    from mstar.engine.resources.sampler.utils import fused_sample
+    same token at any batch position and on the eager sampler."""
+    from mstar.engine.resources.sampler.utils import fused_sample, sample_tokens
 
     torch.manual_seed(0)
     dev, draws = torch.device("cuda"), 4096
@@ -666,6 +666,41 @@ def test_fused_sample_draws_from_the_filtered_distribution(vocab):
         pen[rows][flip], seen[rows][flip],
     )
     assert torch.equal(again[flip].view(n, draws), tokens)
+    eager = sample_tokens(
+        logits[rows], temp[rows], top_k[rows], top_p[rows], pen[rows], seen[rows], seed=seed, rand_offset=offset,
+    )
+    assert torch.equal(eager.view(n, draws), tokens)
+
+
+def test_fused_sample_cuts_a_near_tie_with_the_kth_token():
+    """With top_k=3 and the 3rd and 4th probabilities 0.2% apart, the 4th is
+    never drawn: the cut compares full float32 probabilities, not their bf16
+    truncation. The kernel runs in Triton's CPU interpreter, which reads
+    ``TRITON_INTERPRET`` at import, so in a subprocess."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = """
+import torch
+from mstar.engine.resources.sampler.utils import fused_sample
+p = torch.full((32,), 1e-3)
+p[:4] = torch.tensor([0.3, 0.3, 0.2, 0.1996])
+n = 512
+tokens = fused_sample(
+    p.log().expand(n, -1).contiguous(), torch.ones(n), torch.full((n,), 3, dtype=torch.int32),
+    torch.ones(n), torch.full((n,), 1234, dtype=torch.int64), torch.arange(n, dtype=torch.int64),
+)
+print(torch.bincount(tokens, minlength=32).tolist())
+"""
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "TRITON_INTERPRET": "1",
+           "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
+    out = subprocess.run([sys.executable, "-c", script], env=env, cwd=root, capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    counts = [int(c) for c in out.stdout.strip().splitlines()[-1].strip("[]").split(",")]
+    assert counts[3] == 0 and sum(counts[4:]) == 0, counts
+    assert min(counts[:3]) > 0, counts
 
 
 def test_a_windowed_penalty_needs_no_seen_token_mask():
@@ -675,7 +710,7 @@ def test_a_windowed_penalty_needs_no_seen_token_mask():
     from mstar.engine.resources.sampler.config import SamplingReqConfig
 
     spec = SamplerSpec(resource_key="s", nodes={"n"}, vocab_size=VOCAB,
-                       enable_repetion_penalty=False, max_repetition_window=16)
+                       enable_repetition_penalty=False, max_repetition_window=16)
     SamplingReqConfig(repetition_penalty=1.05, repetition_window=16).validate(spec)
     with pytest.raises(ValueError, match="repetition_penalty"):
         SamplingReqConfig(repetition_penalty=1.05).validate(spec)

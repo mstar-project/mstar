@@ -13,11 +13,11 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -57,9 +57,10 @@ logger = logging.getLogger(__name__)
 # How long a read waits for a verify step's verdict before the process exits
 _VERDICT_DEADLINE_S = 300.0
 
-# Captured prefill shapes when the config names none. They start above the MoE decode path's
-# 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
-# request's 2048, then 256 apart to 4096 for steps of several prompts.
+# Captured prefill shapes, which a deployment's serving config `prefill_token_buckets` replaces.
+# They start above the MoE decode path's 64 tokens, since the fused runner routes padding rows
+# safely; 64 apart from 1024 to one request's 2048, then 256 apart to 4096 for steps of several
+# prompts.
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
 PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
@@ -231,8 +232,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # runs eager rather than being split.
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
-                capture_token_lengths=list(
-                    self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS),
+                capture_token_lengths=list(PREFILL_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,

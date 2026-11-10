@@ -17,7 +17,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
@@ -26,6 +25,7 @@ from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextM
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
+from mstar.testing_utils.resource import StubResource
 
 
 def _batch(**kwargs) -> ExecutingBatch:
@@ -38,14 +38,10 @@ def _batch(**kwargs) -> ExecutingBatch:
     return ExecutingBatch(**kwargs)
 
 
-class _GreedySampler(Resource):
+class _GreedySampler(StubResource):
     """Argmax in place of the Triton sampler; the Resource hooks are no-ops."""
 
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
-
-    def sample(self, logits, **kwargs):
+    def sample(self, request_ids, logits, **kwargs):
         return logits.argmax(-1)
 
 
