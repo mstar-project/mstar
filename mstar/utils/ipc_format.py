@@ -141,6 +141,16 @@ class EdgeItems(MessageBody):
     # the arena segment each item is in (an index into names), -1 for none
     shm_segment_idx: list[int] = field(default_factory=list)
     shm_offsets: list[int] = field(default_factory=list)
+    # A frame of inline items carries each item's value here instead of the
+    # descriptor columns above: a token the producer took off its stop check's
+    # host copy, so nothing is staged, read or acknowledged.
+    values: list[int] = field(default_factory=list)
+
+    @property
+    def request_id(self) -> str | None:
+        """The request of a one-row frame (one parked for a request that has
+        not arrived), None for a frame of several."""
+        return self.request_ids[0] if len(self.request_ids) == 1 else None
 
 
 @dataclass

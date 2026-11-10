@@ -143,7 +143,7 @@ def test_the_thinker_declares_its_loop_back_and_its_stop(thinker):
     assert stop.walk == frozenset(DECODE_WALKS), "both decode walks end the loop, and no prefill"
     assert not stop.prefill_walks, "a stop at prefill ending the partition isn't this model's behaviour"
     for hook in (
-        "uniform_row_inputs", "device_loopback_signals", "inline_client_signals",
+        "uniform_row_inputs", "device_loopback_signals", "inline_signals",
         "check_stop", "check_stop_batched", "loopback_inputs",
     ):
         assert hook not in vars(ThinkerSubmodule), f"{hook} follows from the declarations"
@@ -170,8 +170,8 @@ def test_prefill_hands_over_to_the_requests_decode_walk(audio_output, walk):
 def test_only_the_text_walk_keeps_its_token_on_the_device(thinker):
     assert thinker.device_loopback_signals(THINKER_TEXT_DECODE) == frozenset({"text_inputs"})
     assert thinker.device_loopback_signals("thinker_decode") == frozenset()
-    assert thinker.inline_client_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
-    assert thinker.inline_client_signals("thinker_decode") == {}
+    assert thinker.inline_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
+    assert thinker.inline_signals("thinker_decode") == {}
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True).input_seq_len == 1
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=False) is None
     assert thinker.uniform_row_inputs("thinker_decode", has_loopback=True) is None
@@ -183,7 +183,7 @@ def test_the_tensor_path_stays_with_loop_back_off(thinker, monkeypatch):
     assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True) is None
     row = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([5])]}, has_loopback=True)
     assert row.input_ids.tolist() == [5], "a row brings its token when nothing keeps it"
-    assert thinker.inline_client_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
+    assert thinker.inline_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
 
 
 def test_an_eager_only_sampler_keeps_the_tensor_path(thinker):

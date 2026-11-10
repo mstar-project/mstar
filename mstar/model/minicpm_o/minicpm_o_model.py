@@ -525,6 +525,8 @@ class MiniCPMOModel(Model):
                 # upstream's stream windows: 25 new codes, the previous window's
                 # last 3 again as the encoder's look-back
                 chunk_policy_factory=lambda: LeftContextChunkPolicy(chunk=HOP, left_context=LEAD_SILENCE),
+                # one code an item, which the vocoder takes as a CPU window
+                by_value=True,
             )],
         )
 
