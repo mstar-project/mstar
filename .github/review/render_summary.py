@@ -32,6 +32,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# The bot's approval still counts these open when fixed above: a PR must fix its own (gpu_review.fixed_only_above).
+MUST_FIX_HERE = ("P0", "P1")
 # disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
 STILL_OPEN = ("open", "disputed")
 # What takes an earlier finding outside the diff out of the state (`carried`).
@@ -242,20 +244,33 @@ def stacked_above(path):
     return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if path and Path(path).exists() else []
 
 
-def judged(review, stacked):
+def judged(review, pages, stacked):
     """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
     when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
-    is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it."""
+    is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it.
+    A re-review's verdict on an earlier finding can raise its priority but never lower it: the verdict counts
+    at least at the tag the bot posted on its thread (`pages`) or at the outside-the-diff item's priority, and
+    that item at least at the verdict's."""
+    tags = inline_findings(pages)
+    verdicts = {f["ref"]: f["priority"] for f in review.get("prior_findings", [])}
+    items = {f["location"]: f["priority"] for f in review["outside_diff"]}
+
     def unchecked(f, text):
         note = f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
         return text if note in text else f"{text} {note}"
-    return {**review,
-            "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
-                             {**{k: v for k, v in f.items() if k != "fixed_in"},
-                              "detail": unchecked(f, f["detail"])} for f in review["outside_diff"]],
-            "prior_findings": [f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else
-                               {**f, "status": "open", "why": unchecked(f, f["why"])}
-                               for f in review.get("prior_findings", [])]}
+
+    def outside(f):
+        f = {**f, "priority": min(f["priority"], verdicts.get(f["location"], "P3"))}
+        return f if not f.get("fixed_in") or f["fixed_in"] in stacked else \
+            {**{k: v for k, v in f.items() if k != "fixed_in"}, "detail": unchecked(f, f["detail"])}
+
+    def prior(f):
+        f = {**f, "priority": min(f["priority"], tags.get(f["ref"], "P3"), items.get(f["ref"], "P3"))}
+        return f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else \
+            {**f, "status": "open", "why": unchecked(f, f["why"])}
+
+    return {**review, "outside_diff": [outside(f) for f in review["outside_diff"]],
+            "prior_findings": [prior(f) for f in review.get("prior_findings", [])]}
 
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -342,7 +357,7 @@ def open_findings(review, pages, stacked):
     later review judged, since the text the review read isn't the bot's. A finding a PR stacked above fixes
     isn't open: it lands with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the
     PR's review threads (GraphQL)."""
-    review = judged(review, stacked)
+    review = judged(review, pages, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
     disputed = {f["ref"]: f["why"] for f in prior if f["status"] == "disputed"}
@@ -370,7 +385,7 @@ def open_findings(review, pages, stacked):
 
 def status(review, pages, head, mode, stacked):
     found = [p for _, p, _ in open_findings(review, pages, stacked)]
-    review = inert(judged(review, stacked))
+    review = inert(judged(review, pages, stacked))
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -395,7 +410,9 @@ def prior_above(review):
 
 
 def above(finding):
-    return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it."
+    must = " The bot won't approve this PR until it's fixed in this PR." if finding["priority"] in MUST_FIX_HERE \
+        else ""
+    return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it.{must}"
 
 
 def latent(bug):
@@ -411,7 +428,7 @@ def checklist(review, pages, stacked, extra=()):
     and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
     only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
-    review = inert(judged(review, stacked))
+    review = inert(judged(review, pages, stacked))
 
     def where(item):
         return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
@@ -444,7 +461,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
     `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
-    raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
+    raw = judged(review, pages, stacked)  # the saved state and the checklist; what's shown goes through `inert`
     review = inert(raw)
     if review["since_last"].strip(" \t\r\n\"'"):  # a model sometimes returns a pair of quotes for "nothing"
         parts.append(review["since_last"])

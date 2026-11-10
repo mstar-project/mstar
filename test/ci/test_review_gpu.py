@@ -222,7 +222,8 @@ class TestCarry(unittest.TestCase):
                                      ({"inline": {"4": "P2"}}, [thread(4, "**[P3]** retagged")],
                                       "deleted or retagged since the bot"),
                                      ({}, [thread(4, "**[P3]** x", edited="t")], "inline 4 (P0, edited"),
-                                     ({"prior_findings": [{"ref": "4", "status": "fixed", "why": "w"}]},
+                                     ({"prior_findings": [{"ref": "4", "priority": "P3", "status": "fixed",
+                                                           "why": "w"}]},
                                       [thread(4, "**[P3]** x", edited="t")], "inline 4 (P0, edited")]:
             with self.subTest(why):
                 self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review=review,
@@ -602,21 +603,28 @@ class TestApprove(unittest.TestCase):
         above = [{"number": 9, "head_sha": "a" * 40}]
         still = {f"GET repos/{R}/pulls/9": {"state": "open", "head": {"sha": "a" * 40}}}
 
-        def on_thread(p):
-            """An earlier inline finding a re-review judged fixed above."""
-            return {"prior": [{"ref": "4", "priority": p, "status": "fixed_above", "fixed_in": 9, "why": "w"}],
-                    "extra": {**still, "POST graphql": threads_page(thread(4, f"**[{p}]** x"))}}
+        def on_thread(tag, said):
+            """An earlier inline finding, tagged `tag`, a re-review judged fixed above at priority `said`."""
+            return {"prior": [{"ref": "4", "priority": said, "status": "fixed_above", "fixed_in": 9, "why": "w"}],
+                    "extra": {**still, "POST graphql": threads_page(thread(4, f"**[{tag}]** x"))}}
 
-        for name, p, kwargs in (
-                ("outside the diff", "P1", {"extra": still, "outside": [
-                    {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}]}),
-                ("a bot thread", "P1", on_thread("P1")), ("a P2's bot thread", "P2", on_thread("P2"))):
+        def outside(priority, said=None):
+            """An item outside the diff fixed above, and a re-review's verdict on it at priority `said`."""
+            item = {"priority": priority, "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
+            return {"extra": still, "outside": [item], "prior": [] if said is None else [
+                {"ref": "a.py:1", "priority": said, "status": "fixed_above", "fixed_in": 9, "why": "w"}]}
+
+        for name, blocks, kwargs in (("outside the diff", True, outside("P1")),
+                                     ("a bot thread", True, on_thread("P1", "P1")),
+                                     ("a P1 thread the re-review calls P2", True, on_thread("P1", "P2")),
+                                     ("a P2 item the re-review calls P1", True, outside("P2", "P1")),
+                                     ("a P2's bot thread", False, on_thread("P2", "P2"))):
             with self.subTest(name):
                 text, _, writes = self.approve({"value": "on"}, above=above, **kwargs)
-                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], p == "P2",
+                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], not blocks,
                                  f"{name}: a P0/P1 a PR above fixes would approve, or a P2 one wouldn't")
-                if p == "P1":  # inert breaks the `#9` link
-                    self.assertIn("9 above: a P0/P1 must be fixed in this PR", text, "the checklist wouldn't say why")
+                self.assertEqual("**[P1]**" in text and "The bot won't approve this PR until it's fixed in this PR"
+                                 in text, blocks, f"{name}: the checklist wouldn't say why")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         posted = []
