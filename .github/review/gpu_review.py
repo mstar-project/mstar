@@ -1097,9 +1097,16 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
     so a session that died at once leaves its reason."""
     exact = (s2, s3, s4)
     for box in boxes(Path(runner_temp, "lt")):
-        for f in (box / "results/report.md", box / "results/progress.log", box / "unavailable.md"):
+        for f in (box / "results/report.md", box / "unavailable.md"):
             if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
                 f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
+        log = box / "results/progress.log"
+        if log.is_file():  # line by line, each cut to LINE_CAP (log_lines), so no size of it can fill the job's memory
+            redacted = log.with_name("progress.log.redacted")
+            with open(log, "rb") as f, open(redacted, "w") as out_f:
+                for line in log_lines(f):
+                    out_f.write(bot.redact(line, exact=exact) + "\n")
+            redacted.replace(log)
         result, fields = box / "results/result.json", {}
         if result.is_file():  # the box wrote this: unreadable counts as no verdict
             try:
