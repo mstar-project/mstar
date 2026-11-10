@@ -2083,7 +2083,15 @@ one call site. A plain <code class="docutils literal notranslate"><span class="p
 subclasses of either that keep their base’s forward are swapped alike, and are whole
 on every rank. An unbound module keeps its class, so a deployment without a <code class="docutils literal notranslate"><span class="pre">lora:</span></code>
 block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
-graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+graph and its guards). An MoE layer’s <code class="docutils literal notranslate"><span class="pre">FusedExperts</span></code> is a target per parameter
+(<code class="docutils literal notranslate"><span class="pre">LoraCapable.lora_targets</span></code>): <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> and <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, each with an A and B
+per expert, named <code class="docutils literal notranslate"><span class="pre">experts_gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">experts_down_proj</span></code> and placed per expert
+by the loader’s <code class="docutils literal notranslate"><span class="pre">&quot;gate:N&quot;</span></code> / <code class="docutils literal notranslate"><span class="pre">&quot;up:N&quot;</span></code> / <code class="docutils literal notranslate"><span class="pre">&quot;down:N&quot;</span></code> shard ids; its twin adds the
+deltas inside the dispatch (<code class="docutils literal notranslate"><span class="pre">FusedExperts._dispatch</span></code>), after each grouped GEMM
+(before the activation, and before the top-k sum and the all-reduce), so a subclass
+with a <code class="docutils literal notranslate"><span class="pre">_dispatch</span></code> of its own is refused as one with its own forward is; so is an
+adapter of PEFT’s fused 3-D form (one A and B on the experts container), read per
+expert only. Anything else holding weight matrices (a router, a
 depthwise conv, <code class="docutils literal notranslate"><span class="pre">nn.Embedding</span></code>, a forward overridden on an instance or hooked) takes
 none: the walk records why, and an adapter touching it is refused with that reason. So
 does a child its parent runs through the weight itself rather than its forward (folded at
@@ -2153,7 +2161,17 @@ target’s slices, each split across ranks on its own, is named in <code class="
 (Qwen3.5’s delta-net <code class="docutils literal notranslate"><span class="pre">in_proj_qkv</span></code>: one A for the three, B cut by their widths), and
 a base linear that pads a slice per rank for alignment says so in <code class="docutils literal notranslate"><span class="pre">slice_align</span></code>.
 <code class="docutils literal notranslate"><span class="pre">parallel=&quot;none&quot;</span></code> is a target whole on every rank, its delta added to an output that
-is already whole.</p></li>
+is already whole. <code class="docutils literal notranslate"><span class="pre">experts=E</span></code> is one stacked parameter of an MoE layer’s routed
+experts: each (token, top-k) row runs its token’s slot’s A and B for the expert the
+router picked, addressed by one combined id <code class="docutils literal notranslate"><span class="pre">(slot</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">E</span> <span class="pre">+</span> <span class="pre">expert</span></code> (the zero
+adapter’s are not stored), on the fused-MoE grouped GEMM (<code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_</span></code>;
+one align per layer over the combined ids, then a shrink and an accumulating expand per
+slice). Experts targets are opt-in, since every slot holds a copy of each expert’s
+factors: <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> declares them in <code class="docutils literal notranslate"><span class="pre">LoraSpec.dropped_targets</span></code>, and the
+YAML’s <code class="docutils literal notranslate"><span class="pre">targets:</span></code> serves them by naming them. The align op groups fewer than 1024 ids
+once padded to its warp of 32, so a spec serves at most <code class="docutils literal notranslate"><span class="pre">992</span> <span class="pre">//</span> <span class="pre">E</span></code> slots (7 at 128
+experts) and refuses more where the YAML sizes it. Experts split by expert parallelism
+are refused at deployment validation and at bind (<code class="docutils literal notranslate"><span class="pre">expert_split</span></code>); serve them under TP.</p></li>
 <li><p><strong>Target kinds and rows.</strong> <code class="docutils literal notranslate"><span class="pre">kind=&quot;embedding&quot;</span></code> is a token embedding: <code class="docutils literal notranslate"><span class="pre">in_features</span></code>
 is the vocabulary, the layer passes token ids as <code class="docutils literal notranslate"><span class="pre">x</span></code>, and the shrink is a gather of
 A’s column per token (<code class="docutils literal notranslate"><span class="pre">mstar::lora_gather_shrink</span></code>), PEFT’s <code class="docutils literal notranslate"><span class="pre">lora_embedding_A</span></code> /
@@ -2161,12 +2179,13 @@ A’s column per token (<code class="docutils literal notranslate"><span class="
 <code class="docutils literal notranslate"><span class="pre">per_segment</span></code> is one row per segment and <code class="docutils literal notranslate"><span class="pre">token_fold=k</span></code> one row per <code class="docutils literal notranslate"><span class="pre">k</span></code>
 consecutive tokens of a segment. The pool plans an addressing per grouping its targets
 use; the call checks the rows it gets.</p></li>
-<li><p><strong>Checkpoint layouts.</strong> Adapters are validated from the safetensors header: modules
-map to targets, shapes fit them (an adapter for another model size is a 400, not an
-admit failure), and a conv adapter whose kernel is its stride flattens to the linear
-over the patch. DoRA (PEFT’s <code class="docutils literal notranslate"><span class="pre">lora_magnitude_vector</span></code>, Kohya’s <code class="docutils literal notranslate"><span class="pre">dora_scale</span></code>), <code class="docutils literal notranslate"><span class="pre">modules_to_save</span></code>, trainable
-tokens and bias LoRA are refused by name. A YAML <code class="docutils literal notranslate"><span class="pre">targets:</span> <span class="pre">[...]</span></code> keeps a subset of
-the model’s targets (dropping vocabulary-sized ones saves their slots); an adapter
+<li><p><strong>Checkpoint layouts.</strong> Adapters are validated from the same read that pins their
+digest: modules map to targets, shapes fit them (an adapter for another model size
+is a 400, not an admit failure), and a conv adapter whose kernel is its stride
+flattens to the linear over the patch. DoRA (PEFT’s <code class="docutils literal notranslate"><span class="pre">lora_magnitude_vector</span></code>,
+Kohya’s <code class="docutils literal notranslate"><span class="pre">dora_scale</span></code>), <code class="docutils literal notranslate"><span class="pre">modules_to_save</span></code>, trainable tokens and bias LoRA are
+refused by name. A YAML <code class="docutils literal notranslate"><span class="pre">targets:</span> <span class="pre">[...]</span></code> keeps a subset of the model’s targets
+(dropping vocabulary-sized ones saves their slots); an adapter
 touching a dropped target is refused, and its modules stay unbound. Without the list,
 a deployment with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off keeps the targets its configured adapters
 touch (a node left with none gets no pool): the API server reads them once at startup
@@ -2187,7 +2206,8 @@ buckets and compiles the same as one that does not. A capture plans every row on
 zero adapter; a replay’s plan writes each row’s slot into the buffers that capture
 recorded, so a captured graph serves any mix of adapters without recapture. The
 kernels are the custom ops <code class="docutils literal notranslate"><span class="pre">mstar::lora_shrink</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar::lora_expand_</span></code> (the
-latter declares the <code class="docutils literal notranslate"><span class="pre">y</span></code> it writes), so <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> takes them as single nodes
+latter declares the <code class="docutils literal notranslate"><span class="pre">y</span></code> it writes), and an experts target’s grouped GEMMs are one
+more, <code class="docutils literal notranslate"><span class="pre">mstar::lora_experts_apply_</span></code>, so <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> takes them as single nodes
 without a graph break. Under Triton the launch grid depends on the token count and
 the slot count alone. The pool is a lean resource (<code class="docutils literal notranslate"><span class="pre">Resource.lean_capture</span></code>; see
 <strong>Lean captures</strong> under the resources table), so the engine captures every bucket whose
@@ -3410,8 +3430,10 @@ A resource sized per step refuses <code class="docutils literal notranslate"><sp
 (adapters held in pinned host memory), <code class="docutils literal notranslate"><span class="pre">adapters</span></code> (adapter name to safetensors
 path: the names requests can ask for), <code class="docutils literal notranslate"><span class="pre">targets</span></code> (the subset of the model’s
 targets to allocate; by default, with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off, the targets the
-configured adapters touch, and every target with it on; a node left with none
-gets no pool, while a YAML list keeping none at all is an error), <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> (default false: serve
+configured adapters touch, and every target with it on, except experts targets,
+which are allocated only when the list names them; a list chooses among all the
+declared targets, so a later one may name a target an earlier one left out; a node
+left with none gets no pool, while a YAML list keeping none at all is an error), <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> (default false: serve
 <code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>),
 <code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code> (default 120: how long the conductor waits for every
 worker to answer one before giving up on it). The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes the

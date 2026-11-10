@@ -726,6 +726,12 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows"><code class="docutils literal notranslate"><span class="pre">ExpertRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.alignment"><code class="docutils literal notranslate"><span class="pre">ExpertRows.alignment</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.ids"><code class="docutils literal notranslate"><span class="pre">ExpertRows.ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.scale"><code class="docutils literal notranslate"><span class="pre">ExpertRows.scale</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.addressing"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.addressing()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.admit()</span></code></a></li>
@@ -764,9 +770,14 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing"><code class="docutils literal notranslate"><span class="pre">LoraAddressing</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.slot_indptr"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.slot_indptr</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_order"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.token_order</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_slot"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.token_slot</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.expert_rows"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.expert_rows()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.grouped_"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.grouped_()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState"><code class="docutils literal notranslate"><span class="pre">SlotState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState.adapter"><code class="docutils literal notranslate"><span class="pre">SlotState.adapter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState.index"><code class="docutils literal notranslate"><span class="pre">SlotState.index</span></code></a></li>
@@ -841,21 +852,59 @@ slot keeps the old weights, unheld, until LRU eviction reuses it.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraAdapterPool" title="mstar.engine.resources.lora.pool.LoraAdapterPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterPool</span></code></a>(spec, device[, rank, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.ExpertRows" title="mstar.engine.resources.lora.pool.ExpertRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ExpertRows</span></code></a>(ids, scale, alignment)</p></td>
+<td><p>How one MoE layer's (token, top-k) rows address its experts targets this step (<code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.expert_rows</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraAdapterPool" title="mstar.engine.resources.lora.pool.LoraAdapterPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterPool</span></code></a>(spec, device[, rank, ...])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraAddressing" title="mstar.engine.resources.lora.pool.LoraAddressing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAddressing</span></code></a>(token_order, slot_indptr)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraAddressing" title="mstar.engine.resources.lora.pool.LoraAddressing"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAddressing</span></code></a>(token_order, slot_indptr, ...)</p></td>
 <td><p>Which slot each token of this step addresses, grouped by slot: the pool's plan output, and all a backend reads.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraLayerDelta" title="mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a>(pool, target, layer_idx)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraLayerDelta" title="mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a>(pool, target, layer_idx)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">+=</span> <span class="pre">delta(x)</span></code> for one target linear at one stack layer, over the current step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.SlotState" title="mstar.engine.resources.lora.pool.SlotState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SlotState</span></code></a>(index[, adapter, refcount, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.SlotState" title="mstar.engine.resources.lora.pool.SlotState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SlotState</span></code></a>(index[, adapter, refcount, ...])</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.ExpertRows">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.pool.</span></span><span class="sig-name descname"><span class="pre">ExpertRows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alignment</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#ExpertRows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.ExpertRows" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>How one MoE layer’s (token, top-k) rows address its experts targets this step
+(<code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.expert_rows</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>scale</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>alignment</strong> (<em>MoeAlignment</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.ExpertRows.alignment">
+<span class="sig-name descname"><span class="pre">alignment</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">MoeAlignment</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.ExpertRows.alignment" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.ExpertRows.ids">
+<span class="sig-name descname"><span class="pre">ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">torch.Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.ExpertRows.ids" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.ExpertRows.scale">
+<span class="sig-name descname"><span class="pre">scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">torch.Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.ExpertRows.scale" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.pool.</span></span><span class="sig-name descname"><span class="pre">LoraAdapterPool</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">agree</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decides</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool" title="Link to this definition">#</a></dt>
@@ -1086,13 +1135,13 @@ for this pool (<code class="docutils literal notranslate"><span class="pre">runs
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async">
 <span class="sig-name descname"><span class="pre">load_adapter_async</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.load_adapter_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async" title="Link to this definition">#</a></dt>
-<dd><p>Serve <code class="docutils literal notranslate"><span class="pre">name</span></code> from <code class="docutils literal notranslate"><span class="pre">path</span></code>: read it on the reader thread, check it against the
-spec (and against <code class="docutils literal notranslate"><span class="pre">digest</span></code>, the weights the API server checked), and only then
-make it servable. The read is not kept, since the host tier holds only what
-requests name: the first request on it reads it again as it is ingested. The
-future fails if it is served already, is still retiring from an unload, or cannot
-be read; a refusal visible now raises here. A request that names it takes a slot
-on its first admit, as for an adapter configured at startup.</p>
+<dd><p>Serve <code class="docutils literal notranslate"><span class="pre">name</span></code> from <code class="docutils literal notranslate"><span class="pre">path</span></code>: read it on the reader thread, hold it to <code class="docutils literal notranslate"><span class="pre">digest</span></code>
+(of the weights the API server checked against the spec), and only then make it
+servable. The read stages no copy, since the host tier holds only what requests
+name: the first request on it reads it in as it is ingested. The future fails if it
+is served already, is still retiring from an unload, or cannot be read; a refusal
+visible now raises here. A request that names it takes a slot on its first admit,
+as for an adapter configured at startup.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1291,7 +1340,8 @@ failed here).</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.weights">
 <span class="sig-name descname"><span class="pre">weights</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">target</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.weights"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.weights" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">(a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in],</span> <span class="pre">b</span> <span class="pre">[slots,</span> <span class="pre">out,</span> <span class="pre">R])</span></code> of one target at one stack layer.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in],</span> <span class="pre">b</span> <span class="pre">[slots,</span> <span class="pre">out,</span> <span class="pre">R])</span></code> of one target at one stack
+layer; an experts target’s are <code class="docutils literal notranslate"><span class="pre">[max_slots,</span> <span class="pre">experts,</span> <span class="pre">...]</span></code>, no zero adapter’s.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1309,7 +1359,7 @@ failed here).</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAddressing">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.pool.</span></span><span class="sig-name descname"><span class="pre">LoraAddressing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_indptr</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAddressing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAddressing" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.pool.</span></span><span class="sig-name descname"><span class="pre">LoraAddressing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_slot</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAddressing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAddressing" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Which slot each token of this step addresses, grouped by slot: the pool’s plan
 output, and all a backend reads.</p>
@@ -1324,6 +1374,7 @@ whose “tokens” are those rows.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>token_order</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>slot_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>token_slot</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1335,6 +1386,11 @@ whose “tokens” are those rows.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAddressing.token_order">
 <span class="sig-name descname"><span class="pre">token_order</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_order" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAddressing.token_slot">
+<span class="sig-name descname"><span class="pre">token_slot</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_slot" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1359,6 +1415,53 @@ weights are views resolved once, here; a call reads only the step’s addressing
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraLayerDelta.expert_rows">
+<span class="sig-name descname"><span class="pre">expert_rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">topk_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">others</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraLayerDelta.expert_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.expert_rows" title="Link to this definition">#</a></dt>
+<dd><p>The rows of <code class="docutils literal notranslate"><span class="pre">topk_ids</span></code> (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">top_k]</span></code>, this rank’s expert ids) for this
+experts delta and <code class="docutils literal notranslate"><span class="pre">others</span></code>, the same MoE layer’s other experts deltas; None on
+a lean step.</p>
+<p>Each row addresses its token’s slot’s A and B for its expert through one combined
+id <code class="docutils literal notranslate"><span class="pre">(slot</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">experts</span> <span class="pre">+</span> <span class="pre">expert</span></code>. A row on the zero adapter, on a slot whose
+adapter adapts none of these at this layer, or on a skipped (sentinel) expert gets
+the id past every factor, which no GEMM reads.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>topk_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>others</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.lora.pool.LoraLayerDelta" title="mstar.engine.resources.lora.pool.LoraLayerDelta"><em>LoraLayerDelta</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.lora.pool.ExpertRows" title="mstar.engine.resources.lora.pool.ExpertRows"><em>ExpertRows</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraLayerDelta.grouped_">
+<span class="sig-name descname"><span class="pre">grouped_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alignment</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraLayerDelta.grouped_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.grouped_" title="Link to this definition">#</a></dt>
+<dd><p>An experts target’s delta, <code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_</span></code> over this layer’s
+factors: <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">[rows,</span> <span class="pre">out]</span></code> += <code class="docutils literal notranslate"><span class="pre">row_weight</span></code> times each row’s delta of <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">[rows</span>
+<span class="pre">//</span> <span class="pre">top_k,</span> <span class="pre">in]</span></code>, for the combined ids <code class="docutils literal notranslate"><span class="pre">ids</span></code> of <code class="docutils literal notranslate"><span class="pre">expert_rows</span></code> (<code class="docutils literal notranslate"><span class="pre">alignment</span></code>
+theirs, or None).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>row_weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>top_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>alignment</strong> (<em>MoeAlignment</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -1446,6 +1549,12 @@ weights are views resolved once, here; a call reads only the step’s addressing
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows"><code class="docutils literal notranslate"><span class="pre">ExpertRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.alignment"><code class="docutils literal notranslate"><span class="pre">ExpertRows.alignment</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.ids"><code class="docutils literal notranslate"><span class="pre">ExpertRows.ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.ExpertRows.scale"><code class="docutils literal notranslate"><span class="pre">ExpertRows.scale</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.addressing"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.addressing()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.admit()</span></code></a></li>
@@ -1484,9 +1593,14 @@ weights are views resolved once, here; a call reads only the step’s addressing
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing"><code class="docutils literal notranslate"><span class="pre">LoraAddressing</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.slot_indptr"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.slot_indptr</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_order"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.token_order</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAddressing.token_slot"><code class="docutils literal notranslate"><span class="pre">LoraAddressing.token_slot</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.expert_rows"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.expert_rows()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraLayerDelta.grouped_"><code class="docutils literal notranslate"><span class="pre">LoraLayerDelta.grouped_()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState"><code class="docutils literal notranslate"><span class="pre">SlotState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState.adapter"><code class="docutils literal notranslate"><span class="pre">SlotState.adapter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.SlotState.index"><code class="docutils literal notranslate"><span class="pre">SlotState.index</span></code></a></li>

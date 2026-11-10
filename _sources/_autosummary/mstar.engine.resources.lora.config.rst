@@ -13,6 +13,7 @@ mstar.engine.resources.lora.config
 
    .. autosummary::
    
+      check_expert_ids
       describe_load_error
       lora_enabled
       resolve_adapter_path

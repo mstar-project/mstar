@@ -763,7 +763,7 @@ under.</p>
 <td><p>Check every adapter <code class="docutils literal notranslate"><span class="pre">spec</span></code> serves (<code class="docutils literal notranslate"><span class="pre">check_adapters</span></code>: a bad one fails the deployment, every bad one named), write their digests and the targets they touch into <code class="docutils literal notranslate"><span class="pre">model_config</span></code>'s <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block and onto <code class="docutils literal notranslate"><span class="pre">spec</span></code>, which then is what every worker builds, and return the digests.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.serving.served_lora_targets" title="mstar.engine.resources.lora.serving.served_lora_targets"><code class="xref py py-obj docutils literal notranslate"><span class="pre">served_lora_targets</span></code></a>(spec)</p></td>
-<td><p>The targets a deployment keeps when its adapters are fixed at startup (runtime updates off, no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>): those one of its adapters touches, as the <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.</p></td>
+<td><p>The targets a deployment keeps when its adapters are fixed at startup (runtime updates off, and no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>, which the caller checks): those one of its adapters touches, as the <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.</p></td>
 </tr>
 </tbody>
 </table>
@@ -823,8 +823,8 @@ what every worker builds, and return the digests.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.serving.served_lora_targets">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.serving.</span></span><span class="sig-name descname"><span class="pre">served_lora_targets</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/serving.html#served_lora_targets"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.serving.served_lora_targets" title="Link to this definition">#</a></dt>
 <dd><p>The targets a deployment keeps when its adapters are fixed at startup (runtime
-updates off, no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>): those one of its adapters touches, as the
-<code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.
+updates off, and no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>, which the caller checks): those one of its
+adapters touches, as the <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.
 Every other target would hold zero weights in every slot, yet cost its kernels on
 every step and its memory (the LM head’s and the embedding’s are vocabulary-sized),
 and a node left with none gets no pool. None when nothing narrows.</p>

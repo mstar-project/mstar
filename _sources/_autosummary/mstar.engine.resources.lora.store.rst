@@ -17,8 +17,7 @@ mstar.engine.resources.lora.store
       as_linear
       check_adapter_file
       check_adapters
-      inspect_adapter
-      inspect_keys
+      classify_adapter
       misfit
    
    

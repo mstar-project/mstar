@@ -14,6 +14,7 @@ mstar.engine.resources.lora.backend
    .. autosummary::
    
       expand_reference_
+      experts_reference_
       gather_shrink_reference
       make_backend
       shrink_reference

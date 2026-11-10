@@ -730,12 +730,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.a"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.a</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.b"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.b</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.digest"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.digest</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.layer_ranks"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.layer_ranks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.name"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.rank"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.rank</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.scaling"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.scaling</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.checked_rank"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.checked_rank()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.drop"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.drop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.get"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.hold"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.hold()</span></code></a></li>
@@ -748,8 +750,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.as_linear"><code class="docutils literal notranslate"><span class="pre">as_linear()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.check_adapter_file"><code class="docutils literal notranslate"><span class="pre">check_adapter_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.check_adapters"><code class="docutils literal notranslate"><span class="pre">check_adapters()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.inspect_adapter"><code class="docutils literal notranslate"><span class="pre">inspect_adapter()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.inspect_keys"><code class="docutils literal notranslate"><span class="pre">inspect_keys()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.classify_adapter"><code class="docutils literal notranslate"><span class="pre">classify_adapter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.misfit"><code class="docutils literal notranslate"><span class="pre">misfit()</span></code></a></li>
 </ul>
             </nav>
@@ -777,18 +778,15 @@
 <td><p>A LoRA factor's shape as a linear's: a conv adapter's <code class="docutils literal notranslate"><span class="pre">A</span> <span class="pre">[r,</span> <span class="pre">c,</span> <span class="pre">*kernel]</span></code> and <code class="docutils literal notranslate"><span class="pre">B</span> <span class="pre">[out,</span> <span class="pre">r,</span> <span class="pre">1,</span> <span class="pre">...]</span></code> flatten to <code class="docutils literal notranslate"><span class="pre">[r,</span> <span class="pre">c</span> <span class="pre">*</span> <span class="pre">prod(kernel)]</span></code> and <code class="docutils literal notranslate"><span class="pre">[out,</span> <span class="pre">r]</span></code>, which is the delta on a conv whose kernel is its stride, over the flattened patch.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.check_adapter_file" title="mstar.engine.resources.lora.store.check_adapter_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_adapter_file</span></code></a>(spec, name, path)</p></td>
-<td><p>The adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code> checked against <code class="docutils literal notranslate"><span class="pre">spec</span></code> from the checkpoint's header; returns its digest.</p></td>
+<td><p>The adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code> checked against <code class="docutils literal notranslate"><span class="pre">spec</span></code> and its digest, which a worker's read holds the file to; the digest is of the read that was checked.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.check_adapters" title="mstar.engine.resources.lora.store.check_adapters"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_adapters</span></code></a>(spec)</p></td>
 <td><p>Every adapter <code class="docutils literal notranslate"><span class="pre">spec</span></code> serves, through <code class="docutils literal notranslate"><span class="pre">check_adapter_file</span></code>; returns each one's digest.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.inspect_adapter" title="mstar.engine.resources.lora.store.inspect_adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">inspect_adapter</span></code></a>(spec, path)</p></td>
-<td><p>Rank, unmapped and misfitting modules of the checkpoint at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.classify_adapter" title="mstar.engine.resources.lora.store.classify_adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">classify_adapter</span></code></a>(spec, shapes)</p></td>
+<td><p>Rank, unmapped and misfitting modules of an adapter, from each module's A and B shapes (both present, as <code class="docutils literal notranslate"><span class="pre">read_lora_file</span></code> requires).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.inspect_keys" title="mstar.engine.resources.lora.store.inspect_keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">inspect_keys</span></code></a>(spec, items)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">inspect_adapter</span></code> over <code class="docutils literal notranslate"><span class="pre">(checkpoint</span> <span class="pre">key,</span> <span class="pre">shape)</span></code> pairs, as a header lists them.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.misfit" title="mstar.engine.resources.lora.store.misfit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">misfit</span></code></a>(spec, module, a_shape, b_shape)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.misfit" title="mstar.engine.resources.lora.store.misfit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">misfit</span></code></a>(spec, module, a_shape, b_shape)</p></td>
 <td><p>Why a mapped module's <code class="docutils literal notranslate"><span class="pre">A</span></code> / <code class="docutils literal notranslate"><span class="pre">B</span></code> shapes do not fit its target, or None.</p></td>
 </tr>
 </tbody>
@@ -797,7 +795,7 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.LoadedAdapter" title="mstar.engine.resources.lora.store.LoadedAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoadedAdapter</span></code></a>(name, digest, rank, scaling, a, b)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.LoadedAdapter" title="mstar.engine.resources.lora.store.LoadedAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoadedAdapter</span></code></a>(name, digest, rank, scaling, ...)</p></td>
 <td><p>One adapter, ready to copy into a slot.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.store.LoraAdapterStore" title="mstar.engine.resources.lora.store.LoraAdapterStore"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterStore</span></code></a>(spec[, rank, world_size, ...])</p></td>
@@ -808,14 +806,17 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoadedAdapter">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">LoadedAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scaling</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoadedAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoadedAdapter" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">LoadedAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scaling</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_ranks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoadedAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoadedAdapter" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One adapter, ready to copy into a slot.</p>
 <p><code class="docutils literal notranslate"><span class="pre">a[target]</span></code> is <code class="docutils literal notranslate"><span class="pre">[target</span> <span class="pre">layers,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">max_rank,</span> <span class="pre">in]</span></code> and <code class="docutils literal notranslate"><span class="pre">b[target]</span></code> is
-<code class="docutils literal notranslate"><span class="pre">[target</span> <span class="pre">layers,</span> <span class="pre">out,</span> <span class="pre">max_rank]</span></code>, both already this rank’s shard. A target the adapter
-does not touch is absent. <code class="docutils literal notranslate"><span class="pre">digest</span></code> is <code class="docutils literal notranslate"><span class="pre">adapter_digest</span></code> of the unsharded weights, so
-every rank agrees on it, computed as the API server computes the one it roots the
-adapter’s prefix-cache keys in.</p>
+<code class="docutils literal notranslate"><span class="pre">[target</span> <span class="pre">layers,</span> <span class="pre">out,</span> <span class="pre">max_rank]</span></code>, both already this rank’s shard; an experts target’s
+hold a pair per expert, <code class="docutils literal notranslate"><span class="pre">[target</span> <span class="pre">layers,</span> <span class="pre">experts,</span> <span class="pre">...]</span></code>. A target the adapter does not
+touch is absent. <code class="docutils literal notranslate"><span class="pre">layer_ranks[target]</span></code> (int32 <code class="docutils literal notranslate"><span class="pre">[target</span> <span class="pre">layers]</span></code>) is the slot’s rank
+at each layer: <code class="docutils literal notranslate"><span class="pre">rank</span></code>, or 0 where this rank’s shard of the layer’s A or B is all
+zero (it adds nothing), as the kernels read it. <code class="docutils literal notranslate"><span class="pre">digest</span></code> is <code class="docutils literal notranslate"><span class="pre">adapter_digest</span></code> of
+the unsharded weights, so every rank agrees on it, computed as the API server computes
+the one it roots the adapter’s prefix-cache keys in.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -825,6 +826,7 @@ adapter’s prefix-cache keys in.</p>
 <li><p><strong>scaling</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
 <li><p><strong>a</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
 <li><p><strong>b</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>layer_ranks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -841,6 +843,11 @@ adapter’s prefix-cache keys in.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoadedAdapter.digest">
 <span class="sig-name descname"><span class="pre">digest</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><span class="pre">bytes</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.store.LoadedAdapter.digest" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoadedAdapter.layer_ranks">
+<span class="sig-name descname"><span class="pre">layer_ranks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.lora.store.LoadedAdapter.layer_ranks" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -881,6 +888,25 @@ calls hold the same set.</p>
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoraAdapterStore.checked_rank">
+<span class="sig-name descname"><span class="pre">checked_rank</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.checked_rank"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.checked_rank" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">path</span></code>’s rank for this spec, read and held to <code class="docutils literal notranslate"><span class="pre">digest</span></code> as <code class="docutils literal notranslate"><span class="pre">read</span></code> does, with
+nothing staged: all a runtime load needs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoraAdapterStore.drop">
 <span class="sig-name descname"><span class="pre">drop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.drop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.drop" title="Link to this definition">#</a></dt>
@@ -928,14 +954,14 @@ a while). True when it was not held, so its copy is the caller’s to read in.</
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoraAdapterStore.load">
-<span class="sig-name descname"><span class="pre">load</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.load"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.load" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">load</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.load"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.load" title="Link to this definition">#</a></dt>
 <dd><p>Hold <code class="docutils literal notranslate"><span class="pre">name</span></code> and read it from <code class="docutils literal notranslate"><span class="pre">path</span></code> unless its copy is in.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -960,18 +986,16 @@ a while). True when it was not held, so its copy is the caller’s to read in.</
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.LoraAdapterStore.read">
-<span class="sig-name descname"><span class="pre">read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.read"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.read" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">path</span></code> read, checked against the spec and sharded for this rank, without
-holding it: a caller can read outside whatever lock guards <code class="docutils literal notranslate"><span class="pre">put</span></code>. With
-<code class="docutils literal notranslate"><span class="pre">digest</span></code>, weights that digest otherwise are refused: the file changed since the
-adapter was checked and keyed, and serving it would put other weights under the
-same prefix-cache root, or different weights on different ranks.</p>
+<span class="sig-name descname"><span class="pre">read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#LoraAdapterStore.read"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.LoraAdapterStore.read" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">path</span></code> read and sharded for this rank, without holding it: a caller can read
+outside whatever lock guards <code class="docutils literal notranslate"><span class="pre">put</span></code>. Held to <code class="docutils literal notranslate"><span class="pre">digest</span></code> as <code class="docutils literal notranslate"><span class="pre">checked_rank</span></code> is, before
+anything is staged.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1015,9 +1039,10 @@ the delta on a conv whose kernel is its stride, over the flattened patch.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.store.check_adapter_file">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">check_adapter_file</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#check_adapter_file"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.check_adapter_file" title="Link to this definition">#</a></dt>
-<dd><p>The adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code> checked against <code class="docutils literal notranslate"><span class="pre">spec</span></code> from the checkpoint’s header;
-returns its digest. Raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for an adapter the deployment cannot
-serve.</p>
+<dd><p>The adapter at <code class="docutils literal notranslate"><span class="pre">path</span></code> checked against <code class="docutils literal notranslate"><span class="pre">spec</span></code> and its digest, which a worker’s
+read holds the file to; the digest is of the read that was checked. Raises
+<code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for an adapter the deployment cannot serve (<code class="docutils literal notranslate"><span class="pre">OSError</span></code> for a file
+that is not a LoRA adapter, as <code class="docutils literal notranslate"><span class="pre">read_lora_file</span></code> refuses it).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1050,31 +1075,16 @@ the deployment at startup, the same whether or not a worker would have preloaded
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.store.inspect_adapter">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">inspect_adapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#inspect_adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.inspect_adapter" title="Link to this definition">#</a></dt>
-<dd><p>Rank, unmapped and misfitting modules of the checkpoint at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p>
-<p>Reads only the safetensors header unless the model converts a native layout, which
-needs the tensors.</p>
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.store.classify_adapter">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">classify_adapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shapes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#classify_adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.classify_adapter" title="Link to this definition">#</a></dt>
+<dd><p>Rank, unmapped and misfitting modules of an adapter, from each module’s A and B
+shapes (both present, as <code class="docutils literal notranslate"><span class="pre">read_lora_file</span></code> requires).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>spec</strong> (<a class="reference internal" href="mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraSpec" title="mstar.engine.resources.lora.config.LoraSpec"><em>LoraSpec</em></a>)</p></li>
-<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>shapes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em><em>]</em><em>]</em>)</p></li>
 </ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.AdapterInfo" title="mstar.engine.resources.lora.config.AdapterInfo"><em>AdapterInfo</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.store.inspect_keys">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.store.</span></span><span class="sig-name descname"><span class="pre">inspect_keys</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/store.html#inspect_keys"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.store.inspect_keys" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">inspect_adapter</span></code> over <code class="docutils literal notranslate"><span class="pre">(checkpoint</span> <span class="pre">key,</span> <span class="pre">shape)</span></code> pairs, as a header lists them.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>spec</strong> (<a class="reference internal" href="mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraSpec" title="mstar.engine.resources.lora.config.LoraSpec"><em>LoraSpec</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.AdapterInfo" title="mstar.engine.resources.lora.config.AdapterInfo"><em>AdapterInfo</em></a></p>
@@ -1152,12 +1162,14 @@ needs the tensors.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.a"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.a</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.b"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.b</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.digest"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.digest</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.layer_ranks"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.layer_ranks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.name"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.rank"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.rank</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoadedAdapter.scaling"><code class="docutils literal notranslate"><span class="pre">LoadedAdapter.scaling</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.checked_rank"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.checked_rank()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.drop"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.drop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.get"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.LoraAdapterStore.hold"><code class="docutils literal notranslate"><span class="pre">LoraAdapterStore.hold()</span></code></a></li>
@@ -1170,8 +1182,7 @@ needs the tensors.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.as_linear"><code class="docutils literal notranslate"><span class="pre">as_linear()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.check_adapter_file"><code class="docutils literal notranslate"><span class="pre">check_adapter_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.check_adapters"><code class="docutils literal notranslate"><span class="pre">check_adapters()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.inspect_adapter"><code class="docutils literal notranslate"><span class="pre">inspect_adapter()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.inspect_keys"><code class="docutils literal notranslate"><span class="pre">inspect_keys()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.classify_adapter"><code class="docutils literal notranslate"><span class="pre">classify_adapter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.store.misfit"><code class="docutils literal notranslate"><span class="pre">misfit()</span></code></a></li>
 </ul>
   </nav></div>

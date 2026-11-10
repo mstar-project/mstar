@@ -727,12 +727,16 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.align_experts"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.align_experts()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_experts_"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.apply_experts_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.apply_linear_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.expand_fused"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.expand_fused()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.gather_shrink"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.gather_shrink()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.shrink"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.shrink()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.experts_alignment"><code class="docutils literal notranslate"><span class="pre">experts_alignment()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.experts_config"><code class="docutils literal notranslate"><span class="pre">experts_config()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -747,17 +751,30 @@
   <section id="module-mstar.engine.resources.lora.ops">
 <span id="mstar-engine-resources-lora-ops"></span><h1>mstar.engine.resources.lora.ops<a class="headerlink" href="#module-mstar.engine.resources.lora.ops" title="Link to this heading">#</a></h1>
 <p>The LoRA shrink and expand as custom ops, so <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> sees one opaque node each,
-and <code class="docutils literal notranslate"><span class="pre">lora_apply_</span></code>, the two as one op, which is what a linear target runs.</p>
+and <code class="docutils literal notranslate"><span class="pre">lora_apply_</span></code>, the two as one op, which is what a linear target runs;
+<code class="docutils literal notranslate"><span class="pre">lora_experts_apply_</span></code> is an experts target’s shrink and expands over combined ids.</p>
 <p><code class="docutils literal notranslate"><span class="pre">mstar::lora_expand_</span></code> adds into <code class="docutils literal notranslate"><span class="pre">y</span></code> in place and says so (<code class="docutils literal notranslate"><span class="pre">mutates_args</span></code>):
 functionalization then keeps every read of <code class="docutils literal notranslate"><span class="pre">y</span></code> on the right side of the add and never
 drops it, whatever Inductor reorders around it.</p>
 <p>The kernel registered here is the plain-torch reference (<code class="docutils literal notranslate"><span class="pre">backend.shrink_reference</span></code> /
-<code class="docutils literal notranslate"><span class="pre">expand_reference_</span></code>), on any device, with no host sync and no data-dependent shape;
+<code class="docutils literal notranslate"><span class="pre">expand_reference_</span></code> / <code class="docutils literal notranslate"><span class="pre">experts_reference_</span></code>), on any device, with no host sync and no data-dependent shape;
 <code class="docutils literal notranslate"><span class="pre">triton_backend</span></code> registers the CUDA kernels over it. Both read the same arguments with
 the same meaning, so the fake (shape) implementations and <code class="docutils literal notranslate"><span class="pre">torch.library.opcheck</span></code> can
 be checked on a CPU.</p>
 <p>Rows of <code class="docutils literal notranslate"><span class="pre">h</span></code> the expand does not read (tokens on the zero adapter, columns past a
 slot’s rank) are unspecified; the reference writes zeros there.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.ops.experts_alignment" title="mstar.engine.resources.lora.ops.experts_alignment"><code class="xref py py-obj docutils literal notranslate"><span class="pre">experts_alignment</span></code></a>(ids, num_ids)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ids</span></code> grouped by id and padded to <code class="docutils literal notranslate"><span class="pre">experts_config</span></code>'s <code class="docutils literal notranslate"><span class="pre">BLOCK_SIZE_M</span></code> (a <code class="docutils literal notranslate"><span class="pre">MoeAlignment</span></code>), as the fused-MoE kernel reads them.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.ops.experts_config" title="mstar.engine.resources.lora.ops.experts_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">experts_config</span></code></a>(ids, num_ids)</p></td>
+<td><p>The tiles of every LoRA GEMM over one layer's combined ids, which share one alignment and so one <code class="docutils literal notranslate"><span class="pre">BLOCK_SIZE_M</span></code>: the base fused-MoE kernel's defaults, which pick by token and id counts alone.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -773,6 +790,23 @@ slot’s rank) are unspecified; the reference writes zeros there.</p>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.lora.backend.html#mstar.engine.resources.lora.backend.LoraBackend" title="mstar.engine.resources.lora.backend.LoraBackend"><code class="xref py py-class docutils literal notranslate"><span class="pre">LoraBackend</span></code></a></p>
 <p>The custom ops: on CUDA the Triton kernels once <code class="docutils literal notranslate"><span class="pre">triton_backend</span></code> is imported,
 elsewhere the reference above, so a CPU test runs exactly the graph a GPU compiles.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.LoraOpsBackend.align_experts">
+<span class="sig-name descname"><span class="pre">align_experts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#LoraOpsBackend.align_experts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.align_experts" title="Link to this definition">#</a></dt>
+<dd><p>What <code class="docutils literal notranslate"><span class="pre">apply_experts_</span></code> reads to group the rows of <code class="docutils literal notranslate"><span class="pre">ids</span></code> (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">top_k]</span></code>
+combined ids, <code class="docutils literal notranslate"><span class="pre">num_ids</span></code> meaning none) by id, shared by every call over them;
+None where nothing groups them (<code class="docutils literal notranslate"><span class="pre">experts_reference_</span></code>).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.LoraOpsBackend.apply_experts_">
+<span class="sig-name descname"><span class="pre">apply_experts_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alignment</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#LoraOpsBackend.apply_experts_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_experts_" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">y[m,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">+=</span> <span class="pre">row_weight[m]</span> <span class="pre">*</span> <span class="pre">(x[m</span> <span class="pre">//</span> <span class="pre">top_k]</span> <span class="pre">&#64;</span> <span class="pre">a[id,</span> <span class="pre">slice</span> <span class="pre">i]^T)</span> <span class="pre">&#64;</span> <span class="pre">b[id,</span>
+<span class="pre">slice</span> <span class="pre">i]^T</span></code> for each row <code class="docutils literal notranslate"><span class="pre">m</span></code> of <code class="docutils literal notranslate"><span class="pre">y</span></code>, <code class="docutils literal notranslate"><span class="pre">id</span> <span class="pre">=</span> <span class="pre">ids.flatten()[m]</span></code>; a row whose id
+is past <code class="docutils literal notranslate"><span class="pre">a</span></code>’s (<code class="docutils literal notranslate"><span class="pre">a.shape[0]</span></code>) gets nothing. <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[ids,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">[ids,</span>
+<span class="pre">out,</span> <span class="pre">R]</span></code>; <code class="docutils literal notranslate"><span class="pre">alignment</span></code> is <code class="docutils literal notranslate"><span class="pre">align_experts</span></code>’ for <code class="docutils literal notranslate"><span class="pre">ids</span></code>.</p>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_">
 <span class="sig-name descname"><span class="pre">apply_linear_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">addressing</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#LoraOpsBackend.apply_linear_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_" title="Link to this definition">#</a></dt>
@@ -819,6 +853,40 @@ rank, may hold anything: the expand does not read them.</p>
 </dl>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.experts_alignment">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.ops.</span></span><span class="sig-name descname"><span class="pre">experts_alignment</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#experts_alignment"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.experts_alignment" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">ids</span></code> grouped by id and padded to <code class="docutils literal notranslate"><span class="pre">experts_config</span></code>’s <code class="docutils literal notranslate"><span class="pre">BLOCK_SIZE_M</span></code> (a
+<code class="docutils literal notranslate"><span class="pre">MoeAlignment</span></code>), as the fused-MoE kernel reads them.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.ops.experts_config">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.ops.</span></span><span class="sig-name descname"><span class="pre">experts_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/ops.html#experts_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.ops.experts_config" title="Link to this definition">#</a></dt>
+<dd><p>The tiles of every LoRA GEMM over one layer’s combined ids, which share one
+alignment and so one <code class="docutils literal notranslate"><span class="pre">BLOCK_SIZE_M</span></code>: the base fused-MoE kernel’s defaults, which pick
+by token and id counts alone.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -871,12 +939,16 @@ rank, may hold anything: the expand does not read them.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.align_experts"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.align_experts()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_experts_"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.apply_experts_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.apply_linear_"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.apply_linear_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.expand_fused"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.expand_fused()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.gather_shrink"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.gather_shrink()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.LoraOpsBackend.shrink"><code class="docutils literal notranslate"><span class="pre">LoraOpsBackend.shrink()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.experts_alignment"><code class="docutils literal notranslate"><span class="pre">experts_alignment()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.ops.experts_config"><code class="docutils literal notranslate"><span class="pre">experts_config()</span></code></a></li>
 </ul>
   </nav></div>
 

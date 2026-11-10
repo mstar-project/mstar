@@ -1148,12 +1148,18 @@ checkpoint’s <code class="docutils literal notranslate"><span class="pre">audi
 <td><p>No embedding target.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Qwen3-Omni (<code class="docutils literal notranslate"><span class="pre">Thinker</span></code>), <em>not validated</em></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, dense-layer <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code></p></td>
-<td><p>Attention only on MoE layers: an adapter on the routed experts or the router is
-refused. Talker, code predictor and encoders take none. Not validated: this MoE
-model’s bf16 noise is about 10x a dense model’s (its router flips experts on
-near-ties), so even base rows, run in a larger batch than the reference’s, miss
-the check against merged weights.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, dense-layer <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>;
+the routed experts’ <code class="docutils literal notranslate"><span class="pre">experts_gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">experts_down_proj</span></code> when the YAML’s
+<code class="docutils literal notranslate"><span class="pre">targets:</span></code> names them</p></td>
+<td><p>Expert targets are opt-in: each slot holds every expert’s A and B (about 1.7 GB per
+slot at rank 16, and as much pinned on the host per adapter held there), and with
+128 experts a pool serves at most 7 slots. Under TP only: an <code class="docutils literal notranslate"><span class="pre">ep_config</span></code> with
+<code class="docutils literal notranslate"><span class="pre">parallel:</span> <span class="pre">ep</span></code> over several ranks refuses them at startup. Per-expert adapters
+only (<code class="docutils literal notranslate"><span class="pre">experts.&lt;N&gt;.&lt;proj&gt;</span></code>), not PEFT’s fused 3-D form. The router takes none.
+Talker, code predictor and encoders take none. Not validated: this MoE model’s
+bf16 noise is about 10x a dense model’s (its router flips experts on near-ties),
+so even base rows, run in a larger batch than the reference’s, miss the check
+against merged weights.</p></td>
 </tr>
 <tr class="row-even"><td><p>Qwen3-TTS (<code class="docutils literal notranslate"><span class="pre">Talker</span></code>), <em>not validated</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">codec_head</span></code></p></td>

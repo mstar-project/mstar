@@ -1144,6 +1144,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    (the default), one per segment (``per_segment``, e.g. an LM head over each row's last</span>
 <span class="sd">    token), or one per ``token_fold`` consecutive tokens of a segment (a patch merger that</span>
 <span class="sd">    folds 2x2 patches into one row).</span>
+
+<span class="sd">    ``experts`` counts the groups of the weight: 1 for a linear, ``E`` for one stacked</span>
+<span class="sd">    parameter of an MoE layer's routed experts (``[E, out, in]``), where each row runs</span>
+<span class="sd">    its token's slot's adapter on the expert the router picked for it. Each expert has</span>
+<span class="sd">    its own A and B per slice, named in a checkpoint by the stacked-shard id</span>
+<span class="sd">    ``"&lt;slice&gt;:&lt;expert&gt;"`` (``"gate:3"``). ``expert_split`` is ``(first, count)`` of the</span>
+<span class="sd">    experts one rank's module holds when expert parallelism splits them; None when it</span>
+<span class="sd">    holds every expert.</span>
 <span class="sd">    """</span>
 
     <span class="n">in_features</span><span class="p">:</span> <span class="nb">int</span>
@@ -1158,6 +1166,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">kind</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"linear"</span><span class="p">,</span> <span class="s2">"embedding"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"linear"</span>
     <span class="n">per_segment</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">token_fold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">experts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">expert_split</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"out_slices"</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">out_slices</span><span class="p">))</span>
@@ -1203,6 +1213,18 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"token_fold must be &gt;= 1, and 1 with per_segment; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token_fold</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"experts must be &gt;= 1; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">experts</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kind</span> <span class="o">!=</span> <span class="s2">"linear"</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">row_grouping</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_packs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_names</span>
+        <span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"an experts target is a linear over the step's tokens, with each slice named "</span>
+                <span class="s2">"and no packs"</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">expert_split</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"expert_split needs an experts target"</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_slices</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1218,10 +1240,26 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        0 per segment."""</span>
         <span class="k">return</span> <span class="mi">0</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_segment</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_fold</span>
 
+<div class="viewcode-block" id="LoraTarget.expert_of">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraTarget.expert_of">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">expert_of</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shard_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The expert a checkpoint module of an experts target holds, from its</span>
+<span class="sd">        ``"&lt;slice&gt;:&lt;expert&gt;"`` shard id; 0 for any other target."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="n">expert</span> <span class="o">=</span> <span class="n">_expert_part</span><span class="p">(</span><span class="n">shard_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">expert</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">expert</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"shard id </span><span class="si">{</span><span class="n">shard_id</span><span class="si">!r}</span><span class="s2"> names no expert of </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">experts</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">expert</span></div>
+
+
 <div class="viewcode-block" id="LoraTarget.slice_index">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraTarget.slice_index">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">slice_index</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shard_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Which slice a checkpoint module lands on, from its stacked-shard id."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">expert_of</span><span class="p">(</span><span class="n">shard_id</span><span class="p">)</span>
+            <span class="n">shard_id</span> <span class="o">=</span> <span class="n">shard_id</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s2">":"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">shard_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slices</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span>
@@ -1311,6 +1349,13 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_expert_part</span><span class="p">(</span><span class="n">shard_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">shard_id</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">":"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">shard_id</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">expert</span> <span class="o">=</span> <span class="n">shard_id</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s2">":"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">expert</span><span class="p">)</span> <span class="k">if</span> <span class="n">expert</span><span class="o">.</span><span class="n">isdigit</span><span class="p">()</span> <span class="k">else</span> <span class="kc">None</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_divide</span><span class="p">(</span><span class="n">numerator</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">denominator</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">numerator</span> <span class="o">%</span> <span class="n">denominator</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">numerator</span><span class="si">}</span><span class="s2"> is not divisible by </span><span class="si">{</span><span class="n">denominator</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
@@ -1321,11 +1366,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraModuleRef">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">LoraModuleRef</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Where one checkpoint module's adapter lands: a target, a stack layer, and the</span>
-<span class="sd">    stacked-shard id of its slice (None for a single-slice target)."""</span>
+<span class="sd">    stacked-shard id of its slice (None for a single-slice target). ``param`` names the</span>
+<span class="sd">    parameter of the bound module the target adapts, for a module with a target per</span>
+<span class="sd">    parameter (MoE experts); None for a module that is one target."""</span>
 
     <span class="n">target</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">layer</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">shard_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">shard_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">param</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1336,7 +1384,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AdapterInfo">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.AdapterInfo">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AdapterInfo</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""What validation needs to know about an adapter checkpoint, read without its weights.</span>
+<span class="w">    </span><span class="sd">"""What validation needs to know about an adapter checkpoint, from its modules' shapes.</span>
 
 <span class="sd">    ``rank`` covers every LoRA module in the file, those left to another node's pool included.</span>
 <span class="sd">    ``misfits`` names modules whose shapes do not fit their target (an adapter trained on</span>
@@ -1405,9 +1453,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># checkpoint modules this spec neither loads nor refuses: the deployment never runs</span>
     <span class="c1"># them, or (in a node's pool) another node's pool loads them</span>
     <span class="n">ignored_modules</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="kc">None</span><span class="p">)</span>
-    <span class="c1"># targets the YAML's ``targets`` list dropped: a layer binding one gets no delta,</span>
-    <span class="c1"># while binding a name the spec never declared stays an error</span>
-    <span class="n">dropped_targets</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">)</span>
+    <span class="c1"># declared targets not served: the experts targets unless the YAML's ``targets``</span>
+    <span class="c1"># names them (``module_lora_spec`` leaves them out), and any that list leaves out. A</span>
+    <span class="c1"># module bound to one gets no delta, and a later ``targets`` list may name it again</span>
+    <span class="n">dropped_targets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LoraTarget</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">declare</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1430,10 +1479,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_declaration</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">:</span>
+        <span class="n">declared</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">,</span> <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">}</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">declared</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> declares no targets"</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="n">astray</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span>
+            <span class="n">astray</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">astray</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> spans nodes </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">)</span><span class="si">}</span><span class="s2">, so "</span>
@@ -1465,9 +1515,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ignored</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ignored_modules</span>
         <span class="k">if</span> <span class="n">elsewhere</span><span class="p">:</span>
             <span class="n">ignored</span> <span class="o">=</span> <span class="n">_ignoring</span><span class="p">(</span><span class="n">ignored</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">module_map</span><span class="p">,</span> <span class="n">elsewhere</span><span class="p">)</span>
+        <span class="n">dropped</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">node</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">node</span><span class="p">)}</span>
         <span class="k">return</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">resource_key</span><span class="o">=</span><span class="n">instance_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">node</span><span class="p">),</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="n">node</span><span class="p">},</span>
-            <span class="n">targets</span><span class="o">=</span><span class="n">own</span><span class="p">,</span> <span class="n">ignored_modules</span><span class="o">=</span><span class="n">ignored</span><span class="p">,</span>
+            <span class="n">targets</span><span class="o">=</span><span class="n">own</span><span class="p">,</span> <span class="n">dropped_targets</span><span class="o">=</span><span class="n">dropped</span><span class="p">,</span> <span class="n">ignored_modules</span><span class="o">=</span><span class="n">ignored</span><span class="p">,</span>
         <span class="p">)</span></div>
 
 
@@ -1496,9 +1547,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">targets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""How many adapters stay resident, the largest rank served, and which adapters</span>
-<span class="sd">        this deployment serves. ``targets`` keeps only those of the model's targets:</span>
-<span class="sd">        dropping the LM head and embedding saves their vocabulary-sized slots, a node left</span>
-<span class="sd">        with none gets no pool, and an adapter that touches a dropped target is refused.</span>
+<span class="sd">        this deployment serves. ``targets`` serves just those of the model's declared</span>
+<span class="sd">        targets, the experts targets included (served only when named,</span>
+<span class="sd">        ``dropped_targets``): dropping the LM head and embedding saves their</span>
+<span class="sd">        vocabulary-sized slots, a node left with none gets no pool, and an adapter that</span>
+<span class="sd">        touches a dropped target is refused. Without ``targets`` the served set stays as</span>
+<span class="sd">        it is.</span>
 
 <span class="sd">        Every value is checked before any is set, so a refused override leaves the spec</span>
 <span class="sd">        as declared."""</span>
@@ -1535,17 +1589,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">targets</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"targets must be a list of target names; got </span><span class="si">{</span><span class="n">targets</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="n">unknown</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">)</span>
+            <span class="n">declared</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">,</span> <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">}</span>
+            <span class="n">unknown</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">declared</span><span class="p">))</span>
             <span class="k">if</span> <span class="n">unknown</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"`resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:` names </span><span class="si">{</span><span class="n">unknown</span><span class="si">}</span><span class="s2">, which this "</span>
-                    <span class="sa">f</span><span class="s2">"model does not declare; it declares </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="sa">f</span><span class="s2">"model does not declare; it declares </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">declared</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
                 <span class="p">)</span>
-            <span class="n">kept</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">}</span>
+            <span class="n">kept</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">}</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">kept</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"`resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:` keeps none of </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="sa">f</span><span class="s2">"`resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:` keeps none of </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">declared</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
                 <span class="p">)</span>
+        <span class="n">check_expert_ids</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">sizes</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"max_slots"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_slots</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">targets</span> <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">kept</span><span class="p">,</span>
+        <span class="p">)</span>
 
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">sizes</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
@@ -1559,7 +1617,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">adapter_digests</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">adapter_digests</span> <span class="o">=</span> <span class="n">adapter_digests</span>
         <span class="k">if</span> <span class="n">targets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">|</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">targets</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">kept</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">t</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kept</span><span class="p">}</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">targets</span> <span class="o">=</span> <span class="n">kept</span></div>
 
 
@@ -1579,6 +1637,13 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># a module map built from the model's modules says why one is not a target</span>
             <span class="n">explain</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">module_map</span><span class="p">,</span> <span class="s2">"explain"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">why</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">map</span><span class="p">(</span><span class="n">explain</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">unmapped</span><span class="p">)</span> <span class="k">if</span> <span class="n">r</span><span class="p">]</span> <span class="k">if</span> <span class="n">explain</span> <span class="k">else</span> <span class="p">[]</span>
+            <span class="n">refs</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">module_map</span><span class="p">(</span><span class="n">m</span><span class="p">)</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">info</span><span class="o">.</span><span class="n">unmapped</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span> <span class="k">else</span> <span class="p">()</span>
+            <span class="n">off</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">ref</span><span class="o">.</span><span class="n">target</span> <span class="k">for</span> <span class="n">ref</span> <span class="ow">in</span> <span class="n">refs</span> <span class="k">if</span> <span class="n">ref</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ref</span><span class="o">.</span><span class="n">target</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">})</span>
+            <span class="k">if</span> <span class="n">off</span><span class="p">:</span>
+                <span class="n">note</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"targets </span><span class="si">{</span><span class="n">off</span><span class="si">}</span><span class="s2"> are left out of this deployment's `resources: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2">: targets:`"</span>
+                <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_targets</span><span class="p">[</span><span class="n">t</span><span class="p">]</span><span class="o">.</span><span class="n">experts</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">off</span><span class="p">):</span>
+                    <span class="n">note</span> <span class="o">+=</span> <span class="s2">", and an experts target is served only when that list names it"</span>
+                <span class="n">why</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">note</span><span class="p">)</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"LoRA adapter </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> touches modules this deployment does not "</span>
                 <span class="sa">f</span><span class="s2">"serve LoRA on: </span><span class="si">{</span><span class="n">_some</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">unmapped</span><span class="p">)</span><span class="si">}</span><span class="s2">. "</span>
@@ -1596,7 +1661,32 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="c1"># what ``LoraSpec.declare`` gives</span>
-<span class="n">_DECLARED</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"num_layers"</span><span class="p">,</span> <span class="s2">"targets"</span><span class="p">,</span> <span class="s2">"module_map"</span><span class="p">,</span> <span class="s2">"ignored_modules"</span><span class="p">)</span>
+<span class="n">_DECLARED</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"num_layers"</span><span class="p">,</span> <span class="s2">"targets"</span><span class="p">,</span> <span class="s2">"dropped_targets"</span><span class="p">,</span> <span class="s2">"module_map"</span><span class="p">,</span> <span class="s2">"ignored_modules"</span><span class="p">)</span>
+
+<span class="c1"># the fused-MoE align op (``moe_align_block_size.cu``) groups, in one thread block, fewer</span>
+<span class="c1"># than this many ids once padded to its WARP_SIZE</span>
+<span class="n">_ALIGN_MAX_IDS</span> <span class="o">=</span> <span class="mi">1024</span>
+<span class="n">_ALIGN_WARP</span> <span class="o">=</span> <span class="mi">32</span>
+
+
+<div class="viewcode-block" id="check_expert_ids">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.check_expert_ids">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_expert_ids</span><span class="p">(</span><span class="n">resource_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">targets</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LoraTarget</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse an experts target with more (slot, expert) ids, ``max_slots`` slots of its</span>
+<span class="sd">    experts each, than the align op groups."""</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">target</span> <span class="ow">in</span> <span class="n">targets</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="n">max_slots</span> <span class="o">*</span> <span class="n">target</span><span class="o">.</span><span class="n">experts</span>
+        <span class="k">if</span> <span class="n">target</span><span class="o">.</span><span class="n">experts</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">ids</span> <span class="o">//</span> <span class="n">_ALIGN_WARP</span><span class="p">)</span> <span class="o">*</span> <span class="n">_ALIGN_WARP</span> <span class="o">&lt;</span> <span class="n">_ALIGN_MAX_IDS</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: target </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> holds </span><span class="si">{</span><span class="n">target</span><span class="o">.</span><span class="n">experts</span><span class="si">}</span><span class="s2"> experts "</span>
+            <span class="sa">f</span><span class="s2">"per slot, so max_slots </span><span class="si">{</span><span class="n">max_slots</span><span class="si">}</span><span class="s2"> gives </span><span class="si">{</span><span class="n">ids</span><span class="si">}</span><span class="s2"> (slot, expert) ids, more than the "</span>
+            <span class="sa">f</span><span class="s2">"fused-MoE align op groups (fewer than </span><span class="si">{</span><span class="n">_ALIGN_MAX_IDS</span><span class="si">}</span><span class="s2">, padded to </span><span class="si">{</span><span class="n">_ALIGN_WARP</span><span class="si">}</span><span class="s2">); "</span>
+            <span class="sa">f</span><span class="s2">"serve at most </span><span class="si">{</span><span class="p">(</span><span class="n">_ALIGN_MAX_IDS</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">_ALIGN_WARP</span><span class="p">)</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">target</span><span class="o">.</span><span class="n">experts</span><span class="si">}</span><span class="s2"> slots "</span>
+            <span class="sa">f</span><span class="s2">"(`resources: </span><span class="si">{</span><span class="n">LORA_RESOURCE_KEY</span><span class="si">}</span><span class="s2">: max_slots:`), or leave the experts targets "</span>
+            <span class="s2">"out of its `targets:`"</span>
+        <span class="p">)</span></div>
+
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_ignoring</span><span class="p">(</span>

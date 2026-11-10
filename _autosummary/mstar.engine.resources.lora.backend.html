@@ -727,7 +727,9 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend"><code class="docutils literal notranslate"><span class="pre">LoraBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.align_experts"><code class="docutils literal notranslate"><span class="pre">LoraBackend.align_experts()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_experts_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_linear_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_linear_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.expand_fused"><code class="docutils literal notranslate"><span class="pre">LoraBackend.expand_fused()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.gather_shrink"><code class="docutils literal notranslate"><span class="pre">LoraBackend.gather_shrink()</span></code></a></li>
@@ -735,6 +737,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.expand_reference_"><code class="docutils literal notranslate"><span class="pre">expand_reference_()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.experts_reference_"><code class="docutils literal notranslate"><span class="pre">experts_reference_()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.gather_shrink_reference"><code class="docutils literal notranslate"><span class="pre">gather_shrink_reference()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.make_backend"><code class="docutils literal notranslate"><span class="pre">make_backend()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.shrink_reference"><code class="docutils literal notranslate"><span class="pre">shrink_reference()</span></code></a></li>
@@ -756,26 +759,33 @@
 and captured paths address slots the same way. Shapes, per layer of one target:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">[T,</span> <span class="pre">in]</span></code>, <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">[T,</span> <span class="pre">out]</span></code> (written in place), <code class="docutils literal notranslate"><span class="pre">h</span> <span class="pre">[T,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R]</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">[slots,</span> <span class="pre">out,</span> <span class="pre">R]</span></code>, <code class="docutils literal notranslate"><span class="pre">ranks</span></code> / <code class="docutils literal notranslate"><span class="pre">scalings</span></code> <code class="docutils literal notranslate"><span class="pre">[slots]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">[slots,</span> <span class="pre">out,</span> <span class="pre">R]</span></code>, <code class="docutils literal notranslate"><span class="pre">ranks</span></code> / <code class="docutils literal notranslate"><span class="pre">scalings</span></code> <code class="docutils literal notranslate"><span class="pre">[slots]</span></code>
+(slot 0, the zero adapter, has rank 0)</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">out_slices</span></code> are this rank’s widths of a fused projection’s outputs (<code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span></code>); slice
 <code class="docutils literal notranslate"><span class="pre">i</span></code> reads <code class="docutils literal notranslate"><span class="pre">h[:,</span> <span class="pre">i*R:(i+1)*R]</span></code> and writes its own columns of <code class="docutils literal notranslate"><span class="pre">y</span></code>.</p>
 <p>An embedding target’s shrink is a gather instead (<code class="docutils literal notranslate"><span class="pre">gather_shrink</span></code>): its input is a token
 id, <code class="docutils literal notranslate"><span class="pre">in</span></code> is the vocabulary, and <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">&#64;</span> <span class="pre">A^T</span></code> of the id’s one-hot is A’s column for it.</p>
+<p>An experts target (<code class="docutils literal notranslate"><span class="pre">apply_experts_</span></code>) holds one A and B per (slot, expert), addressed per
+output row by a combined id <code class="docutils literal notranslate"><span class="pre">(slot</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">experts</span> <span class="pre">+</span> <span class="pre">expert</span></code>; the zero adapter’s are not
+stored, and any id past them is a row that gets nothing.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.expand_reference_" title="mstar.engine.resources.lora.backend.expand_reference_"><code class="xref py py-obj docutils literal notranslate"><span class="pre">expand_reference_</span></code></a>(y, h, b, token_order, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.expand_reference_" title="mstar.engine.resources.lora.backend.expand_reference_"><code class="xref py py-obj docutils literal notranslate"><span class="pre">expand_reference_</span></code></a>(y, h, b, token_slot, ...)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">y[:,</span> <span class="pre">slice]</span> <span class="pre">+=</span> <span class="pre">scaling</span> <span class="pre">*</span> <span class="pre">h[:,</span> <span class="pre">slice</span> <span class="pre">ranks]</span> <span class="pre">&#64;</span> <span class="pre">b[slot,</span> <span class="pre">slice]^T</span></code> in place, as <code class="docutils literal notranslate"><span class="pre">shrink_reference</span></code> computes it.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.gather_shrink_reference" title="mstar.engine.resources.lora.backend.gather_shrink_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gather_shrink_reference</span></code></a>(ids, a, token_order, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.experts_reference_" title="mstar.engine.resources.lora.backend.experts_reference_"><code class="xref py py-obj docutils literal notranslate"><span class="pre">experts_reference_</span></code></a>(x, y, a, b, ids, ...)</p></td>
+<td><p>Plain torch for <code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_</span></code>: gathers each row's factors, <code class="docutils literal notranslate"><span class="pre">_EXPERT_ROWS</span></code> rows at a time so the gathered copies stay bounded.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.gather_shrink_reference" title="mstar.engine.resources.lora.backend.gather_shrink_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gather_shrink_reference</span></code></a>(ids, a, token_slot, ...)</p></td>
 <td><p>Plain torch for <code class="docutils literal notranslate"><span class="pre">gather_shrink</span></code>: fixed shapes and no host sync, so it compiles and captures on any device.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.make_backend" title="mstar.engine.resources.lora.backend.make_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">make_backend</span></code></a>(kind, device)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.make_backend" title="mstar.engine.resources.lora.backend.make_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">make_backend</span></code></a>(kind, device)</p></td>
 <td><p>The custom ops (<code class="docutils literal notranslate"><span class="pre">ops.LoraOpsBackend</span></code>) on every device, so <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> takes each kernel as one opaque node.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.shrink_reference" title="mstar.engine.resources.lora.backend.shrink_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">shrink_reference</span></code></a>(x, a, token_order, ...)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">h</span> <span class="pre">[T,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R]</span></code> for <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">[T,</span> <span class="pre">in]</span></code> against <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, every token against every slot and then its own selected: no host sync and no data-dependent shape, so it compiles and captures, at <code class="docutils literal notranslate"><span class="pre">slots</span></code> times a dense LoRA's work.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.backend.shrink_reference" title="mstar.engine.resources.lora.backend.shrink_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">shrink_reference</span></code></a>(x, a, token_slot, ranks, ...)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">h</span> <span class="pre">[T,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R]</span></code> for <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">[T,</span> <span class="pre">in]</span></code> against <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, every token against every slot and then its own (<code class="docutils literal notranslate"><span class="pre">token_slot</span> <span class="pre">[T]</span></code>) selected: no host sync and no data-dependent shape, so it compiles and captures, at <code class="docutils literal notranslate"><span class="pre">slots</span></code> times a dense LoRA's work.</p></td>
 </tr>
 </tbody>
 </table>
@@ -793,6 +803,25 @@ id, <code class="docutils literal notranslate"><span class="pre">in</span></code
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.LoraBackend">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">LoraBackend</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#LoraBackend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.LoraBackend" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.LoraBackend.align_experts">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">align_experts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#LoraBackend.align_experts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.LoraBackend.align_experts" title="Link to this definition">#</a></dt>
+<dd><p>What <code class="docutils literal notranslate"><span class="pre">apply_experts_</span></code> reads to group the rows of <code class="docutils literal notranslate"><span class="pre">ids</span></code> (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">top_k]</span></code>
+combined ids, <code class="docutils literal notranslate"><span class="pre">num_ids</span></code> meaning none) by id, shared by every call over them;
+None where nothing groups them (<code class="docutils literal notranslate"><span class="pre">experts_reference_</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>num_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>MoeAlignment | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.LoraBackend.apply_">
 <span class="sig-name descname"><span class="pre">apply_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">addressing</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">embedding</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#LoraBackend.apply_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_" title="Link to this definition">#</a></dt>
@@ -814,6 +843,33 @@ expand into <code class="docutils literal notranslate"><span class="pre">y</span
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)">torch.Tensor</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.LoraBackend.apply_experts_">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">apply_experts_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alignment</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#LoraBackend.apply_experts_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_experts_" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">y[m,</span> <span class="pre">slice</span> <span class="pre">i]</span> <span class="pre">+=</span> <span class="pre">row_weight[m]</span> <span class="pre">*</span> <span class="pre">(x[m</span> <span class="pre">//</span> <span class="pre">top_k]</span> <span class="pre">&#64;</span> <span class="pre">a[id,</span> <span class="pre">slice</span> <span class="pre">i]^T)</span> <span class="pre">&#64;</span> <span class="pre">b[id,</span>
+<span class="pre">slice</span> <span class="pre">i]^T</span></code> for each row <code class="docutils literal notranslate"><span class="pre">m</span></code> of <code class="docutils literal notranslate"><span class="pre">y</span></code>, <code class="docutils literal notranslate"><span class="pre">id</span> <span class="pre">=</span> <span class="pre">ids.flatten()[m]</span></code>; a row whose id
+is past <code class="docutils literal notranslate"><span class="pre">a</span></code>’s (<code class="docutils literal notranslate"><span class="pre">a.shape[0]</span></code>) gets nothing. <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[ids,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">[ids,</span>
+<span class="pre">out,</span> <span class="pre">R]</span></code>; <code class="docutils literal notranslate"><span class="pre">alignment</span></code> is <code class="docutils literal notranslate"><span class="pre">align_experts</span></code>’ for <code class="docutils literal notranslate"><span class="pre">ids</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>a</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>b</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>row_weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>top_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>out_slices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>alignment</strong> (<em>MoeAlignment</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -908,7 +964,7 @@ rank, may hold anything: the expand does not read them.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.expand_reference_">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">expand_reference_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#expand_reference_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.expand_reference_" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">expand_reference_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scalings</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#expand_reference_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.expand_reference_" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">y[:,</span> <span class="pre">slice]</span> <span class="pre">+=</span> <span class="pre">scaling</span> <span class="pre">*</span> <span class="pre">h[:,</span> <span class="pre">slice</span> <span class="pre">ranks]</span> <span class="pre">&#64;</span> <span class="pre">b[slot,</span> <span class="pre">slice]^T</span></code> in place, as
 <code class="docutils literal notranslate"><span class="pre">shrink_reference</span></code> computes it.</p>
 <dl class="field-list simple">
@@ -917,8 +973,7 @@ rank, may hold anything: the expand does not read them.</p>
 <li><p><strong>y</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>h</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>b</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>token_order</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>slot_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>token_slot</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>ranks</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>scalings</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>out_slices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
@@ -931,8 +986,34 @@ rank, may hold anything: the expand does not read them.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.experts_reference_">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">experts_reference_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#experts_reference_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.experts_reference_" title="Link to this definition">#</a></dt>
+<dd><p>Plain torch for <code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_</span></code>: gathers each row’s factors,
+<code class="docutils literal notranslate"><span class="pre">_EXPERT_ROWS</span></code> rows at a time so the gathered copies stay bounded. Fixed shapes and
+no host sync, so it compiles and captures; fine on a CPU, at a dense LoRA’s work per
+row.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>a</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>b</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>row_weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>top_k</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>out_slices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.gather_shrink_reference">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">gather_shrink_reference</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#gather_shrink_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.gather_shrink_reference" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">gather_shrink_reference</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#gather_shrink_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.gather_shrink_reference" title="Link to this definition">#</a></dt>
 <dd><p>Plain torch for <code class="docutils literal notranslate"><span class="pre">gather_shrink</span></code>: fixed shapes and no host sync, so it compiles
 and captures on any device.</p>
 <dl class="field-list simple">
@@ -940,8 +1021,7 @@ and captures on any device.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>a</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>token_order</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>slot_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>token_slot</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>ranks</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 </ul>
 </dd>
@@ -974,18 +1054,18 @@ while nothing else in the process has registered the Triton kernels.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.backend.shrink_reference">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">shrink_reference</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#shrink_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.shrink_reference" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.backend.</span></span><span class="sig-name descname"><span class="pre">shrink_reference</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ranks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/backend.html#shrink_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.backend.shrink_reference" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">h</span> <span class="pre">[T,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R]</span></code> for <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">[T,</span> <span class="pre">in]</span></code> against <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">[slots,</span> <span class="pre">slices</span> <span class="pre">*</span> <span class="pre">R,</span> <span class="pre">in]</span></code>, every
-token against every slot and then its own selected: no host sync and no data-dependent
-shape, so it compiles and captures, at <code class="docutils literal notranslate"><span class="pre">slots</span></code> times a dense LoRA’s work. Zeros where
-the expand does not read (dead tokens, columns past a slot’s rank).</p>
+token against every slot and then its own (<code class="docutils literal notranslate"><span class="pre">token_slot</span> <span class="pre">[T]</span></code>) selected: no host sync
+and no data-dependent shape, so it compiles and captures, at <code class="docutils literal notranslate"><span class="pre">slots</span></code> times a dense
+LoRA’s work. Zeros where the expand does not read (the zero adapter’s rows, columns
+past a slot’s rank).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>a</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>token_order</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>slot_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>token_slot</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>ranks</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>num_slices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
@@ -1046,7 +1126,9 @@ the expand does not read (dead tokens, columns past a slot’s rank).</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend"><code class="docutils literal notranslate"><span class="pre">LoraBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.align_experts"><code class="docutils literal notranslate"><span class="pre">LoraBackend.align_experts()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_experts_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_experts_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.apply_linear_"><code class="docutils literal notranslate"><span class="pre">LoraBackend.apply_linear_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.expand_fused"><code class="docutils literal notranslate"><span class="pre">LoraBackend.expand_fused()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.LoraBackend.gather_shrink"><code class="docutils literal notranslate"><span class="pre">LoraBackend.gather_shrink()</span></code></a></li>
@@ -1054,6 +1136,7 @@ the expand does not read (dead tokens, columns past a slot’s rank).</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.expand_reference_"><code class="docutils literal notranslate"><span class="pre">expand_reference_()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.experts_reference_"><code class="docutils literal notranslate"><span class="pre">experts_reference_()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.gather_shrink_reference"><code class="docutils literal notranslate"><span class="pre">gather_shrink_reference()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.make_backend"><code class="docutils literal notranslate"><span class="pre">make_backend()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.backend.shrink_reference"><code class="docutils literal notranslate"><span class="pre">shrink_reference()</span></code></a></li>

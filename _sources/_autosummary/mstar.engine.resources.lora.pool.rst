@@ -17,6 +17,7 @@ mstar.engine.resources.lora.pool
 
    .. autosummary::
    
+      ExpertRows
       LoraAdapterPool
       LoraAddressing
       LoraLayerDelta
