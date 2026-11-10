@@ -174,6 +174,7 @@ pub(super) fn text_chat(
         output_modalities: vec!["text".to_string()],
         model_kwargs: mk,
         parts,
+        ..SubmitArgs::default()
     })
 }
 
@@ -245,6 +246,7 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
         output_modalities: vec!["text".to_string()],
         model_kwargs: mk,
         parts,
+        ..SubmitArgs::default()
     })
 }
 

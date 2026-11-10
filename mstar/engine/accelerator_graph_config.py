@@ -89,7 +89,8 @@ class AcceleratorGraphConfig(ABC):
         # pick, ``{"max_autotune_gemm_backends": "ATEN"}``
         inductor_options: Mapping[str, Any] | None = None,
 
-        # Per-config override for the set of batch sizes to capture
+        # Per-config override for the set of batch sizes to capture (None: the
+        # runner's defaults; []: none)
         capture_batch_sizes: list[int] | None = None,
         # Method on the submodule to capture
         capture_forward_method: str = "forward_batched",
@@ -519,8 +520,12 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     one_row_per_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
-    # None => defer to the runner's default batch-size buckets
+    # None => defer to the runner's default batch-size buckets; [] captures nothing
     capture_batch_sizes: list[int] | None = None
+    # A shape with no captured graph runs the region eagerly through ``run``, its
+    # step declared, planned and committed over the real rows, rather than raising;
+    # the caller then has one path for both. Off: the caller checks ``can_run``.
+    eager_fallback: bool = False
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False

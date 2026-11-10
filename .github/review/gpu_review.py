@@ -13,12 +13,15 @@ the box left no results, after writing lt/unavailable.md.
 """
 import fnmatch
 import html
+import itertools
 import json
 import math
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -252,6 +255,9 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   PR also touches" row), so run none. Never run what CI already runs (its CPU tests, lint, type
   checks): run only what needs a GPU or what CI can't run, and always the test files the PR adds or
   changes that skip without CUDA.
+- As you go, append one short line per milestone to `$LIVE_PR_OUT/progress.log`, as `HH:MM <what>`:
+  the plan written (with its estimated time), bootstrap done, each check started and finished with its
+  outcome, writing the report. The workflow's log shows them while you run.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done. Plan for as little testing as the
   change needs, ideally much less than two hours; about two hours once compile caches are warm
@@ -405,13 +411,115 @@ def box_cost(path):
           if usable else "The box left no usable report of its Claude cost.")
 
 
+PROGRESS_CAP = 65536  # bytes of progress.log a poll reads
+
+
+def exact_lines(values):
+    """What the box's text is redacted of, the same everywhere: the lines of each of `values`, stripped (a "\r"
+    would never match, a line of spaces would blank every space) and non-empty, since text redacted line by line
+    never holds a value with a newline in it whole; longest first, so a value that holds another is replaced
+    before it."""
+    parts = dict.fromkeys(part.strip() for value in values for part in value.split("\n"))
+    return sorted(filter(None, parts), key=len, reverse=True)
+
+
+def print_progress(lines, exact):
+    """Print the box session's progress lines to the job's log, each redacted (the `exact` values and the credential
+    patterns), then cut and quoted, since the session wrote them."""
+    for line in lines:
+        print(bot.log_value(bot.redact(line, exact=exact)[:300]), flush=True)
+
+
+def show_progress(key, seen, exact):
+    """Print the lines the box's session added to progress.log since the `seen` lines already printed
+    (print_progress); the new count. Whole lines, at most 50 a poll; a line longer than the read's cap counts as
+    one, cut, once wc counts it. A file that got shorter is read once more, from its start. The box caps the read
+    (a FIFO or a huge line can't hold it), and what is printed is capped again here; a read that fails, times out
+    or gives no line count changes nothing. What is left when the box is done, show_rest prints."""
+    log = f"{ERAS_OUT}/progress.log"
+
+    def read(start):  # (the file's line count, what follows line `start`), or None
+        try:
+            r = gpu("ssh", key, f"timeout 60 wc -l {log} && timeout 60 tail -n +{start + 1} {log} | head -n 50 "
+                                f"| head -c {PROGRESS_CAP + 1}", check=False, timeout=120)
+            total = int(r.stdout.split(maxsplit=1)[0])
+        except (subprocess.TimeoutExpired, ValueError, IndexError):
+            return None
+        return None if r.returncode or total < 0 else (total, r.stdout.partition("\n")[2])
+
+    got = read(seen)
+    if got and got[0] < seen:  # rewritten shorter
+        seen, got = 0, read(0)
+    if got is None:
+        return seen
+    total, raw = got[0], got[1].encode("utf-8", "surrogateescape")
+    # The box's caps again, so a box that didn't keep them can't flood the job's log. They don't bound what the
+    # ssh call captured, which isn't streamed: the PR's author is trusted.
+    lines = raw[:PROGRESS_CAP].decode("utf-8", "surrogateescape").split("\n")
+    # The last piece is a line still being written, or nothing: shown only when it is one line past the cap that
+    # wc already counts (so a line still being written isn't shown at every poll).
+    tail = lines.pop()
+    whole = not lines and len(raw) >= PROGRESS_CAP and total > seen
+    ended = raw[PROGRESS_CAP:PROGRESS_CAP + 1] == b"\n"  # exactly the cap long: whole, not cut
+    lines = [*lines, *([tail if ended else cut_short(tail, exact)] if tail and whole else [])][:50]
+    print_progress(lines, exact)
+    return seen + len(lines)
+
+
+PROGRESS_REST = 1000  # the most lines of what is left of progress.log the end of a run prints
+LINE_CAP = 4096  # the bytes of one such line read; print_progress cuts it shorter after redacting it
+# What a credential pattern's token is made of. The exact values needn't be: cut_short strips their starts itself.
+TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+
+
+def cut_short(line, exact):
+    """A progress line that was cut short at a cap, before it is redacted, and marked: without what it ends in that
+    may be the start of a secret the cut split (too short for the redaction to know), the longest start of one of
+    the `exact` values it will be redacted of, then a run of token characters."""
+    for value in filter(None, exact):
+        line = line[:len(line) - next((k for k in range(len(value) - 1, 0, -1) if line.endswith(value[:k])), 0)]
+    return line.rstrip(TOKEN_CHARS) + "…"
+
+
+def log_lines(f, exact):
+    """The lines of the binary file `f`, without their newline, each cut to LINE_CAP bytes (cut_short), the rest of
+    it read past in such pieces: only "\\n" ends a line, as wc counts them, so a bare "\\r" (a progress bar)
+    doesn't."""
+    while line := f.readline(LINE_CAP):
+        cut = False
+        if not line.endswith(b"\n"):  # longer than the cap, exactly the cap, or the last line, unended
+            while more := f.readline(LINE_CAP):
+                cut = cut or more != b"\n"
+                if more.endswith(b"\n"):
+                    break
+        text = line.removesuffix(b"\n").decode("utf-8", "replace")
+        yield cut_short(text, exact) if cut else text
+
+
+def show_rest(path, seen, exact):
+    """Once the box's results are back: the lines of its progress.log (`path`) the polls didn't print, the last one
+    too, at most PROGRESS_REST (print_progress); from its start if it got shorter than `seen`."""
+    if not path.is_file():
+        return
+    with open(path, "rb") as f:
+        it = log_lines(f, exact)
+        if sum(1 for _ in itertools.islice(it, seen)) < seen:  # rewritten shorter: from its start
+            f.seek(0)
+            it = log_lines(f, exact)
+        lines = list(itertools.islice(it, PROGRESS_REST))
+    print_progress(lines, exact)
+
+
 def wait(out, runner_temp):
-    """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
-    `unavailable` set, when the box left no results (Eras refused the Pod, say): the status, which carries
-    the platform's failure code and message, goes in the comment."""
+    """Until the box's session finishes, printing its new progress lines at every poll (show_progress); then copy
+    its results back, print the progress lines left (show_rest) and let the box go. Exits 3, with `unavailable`
+    set, when the box left no results (Eras refused the Pod, say): the status, which carries the platform's
+    failure code and message, goes in the comment."""
     lt = Path(runner_temp, "lt")
     key, e = instance(lt)
     cfg = gpu_py.load_config()
+    exact = exact_lines([os.environ.get("ERAS_API_KEY", "")])  # progress lines: of the only key this box holds
+    seen = 0
     while True:
         try:
             st, host, port = gpu_py.status(e, cfg)
@@ -424,17 +532,20 @@ def wait(out, runner_temp):
             with gpu_py.ledger_txn() as d:
                 d[key].update(host=host, port=port)
             e.update(host=host, port=port)
-        if state.startswith("run ") or state in ("ended", "releasing"):
-            break  # the Pod is gone, and its results with it
-        if host and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0:
+        # the Pod is gone, and its results with it, or the session is done
+        done = state.startswith("run ") or state in ("ended", "releasing") \
+            or bool(host) and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0
+        seen = show_progress(key, seen, exact)
+        if done:
             break
         time.sleep(60)
     results = lt / "results"
     results.mkdir(exist_ok=True)
     gpu("pull", key, f"{ERAS_OUT}/.", str(results), check=False, timeout=1800)
+    show_rest(results / "progress.log", seen, exact)
     gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
-    print("collected: " + bot.log_value(sorted(p.name for p in results.iterdir())))
+    print("collected: " + bot.log_value(sorted(bot.redact(p.name, exact=exact) for p in results.iterdir())))
     box_cost(results / "claude.json")
     if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
         unavailable(out, lt, f"The GPU box ended with no results: {st}.\n"
@@ -508,11 +619,11 @@ def fixed_only_above(review, stacked):
 
 def to_fix_first(review, pr, above):
     """What the review left open that stops the live test from starting, and approval too: open P0–P2
-    findings (counted as the summary counts them, fixed above judged) and skipped files. Open questions
-    and the design risk stop only approval."""
+    findings (counted as the summary counts them, fixed above judged) and skipped files, which under a full
+    review's team turn cap mean the review didn't finish. Open questions and the design risk stop only approval."""
     why = []
     if review.get("skipped"):
-        why.append("the review skipped files")
+        why.append(render_summary.UNFINISHED)
     open_ = blocking(review, review_threads(pr), render_summary.stacked_above(above))
     if open_:
         why.append("open P0–P2 findings: " + ", ".join(open_))
@@ -791,15 +902,42 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner)
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
+UPLOADED = ("report.md", "result.json", "progress.log")  # what the workflow's "Keep the report" uploads from results
+
+
+def remove(path):
+    """Remove whatever is at `path`: a directory with all it holds, or anything else."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def redact(out, runner_temp, s2="", s3=""):
     """What the box and the providers wrote, redacted in place before anything reads it, so the comment,
     the kept report and the artifact all get the redacted copy: the exact values of the secrets this job
-    holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key."""
+    holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key.
+    First, anything but a regular file at a path the artifact uploads (UPLOADED) goes: redact would skip it,
+    and the upload would take a directory's files unredacted."""
     lt = Path(runner_temp, "lt")
-    exact = (s2, s3)
+    exact = exact_lines((s2, s3))
+    for path in (lt / "results" / name for name in UPLOADED):
+        if path.is_symlink() or not path.is_file():
+            remove(path)
     for f in (lt / "results/report.md", lt / "unavailable.md"):
-        if f.is_file():
-            f.write_text(bot.redact(f.read_text(), exact=exact))
+        if f.is_file():  # bytes that aren't UTF-8 become U+FFFD, so nothing that reads it later can fail on them
+            f.write_text(bot.redact(f.read_text(errors="replace"), exact=exact))
+    log = lt / "results/progress.log"
+    if log.is_file():  # line by line, each cut to LINE_CAP (log_lines), so no size of it can fill the job's memory
+        out_f = tempfile.NamedTemporaryFile("w", dir=runner_temp, delete=False)  # outside what the box wrote
+        try:
+            with out_f, open(log, "rb") as f:
+                for line in log_lines(f, exact):
+                    out_f.write(bot.redact(line, exact=exact) + "\n")
+            os.replace(out_f.name, log)
+        except BaseException:
+            Path(out_f.name).unlink(missing_ok=True)
+            raise
     verdict = lt / "results/result.json"
     if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
         try:
@@ -824,8 +962,13 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
                 "or a fork owned by someone with write access; this review stands without it.\n")
     elif gated == "true":
         reasons = render_summary.inert(Path(runner_temp, "gate.txt").read_text()).rstrip("\n")
+        unfinished = ("the files the review left are the bot's to finish, not yours. Comment `/review` again, after "
+                      "fixing any open finding named here.")
         body = (f"No live test yet ({reasons}): a finding's thread was edited after the bot posted it, so another "
-                "`/review` can't clear it and a person has to decide.\n" if render_summary.EDITED in reasons else
+                "`/review` can't clear it and a person has to decide."
+                + (f" Also, {unfinished}" if render_summary.UNFINISHED in reasons else "") + "\n"
+                if render_summary.EDITED in reasons else
+                f"No live test yet ({reasons}): {unfinished}\n" if render_summary.UNFINISHED in reasons else
                 f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n")
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")

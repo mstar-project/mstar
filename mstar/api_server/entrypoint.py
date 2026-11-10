@@ -3180,9 +3180,6 @@ def main(argv: list[str] | None = None):
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
-        if config.get("openpi") is not None:
-            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
-                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3274,9 +3271,13 @@ def main(argv: list[str] | None = None):
         if args.rust_frontend:
             import tempfile
 
+            from mstar.api_server.openai.adapters import get_adapter
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
+                openpi_facts,
+                realtime_facts,
+                transcription_facts,
             )
 
             bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
@@ -3289,7 +3290,12 @@ def main(argv: list[str] | None = None):
                 args.port, bridge_dir, args.upload_dir, api_key=api_key,
                 timeout_s=args.timeout,
                 sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
-                served_models=api_server.served_models)
+                served_models=api_server.served_models,
+                transcription=transcription_facts(api_server, get_adapter(model_name)),
+                openpi=openpi_facts(api_server.openpi_policy),
+                ws_max_bytes=_ws_max_size(config),
+                client_streams=api_server.client_streams,
+                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

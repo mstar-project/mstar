@@ -570,7 +570,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
         ``prefill_window_tokens``, run over row chunks in turn: each writes its keys and latents
         (``token_window``) before the next selects over them."""
-        chunk, kv = self.config.prefill_window_tokens, self._kv()
+        chunk, kv, dsa = self.config.prefill_window_tokens, self._kv(), self._dsa_plan()
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
@@ -578,7 +578,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1])
             want = [r - c0 for r in rows if c0 <= r < c1]
             if want:
-                picked.append(hidden[want])
+                picked.append(hidden[dsa.device_rows(want)])
         return torch.cat(picked)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -702,9 +702,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), hidden, position_ids[c0:c1] + 1)
             want = [r - c0 for r in last if c0 <= r < c1]
             if want:
-                normed.append(hidden[want])
+                normed.append(hidden[dsa_ctx.device_rows(want)])
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(torch.cat(normed)))
-        rows = torch.tensor(last, device=input_ids.device)
+        rows = dsa_ctx.device_rows(last)
         with kv.token_rows(rows), self._dsa().pick(last):
             h_head, _ = lm.mtp(
                 lm.model.embed_tokens(new_tokens), torch.cat(normed),
