@@ -2479,7 +2479,8 @@ the prefill) still brings it routed, and that read puts it over the slot's.
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own. Qwen3.5 reads the tokens with ``last_sampled``.
 Its ``walk`` may be a ``frozenset`` of walks when several decode walks read the token back; a
-combined step's rows each follow their own walk.
+combined step's rows each follow their own walk, and naming a combined walk is refused at
+startup.
 
 A token that also streams to another node can go down the stream by value, when the
 stream's ``Connection`` sets ``by_value=True``: its consumer then takes a window of the
@@ -2492,7 +2493,8 @@ off another buffer keeps its tensors. A row whose stop check withheld one of the
 (``StopCheck.withheld``) sends nothing for it, and its stream counts no item. The step
 keeps its rows on the device when every output is one of ``device_loopback_signals`` or
 rides the column on every edge (a client emit or a ``by_value`` stream, neither persisted,
-and not counted toward the conductor's output tokens nor collected by an enclosing loop):
+no non-streamed edge counted toward the conductor's output tokens, and not collected by
+an enclosing loop):
 MiniCPM-o's TTS decode loops its code back on the device and streams the same code to the
 vocoder by value. A rows-only step builds no per-request outputs and skips
 ``postprocess``, so whatever a submodule's ``postprocess`` does must be about the outputs
