@@ -54,13 +54,14 @@ LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]
 # `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
 # `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
 # Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
-# PR's live test run on an AMD box too (vendors_of), and those it covers (gpu_review.covered_by_amd) stop
+# PR's live test run on an AMD box too (vendors_of), and those it covers (covered_by_amd) stop
 # counting once it passed there.
 AMD_MODEL = r"mi\d{3}[ax]?"
 AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
 UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
                                  r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
 AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+AMD_RENTED = re.compile(r"\bMI3[0-5]\d?X\b", re.IGNORECASE)  # the AMD GPUs an AMD box can be (gpu.py SUPPORTED)
 # The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
 # for a PR that names AMD hardware.
 VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
@@ -691,9 +692,22 @@ def hardware_named(pull, changes):
     return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
 
 
+def covered_by_amd(word):
+    """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
+    `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
+    untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
+    change can pass on an H200."""
+    if not AMD_HARDWARE.fullmatch(word):
+        return False
+    series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
+    return not re.fullmatch(AMD_MODEL, word, re.IGNORECASE) \
+        or bool(AMD_RENTED.search(word + "x" if series else word))
+
+
 def vendors_of(words):
-    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named)."""
-    return [v for v in VENDORS if v == "nvidia" or any(AMD_HARDWARE.fullmatch(w) for w in words)]
+    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named): AMD
+    only when a word is one its box covers (a PR naming just an MI300A can't pass there, so no box is rented)."""
+    return [v for v in VENDORS if v == "nvidia" or any(covered_by_amd(w) for w in words)]
 
 
 def vendors_for(repo, pull, sha):

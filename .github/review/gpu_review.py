@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,6 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pypr
                ".mcp.json", ".claude.json", ".ripgreprc")
 # A submodule's commit in a file's patch, how the compare API shows a gitlink (mode 160000; it gives no mode).
 GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
-AMD_RENTED = gpu_py.SUPPORTED["amd"]  # the AMD GPUs an AMD box can be
 # Where a box comes from, by vendor in effect: Eras for NVIDIA while it has GPUs free, DigitalOcean otherwise,
 # and for AMD, which Eras doesn't have. Not by price: Eras is the provider the bot's caches and limits are for.
 PREFERENCE = ("eras", "digitalocean")
@@ -181,26 +181,14 @@ HARDWARE_PHRASE = re.compile(rf"({bot.UNTESTABLE_HARDWARE.pattern})(-(?:specific
                              re.IGNORECASE)
 
 
-def covered_by_amd(word):
-    """Whether a pass on an AMD box covers this hardware word: an AMD word that names no GPU model (`rocm`,
-    `is_amd`), or one of the MI3xxX models gpu.py rents, or their series (`MI300`; an MI300A or MI250 stays
-    untestable). The box is the cheapest of those models, so an MI355X change can pass on an MI300X, as a B200
-    change can pass on an H200."""
-    if not bot.AMD_HARDWARE.fullmatch(word):
-        return False
-    series = re.fullmatch(r"mi\d{3}", word, re.IGNORECASE)  # no letter: the series of the X model
-    return not re.fullmatch(bot.AMD_MODEL, word, re.IGNORECASE) \
-        or bool(AMD_RENTED.search(word + "x" if series else word))
-
-
 def beyond_vendors(text, vendors):
     """The review's `untestable` text (model text) without what a run on `vendors` covers: with AMD among them, its
-    AMD hardware words (covered_by_amd, HARDWARE_PHRASE), and a clause (between `;` and `,`) they leave saying
+    AMD hardware words (bot.covered_by_amd, HARDWARE_PHRASE), and a clause (between `;` and `,`) they leave saying
     nothing (FILLER)."""
     if "amd" not in vendors or not text:
         return text or ""
     def drop(m):  # the version stays unless it is ROCm's or HIP's: `MI300X 2` is two of them
-        if not covered_by_amd(m[1]):
+        if not bot.covered_by_amd(m[1]):
             return m[0]
         return "" if not m[3] or m[1].lower() in ("rocm", "hip") else m[3]
 
@@ -378,7 +366,8 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
           forced="", asked="", asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
-    description (pr-body.md) as data, and the box's own Anthropic key. Every vendor's box or none: when one has no
+    description (pr-body.md) as data, and an Anthropic key (an Eras box's own spend-capped one; a DigitalOcean
+    box gets the review's own ANTHROPIC_API_KEY, in its user_data). Every vendor's box or none: when one has no
     GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box then
     fails to start (its offer taken meanwhile), those already started go. Each box that doesn't run gets an
     unavailable.md, and the step exits 3 with `unavailable` set."""
@@ -487,6 +476,7 @@ def fit_user_data(lt, box, secret_length):
     findings = json.loads((lt / "findings.json").read_text())
     report = findings.get("earlier_report", "")
     paths = [box / "findings.json", box / "pr-body.md"]
+    key = secrets.token_urlsafe(secret_length)[:secret_length]  # compresses like the real key, not like "kkk…"
 
     def cut(text, n):
         return text if n >= len(text) else text[:n] + CUT
@@ -495,7 +485,7 @@ def fit_user_data(lt, box, secret_length):
         paths[0].write_text(json.dumps({**findings, **({"earlier_report": r} if report else {})}, indent=1))
         paths[1].write_text(b)
         files = [str(f) for f in (box / "brief.md", *paths, lt / "run.json", BOX_COMMON)]
-        text = gpu_py.cloud_config(str(BOX), files, "k" * secret_length or None)
+        text = gpu_py.cloud_config(str(BOX), files, key or None)
         return len(text.encode()) <= gpu_py.USER_DATA_MAX
 
     nb, nr = len(body), len(report)
@@ -820,7 +810,7 @@ def untestable(pull, changes, review, vendors):
     names and changed lines, but what the run on `vendors` covers (AMD, when it ran on an AMD box: the rule
     then also needs its verdict, which is a pass only when every box passed). A diff GitHub won't give is a
     reason too."""
-    named = [w for w in bot.hardware_named(pull, changes) if "amd" not in vendors or not covered_by_amd(w)]
+    named = [w for w in bot.hardware_named(pull, changes) if "amd" not in vendors or not bot.covered_by_amd(w)]
     needs = [x for x in (beyond_vendors((review.get("live_test") or {}).get("untestable"), vendors),
                          ", ".join(named)) if x]
     unread = [f["filename"] for f in changes if f.get("changes") and not f.get("patch")]
@@ -1054,6 +1044,8 @@ def render_comment(sha, lt, vendors, media_url=""):
         if verdict == "none" and (lt / vendor / "unavailable.md").is_file():  # why it couldn't run, redacted
             verdict, report = "unavailable", render_summary.inert((lt / vendor / "unavailable.md").read_text())
         summary = " ".join(str(result.get("summary", "")).split())  # on one line: it can't open a fence over the report
+        if verdict == "pass" and (results / "timed_out").exists():  # stopped at END_BY: what it never ran can't pass
+            verdict, summary = "partial", f"{summary} The session ran out of time after writing pass.".strip()
         title = f"**Live test of `{sha[:7]}` on {bot.VENDORS[vendor]}: {verdict}.** {render_summary.inert(summary)}"
         room = (60000 - len(head) - len(media) - 100) // len(vendors) - len(title)
         report, cut = (report, "") if len(report) <= room else \

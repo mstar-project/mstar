@@ -54,7 +54,8 @@ curl -fsSL https://claude.ai/install.sh | bash -s "$(field claude)" > "$OUT/inst
 
 cd "$W" || finish "no work directory"
 # The session stops at run.json's end_by, a margin before the box's deadline, so what it wrote (the report it
-# writes as it goes, progress.log) is collected rather than lost with the box; one that ran out of time is partial.
+# writes as it goes, progress.log) is collected rather than lost with the box; one that ran out of time is partial: `timed_out` marks it, and render_comment holds a `pass` it wrote
+# before then to partial.
 END_BY=$(field end_by)
 [[ $END_BY =~ ^[0-9]+$ ]] || finish "run.json has no end_by"
 VERDICT=no-result NOW=$(date +%s)
@@ -63,5 +64,5 @@ timeout --kill-after=60 "$(( END_BY > NOW ? END_BY - NOW : 1 ))" "$HOME/.local/b
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \
   > "$OUT/claude.json" 2> "$OUT/claude.err"
 CODE=$?
-[ "$(date +%s)" -lt "$END_BY" ] || { VERDICT=partial; finish "the session ran out of time"; }
+[ "$(date +%s)" -lt "$END_BY" ] || { VERDICT=partial; touch "$OUT/timed_out"; finish "the session ran out of time"; }
 finish "the session ended without a result (exit $CODE)"
