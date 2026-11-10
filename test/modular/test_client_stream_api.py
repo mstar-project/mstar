@@ -18,6 +18,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -43,6 +44,7 @@ from mstar.profile.format import RequestProfile, RequestTiming  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
     CLIENT,
+    ClientAudio,
     ClientStreamLimits,
     Connection,
     PartitionTopology,
@@ -376,38 +378,53 @@ def test_an_append_s_text_settings_and_target_streams_reach_the_hook(tmp_path):
 
 
 class _Transcribing(_ListeningModel):
-    """Takes text appends too: each becomes one item of its byte values."""
+    """Takes text appends too, as text or as ``model_kwargs["say"]``: each
+    becomes one item of its byte values."""
 
     def process_stream_chunk(self, chunk):
         items = super().process_stream_chunk(chunk)
-        if chunk.text:
-            items["audio_in"] = [*items["audio_in"], torch.tensor(list(chunk.text.encode()), dtype=torch.float32)]
+        text = chunk.text or chunk.model_kwargs.get("say")
+        if text:
+            items["audio_in"] = [*items["audio_in"], torch.tensor(list(text.encode()), dtype=torch.float32)]
         return items
 
 
-def test_a_text_only_append_reaches_a_model_that_takes_text():
+@pytest.mark.parametrize("append", [
+    ClientAppend("r", text="hi"), ClientAppend("r", model_kwargs={"say": "hi"}),
+], ids=["text", "model_kwargs"])
+def test_a_text_or_model_kwargs_only_append_reaches_the_hook(append):
     wt, sent, _tm = _thread(_Transcribing())
     _open(wt)
 
-    wt._process_stream_input(ClientAppend("r", text="hi"))
+    wt._process_stream_input(append)
 
     (chunk,) = wt.model.chunk_calls
-    assert chunk.text == "hi" and chunk.tensors == {} and chunk.streams == {}
+    assert chunk.tensors == {} and chunk.streams == {}
     _route(wt)
     assert _signals(sent) == [("w0", "audio_in", [[2]], {})]
 
 
-def test_a_text_only_append_to_a_model_that_takes_none_is_refused_with_a_400():
+@pytest.mark.parametrize("append", [
+    ClientAppend("r", text="hello?"), ClientAppend("r", model_kwargs={"say": "hello?"}),
+    ClientAppend("r", model_kwargs={"say": "hello?"}, ends=END),
+], ids=["text", "model_kwargs", "model_kwargs_ending_input"])
+def test_an_append_the_model_turns_into_nothing_is_refused_with_a_400(append):
     """The hook returns nothing for the text: dropped silently, the client
-    would never learn its words went nowhere."""
+    would never learn its words went nowhere. ``model_kwargs`` beside
+    ``end_input`` still end the input."""
     wt, sent, _tm = _thread()
     _open(wt)
 
-    wt._process_waiting_input(ClientAppend("r", text="hello?"))
+    wt._process_waiting_input(append)
 
+    if append.ends:
+        assert wt.out_queue.empty()
+        _route(wt)
+        assert _signals(sent) == [("w0", None, [], {"audio_in": 0})]
+        return
     error = wt.out_queue.get_nowait()
     assert error.modality == "error" and error.metadata["status"] == 400
-    assert b"takes no text" in error.data
+    assert b"takes no text or model_kwargs" in error.data
     _route(wt)
     assert _signals(sent) == []
     assert [b.request_id for b in _bodies(sent, ConductorMessageType.ABORT_REQUEST)] == ["r"]
@@ -426,6 +443,95 @@ def test_prompt_tensors_named_after_a_client_stream_are_its_first_chunk(tmp_path
     assert not new.input_open
     _route(wt)
     assert _signals(sent) == [("w0", "audio_in", [[8]], {}), ("w0", None, [], {"audio_in": 1})]
+
+
+@pytest.mark.parametrize("ends, open_streams", [(frozenset(), {"audio_in"}), (END, frozenset())])
+def test_process_prompt_is_told_which_streams_the_opening_leaves_open(ends, open_streams):
+    """So a model can refuse a live opening its settings can't serve
+    (Qwen3-TTS text in a layout that streams none); a client's own
+    ``open_streams`` kwarg can't stand in for it."""
+    model, seen = _ListeningModel(), []
+    model.process_prompt = lambda *args, open_streams, **kwargs: (
+        seen.append(open_streams) or {"text_inputs": [torch.tensor([1])]}
+    )
+    wt, _sent, _tm = _thread(model)
+    wt._process_input(PreprocessInput(
+        request_id="r", text="hi", file_paths=None, input_modalities=["text"], output_modalities=["text"],
+        model_kwargs={"open_streams": ["audio_in"]}, ends=ends,
+    ))
+    assert seen == [open_streams]
+class _FramedModel(_ListeningModel):
+    """``audio_in`` declares ClientAudio on a 4-sample frame, and the model
+    has no process_stream_chunk: the data worker turns its appends into items."""
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), audio=ClientAudio(16000, 4)),
+        ])
+
+    def process_prompt(self, *a, **k):
+        return {"text_inputs": [torch.tensor([1])], "audio_in": [torch.zeros(6)]}
+
+    def process_stream_chunk(self, chunk):
+        raise AssertionError("the data worker takes ClientAudio appends itself")
+
+
+def test_client_audio_goes_on_in_whole_frames_whatever_the_appends(tmp_path):
+    """Each append's whole frames go as an item each, the opening clip's as
+    one item, with the rest waiting for the next append, so every route keeps
+    a call on its consumer's frame; the stream's end takes the rest along,
+    before it."""
+    wt, sent, _tm = _thread(_FramedModel())
+    _open(wt)                                                                 # 6: 4 and 2 left
+    _route(wt)
+    for append in (
+        ClientAppend("r", samples={"audio_in": np.full(1, 0.5, np.float32)}),   # 3: nothing yet
+        ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 9)]}),   # 12: three frames
+        ClientAppend("r", samples={"audio_in": np.zeros(5, np.float32)}),        # 4 and 1 left
+        ClientAppend("r", ends=END),                                             # the 1, then the end
+    ):
+        wt._process_stream_input(append)
+
+    assert _signals(sent) == [("w0", "audio_in", dims, {}) for dims in ([[4]], [[4]] * 3, [[4]], [[1]])] + [
+        ("w0", None, [], {"audio_in": 6})]
+
+
+def test_an_opening_clip_shorter_than_a_frame_sends_nothing_until_one_fills():
+    class _Short(_FramedModel):
+        def process_prompt(self, *a, **k):
+            return {"text_inputs": [torch.tensor([1])], "audio_in": [torch.zeros(3)]}
+
+    wt, sent, _tm = _thread(_Short())
+    _open(wt)
+    _route(wt)
+    assert _signals(sent) == []
+    wt._process_stream_input(ClientAppend("r", samples={"audio_in": np.zeros(1, np.float32)}))
+    assert _signals(sent) == [("w0", "audio_in", [[4]], {})]
+
+
+@pytest.mark.parametrize("append, error", [
+    (ClientAppend("r", text="hello"), b"audio appends only; got text"),
+    (ClientAppend("r", samples={"audio_in": np.array([0.0, np.nan], np.float32)}), b"NaN or inf"),
+    (ClientAppend("r", samples={"audio_in": np.zeros((2, 2), np.float32)}), b"mono audio"),
+    ("48000", b"must be 16000 Hz audio; got 48000 Hz"),
+])
+def test_client_audio_appends_are_checked_before_they_are_sent(tmp_path, append, error):
+    class _Resampled(_FramedModel):
+        def load_audio(self, filepath, device):
+            out = super().load_audio(filepath, device)
+            return TensorAndMetadata(out.data, {"sample_rate": 16000, "source_sample_rate": 48000})
+
+    wt, sent, _tm = _thread(_Resampled())
+    _open(wt)
+    _route(wt)
+    if append == "48000":
+        append = ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 8)]})
+    wt._process_waiting_input(append)
+
+    reply = wt.out_queue.get_nowait()
+    assert reply.metadata["status"] == 400 and error in reply.data
+    assert _signals(sent) == [("w0", "audio_in", [[4]], {})]   # the opening's frame alone
 
 
 def test_an_append_for_a_finished_request_is_dropped(tmp_path):
@@ -811,7 +917,7 @@ def test_generate_ws_opens_appends_and_ends_in_order(monkeypatch, tmp_path):
     monkeypatch.setattr(entrypoint, "api_server", fake)
     wav = {"name": "chunk.wav", "data": "UklGRg=="}
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "call", "append": [wav]}))
         ws.send_text(json.dumps({"request_id": "call", "append": [wav], "end_input": True}))
         assert _recv_json(ws) == {"request_id": "call", "finish": True}
@@ -858,7 +964,7 @@ def test_closing_the_socket_aborts_the_calls_it_opened(monkeypatch, tmp_path):
     fake = _HangingServer(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]}))
         deadline = time.time() + 5
         while len(fake.calls) < 2 and time.time() < deadline:
@@ -875,7 +981,7 @@ def test_generate_ws_rejects_bad_ids_in_band_and_stays_up(monkeypatch, tmp_path)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
         ws.send_text(json.dumps({"request_id": ["oops"], "append": []}))
         assert "must be a string" in _recv_json(ws)["error"]
-        ws.send_text(json.dumps({"output_modalities": "text,audio"}))      # a live call with no id
+        ws.send_text(json.dumps({"output_modalities": "text,audio", "end_input": False}))      # a live call with no id
         assert "needs a request_id" in _recv_json(ws)["error"]
         ws.send_text(json.dumps({"request_id": "ok", "output_modalities": "text", "end_input": True,
                                  "text": "hi"}))
@@ -886,10 +992,12 @@ def test_an_append_after_end_input_is_answered_and_the_call_goes_on(monkeypatch,
     fake = _HangingServer(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "b", "output_modalities": "text,audio"}))
+        ws.send_text(json.dumps({"request_id": "b", "output_modalities": "text,audio", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "b", "end_input": True}))
         ws.send_text(json.dumps({"request_id": "b", "append": [{"name": "c.wav", "data": "UklGRg=="}]}))
-        assert "not taking input" in _recv_json(ws)["error"]
+        late = _recv_json(ws)["error"]
+        assert "not taking input" in late
+        assert "end_input: false" not in late, "the call was opened live"
         assert fake.aborted == []
 
 
@@ -907,7 +1015,7 @@ def test_a_rejected_append_ends_the_call_with_its_error_and_no_finish(monkeypatc
         server.max_call_input_bytes = 1
     bad = {"name": "x.unknown", "data": "AA=="} if "unknown" in why else {"name": "c.wav", "data": "UklGRg=="}
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "call", "append": [bad]}))
         error = _recv_json(ws)
         # the next frame answers this probe: no finish came between
@@ -926,7 +1034,7 @@ def test_an_append_after_the_model_ended_the_call_is_late_not_rejected(monkeypat
     call's last chunks, a bad append must not fail a reply that is done."""
     server = _real_ws_server(monkeypatch, tmp_path)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         assert _wait(lambda: "call" in server._live)
         key = server._live["call"]
         messages = [APIServerMessage("request_complete", RequestComplete(
@@ -997,13 +1105,21 @@ def test_an_opening_file_naming_a_stream_the_model_lacks_is_refused_with_a_400()
     assert isinstance(server.preprocess_worker.items[0], PreprocessInput)
 
 
-def test_an_append_s_text_counts_against_the_input_budget():
+def test_an_append_s_text_model_kwargs_and_samples_count_against_the_input_budget():
     server = _server()
+    server.client_audio = [Connection(CLIENT, "Ear", "audio_in", chunk_policy_factory=lambda: None,
+                                      audio=ClientAudio(16000, 4))]
     server.max_call_input_bytes = 8
     key = _submit(server, end_input=False)
     assert server.stream_input(key, text="four") is True                 # 4 of 8
     with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, model_kwargs={"a": 1})                  # 4 + 8 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, model_kwargs={"b": b"xy"})              # a msgpack frame's bytes: 4 + 11
+    with pytest.raises(ValueError, match="max_call_input_mb"):
         server.stream_input(key, text="fives")                           # 9 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, samples={"audio_in": np.zeros(2, np.float32)})   # 12 of 8
     assert server.preprocess_worker.items[-1] == ClientAppend(key, text="four")
 
 
@@ -1049,7 +1165,7 @@ def test_generate_ws_ends_the_streams_end_input_lists(monkeypatch, tmp_path):
     server = _real_ws_server(monkeypatch, tmp_path)
     server.client_streams = frozenset({"audio_in", "video_in"})
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "end_input": ["video_in"]},                     # an append: no input
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}], "end_input": ["audio_in"]},
         {"request_id": "call", "end_input": ["audio_in"]},                     # late now
@@ -1067,7 +1183,7 @@ def test_generate_ws_ends_the_streams_end_input_lists(monkeypatch, tmp_path):
 def test_generate_ws_refuses_ending_a_stream_the_model_lacks(monkeypatch, tmp_path):
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "end_input": ["video_in"]},
         {"request_id": "bad", "text": "x", "end_input": [7]},
     ])
@@ -1083,12 +1199,13 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
     monkeypatch.setattr(entrypoint, "api_server", fake)
     wav = {"name": "chunk.wav", "data": "UklGRg=="}
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [wav]},                                 # the shorthand
         {"request_id": "call", "append": {"files": [wav]}},                      # the same, as a record
         {"request_id": "call", "append": {"text": "hello"}},                     # text only
         {"request_id": "call", "append": {"files": [{**wav, "stream": "audio_in"}],
                                           "model_kwargs": {"gain": 2}, "text": None}},
+        {"request_id": "call", "append": {"model_kwargs": {"gain": 4}}},           # model_kwargs only
         {"request_id": "call", "append": {"model_kwargs": '{"gain": 3}', "text": "x"}, "end_input": True},
     ])
     # until the call finishes: the socket's close aborts a call still running
@@ -1096,13 +1213,15 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
 
     assert ws.sent == [{"request_id": "call", "finish": True}]
     assert [c[2:] for c in fake.calls[1:]] == [
-        (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], True),
+        (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], False),
+        ([], True),
     ]
     assert fake.appended == [
         {"text": None, "file_streams": None, "model_kwargs": None},
         {"text": None, "file_streams": None, "model_kwargs": None},
         {"text": "hello", "file_streams": None, "model_kwargs": None},
         {"text": None, "file_streams": {"audio": ["audio_in"]}, "model_kwargs": {"gain": 2}},
+        {"text": None, "file_streams": None, "model_kwargs": {"gain": 4}},
         {"text": "x", "file_streams": None, "model_kwargs": {"gain": 3}},
     ]
 
@@ -1120,7 +1239,7 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
         "text-beside", "kwargs-beside"])
 def test_a_malformed_append_record_ends_the_call_with_a_400(monkeypatch, tmp_path, append):
     server = _real_ws_server(monkeypatch, tmp_path)
-    ws = _QueuedFramesSocket([{"request_id": "call", "output_modalities": "text"}, append])
+    ws = _QueuedFramesSocket([{"request_id": "call", "output_modalities": "text", "end_input": False}, append])
     asyncio.run(_serve(ws, until=lambda: ws.sent))
 
     (error,) = ws.sent
@@ -1132,7 +1251,7 @@ def test_a_malformed_append_record_ends_the_call_with_a_400(monkeypatch, tmp_pat
 def test_generate_ws_refuses_an_append_to_a_stream_the_model_lacks(monkeypatch, tmp_path):
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": {"files": [{"name": "c.wav", "data": "UklGRg==", "stream": "nope"}]}},
     ])
     asyncio.run(_serve(ws, until=lambda: ws.sent))
@@ -1166,7 +1285,7 @@ def test_an_append_the_model_routes_to_an_ended_stream_is_answered_as_late(monke
     fake = _RoutedToAnEndedStream(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
     ])
     calls_at_the_reply = []
@@ -1190,7 +1309,7 @@ def test_what_an_append_record_carries_never_opens_a_request(monkeypatch, tmp_pa
     record feed the call, whatever else the message holds."""
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "output_modalities": "text",
          "append": {"text": "more", "files": [{"name": "c.wav", "data": "UklGRg=="}],
                     "model_kwargs": {"gain": 2}}},
@@ -1219,10 +1338,10 @@ def test_a_second_socket_cannot_take_over_a_live_call(monkeypatch, tmp_path):
     monkeypatch.setattr(entrypoint, "api_server", server)
     client = TestClient(entrypoint.app)
     with client.websocket_connect("/generate/ws") as a, client.websocket_connect("/generate/ws") as b:
-        a.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        a.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         assert _wait(lambda: "call" in server._live)
         first = server._live["call"]
-        b.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio"}))
+        b.send_text(json.dumps({"request_id": "call", "output_modalities": "text,audio", "end_input": False}))
         refused = _recv_json(b)
         a.send_text(json.dumps({"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]}))
         assert _wait(lambda: any(isinstance(i, ClientAppend) for i in server.preprocess_worker.items))
@@ -1365,7 +1484,7 @@ def test_a_new_request_under_a_live_calls_id_is_refused_and_the_call_goes_on(mon
     in flight: refused with a 409, the call untouched."""
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text,audio"},
+        {"request_id": "call", "output_modalities": "text,audio", "end_input": False},
         {"request_id": "call", "output_modalities": "text,audio", "text": "hello again"},
         {"request_id": "call", "text": "a separate question", "end_input": True},
         {"request_id": "other", "end_input": True},
@@ -1385,7 +1504,7 @@ def test_an_end_of_input_with_settings_or_null_fields_ends_the_call_s_input(monk
     is no field at all."""
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text,audio"},
+        {"request_id": "call", "output_modalities": "text,audio", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}], "files": None},
         {"request_id": "call", "end_input": True, "model_kwargs": {}, "output_modalities": "text,audio",
          "text": None},
@@ -1404,7 +1523,7 @@ def test_a_failed_request_cannot_take_over_the_next_calls_entry(monkeypatch, tmp
     server = _real_ws_server(monkeypatch, tmp_path)
     ws = _QueuedFramesSocket([
         {"request_id": "A", "text": "x", "model_kwargs": "{not json", "end_input": True},
-        {"request_id": "A", "output_modalities": "text"},
+        {"request_id": "A", "output_modalities": "text", "end_input": False},
     ])
 
     def streaming():
@@ -1417,17 +1536,24 @@ def test_a_failed_request_cannot_take_over_the_next_calls_entry(monkeypatch, tmp
     assert server.preprocess_worker.aborted == ["A#1"]
 
 
-def test_a_null_end_input_is_false(monkeypatch, tmp_path):
+def test_an_opening_is_one_shot_unless_it_sends_end_input_false(monkeypatch, tmp_path):
+    """As on /generate, a call's input ends with its opening unless the
+    opening keeps it open. A null field counts as absent: one-shot on an
+    opening, ending nothing on an append."""
     fake = _StreamingFakeServer(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text", "end_input": None},
+        {"request_id": "one", "text": "hi"},
+        {"request_id": "nil", "text": "hi", "end_input": None},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}], "end_input": None},
     ])
-    asyncio.run(_serve(ws, until=lambda: len(fake.calls) >= 2))
+    asyncio.run(_serve(ws, until=lambda: len(fake.calls) >= 4))
 
-    assert ws.sent == []
-    assert fake.calls[:2] == [("submit", "call", False), ("append", "call", ["c.wav"], False)]
+    assert fake.calls[:4] == [
+        ("submit", "one", True), ("submit", "nil", True),
+        ("submit", "call", False), ("append", "call", ["c.wav"], False),
+    ]
 
 
 def test_a_bad_append_racing_the_end_of_the_call_is_answered_as_late(monkeypatch, tmp_path):
@@ -1444,7 +1570,7 @@ def test_a_bad_append_racing_the_end_of_the_call_is_answered_as_late(monkeypatch
     fake = _EndsMeanwhile(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
     ])
     asyncio.run(_serve(ws, until=lambda: ws.sent))
@@ -1465,7 +1591,7 @@ def test_an_append_that_fails_internally_hides_the_error_from_the_client(monkeyp
     fake = _Fails(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
     ])
     asyncio.run(_serve(ws, until=lambda: any(c[0] == "reject" for c in fake.calls)))
@@ -1489,7 +1615,7 @@ def test_an_append_the_call_stops_taking_meanwhile_is_answered_as_late(monkeypat
     fake = _EndsMeanwhile(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "output_modalities": "text", "end_input": False},
         {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
     ])
     asyncio.run(_serve(ws, until=lambda: ws.sent))
@@ -1512,7 +1638,7 @@ def test_replies_to_appends_never_hold_up_reading(monkeypatch, tmp_path):
     monkeypatch.setattr(entrypoint, "api_server", fake)
     wav = {"name": "c.wav", "data": "UklGRg=="}
     ws = _UnreadSocket([
-        {"request_id": "a", "output_modalities": "text"},
+        {"request_id": "a", "output_modalities": "text", "end_input": False},
         {"request_id": "a", "end_input": True},
         {"request_id": "a", "append": [wav]},                  # late
         {"request_id": "nobody", "append": [wav]},             # not this socket's
@@ -1524,10 +1650,10 @@ def test_replies_to_appends_never_hold_up_reading(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("frames", [
-    [{"request_id": "a", "output_modalities": "text"}],                  # a 409
-    [{"request_id": 7, "text": "x"}],                                    # a bad id
-    [{"output_modalities": "text"}],                                     # a live call without an id
-    [{"request_id": "b", "output_modalities": "text"},                   # a call that fails to open,
+    [{"request_id": "a", "output_modalities": "text", "end_input": False}],   # a 409
+    [{"request_id": 7, "text": "x"}],                                         # a bad id
+    [{"output_modalities": "text", "end_input": False}],                      # a live call without an id
+    [{"request_id": "b", "output_modalities": "text", "end_input": False},    # a call that fails to open,
      {"request_id": "b", "append": [{"name": "c.wav", "data": "UklGRg=="}]}],  # then its append
 ], ids=["in-use", "bad-id", "no-id", "failed-call-append"])
 def test_refusals_never_hold_up_reading(monkeypatch, tmp_path, frames):
@@ -1547,7 +1673,7 @@ def test_refusals_never_hold_up_reading(monkeypatch, tmp_path, frames):
     fake = _Busy(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _UnreadSocket([
-        {"request_id": "a", "output_modalities": "text"},
+        {"request_id": "a", "output_modalities": "text", "end_input": False},
         *frames,
         {"request_id": "c", "text": "next", "end_input": True},
     ])
@@ -1572,7 +1698,7 @@ def test_every_append_queued_behind_a_refused_opening_is_answered(monkeypatch, t
     monkeypatch.setattr(entrypoint, "api_server", fake)
     wav = {"name": "c.wav", "data": "UklGRg=="}
     ws = _QueuedFramesSocket([
-        {"request_id": "b", "output_modalities": "text"},
+        {"request_id": "b", "output_modalities": "text", "end_input": False},
         *[{"request_id": "b", "append": [wav]} for _ in range(3)],
     ])
     asyncio.run(_serve(ws, until=lambda: sum(1 for m in ws.sent if m.get("append")) == 3))
@@ -1596,7 +1722,7 @@ def test_an_append_file_that_cannot_be_deleted_does_not_end_the_socket(monkeypat
     fake = _Refuses(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     ws = _QueuedFramesSocket([
-        {"request_id": "a", "output_modalities": "text"},
+        {"request_id": "a", "output_modalities": "text", "end_input": False},
         {"request_id": "a", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
         {"request_id": "c", "text": "next", "end_input": True},
     ])

@@ -9,7 +9,7 @@ import yaml
 
 from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
@@ -29,9 +29,9 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.bagel.bagel_model import CFG_WINDOW, ROLE_TURNS, BagelModel
 from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
-from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule
+from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule, cfg_window
 from mstar.model.submodule_base import END_PARTITION
 
 
@@ -46,18 +46,36 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50, max_position_embeddings=32768,
+        num_timesteps=50, timestep_shift=3.0, max_position_embeddings=32768,
+        think_mode=False, cfg_text_scale=1.0, cfg_img_scale=1.0, cfg_interval=[0.4, 1.0],
+        cfg_renorm_type="global", cfg_renorm_min=0.0,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
         repetition_penalty=1.0,
         ignore_eos=False,
         vocab_size=32,
+        # the image geometry check_request_kwargs bounds width / height by
+        latent_downsample=16, max_latent_size=64,
     )
+    model.sampling_defaults = {
+        "temperature": 1.0, "top_k": 0, "top_p": 1.0,
+        "repetition_penalty": 1.0, "ignore_eos": False,
+    }
     model._has_cfg_parallel = True
     model._has_llm_disaggregation = False
     model._image_gen_remote_handoff = False
     return model
+
+
+def _image_kwargs(model: BagelModel, kwargs: dict) -> dict:
+    """An image request's kwargs with the `CFGWindow` process_prompt resolves from them."""
+    params = model._request_params(["text"], ["image"], kwargs)
+    window = cfg_window(
+        model.config.num_timesteps, model.config.timestep_shift, tuple(params["cfg_interval"]),
+        params["cfg_text_scale"], params["cfg_img_scale"],
+    )
+    return {**kwargs, CFG_WINDOW: tuple(window)}
 
 
 def test_cfg_graph_is_reused_for_tp_branches():
@@ -97,13 +115,9 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
 def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model = _bare_model()
     model._has_llm_disaggregation = True
-    args = {
-        "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
-        )
-    }
-
-    config = model.get_request_resource_configs(args)["kv"]
+    # a text-to-image request, guided or not by its own cfg_text_scale
+    kwargs = _image_kwargs(model, {"cfg_text_scale": 4.0})
+    config = model.get_request_resource_configs(["text"], ["image"], kwargs)["kv"]
 
     assert config.publish_labels_per_node_walk == {
         ("LLM", "prefill_text"): ["main", "cfg_text", "cfg_img"],
@@ -115,8 +129,8 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     }
     assert config.get_publish_labels("LLM", "decode", ["main", "cfg_img"]) == []
 
-    args["default"].full_metadata.kwargs["requires_cfg"] = False
-    config = model.get_request_resource_configs(args)["kv"]
+    kwargs = _image_kwargs(model, {"cfg_text_scale": 1.0})
+    config = model.get_request_resource_configs(["text"], ["image"], kwargs)["kv"]
     assert {
         tuple(labels)
         for labels in config.publish_labels_per_node_walk.values()
@@ -145,36 +159,72 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
 
 
 @pytest.mark.parametrize(
-    ("schedule", "target", "think", "ignore_eos", "stop"),
+    ("inputs", "target", "think", "ignore_eos", "k", "stop"),
     [
-        (["prefill_vit", "prefill_text"], "text", False, False, {END_PARTITION}),
-        (["prefill_vit", "prefill_text"], "text", False, True, set()),
+        # prefill_text, prefill_vit, prefill_text, decode
+        (["image", "text"], "text", False, False, 2, {END_PARTITION}),
+        (["image", "text"], "text", False, True, 2, set()),
         # an earlier prefill's token is not the reply's
-        (["prefill_text", "prefill_vit", "prefill_text"], "text", False, False, set()),
+        (["image", "text"], "text", False, False, 0, set()),
         # thinking ends here, but image_gen still has to run
-        (["prefill_text", "prefill_text"], "image", True, False, set()),
-        (["prefill_text"], "text", False, False, {"decode_loop"}),
+        (["text"], "image", True, False, 1, set()),
+        (["text"], "text", False, False, 1, {"decode_loop"}),
     ],
     ids=["last-prefill", "ignore-eos", "earlier-prefill", "think-then-image", "decode"],
 )
-def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(schedule, target, think, ignore_eos, stop):
+def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(inputs, target, think, ignore_eos, k, stop):
     """The prefill's token comes before decode_loop exists, so a stop there
     ends the partition rather than naming a loop the walk doesn't have."""
-    metadata = CurrentForwardConductorMetadata(graph_walk=schedule[0], is_prefill=True, kwargs={
-        "prefill_schedule": [(walk, object()) for walk in schedule], "prefill_step": 0,
-        "target_output": target, "think_mode": think, "requires_cfg": False,
-        "cfg_text_scale": 1.0, "cfg_img_scale": 1.0, "cfg_interval": (0.0, 1.0),
-        "cfg_renorm_type": "global", "cfg_renorm_min": 0.0, "width": 0, "height": 0, "image_preprocess": None,
-    })
-    step = _bare_model().get_partition_forward_pass_args("default", metadata, {})
+    from test_ingest_unpersist import plan_step
+
+    model = _bare_model()
+    model._has_cfg_parallel = False
+    signals = {name: [SimpleNamespace(dims=[3, 8, 8])]
+               for name in ("text_inputs.0", "text_inputs.1", *(("image_inputs.0",) if "image" in inputs else ()))}
+    # a text reply's prompt is written as role turns (bagel_model.uses_role_turns)
+    kwargs = {"think_mode": think, ROLE_TURNS: target == "text"}
+    if target == "image":
+        kwargs = _image_kwargs(model, kwargs)
+    plan = model.walk_plan("default", inputs, [target], signals, kwargs)
+    step = plan_step(model, plan, k, signals)
     info = CurrentForwardPassInfo(
-        request_id="r", graph_walk=step.full_metadata.graph_walk, fwd_index=0, random_seed=0, max_tokens=100,
+        request_id="r", graph_walk=plan[k].walk, fwd_index=0, random_seed=0, max_tokens=100,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)}, step_metadata=step.step_metadata,
     )
     llm = SimpleNamespace(eos_token_id=4)
     outputs = {"new_token": [torch.tensor([4])]}
     LLMSubmodule.postprocess(llm, "r", info, outputs)
     assert LLMSubmodule.check_stop(llm, "r", info, outputs) == stop
+
+
+@pytest.mark.parametrize(("inputs", "target", "think"), [
+    (["image", "text"], "text", False),
+    (["text"], "image", True),
+], ids=["text", "think-then-image"])
+def test_a_one_token_budget_ends_at_the_prefills_token(inputs, target, think):
+    """The last prefill samples the only token asked for, so no decode step
+    follows it: a text reply ends there, and a think-then-image request goes
+    straight to its image."""
+    from mstar.model.bagel.bagel_model import DECODE, FINAL_PREFILL
+
+    model = _bare_model()
+    model._has_cfg_parallel = False
+    signals = {name: [SimpleNamespace(dims=[3, 8, 8])]
+               for name in ("text_inputs.0", "text_inputs.1", *(("image_inputs.0",) if "image" in inputs else ()))}
+    kwargs = {"think_mode": think, ROLE_TURNS: target == "text"}
+    if target == "image":
+        kwargs = _image_kwargs(model, kwargs)
+    full = model.walk_plan("default", inputs, [target], signals, kwargs)
+    one = model.walk_plan("default", inputs, [target], signals, {**kwargs, "max_output_tokens": 1})
+    assert DECODE in [step.walk for step in full]
+    assert DECODE not in [step.walk for step in one]
+    last_prefill = max(k for k, step in enumerate(one) if step.step_metadata.get(FINAL_PREFILL) is not None)
+    assert one[last_prefill].step_metadata[FINAL_PREFILL] is True
+    if target == "text":
+        assert len(one) == last_prefill + 1
+    else:
+        assert [step.walk for step in one[last_prefill + 1:]] == [step.walk for step in full if step.walk != DECODE][
+            last_prefill + 1:]
 
 
 def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():

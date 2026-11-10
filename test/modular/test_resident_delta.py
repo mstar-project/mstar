@@ -31,6 +31,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
     MessageSource,
@@ -129,10 +130,8 @@ def test_an_empty_delta_is_falsy():
 # --- the engine's journal and replay ----------------------------------------
 
 
-class _Resource:
+class _Resource(StubResource):
     supports_eviction = True
-    supports_preplan = False
-    force_double_buffer = False
 
     def __init__(self):
         self.offloaded: set[str] = set()
@@ -726,7 +725,7 @@ def _oom(rank, referenced_rids=frozenset()):
     rank.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name="node", failed_resource=None,
         admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
-        request_ids=["r0", "r1"], cached_rids=set(),
+        request_ids=["r0", "r1"], cached_rids=set(), no_forward_rids=set(),
     ), referenced_rids)
 
 

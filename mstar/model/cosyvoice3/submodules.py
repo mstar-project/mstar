@@ -63,9 +63,9 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.model.chatterbox.components.audio import kaldi_fbank_80
-from mstar.model.chatterbox.components.audio_frontend import resample
+from mstar.model.chatterbox.components.audio_frontend import kaldi_fbank_80, resample
 from mstar.model.chatterbox.submodules import VoiceCache
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.cosyvoice3.components.dit import PackedRows
 from mstar.model.cosyvoice3.components.flow import (
     CosyVoice3FlowRow,
@@ -163,7 +163,7 @@ class ReferenceEncoder:
     from the 24 kHz one, both cut so the mel has exactly two frames a token.
     Shared by the speaker-encoder and flow nodes when they are colocated."""
 
-    def __init__(self, tokenizer: nn.Module, mel: nn.Module | None, campplus: nn.Module | None):
+    def __init__(self, tokenizer: nn.Module, mel: MatchaLogMel, campplus: nn.Module | None):
         self.tokenizer = tokenizer
         self.mel = mel
         self.campplus = campplus
@@ -176,15 +176,8 @@ class ReferenceEncoder:
         with native_convolutions():
             tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
-        frames = self._mel_frames(wav24.numel())
+        frames = self.mel.num_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
-
-    def _mel_frames(self, num_samples: int) -> int:
-        from mstar.model.chatterbox.components.audio import MelSpectrogram24k
-
-        if isinstance(self.mel, MelSpectrogram24k):
-            return self.mel.num_frames(num_samples)
-        return num_samples // 480
 
     @torch.no_grad()
     def voice(self, wav24: torch.Tensor) -> ReferenceVoice:
@@ -282,6 +275,11 @@ class LMSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Captured LM prefills, packed, by total tokens. A prefill they don't hold
+    # runs eagerly, about 30 ms of launches stalling its worker's decode. A
+    # deployment sets its own with the serving config's `prefill_token_buckets`
+    # (`{llm: {prefill_voice: [...]}}`).
+    LM_PREFILL_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024]
 
     def __init__(self, model: nn.Module, config: CosyVoice3Config):
         super().__init__()
@@ -552,12 +550,12 @@ class LMSubmodule(ARNodeSubmodule):
                 compile=False,
             )
         ]
-        if self.config.lm_prefill_token_buckets:
+        if self.config.lm_prefill_batch_sizes:
             configs.append(
                 PackedAcceleratorGraphConfig(
                     capture_graph_walk="prefill_voice",
                     replay_graph_walks=list(PREFILL_WALKS),
-                    capture_token_lengths=list(self.config.lm_prefill_token_buckets),
+                    capture_token_lengths=list(self.LM_PREFILL_TOKEN_BUCKETS),
                     make_node_input=lambda n: ARNodeInputs(
                         input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
                         input_seq_len=n,

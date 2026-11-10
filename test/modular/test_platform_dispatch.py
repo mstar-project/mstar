@@ -225,6 +225,7 @@ def fake_compile(monkeypatch):
 
 class _GraphRunner:
     _forward_for = AcceleratorGraphRunner._forward_for
+    recompile_limit = None
 
     def __init__(self):
         self._submodule = _Submodule()
@@ -234,7 +235,7 @@ class _GraphRunner:
 def _bucket(num_tokens: int):
     return SimpleNamespace(
         config=SimpleNamespace(
-            compile=True, compile_mode=None, capture_forward_method="forward_batched",
+            compile=True, compile_mode=None, inductor_options=None, capture_forward_method="forward_batched",
         ),
         config_idx=0,
         num_tokens=num_tokens,

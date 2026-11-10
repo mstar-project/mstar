@@ -37,9 +37,9 @@ def parse_ndjson_line(line: str) -> dict | None:
 
     Returns ``{"modality", "bytes", "metadata"}``, or ``None`` for a blank
     line. The server writes only JSON lines, so one that does not parse is a
-    stream cut mid-line and raises, as does a top-level ``error`` (the Rust
-    frontend's in-band failure envelope), rather than ending the stream as if
-    it were complete.
+    stream cut mid-line and raises, as does a top-level ``error`` (the in-band
+    failure envelope of Rust frontends before they wrote Python's ``error``
+    chunk), rather than ending the stream as if it were complete.
     """
     line = line.strip()
     if not line:

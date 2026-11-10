@@ -1,6 +1,7 @@
 
 import json
 import logging
+import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
@@ -456,12 +457,41 @@ class TextChunkDetokenizer:
         return data
 
 
+class SentencePieceDetokenizer:
+    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
+    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
+    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
+    per token, so a character split across byte pieces reassembles client-side.
+    """
+
+    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
+        vocab = tokenizer_json["model"]["vocab"]
+        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
+            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
+        vocab = dict(vocab)
+        for added in tokenizer_json.get("added_tokens", []):
+            vocab[added["content"]] = added["id"]
+        self.pieces = {idx: piece for piece, idx in vocab.items()}
+        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        piece = self.pieces.get(token_id)
+        if piece is None or token_id in self.skip_ids:
+            return b""
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+            return bytes([int(piece[3:5], 16)])
+        return piece.replace("▁", " ").encode("utf-8")
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return b"".join(self.token_bytes(i) for i in token_ids)
+
+
 class TextOutput(NamedTuple):
     """How a model's text output, token ids, becomes bytes: ``Model.text_output``
     declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
     derive their text paths from it."""
 
-    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
 
@@ -494,6 +524,7 @@ _KNOBS = {
 
 def load_generation_defaults(
     checkpoint_dir: str | Path | None, prefix: str = "", stage: str = "",
+    switch_only: bool = False,
 ) -> dict:
     """The sampling defaults ``checkpoint_dir/generation_config.json`` declares.
 
@@ -501,6 +532,8 @@ def load_generation_defaults(
     ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads
     ``talker_temperature``) and ``stage`` prefixes the returned names
     (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.
+    ``switch_only`` reads ``do_sample`` alone, for a file that is the backbone's
+    chat preset rather than the model's own recipe.
     Returns ``{}`` when there is no file, so the caller's own defaults apply.
     """
     if checkpoint_dir is None:
@@ -514,7 +547,7 @@ def load_generation_defaults(
         logger.warning("Unreadable %s; using the model's own defaults", path)
         return {}
     out = {}
-    for hf_key, knob in _KNOBS.items():
+    for hf_key, knob in ({} if switch_only else _KNOBS).items():
         value = config.get(prefix + hf_key)
         if value is not None:
             out[stage + knob] = value
@@ -624,6 +657,14 @@ def capture_ladder(key: str, value) -> list[int]:
     return list(value)
 
 
+def warn_retired_ladder_env(name: str, setting: str) -> None:
+    """Warn that the environment variable ``name``, a capture ladder the serving config's
+    ``prefill_token_buckets`` replaced, is set but no longer read; ``setting`` is the
+    serving config entry that sets it."""
+    if name in os.environ:
+        logger.warning("%s is no longer read; set the ladder in the serving config: %s", name, setting)
+
+
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
     """Raise unless ``loaded`` names every parameter of ``module``: one built on
     ``meta`` and filled by a loader would otherwise serve uninitialized memory."""
@@ -682,32 +723,3 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
                 f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
-
-
-class SentencePieceDetokenizer:
-    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
-    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
-    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
-    per token, so a character split across byte pieces reassembles client-side.
-    """
-
-    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
-        vocab = tokenizer_json["model"]["vocab"]
-        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
-            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
-        vocab = dict(vocab)
-        for added in tokenizer_json.get("added_tokens", []):
-            vocab[added["content"]] = added["id"]
-        self.pieces = {idx: piece for piece, idx in vocab.items()}
-        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
-
-    def piece_bytes(self, token_id: int) -> bytes:
-        piece = self.pieces.get(token_id)
-        if piece is None or token_id in self.skip_ids:
-            return b""
-        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
-            return bytes([int(piece[3:5], 16)])
-        return piece.replace("▁", " ").encode("utf-8")
-
-    def to_bytes(self, token_ids: list[int]) -> bytes:
-        return b"".join(self.piece_bytes(i) for i in token_ids)

@@ -10,6 +10,7 @@ from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
 if TYPE_CHECKING:
+    import numpy as np
     import torch
 
 
@@ -100,9 +101,6 @@ class LoraAdapterResult:
     op_id: str
     error_message: str | None = None
     status: int = 200
-    # whether the conductor serves the name once the operation is over, so the API
-    # server's selection follows it whatever the outcome; None when it has no LoRA
-    served: bool | None = None
 
 
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
@@ -158,6 +156,10 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    # what the prompt's prefix-cache key chains hang from: the root of the LoRA adapter
+    # the API server selected (``ServedModels.select``), empty for the base model. Set
+    # in process, never from the client's kwargs.
+    prefix_root: bytes = b""
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
     # Inputs the API server already holds decoded, by modality and in order,
@@ -180,6 +182,9 @@ class ClientAppend:
     file_streams: dict[str, list[str | None]] | None = None
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
+    # per ClientAudio stream, decoded mono float32 samples at its declared
+    # rate: a route that decodes the client's codec itself appends without a file
+    samples: "dict[str, np.ndarray] | None" = None
     # Answers the append as late, with an error naming why; called from the
     # preprocess thread when the model routes items to a stream that has
     # ended (by the client, or with its consuming partition). None: nobody

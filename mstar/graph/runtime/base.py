@@ -485,10 +485,11 @@ class RouteInput(NamedTuple):
     # One output signal whose per-rid value is a host scalar the worker
     # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
     # inline in one frame per step instead of as a tensor per request. The
-    # values are in wg_ids.keys() order; empty means none. A runtime without
+    # values are in wg_ids.keys() order; empty means none, and a row whose
+    # value is None takes the tensor path. A runtime without
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
-    inline_values: tuple[int, ...] | list[int] = ()
+    inline_values: tuple[int | None, ...] | list[int | None] = ()
     # The log-prob of the token row i sampled (None without one): it rides
     # with the row's client emits of this step, inline or in a tensor emit's
     # metadata. Empty when no row has one.
@@ -549,8 +550,6 @@ class SendInput(NamedTuple):
     new_token_counts: ParallelList[int, dict[str, int]]
 
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
-    # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed
-    stream_tokens_consumed: ParallelList[int, dict[str, int]] | None = None
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only
     # under enable_prof, so this is None in production.
     profiling: ParallelList[int, Profiling] | None = None
@@ -574,7 +573,7 @@ class PostprocessNeed(IntEnum):
     # the outputs stored as tensors, to route: resume with ``stored``
     STORE = 2
     # the send's Python payloads (forward-pass info, publication, new-token
-    # counts, stream consumption, profiling): resume with ``send``
+    # counts, profiling): resume with ``send``
     SEND = 3
 
 
@@ -624,7 +623,7 @@ class RouteTensors(NamedTuple):
     tensors: list[int]
     num_tensors: list[int]
     inline_signal: str | None = None
-    inline_values: tuple[int, ...] | list[int] = ()
+    inline_values: tuple[int | None, ...] | list[int | None] = ()
     logprobs: tuple[float | None, ...] | list[float | None] = ()
 
 

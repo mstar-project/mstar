@@ -12,7 +12,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 
 | Layer | Path | Owns |
 | --- | --- | --- |
-| API server | `mstar/api_server/` | HTTP, tokenization, media loading, streaming results back |
+| API server | `mstar/api_server/` | tokenization, media loading, and the Python HTTP frontend, which is being retired (invariant 15) |
 | Conductor | `mstar/conductor/` | request lifecycle, graph-walk transitions, worker selection |
 | Worker | `mstar/worker/` | one process per GPU: micro-scheduler, async execution, tensor routing |
 | Engine | `mstar/engine/engine.py` | compiles forwards, captures accelerator graphs, batches, runs admit/plan/forward/commit |
@@ -20,7 +20,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 | Models | `mstar/model/` | computation graph, tokenization, resource *declarations*, submodules |
 | Graph | `mstar/graph/` | M* graph primitives and logic |
 | Communication | `mstar/communication/` | ZMQ control mesh, tensor transport (RDMA/TCP/SHM) |
-| Rust | `rust/` | the graph runtime, vendored transport, SHM arena, and API server |
+| Rust | `rust/` | the graph runtime, vendored transport, SHM arena, and the HTTP API server (`rust/server/`, `mstar-server`) |
 
 Background: [docs/architecture.rst](docs/architecture.rst). Model authoring, end to end: [docs/adding_models.rst](docs/adding_models.rst).
 
@@ -107,7 +107,7 @@ By default the worker speculates step N+1 through the graph while step N is stil
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
 Some additional information:
-- **Speculation "wastes" the last step of a dynamic loop.** AR decode accepts that cost, because it cannot know its length in advance. Flow and diffusion nodes know their iteration count at request ingestion, so they exit early in `prepare_inputs` for the extra step and pay no extra compute (only some CPU work). A node that can do neither sets `enable_async_scheduling=False`.
+- **Speculation "wastes" the last step of a dynamic loop.** AR decode accepts that cost, because it cannot know its length in advance. Flow and diffusion nodes know their iteration count at request ingestion, so they declare it as the loop's cap (`Model.get_loop_caps`): the loop completes on that iteration and neither runtime speculates past it, so there is no extra step at all. A node that can do neither sets `enable_async_scheduling=False`.
 - **A host sync outside `check_stop` forces synchronous execution.** `check_stop` is fed CPU tensors after a D2H that the worker prematerializes on a side stream, so it is free. Any other `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, `bool()`/`if` on a device tensor, or print of one in the step path collapses the pipeline back to serial and usually costs more than it appears. So does building a device tensor from host data per row in `prepare_inputs` (`torch.tensor(x, device="cuda")`, `.to("cuda")` of a pageable tensor): it is a synchronous copy. Values that are already known on the host (e.g., request settings decided in `process_prompt`) should travel in `step_metadata`, not round-trip through the device.
 - **A new resource doing H2D into fixed buffers must set `force_double_buffer`** (see `Resource.force_double_buffer` in [mstar/engine/resources/base.py](mstar/engine/resources/base.py)). Without it, step N+1 overwrites buffers step N is still reading.
 - **Moving GIL-holding Python to another thread does not parallelize it**; it only adds contention (overlapping `prepare_inputs` with the plan thread measured worse). For a host-bound step, the fix is deleting work, not moving it.
@@ -185,7 +185,17 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 - **New handle-keyed state has to be purged when the handle is released**, or it silently attaches to whichever request is given that handle next. `rid_table.py` lists the state known to be handle-keyed; add to it. Clearing at the top of a per-step routine is not a substitute, because early returns skip it.
 - **An unknown rid off the wire is expected; an unknown rid from local state is a bug.** A message can name a request this rank has already removed, so the lookup returns `None` rather than raising — handle that case explicitly at each call site, and say which of the two it is.
 
+### 15. API surfaces land in the Rust frontend
+
+The Python HTTP frontend (the FastAPI routes in `mstar/api_server/entrypoint.py`, `mstar/api_server/openai/router.py` and its `serving_*.py`) is being retired: `mstar serve` is moving to `mstar-server` (`rust/server/`) for every model. Until it is gone, both serve, and nothing new may be served by Python alone:
+
+- **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/` in the same PR** as its Python counterpart, with a test in `test/rust/` that sends the same request to both frontends and compares what reaches `submit_request` and what the client gets back (`test_rust_openai_adapters.py` and `test_rust_frontend.py` have the pattern). A model's adapter is a class in `ADAPTER_REGISTRY` plus a type implementing `OpenAIAdapter` in `rust/server/src/adapters/` and its row in `ADAPTERS`.
+- **`NOT_PORTED` in `test/rust/test_rust_openai_adapters.py` only shrinks.** Adding to it is a regression of the migration, not a follow-up.
+- **What the data worker does per request stays in Python for now**: `process_prompt`, tokenization, detokenization, and media a model's own loader decodes (`ref_audio` is checked by that loader, `media_io.check_ref_audio`). That code is behind both frontends and is not part of this rule.
+- **A behavior change to a surface both frontends serve changes both**, so the two don't drift (an adapter's refusal text, a default, a status code).
+
 ## Testing
+
 
 ```bash
 ruff check .                          # CI enforces this
@@ -197,6 +207,8 @@ CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
+
+Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
 
 ### Running the CPU suite
 
