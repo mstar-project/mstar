@@ -752,6 +752,10 @@ class BagelModel(Model):
             return torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
         return torch.tensor(list(text.encode("utf-8")), dtype=torch.uint8)
 
+    def max_input_files(self) -> dict[str, int]:
+        # images only: the data worker refuses audio and video before decoding them
+        return {"audio": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

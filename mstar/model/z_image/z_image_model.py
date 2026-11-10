@@ -218,6 +218,10 @@ class ZImageModel(Model):
         # past the loop's max_iters the conductor refuses the request
         return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
+    def max_input_files(self) -> dict[str, int]:
+        # text only: the data worker refuses any file before decoding it
+        return {"image": 0, "audio": 0, "video": 0}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

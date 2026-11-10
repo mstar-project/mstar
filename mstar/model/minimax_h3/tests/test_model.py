@@ -219,7 +219,7 @@ def test_files_the_model_cannot_take_are_refused_before_decoding(tmp_path, monke
     worker = _data_worker(model)
     image = _png(tmp_path / "k.png")
     for files in ({"image": [image] * 3}, {"video": [image]}, {"audio": [image]}):
-        with pytest.raises(ValueError, match="at most"):
+        with pytest.raises(ValueError, match="at most|takes no"):
             worker._load_media(files)
 
 

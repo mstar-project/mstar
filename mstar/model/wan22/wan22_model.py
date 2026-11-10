@@ -413,6 +413,10 @@ class Wan22Model(Model):
             raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
         return {"num_inference_steps": steps, "guidance_scale": float(guidance), "negative_prompt": negative}
 
+    def max_input_files(self) -> dict[str, int]:
+        # one conditioning image (image-to-video); the data worker refuses anything else before decoding
+        return {"image": 1, "audio": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

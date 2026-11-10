@@ -150,9 +150,6 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["text"], ["text"])
     with pytest.raises(ValueError, match="reference image"):
         model.process_prompt("x", ["image", "text"], ["image"], tensors={"image_inputs": []})
-    too_many = {"image_inputs": [torch.zeros(3, 64, 64)] * (model.config.max_ref_images + 1)}
-    with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
 
 
 def test_steps_past_the_loop_ceiling_are_refused_not_clamped():

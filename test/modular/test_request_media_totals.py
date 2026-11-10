@@ -138,6 +138,44 @@ def test_one_ordinary_clip_still_loads(tmp_path, headers, module, cls):
     assert loaded == paths
 
 
+# image and video generators: an audio or video file was decoded and dropped (200)
+IMAGE_MODELS = [
+    ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    ("mstar.model.z_image.z_image_model", "ZImageModel"),
+    ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
+    ("mstar.model.bagel.bagel_model", "BagelModel"),
+    ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
+    ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
+]
+
+
+@pytest.mark.parametrize("module, cls, modality", [
+    *[(module, cls, "audio") for module, cls in IMAGE_MODELS],
+    # Cosmos3 takes video
+    *[(module, cls, "video") for module, cls in IMAGE_MODELS if cls != "Cosmos3Model"],
+])
+def test_an_image_model_refuses_audio_and_video_before_decoding(tmp_path, module, cls, modality):
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    model = object.__new__(getattr(importlib.import_module(module), cls))
+    model._config = Flux2KleinConfig()  # FLUX.2 counts reference images by its config
+    loaded = []
+    setattr(model, f"load_{modality}", lambda path, device: loaded.append(path))
+    (tmp_path / "upload").write_bytes(b"")
+    request = PreprocessInput(
+        request_id="r1", text="a cat", file_paths={modality: [str(tmp_path / "upload")]},
+        input_modalities=[modality, "text"], output_modalities=["image"], model_kwargs={},
+    )
+    wt = _preprocess_thread(model)
+    with pytest.raises(ValueError, match=f"this model takes no {modality} files") as info:
+        wt._process_input(request)
+    assert loaded == []
+    assert _status(wt, info.value) == 400
+
+
 def test_audio_clips_share_the_audio_limit(tmp_path, headers, monkeypatch):
     """Each 2 s clip fits a 3 s limit; the second is refused from its header
     before it is decoded."""

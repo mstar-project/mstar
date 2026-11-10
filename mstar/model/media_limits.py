@@ -167,6 +167,8 @@ def check_file_counts(counts: dict[str, int], model_limits: dict[str, int]) -> N
     (:meth:`mstar.model.base.Model.max_input_files`), before any is decoded."""
     for modality, limit in model_limits.items():
         count = counts.get(modality, 0)
+        if count and not limit:
+            raise ValueError(f"this model takes no {modality} files; the request attaches {count}")
         if count > limit:
             raise ValueError(
                 f"the request attaches {count} {modality} files; this model takes at most {limit}"

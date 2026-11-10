@@ -333,6 +333,10 @@ class Flux2KleinModel(Model):
         # past the loop's max_iters the conductor refuses the request
         return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
+    def max_input_files(self) -> dict[str, int]:
+        # up to max_ref_images reference images; the data worker refuses anything else before decoding
+        return {"image": self.config.max_ref_images, "audio": 0, "video": 0}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
@@ -345,8 +349,6 @@ class Flux2KleinModel(Model):
         images = (tensors or {}).get(IMAGE_INPUTS) or []
         if "image" in input_modalities and not images:
             raise ValueError("request declared an image input but no image arrived; editing needs the reference image")
-        if len(images) > self.config.max_ref_images:
-            raise ValueError(f"at most {self.config.max_ref_images} reference images are supported, got {len(images)}")
         ref_dims = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
         self._resolve_size(kwargs, ref_dims)
         self._resolve_steps(kwargs)

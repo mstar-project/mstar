@@ -390,6 +390,10 @@ class LTX25Model(Model):
         # num_inference_steps and guidance_scale are read only to warn that the fixed schedule ignores them
         return frozenset({"height", "width", "num_frames", "fps", "recipe", "num_inference_steps", "guidance_scale"})
 
+    def max_input_files(self) -> dict[str, int]:
+        # text only: the data worker refuses any file before decoding it
+        return {"image": 0, "audio": 0, "video": 0}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

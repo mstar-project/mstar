@@ -938,6 +938,10 @@ class Cosmos3Model(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        # images and videos: the data worker refuses audio before decoding it
+        return {"audio": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

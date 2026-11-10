@@ -217,6 +217,10 @@ class LingBotWorldModel(Model):
         # one rollout iteration per chunk of latent frames; process_prompt refused a request without poses
         return {ROLLOUT_LOOP_NAME: self._latent_frames(model_kwargs) // self.config.chunk_size}
 
+    def max_input_files(self) -> dict[str, int]:
+        # one conditioning image; the data worker refuses anything else before decoding
+        return {"image": 1, "audio": 0, "video": 0}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
