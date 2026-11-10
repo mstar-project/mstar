@@ -30,9 +30,9 @@ masks ``h`` and ``b`` by the max rank, the same for every slot, rather than by t
 rank. The max rank is a runtime argument, but Triton specializes integer arguments on
 divisibility by 16, so for a max rank that is a multiple of 16 the mask is constant over
 runs of contiguous elements and the loads compile to 16-byte ``cp.async`` copies; masked
-by a rank loaded from memory (or a max rank off the multiple), they are scalar loads.
-``tl.multiple_of`` on the shrink's k bounds does the same for ``x`` and ``a``. So
-``b[slot, :, rank:]`` is read, against zeros, and must be finite (``ops.py``).
+by a rank loaded from memory (or a max rank off the multiple), they are scalar loads. So
+``b[slot, :, rank:]`` is read, against zeros, and must be finite (``ops.py``). The same
+specialization on ``in_features`` vectorizes the shrink's loads of ``x`` and ``a``.
 
 These are the CUDA kernels of the ``mstar::lora_shrink`` / ``mstar::lora_expand_`` /
 ``mstar::lora_apply_`` custom ops (``ops.py``), so ``torch.compile`` treats each as one
@@ -161,7 +161,6 @@ def _lora_shrink_kernel(
     stride_xm, stride_xk, stride_as, stride_ar, stride_ak, stride_hs, stride_hm, stride_hn,
     NUM_SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr, R_TILES: tl.constexpr, BLOCK_K: tl.constexpr,
-    K_ALIGN: tl.constexpr,
 ):
     """``h[split, t, slice cols] = x[t, split's k] @ a[slot, slice rows, split's k]^T``, one
     tile of ``BLOCK_R`` of the rank per program, and zeros from the slot's rank up to
@@ -181,9 +180,8 @@ def _lora_shrink_kernel(
     cols = slice_id * max_rank + offs_n
     acc = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
     if r0 < rank:
-        # K_ALIGN divides both bounds, so the compiler can vectorize the masked loads along k
-        k_lo = tl.multiple_of(split * k_per_split, K_ALIGN)
-        k_hi = tl.multiple_of(tl.minimum(k_lo + k_per_split, in_features), K_ALIGN)
+        k_lo = split * k_per_split
+        k_hi = tl.minimum(k_lo + k_per_split, in_features)
         for k0 in range(k_lo, k_hi, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)
             k_mask = offs_k < k_hi
@@ -329,11 +327,6 @@ def _rank_tiles(max_rank: int) -> tuple[int, int]:
     return block, triton.cdiv(max_rank, block)
 
 
-def _align(*values: int) -> int:
-    """The largest power of two up to 16 dividing every value."""
-    return next(a for a in (16, 8, 4, 2, 1) if all(v % a == 0 for v in values))
-
-
 def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles):
     slots, width, _ = a.shape
     block_r, r_tiles = _rank_tiles(width // num_slices)
@@ -345,7 +338,7 @@ def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k
         h.stride(0), h.stride(1), h.stride(2),
         NUM_SLOTS=slots, SLOTS_P2=triton.next_power_of_2(slots),
         BLOCK_M=tiles.m, BLOCK_R=block_r, R_TILES=r_tiles, BLOCK_K=tiles.n,
-        K_ALIGN=_align(x.shape[1], k_per_split), num_stages=tiles.stages,
+        num_stages=tiles.stages,
     )
 
 
