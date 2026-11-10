@@ -34,6 +34,11 @@ LOOP = "denoise_loop"
 WALK = "image_gen"
 
 
+
+def _schedule(sub, info):
+    """The memoized schedule of ``info``'s walk, at its own bucket key."""
+    return sub.schedule_of(info, sub.bucket_key_for(info))
+
 class ToyDenoise(DenoiseLoopSubmodule):
     """Velocity = -latents scaled by a learned-free constant; shape key = token count."""
 
@@ -103,7 +108,7 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     assert torch.equal(a.tensor_inputs[LATENTS], b.tensor_inputs[LATENTS])
     assert not torch.equal(a.tensor_inputs[LATENTS], c.tensor_inputs[LATENTS])
     assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
-    schedule = sub.schedule_of(_info("r0", 0, seed=7))
+    schedule = _schedule(sub, _info("r0", 0, seed=7))
     assert schedule.num_steps == 4
     # step scalars come off the schedule
     assert torch.equal(a.tensor_inputs["sigma"], schedule.sigmas[0:1])
@@ -116,7 +121,7 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
     x = torch.ones(8, 4)
     out = sub.prepare_inputs(WALK, _info("r0", 2), _inputs(x))
     assert out.tensor_inputs[LATENTS] is x
-    sched = sub.schedule_of(_info("r0", 2))
+    sched = _schedule(sub, _info("r0", 2))
     assert torch.equal(out.tensor_inputs["sigma"], sched.sigmas[2:3])
     assert torch.equal(out.tensor_inputs["sigma_next"], sched.sigmas[3:4])
 
@@ -159,7 +164,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
     # row b took its own sigma pair (step 1 of a 6-step schedule)
-    sched_b = sub.schedule_of(_info("b", 1, steps=6))
+    sched_b = _schedule(sub, _info("b", 1, steps=6))
     expected_b = euler_step(torch.ones(8, 4), -torch.ones(8, 4) * 0.5, sched_b.sigmas[1], sched_b.sigmas[2])
     assert torch.equal(out["b"][LATENTS][0], expected_b)
     assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 1, 1), (2, 3))
@@ -355,7 +360,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     # sliced at each row's own step index, and offset=1 still reads k + 1
     assert torch.equal(a.tensor_inputs["guidance"], torch.tensor([0.0]))
     assert torch.equal(b.tensor_inputs["guidance"], torch.tensor([2.0]))
-    sched_b = sub.schedule_of(_info("b", 2))
+    sched_b = _schedule(sub, _info("b", 2))
     assert torch.equal(b.tensor_inputs["sigma_next"], sched_b.sigmas[3:4])
 
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
@@ -369,7 +374,9 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
     # the base staged it off the schedule, so the model had nothing to keep
-    assert torch.equal(sub._staged_schedules(*sub._schedule_key(_info("a", 0)))["guidances"], torch.arange(4.0))
+    info = _info("a", 0)
+    assert torch.equal(sub._staged_schedules(*sub._schedule_key(info, sub.bucket_key_for(info)))["guidances"],
+                       torch.arange(4.0))
 
 
 def test_a_step_scalar_the_schedule_does_not_carry_says_so():
@@ -423,19 +430,19 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
 
 def test_a_schedule_memo_hit_equals_a_recompute():
     sub = ToyDenoise()
-    memo = sub.schedule_of(_info("a", 0, steps=4))
+    memo = _schedule(sub, _info("a", 0, steps=4))
     fresh = sub.schedule_for(WALK, 4, (8, 3))
-    assert sub.schedule_of(_info("b", 2, steps=4)) is memo, "requests with the same settings share one schedule"
+    assert _schedule(sub, _info("b", 2, steps=4)) is memo, "requests with the same settings share one schedule"
     assert torch.equal(memo.sigmas, fresh.sigmas) and torch.equal(memo.timesteps, fresh.timesteps)
 
 
 def test_each_input_of_the_hook_moves_the_memos_key():
     sub = ToyDenoise()
-    first = sub.schedule_of(_info("a", 0, steps=4, tokens=8))
-    assert sub.schedule_of(_info("a", 0, steps=5, tokens=8)) is not first
-    assert sub.schedule_of(_info("a", 0, steps=4, tokens=16)) is not first
+    first = _schedule(sub, _info("a", 0, steps=4, tokens=8))
+    assert _schedule(sub, _info("a", 0, steps=5, tokens=8)) is not first
+    assert _schedule(sub, _info("a", 0, steps=4, tokens=16)) is not first
     other_walk = dataclasses.replace(_info("a", 0, steps=4, tokens=8), graph_walk="refine")
-    assert sub.schedule_of(other_walk) is not first
+    assert _schedule(sub, other_walk) is not first
 
 
 def test_requests_with_the_same_settings_share_one_schedule_on_the_device():
@@ -510,7 +517,7 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
         step_metadata={"tokens": 16, "num_inference_steps": 2}, dynamic_loop_iter_counts={LOOP: 0},
     )
     out = sub.prepare_inputs("refine", refine, _inputs())
-    assert sub.num_steps_of(refine) == 2 and out.resource_step_info == (16, 3)
+    assert _schedule(sub, refine).num_steps == 2 and out.resource_step_info == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
 
 

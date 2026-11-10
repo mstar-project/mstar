@@ -355,13 +355,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         device = self.get_device()
         # A request whose walks run this node in successive stages (a draft loop, then a
         # refinement loop) gets a fresh shape and schedule for each, through the key.
-        bucket_key, num_steps = self.bucket_key_for(fwd_info), self.num_steps_of(fwd_info)
+        bucket_key = self.bucket_key_for(fwd_info)
+        schedule_key = self._schedule_key(fwd_info, bucket_key)
+        num_steps = self._schedules(*schedule_key).num_steps
         if k >= num_steps:
             raise RuntimeError(
                 f"{type(self).__name__}: iteration {k} is past request {fwd_info.request_id}'s "
                 f"{num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
             )
-        staged = self._staged_schedules(*self._schedule_key(fwd_info))
+        staged = self._staged_schedules(*schedule_key)
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
@@ -375,15 +377,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             resource_step_info=self.step_key(fwd_info, bucket_key),
         )
 
-    def _schedule_key(self, fwd_info: CurrentForwardPassInfo) -> tuple[str, int | None, Hashable]:
-        return fwd_info.graph_walk, fwd_info.step_metadata.get(NUM_STEPS), self.bucket_key_for(fwd_info)
+    def _schedule_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> tuple[str, int | None, Hashable]:
+        return fwd_info.graph_walk, fwd_info.step_metadata.get(NUM_STEPS), bucket_key
 
-    def schedule_of(self, fwd_info: CurrentForwardPassInfo) -> FlowMatchSchedule:
-        """The memoized schedule of the walk ``fwd_info`` is on."""
-        return self._schedules(*self._schedule_key(fwd_info))
-
-    def num_steps_of(self, fwd_info: CurrentForwardPassInfo) -> int:
-        return self.schedule_of(fwd_info).num_steps
+    def schedule_of(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> FlowMatchSchedule:
+        """The memoized schedule of the walk ``fwd_info`` is on, at its ``bucket_key``."""
+        return self._schedules(*self._schedule_key(fwd_info, bucket_key))
 
     def _stage_schedule(self, walk: str, num_steps: int | None, bucket_key: Hashable) -> dict[str, torch.Tensor]:
         return self._step_scalar_sources(self._schedules(walk, num_steps, bucket_key), self.get_device())
@@ -625,11 +624,12 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
         steps = []
         for i, rid in enumerate(engine_inputs.request_ids):
             info = engine_inputs.per_request_info[rid]
-            schedule = self.schedule_of(info)
+            schedule_key = self._schedule_key(info, bucket_key)
+            schedule = self._schedules(*schedule_key)
             steps.append(unipc_step(
                 output[i], latents[i],
                 UniPCState(model_outputs=unipc_model_outputs[i], last_sample=unipc_last_sample[i]),
-                schedule.sigmas, self._staged_schedules(*self._schedule_key(info))["sigmas"], self.step_index(info),
+                schedule.sigmas, self._staged_schedules(*schedule_key)["sigmas"], self.step_index(info),
                 schedule.num_steps,
             ))
         return {
