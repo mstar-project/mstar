@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Provision GPUs for live PR tests (NVIDIA Hopper or newer, AMD MI300X or newer): Eras Cloud, RunPod or Lambda.
+"""Provision GPUs for live PR tests (NVIDIA Hopper or newer, AMD MI300X or newer): Eras Cloud, RunPod, Lambda
+or DigitalOcean.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
@@ -23,17 +24,22 @@ a "no availability" report. Prices are USD/hr for the whole box.
 An Eras instance runs sshd as root in a Pod that Kubernetes stops at the deadline
 (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
 
-`launch --run SCRIPT` (Eras) makes the script the work itself rather than holding the GPUs for
-ssh: it is the Pod's command, with the --input files in /run/live-pr and sshd up beside it for
-copying results back, and the instance is released 15 minutes after it exits. The GPUs go when
-the script ends, whether or not whoever launched it is still there.
+A DigitalOcean GPU Droplet is a VM, root over ssh, NVIDIA or AMD by size, billed until deleted:
+nothing on DigitalOcean's side ends it.
+
+`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh, with
+the --input files in /run/live-pr. On Eras it is the Pod's command, with sshd up beside it for
+copying results back, and the instance is released 15 minutes after it exits, so the GPUs go when
+the script ends, whether or not whoever launched it is still there. On DigitalOcean cloud-init
+writes the files and starts the script at boot (in the droplet's user_data, 64 KiB at most); the
+droplet stays up until terminated.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
 
 `launch` exits 4 when budget.max_running refuses it, 1 on any other error.
 
-Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY. Settings from config.local.json
+Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY / DIGITALOCEAN_TOKEN. Settings from config.local.json
 next to the skill (see config.example.json). Stdlib only, so it runs from any python3.
 """
 from __future__ import annotations
@@ -43,6 +49,8 @@ import base64
 import contextlib
 import fcntl
 import functools
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -64,6 +72,7 @@ RUNPOD = "https://api.runpod.io/v2"
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 LAMBDA = "https://cloud.lambda.ai/api/v1"
 ERAS = "https://api.erascloud.ai"
+DIGITALOCEAN = "https://api.digitalocean.com/v2"
 # The GPUs this tool rents, by vendor: NVIDIA Hopper or newer (\b keeps out the H20, Hopper silicon with a
 # fraction of the compute), and AMD MI300X or newer.
 SUPPORTED = {"nvidia": re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I),
@@ -182,6 +191,21 @@ def eras(method, path, body=None, params=None, retry=True):
         return http(m, ERAS + url, "ERAS_API_KEY", b, q, again, "x-api-key", "")
     _eras_org = _eras_org or call("GET", "/v1/me")["default_organization"]["id"]
     return call(method, f"/v1/org/{_eras_org}{path}", body, params, retry)
+
+
+def digitalocean(method, path, body=None, params=None, retry=True):
+    return http(method, DIGITALOCEAN + path, "DIGITALOCEAN_TOKEN", body, params, retry)
+
+
+def digitalocean_list(path: str, field: str, params: dict | None = None) -> list:
+    """Every item of a DigitalOcean list, across all pages."""
+    items, page = [], 1
+    while True:
+        reply = digitalocean("GET", path, params={**(params or {}), "per_page": 200, "page": page})
+        items += reply.get(field) or []
+        if not ((reply.get("links") or {}).get("pages") or {}).get("next"):
+            return items
+        page += 1
 
 
 def tail_lines(text: str, limit: int) -> str:
@@ -562,7 +586,105 @@ class Eras(Provider):
         eras("POST", f"/instances/{iid}/release", {})
 
 
-PROVIDERS = {cls.name: cls for cls in (Eras, RunPod, Lambda)}
+class DigitalOcean(Provider):
+    """GPU Droplets: one offer per size, created wherever DigitalOcean has it (no region asked for)."""
+    name, key_env = "digitalocean", "DIGITALOCEAN_TOKEN"
+    vendors = ("nvidia", "amd")
+    takes_run = True
+
+    @classmethod
+    def pool(cls, cfg, offer_id):
+        return cls(cfg).offers(1, 0, True)
+
+    def offers(self, gpus, min_vram, all_regions, allow_arm=False):
+        offers = []
+        for s in digitalocean_list("/sizes", "sizes"):
+            g = s.get("gpu_info") or {}
+            gpu = str(g.get("model") or "").replace("_", " ").upper()  # nvidia_h100 -> NVIDIA H100
+            vram = (g.get("vram") or {}).get("amount") or 0
+            # Contracted sizes are sold under a contract, never created self-serve.
+            if vendor_of(gpu) not in self.vendors or (g.get("count") or 0) < gpus or vram < min_vram \
+                    or s["slug"].endswith("-contracted") or not (s.get("available") or all_regions):
+                continue
+            offers.append({
+                "id": f"digitalocean:{s['slug']}", "provider": "digitalocean", "gpu": gpu, "count": g["count"],
+                "vram_gb": vram, "region": "any", "usd_per_hour": round(s["price_hourly"], 2),
+                "availability": "available" if s.get("available") else "none", "storage": True,
+            })
+        return offers
+
+    def plan(self, o, name, pubkey, hours, args):
+        # DigitalOcean's AI/ML-ready images: ROCm for AMD; for NVIDIA one for every 1-GPU size, one for 8.
+        image = ("gpu-amd-base" if vendor_of(o["gpu"]) == "amd" else
+                 "gpu-h100x8-base" if o["count"] > 1 else "gpu-h100x1-base")
+        key = "<registered at launch>" if args.dry_run else digitalocean_ssh_key(pubkey, name)
+        body = {"name": name, "size": o["id"].split(":", 1)[1], "image": image, "ssh_keys": [key]}
+        if args.run:
+            secret = self.cfg.get("digitalocean", {}).get("run_secret_env")
+            if secret and not args.dry_run and not os.environ.get(secret):
+                die(f"digitalocean.run_secret_env names {secret}, which is not set; the box would have no key")
+            body["user_data"] = cloud_config(args.run, args.input, secret and (
+                "<the value of $" + secret + ">" if args.dry_run else os.environ[secret]))
+        return body, lambda: str(digitalocean("POST", "/droplets", body, retry=False)["droplet"]["id"])
+
+    def hf_home(self):
+        return self.cfg.get("digitalocean", {}).get("hf_home", "/workspace/hf")
+
+    def status(self, e):
+        try:
+            d = digitalocean("GET", f"/droplets/{e['instance_id']}")["droplet"]
+        except ApiError as err:
+            if err.status == 404:  # deleted, by terminate or by hand
+                return "ended", None, 22
+            raise
+        host = next((n.get("ip_address") for n in (d.get("networks") or {}).get("v4") or []
+                     if n.get("type") == "public"), None)
+        return "ended" if d.get("status") == "archive" else d.get("status", "?"), host, 22
+
+    def instances(self):
+        # GPU droplets are listed only with type=gpus.
+        return [Instance(str(d["id"]), d.get("name"), d.get("status"))
+                for d in digitalocean_list("/droplets", "droplets", {"type": "gpus"}) if d.get("status") != "archive"]
+
+    def release(self, iid, e):
+        digitalocean("DELETE", f"/droplets/{iid}")
+
+
+USER_DATA_MAX = 64 * 1024  # what DigitalOcean takes in a droplet's user_data
+
+
+def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
+    """The user_data that runs `run` at boot as `launch --run` does on Eras: the script and its inputs in
+    /run/live-pr, a secret at /run/live-pr-key/value as Eras mounts run_secret_id, and the script started
+    as a unit of its own so cloud-init isn't left waiting on it. JSON is YAML, which cloud-init reads."""
+    def entry(path, data):
+        return {"path": path, "encoding": "gz+b64", "permissions": "0600",
+                "content": base64.b64encode(gzip.compress(data, mtime=0)).decode()}
+    files = [entry(f"/run/live-pr/{Path(f).name}", Path(f).read_bytes()) for f in [run, *inputs]]
+    if secret:
+        files.append(entry("/run/live-pr-key/value", secret.encode()))
+    text = "#cloud-config\n" + json.dumps({"write_files": files, "runcmd": [
+        ["systemd-run", "--unit", "live-pr", "bash", f"/run/live-pr/{Path(run).name}"]]})
+    if len(text.encode()) > USER_DATA_MAX:
+        die(f"the --run script and inputs take {len(text.encode())} bytes of user_data, over DigitalOcean's "
+            f"{USER_DATA_MAX}; send smaller inputs")
+    return text
+
+
+def digitalocean_ssh_key(pubkey: str, name: str) -> str:
+    """The team's fingerprint for this public key, registering it the first time, under the launch's name.
+    A droplet created with no key gets a root password instead."""
+    blob = base64.b64decode(pubkey.split()[1])
+    fingerprint = ":".join(f"{b:02x}" for b in hashlib.md5(blob, usedforsecurity=False).digest())
+    try:
+        return digitalocean("GET", f"/account/keys/{fingerprint}")["ssh_key"]["fingerprint"]
+    except ApiError as err:
+        if err.status != 404:
+            raise
+    return digitalocean("POST", "/account/keys", {"name": name, "public_key": pubkey})["ssh_key"]["fingerprint"]
+
+
+PROVIDERS = {cls.name: cls for cls in (Eras, RunPod, Lambda, DigitalOcean)}
 
 
 def provider_of(cfg: dict, record: dict) -> Provider:
@@ -785,7 +907,6 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key, registering it the first time, under the launch's
     name. It stays registered for later launches."""
-    import hashlib
     blob = base64.b64decode(pubkey.split()[1])
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
     for k in eras_items("/ssh-keys", 100):
@@ -887,7 +1008,6 @@ def eras_create(body: dict) -> str:
     reused with another request, so each attempt (listing, cache volume) has its own. The create is
     sent again only after a 429, with the same key; any other failure may have come after Eras acted,
     so it goes to launch, which finds the instance by name."""
-    import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
     if problems:
@@ -1146,10 +1266,11 @@ def main():
     p.add_argument("--hours", type=float)
     p.add_argument("--tag", help="names the instance live-pr-<pr>-<tag> (and makes an Eras launch idempotent); "
                                 "by default the time and 4 hex digits")
-    p.add_argument("--run", help="Eras: a script that is the work itself; the GPUs go when it ends")
+    p.add_argument("--run", help="Eras, DigitalOcean: a script that is the work itself (on Eras the GPUs go when it "
+                                "ends)")
     p.add_argument("--input", action="append", default=[],
                    help="a file for the --run script, in /run/live-pr. No secrets here: the files stay in the "
-                        "run's record; use eras.run_secret_id")
+                        "run's record; use eras.run_secret_id or digitalocean.run_secret_env")
     cache = p.add_mutually_exclusive_group()
     cache.add_argument("--cache", choices=("ro", "none"), default="ro",
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")

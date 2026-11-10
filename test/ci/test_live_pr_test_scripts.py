@@ -61,7 +61,8 @@ class TestGpu(unittest.TestCase):
         env = unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k"})
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("LAMBDA_API_KEY", None)  # never reach a real account
+        for other in ("LAMBDA_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN"):  # never reach a real account
+            os.environ.pop(other, None)
 
     def test_a_create_is_not_sent_again_after_a_5xx_or_a_timeout(self):
         for failure in (http_error(502), TimeoutError("timed out"), urllib.error.URLError("refused"),

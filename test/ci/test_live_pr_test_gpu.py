@@ -4,6 +4,7 @@ import argparse
 import base64
 import contextlib
 import functools
+import gzip
 import hashlib
 import io
 import json
@@ -275,6 +276,163 @@ class TestEras(unittest.TestCase):
                          "a refused launch would leave an ssh key in the organization")
         self.assertIn(("POST", "/instances"), [c[:2] for c in self.eras_launch(max_running=1, held=())],
                       "a launch under budget.max_running would be refused")
+
+
+def do_size(slug, model, count, vram, price, regions=("nyc2", "tor1"), available=True):
+    """A GPU size as DigitalOcean's GET /v2/sizes lists it (the spec's size and gpu_info)."""
+    return {"slug": slug, "memory": 245760 * count, "vcpus": 20 * count, "disk": 720, "transfer": 15.0,
+            "price_monthly": round(price * 730, 2), "price_hourly": price, "regions": list(regions),
+            "available": available, "description": f"{model} GPU - {count}X",
+            "disk_info": [{"type": "local", "size": {"amount": 720, "unit": "gib"}},
+                          {"type": "scratch", "size": {"amount": 5120, "unit": "gib"}}],
+            "gpu_info": {"count": count, "vram": {"amount": vram, "unit": "gib"}, "model": model}}
+
+
+DO_SIZES = [  # two pages, as the API pages them
+    {"sizes": [{"slug": "s-1vcpu-1gb", "memory": 1024, "vcpus": 1, "disk": 25, "transfer": 1.0, "price_monthly": 6,
+                "price_hourly": 0.00893, "regions": ["nyc1"], "available": True, "description": "Basic"},
+               do_size("gpu-h100x1-80gb", "nvidia_h100", 1, 80, 3.39),
+               do_size("gpu-h100x8-640gb", "nvidia_h100", 8, 80, 23.92),
+               do_size("gpu-h200x1-141gb", "nvidia_h200", 1, 141, 3.44, available=False),
+               do_size("gpu-l40sx1-48gb", "nvidia_l40s", 1, 48, 1.57)],
+     "links": {"pages": {"last": "https://api.digitalocean.com/v2/sizes?page=2",
+                         "next": "https://api.digitalocean.com/v2/sizes?page=2"}}, "meta": {"total": 8}},
+    {"sizes": [do_size("gpu-mi300x1-192gb", "amd_mi300x", 1, 192, 1.99, regions=()),  # sold, but no region listed
+               do_size("gpu-h200x8-1128gb-contracted", "nvidia_h200", 8, 141, 27.52),
+               do_size("gpu-mi300x8-1536gb", "amd_mi300x", 8, 192, 15.92)],
+     "links": {"pages": {"first": "https://api.digitalocean.com/v2/sizes?page=1",
+                         "prev": "https://api.digitalocean.com/v2/sizes?page=1"}}, "meta": {"total": 8}},
+]
+
+
+class TestDigitalOcean(unittest.TestCase):
+    def setUp(self):
+        self.calls, self.keys = [], []
+        self.droplets = [{"id": 3164444, "name": "live-pr-7-1-1-amd", "status": "active",
+                          "networks": {"v4": [{"ip_address": "10.0.0.2", "type": "private"},
+                                              {"ip_address": "104.236.32.182", "type": "public"}]}},
+                         {"id": 3164445, "name": "someone-else", "status": "active"},
+                         {"id": 3164446, "name": "live-pr-6-x", "status": "archive"}]
+        saved = {k: GPU[k] for k in ("digitalocean", "STATE", "LEDGER", "find_offer")}
+        self.addCleanup(GPU.update, saved)
+        state = Path(tempfile.mkdtemp())
+        GPU.update(digitalocean=self.api, STATE=state, LEDGER=state / "instances.json")
+        env = keys("digitalocean")
+        env.start()
+        self.addCleanup(env.stop)
+
+    def api(self, method, path, body=None, params=None, retry=True):
+        self.calls.append((method, path, body, params))
+        if path == "/sizes":
+            return DO_SIZES[params["page"] - 1]
+        if path == "/droplets" and method == "GET":
+            return {"droplets": self.droplets, "links": {}, "meta": {"total": len(self.droplets)}}
+        if path == "/droplets":
+            return {"droplet": {"id": 3164447, "name": body["name"], "status": "new"}, "links": {"actions": []}}
+        if path.startswith("/droplets/"):
+            found = [d for d in self.droplets if str(d["id"]) == path.split("/")[-1]]
+            if not found:
+                raise GPU["ApiError"](404, {"id": "not_found", "message": "The resource you requested could not be "
+                                                                          "found."})
+            return {"droplet": found[0]}
+        if path.startswith("/account/keys/"):
+            if not self.keys:
+                raise GPU["ApiError"](404, {"id": "not_found", "message": "not found"})
+            return {"ssh_key": self.keys[0]}
+        if path == "/account/keys":
+            self.keys.append({"id": 512189, "fingerprint": "f", "public_key": body["public_key"], "name": body["name"]})
+            return {"ssh_key": self.keys[-1]}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def offers(self, vendor, gpus=1, all_regions=False):
+        printed = io.StringIO()
+        args = argparse.Namespace(gpus=gpus, vendor=vendor, min_vram=80, all_regions=all_regions, allow_arm=False,
+                                  json=True)
+        with contextlib.redirect_stdout(printed):
+            GPU["cmd_offers"](args, {"budget": {"max_usd_per_hour": 30}})
+        return {o["id"]: (o["vendor"], o["gpu"], o["count"], o["usd_per_hour"], o["availability"])
+                for o in json.loads(printed.getvalue())["offers"]}
+
+    def test_offers_are_its_self_serve_gpu_sizes_by_vendor(self):
+        self.assertEqual(self.offers("nvidia"), {
+            "digitalocean:gpu-h100x1-80gb": ("nvidia", "NVIDIA H100", 1, 3.39, "available"),
+            "digitalocean:gpu-h100x8-640gb": ("nvidia", "NVIDIA H100", 8, 23.92, "available")},
+            "a size under 80 GB, sold only under contract or not available would be offered")
+        self.assertEqual(self.offers("amd"), {
+            "digitalocean:gpu-mi300x1-192gb": ("amd", "AMD MI300X", 1, 1.99, "available"),
+            "digitalocean:gpu-mi300x8-1536gb": ("amd", "AMD MI300X", 8, 15.92, "available")},
+            "an MI300X size that lists no region would never be offered, though a create without one takes it")
+        self.assertEqual(list(self.offers("amd", gpus=2)), ["digitalocean:gpu-mi300x8-1536gb"])
+        self.assertIn("digitalocean:gpu-h200x1-141gb", self.offers("nvidia", all_regions=True))
+
+    def launch(self, run, inputs=(), dry_run=False, offer="digitalocean:gpu-mi300x1-192gb", gpu="AMD MI300X",
+               count=1, cfg=None):
+        """cmd_launch of `offer`; the create's body, or None when nothing was created."""
+        key = Path(tempfile.mkdtemp()) / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        GPU["find_offer"] = lambda cfg, oid: {"id": offer, "provider": "digitalocean", "gpu": gpu, "count": count,
+                                              "usd_per_hour": 1.99, "region": "any", "storage": True}
+        args = argparse.Namespace(offer=offer, pr=7, hours=1, tag="1-1-amd", run=run, input=list(inputs),
+                                  allow_over_budget=False, dry_run=dry_run)
+        cfg = {"ssh_public_key": str(key), "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4},
+               **(cfg or {})}
+        with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            GPU["cmd_launch"](args, cfg)
+        self.printed = out.getvalue()
+        return next((c[2] for c in self.calls if c[:2] == ("POST", "/droplets")), None)
+
+    def test_a_run_is_written_and_started_by_cloud_init(self):
+        d = Path(tempfile.mkdtemp())
+        box, body = d / "box.sh", d / "pr-body.md"
+        box.write_text("echo hello\n")
+        body.write_text("Generated with Claude Code \N{ROBOT FACE}\n", encoding="utf-8")
+        cfg = {"digitalocean": {"run_secret_env": "BOX_KEY"}}
+        with unittest.mock.patch.dict(os.environ, {"BOX_KEY": "sk-ant-box"}):
+            self.launch(str(box), [str(body)], dry_run=True, cfg=cfg)
+            self.assertEqual([c[:2] for c in self.calls if c[0] != "GET"], [], "a dry run would register the key")
+            self.assertNotIn("sk-ant-box", self.printed, "a dry run would print the box's key")
+            created = self.launch(str(box), [str(body)], cfg=cfg)
+        self.assertEqual(created["image"], "gpu-amd-base", "an AMD box would boot an image with no ROCm")
+        self.assertNotIn("region", created, "a size with no region listed would be asked for where it isn't")
+        self.assertEqual(created["ssh_keys"], ["f"], "the box would get a root password, not the runner's key")
+        header, config = created["user_data"].split("\n", 1)
+        self.assertEqual(header, "#cloud-config")
+        config = json.loads(config)
+        files = {f["path"]: gzip.decompress(base64.b64decode(f["content"])) for f in config["write_files"]}
+        self.assertEqual(files, {"/run/live-pr/box.sh": box.read_bytes(), "/run/live-pr/pr-body.md": body.read_bytes(),
+                                 "/run/live-pr-key/value": b"sk-ant-box"},
+                         "the box would read changed inputs, or have no Anthropic key")
+        self.assertEqual({f["permissions"] for f in config["write_files"]}, {"0600"})
+        self.assertEqual(config["runcmd"], [["systemd-run", "--unit", "live-pr", "bash", "/run/live-pr/box.sh"]],
+                         "the droplet would boot and bill with nothing running")
+        self.assertEqual(list(GPU["ledger"]()), ["digitalocean:3164447"])
+
+        self.calls.clear()
+        GPU["save_ledger"]({})
+        created = self.launch(str(box), offer="digitalocean:gpu-h100x8-640gb", gpu="NVIDIA H100", count=8)
+        self.assertEqual(created["image"], "gpu-h100x8-base")
+        self.assertNotIn(("POST", "/account/keys"), [c[:2] for c in self.calls], "the key would be registered twice")
+        self.assertNotIn("/run/live-pr-key/value", created["user_data"])
+        big = d / "big.md"
+        big.write_bytes(os.urandom(60 * 1024))
+        self.calls.clear()
+        GPU["save_ledger"]({})
+        with self.assertRaises(SystemExit, msg="DigitalOcean would refuse the create, or cut the box's files"):
+            self.launch(str(box), [str(big)])
+        self.assertIsNone(next((c for c in self.calls if c[:2] == ("POST", "/droplets")), None))
+
+    def test_this_tools_gpu_droplets_count_and_a_deleted_one_has_ended(self):
+        with keys("digitalocean"):
+            self.assertEqual(GPU["running"]({}), ["digitalocean:3164444  live-pr-7-1-1-amd  active"],
+                             "the bot's AMD boxes would run past budget.max_running")
+        listed = [c[3] for c in self.calls if c[:2] == ("GET", "/droplets")]
+        self.assertTrue(listed and all(params.get("type") == "gpus" for params in listed),
+                        "GPU droplets aren't in DigitalOcean's default listing")
+        e = {"provider": "digitalocean", "instance_id": "3164444", "region": "any"}
+        self.assertEqual(GPU["status"](e, {}), ("active", "104.236.32.182", 22))
+        self.assertEqual(GPU["status"]({**e, "instance_id": "9"}, {})[0], "ended",
+                         "the bot would wait on a deleted droplet until its timeout")
 
 
 if __name__ == "__main__":
