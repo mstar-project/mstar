@@ -174,6 +174,7 @@ PARTIAL_MEDIA_MODELS = [
     ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "audio", 1),
     ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "video", 2),
     ("mstar.model.pi05.pi05_model", "Pi05Model", "audio", 1),
+    ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel", "video", 1),
     # without the reasoner, Cosmos3 conditions on one image or one video
     ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model", "image", 2),
 ]
