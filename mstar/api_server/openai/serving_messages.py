@@ -39,7 +39,9 @@ _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "strea
            "prefix_cache"}
 _COUNT_FIELDS = {"model", "messages", "system", "tools", "tool_choice", "thinking", "context_management",
                  "output_config"}
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 3}
+_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 3}
+# the stop matcher scans every stop on each token, on the event loop that serves every request
+_MAX_STOPS, _MAX_STOP_CHARS = 16, 256
 
 _STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens"}
 
@@ -95,6 +97,9 @@ def to_chat_request(body, *, counting: bool = False,
     stops = body.get("stop_sequences") or []
     if not isinstance(stops, list) or not all(isinstance(s, str) and s for s in stops):
         raise ValueError(f"stop_sequences must be a list of non-empty strings; got {stops!r}")
+    if len(stops) > _MAX_STOPS or any(len(s) > _MAX_STOP_CHARS for s in stops):
+        raise ValueError(f"stop_sequences takes at most {_MAX_STOPS} strings of at most "
+                         f"{_MAX_STOP_CHARS} characters")
     return ChatCompletionRequest(**chat), stops
 
 
@@ -274,7 +279,7 @@ def _output_config(config, efforts: tuple[str, ...]) -> dict:
     if effort is None:
         return {}
     if effort not in _EFFORT_RANK:
-        raise ValueError(f"output_config.effort takes low, medium, high or max; got {effort!r}")
+        raise ValueError(f"output_config.effort takes low, medium, high, xhigh or max; got {effort!r}")
     return {"reasoning_effort": reply.template_level(
         _EFFORT_RANK[effort], efforts, f"output_config.effort={effort!r}")}
 

@@ -243,7 +243,8 @@ def test_a_request_can_turn_its_prefix_cache_off():
 
 
 @pytest.mark.parametrize("effort, glm52, glm53", [
-    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("max", "max", "max"),
+    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("xhigh", "max", "max"),
+    ("max", "max", "max"),
 ])
 def test_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
     from mstar.api_server.openai import adapters, serving_messages
@@ -278,6 +279,8 @@ def test_tool_choice_maps_onto_chat(choice, want):
         {"type": "redacted_thinking", "data": "x"}]}, {"role": "user", "content": "go"}]), "redacted_thinking"),
     (_body(container="c1"), "container"),
     (_body(stop_sequences=["", "x"]), "stop_sequences"),
+    (_body(stop_sequences=[f"s{i}" for i in range(17)]), "at most 16 strings"),
+    (_body(stop_sequences=["x" * 257]), "at most 256 characters"),
     (_body(tool_choice={"type": "tool"}), "name"),
     (_body(messages=[{"role": "tool", "content": "x"}]), "role"),
     (_body(context_management={"edits": [{"type": "clear_tool_uses_20250919"}]}), "context_management"),
@@ -337,8 +340,6 @@ def test_a_body_nested_past_the_decoders_depth_is_an_anthropic_400(client_and_st
     assert "nests too deeply" in r.json()["error"]["message"] and stub.last_submit is None
 
 
-@pytest.mark.xfail(strict=True, reason="stop_sequences has no cap, and the event loop matches every stop on "
-                   "each token (10,000 of 100 chars: ~14 ms a token, which every request waits out); follow-up")
 def test_a_stop_sequence_list_past_a_cap_is_a_400(client_and_stub):
     client, stub = client_and_stub
     r = client.post("/v1/messages", json=_body(stop_sequences=[f"stop {i}" for i in range(10_000)]))
