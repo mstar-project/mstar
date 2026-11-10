@@ -1102,13 +1102,16 @@ class TestPost(unittest.TestCase):
         self.assertNotIn("then comment `/review` again", comment, "no later review can clear an edited thread")
 
     def test_an_unfinished_review_is_not_left_to_the_author(self):
-        with tempfile.TemporaryDirectory() as temp, workspace():
-            Path(temp, "gate.txt").write_text(render_summary.UNFINISHED)
-            _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
-                             run_url="u", trusted="true", gated="true")
-        (_, comment), = posted.writes()
-        self.assertIn("the bot's to finish, not yours", comment)
-        self.assertNotIn("fix what the review left open", comment, "the author would be told to fix the bot's gap")
+        for reasons in (render_summary.UNFINISHED, f"{render_summary.UNFINISHED}; inline 4 ({render_summary.EDITED})"):
+            with self.subTest(reasons), tempfile.TemporaryDirectory() as temp, workspace():
+                Path(temp, "gate.txt").write_text(reasons)
+                _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
+                                 run_url="u", trusted="true", gated="true")
+                (_, comment), = posted.writes()
+                self.assertIn("the bot's to finish, not yours", comment)
+                self.assertNotIn("fix what the review left open", comment, "the author would fix the bot's gap")
+                if render_summary.EDITED in reasons:
+                    self.assertIn("a person has to decide", comment, "the edited thread would be dropped")
 
 
 class TestEras(unittest.TestCase):
