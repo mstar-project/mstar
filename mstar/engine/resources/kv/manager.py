@@ -5191,15 +5191,24 @@ class KVManager(AttentionResource):
 
     def _frees(self, rids: Collection[str]) -> int:
         """The room moving ``rids`` off the device would make: the pages of their streams that would reach the free
-        list or the evictable set, and their unused allotments."""
+        list or the evictable set, their unused allotments, and the room `_shared` kept for the window pages they
+        release that another stream still holds (`_unshare`)."""
         released: Counter = Counter()
+        windows: Counter = Counter()
         for rid in rids:
             for stream in self._streams[rid].values():
                 released.update(stream.pages())
+                windows.update(held_pages(stream.later))
         held = list(released)
         pages = sum(owners == released[page] for page, owners in zip(held, self._arena.owners_of(held), strict=True))
         if self._index is not None:
             pages += self._index.evictable_after(released)
+            if self._counts and windows:
+                # each release takes one page off a page's holders past the first, until one holder is left
+                pages += sum(
+                    max(0, holders - 1) - max(0, holders - times - 1)
+                    for holders, times in zip(self._holders(list(windows)), windows.values(), strict=True)
+                )
         return pages + sum(self._allotments[rid].remaining for rid in rids if rid in self._allotments)
 
     def _settle(self, rid: str, freed: int, allotment: Allotment | None = None) -> None:
@@ -5427,14 +5436,16 @@ class KVManager(AttentionResource):
         if stream.lent:
             stream.lent.difference_update(pages)
 
+    def _holders(self, pages: list[int]) -> list[int]:
+        """How many streams hold each of the window pages ``pages``: its owners less the index's own hold."""
+        index = self._index
+        return [owners - index.holds(page) for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)]
+
     def _share(self, pages: list[int]) -> None:
         """Keep room (`_shared`) for each of the window pages ``pages`` a stream is about to take that another stream
         holds already. Under the lock."""
         if self._counts and self._index is not None and pages:
-            index = self._index
-            self._shared += sum(
-                owners > index.holds(page) for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
-            )
+            self._shared += sum(holders > 0 for holders in self._holders(pages))
 
     def _unshare(self, stream: CacheStream, pages: list[int]) -> None:
         """Before ``stream`` releases its window pages ``pages``, give back the room `_shared` kept for each one another
@@ -5442,11 +5453,7 @@ class KVManager(AttentionResource):
         leaves the allotment room for it. Reads who holds what and nothing else. Under the lock."""
         if not self._counts or self._index is None or not pages:
             return
-        index = self._index
-        held = [
-            page for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
-            if owners > 1 + index.holds(page)
-        ]
+        held = [page for page, holders in zip(pages, self._holders(pages), strict=True) if holders > 1]
         self._shared -= len(held)
         stream.lent.update(held)
 

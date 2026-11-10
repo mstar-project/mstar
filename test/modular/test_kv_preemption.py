@@ -985,7 +985,10 @@ def test_a_drop_of_a_request_sharing_cached_window_pages_keeps_the_count_and_its
     assert window[0] & window[1] and kv._shared, "a and b share none of the cached window pages"
     kept = "b" if dropped == "a" else "a"
 
+    room, frees = kv._room(), kv._frees([dropped])
+    assert kv._choose(frees, [dropped], lambda rid: True) == Victims([], [dropped], [])
     _drop(kv, dropped)
+    assert kv._room() - room == frees, "preemption counts the drop's room wrong"
     for _ in range(24):
         _grow_kv(kv, kept, 1)
 
