@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import json
 import math
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+from mstar.utils.cpus import usable_cpus
+from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
     from mstar.model.utils import TextOutput
@@ -30,14 +33,6 @@ STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
-
-
-def _xgr():
-    try:
-        import xgrammar
-    except ImportError as e:  # pragma: no cover - a dependency
-        raise ValueError("structured output needs the xgrammar package") from e
-    return xgrammar
 
 
 @dataclass(frozen=True)
@@ -54,7 +49,8 @@ class GrammarRequest:
         return "|".join(_regex_escape(c) for c in json.loads(self.value))
 
     def _content(self):
-        xgr = _xgr()
+        import xgrammar as xgr
+
         if self.kind == "json":
             return xgr.Grammar.from_json_schema(self.value)
         if self.kind == "json_object":
@@ -80,7 +76,9 @@ class GrammarRequest:
             content = self._content()
             if self.after is None:
                 return content
-            return _xgr().Grammar.from_structural_tag(self._structural_tag(content))
+            import xgrammar as xgr
+
+            return xgr.Grammar.from_structural_tag(self._structural_tag(content))
         except (RuntimeError, ValueError) as e:
             raise ValueError(f"structured_outputs {self.kind}: {e}") from e
 
@@ -177,7 +175,9 @@ class _Row:
             if failed is not None:
                 self.error = f"structured_outputs grammar failed to compile: {failed}"
             else:
-                self._matcher = _xgr().GrammarMatcher(self.compiled.result())
+                import xgrammar as xgr
+
+                self._matcher = xgr.GrammarMatcher(self.compiled.result())
         return None if self.error is not None else self._matcher
 
     @property
@@ -196,8 +196,8 @@ class GrammarRows:
     still on their way to the host, and the bitmask each step applies."""
 
     def __init__(self, text_output: TextOutput, vocab_size: int | None, device: torch.device, cache_bytes: int):
-        xgr = _xgr()
-        self._xgr = xgr
+        import xgrammar as xgr
+
         detok = text_output.detokenizer
         stop = sorted(int(t) for t in text_output.stop_token_ids)
         tokenizer = getattr(detok, "tokenizer", None)
@@ -217,10 +217,12 @@ class GrammarRows:
             self.info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, vocab_size=size, stop_token_ids=stop)
         self.vocab_size = size
         self.words = math.ceil(size / 32)
-        self._compiler = xgr.GrammarCompiler(self.info, max_threads=8, cache_limit_bytes=cache_bytes)
+        # sized by the CPUs this worker may use, which xgrammar's own "auto" doesn't read
+        cpus = usable_cpus()
+        self._compiler = xgr.GrammarCompiler(self.info, max_threads=min(8, cpus), cache_limit_bytes=cache_bytes)
         # compiles run off the worker's threads (xgrammar releases the GIL)
-        self._compile_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="grammar-compile")
-        self._batch = xgr.BatchGrammarMatcher()
+        self._compile_pool = ThreadPool(max_workers=min(2, cpus), thread_name_prefix="grammar-compile")
+        self._batch = xgr.BatchGrammarMatcher(max_threads=max(1, cpus // 2))
         self._device = device
         self._rows: dict[Any, _Row] = {}
         # (rows, host tokens, event) per committed step not yet accepted, oldest first.
@@ -301,10 +303,10 @@ class GrammarRows:
         rows, width = logits.shape[0], logits.shape[-1]
         covered = min(width, mask.shape[-1] * 32)
         if logits.is_cuda:
-            from xgrammar.kernels.apply_token_bitmask_inplace_triton import apply_token_bitmask_inplace_triton
+            import xgrammar as xgr
 
-            # one pass, no host reads: capturable
-            apply_token_bitmask_inplace_triton(logits, mask[:rows], vocab_size=covered)
+            # one Triton pass, no host reads: capturable
+            xgr.apply_token_bitmask_inplace(logits, mask[:rows], vocab_size=covered)
         else:
             allowed = ((mask[:rows].unsqueeze(-1) >> self._shifts) & 1).reshape(rows, -1)
             logits[:, :covered].masked_fill_(allowed[:, :covered] == 0, float("-inf"))
