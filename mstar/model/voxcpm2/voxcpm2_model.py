@@ -139,6 +139,11 @@ class VoxCPM2Model(Model):
     MAX_CFG_VALUE = 10.0
     INTERNAL_KWARGS = TALKER_STEP_METADATA
     LENGTH_KWARGS = ("max_new_tokens", "max_output_tokens", "max_len")
+    # Every model_kwargs key a request may carry; the speech adapter maps
+    # ``instructions`` onto ``instruct`` and drops ``voice``; a sent ``speed`` is logged as ignored
+    REQUEST_KWARGS = frozenset({
+        "instruct", "instructions", "ref_text", "cfg_value", "min_len", "inference_timesteps", *LENGTH_KWARGS,
+    })
     # English speech measured at 1.3 to 2.9 patches per text token (24 zero-shot
     # requests of 1,300 to 1,700 tokens), so text up to max_len / 3 tokens fits in max_len patches
     MAX_PATCHES_PER_TEXT_TOKEN = 3.0
@@ -287,7 +292,8 @@ class VoxCPM2Model(Model):
             "talker_decode": Loop(
                 name="talker_decode_loop",
                 section=talker(["latent_patch"], loop=True),
-                max_iters=self.get_max_output_tokens(),
+                # the default request's cap, so the conductor refuses a budget past max_len
+                max_iters=self.get_loop_caps()["talker_decode_loop"],
                 outputs=[],
             ),
             "vae_chunk": GraphNode(
@@ -378,14 +384,34 @@ class VoxCPM2Model(Model):
 
     @staticmethod
     def _number(kwargs: dict, key: str, default, kind=float):
-        value = kwargs.get(key, default)
+        """``kwargs[key]`` as a finite JSON number, ``default`` when absent. An
+        integer knob takes a float only when it is whole; a string or a bool is refused."""
+        value = kwargs.get(key)
+        if value is None:
+            return default
+        if kind is int and isinstance(value, float) and value.is_integer():
+            value = int(value)
+        allowed = int if kind is int else (int, float)
+        if isinstance(value, bool) or not isinstance(value, allowed):
+            what = "an integer" if kind is int else "a number"
+            raise ValueError(f"VoxCPM2 {key} must be {what}, got {value!r}")
+        if kind is int:
+            return value  # the callers range-check it; a huge int has no float to overflow
         try:
-            value = kind(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"VoxCPM2 {key} must be a number, got {value!r}") from None
+            value = float(value)
+        except OverflowError:  # an int past the float range
+            value = math.inf
         if not math.isfinite(value):
             raise ValueError(f"VoxCPM2 {key} must be finite")
         return value
+
+    @staticmethod
+    def _text(kwargs: dict, key: str) -> str:
+        """``kwargs[key]`` as a string, empty when absent."""
+        value = kwargs.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"VoxCPM2 {key} must be a string, got {value!r}")
+        return value or ""
 
     def _patch_cap(self, kwargs: dict) -> int:
         """The request's patch cap: ``max_new_tokens``, else the standard
@@ -420,12 +446,13 @@ class VoxCPM2Model(Model):
             raise ValueError("VoxCPM2 supports audio output only")
         if "text" not in input_modalities or not set(input_modalities) <= {"text", "audio"}:
             raise ValueError("VoxCPM2 takes text, plus at most one reference clip")
-        instruct = str(kwargs.get("instruct") or kwargs.get("instructions") or "").strip()
+        instruct = (self._text(kwargs, "instruct") or self._text(kwargs, "instructions")).strip()
         if instruct:
             text = f"({instruct}){text}"
         # the reference's ``VoxCPM.generate``: runs of whitespace in the target become one space
         text = re.sub(r"\s+", " ", text)
-        if "inference_timesteps" in kwargs and int(kwargs["inference_timesteps"]) != self.inference_timesteps:
+        timesteps = self._number(kwargs, "inference_timesteps", self.inference_timesteps, int)
+        if timesteps != self.inference_timesteps:
             raise ValueError(
                 f"VoxCPM2 serves inference_timesteps={self.inference_timesteps}; it is a deployment setting"
             )
@@ -438,7 +465,7 @@ class VoxCPM2Model(Model):
             raise ValueError(f"VoxCPM2 needs min_len >= 0 and 1 <= max_new_tokens <= {self.config.max_len}")
 
         clips = (tensors or {}).get("audio_inputs", [])
-        ref_text = str(kwargs.get("ref_text") or "")
+        ref_text = self._text(kwargs, "ref_text")
         if not ref_text.strip():
             ref_text = ""
         digest = None
@@ -535,6 +562,9 @@ class VoxCPM2Model(Model):
         if model_kwargs.get(PATCH_BUDGET_KEY) is not None:
             budget = min(budget, int(model_kwargs[PATCH_BUDGET_KEY]))
         return {"talker_decode_loop": max(1, budget - 1)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return self.REQUEST_KWARGS
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         talker = {"main": KVLabel(growth=(("talker_decode", "talker_decode_loop"),))}

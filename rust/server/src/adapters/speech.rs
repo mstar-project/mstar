@@ -40,14 +40,6 @@ pub(super) fn speech_submission(req: &SpeechRequest, model_kwargs: Map<String, V
     }
 }
 
-/// `SpeechRequest.speed` as Python reads it: unsent is its default 1.0, `null` None.
-pub(super) fn speech_speed(req: &SpeechRequest) -> Option<f64> {
-    match req.speed {
-        None => Some(1.0),
-        Some(sent) => sent,
-    }
-}
-
 /// OpenAI's `instructions` as the model's `instruct`, when non-empty.
 pub(super) fn instructions_as_instruct(mk: &mut Map<String, Value>) {
     if let Some(instructions) = mk.remove("instructions").filter(truthy) {
@@ -69,7 +61,6 @@ impl OpenAIAdapter for Orpheus {
     }
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk = speech_kwargs(req, "temperature", "top_p");
-        forward_sent_speed(&mut mk, req);
         Ok(speech_submission(req, mk))
     }
 }
@@ -94,7 +85,6 @@ impl OpenAIAdapter for Qwen3TTS {
         // OpenAI's field is `instructions`; the model reads `instruct`.
         instructions_as_instruct(&mut mk);
         sampling(&mut mk, req, "temperature", "top_p");
-        forward_sent_speed(&mut mk, req);
         Ok(speech_submission(req, mk))
     }
     fn ref_audio(&self) -> Option<RefAudio> {
@@ -102,7 +92,7 @@ impl OpenAIAdapter for Qwen3TTS {
     }
 }
 
-/// Kokoro: speech, forwarding `voice` and `speed`, which are real model knobs.
+/// Kokoro: speech, forwarding `voice`; a sent `speed` reaches it from `audio_speech`.
 pub struct Kokoro;
 
 impl OpenAIAdapter for Kokoro {
@@ -113,9 +103,6 @@ impl OpenAIAdapter for Kokoro {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
         if let Some(voice) = &req.voice {
             set_default(&mut mk, "voice", Value::from(voice.clone()));
-        }
-        if let Some(speed) = speech_speed(req) {
-            set_default(&mut mk, "speed", json_num(speed));
         }
         set_seed(&mut mk, req.seed);
         Ok(speech_submission(req, mk))
@@ -136,7 +123,6 @@ impl OpenAIAdapter for Chatterbox {
             set_default(&mut mk, "voice", Value::from(voice.clone()));
         }
         sampling(&mut mk, req, "temperature", "top_p");
-        forward_sent_speed(&mut mk, req);
         Ok(speech_submission(req, mk))
     }
     fn ref_audio(&self) -> Option<RefAudio> {
@@ -158,6 +144,10 @@ impl OpenAIAdapter for FishS2Pro {
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
         sampling(&mut mk, req, "temperature", "top_p");
+        // not an S2-Pro control; forwarded, as the Python adapter does, so it is logged as ignored
+        if let Some(voice) = &req.voice {
+            set_default(&mut mk, "voice", Value::from(voice.clone()));
+        }
         // a transcript without its clip
         if !mk.get("ref_audio").is_some_and(truthy) {
             mk.remove("ref_text");
@@ -200,7 +190,7 @@ impl OpenAIAdapter for CosyVoice3 {
 }
 
 /// OmniVoice: speech whose mode follows from what is sent; `voice` stands in
-/// for `instruct` and `speed` is a real knob.
+/// for `instruct`; a sent `speed` reaches it from `audio_speech`.
 pub struct OmniVoice;
 
 impl OpenAIAdapter for OmniVoice {
@@ -218,9 +208,6 @@ impl OpenAIAdapter for OmniVoice {
             }
         }
         mk.remove("voice");
-        if let Some(speed) = speech_speed(req) {
-            set_default(&mut mk, "speed", json_num(speed));
-        }
         set_seed(&mut mk, req.seed);
         Ok(speech_submission(req, mk))
     }

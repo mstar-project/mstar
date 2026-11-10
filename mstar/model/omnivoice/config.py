@@ -68,8 +68,9 @@ class OmniVoiceGenerationDefaults:
     class_temperature: float = 0.0
     denoise: bool = True
 
-    # Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step
-    # is the loop's cap; this only bounds the graph.
+    # Ceiling for the unmask Loop's ``max_iters`` and the largest num_step a
+    # request may ask for (above it is a 400). A request's own num_step is the
+    # loop's cap.
     max_num_step: int = 64
 
 

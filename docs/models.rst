@@ -262,6 +262,17 @@ Notes
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
+- Unset sampling knobs take the checkpoint's ``generation_config.json``, then the
+  model's config. BAGEL and Orpheus are the exception: their files are the
+  backbone's chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
+  ``do_sample: false`` is read and the recipes stay (BAGEL temperature 0.6,
+  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8).
+- Qwen3-Omni's Talker cap comes from ``talker_max_new_tokens``, 4096 on the
+  released checkpoint (it was 2048). Plain sampling keys target the Thinker, except
+  on ``/v1/audio/speech``, where ``temperature`` and ``top_p`` set the Talker;
+  ``talker_*`` and ``code_predictor_*`` set those stages on every route.
+- Qwen3-TTS: ``talker_<knob>`` wins over a plain ``<knob>`` when a request
+  sends both.
 
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -336,9 +347,10 @@ VoxCPM2, Wan2.2, Waypoint and Z-Image.
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
-- Zero-shot only: there are no built-in speakers. Pass ``reference_audio`` with its
-  transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
-  ``ref_text`` is required alongside ``reference_audio``.
+- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` (an uploaded
+  ``audio`` input on ``/generate``) with its transcript in ``ref_text`` to clone a voice,
+  or describe one in ``instruct`` (``voice`` on ``/v1/audio/speech``).
+  ``ref_text`` is required alongside the reference clip.
 - ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
   name is resolved to the id the model was trained on before the prompt is
   built, and an unrecognised value warns and falls back to language-agnostic
@@ -492,7 +504,7 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
     ``target_language`` (a translation to or from English; the OpenAI route also takes
     ``task="translate"``) and ``punctuation`` (default on).
-  - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
+  - ``canary_qwen``: English only. ``instruction``
     replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
 
 - A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
@@ -509,6 +521,28 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
+- Request knobs must have their documented types (a string ``language``, a boolean
+  ``punctuation``, a string ``instruction``), or the request is a 400. Canary-Qwen refuses a
+  ``language`` other than English on every route. Canary and Canary-Qwen decode greedily
+  unless the request sets ``temperature`` above 0 (``top_p`` and ``top_k`` then apply);
+  neither checkpoint declares sampling defaults, so a ``min_p`` or ``repetition_penalty``
+  is refused.
+  ``max_output_tokens`` may be at most 1014 on Canary (the position table less its 10-token
+  prompt) and 1024 on Canary-Qwen; a larger value is refused rather than cut. Parakeet and
+  Nemotron decode greedily and read only ``language``: a sent ``temperature`` is logged
+  as ignored.
+
+Qwen3-ASR (``qwen3_asr``, ``qwen3_asr_realtime``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Greedy, as the checkpoint's ``do_sample: false`` declares. A request reads ``language``
+  (an ISO code or name; it forces the language and drops the model's ``language X`` line),
+  ``initial_prompt`` (or the request text) as system-turn context, and ``assistant_prefix``,
+  a string the model continues from (the realtime route's running hypothesis).
+- ``max_output_tokens`` defaults to 4096; a larger value is served up to the text model's
+  ``max_position_embeddings`` while the KV pool has room, and past it is a 400. The model
+  writes no timestamps: ``/v1/audio/transcriptions`` gives a timed format's segments one
+  per window. ``min_p`` and ``repetition_penalty`` are refused.
 
 BAGEL notes
 ~~~~~~~~~~~
@@ -533,6 +567,21 @@ BAGEL notes
   GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
+
+GLM-5.2 / GLM-5.3-Flash (``glm52``, ``glm5_next``)
+--------------------------------------------------
+
+- Sampling defaults come from the checkpoint's ``generation_config.json`` (temperature
+  1.0 and top_p 0.95 for both), read from a local checkpoint or the cached Hub snapshot;
+  the conductor never fetches it, and without it the same values apply. A request may set
+  ``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``,
+  ``penalize_prompt`` and ``ignore_eos``. ``min_p`` above 0 is refused, since neither
+  checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.
+- GLM-5.2's ``max_tokens`` may run to its serving window (``index_topk``, or
+  ``max_seq_len`` with ``dsa_long_context``). GLM-5.3-Flash holds contexts to
+  ``index_topk`` (2048), where dense MLA computes exactly what its sparse attention does,
+  so ``max_tokens`` above 2048 is a 400 rather than being shortened; under MTP, a
+  ``max_tokens`` past the room the prompt leaves is refused too.
 
 Muse Glimmer (``muse_glimmer``)
 -------------------------------
@@ -677,6 +726,7 @@ and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
 and 9B ship none, so the engine sampler's defaults apply. A request's
 ``min_p`` above 0 is refused (a 400) unless the checkpoint sets a ``min_p``,
 which turns the sampler's min-p filter on; none of these does.
+``max_output_tokens`` may not exceed ``max_position_embeddings``.
 
 With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
@@ -900,7 +950,11 @@ Kokoro notes
   ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
   English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
   ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
-  synthesize a phoneme string directly).
+  synthesize a phoneme string directly). An empty ``voice`` / ``lang_code`` or a
+  ``speed`` outside 0.25-4.0 is a 400. ``seed`` fixes the vocoder's noise (absent, the
+  server derives one from the request id), so a seeded request run at the same batch
+  layout repeats exactly; batched differently, its noise is the same but padding rounding
+  moves the waveform's phase, as it does in the reference.
 - Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
   fallback even when it is installed, ``chunk_target_phonemes`` and
@@ -1051,6 +1105,13 @@ CosyVoice3 notes
 - Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
   prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
   from 1.4% to 13.4%, with words dropped mid-sentence.
+- Request knobs are strictly typed: ``ras_window`` and ``n_cfm_timesteps`` take a whole
+  float but not a string or a boolean; ``top_k`` (1-128) and ``max_new_tokens`` follow
+  the server's integer rule (:ref:`generation-parameters`); an out-of-range value is a
+  400. ``voice``, ``instruct`` and ``ref_text``
+  must be strings. ``max_new_tokens`` above the deployment's speech-token limit is
+  refused, not cut. ``seed`` fixes the LM's sampling; the flow and vocoder noise is
+  fixed, as in the reference. ``speed`` has no effect and is logged as ignored.
 - On ``/v1/audio/speech``, text longer than one piece is synthesized as ordered
   sentence pieces, as the reference frontend does: about 80 tokens (320
   characters) of English, or 80 characters of text with Chinese, each piece
@@ -1152,7 +1213,7 @@ Qwen3-TTS notes
   whole-walk CUDA Graph (up to 128 rows a step), with the 15-step CodePredictor
   loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
-  request state. Residual ``subtalker_*`` sampling is per-request through the
+  request state. Residual ``code_predictor_*`` sampling (``subtalker_*`` is a deprecated alias) is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
@@ -1288,7 +1349,7 @@ Fish Audio S2-Pro notes
   control is part of the text. Clone a voice with ``ref_audio`` (data URL,
   base64, or an http(s) URL when the server allows remote fetch) and its transcript in
   ``ref_text``; with the SDK, ``client.tts(text, reference_audio="ref.wav",
-  ref_text="...")``. ``voice`` and ``speed`` are ignored.
+  ref_text="...")``. ``voice`` and ``speed`` are logged as ignored.
 - Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
   ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
   temperature first and takes top-k and top-p over the tempered probabilities,
@@ -1346,6 +1407,13 @@ VoxCPM2 notes
   mid-text, as it does in the official ``voxcpm`` package (a 983-character
   Russian text stopped about three quarters of the way in on 5 of 10 seeds
   there). Split long text into several requests.
+- ``min_len``, ``max_len`` and ``inference_timesteps`` must be integers (a whole float
+  such as ``16.0`` is accepted; ``2.7`` and ``"20"`` are 400s), ``max_new_tokens`` /
+  ``max_output_tokens`` (160 ms patches) follow the server's integer rule, and
+  ``cfg_value`` is a number in [0, 10].
+  ``inference_timesteps`` is a deployment setting a request may only repeat. A budget past
+  the model's ``max_len`` is refused. ``seed`` fixes the diffusion noise. ``voice`` is
+  dropped (VoxCPM2 has no named voices) and a sent ``speed`` is logged as ignored.
 
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
@@ -1562,19 +1630,21 @@ Chatterbox notes
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
-  the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
-  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  the upper bounds are the reference demo's), ``penalize_prompt`` (whether the
+  penalty counts the prompt's tokens, default true), ``seed``, ``n_cfm_timesteps``
+  (S3Gen Euler steps, 10; Turbo 2), ``max_output_tokens`` (up to the deployment's
   ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
   ``max_concurrent_requests`` set, the server refuses to start unless that
   many requests of that length fit the KV cache, so raise it together with
   ``max_num_pages`` or a lower cap),
-  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  ``ignore_eos`` (T3 decodes all ``max_output_tokens``
   past the stop token, for fixed-length benchmarks; the speech tokens among
   them are vocoded, but T3 keeps emitting stop and control tokens after the
   end of speech and those are dropped, so the audio is shorter than
-  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
-  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
-  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  ``max_output_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo has no
+  ``cfg_weight``, ``exaggeration`` or ``min_p``: a non-zero value is a 400.
+  ``language_id`` on a non-multilingual checkpoint is reported as ignored.
   The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
   a clip uploaded as ``audio`` input is the reference voice.
 - Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
@@ -1734,7 +1804,9 @@ same transformer instance and KV pool as the generator. ``/v1/chat/completions``
 takes image and video content parts (URLs or data URIs) and streams tokens; the
 chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
 ``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
-``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused unless the checkpoint's
+``generation_config.json`` sets one; ``max_tokens``
+defaults to 2048), and for video attachments ``video_fps`` / ``video_num_frames``
 (frames are sampled at 2 fps by default, each frame a timestamped span).
 
 .. code-block:: bash
@@ -1889,8 +1961,8 @@ own ``window_decoder`` partition; a request opts in per call:
        new frames are delivered — a new prompt steers the same world.
    * - ``session_timeout_s``
      - 600
-     - Seconds an idle session is kept after its request finishes, capped at the
-       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
+     - Seconds an idle session is kept after its request finishes, at most the
+       deployment's ``session_timeout_max_s`` (3600); more is a 400. An expired session resumes
        like an unknown one: the request is rejected.
    * - ``end_session``
      - ``false``
@@ -1993,7 +2065,8 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
        frames = ``(num_frames - 1) // 4 + 1``.
    * - ``num_inference_steps``
      - 50
-     - Clamped to ``max_denoise_steps`` (100), the denoise loop's ceiling.
+     - An integer in 1-100; the upper bound is the denoise loop's ``max_iters``
+       (``max_denoise_steps``). A 400 outside it.
    * - ``guidance_scale``
      - 5.0
      - Classifier-free guidance; run as a single batched forward.

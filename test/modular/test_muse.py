@@ -765,3 +765,14 @@ def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(model_dir, monk
     for i, layer in enumerate(lm.model.layers):
         # what the stack's forward sets; the attention refuses a layer of the other group
         layer.self_attn.attend.set_layer_idx(i)
+
+
+@pytest.mark.parametrize(
+    "bad", [{"enable_thinking": "false"}, {"enable_thinking": 0}, {"current_date": 20261109}], ids=str,
+)
+def test_a_mistyped_template_switch_is_a_400(model_dir, bad):
+    """A string ``"false"`` would leave reasoning on, so it is refused, as on Qwen3.5."""
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+
+    with pytest.raises(ValueError, match=next(iter(bad))):
+        MuseGlimmerModel(str(model_dir)).render_prompt([], **bad)
