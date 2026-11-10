@@ -1,6 +1,5 @@
 """A request's media is refused by what its files add up to, and by the
 model's per-modality file count, before the data worker decodes the files."""
-import contextlib
 import importlib
 import queue
 import struct
@@ -221,16 +220,17 @@ def test_cosmos3_generation_takes_one_image_or_one_video(tmp_path):
 
     model = object.__new__(Cosmos3Model)
     model.config = types.SimpleNamespace(serves_reasoner=False, enable_reasoner=False)
-    loaded = []
-    model.load_video = lambda path, device: loaded.append(path) or torch.zeros(1, 3, 8, 8)
+    def load_video(path, device):
+        raise RuntimeError("the count check let the video through")
+
+    model.load_video = load_video
     (tmp_path / "clip").write_bytes(b"")
     request = PreprocessInput(
         request_id="r1", text="a cat", file_paths={"video": [str(tmp_path / "clip")]},
         input_modalities=["video", "text"], output_modalities=["video"], model_kwargs={},
     )
-    with contextlib.suppress(Exception):  # only the count check is under test
+    with pytest.raises(RuntimeError, match="the count check let the video through"):
         _preprocess_thread(model)._process_input(request)
-    assert loaded == [str(tmp_path / "clip")]
     two = {"image_inputs": [torch.zeros(3, 8, 8)], "video_inputs": [torch.zeros(1, 3, 8, 8)]}
     with pytest.raises(ValueError, match="one image or one video; got 2"):
         model.process_prompt("a cat", ["image", "video", "text"], ["video"], tensors=two)
