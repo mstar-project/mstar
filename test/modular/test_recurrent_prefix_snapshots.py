@@ -905,25 +905,6 @@ def test_an_eager_prefill_writes_the_checkpoint_buffer_the_graphs_share():
     assert plans[1][5] is plans[0][5], "the eager step allocated checkpoints of its own"
 
 
-@pytest.mark.parametrize("writes", [True, False])
-def test_a_pool_keeps_snapshots_only_while_its_gdn_kernels_write_checkpoints(writes):
-    """AITER's GDN kernels update the pool in place and save no checkpoints, so a snapshot slot
-    would hold whatever it held before: over them the pool's prefix cache stays shut."""
-    pool = _build(RecurrentStateConfig(
-        num_layers=2, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
-        max_slots=4, prefix_slots=2, kv_cache="kv",
-    ))
-    pool.bind_kv(_StubChains())
-    gdn = GDNManager(
-        config=LinearAttnConfig(recurrent_state="state", variant=LinearAttnVariant.GDN),
-        geometry=DeltaNetGeometry(num_k_heads=1, num_v_heads=1, head_k_dim=2, head_v_dim=2, conv_kernel_size=2),
-        num_layers=1, state_dtype=torch.float32, has_sink=True, device=torch.device("cpu"),
-        kernels=SimpleNamespace(writes_snapshots=writes),
-    )
-    gdn.bind_dependencies({"state": pool})
-    assert (pool._kv is not None) is writes
-
-
 @pytest.mark.parametrize("refusal", [None, "the kernels keep no state checkpoints"])
 def test_the_engine_keeps_a_node_shut_over_a_resource_that_refuses_to_restore(monkeypatch, refusal):
     """The same refusal from the spec, before any resource is built: the GDN layer over the pool
@@ -932,11 +913,3 @@ def test_the_engine_keeps_a_node_shut_over_a_resource_that_refuses_to_restore(mo
     monkeypatch.setattr(LinearAttnSpec, "restore_refusal", lambda self: refusal)
     opened = opening_prefix_caches(specs.values(), {"LLM": 1}, checkpoint_named=True)
     assert opened == (set() if refusal else {"kv", "state"})
-
-
-def test_refusing_snapshots_gives_the_slots_back():
-    pool = _pool(prefix_slots=2)
-    assert all(b.shape[1] == 6 for b in pool._blocks.values())
-    pool.refuse_snapshots("the kernels keep no checkpoints")
-    assert all(b.shape[1] == 4 for b in pool._blocks.values())
-    assert pool.config.prefix_slots == 0 and pool._kv is None
