@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import types
 import unittest
 import unittest.mock
@@ -528,6 +529,18 @@ class TestComment(unittest.TestCase):
                     self.assertLessEqual(len(tail.read_text()), gpu_review.ERR_TAIL + 1)
                     self.assertGreater(len(tail.read_text()), gpu_review.ERR_TAIL - 100,
                                        "the tail would drop the long line the error is on")
+        with tempfile.TemporaryDirectory() as temp:  # a stderr of any size: only its end is read
+            results = Path(temp, "lt/amd/results")
+            results.mkdir(parents=True)
+            (results / "claude.err").write_bytes(b"x " * (4 << 20) + b"API Error: 401\n")
+            tracemalloc.start()
+            try:
+                gpu_review.redact({}, temp)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertTrue((results / "claude.err.tail").read_text().endswith("x API Error: 401\n"))
+            self.assertLess(peak, 2 << 20, "an 8 MB stderr would be read whole into the job's memory")
 
     def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
         box_key = "sk-ant-api03-" + "Ab1_-" * 8

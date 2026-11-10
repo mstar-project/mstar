@@ -1087,6 +1087,7 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner,
 
 
 ERR_TAIL = 4096  # how much of a box session's stderr, redacted, the run's artifact keeps: its last 4 KB
+ERR_READ = 65536  # how much of its end is read and redacted, to keep ERR_TAIL of it
 
 
 def redact(out, runner_temp, s2="", s3="", s4=""):
@@ -1117,10 +1118,17 @@ def redact(out, runner_temp, s2="", s3="", s4=""):
             result.write_text(json.dumps(fields))
         err = box / "results/claude.err"
         if err.is_file() and fields.get("verdict") not in ("pass", "partial", "fail"):
-            tail = bot.redact(err.read_text(errors="replace"), exact=exact)  # whole, so no secret is cut in two
-            if len(tail) > ERR_TAIL:  # marked where it starts mid-line
-                tail = ("" if tail[-ERR_TAIL - 1] == "\n" else "…") + tail[-ERR_TAIL:]
-            (box / "results/claude.err.tail").write_text(tail)
+            with open(err, "rb") as f:  # only its end, so no size of it can fill the job's memory
+                cut = f.seek(0, os.SEEK_END) > ERR_READ
+                f.seek(-ERR_READ if cut else 0, os.SEEK_END if cut else os.SEEK_SET)
+                window = f.read()
+            if cut:  # from its first whitespace, so a secret the seek split can't leave its end
+                space = re.search(rb"\s", window)
+                window = window[space.start():] if space else b""
+            text = bot.redact(window.decode("utf-8", "replace"), exact=exact)  # whole, so no secret is cut in two
+            start = max(len(text) - ERR_TAIL, 0)  # marked where it starts mid-line
+            whole = text[start - 1] == "\n" if start else not cut or text.startswith("\n")
+            (box / "results/claude.err.tail").write_text(("" if whole else "…") + text[start:])
 
 
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):
