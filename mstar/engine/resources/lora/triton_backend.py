@@ -13,11 +13,22 @@ only on the token count, the slot count and the shapes, never on the batch's con
 captured replay launches the same grid every step.
 
 At decode width a shrink has a few row tiles and a long contraction, so ``lora_apply_``
-splits the contraction over programs into fp32 partials that its expand sums when it
-loads them. The rank is held in tiles of at most 64: when the max rank fits one tile the
-expand loads a row tile's ``h`` once and walks a strip of output columns with it; above
-that it reloads ``h`` per column block, one rank tile at a time, and only the tiles under
-the slot's own rank.
+splits the contraction over programs into fp32 partials. The rank is held in tiles of at
+most 64: when the max rank fits one tile the expand loads a row tile's ``h`` once, summing
+the partials, and walks a strip of output columns with it; above that it reloads ``h``
+per column block, one rank tile at a time and only the tiles under the slot's own rank,
+so a small kernel first sums the partials into one ``h`` (``_lora_reduce_kernel``):
+summed inside that loop they would be reloaded for every column block.
+
+Tile sizes depend only on the token count and the max rank (``_tiles``): small row tiles
+at decode width, where the work is streaming the adapter weights, and larger ones at
+prefill width, where it is the GEMMs.
+
+The shrink writes zeros from a slot's rank up to the max rank, so ``lora_apply_``'s expand
+contracts over whole rank tiles with no mask on the slot's rank, which would stop the
+compiler from vectorizing loads along ``h``'s contiguous axis. Weight columns past a
+slot's rank meet those zeros, so they must be finite (the pool zero-pads them), as the
+reference also requires.
 
 These are the CUDA kernels of the ``mstar::lora_shrink`` / ``mstar::lora_expand_`` /
 ``mstar::lora_apply_`` custom ops (``ops.py``), so ``torch.compile`` treats each as one
@@ -27,6 +38,7 @@ opaque node, and of ``mstar::lora_experts_apply_``, an experts target's grouped 
 from __future__ import annotations
 
 import functools
+from typing import NamedTuple
 
 import torch
 import triton
@@ -46,15 +58,32 @@ from mstar.utils.fused_moe.runner import tl_compute_type
 # fused slices the expand kernel takes in one launch (q/k/v, gate/up, a delta-net's
 # q / k / v / z / a / b)
 _MAX_SLICES = 8
-_BLOCK_M = 16
 # a program holds at most this many of a slot's rank at once; larger ranks are tiled
 _MAX_BLOCK_R = 64
-_SHRINK_BLOCK_K = 128
-_EXPAND_BLOCK_N = 64
-# a split-K shrink gives each program about this much of the contraction, in at most
-# this many splits; only when the row tiles alone would not fill the device
+# a split-K shrink gives each program at least this much of the contraction, in at most
+# this many splits, and splits only until its programs fill the device this many times
 _SPLIT_K_CHUNK = 256
 _MAX_SPLITS = 16
+_SHRINK_WAVES = 2
+
+
+class _Tiles(NamedTuple):
+    shrink_m: int
+    shrink_k: int
+    expand_m: int
+    expand_n: int
+
+
+_DECODE_TILES = _Tiles(shrink_m=16, shrink_k=128, expand_m=16, expand_n=64)
+_PREFILL_TILES = _Tiles(shrink_m=64, shrink_k=128, expand_m=64, expand_n=128)
+# from these many tokens, or these many over a tiled rank, the prefill tiles are faster
+_PREFILL_TOKENS = 256
+_PREFILL_TOKENS_TILED_RANK = 64
+
+
+def _tiles(tokens: int, max_rank: int) -> _Tiles:
+    tiled = max_rank > _MAX_BLOCK_R
+    return _PREFILL_TILES if tokens >= (_PREFILL_TOKENS_TILED_RANK if tiled else _PREFILL_TOKENS) else _DECODE_TILES
 
 
 @triton.jit
@@ -86,9 +115,11 @@ def _lora_shrink_kernel(
     stride_xm, stride_xk, stride_as, stride_ar, stride_ak, stride_hs, stride_hm, stride_hn,
     NUM_SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr, R_TILES: tl.constexpr, BLOCK_K: tl.constexpr,
+    K_ALIGN: tl.constexpr,
 ):
     """``h[split, t, slice cols] = x[t, split's k] @ a[slot, slice rows, split's k]^T``, one
-    tile of ``BLOCK_R`` of the rank per program."""
+    tile of ``BLOCK_R`` of the rank per program, and zeros from the slot's rank up to
+    ``max_rank``."""
     pid_m = tl.program_id(0)
     slice_id = tl.program_id(1) // R_TILES
     r0 = (tl.program_id(1) % R_TILES) * BLOCK_R
@@ -96,34 +127,45 @@ def _lora_shrink_kernel(
     slot, m0, end, rank, valid = _locate(pid_m, indptr_ptr, ranks_ptr, NUM_SLOTS, SLOTS_P2, BLOCK_M)
     if not valid:
         return
-    if r0 >= rank:
-        return
     offs_m = m0 + tl.arange(0, BLOCK_M)
     m_mask = offs_m < end
     rows = tl.load(order_ptr + offs_m, mask=m_mask, other=0).to(tl.int64)
     offs_n = r0 + tl.arange(0, BLOCK_R)
     n_mask = offs_n < rank
     cols = slice_id * max_rank + offs_n
-    k_lo = split * k_per_split
-    k_hi = tl.minimum(k_lo + k_per_split, in_features)
     acc = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
-    for k0 in range(k_lo, k_hi, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < k_hi
-        x = tl.load(
-            x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
-        )
-        a = tl.load(
-            a_ptr + slot * stride_as + cols[None, :] * stride_ar + offs_k[:, None] * stride_ak,
-            mask=n_mask[None, :] & k_mask[:, None], other=0.0,
-        )
-        acc += tl.dot(x, a)
+    if r0 < rank:
+        # K_ALIGN divides both bounds, so the compiler can vectorize the masked loads along k
+        k_lo = tl.multiple_of(split * k_per_split, K_ALIGN)
+        k_hi = tl.multiple_of(tl.minimum(k_lo + k_per_split, in_features), K_ALIGN)
+        for k0 in range(k_lo, k_hi, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < k_hi
+            x = tl.load(
+                x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            a = tl.load(
+                a_ptr + slot * stride_as + cols[None, :] * stride_ar + offs_k[:, None] * stride_ak,
+                mask=n_mask[None, :] & k_mask[:, None], other=0.0,
+            )
+            acc += tl.dot(x, a)
     tl.store(
         h_ptr + split * stride_hs + rows[:, None] * stride_hm + cols[None, :] * stride_hn,
         acc.to(h_ptr.dtype.element_ty),
-        mask=m_mask[:, None] & n_mask[None, :],
+        mask=m_mask[:, None] & (offs_n < max_rank)[None, :],
     )
+
+
+@triton.jit
+def _lora_reduce_kernel(parts_ptr, h_ptr, numel, stride_s, SPLITS: tl.constexpr, BLOCK: tl.constexpr):
+    """``h = sum over splits of parts[split]``, in fp32 and in split order."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for split in tl.static_range(SPLITS):
+        acc += tl.load(parts_ptr + split * stride_s + offs, mask=mask, other=0.0)
+    tl.store(h_ptr + offs, acc.to(h_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -135,26 +177,35 @@ def _bound(i, b0, b1, b2, b3, b4, b5, b6, b7, b8):
 
 
 @triton.jit
-def _load_h(h_ptr, rows, m_mask, col0, r0, rank, stride_hs, stride_hm, stride_hn,
-            SPLITS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr):
+def _load_h(h_ptr, rows, m_mask, col0, r0, rank, max_rank, stride_hs, stride_hm, stride_hn,
+            SPLITS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr,
+            ZEROS_PAST_RANK: tl.constexpr, dtype: tl.constexpr):
     """``h`` over ranks ``[r0, r0 + BLOCK_R)`` of a slice starting at column ``col0``, its
-    split partials summed in fp32."""
+    split partials summed in fp32, as ``dtype``. Loaded up to ``max_rank``; past the slot's
+    rank it is zeroed unless ``h`` already holds zeros there (``ZEROS_PAST_RANK``)."""
     offs_k = r0 + tl.arange(0, BLOCK_R)
     ptrs = h_ptr + rows[:, None] * stride_hm + (col0 + offs_k)[None, :] * stride_hn
-    mask = m_mask[:, None] & (offs_k < rank)[None, :]
-    h = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
-    for split in tl.static_range(SPLITS):
-        h += tl.load(ptrs + split * stride_hs, mask=mask, other=0.0).to(tl.float32)
-    return h
+    mask = m_mask[:, None] & (offs_k < max_rank)[None, :]
+    if SPLITS == 1:
+        h = tl.load(ptrs, mask=mask, other=0.0)
+    else:
+        h = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+        for split in tl.static_range(SPLITS):
+            h += tl.load(ptrs + split * stride_hs, mask=mask, other=0.0).to(tl.float32)
+    if not ZEROS_PAST_RANK:
+        # a select, not a multiply: h past a slot's rank may hold anything
+        h = tl.where((offs_k < rank)[None, :], h, 0.0)
+    return h.to(dtype)
 
 
 @triton.jit
-def _load_b(b_ptr, slot, offs_n, n_mask, r0, rank, stride_bs, stride_bn, stride_bk, BLOCK_R: tl.constexpr):
-    """``b[slot]`` over ranks ``[r0, r0 + BLOCK_R)`` and columns ``offs_n``, as ``[BLOCK_R, N]``."""
+def _load_b(b_ptr, slot, offs_n, n_mask, r0, max_rank, stride_bs, stride_bn, stride_bk, BLOCK_R: tl.constexpr):
+    """``b[slot]`` over ranks ``[r0, r0 + BLOCK_R)`` and columns ``offs_n``, as ``[BLOCK_R, N]``;
+    ranks past the slot's meet zeros in ``h``."""
     offs_k = r0 + tl.arange(0, BLOCK_R)
     return tl.load(
         b_ptr + slot * stride_bs + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk,
-        mask=(offs_k < rank)[:, None] & n_mask[None, :], other=0.0,
+        mask=(offs_k < max_rank)[:, None] & n_mask[None, :], other=0.0,
     )
 
 
@@ -168,6 +219,7 @@ def _lora_expand_kernel(
     stride_ym, stride_yn,
     NUM_SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr, SPLITS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_R: tl.constexpr, R_TILES: tl.constexpr,
+    ZEROS_PAST_RANK: tl.constexpr,
 ):
     """``y[t, slice] += scaling * (sum over splits of h[split, t, slice ranks]) @ b^T``,
     each program over a strip of the slice's columns."""
@@ -175,6 +227,7 @@ def _lora_expand_kernel(
     pid_n = tl.program_id(1)
     slice_id = tl.program_id(2)
     n_programs = tl.num_programs(1)
+    dtype = b_ptr.dtype.element_ty
     lo = _bound(slice_id, bound0, bound1, bound2, bound3, bound4, bound5, bound6, bound7, bound8)
     hi = _bound(slice_id + 1, bound0, bound1, bound2, bound3, bound4, bound5, bound6, bound7, bound8)
     if lo + pid_n * BLOCK_N >= hi:
@@ -186,25 +239,26 @@ def _lora_expand_kernel(
     m_mask = offs_m < end
     rows = tl.load(order_ptr + offs_m, mask=m_mask, other=0).to(tl.int64)
     scaling = tl.load(scalings_ptr + slot).to(tl.float32)
+    col0 = slice_id * max_rank
     if R_TILES == 1:
         # the whole rank in one tile: its h is loaded once, for every column strip
-        h = _load_h(h_ptr, rows, m_mask, slice_id * max_rank, 0, rank, stride_hs, stride_hm, stride_hn,
-                    SPLITS, BLOCK_M, BLOCK_R).to(b_ptr.dtype.element_ty)
+        h = _load_h(h_ptr, rows, m_mask, col0, 0, rank, max_rank, stride_hs, stride_hm, stride_hn,
+                    SPLITS, BLOCK_M, BLOCK_R, ZEROS_PAST_RANK, dtype)
     for n0 in range(lo + pid_n * BLOCK_N, hi, n_programs * BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
         n_mask = offs_n < hi
         if R_TILES == 1:
-            acc = tl.dot(h, _load_b(b_ptr, slot, offs_n, n_mask, 0, rank, stride_bs, stride_bn, stride_bk, BLOCK_R))
+            acc = tl.dot(h, _load_b(b_ptr, slot, offs_n, n_mask, 0, max_rank, stride_bs, stride_bn, stride_bk,
+                                    BLOCK_R))
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             # bounded by the slot's rank, not max_rank: a small adapter in a large-rank pool
             # pays for its own rank
             for r0 in range(0, rank, BLOCK_R):
-                h = _load_h(h_ptr, rows, m_mask, slice_id * max_rank, r0, rank,
-                            stride_hs, stride_hm, stride_hn, SPLITS, BLOCK_M, BLOCK_R)
                 acc += tl.dot(
-                    h.to(b_ptr.dtype.element_ty),
-                    _load_b(b_ptr, slot, offs_n, n_mask, r0, rank, stride_bs, stride_bn, stride_bk, BLOCK_R),
+                    _load_h(h_ptr, rows, m_mask, col0, r0, rank, max_rank, stride_hs, stride_hm, stride_hn,
+                            SPLITS, BLOCK_M, BLOCK_R, ZEROS_PAST_RANK, dtype),
+                    _load_b(b_ptr, slot, offs_n, n_mask, r0, max_rank, stride_bs, stride_bn, stride_bk, BLOCK_R),
                 )
         y_ptrs = y_ptr + rows[:, None] * stride_ym + offs_n[None, :] * stride_yn
         mask = m_mask[:, None] & n_mask[None, :]
@@ -217,9 +271,9 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _row_tiles(tokens: int, slots: int) -> int:
+def _row_tiles(tokens: int, slots: int, block_m: int) -> int:
     """The most compact row tiles any grouping of ``tokens`` over ``slots`` needs."""
-    return min(tokens, triton.cdiv(tokens, _BLOCK_M) + slots - 1)
+    return min(tokens, triton.cdiv(tokens, block_m) + slots - 1)
 
 
 def _rank_tiles(max_rank: int) -> tuple[int, int]:
@@ -229,22 +283,40 @@ def _rank_tiles(max_rank: int) -> tuple[int, int]:
     return block, triton.cdiv(max_rank, block)
 
 
-def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split):
+def _align(*values: int) -> int:
+    """The largest power of two up to 16 dividing every value."""
+    return next(a for a in (16, 8, 4, 2, 1) if all(v % a == 0 for v in values))
+
+
+def _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles):
     slots, width, _ = a.shape
     block_r, r_tiles = _rank_tiles(width // num_slices)
-    _lora_shrink_kernel[(_row_tiles(x.shape[0], slots), num_slices * r_tiles, splits)](
+    _lora_shrink_kernel[(_row_tiles(x.shape[0], slots, tiles.shrink_m), num_slices * r_tiles, splits)](
         x, a, h, token_order, slot_indptr, ranks,
         x.shape[1], width // num_slices, k_per_split,
         x.stride(0), x.stride(1),
         a.stride(0), a.stride(1), a.stride(2),
         h.stride(0), h.stride(1), h.stride(2),
         NUM_SLOTS=slots, SLOTS_P2=triton.next_power_of_2(slots),
-        BLOCK_M=_BLOCK_M, BLOCK_R=block_r, R_TILES=r_tiles, BLOCK_K=_SHRINK_BLOCK_K,
+        BLOCK_M=tiles.shrink_m, BLOCK_R=block_r, R_TILES=r_tiles, BLOCK_K=tiles.shrink_k,
+        K_ALIGN=_align(x.shape[1], k_per_split),
     )
 
 
-def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices):
-    """``h`` is ``[splits, tokens, slices * R]``, summed over its splits."""
+def _reduce(parts: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``[splits, tokens, width]`` fp32 partials summed into ``[1, tokens, width]``."""
+    h = parts.new_empty(1, *parts.shape[1:], dtype=dtype)
+    block = 128
+    _lora_reduce_kernel[(triton.cdiv(h.numel(), block),)](
+        parts, h, h.numel(), parts.stride(0), SPLITS=parts.shape[0], BLOCK=block,
+    )
+    return h
+
+
+def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles, zeros_past_rank):
+    """``h`` is ``[splits, tokens, slices * R]``, summed over its splits; ``zeros_past_rank``
+    says it holds zeros from each slot's rank up to ``R`` (as ``_lora_shrink_kernel``
+    writes it)."""
     if len(out_slices) > _MAX_SLICES:
         raise ValueError(f"at most {_MAX_SLICES} fused slices; got {len(out_slices)}")
     slots, _, max_rank = b.shape
@@ -252,11 +324,11 @@ def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices)
     for width in out_slices:
         bounds.append(bounds[-1] + width)
     bounds += [bounds[-1]] * (_MAX_SLICES + 1 - len(bounds))
-    row_tiles = _row_tiles(y.shape[0], slots)
+    row_tiles = _row_tiles(y.shape[0], slots, tiles.expand_m)
     block_r, r_tiles = _rank_tiles(max_rank)
     # enough strips to fill the device a few times over when the row tiles do not
     strips = max(1, min(
-        triton.cdiv(max(out_slices), _EXPAND_BLOCK_N),
+        triton.cdiv(max(out_slices), tiles.expand_n),
         4 * _num_sms(y.device.index) // (row_tiles * len(out_slices)),
     ))
     _lora_expand_kernel[(row_tiles, strips, len(out_slices))](
@@ -266,10 +338,8 @@ def _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices)
         b.stride(0), b.stride(1), b.stride(2),
         y.stride(0), y.stride(1),
         NUM_SLOTS=slots, SLOTS_P2=triton.next_power_of_2(slots), SPLITS=h.shape[0],
-        BLOCK_M=_BLOCK_M, BLOCK_N=_EXPAND_BLOCK_N, BLOCK_R=block_r, R_TILES=r_tiles,
-        # a tiled rank reloads its h tiles per column strip: pipelining those loads would
-        # stage every split of every tile in shared memory
-        **({"num_stages": 1} if r_tiles > 1 else {}),
+        BLOCK_M=tiles.expand_m, BLOCK_N=tiles.expand_n, BLOCK_R=block_r, R_TILES=r_tiles,
+        ZEROS_PAST_RANK=zeros_past_rank,
     )
 
 
@@ -278,14 +348,16 @@ def _shrink_cuda(x, a, token_order, slot_indptr, token_slot, ranks, num_slices):
     h = x.new_empty(tokens, a.shape[1])
     if tokens == 0:
         return h
-    _shrink_into(h.unsqueeze(0), x, a, token_order, slot_indptr, ranks, num_slices, 1, in_features)
+    _shrink_into(h.unsqueeze(0), x, a, token_order, slot_indptr, ranks, num_slices, 1, in_features,
+                 _tiles(tokens, a.shape[1] // num_slices))
     return h
 
 
 def _expand_cuda(y, h, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
     if y.shape[0] == 0:
         return
-    _expand_from(y, h.unsqueeze(0), b, token_order, slot_indptr, ranks, scalings, out_slices)
+    _expand_from(y, h.unsqueeze(0), b, token_order, slot_indptr, ranks, scalings, out_slices,
+                 _tiles(y.shape[0], b.shape[2]), zeros_past_rank=False)
 
 
 def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scalings, out_slices):
@@ -294,15 +366,20 @@ def _apply_cuda(y, x, a, b, token_order, slot_indptr, token_slot, ranks, scaling
         return
     slots, width, _ = a.shape
     num_slices = len(out_slices)
-    splits = 1
-    if _row_tiles(tokens, slots) * num_slices < _num_sms(x.device.index):
-        splits = max(1, min(_MAX_SPLITS, triton.cdiv(in_features, _SPLIT_K_CHUNK)))
-    k_per_split = triton.cdiv(triton.cdiv(in_features, splits), _SHRINK_BLOCK_K) * _SHRINK_BLOCK_K
+    tiles = _tiles(tokens, width // num_slices)
+    r_tiles = _rank_tiles(width // num_slices)[1]
+    programs = _row_tiles(tokens, slots, tiles.shrink_m) * num_slices * r_tiles
+    splits = max(1, min(_MAX_SPLITS, triton.cdiv(in_features, _SPLIT_K_CHUNK),
+                        triton.cdiv(_SHRINK_WAVES * _num_sms(x.device.index), programs)))
+    k_per_split = triton.cdiv(triton.cdiv(in_features, splits), tiles.shrink_k) * tiles.shrink_k
     splits = triton.cdiv(in_features, k_per_split)
-    # fp32 partials, written only for rows the expand reads, so never cleared
-    h = torch.empty(splits, tokens, width, dtype=torch.float32, device=x.device)
-    _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split)
-    _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices)
+    # partials, written only for rows the expand reads, so never cleared; one split is
+    # written in the weights' dtype, as the expand would round it
+    h = torch.empty(splits, tokens, width, dtype=torch.float32 if splits > 1 else x.dtype, device=x.device)
+    _shrink_into(h, x, a, token_order, slot_indptr, ranks, num_slices, splits, k_per_split, tiles)
+    if splits > 1 and r_tiles > 1:
+        h = _reduce(h, x.dtype)
+    _expand_from(y, h, b, token_order, slot_indptr, ranks, scalings, out_slices, tiles, zeros_past_rank=True)
 
 
 lora_shrink.register_kernel("cuda")(_shrink_cuda)
