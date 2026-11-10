@@ -435,7 +435,7 @@ def test_attend_refuses_misuse():
     h, d, t = 1, 16, 2
     config = BoundedKVConfig(num_layers=1, num_heads=h, head_dim=d, rows_per_request=1, min_source_len=10,
                              max_source_len=10, retention=SinkWindow(4, 8), max_slots=2)
-    mgr = BoundedKVManager(config, torch.device("cpu"))
+    mgr = BoundedKVManager(config, torch.device("cpu"), torch.float32)
     # row 1 starts from a shared source, row 2 from its own row_source entry
     step = BoundedKVStep(segments=(Segment(1, "main", t), Segment(2, "main", t)),
                          positions={1: StreamPosition(10, 0, 0), 2: StreamPosition(10, 0, -1)})
@@ -520,7 +520,7 @@ def test_plan_resolves_retention_once_per_source_len():
 
     config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
                              retention=retention, max_slots=4)
-    mgr = BoundedKVManager(config, torch.device("cpu"))
+    mgr = BoundedKVManager(config, torch.device("cpu"), torch.float32)
     built = len(calls)
     for t in range(3):
         step, ctx = _step([1, 2], [t, t], [1, 1])
