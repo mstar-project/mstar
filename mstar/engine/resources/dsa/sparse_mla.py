@@ -120,19 +120,32 @@ class SparseGraphPlan:
         return self.wrapper.run(*_split(q_nope, q_pe, latent))
 
 
+class SparseChunk(NamedTuple):
+    """Rows ``[r0, r1)`` of an eager plan: their wrapper, its index buffer, and the plan's
+    offsets and lengths on the device, which ``_pack`` lays the slots out by."""
+
+    r0: int
+    r1: int
+    wrapper: object
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    lens: torch.Tensor
+
+
 class EagerSparsePlan:
     """An eager forward's plan (``EagerSparsePlans.plan``): a wrapper per ``MAX_ROWS`` rows,
     which run in turn. Every layer attends with the same lengths, so it is planned once."""
 
-    def __init__(self, chunks: list):
+    def __init__(self, chunks: list[SparseChunk]):
         self.chunks = chunks
 
     def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
         q_nope, q_pe, ckv, kpe = _split(q_nope, q_pe, latent)
         out = q_nope.new_empty(q_nope.shape)
-        for r0, r1, wrapper, indices, indptr, lens in self.chunks:
-            _pack(indices, slots[r0:r1], indptr, lens)
-            out[r0:r1] = wrapper.run(q_nope[r0:r1], q_pe[r0:r1], ckv, kpe)
+        for chunk in self.chunks:
+            rows = slice(chunk.r0, chunk.r1)
+            _pack(chunk.indices, slots[rows], chunk.indptr, chunk.lens)
+            out[rows] = chunk.wrapper.run(q_nope[rows], q_pe[rows], ckv, kpe)
         return out
 
 
@@ -177,9 +190,9 @@ class EagerSparsePlans:
             indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
             _plan(workspace, wrapper, indices[:need], lens[r0:r1], heads, kv_lora_rank, kpe,
                   sm_scale)
-            chunks.append((r0, r1, wrapper, indices[:need],
-                           indptr.to(device, non_blocking=True),
-                           chunk.to(device, non_blocking=True)))
+            chunks.append(SparseChunk(r0, r1, wrapper, indices[:need],
+                                      indptr.to(device, non_blocking=True),
+                                      chunk.to(device, non_blocking=True)))
         self._planned[turn] = torch.cuda.Event()
         self._planned[turn].record()
         return EagerSparsePlan(chunks)
