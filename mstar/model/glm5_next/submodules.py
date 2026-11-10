@@ -752,7 +752,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # row i is request i: one clone out of the graph and one host copy a step
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
+            # "text_inputs": the ids the KV cache keys the reply's pages by (`kv_labels`)
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
         )
 
     # -- MTP host side: the verdict mailbox ---------------------------------

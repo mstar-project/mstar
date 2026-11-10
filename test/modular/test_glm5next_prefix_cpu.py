@@ -81,10 +81,15 @@ def _engine(model: Glm5NextModel, prefix_slots: int) -> tuple[Engine, Glm5NextLL
     return engine, sub
 
 
-def _request(model: Glm5NextModel, engine: Engine, rid: str, text: str) -> torch.Tensor:
-    """Tokenize and key ``text`` as the preprocess worker and conductor do, and add it."""
+def _request(model: Glm5NextModel, engine: Engine, rid: str, text: str,
+             ids: torch.Tensor | None = None) -> torch.Tensor:
+    """Tokenize and key ``text`` as the preprocess worker and conductor do, and add it. ``ids``
+    stand in for the tokens of a ``text`` as long (ids past the byte tokenizer's)."""
     out = model.process_prompt(text, ["text"], ["text"])
     tensors, layouts = dict(out.new_input_tensors), out.metadata["kv_layout"]
+    if ids is not None:
+        assert len(ids) == len(tensors["text_inputs"][0])
+        tensors["text_inputs"] = [ids]
     rows = {key: {label: layout.row() for label, layout in by.items()} for key, by in layouts.items()}
     page = engine._resources[KV_CACHE].config.tokens_per_page
     worker = SimpleNamespace(
@@ -94,7 +99,7 @@ def _request(model: Glm5NextModel, engine: Engine, rid: str, text: str) -> torch
     sent = PreprocessWorkerThread._prefix_keys(worker, tensors, layouts, rows, None, {})
     kv = KVReqConfig()
     kv.apply_conductor_config(
-        kv_layout=rows[KV_CACHE], loop_caps={"decode_loop": DECODES + 4},
+        kv_layout=rows[KV_CACHE], loop_caps={"decode_loop": MAX_TOKENS + 4},
         **{name: by[KV_CACHE] for name, by in sent.items()},
     )
     engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0), KV_CACHE: kv})
@@ -180,3 +185,28 @@ def test_a_prompt_past_a_cached_prefix_decodes_as_a_cold_run(k):
         "c": _request(cold_model, cold, "c", "an unrelated prompt that shares nothing with the others."),
     })
     assert got.tokens == ref.tokens, "a prefix hit changed the greedy output"
+
+
+def test_the_next_turn_starts_past_the_reply_s_pages():
+    """Without MTP, at one rank, the reply's ids key the pages decode fills and the KDA state
+    saved at their end: a turn that re-sends the prompt and the reply prefills only what
+    follows the reply's last whole page."""
+    model = _model(0)
+    warm, _ = _engine(model, prefix_slots=4)
+    page = warm._resources[KV_CACHE].config.tokens_per_page
+    prompt = "".join(f"turn {i}: what does the fox say? " for i in range(10))[:page + 72]
+    a = _request(model, warm, "a", prompt)
+    # decode fills the prompt's last page
+    reply = torch.tensor(_generate(warm, {"a": a}, decodes=60).tokens["a"][:58])
+    warm.remove_request("a")
+
+    turn = torch.cat([a, reply, a[:20]])
+    assert len(a) // page == 1 and (len(a) + len(reply)) // page == 2
+    got = _generate(warm, {"b": _request(model, warm, "b", "x" * len(turn), ids=turn)})
+    assert got.prefilled == {"b": len(turn) - 2 * page}
+
+    cold_model = _model(0)
+    cold, _ = _engine(cold_model, prefix_slots=0)
+    ref = _generate(cold, {"b": _request(cold_model, cold, "b", "x" * len(turn), ids=turn)})
+    assert ref.prefilled == {"b": len(turn)}
+    assert got.tokens == ref.tokens, "a hit on the reply's pages changed the greedy output"
