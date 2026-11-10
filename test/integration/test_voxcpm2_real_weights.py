@@ -142,7 +142,8 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
 
     bind_dense_resources = _helper("fake_resources").bind_dense_resources
 
-    # mstar::rms_norm runs fp32 inputs in bf16 on CUDA
+    # mstar::rms_norm runs fp32 inputs in bf16 on CUDA, and so does the fallback of
+    # mstar::fused_add_rms_norm, which the local stacks' residual adds go through
     monkeypatch.setattr(
         norm,
         "run_rms_norm",
@@ -150,6 +151,13 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
             x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
         ),
     )
+
+    def fp32_add_rms_norm(hidden_states, residual, weight, eps, gemma_mode=False):
+        assert not gemma_mode
+        summed = hidden_states + residual
+        return summed * torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps) * weight, summed
+
+    monkeypatch.setattr(norm, "add_rms_norm", fp32_add_rms_norm)
     case = prompts["design"]
     device = torch.device("cuda")
     tf32 = torch.backends.cuda.matmul.allow_tf32

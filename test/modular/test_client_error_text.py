@@ -204,7 +204,7 @@ def test_a_refusal_reaches_the_client_without_its_directory(monkeypatch, path):
         bridge = _bridge(server)
         bridge._submit({"rid": "r1", "text": "hi"})
         [message] = bridge.sent
-        assert message["metadata"] == {"status": 400}
+        assert message["metadata"] == {"status": 400, "refused": True}
         text = message["data"].decode()
     assert text == "cannot read a.wav"
 
@@ -231,10 +231,14 @@ def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
     asyncio.run(bridge._relay("r2", None, bridge.server.iter_result_chunks("r2")))
 
     assert [m["rid"] for m in bridge.sent] == ["r1", "r2"]
-    for message in bridge.sent:
-        assert message["t"] == "err"
-        _assert_clean(message["msg"])
-        assert tensor_file in _logged(caplog, _error_id(message["msg"])).getMessage()
+    submitted, relayed = bridge.sent
+    # a failed submit is a refusal (no request ever had the id); a failed relay a bare err, a 500
+    assert (submitted["t"], submitted["modality"], submitted["metadata"]) == (
+        "chunk", "error", {"status": 500, "refused": True})
+    assert relayed["t"] == "err"
+    for text in (submitted["data"].decode(), relayed["msg"]):
+        _assert_clean(text)
+        assert tensor_file in _logged(caplog, _error_id(text)).getMessage()
 
 
 def test_the_rust_frontend_bridge_logs_a_type_error_s_traceback(caplog):
@@ -244,7 +248,7 @@ def test_the_rust_frontend_bridge_logs_a_type_error_s_traceback(caplog):
     bridge._submit({"rid": "r1", "text": "hi"})
 
     [message] = bridge.sent
-    assert message["metadata"] == {"status": 400}
+    assert message["metadata"] == {"status": 400, "refused": True}
     [record] = [r for r in caplog.records if "submit r1" in r.getMessage()]
     assert record.exc_info is not None, "a TypeError from submit logged no traceback"
 

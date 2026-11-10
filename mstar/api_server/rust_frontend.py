@@ -15,6 +15,9 @@ protocol are untouched):
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
                        | {t:"voices", rid, sub}
+                       | {t:"windows", rid, sub, op, plan, ...}
+                       | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
+                       | {t:"end_of_turn", rid, sub, audio(bin)}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
@@ -22,6 +25,22 @@ protocol are untouched):
                        | {t:"metrics", rid, sub, data(bin), metadata}
                        | {t:"checked", rid, sub, error?, status?}
                        | {t:"voices", rid, sub, metadata:{voices?}}
+                       | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
+                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
+                       | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
+
+A ``live`` request is one operation on a ``/generate/ws`` live call, the
+submission ``call`` names: ``taking`` (``taking_input``), ``append``
+(``stream_input``) or ``reject`` (``reject_input``). An append the model finds
+late is sent later as a ``chunk`` (modality ``late``) on the socket's
+``notice`` route, its ``tag`` echoed in the metadata.
+
+A ``windows`` request is one operation on a transcription upload's
+``WindowPlanner`` (``serving_transcriptions``), kept here under the frontend's
+``plan`` id: ``plan`` makes it (and decodes an upload that will be windowed),
+``fixed``, ``at`` and ``cut`` cut windows, and ``close`` deletes the upload
+and its windows, with no reply. The model's own loader decodes the upload,
+which no Rust decoder matches.
 
 A ``metrics`` request carries the frontend's cumulative refusal counts as
 three parallel lists (route template, status, count), which the API server
@@ -72,6 +91,7 @@ import re
 import shutil
 import subprocess
 import sysconfig
+from enum import StrEnum
 from pathlib import Path
 
 from mstar.api_server.auth import API_KEY_ENV
@@ -180,6 +200,32 @@ SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
 LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
 #: ``ServedModels`` as JSON: the names that select the base model, and the LoRA adapters.
 SERVED_MODELS_ENV = "MSTAR_SERVED_MODELS"
+#: What ``/v1/audio/transcriptions`` needs from the model, as JSON (``transcription_facts``).
+TRANSCRIPTION_ENV = "MSTAR_TRANSCRIPTION"
+#: The deployment's openpi policy, as JSON (``openpi_facts``); unset serves no openpi socket.
+OPENPI_ENV = "MSTAR_OPENPI"
+#: The largest WebSocket message, in bytes (the config's ``ws_max_message_mb``).
+WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
+#: The model's client streams, as JSON: a request to a model with any is a live call.
+CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
+#: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).
+REALTIME_ENV = "MSTAR_REALTIME"
+
+
+class WindowOp(StrEnum):
+    """A ``windows`` request's operation on a transcription upload's ``WindowPlanner``."""
+    PLAN = "plan"     # read the upload, and check it against the route's caps
+    FIXED = "fixed"   # fixed-length windows over the whole upload
+    AT = "at"         # the window that starts at ``offset``
+    CUT = "cut"       # ``duration`` seconds from ``offset``
+    CLOSE = "close"   # the request ended: delete the upload and its windows
+
+
+class LiveOp(StrEnum):
+    """A ``live`` request's operation on a live call."""
+    TAKING = "taking"   # taking_input: whether the call still takes input
+    APPEND = "append"   # stream_input: text, files, model_kwargs or samples, maybe ending streams
+    REJECT = "reject"   # reject_input: end the call with the client's error
 
 
 def soundfile_library() -> str | None:
@@ -205,14 +251,145 @@ def served_models_json(served_models) -> str:
     })
 
 
+def transcription_facts(server, adapter) -> dict | None:
+    """``TRANSCRIPTION_ENV``'s value: what mstar-server's transcription route needs
+    that only this side knows. The model's declared kwargs (``request_kwargs``,
+    which decide what the long-form drivers add), the deployment's
+    ``max_concurrent_requests`` (which parallel uploads share), the language
+    tables the adapter checks against, and the URL pydantic's error text cites.
+    ``None`` for a model with no transcription surface."""
+    if adapter is None or not adapter.supports_transcriptions:
+        return None
+    from pydantic.version import version_short
+
+    from mstar.api_server.openai import adapters
+
+    model = getattr(server, "model", None)
+    declared = model.request_kwargs() if model is not None else None
+    facts = {
+        "request_kwargs": sorted(declared) if declared is not None else None,
+        "max_concurrent_requests": getattr(server, "max_concurrent_requests", None),
+        "errors_url": f"https://errors.pydantic.dev/{version_short()}/v/",
+    }
+    if isinstance(adapter, adapters.CanaryAdapter):
+        from mstar.model.canary.config import LANGUAGES
+
+        facts["languages"] = list(LANGUAGES)
+    if isinstance(adapter, adapters.TransducerAdapter) and adapter.detects_language:
+        from mstar.model.utils import GRANARY_LANGUAGES
+
+        facts["languages"] = list(GRANARY_LANGUAGES)
+        facts["detects_language"] = True
+    if isinstance(adapter, adapters.Qwen3ASRAdapter):
+        from mstar.model.qwen3_asr.config import LANGUAGE_CODES
+
+        facts["language_codes"] = [[code, name] for code, name in LANGUAGE_CODES.items()]
+    return facts
+
+
+def openpi_facts(policy) -> dict | None:
+    """``OPENPI_ENV``'s value for an ``OpenpiPolicy``: the block as the API server
+    checked it against its model, its metadata frame packed as this side packs
+    it. ``None`` (no ``openpi:`` block) serves no socket at ``/``."""
+    if policy is None:
+        return None
+    import base64
+
+    from mstar.api_server.openpi import pack
+
+    return {
+        "image_keys": list(policy.image_keys), "state_keys": list(policy.state_keys),
+        "state_kwarg": policy.state_kwarg, "action_horizon": policy.action_horizon,
+        "action_dim": policy.action_dim, "action_dims": policy.action_dims,
+        "metadata": base64.b64encode(pack(policy.metadata)).decode("ascii"),
+    }
+
+
+def onnxruntime_library() -> str | None:
+    """The ONNX Runtime library the ``onnxruntime`` package loads, for mstar-server
+    to score turn detection with the same runtime; ``None`` without it."""
+    try:
+        import onnxruntime
+    except ImportError:
+        return None
+    # the versioned name (libonnxruntime.so.1.31.1) is the file itself
+    libs = sorted(Path(onnxruntime.__file__).parent.joinpath("capi").glob("libonnxruntime.so*"),
+                  key=lambda p: len(p.name))
+    return str(libs[-1]) if libs else None
+
+
+def conversation_facts(server) -> dict | None:
+    """What a ``/v1/realtime`` conversation needs from a model with a
+    ``ClientAudio`` client stream, as the Python route reads it off the model:
+    how many such streams, whether it has turn tokens and its output channels
+    (which decide whether it converses), and, for one that does, its stream
+    and the reply settings. ``None`` for a model with no such stream."""
+    audio = list(getattr(server, "client_audio", None) or [])
+    if not audio:
+        return None
+    model = server.model
+    facts = {"streams": len(audio), "turn_tokens": getattr(model, "turn_tokens", None) is not None,
+             "channels": model.get_output_audio_channels("audio")}
+    if facts["turn_tokens"] and len(audio) == 1 and facts["channels"] == 1:
+        stream = audio[0]
+        facts.update(
+            stream=stream.edge_name, rate=stream.audio.sample_rate, frame_samples=stream.audio.frame_samples,
+            output_rate=model.get_output_sample_rate("audio"), voice=model.get_default_voice(),
+            idle_steps=model.turn_idle_steps, silence_rms=float(model.turn_silence_rms),
+        )
+    return facts
+
+
+def realtime_facts(server, adapter, directory: str) -> dict | None:
+    """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
+    ``conversation`` is ``conversation_facts``'. For a realtime transcription
+    surface: ONNX Runtime's library and Silero's weights (``None`` where this
+    server has none, which leaves server_vad off as it is here), why Smart
+    Turn did not load (``None`` when it did), and the model's tokenizer,
+    saved under ``directory`` for the stable prefix. ``None`` for any other
+    model."""
+    conversation = conversation_facts(server)
+    transcribes = adapter is not None and getattr(adapter, "supports_realtime_transcription", False)
+    if not transcribes and conversation is None:
+        return None
+    facts = {"conversation": conversation}
+    if not transcribes:
+        return facts
+    from mstar.api_server.openai import realtime_vad
+
+    def file(path):
+        return str(path) if path is not None and Path(path).is_file() else None
+
+    # semantic_vad's end-of-turn model runs here, over the bridge (``_end_of_turn``)
+    facts.update({
+        "onnxruntime": onnxruntime_library(),
+        "silero": file(realtime_vad.silero_weights()),
+        "smart_turn_problem": None if realtime_vad.smart_turn() is not None else realtime_vad.smart_turn_problem(),
+        "tokenizer": None,
+    })
+    tokenizer = getattr(getattr(server, "model", None), "tokenizer", None)
+    if tokenizer is not None and getattr(tokenizer, "is_fast", False):
+        path = Path(directory) / "tokenizer.json"
+        tokenizer.backend_tokenizer.save(str(path))
+        facts["tokenizer"] = str(path)
+    return facts
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
-                       sample_rate: int | None = None, served_models=None) -> subprocess.Popen:
+                       sample_rate: int | None = None, served_models=None,
+                       transcription: dict | None = None, openpi: dict | None = None,
+                       ws_max_bytes: int | None = None, client_streams=(),
+                       realtime: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
-    request's ``model`` selects; ``None`` serves the base model alone."""
+    request's ``model`` selects; ``None`` serves the base model alone.
+    ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
+    ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
+    message limit, ``client_streams`` the model's (``APIServer.client_streams``), and
+    ``realtime`` ``realtime_facts``' for its realtime surface."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -229,6 +406,19 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(SERVED_MODELS_ENV, None)
     if served_models is not None:
         env[SERVED_MODELS_ENV] = served_models_json(served_models)
+    env.pop(TRANSCRIPTION_ENV, None)
+    if transcription is not None:
+        env[TRANSCRIPTION_ENV] = json.dumps(transcription)
+    env.pop(OPENPI_ENV, None)
+    if openpi is not None:
+        env[OPENPI_ENV] = json.dumps(openpi)
+    env.pop(WS_MAX_BYTES_ENV, None)
+    if ws_max_bytes is not None:
+        env[WS_MAX_BYTES_ENV] = str(int(ws_max_bytes))
+    env[CLIENT_STREAMS_ENV] = json.dumps(sorted(client_streams))
+    env.pop(REALTIME_ENV, None)
+    if realtime is not None:
+        env[REALTIME_ENV] = json.dumps(realtime)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -237,6 +427,26 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)
     return proc
+
+
+def _stream_and_raw_inputs(msg: dict) -> dict:
+    """A submit's ``end_input``, ``file_streams`` and ``raw_inputs``, those it
+    carries: the frontend sends each only when set, so the others keep
+    ``submit_request``'s defaults. ``raw_inputs`` arrive as numpy's
+    ``(dtype.str, shape, bytes)`` and go on as the tensors the model loads."""
+    extra = {k: msg[k] for k in ("end_input", "file_streams") if msg.get(k) is not None}
+    if raw := msg.get("raw_inputs"):
+        import numpy as np
+        import torch
+
+        extra["raw_inputs"] = {
+            modality: [
+                torch.from_numpy(np.frombuffer(a["data"], dtype=np.dtype(a["dtype"])).reshape(a["shape"]).copy())
+                for a in arrays
+            ]
+            for modality, arrays in raw.items()
+        }
+    return extra
 
 
 class RustFrontendBridge:
@@ -263,6 +473,8 @@ class RustFrontendBridge:
         self._keys: dict[int, str] = {}
         # set by _serve; the API server's message thread schedules relay() on it
         self.loop: asyncio.AbstractEventLoop | None = None
+        # a transcription upload's WindowPlanner, by the frontend's plan id, until it closes
+        self._planners: dict = {}
 
     # -- outbound ----------------------------------------------------------
 
@@ -271,6 +483,13 @@ class RustFrontendBridge:
 
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
+
+    def _refuse(self, rid: str, sub: int | None, text: str, status: int) -> None:
+        """``submit_request`` refused the submission: an in-band error chunk, the
+        only reply that carries a status, marked ``refused`` since the request
+        never had its id (``/generate/ws`` answers an unnamed one with null)."""
+        self._send({"t": "chunk", "rid": rid, "sub": sub, "modality": "error", "data": text.encode("utf-8"),
+                    "metadata": {"status": status, "refused": True}})
 
     def relay(self, tags: list[int], chunks: list) -> None:
         """``ChunkSink.relay``: one ``chunks`` message for a message pass."""
@@ -288,8 +507,8 @@ class RustFrontendBridge:
         if msg.get("tokens") is not None:
             # The Python preprocess worker owns tokenization; run the
             # frontend without MSTAR_TOKENIZER so it sends text.
-            self._err(rid, sub, "pre-tokenized ingest is not supported by this "
-                                "backend (unset MSTAR_TOKENIZER)")
+            self._refuse(rid, sub, "pre-tokenized ingest is not supported by this "
+                                   "backend (unset MSTAR_TOKENIZER)", 500)
             return
         try:
             parts = msg.get("prompt_parts")
@@ -303,6 +522,7 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
                 report_usage=bool(msg.get("report_usage")),
+                **_stream_and_raw_inputs(msg),
             )
         except (ValueError, TypeError) as e:
             # a refused input: an in-band error chunk carries its 400 to the client.
@@ -313,29 +533,21 @@ class RustFrontendBridge:
                 text = scrub_paths(str(e))
             else:
                 text, _ = client_error_text(e, f"submit {rid} failed", log=logger, type_name=False)
-            self._send({
-                "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                "data": text.encode("utf-8"), "metadata": {"status": 400},
-            })
+            self._refuse(rid, sub, text, 400)
             return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             status = getattr(e, "status_code", None)
             if isinstance(status, int):
                 # An HTTPException (not imported: this bridge runs without
-                # fastapi), e.g. the 409 for a rid still in flight. An in-band
-                # error chunk is the only reply that carries a status; `t="err"`
-                # always surfaces as a 500.
+                # fastapi), e.g. the 409 for a rid still in flight.
                 detail = getattr(e, "detail", e)
                 logger.warning("submit %s refused (%d): %s", rid, status, detail)
-                self._send({
-                    "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                    "data": str(detail).encode(), "metadata": {"status": status},
-                })
+                self._refuse(rid, sub, str(detail), status)
                 return
             text, _ = client_error_text(
                 e, f"submit {rid} failed", log=logger, type_name=False,
             )
-            self._err(rid, sub, text)
+            self._refuse(rid, sub, text, 500)
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
@@ -437,6 +649,183 @@ class RustFrontendBridge:
 
         self.loop.create_task(answer())
 
+    def _live(self, msg: dict) -> None:
+        """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
+        conversation, whose appends carry ``audio``: float32 samples for the
+        ``ClientAudio`` stream ``stream``), answered as the Python route would
+        act on it. The call is the submission its ``call`` names; one that has
+        ended has no key and takes nothing."""
+        key = self._keys.get(msg.get("call"))
+        reply = {"t": "live", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+        try:
+            op = LiveOp(msg.get("op"))
+            if op is LiveOp.TAKING:
+                meta = {"taking": key is not None and self.server.taking_input(key)}
+            elif op is LiveOp.REJECT:
+                meta = {"rejected": key is not None and self.server.reject_input(key, msg["error"], int(msg["status"]))}
+            elif key is None:
+                meta = {"accepted": False}
+            else:
+                notice, tag, loop = msg.get("notice"), msg.get("tag") or {}, self.loop
+
+                def on_late(error: str) -> None:
+                    # from the preprocess thread: sent from this loop
+                    late = {"t": "chunk", "rid": "", "sub": notice, "modality": "late",
+                            "data": error.encode("utf-8"), "metadata": tag}
+                    try:
+                        loop.call_soon_threadsafe(self._send, late)
+                    except RuntimeError:
+                        pass  # the loop has closed, and the frontend with it
+
+                audio, samples = msg.get("audio"), {}
+                if audio:
+                    import numpy as np
+
+                    # copied: torch.from_numpy warns on a read-only buffer
+                    samples = {"samples": {msg["stream"]: np.frombuffer(audio, dtype="<f4").copy()}}
+                try:
+                    accepted = self.server.stream_input(
+                        key, msg.get("file_paths") or None, end_input=msg.get("end_input", False),
+                        text=msg.get("text"), file_streams=msg.get("file_streams"),
+                        model_kwargs=msg.get("model_kwargs"), on_late=on_late if notice is not None else None,
+                        **samples,
+                    )
+                    meta = {"accepted": accepted}
+                except ValueError as exc:  # the client's fault
+                    meta = {"error": scrub_paths(str(exc)), "status": 400}
+                except Exception as exc:  # noqa: BLE001 — the append fails, the bridge goes on
+                    route = "realtime" if audio else "generate/ws"
+                    text, error_id = client_error_text(exc, f"{route} append failed", log=logger, type_name=False)
+                    meta = {"error": text, "status": 500, "error_id": error_id}
+        except Exception as exc:  # noqa: BLE001 — an unknown op included
+            text, _ = client_error_text(exc, f"live {msg.get('op')!r} failed", log=logger, type_name=False)
+            meta = {"error": text, "status": 500}
+        reply["metadata"] = meta
+        self._send(reply)
+
+    def _end_of_turn(self, msg: dict) -> None:
+        """``semantic_vad``'s end-of-turn probability of a turn's last audio
+        (float32), by this side's Smart Turn: its int8 model moves by tenths
+        when its features move by 1e-5, so the frontend asks rather than
+        computing the features itself. Off this loop: a call is about 45 ms."""
+        reply = {"t": "end_of_turn", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            try:
+                import numpy as np
+
+                from mstar.api_server.openai import realtime_vad
+
+                model = realtime_vad.smart_turn()
+                if model is None:
+                    raise RuntimeError(realtime_vad.smart_turn_problem())
+                audio = np.frombuffer(msg["audio"], dtype="<f4")
+                reply["metadata"] = {"p": float(await asyncio.to_thread(model, audio))}
+            except Exception as exc:  # noqa: BLE001 — the session goes on without the model
+                logger.exception("bridge: the end-of-turn model failed")
+                reply["metadata"] = {"error": f"{type(exc).__name__}: {exc}"}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
+    def _in_uploads(self, path: Path) -> bool:
+        return path.resolve().is_relative_to(Path(self.server.upload_dir).resolve())
+
+    def _windows(self, msg: dict) -> None:
+        """One operation on a transcription upload's ``WindowPlanner``, off this
+        loop since it decodes and writes. A failure is answered as the Python
+        route answers it: its status and message (an ``HTTPException``'s, or
+        ``client_error_text``'s), and the exception's type for a stream's
+        ``transcription failed (<type>)``."""
+        try:
+            op = WindowOp(msg.get("op"))
+        except ValueError:
+            op = None   # answered with an error below
+        plan = msg.get("plan")
+        reply = {"t": "windows", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            from fastapi import HTTPException
+
+            from mstar.api_server import media_io
+            from mstar.api_server.openai import serving_transcriptions as st
+
+            if op is WindowOp.CLOSE:
+                planner = self._planners.pop(plan, None)
+                if planner is not None:
+                    await asyncio.to_thread(planner.cleanup)
+                elif msg.get("path") and self._in_uploads(Path(msg["path"])):
+                    Path(msg["path"]).unlink(missing_ok=True)
+                return
+            try:
+                if op is None:
+                    raise RuntimeError(f"unknown windows operation {msg.get('op')!r}")
+                if op is WindowOp.PLAN:
+                    path = Path(msg["path"])
+                    # the planner deletes the upload, so only one the frontend saved under upload_dir
+                    if not self._in_uploads(path):
+                        raise RuntimeError(f"upload {path} is outside the upload directory")
+                    planner = await asyncio.to_thread(
+                        st.WindowPlanner, str(path), msg["max_seconds"], Path(self.server.upload_dir),
+                        balanced=bool(msg["balanced"]), search_seconds=msg["search_seconds"],
+                        frame_seconds=msg["frame_seconds"], whole_seconds=msg["whole_seconds"],
+                    )
+                    self._planners[plan] = planner
+                    windows = await self._prepare(planner, plan, st, media_io)
+                else:
+                    planner = self._planners[plan]
+                    if op is WindowOp.FIXED:
+                        windows = await asyncio.to_thread(planner.fixed)
+                    elif op is WindowOp.AT:
+                        windows = [await asyncio.to_thread(planner.window_at, msg["offset"])]
+                    else:
+                        windows = [await asyncio.to_thread(planner.cut, msg["offset"], msg["duration"])]
+                reply["metadata"] = {
+                    "duration": planner.duration, "single": planner.single,
+                    "windows": [{"path": w.path, "offset": w.offset, "duration": w.duration} for w in windows],
+                }
+            except Exception as exc:  # noqa: BLE001 — the request fails, the bridge goes on
+                status, detail = getattr(exc, "status_code", None), getattr(exc, "detail", None)
+                if isinstance(status, int) and detail is not None:
+                    message = str(detail)
+                else:
+                    message, _ = client_error_text(
+                        exc, "/v1/audio/transcriptions request failed", log=logger, type_name=False)
+                    if not isinstance(status, int):
+                        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+                reply["metadata"] = {"error": {
+                    "status": status, "message": message,
+                    "http": isinstance(exc, HTTPException), "type": type(exc).__name__,
+                }}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
+    async def _prepare(self, planner, plan, st, media_io) -> list:
+        """``create_transcription``'s checks on a new upload: past the cap by its
+        header, then decoded when it will be windowed; a refusal deletes it."""
+        from fastapi import HTTPException
+
+        def refuse(status: int, detail: str):
+            self._planners.pop(plan, None)
+            planner.cleanup()
+            return HTTPException(status_code=status, detail=detail)
+
+        if planner.duration is not None and planner.duration > st.MAX_DURATION_SECONDS:
+            raise refuse(413, f"audio is {planner.duration:.0f} s; the limit is {st.MAX_DURATION_SECONDS} s")
+        try:
+            if planner.decodes:
+                await asyncio.to_thread(planner.prepare)
+        except media_io.AudioTooLongError:
+            raise refuse(413, f"audio is longer than the {st.MAX_DURATION_SECONDS} s limit") from None
+        except ValueError as exc:
+            raise refuse(400, str(exc)) from None
+        except BaseException:
+            self._planners.pop(plan, None)
+            planner.cleanup()
+            raise
+        return []
+
     def _handle(self, msg: dict) -> None:
         t = msg.get("t")
         if t == "submit":
@@ -453,6 +842,12 @@ class RustFrontendBridge:
             self._check_ref_audio(msg)
         elif t == "voices":
             self._voices(msg)
+        elif t == "windows":
+            self._windows(msg)
+        elif t == "live":
+            self._live(msg)
+        elif t == "end_of_turn":
+            self._end_of_turn(msg)
         else:
             logger.warning("bridge: unknown message type %r", t)
 
@@ -504,3 +899,7 @@ class RustFrontendBridge:
 
     def stop(self) -> None:
         self.running = False
+        # the uploads of transcriptions still running go with the frontend
+        for planner in list(self._planners.values()):
+            planner.cleanup()
+        self._planners.clear()
