@@ -46,9 +46,10 @@ ROUTES = {
     "speech": ("/v1/audio/speech", {"input": "hi"}),
     "images": ("/v1/images/generations", {"prompt": "a cat"}),
     "videos": ("/v1/videos/generations", {"prompt": "a cat"}),
+    # a JSON body carries no upload: a served route refuses it with a 400, not a 404
+    "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-# /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED: set[tuple[str, str]] = set()
 
 
@@ -123,13 +124,14 @@ def test_a_model_without_an_adapter_gets_the_python_frontend_s_404():
 
 
 def test_a_class_with_no_port_is_a_404_naming_it_and_a_startup_warning():
-    with _mock_server("WhisperAdapter") as (port, proc):
+    # every registry class is ported; a class from a newer Python side has none
+    with _mock_server("FutureAdapter") as (port, proc):
         status, data = _post(port, *ROUTES["chat"])
         proc.terminate()
         _, stderr = proc.communicate(timeout=10)
     assert status == 404
-    assert "WhisperAdapter" in json.loads(data)["error"]["message"]
-    assert "some_model's OpenAI adapter WhisperAdapter has no port in this frontend" in stderr
+    assert "FutureAdapter" in json.loads(data)["error"]["message"]
+    assert "some_model's OpenAI adapter FutureAdapter has no port in this frontend" in stderr
 
 
 # ── a chat reaches the backend as the Python adapter builds it ──────────────

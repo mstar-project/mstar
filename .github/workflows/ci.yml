@@ -94,6 +94,9 @@ jobs:
           # Model.load_audio decodes with libsndfile before torchcodec; the
           # tests of that path skip without it.
           python -m pip install soundfile
+          # The eval runner (benchmark/asr_eval.py, imported by the WER and DROID
+          # dataset tests) needs aiohttp, which datasets 5.2 stopped pulling in.
+          python -m pip install aiohttp
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
           python -m pip install diffusers==0.39.0
@@ -201,13 +204,21 @@ jobs:
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
           # parity cases run the Python app through fastapi's TestClient;
           # soundfile (its wheel bundles libsndfile): the voice-clip checks and
-          # the compressed-speech byte parity, which skip without it
+          # the compressed-speech byte parity, which skip without it;
+          # websockets and onnxruntime: the WebSocket parity cases and realtime's
+          # turn detection; silero-vad only for its bundled ONNX file, so
+          # without its torchaudio
           pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
-            fastapi uvicorn python-multipart httpx soundfile
+            fastapi uvicorn python-multipart httpx soundfile websockets onnxruntime
+          pip install --no-deps silero-vad
           # cpu torch + triton: the arena test imports the tensor-transport
-          # stack, which reaches mstar.utils.sampling (triton at module level)
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install triton
+          # stack, which reaches mstar.utils.sampling (triton at module level).
+          # torchaudio: load_speech_file resamples with it, which the
+          # transcription parity cases reach on their 44.1 kHz upload. Pinned
+          # as CPU Core pins them.
+          pip install torch==2.10.0 torchaudio==2.10.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install triton==3.6.0
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
           # the row store needs the columnar tensor store; CPU Core skips most of it

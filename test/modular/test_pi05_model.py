@@ -835,6 +835,48 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
     assert remap("totally.unknown.key") is None
 
 
+# ----------------------------------------------------------------------
+# generation-input contract
+# ----------------------------------------------------------------------
+
+
+def test_pi05_request_kwargs_are_only_the_robot_state():
+    model = _make_model()
+    # flow steps are deployment YAML; a client num_steps is reported as ignored
+    assert model.request_kwargs() == {"robot_state"}
+
+
+@pytest.mark.parametrize("state", [
+    "0.1 0.2",
+    [0.1, "0.2"],
+    [True, 0.0],
+    [[0.1, 0.2]],
+    [],
+    [0.0] * 33,
+    [float("nan")],
+    {"a": 1},
+])
+def test_pi05_bad_robot_state_is_a_400(state):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="robot_state"):
+        model.process_prompt(
+            prompt="pick", input_modalities=["image", "text"], output_modalities=["action"], robot_state=state,
+        )
+
+
+def test_pi05_out_of_range_state_bins_as_openpi_does():
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors=_ONE_IMAGE, robot_state=[-5.0, 0, 5.0] + [0.5] * 29,
+    )
+    # below -1 is bin -1 and at or above 1 the last bin (`discretize_state`)
+    assert stub.last_prompt.split("State: ", 1)[1].startswith("-1 128 255 192 ")
+
+
 @pytest.mark.parametrize("policy_saved", [False, True])
 def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy_saved):
     """lerobot/pi05_droid is a saved PI05Policy: every key sits under ``model.`` and

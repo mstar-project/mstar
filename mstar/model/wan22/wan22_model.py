@@ -63,6 +63,16 @@ logger = logging.getLogger(__name__)
 # libx264, which postprocess encodes with, refuses a frame wider or taller than this
 _MP4_MAX_SIDE = 16384
 
+# Every model_kwargs key a request may carry; the video adapter maps ``size``
+# onto height/width and forwards num_frames and fps.
+REQUEST_KWARGS = frozenset({
+    "height", "width", "num_frames", "fps", "num_inference_steps", "guidance_scale", "negative_prompt",
+})
+
+
+def _is_number(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
 
 class Wan22Model(Model):
     """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
@@ -293,11 +303,10 @@ class Wan22Model(Model):
 
     @staticmethod
     def _require_positive_int(name: str, raw) -> int:
-        """Coerce a request geometry knob, or raise ``ValueError``."""
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            raise ValueError(f"Wan2.2 {name} must be an integer; got {raw!r}.") from None
+        """A request geometry knob, which must be a positive JSON integer, or ``ValueError``."""
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"Wan2.2 {name} must be an integer; got {raw!r}.")
+        value = raw
         if value <= 0:
             raise ValueError(f"Wan2.2 {name} must be positive; got {value}.")
         return value
@@ -311,14 +320,13 @@ class Wan22Model(Model):
         axis must fit the DiT's rotary table and each side the mp4 encoder, and fps
         must be positive.
 
-        This runs on the data worker because that is where a ValueError becomes a
-        400 for the one bad request. Left to fail later, none of these fail well:
+        This runs in process_prompt, so a bad request is a 400 before any work.
+        Left to fail later, none of these fail well:
         an unaligned size hits the DiT as a mid-forward shape mismatch and faults
         the WORKER; a non-positive num_frames makes the latent time extent <= 0 and
         crashes on a negative tensor dim; an unaligned num_frames does not fail at
         all but is silently floored (ask for 32 frames, get 29); and a bad fps is
-        only caught after the whole video is generated, on the result path, where
-        the raise is swallowed and the client hangs.
+        only caught after the whole video is generated, on the result path.
         """
         cfg = self.config
         size = {}
@@ -326,7 +334,7 @@ class Wan22Model(Model):
             ("height", cfg.patch_size[1], cfg.spatial_alignment[0], cfg.default_height),
             ("width", cfg.patch_size[2], cfg.spatial_alignment[1], cfg.default_width),
         ):
-            value = size[name] = self._require_positive_int(name, model_kwargs.get(name, default))
+            value = size[name] = self._require_positive_int(name, self._get(model_kwargs, name, default))
             if value % align:
                 lower = value // align * align
                 upper = lower + align
@@ -340,7 +348,7 @@ class Wan22Model(Model):
 
         temporal = cfg.vae_scale_factor_temporal
         frames = self._require_positive_int(
-            "num_frames", model_kwargs.get("num_frames", cfg.default_num_frames)
+            "num_frames", self._get(model_kwargs, "num_frames", cfg.default_num_frames)
         )
         if (frames - 1) % temporal:
             lower = (frames - 1) // temporal * temporal + 1
@@ -379,12 +387,31 @@ class Wan22Model(Model):
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = model_kwargs.get("fps")
         if raw_fps is not None:
-            try:
-                fps = float(raw_fps)
-            except (TypeError, ValueError):
-                raise ValueError(f"Wan2.2 fps must be a number; got {raw_fps!r}.") from None
-            if not math.isfinite(fps) or fps <= 0:
+            if isinstance(raw_fps, bool) or not isinstance(raw_fps, (int, float)):
+                raise ValueError(f"Wan2.2 fps must be a number; got {raw_fps!r}.")
+            if not math.isfinite(raw_fps) or raw_fps <= 0:
                 raise ValueError(f"Wan2.2 fps must be positive and finite; got {raw_fps!r}.")
+
+    @staticmethod
+    def _get(model_kwargs: dict, name: str, default):
+        """``model_kwargs[name]``, with null the same as absent."""
+        value = model_kwargs.get(name)
+        return default if value is None else value
+
+    def _resolve_denoise_knobs(self, model_kwargs: dict) -> dict:
+        """num_inference_steps, guidance_scale and negative_prompt, validated; ``ValueError`` names the bad one."""
+        cfg = self.config
+        steps = self._get(model_kwargs, "num_inference_steps", cfg.default_num_inference_steps)
+        # past the denoise loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"Wan2.2 num_inference_steps must be an integer >= 1; got {steps!r}.")
+        guidance = self._get(model_kwargs, "guidance_scale", cfg.guidance_scale)
+        if not _is_number(guidance):
+            raise ValueError(f"Wan2.2 guidance_scale must be a finite number; got {guidance!r}.")
+        negative = self._get(model_kwargs, "negative_prompt", cfg.default_negative_prompt)
+        if not isinstance(negative, str):
+            raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
+        return {"num_inference_steps": steps, "guidance_scale": float(guidance), "negative_prompt": negative}
 
     def process_prompt(
         self,
@@ -401,13 +428,14 @@ class Wan22Model(Model):
         I2V image rides through as ``image_inputs`` for the vae_encoder to
         preprocess, but its size is checked here.
 
-        Every malformed-request check lives here, so a malformed request is a
-        400 before it reaches the conductor; ``walk_plan`` only backstops some.
+        Every malformed-request check runs here, before tokenizing, so a bad
+        request is a 400 without any work; ``walk_plan`` repeats the cheap ones
+        as backstops.
         """
         self._validate_request(prompt, input_modalities, output_modalities, tensors)
         self._validate_generation_size(kwargs)
         self._validate_conditioning_image(input_modalities, tensors, kwargs)
-        negative_prompt = kwargs.get("negative_prompt", self.config.default_negative_prompt)
+        negative_prompt = self._resolve_denoise_knobs(kwargs)["negative_prompt"]
         self._ensure_tokenizer()
         return {
             "text_inputs": [
@@ -460,8 +488,8 @@ class Wan22Model(Model):
         if not images:
             return  # presence is _validate_request's job
         expected = (
-            int(model_kwargs.get("height", self.config.default_height)),
-            int(model_kwargs.get("width", self.config.default_width)),
+            self._get(model_kwargs, "height", self.config.default_height),
+            self._get(model_kwargs, "width", self.config.default_width),
         )
         got = tuple(images[0].shape[-2:])
         if got != expected:
@@ -469,6 +497,17 @@ class Wan22Model(Model):
                 f"Wan2.2 conditioning image is {got[0]}x{got[1]} (HxW) but the request is "
                 f"{expected[0]}x{expected[1]}; resize it client-side (the server does not resize)."
             )
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
+        steps = self._get(model_kwargs, "num_inference_steps", self.config.default_num_inference_steps)
+        if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+            return {DENOISE_LOOP_NAME: steps}
+        return {}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
@@ -525,14 +564,6 @@ class Wan22Model(Model):
             "on" if self.config.compile_dit else "off",
         )
 
-    def _resolve_steps(self, model_kwargs: dict) -> int:
-        requested = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
-        return max(1, min(requested, self.config.max_denoise_steps))
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the loop ends on the request's own step count, and is never speculated past it
-        return {DENOISE_LOOP_NAME: self._resolve_steps(model_kwargs)}
-
     def walk_plan(
         self,
         partition_name: str,
@@ -541,8 +572,8 @@ class Wan22Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        # These are backstops, not the primary guard: ``process_prompt`` already
-        # rejected every one of these on the data worker.
+        # Backstops; process_prompt already rejected each of these. A
+        # ValueError here is a 400 too.
         target_output = output_modalities[0] if output_modalities else "video"
         if target_output != "video":
             raise ValueError(
@@ -564,23 +595,15 @@ class Wan22Model(Model):
             walks.append(self.ENCODE_IMAGE_WALK)
         walks.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
 
-        requested_steps = int(
-            model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
-        )
-        num_inference_steps = self._resolve_steps(model_kwargs)
-        if num_inference_steps != requested_steps:
-            logger.info(
-                "Clamped num_inference_steps from %d to %d (max_denoise_steps=%d)",
-                requested_steps, num_inference_steps, self.config.max_denoise_steps,
-            )
-
+        self._validate_generation_size(model_kwargs)
+        knobs = self._resolve_denoise_knobs(model_kwargs)
         # what the submodules read from ``request_info.step_metadata``
         request = {
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": float(model_kwargs.get("guidance_scale", self.config.guidance_scale)),
-            "height": int(model_kwargs.get("height", self.config.default_height)),
-            "width": int(model_kwargs.get("width", self.config.default_width)),
-            "num_frames": int(model_kwargs.get("num_frames", self.config.default_num_frames)),
+            "num_inference_steps": knobs["num_inference_steps"],
+            "guidance_scale": knobs["guidance_scale"],
+            "height": self._get(model_kwargs, "height", self.config.default_height),
+            "width": self._get(model_kwargs, "width", self.config.default_width),
+            "num_frames": self._get(model_kwargs, "num_frames", self.config.default_num_frames),
         }
         self._log_config_echo(model_kwargs, request)
         return [WalkStep(walk, step_metadata=request) for walk in walks]

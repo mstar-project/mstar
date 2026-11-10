@@ -285,6 +285,10 @@ class ParakeetModel(Model):
         num_frames = model_kwargs.get(NUM_FRAMES)
         return {} if num_frames is None else {DECODE_LOOP: self.config.transducer.decode_iterations(num_frames)}
 
+    def request_kwargs(self) -> frozenset[str]:
+        # decoding is greedy, so the transcription adapter's temperature is logged as ignored
+        return frozenset({"language"})
+
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
