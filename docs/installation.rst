@@ -106,6 +106,16 @@ one for the encoders and decoder, and two for the LLM.
    cd /mstar-workspace/mstar
    mstar serve bagel --config configs/bagel_xpu_tp2.yaml
 
+Attention on AMD GPUs (ROCm)
+----------------------------
+
+On a ROCm build of PyTorch, attention runs on AMD's libraries, which are not mstar
+dependencies. Install ``amd-aiter`` (AITER) for the default paged, cross and ragged
+attention, and ``amd-flashinfer`` (AMD's FlashInfer build) for what AITER's kernels do
+not cover: a cache that keeps a sliding window, power-of-two page sizes up to 64, and
+non-causal steps with several queries per row. The server stops at startup with an error
+naming the missing package when the model needs it.
+
 Optional dependencies
 ---------------------
 
