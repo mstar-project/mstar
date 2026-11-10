@@ -1,4 +1,5 @@
-"""A speculative batch runs under loop counters of its own.
+"""A speculative batch runs under loop counters of its own, and under the
+walk it is labelled with.
 
 A request's shared ``CurrentForwardPassInfo`` is refreshed as each batch is
 built, so while iteration k of a loop is in flight it reads k. A speculative
@@ -8,6 +9,10 @@ sigma twice, and no veto of the overshoot past the last step. So
 ``InputMetadata`` carrying the counters it will run at (the engine reads them
 through ``ForwardPassInfoWrapper``), and leaves the shared info to the in-flight
 batch, whose stop check still has to read k.
+
+When every row of the target's walk ended at N, the rows left are another
+walk's, and the step is labelled with that walk: it routes that walk's outputs
+and continues no row of the target's loop.
 """
 
 import sys
@@ -124,12 +129,13 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
     assert spec.is_new_iter is False
 
 
-def test_a_step_left_with_only_another_walks_rows_routes_that_walks_signals():
+def test_a_step_left_with_only_another_walks_rows_is_that_walks_step():
     """The chain's own decode rows all ended at N and only prompt rows joined
-    (one mid-prefill, new ones): the step is a ``prefill_text`` step, and it
-    routes that walk's outputs. Routing decode's loop-back token instead sent
-    each prompt's first token to neither the client (an empty 200 for
-    ``max_tokens: 1``) nor its first decode step (an IndexError)."""
+    (one mid-prefill, new ones): the step is a ``prefill_text`` step. It
+    routes that walk's outputs and runs outside decode's loop. Routing
+    decode's loop-back token instead sent each prompt's first token to neither
+    the client (an empty 200 for ``max_tokens: 1``) nor its first decode step
+    (an IndexError)."""
     shared = {1: _info(1, 0), 2: _info(2, 0)}
     ctx = _context(shared)
     signals = {"decode": ("text_inputs",), "prefill_text": ("new_token",)}
@@ -147,3 +153,4 @@ def test_a_step_left_with_only_another_walks_rows_routes_that_walks_signals():
 
     assert spec.scheduled_batch.graph_walk == "prefill_text"
     assert tuple(spec.scheduled_batch.output_signals) == ("new_token",)
+    assert (spec.is_new_iter, spec.loop_name) == (False, None)

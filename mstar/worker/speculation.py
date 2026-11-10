@@ -319,6 +319,14 @@ class SpeculationBuilder:
             ctx.scheduler.label_for(spec_node, request_walks) if request_walks
             else (spec_target.graph_walk, {})
         )
+        if not request_walks and label != spec_target.graph_walk:
+            # Every row of the target's walk ended at N, so this is a step of
+            # its rows' own walk: it routes that walk's outputs and continues
+            # no row of the target's loop, like a step built for those rows.
+            spec_target = SpeculationOutput(
+                node_name=spec_node, graph_walk=label,
+                output_signals=tuple(self._walk_output_signals(spec_node, label, spec_target)),
+            )
         spec_batch = ScheduledBatch(
             node_name=spec_node,
             graph_walk=label,
@@ -335,13 +343,8 @@ class SpeculationBuilder:
             },
             # Reported by whichever step chose the target -- speculate_node on
             # the leader, get_spec_target on a follower -- so the hot path does
-            # not cross back into the runtime once per forward pass. A step
-            # whose rows are all of another walk (the target's own rows ended
-            # at N) is that walk's step, and routes that walk's outputs.
-            output_signals=(
-                spec_target.output_signals if request_walks
-                else self._walk_output_signals(spec_node, label, spec_target)
-            ),
+            # not cross back into the runtime once per forward pass.
+            output_signals=spec_target.output_signals,
             tp_seq=tp_seq,
         )
         input_meta, per_request_info = input_metadata_and_fwd_info(
