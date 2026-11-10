@@ -1027,13 +1027,15 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">The pixel and audio caps hold for a whole request: while the data worker loads</span>
 <span class="sd">a request's files inside :class:`RequestMediaBudget`, every check also counts</span>
-<span class="sd">against what the request's earlier files used.</span>
+<span class="sd">against what the request's other files use, whether finished or still loading.</span>
 <span class="sd">"""</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">errno</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextvars</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextVar</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1142,7 +1144,12 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="n">_request_budget</span><span class="p">:</span> <span class="n">ContextVar</span><span class="p">[</span><span class="s2">"RequestMediaBudget | None"</span><span class="p">]</span> <span class="o">=</span> <span class="n">ContextVar</span><span class="p">(</span><span class="s2">"mstar_request_media_budget"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_LoadingFile</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="n">budget</span><span class="p">:</span> <span class="s2">"RequestMediaBudget"</span>
+    <span class="n">charges</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span>
+
+
+<span class="n">_loading_file</span><span class="p">:</span> <span class="n">ContextVar</span><span class="p">[</span><span class="n">_LoadingFile</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="n">ContextVar</span><span class="p">(</span><span class="s2">"mstar_request_loading_file"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="RequestMediaBudget">
@@ -1170,7 +1177,9 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">limits</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="n">max_image_pixels</span><span class="p">(),</span> <span class="s2">"video"</span><span class="p">:</span> <span class="n">max_video_pixels</span><span class="p">(),</span> <span class="s2">"audio"</span><span class="p">:</span> <span class="n">max_audio_seconds</span><span class="p">()}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">used</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_file</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="c1"># one entry per file being loaded: files of a request may load at once</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_loading</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
 
 <div class="viewcode-block" id="RequestMediaBudget.file">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget.file">[docs]</a>
@@ -1178,34 +1187,40 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">file</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Load one file. It is charged the most any single check counted for</span>
 <span class="sd">        it, so a header estimate and the decode after it are not added up."""</span>
-        <span class="n">token</span> <span class="o">=</span> <span class="n">_request_budget</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="n">charges</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_loading</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">charges</span><span class="p">)</span>
+        <span class="n">token</span> <span class="o">=</span> <span class="n">_loading_file</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">_LoadingFile</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">charges</span><span class="p">))</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="k">yield</span>
         <span class="k">finally</span><span class="p">:</span>
-            <span class="n">_request_budget</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">kind</span><span class="p">,</span> <span class="n">amount</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+=</span> <span class="n">amount</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span></div>
+            <span class="n">_loading_file</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_loading</span> <span class="o">=</span> <span class="p">[</span><span class="n">file</span> <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loading</span> <span class="k">if</span> <span class="n">file</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">charges</span><span class="p">]</span>
+                <span class="k">for</span> <span class="n">kind</span><span class="p">,</span> <span class="n">amount</span> <span class="ow">in</span> <span class="n">charges</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+=</span> <span class="n">amount</span></div>
 
 
 <div class="viewcode-block" id="RequestMediaBudget.charge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.RequestMediaBudget.charge">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">charge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">],</span> <span class="n">amount</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]:</span>
-            <span class="n">files</span><span class="p">,</span> <span class="n">unit</span><span class="p">,</span> <span class="n">env</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_LIMITS</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"the request's </span><span class="si">{</span><span class="n">files</span><span class="si">}</span><span class="s2"> decode to more than </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">unit</span><span class="si">}</span><span class="s2"> together; "</span>
-                <span class="sa">f</span><span class="s2">"send fewer or smaller files (the limit is </span><span class="si">{</span><span class="n">env</span><span class="si">}</span><span class="s2">)"</span>
-            <span class="p">)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">charge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">charges</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">],</span> <span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">charges</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">charges</span><span class="p">[</span><span class="n">kind</span><span class="p">],</span> <span class="n">amount</span><span class="p">)</span>
+            <span class="n">loading</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">file</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loading</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">used</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span> <span class="o">+</span> <span class="n">loading</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]:</span>
+                <span class="n">files</span><span class="p">,</span> <span class="n">unit</span><span class="p">,</span> <span class="n">env</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_LIMITS</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"the request's </span><span class="si">{</span><span class="n">files</span><span class="si">}</span><span class="s2"> decode to more than </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">limits</span><span class="p">[</span><span class="n">kind</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">unit</span><span class="si">}</span><span class="s2"> together; "</span>
+                    <span class="sa">f</span><span class="s2">"send fewer or smaller files (the limit is </span><span class="si">{</span><span class="n">env</span><span class="si">}</span><span class="s2">)"</span>
+                <span class="p">)</span></div>
 </div>
 
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_charge_request</span><span class="p">(</span><span class="n">kind</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">budget</span> <span class="o">=</span> <span class="n">_request_budget</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">budget</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">budget</span><span class="o">.</span><span class="n">charge</span><span class="p">(</span><span class="n">kind</span><span class="p">,</span> <span class="n">amount</span><span class="p">)</span>
+    <span class="n">file</span> <span class="o">=</span> <span class="n">_loading_file</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">file</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">file</span><span class="o">.</span><span class="n">budget</span><span class="o">.</span><span class="n">charge</span><span class="p">(</span><span class="n">file</span><span class="o">.</span><span class="n">charges</span><span class="p">,</span> <span class="n">kind</span><span class="p">,</span> <span class="n">amount</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="check_file_counts">

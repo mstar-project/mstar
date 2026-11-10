@@ -778,7 +778,7 @@ check what a file will decode to, not how big it is. A refusal is a
 decoder can’t read (<a class="reference internal" href="#mstar.model.media_limits.decoding_upload" title="mstar.model.media_limits.decoding_upload"><code class="xref py py-func docutils literal notranslate"><span class="pre">decoding_upload()</span></code></a>).</p>
 <p>The pixel and audio caps hold for a whole request: while the data worker loads
 a request’s files inside <a class="reference internal" href="#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">RequestMediaBudget</span></code></a>, every check also counts
-against what the request’s earlier files used.</p>
+against what the request’s other files use, whether finished or still loading.</p>
 <p class="rubric">Module Attributes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -900,10 +900,11 @@ audio checks charge the request through it.</p>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.media_limits.RequestMediaBudget.charge">
-<span class="sig-name descname"><span class="pre">charge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kind</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">amount</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#RequestMediaBudget.charge"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.RequestMediaBudget.charge" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">charge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">charges</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kind</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">amount</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#RequestMediaBudget.charge"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.RequestMediaBudget.charge" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><strong>charges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
 <li><p><strong>kind</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>amount</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
 </ul>
