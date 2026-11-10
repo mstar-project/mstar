@@ -12,10 +12,6 @@ from mstar.model.components.diffusion.qwen.encoder import QwenEncoderConfig
 from mstar.model.components.qwen_vision import QwenVisionConfig
 
 QWEN_IMAGE21 = "Qwen/Qwen-Image-2.1"
-SNAPSHOT_PATTERNS = [
-    "model_index.json", "*/config.json", "*.safetensors", "*.safetensors.index.json",
-    "scheduler/*.json", "processor/*",
-]
 
 # Graph names shared by the model file and the submodules.
 TEXT_ENCODER_NODE = "text_encoder"

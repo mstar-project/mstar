@@ -67,7 +67,6 @@ from mstar.model.qwen_image21.config import (
     PREFIX_TEXT_WALK,
     QWEN_IMAGE21,
     SIZE_MULTIPLE,
-    SNAPSHOT_PATTERNS,
     SYSTEM_PROMPT,
     TEXT_ENCODER_NODE,
     UNCOND,
@@ -174,7 +173,7 @@ class QwenImage21Model(Model):
     @property
     def snapshot(self):
         if self._snapshot is None:
-            self._snapshot = resolve_snapshot_dir(self.model_path_hf, self.cache_dir, allow_patterns=SNAPSHOT_PATTERNS)
+            self._snapshot = resolve_snapshot_dir(self.model_path_hf, self.cache_dir)
         return self._snapshot
 
     @property
