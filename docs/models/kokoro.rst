@@ -1,0 +1,103 @@
+Kokoro
+======
+
+TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
+decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
+batched across requests.
+
+Registry key: ``kokoro``. Checkpoint: ``hexgrad/Kokoro-82M``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``kokoro``
+     - ``configs/kokoro.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve kokoro
+
+For client requests and response formats, see :doc:`/clients`.
+
+Install pronunciation dependencies
+----------------------------------
+
+Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
+spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
+this itself on first use when it has network access). ``.[all]`` includes the G2P
+dependencies, and the Docker images also install the tagger. ``pip install 'misaki[en]'``
+additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
+out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
+Italian and Portuguese voices; without it those words are skipped and those
+languages are unavailable. Japanese and Mandarin voices need ``misaki[ja]`` /
+``misaki[zh]``.
+
+Voice, language and speed
+-------------------------
+
+Serve with ``mstar serve kokoro``. Request knobs: ``voice`` (a bundled voice such
+as ``af_heart``, or a blend ``af_bella+af_sky`` / ``af_bella(2)+af_sky(1)``),
+``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
+English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
+``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
+synthesize a phoneme string directly). An empty ``voice`` / ``lang_code`` or a
+``speed`` outside 0.25-4.0 is a 400. ``seed`` fixes the vocoder's noise (absent, the
+server derives one from the request id), so a seeded request run at the same batch
+layout repeats exactly; batched differently, its noise is the same but padding rounding
+moves the waveform's phase, as it does in the reference.
+
+Configure batching and precision
+--------------------------------
+
+Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
+``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
+fallback even when it is installed, ``chunk_target_phonemes`` and
+``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
+``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
+skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
+half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
+in bf16 (about 13% more throughput at concurrency 32 on an H100 and 20-25% at
+concurrency 32-64 on an H200, Whisper WER unchanged, with the harmonic source and the
+iSTFT kept in fp32; the parity test covers fp32 only; ``configs/kokoro_bf16.yaml``).
+Each BiLSTM's two directions run as one block-diagonal recurrence, and cuDNN times
+the conv algorithms of both captured halves once per bucket, at capture
+(``NodeSubmodule.capture_cudnn_benchmark``).
+
+Streaming sentence chunks
+-------------------------
+
+Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
+PL-BERT window); each chunk is emitted to the client as soon as it is
+synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
+sentence. The first chunk is kept short so time to first audio is one short
+synthesis.
+
+Output format and startup
+-------------------------
+
+Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
+phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
+frame half of the forward are captured as CUDA graphs per length bucket and the
+frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
+about two minutes; rows of one step are grouped by frame bucket
+(``frame_grouping: single`` pads them into one group instead, kept for comparison).
+
+Voice discovery and integrations
+--------------------------------
+
+``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
+into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
+pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
+voices for a picker: the bundled voices whose G2P extra is installed on the server
+(a request for one of the others gets a 400 with the ``pip install`` hint).

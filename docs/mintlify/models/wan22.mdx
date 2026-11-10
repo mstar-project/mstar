@@ -1,0 +1,98 @@
+---
+title: "Wan2.2"
+description: "Deployment, request options, capacity and implementation notes for Wan2.2."
+---
+
+Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+
+Registry key: `wan22`. Checkpoint: `Wan-AI/Wan2.2-TI2V-5B-Diffusers`.
+
+## Deployment configs
+
+The CLI maps the model keys to these deployment configs. See [Installation](/installation) for dependencies; model-specific requirements and limits follow on this page:
+
+| CLI model key | Config in the repository |
+|---------------|--------------------------|
+| `wan22`       | `configs/wan22.yaml`     |
+
+From the repository root, launch a deployment with:
+
+``` bash
+mstar serve wan22
+```
+
+For client requests and response formats, see [Using a Server](/clients).
+
+Text-to-video and image-to-video on **Wan2.2-TI2V-5B** — the dense 5B variant (`Wan-AI/Wan2.2-TI2V-5B-Diffusers`): a native video DiT, a UMT5-XXL prompt encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT) variants are **not** supported; `wan22` rejects any other variant explicitly.
+
+Install and serve on one GPU:
+
+``` bash
+pip install -e ".[wan22]"
+mstar serve wan22                              # configs/wan22.yaml
+# or: mstar-serve --config configs/wan22.yaml --port 8000
+```
+
+## Generate a video
+
+Two routes are served. `POST /generate` is the native one (multipart form, like every other model); the mp4 comes back base64-encoded in `outputs.video[0].data`:
+
+``` bash
+curl -s http://localhost:8000/generate \
+  -F 'text=a fluffy cat walking across a sunlit floor' \
+  -F 'output_modalities=video' -F 'streaming=false' \
+  -F 'model_kwargs={"height":480,"width":832,"num_frames":33,"num_inference_steps":50,"guidance_scale":5.0}'
+```
+
+`POST /v1/videos/generations` is the OpenAI-shaped surface (JSON body, mp4 in `data[0].b64_json`). Here the size is a single `WxH` string — **width first**, the opposite order to the `height`/`width` kwargs above — and supplying an `image` (URL or data URI) turns the request into image-to-video:
+
+``` bash
+curl -sS -X POST http://localhost:8000/v1/videos/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "a fluffy cat walking across a sunlit floor",
+       "size": "832x480", "num_frames": 33, "seed": 42,
+       "num_inference_steps": 50, "guidance_scale": 5.0}' \
+  | python -c "import sys,json,base64; d=json.load(sys.stdin); \
+               open('out.mp4','wb').write(base64.b64decode(d['data'][0]['b64_json']))"
+```
+
+`test/wan22/t2v_request.sh` and `i2v_request.sh` wrap these two calls.
+
+## Generation fields
+
+Generation knobs (per request, via `model_kwargs` or the request body):
+
+| Knob | Default | Notes |
+|----|----|----|
+| `height` / `width` | 704 / 1280 | The checkpoint's native 720P tier. **Both must be multiples of 32** — see below. Rejected with a 400 otherwise. |
+| `num_frames` | 81 | **Must be 4k+1** — see below. Rejected with a 400 otherwise. Latent frames = `(num_frames - 1) // 4 + 1`. |
+| `num_inference_steps` | 50 | An integer in 1-100; the upper bound is the denoise loop's `max_iters` (`max_denoise_steps`). A 400 outside it. |
+| `guidance_scale` | 5.0 | Classifier-free guidance; run as a single batched forward. |
+| `negative_prompt` | `""` | Empty by default, matching the reference pipeline. |
+| `fps` | 24 | **Playback rate only** — it is the mp4 container rate, not a generation knob. Wan2.2 always generates a fixed `num_frames` clip at an implied 24 fps, so another value just rescales the clip's duration. |
+
+## Valid sizes and frame counts
+
+**The ÷32 rule.** Height and width must each be an exact multiple of **32**: a pixel dimension is downsampled 16x by the VAE and then patchified 2x by the DiT, and only exact multiples survive both. So `720x1280` is **not** a valid size for this model (720/32 = 22.5) — the 720p-class tier is **704x1280**. An unaligned size is rejected at the request seam with a 400 naming the rule and the nearest valid sizes, because it has no clean failure deeper in: the two paths round the latent extent differently and the DiT dies mid-forward.
+
+**The 4k+1 frame rule.** `num_frames` must be one more than a multiple of 4 (33, 81, 121 …): the VAE compresses time by 4 around an anchor frame, so only `4k+1` survives the round trip. Anything else is *silently floored* — ask for 32 frames and you would get 29 — so it too is rejected with a 400 naming the nearest valid counts.
+
+**Size ceiling.** `height x width x num_frames` may not exceed `max_video_pixels` (default 268,435,456, about 3.6x the default clip; raise it under the yaml's `model_kwargs`), each axis must fit the DiT's 1,024 rotary positions (`num_frames` up to 4,093), and height and width are at most 16,384, the largest side the mp4 encoder (libx264) opens. Each is a 400 naming the limit.
+
+## Compilation and execution
+
+**Compiled DiT shapes.** With `compile_dit` the DiT compiles one graph per input shape, so only the `"WxHxF"` shapes in `compile_dit_sizes` (default `1280x704x81`) use the compiled transformer; each compiles on first use, once with CFG and once without, so at most two compiles per listed shape. Any other size or frame count runs the same transformer eager, with no compile, which is slower per request once warm: on an H200, about 49% more at 640x352x17 and 55% more at 832x480x33 than the same shape compiled. List the shapes a deployment serves under the yaml's `model_kwargs`; each one listed costs its compiles on first use. The first DiT call after startup is traced twice (a guard on the rotary table), so a server compiles at most two graphs per listed shape plus one.
+
+**UniPC runs inline, inside the DiT node.** The scheduler is the DiT scaffold's (`components/diffusion/unipc.py`, which cosmos3 runs too), not a separate stage: the solver state (the order-2 history buffer and the corrector's `last_sample`) is carried on the denoise loop's own edges, so it travels with the request rather than living in a scheduler object on one rank. Requests are therefore independent and the loop is resumable across ranks. `dit_max_batch_size` (default 1) lets requests at one latent grid and guidance scale share a forward, each row count compiling its own graph.
+
+**What is accelerated by default.** The DiT runs under `torch.compile` (`compile_dit`); its self-attention runs on the engine's ragged attention resource (FlashInfer, FA3 on Hopper; on a B300 the `ragged_attention` kernel table picks torch's cuDNN SDPA, the kernel `attention_backend: sdpa` runs, and the two configs give the same videos at the same step time) as an opaque op inside the compiled graph, 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on an earlier version of the DiT block, before the adaLN was computed in one pass and the q/k norm and RoPE were fused (`model_kwargs: attention_backend: sdpa` restores the reference kernel; the cross-attention over the 512 text tokens stays on SDPA, which is faster at that shape).
+
+The untiled VAE decode runs the shared Wan VAE decoder, channels-last and compiled (`vae_decode_fast`; set it to `false` under the yaml's `model_kwargs` for stock `vae.decode`). Both compile on first use: the DiT only for the `compile_dit_sizes` shapes (see Compiled DiT shapes), so the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only for the sizes in `vae_decode_fast_sizes` (model default `1280x704`; the shipped configs add `832x480`, where it decodes 1.59x faster); any other size decodes with stock `vae.decode`, frames identical to `vae_decode_fast: false`.
+
+The compile uses Inductor's deterministic mode, so every server process decodes the same latents to the same frames; torch 2.9.1 has no such mode, and there two processes can differ by a few uint8 levels. The VAE decode tiles only when free VRAM at decode time is short of the untiled estimate (the `auto` policy; `WAN22_VAE_DECODE_TILING` forces a path), which keeps the untiled conv3d from OOMing a 32 GiB card. No CUDA-graph capture, no continuous batching (one request per step) and no component offload.
+
+## Choose a multi-GPU layout
+
+**Two GPUs.** `configs/wan22_cfg_parallel_2gpu.yaml` is CFG-parallel: it runs the dit over two ranks (`cfg_size: 2`) that split the classifier-free guidance batch: each rank runs one branch over the batch's rows and the two noise predictions are all-gathered every step, so a guided step costs one branch's forward (502 vs 1000 ms at 1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps; measured on that earlier version). The text encoder and VAE run on rank 0. Without guidance both ranks compute the same step, correct but no faster. For throughput under concurrency, `configs/wan22_dp2.yaml` serves a whole replica per GPU instead: 5.2 videos/min at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE decode; measured on that earlier version), while one request takes the 1-GPU time.
+
+**Four GPUs.** `configs/wan22_cfg2_sp2_4gpu.yaml` also splits each branch's tokens over a pair of ranks (`cfg_size: 2, sp_size: 2`, Ulysses on the dit's self-attention) to cut one request's latency. Split the guidance branches first (`cfg_size: 2`), then add `sp_size` on top: on two GPUs, `sp_size: 2` alone is slower than `cfg_size: 2`. `sp_size` must divide the dit's 24 attention heads. Under concurrency, data parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four replicas (`wan22_dp2.yaml`'s layout over four ranks) serve 8.6 videos/min against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on H100s.

@@ -1,30 +1,94 @@
 Serving
 =======
 
-``mstar`` has two ways to start a server:
+Start with a model's shipped configuration, then change placement or resource limits for your
+deployment. Complete `installation <installation.html>`__ first; for a first BAGEL request,
+follow the `quickstart <quickstart.html>`__.
 
-- ``mstar serve <model>`` — a one-command wrapper with sensible per-model defaults (most
-  single-GPU; a few multi-GPU). Best for getting started and single-node runs.
-- ``mstar-serve --config <yaml>`` — the low-level entry point that takes an explicit
-  config. Use it for custom layouts, disaggregation, and tensor parallelism.
+.. list-table::
+   :header-rows: 1
 
-``mstar serve`` resolves a default config for the model, fills in the plumbing that
-``mstar-serve`` needs (socket/upload dirs, a single-node-safe tensor protocol, the HF
-cache), and then delegates to it.
+   * - Task
+     - Start here
+   * - Launch a shipped model configuration
+     - ```mstar serve`` <#mstar-serve>`__
+   * - Place nodes on devices or change parallelism
+     - `Deployment layouts <#deployment-layouts>`__
+   * - Size caches or limit concurrent requests
+     - `Resource capacity <#resource-overrides>`__
+   * - Set token budgets and capture sizes
+     - `Scheduling and capture <#scheduling-and-capture>`__
+   * - Authenticate clients
+     - `API key <#api-key>`__
+   * - Measure a running deployment
+     - `Request profiling <#request-profiling>`__ and `metrics <#serving-metrics>`__
+
+Both launch commands start the same server. ``mstar serve <model>`` selects a shipped config and
+fills in the socket directory, upload directory, weight cache, and ``SHM`` tensor transport.
+``mstar-serve --config <yaml>`` requires an explicit config and defaults to ``RDMA``. Use
+``--tensor-comm-protocol SHM`` for that command on a single node without RDMA.
+
+.. _http-frontends:
+
+Choose an HTTP frontend
+-----------------------
+
+The default frontend is Python. Add ``--rust-frontend`` to either command to serve HTTP with
+``mstar-server``; the Python process still handles preprocessing and the conductor protocol. See
+`installation <installation.html>`__ for the Rust binary.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Interface
+     - Python frontend
+     - Rust frontend
+   * - Native ``POST /generate``, health, metrics
+     - Yes
+     - Yes
+   * - OpenAI chat, speech, image, video, model and voice routes
+     - Model-dependent
+     - Model-dependent
+   * - Audio transcription uploads, ``/v1/realtime``, ``/generate/ws``, openpi WebSocket
+     - Yes, where the model supports them
+     - Not served
+   * - Runtime LoRA load/unload
+     - With ``runtime_updates: true``
+     - Not served; that setting prevents startup
+
+Use the Python frontend for live input or transcription. `Client interfaces <clients.html>`__
+describes the request and response contracts.
+
+.. _mstar-serve:
 
 mstar serve
 -----------
 
-.. code-block:: bash
+.. code:: bash
 
    mstar serve <model> [options]
 
-``<model>`` is one of ``bagel``, ``bagel_cfg_parallel``, ``qwen3_omni``, ``orpheus``,
-``pi05``, ``vjepa2``, ``vjepa2_ac`` (or pass ``--config`` for any other deployment).
+Run ``mstar serve --help`` for the model keys and flags supported by your installed version.
+`Supported models <models.html>`__ lists model requirements and deployment choices. ``--config``
+overrides the shipped YAML; the positional model name is still required.
+
+For example, from a source checkout with BAGEL installed:
+
+.. code:: bash
+
+   mstar serve bagel --host 127.0.0.1
+
+After startup completes, check health from another terminal:
+
+.. code:: bash
+
+   curl --fail http://localhost:8000/health
+
+A healthy server returns ``{"status":"healthy"}``. This checks the server; send the `quickstart
+request <quickstart.html>`__ to check model output.
 
 .. list-table::
    :header-rows: 1
-   :widths: 28 24 48
 
    * - Option
      - Default
@@ -37,20 +101,14 @@ mstar serve
      - HTTP port.
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
-     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       and ``/metrics`` (see :ref:`api-key`).
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health`` and ``/metrics`` (see
+       `API key <serving.html#api-key>`__).
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
    * - ``-O``, ``--compile-level``
      - ``MSTAR_COMPILE_LEVEL``, else ``1``
-     - How much the captured forwards' compiles tune at startup. ``-O0``: torch.compile's
-       default mode, no tuning. ``-O1``: coordinate descent, which fuses the decode GEMMs
-       with their epilogues. ``-O2``: full max-autotune, which adds the GEMM template
-       search. Qwen3.5-0.8B on an H200 with an empty cache started in 170 s / 320 s /
-       1,294 s at the same throughput; Qwen3-TTS was 25-30% slower at ``-O0`` (c=1).
-       Use ``-O2`` for numbers quoted against other engines. Compiles a model runs itself
-       (e.g. a diffusion VAE decode) keep their own mode.
+     - Startup compile tuning: ``0``, ``1``, or ``2``. See `Compile levels <#compile-levels>`__.
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.
@@ -62,8 +120,7 @@ mstar serve
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
      - ``/tmp/mstar_<user>_<port>/``
-     - ZMQ IPC socket prefix; one per server, so servers on other ports do
-       not share sockets.
+     - ZMQ IPC socket prefix; one per server, so servers on other ports do not share sockets.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads_<user>/``
      - Temp directory for uploaded media.
@@ -72,22 +129,27 @@ mstar serve
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
    * - ``--log-stats``
      - off
-     - Print a per-request profile when each request finishes (see
-       :ref:`request-profiling`).
+     - Print a per-request profile when each request finishes (see `Request
+       profiling <serving.html#request-profiling>`__).
    * - ``--log-stats-file``
      - stdout
-     - Append the per-request profiles to this file instead of stdout
-       (implies ``--log-stats``).
+     - Append the per-request profiles to this file instead of stdout (implies ``--log-stats``).
    * - ``--enable-metrics``
      - off
-     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
-       Needs ``.[metrics]``.
+     - Serve Prometheus metrics at ``/metrics`` (see `Metrics <serving.html#serving-metrics>`__). Needs
+       ``.[metrics]``.
+   * - ``--rust-frontend``
+     - off
+     - Serve supported HTTP routes with ``mstar-server``; see `frontend coverage <#http-frontends>`__.
+   * - ``--rust-frontend-bin``
+     - automatic lookup
+     - Path to ``mstar-server``; implies ``--rust-frontend``. Otherwise checks ``MSTAR_SERVER_BIN``,
+       the environment's scripts directory, ``PATH``, then ``rust/server/target/release``.
 
-Each model maps to a default config (override with ``--config``):
+Examples of shipped defaults (not the complete model list; override with ``--config``):
 
 .. list-table::
    :header-rows: 1
-   :widths: 22 44 12
 
    * - Model
      - Default config
@@ -114,16 +176,17 @@ Each model maps to a default config (override with ``--config``):
      - ``configs/vjepa2_ac.yaml``
      - 1
 
+.. _mstar-serve-1:
+
 mstar-serve
 -----------
 
-.. code-block:: bash
+.. code:: bash
 
    mstar-serve --config configs/<model>.yaml [options]
 
 .. list-table::
    :header-rows: 1
-   :widths: 28 22 50
 
    * - Option
      - Default
@@ -136,8 +199,8 @@ mstar-serve
      - Bind address / HTTP port.
    * - ``--api-key``
      - ``MSTAR_API_KEY``, else off
-     - Require ``Authorization: Bearer <key>`` on every route except ``/health``
-       and ``/metrics`` (see :ref:`api-key`).
+     - Require ``Authorization: Bearer <key>`` on every route except ``/health`` and ``/metrics`` (see
+       `API key <serving.html#api-key>`__).
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
@@ -146,9 +209,9 @@ mstar-serve
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
      - ``/tmp/mstar_<user>_<port>/``
-     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo
-       worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
-       it defaults to a new directory per launch and removes it at exit.
+     - ZMQ IPC socket prefix (shared with conductor/workers). The Dynamo worker
+       (``python -m mstar.integrations.dynamo``) has no HTTP port, so it defaults to a new directory
+       per launch and removes it at exit.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.
@@ -166,347 +229,766 @@ mstar-serve
      - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
    * - ``--log-stats``
      - off
-     - Print a per-request profile when each request finishes (see
-       :ref:`request-profiling`).
+     - Print a per-request profile when each request finishes (see `Request
+       profiling <serving.html#request-profiling>`__).
    * - ``--log-stats-file``
      - stdout
-     - Append the per-request profiles to this file instead of stdout
-       (implies ``--log-stats``).
+     - Append the per-request profiles to this file instead of stdout (implies ``--log-stats``).
    * - ``--enable-metrics``
      - off
-     - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
-       Needs ``.[metrics]``.
+     - Serve Prometheus metrics at ``/metrics`` (see `Metrics <serving.html#serving-metrics>`__). Needs
+       ``.[metrics]``.
+   * - ``--rust-frontend``
+     - off
+     - Serve supported HTTP routes with ``mstar-server``; see `frontend coverage <#http-frontends>`__.
+   * - ``--rust-frontend-bin``
+     - automatic lookup
+     - Path to ``mstar-server`` when ``--rust-frontend`` is set. Otherwise checks ``MSTAR_SERVER_BIN``,
+       the environment's scripts directory, ``PATH``, then ``rust/server/target/release``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
 
 .. note::
 
-   ``mstar serve`` defaults the tensor protocol to ``SHM`` (safe on a single node),
-   whereas ``mstar-serve`` defaults to ``RDMA``. On a single node without RDMA, pass
+   ``mstar serve`` defaults the tensor protocol to ``SHM`` (safe on a single node), whereas
+   ``mstar-serve`` defaults to ``RDMA``. On a single node without RDMA, pass
    ``--tensor-comm-protocol SHM`` to ``mstar-serve``.
-
 .. _api-key:
 
 API key
 -------
 
-Both commands listen on all interfaces by default and accept requests from anyone who
-can reach the port. If no gateway in front of the server authenticates clients, set a
-key or bind ``--host 127.0.0.1``; the server logs a warning at startup while no key is
-set.
+Both commands listen on all interfaces by default and accept requests from anyone who can reach
+the port. If no gateway in front of the server authenticates clients, set a key or bind
+``--host 127.0.0.1``; the server logs a warning at startup while no key is set.
 
-.. code-block:: bash
+.. code:: bash
 
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
    mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
 
+.. _api-key-precedence:
+
+Send and override the key
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
-:ref:`serving-metrics`) answers ``401`` unless the request carries
-``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
-``/generate/ws``) refuse the handshake without it. The check is one middleware over the
-whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
-however much of the key matches. CORS preflights still get their answer, since browsers
-send them without credentials. ``--api-key`` overrides the environment variable, but
-prefer the variable: a command-line flag is visible to every local user in the process
-list. An empty value turns the check off, so ``--api-key ""`` disables a key set in the
-environment, and so does a variable that expands to nothing (``--api-key "$UNSET_VAR"``).
+`Metrics <serving.html#serving-metrics>`__) answers ``401`` unless the request carries
+``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``, ``/generate/ws``)
+refuse the handshake without it. The check is one middleware over the whole app (FastAPI and the
+Rust frontend alike), and the comparison takes the same time however much of the key matches.
+
+CORS preflights still get their answer, since browsers send them without credentials.
+
+``--api-key`` overrides the environment variable, but prefer the variable: a command-line flag
+is visible to every local user in the process list. An empty value turns the check off, so
+``--api-key ""`` disables a key set in the environment, and so does a variable that expands to
+nothing (``--api-key "$UNSET_VAR"``).
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
-``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`.
+``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see `Using a
+Server <clients.html>`__.
 
-Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
-``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
-Dynamo's frontend or a gateway in front of it.
+.. _dynamo-boundaries:
+
+Authentication and live input with Dynamo
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward ``Authorization`` to
+backends, so the M\* worker cannot check a key there: authenticate at Dynamo's frontend or a
+gateway in front of it.
 
 No Dynamo surface carries a live call's appends: the Dynamo worker
 (``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
-request. For live input, serve the model with ``mstar serve`` and call it over
-``/v1/realtime`` or ``/generate/ws``.
+request. For live input, serve the model with ``mstar serve`` and call it over ``/v1/realtime``
+or ``/generate/ws``.
+
+.. _deployment-layouts:
+
+Deployment layouts
+------------------
+
+Choose a layout the model supports. A worker is a process associated with a rank;
+``rank_devices`` can map multiple ranks to one device. ``node_groups`` places model graph nodes
+on those ranks. Node names come from the model's graph walks: for example, BAGEL has
+``vit_encoder``, ``vae_encoder`` and ``LLM``, while Orpheus has ``LLM`` and ``snac_decoder``.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Goal
+     - Layout
+   * - Keep all nodes on one GPU
+     - `Single GPU <#single-gpu>`__
+   * - Give nodes independent worker loops on one GPU
+     - `Several workers <#several-workers-on-one-gpu>`__
+   * - Split prefill and decode placement
+     - `Disaggregation <#disaggregation>`__
+   * - Shard weights across GPUs
+     - `Tensor parallelism <#tensor-parallelism>`__
+   * - Split sequence tokens or guidance branches
+     - `Sequence and guidance parallelism <#sequence-and-guidance-parallelism>`__
+   * - Distribute whole MoE experts
+     - `Expert parallelism <#expert-parallelism>`__
+
+Examples with ``model`` and ``max_seq_len`` are complete placement configs. Other YAML blocks
+are excerpts to merge into that model's existing config.
+
+.. _single-gpu:
+
+Single GPU
+~~~~~~~~~~
+
+Everything on rank 0:
+
+.. code:: yaml
+
+   model: "bagel"
+   max_seq_len: 32768
+   node_groups:
+     - {node_names: [vit_encoder], ranks: [0]}
+     - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
+     - {node_names: [LLM], ranks: [0]}
+
+.. _several-workers-on-one-gpu:
+
+Several workers on one GPU
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A worker is one process per rank, and by default rank ``n`` runs on device ``n``.
+``rank_devices`` maps ranks onto devices explicitly, so two node groups can run as separate
+workers on the same GPU: a heavy autoregressive node then never waits for a light node's steps
+on its worker loop (a TTS talker and its codec):
+
+.. code:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0]}
+     - {node_names: [Codec], ranks: [1]}
+   rank_devices: {1: 0}
+
+At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws away,
+then captures the cheapest buckets across all of them while its largest eager step still fits
+beside them; a bucket left out runs eagerly. Workers sharing a GPU see each other's memory only
+as used, so the first to capture can take the other's room. Set ``gpu_memory_fraction``
+(``0.45`` for two workers, say) to bound what each plans for. It counts PyTorch allocations, not
+the CUDA context or NCCL buffers, so leave room for those.
+
+Workers that share a GPU time-slice it by default: one process's kernels wait for the other's.
+``mps: true`` makes the conductor start a CUDA MPS control daemon of its own before it spawns
+the workers, run every worker as its client so their kernels overlap, and quit the daemon at
+shutdown. The daemon uses a private pipe directory, so other processes on the GPU are
+unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA driver) must be on ``PATH``. The
+``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three Chatterbox models, OmniVoice and
+CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+
+.. _a-light-node-beside-a-heavy-one-on-one-worker:
+
+Run a light node beside a heavy node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``side_stream: true`` on a node group runs that node's steps on a lane of their own instead of
+the worker's main chain: they take no turn on it, run on a second CUDA stream beside its steps,
+and whatever comes ready meanwhile batches into the next one. It applies to the walks the node's
+submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares ``codec_chunk``, but
+no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS.
+
+Startup fails with a ``ValueError`` naming the field where the lane can't apply: a TP, SP or CFG
+node, a node alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn't the node's alone, is part of a combined
+walk, or has output spans or a stop check. Without the field the node runs on the chain. The
+following illustrates the placement syntax; it is not a working Qwen3-TTS override while
+``Codec`` holds ``codec_state``:
+
+.. code:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
+     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
+
+.. _disaggregation:
+
+Place different walks on different GPUs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The same node can live on different GPUs *per graph walk* — e.g. prefill, decode, and image
+generation on three GPUs:
+
+.. code:: yaml
+
+   node_groups:
+     - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
+     - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
+
+Because placement is config-only, the *same* model code runs single-GPU or fully disaggregated.
+``configs/`` ships several layouts per model (``*_single_gpu``, ``*_colocated``,
+``*_pd_disaggregated``, ``*_cfg_parallel``, …).
+
+Tensor parallelism
+~~~~~~~~~~~~~~~~~~
+
+Shard a node across GPUs with ``tp_size`` and that many ``ranks``:
+
+.. code:: yaml
+
+   model: "orpheus"
+   max_seq_len: 131072
+   node_groups:
+     - {node_names: [LLM], ranks: [0, 1], tp_size: 2, graph_walks: [prefill, decode]}
+     - {node_names: [snac_decoder], ranks: [0], graph_walks: [snac_chunk]}
+
+A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1``; the weight
+loaders then shard parameters automatically, with no model-code changes. See `Tensor
+parallelism <adding_models.html#tensor-parallelism>`__ in the model guide for the model-side
+details.
+
+.. _sequence-and-guidance-parallelism:
+
+Sequence and guidance parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``sp_size`` splits a node's token sequence over that many ranks (Ulysses: an all-to-all around
+attention), and ``cfg_size`` splits its classifier-free-guidance branches, each rank running its
+share of them and the noise predictions gathered every step. Each needs the model to declare the
+node SP- or CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for
+Wan2.2). The axes compose: a group's ``ranks`` form lockstep instances of
+``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks), each
+instance's ranks listed in ascending order, and the conductor routes each request to one whole
+instance:
+
+.. code:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
+     # one guidance branch per pair of ranks, each branch's tokens split over its pair
+     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
+
+Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same groups
+on every axis, each declared parallel on those axes by the model. The ranks then run every
+node's steps in one order.
+
+The conductor refuses lockstep nodes on one worker in different groups, and two lockstep nodes
+on one worker that share a paged KV cache: rank 0 replicates the page moves it makes on a pool
+(host offloads and reloads, for example) per node, riding on one node's next step, so two nodes
+on one pool could admit out of step on a follower. Until rank 0 journals a shared pool's moves
+in one stream, place such nodes on different workers.
+
+.. _expert-parallelism:
+
+Expert parallelism
+~~~~~~~~~~~~~~~~~~
+
+By default a TP group shards every MoE expert along its intermediate dimension. An ``ep_config``
+block on the node group instead gives each rank whole experts. Attention and dense MLPs stay
+TP-sharded:
+
+.. code:: yaml
+
+   model: "qwen3_omni"
+   max_seq_len: 32768
+   node_groups:
+     - node_names: [Thinker]
+       ranks: [0, 1]
+       tp_size: 2
+       ep_config:
+         parallel: ep          # each rank holds 64 of the 128 experts at full width
+     - {node_names: [audio_encoder, vision_encoder], ranks: [0]}
+     - {node_names: [Talker], ranks: [2]}
+     - {node_names: [Code2Wav], ranks: [2]}
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``ep_config`` key
+     - Meaning
+   * - ``parallel``
+     - ``tp`` (default) or ``ep``.
+   * - ``ep_group``
+     - The ranks EP spans. Only ``tp``, the group's TP ranks, exists today.
+   * - ``debug_check_routing``
+     - Device-assert that every rank routes each token to the same experts. Costs one all-gather per
+       MoE layer; off by default. Needs ``parallel: ep``.
+   * - ``log_expert_load_every``
+     - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off. Needs
+       ``parallel: ep``.
+   * - ``mask_padding``
+     - Skip CUDA-graph padding rows in the routed experts, TP or EP. Off by default; it gave no
+       throughput gain on Qwen3-Omni at 8 GPUs.
+
+The number of experts must divide evenly by the group size. A node must be declared EP-enabled
+by the model; an ``ep_config`` on any other node, an unknown key, or two per-walk groups giving
+one node different ``ep_config`` blocks fails at start-up. See
+``configs/qwen3omni_thinker_ep2.yaml``.
+
+.. _config-files:
 
 Config files
 ------------
 
-A config maps the model's computation-graph nodes to physical GPU ranks. The keys:
+A config names a model and maps its graph nodes to worker ranks. Start from a shipped file in
+``configs/`` so the node names, resources and walks match the model. The `layout
+examples <#deployment-layouts>`__ show the changes for each placement strategy.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 20 80
+The top-level keys below are deployment settings. YAML ``model_kwargs`` are fixed at startup;
+request ``model_kwargs`` are a separate client interface.
 
-   * - Key
-     - Meaning
-   * - ``model``
-     - Registry key of the model (see :doc:`models`).
-   * - ``max_seq_len``
-     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
-       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
-       ``resources: <kv>:`` (see the resource overrides below).
-   * - ``node_groups``
-     - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
-       ``sp_size`` and ``cfg_size``. An ``ep_config`` block picks TP or EP for the
-       group's MoE experts. ``side_stream: true`` runs the group's node beside the
-       worker's main chain of steps (see below).
-   * - ``resources``
-     - *(optional)* Per-resource overrides, keyed by the model's resource names (see
-       below).
-   * - ``max_concurrent_requests``
-     - *(optional)* How many requests run at once. Requests past the cap wait in the
-       conductor's queue, except a live call (open client input), which is refused with
-       a 503.
-   * - ``routing_weights``
-     - *(optional)* The weights of the data-parallel replica pick (see below), one per
-       term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
-       the prompt predicted in its KV prefix cache. Each is a number from 0 to 1e6; ``load``
-       defaults to 1.0 and ``prefix`` to 8.0. Any other key, or ``load: 0`` while another
-       weight is above 0, fails loading. ``prefix: 0`` picks by load alone, and ``prefix: 1``
-       or less keeps a hit below one live request, so it only breaks ties. At data
-       parallelism, warmup copies run with ``prefix_cache=False``, so
-       they still spread but do not warm the prefill that starts from cached pages; a
-       warmup spec that sets ``prefix_cache`` keeps its own value.
-   * - ``gpu_memory_fraction``
-     - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
-       done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free. A node that sets ``capture_cudnn_benchmark`` is held to the
-       share while its captures are sized, so its eager step must fit in it.
-   * - ``mps``
-     - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
-       conductor starts in a private directory, so workers that share a GPU overlap their
-       kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
-       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
-       needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
-       shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
-       ``false``.
-   * - ``max_call_input_mb``
-     - *(optional, default 512)* For a model that takes live client input: how many MiB
-       of files (and append text) one call may send over its whole life, its opening
-       message's included, and of decoded audio samples a route appends
-       (``/v1/realtime``: 4 bytes a sample at the stream's rate, server-padded silence
-       included).
-       A live call's opening message past it is refused, and an append that would pass
-       it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
-       decoded input is larger than its files, and how much of it waits in buffers
-       depends on how fast the model consumes it.
-   * - ``client_streams``
-     - *(optional)* For a model that takes live client input: per client stream (by
-       its edge name, e.g. ``audio_in``), overrides of the limits the model declares on
-       it (``ClientStreamLimits``, see :doc:`adding_models`). ``max_items``: what the
-       stream may carry over a call's life, in the model's units (items, or the frames
-       or samples a model counts per item); a call past it ends with a 400. A deployment
-       may set a bound the model leaves open (``null`` is none) or lower one it
-       declares, which is the most the model can take, but not raise or lift it: a
-       model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
-       ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
-       ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
-   * - ``model_kwargs``
-     - *(optional)* Server-init model parameters (see below).
-   * - ``openpi``
-     - *(optional)* For a robot policy, a model that declares ``Model.robot_io`` and
-       ``Model.load_decoded_image`` (pi0.5 today). Serves openpi's policy WebSocket at ``/`` (see
-       :doc:`clients`), mapping an openpi observation onto the request, as openpi's
-       per-robot input and output transforms do. ``images``: the observation keys of the
-       cameras, in slot order. ``state``: the keys whose values are joined, in order,
-       into the robot state. ``action_dims``: how many leading action dims a reply keeps
-       (default all). ``metadata``: the frame sent on connect (default ``{}``). A block
-       the model can't serve (more cameras than ``num_cameras``, an unknown key) stops
-       the server at startup.
-   * - ``ws_per_message_deflate``
-     - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes; it applies to every route.
-       Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
-       55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
-       costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
-       ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck.
-   * - ``ws_max_message_mb``
-     - *(optional)* The largest WebSocket message the server reads, in MiB, on every
-       WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
-       closes its socket with ``1009`` before any handler sees it, so the client gets no
-       error frame. Raise it for clients that send big uncompressed frames, such as several
-       raw camera images in one openpi observation.
-   * - ``scheduling``
-     - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
-       :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
-       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
-       may go without running before it goes first, for every key its entry leaves unbounded.
-       ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
-       a node, a walk or both, which replaces the model's list; the most specific entry for a
-       pair decides. An entry naming nothing the model runs, a negative priority, a
-       ``max_wait`` under 1, two entries for the same target or an unknown field fail
-       loading. For example ``scheduling: {walk_priorities: [{walk: talker_prefill, priority:
-       1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
-   * - ``speculation_mixes_walks``
-     - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
-       walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
-       chain on it merges ready rows of the other walks of its combined walk, so
-       decode steps take in new prompts, and their chunks, as they arrive. Off, a chain
-       keeps to its own walk and yields to the others, and a step mixes walks only
-       when the scheduler builds one fresh. Defaults to on where the combined walk
-       has a token budget (``max_batch_tokens``), and off where it has none, since a
-       merged prompt then runs whole. Naming a node with no combined walk, or a
-       walk outside its combined walks, fails loading.
-   * - ``max_batch_tokens``
-     - *(optional)* Per node, one token budget for every walk the model budgets, or a
-       mapping of walk -> budget; null turns a walk's chunking off. Overrides the
-       model's defaults. See *Chunked prefill budgets* below.
-   * - ``prefill_token_buckets``
-     - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
-       graph capture is taken at, in place of the model's. A name is a walk the
-       node runs, for its packed captures on that walk (the model's
-       ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
-       ``prefill_voice`` capture, so name ``prefill_voice``), or the label of
-       one of its piecewise packed regions, for that region's ``total_tokens``
-       (BAGEL's ``vit_block_loop``, OmniVoice's ``backbone_layers``). A step
-       pads to the smallest rung that holds it, and a longer one runs eagerly.
-       A walk's ladder is a list, or a
-       mapping of min batch size -> list for a ladder per range of batch sizes:
-       ``{1: [...], 2: [...]}`` captures one request on the first and every larger
-       batch on the second (a larger batch size's ladder must reach at least as
-       far). A walk's ladder runs to the first rung that holds the most tokens a
-       step its capture replays runs: its token budget (``max_batch_tokens``; a walk
-       inside a combined walk runs under the combined walk's), or, for a combined
-       walk's steps, past it where the capture's widest batch of one-token decode
-       rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
-       that many. The rungs past it, which no step would reach, are dropped and
-       logged. A ladder is kept whole
-       where its steps run under no budget or may hold a prompt of a walk whose
-       chunking ``max_batch_tokens`` turned off, which runs whole, as is a
-       region's. A vision tower's ``vision_block_loop`` and an AuT encoder's
-       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
-       every other region keeps its own batch cap. A tower's attention resource is
-       sized from the model's own top rung, and a batch with more attention segments
-       than it holds is split into its requests, a request still over it running
-       eagerly, so a ladder past that rung replays its longer steps only with the
-       resource raised under ``resources``: ``vision_attn: {max_segments_per_step: N}``
-       for a vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N
-       frames or windows a step), and ``audio_attn: {max_segments_per_request: N}`` for
-       Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung adds captures,
-       graph memory and startup time. Loading fails, before any weights load, if the
-       setting is not a mapping of node -> name -> ladder, names a node in no node
-       group or a walk of the model that does not run the node (a node runs the walks
-       it is in and its combined walks), a ladder is not a non-empty list of distinct
-       positive ints, or a name that is no walk has a mapping. Warmup fails on a walk
-       whose steps replay another walk's capture, naming that walk, on a walk the node
-       captures by batch size alone (a ``decode`` capture), on a walk of a node whose
-       model captures no walk at all (a vision tower, an AuT encoder), naming its
-       regions, on a name that is neither a walk nor a region of the node or is both
-       (on a node whose model declares no region, every name that is no walk), and on a
-       region captured by batch size alone; a walk or region the node captures nothing
-       for at this deployment (a model that turns its captures off, such as GLM-5.2 with
-       ``dsa_long_context``) is logged and skipped. Loading also fails where a model
-       refuses a region whose buckets it uses elsewhere: CosyVoice3's
-       ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
-       key replaces ``model_kwargs.prefill_token_buckets``,
-       ``prefill_batched_token_buckets`` (GLM-5.2), ``backbone_token_buckets``
-       (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
-   * - ``can_override_mixed_max_tokens``
-     - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
-       of its own under the step's. See *Chunked prefill budgets* below.
-   * - ``speculate_mid_prefill``
-     - *(optional, default true)* Per node, ``true``/``false`` for every walk it chunks,
-       or a mapping of walk -> ``true``/``false``. On, a prompt mid-prefill takes its
-       next chunk in the step speculated during the current one, so a lone long prompt
-       pays no scheduling gap between chunks; other ready work still goes first after
-       every prompt step. Off, the next chunk waits for the current one to land. Naming
-       a node or walk the model does not chunk fails loading.
-   * - ``batch_builder``
-     - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
-       budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
-       a prompt mid-prefill takes the budget before a newer one, so it finishes first,
-       and prompts short enough for an equal share still go in whole. ``fair_share``
-       splits the budget max-min fair over every waiting prompt, so each advances every
-       step and all finish late together.
-   * - ``min_chunk_tokens``
-     - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
-       in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
-       chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
-       up to a page. See *Chunked prefill budgets* below.
-   * - ``rebuild_host_mb``
-     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
-       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
-       keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
-       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
-   * - ``warmup_requests``
-     - *(optional)* Requests the server runs after the workers are ready and before it
-       binds, so no client pays a shape's first-request cost (torch.compile of a step,
-       a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
-       ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
-       inputs in prompt order (text follows them). A file is a path or
-       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into
-       ``--cache-dir``); its modality comes from the extension, or give
-       ``{path: ..., modality: ...}``.
-       ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
-       long prompts take (a long-context prefill). Each entry is sent as many
-       times at once as the most data-parallel replicas any of the model's worker
-       graphs is served by (the replicas the conductor picks from; a node group no
-       walk places adds none). The conductor's pick (least loaded, ties to the
-       replica picked longest ago) puts a group's copies on every one of its
-       replicas in whatever order they finish, so every replica warms. When some
-       worker graph has fewer replicas than that, such as one DiT instance beside a
-       replicated VAE, the entry first runs once alone, so that graph also warms its
-       one-request shape before the copies reach it together. A malformed or failing warmup
-       is logged and skipped.
-   * - ``dist_timeout_s``
-     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
-       subgroups during weight load and warmup; serving keeps PyTorch's default.
-       Unset keeps PyTorch's default throughout. Raise it only where weight load,
-       JIT or CUDA-graph capture can exceed that default.
-   * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path of every TP, SP and CFG group:
-       ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
-       any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
-       up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
-       The symmetric-memory modes send
-       contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
-       torch symmetric memory: one-shot reads every peer's buffer over NVLink and
-       reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
-       Larger messages stay on NCCL, and so does one-shot inside a
-       ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
-       differs from NCCL's, so bf16 results can differ at the last bit. Falls back
-       to NCCL, with a warning, where the chosen path cannot be set up on every
-       rank of the group.
-   * - ``tp_allreduce_max_kb``
-     - *(optional)* Largest message, in KiB, the non-NCCL path takes;
-       larger ones go to NCCL. It is also the size of the buffer each group
-       rendezvouses. Default 512.
-   * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``
-       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
-       overrides it).
-   * - ``preprocess_workers``
-     - *(optional)* Requests the data worker prepares at once, for a model that
-       declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
-       beside the API server's intra-op threads (``preprocess_torch_threads``),
-       at most 8; ``1`` prepares inline. It must be a positive integer, for any
-       model: the server refuses to start on another value. See :doc:`adding_models`.
-   * - ``knobs``
-     - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
-       ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
-       ``kv_chain_lazy_steps``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_threads``, ``step_thread_core``, ``idle_hold``,
-       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
-       ``step_threads`` takes ``threaded``, the default, or ``serial``, ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
-       ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
-       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
-       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
-       (``MSTAR_DEVICE_LOOPBACK`` and so on; see
-       :doc:`environment_variables`) overrides it when set, and an unknown name
-       fails at startup. For example ``knobs: {kv_chain_lazy_steps: 4,
-       kv_pinned_indptrs: true}``, or ``knobs: {pre_plan: false}``
-       (``whisper_large_v3_turbo.yaml``).
+.. _placement-and-capacity:
 
-Node names are model-specific — they are the node names appearing in the model's graph
-walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
-``snac_decoder``).
+Placement and capacity
+~~~~~~~~~~~~~~~~~~~~~~
 
-**Resource overrides.** A model declares the KV caches, attention backends, positions and
-samplers that its nodes need. Each declaration has a ``resource_key``. A deployment tunes
-them by that name:
+.. _config-model:
 
-.. code-block:: yaml
+``model``
+^^^^^^^^^
+
+Registry key of the model (see `Supported Models <models.html>`__).
+
+.. _config-max-seq-len:
+
+``max_seq_len``
+^^^^^^^^^^^^^^^
+
+Required, but nothing reads it: it neither sizes the KV cache nor caps context. A KV cache's
+length limit is its own ``max_seq_len``, set by the model or under ``resources: <kv>:`` (see
+`resource overrides <#resource-overrides>`__).
+
+.. _config-node-groups:
+
+``node_groups``
+^^^^^^^^^^^^^^^
+
+List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally scoped to
+specific ``graph_walks`` and/or parallelized with ``tp_size``, ``sp_size`` and ``cfg_size``. An
+``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream: true`` runs the
+group's node beside the worker's main chain of steps; see `side
+streams <#a-light-node-beside-a-heavy-one-on-one-worker>`__.
+
+.. _config-rank-devices:
+
+``rank_devices``
+^^^^^^^^^^^^^^^^
+
+Optional mapping of worker rank to device index; CPU deployments ignore it. An omitted rank uses
+its own number as the device index. For example, ``rank_devices: {1: 0}`` puts worker 1 on
+device 0, allowing it to share that GPU with worker 0. See `several workers on one
+GPU <#several-workers-on-one-gpu>`__ for memory sizing and MPS.
+
+.. _config-resources:
+
+``resources``
+^^^^^^^^^^^^^
+
+*(optional)* `Per-resource overrides <#resource-overrides>`__, keyed by the model's resource
+names.
+
+.. _config-max-concurrent-requests:
+
+``max_concurrent_requests``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* How many requests run at once. Requests past the cap wait in the conductor's queue,
+except a live call (open client input), which is refused with a 503.
+
+.. _config-routing-weights:
+
+``routing_weights``
+^^^^^^^^^^^^^^^^^^^
+
+*(optional)* The weights of the `data-parallel replica pick <#data-parallel-routing>`__, one per
+term: ``load`` for the live requests on a replica, and ``prefix`` for the share of the prompt
+predicted in its KV prefix cache. Each is a number from 0 to 1e6; ``load`` defaults to 1.0 and
+``prefix`` to 8.0. Any other key, or ``load: 0`` while another weight is above 0, fails loading.
+``prefix: 0`` picks by load alone, and ``prefix: 1`` or less keeps a hit below one live request,
+so it only breaks ties. At data parallelism, warmup copies run with ``prefix_cache=False``, so
+they still spread but do not warm the prefill that starts from cached pages; a warmup spec that
+sets ``prefix_cache`` keeps its own value.
+
+.. _config-gpu-memory-fraction:
+
+``gpu_memory_fraction``
+^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* The share of its GPU each worker may hold once CUDA-graph capture is done, for
+`workers sharing a GPU <#several-workers-on-one-gpu>`__. Unset, capture plans against whatever
+is free. A node that sets ``capture_cudnn_benchmark`` is held to the share while its captures
+are sized, so its eager step must fit in it.
+
+.. _config-mps:
+
+``mps``
+^^^^^^^
+
+*(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the conductor
+starts in a private directory, so workers that share a GPU overlap their kernels instead of
+time-slicing (the ASR ``*_split`` configs, and the speech ones: ``chatterbox*_split``,
+``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it needs
+``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on shutdown; on Linux
+the daemon also gets SIGTERM if the conductor is killed. Default ``false``.
+
+.. _live-input-settings:
+
+Live input and WebSockets
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. _config-max-call-input-mb:
+
+``max_call_input_mb``
+^^^^^^^^^^^^^^^^^^^^^
+
+*(optional, default 512)* For a model that takes live client input: how many MiB of files (and
+append text) one call may send over its whole life, its opening message's included, and of
+decoded audio samples a route appends (``/v1/realtime``: 4 bytes a sample at the stream's rate,
+server-padded silence included).
+
+A live call's opening message past it is refused, and an append that would pass it ends the call
+with a 400; a one-shot request is not counted.
+
+It caps a call's input, not memory: decoded input is larger than its files, and how much of it
+waits in buffers depends on how fast the model consumes it.
+
+.. _config-client-streams:
+
+``client_streams``
+^^^^^^^^^^^^^^^^^^
+
+*(optional)* For a model that takes live client input: per client stream (by its edge name, e.g.
+``audio_in``), overrides of the limits the model declares on it (``ClientStreamLimits``, see
+`Adding a New Model <adding_models.html>`__). ``max_items``: what the stream may carry over a
+call's life, in the model's units (items, or the frames or samples a model counts per item); a
+call past it ends with a 400.
+
+A deployment may set a bound the model leaves open (``null`` is none) or lower one it declares,
+which is the most the model can take, but not raise or lift it: a model sizes its buffers from
+its own settings (for ``nemotron_duplex``, raise ``max_session_s`` instead). An unknown stream,
+key or value fails loading.
+
+Unlike ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
+
+.. _config-openpi:
+
+``openpi``
+^^^^^^^^^^
+
+*(optional)* For a robot policy, a model that declares ``Model.robot_io`` and
+``Model.load_decoded_image`` (pi0.5 today). Serves openpi's policy WebSocket at ``/`` (see
+`Using a Server <clients.html#openpi-websocket>`__), mapping an openpi observation onto the
+request, as openpi's per-robot input and output transforms do. ``images``: the observation keys
+of the cameras, in slot order. ``state``: the keys whose values are joined, in order, into the
+robot state. ``action_dims``: how many leading action dims a reply keeps (default all).
+``metadata``: the frame sent on connect (default ``{}``). A block the model can't serve (more
+cameras than ``num_cameras``, an unknown key) stops the server at startup.
+
+.. _config-ws-per-message-deflate:
+
+``ws_per_message_deflate``
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional, default true)* Whether the server offers per-message deflate on its WebSocket
+routes; it applies to every route. Deflate shrinks 80 ms speech frames to 49-73% of their size
+as base64 JSON and to 55-90% as binary PCM, and digital silence to 1-2%, but compressing every
+frame costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
+``/generate/ws``, whose configs turn it off.
+
+Turn it off where the server's event loop, not the network, is the bottleneck.
+
+.. _config-ws-max-message-mb:
+
+``ws_max_message_mb``
+^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* The largest WebSocket message the server reads, in MiB, on every WebSocket route;
+by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``.
+
+A larger one closes its socket with ``1009`` before any handler sees it, so the client gets no
+error frame. Raise it for clients that send big uncompressed frames, such as several raw camera
+images in one openpi observation.
+
+.. _scheduling-and-capture:
+
+Scheduling and capture
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. _config-scheduling:
+
+``scheduling``
+^^^^^^^^^^^^^^
+
+*(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in `Adding a
+New Model <adding_models.html>`__). ``policy``: ``priority`` (the default) or ``round_robin``,
+which turns the model's priorities off. ``max_wait``: the most of a worker's chain steps
+(side-lane steps not counted) a ready key may go without running before it goes first, for every
+key its entry leaves unbounded. ``walk_priorities``: a list of entries
+``{node, walk, priority, max_wait}``, each naming a node, a walk or both, which replaces the
+model's list; the most specific entry for a pair decides. An entry naming nothing the model
+runs, a negative priority, a ``max_wait`` under 1, two entries for the same target or an unknown
+field fail loading.
+
+For example
+``scheduling: {walk_priorities: [{walk: talker_prefill, priority: 1}, {node: Talker, walk: talker_decode, max_wait: 4}]}``.
+
+.. _config-speculation-mixes-walks:
+
+``speculation_mixes_walks``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Per node, ``true``/``false`` for every walk of the node's combined walks, or a
+mapping of walk -> ``true``/``false``. On for a walk, a speculation chain on it merges ready
+rows of the other walks of its combined walk, so decode steps take in new prompts, and their
+chunks, as they arrive. Off, a chain keeps to its own walk and yields to the others, and a step
+mixes walks only when the scheduler builds one fresh. Defaults to on where the combined walk has
+a token budget (``max_batch_tokens``), and off where it has none, since a merged prompt then
+runs whole. Naming a node with no combined walk, or a walk outside its combined walks, fails
+loading.
+
+.. _config-max-batch-tokens:
+
+``max_batch_tokens``
+^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Per node, one token budget for every walk the model budgets, or a mapping of walk
+-> budget; null turns a walk's chunking off. Overrides the model's defaults. See `chunked
+prefill budgets <#chunked-prefill-budgets>`__.
+
+.. _config-prefill-token-buckets:
+
+``prefill_token_buckets``
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Per node, a mapping of name -> ladder: the token counts a packed graph capture is
+taken at, in place of the model's. A name is a walk the node runs, for its packed captures on
+that walk (the model's ``capture_token_lengths``; CosyVoice3's ``prefill`` steps replay its
+``prefill_voice`` capture, so name ``prefill_voice``), or the label of one of its piecewise
+packed regions, for that region's ``total_tokens`` (BAGEL's ``vit_block_loop``, OmniVoice's
+``backbone_layers``). A step pads to the smallest rung that holds it, and a longer one runs
+eagerly.
+
+A walk's ladder is a list, or a mapping of min batch size -> list for a ladder per range of
+batch sizes: ``{1: [...], 2: [...]}`` captures one request on the first and every larger batch
+on the second (a larger batch size's ladder must reach at least as far).
+
+A walk's ladder runs to the first rung that holds the most tokens a step its capture replays
+runs: its token budget (``max_batch_tokens``; a walk inside a combined walk runs under the
+combined walk's), or, for a combined walk's steps, past it where the capture's widest batch of
+one-token decode rows leaves a prompt less than ``min_chunk_tokens``, which then still runs that
+many. The rungs past it, which no step would reach, are dropped and logged.
+
+A ladder is kept whole where its steps run under no budget or may hold a prompt of a walk whose
+chunking ``max_batch_tokens`` turned off, which runs whole, as is a region's.
+
+A vision tower's ``vision_block_loop`` and an AuT encoder's ``aut_encode`` (Qwen3-Omni,
+Qwen3-ASR) pack a step up to their ladder's top; every other region keeps its own batch cap. A
+tower's attention resource is sized from the model's own top rung, and a batch with more
+attention segments than it holds is split into its requests, a request still over it running
+eagerly, so a ladder past that rung replays its longer steps only with the resource raised under
+``resources``: ``vision_attn: {max_segments_per_step: N}`` for a vision tower's
+``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N frames or windows a step), and
+``audio_attn: {max_segments_per_request: N}`` for Qwen3-Omni's ``aut_encode`` (N 8 s windows a
+clip).
+
+Each rung adds captures, graph memory and startup time.
+
+Loading fails, before any weights load, if the setting is not a mapping of node -> name ->
+ladder, names a node in no node group or a walk of the model that does not run the node (a node
+runs the walks it is in and its combined walks), a ladder is not a non-empty list of distinct
+positive ints, or a name that is no walk has a mapping.
+
+Warmup fails on a walk whose steps replay another walk's capture, naming that walk, on a walk
+the node captures by batch size alone (a ``decode`` capture), on a walk of a node whose model
+captures no walk at all (a vision tower, an AuT encoder), naming its regions, on a name that is
+neither a walk nor a region of the node or is both (on a node whose model declares no region,
+every name that is no walk), and on a region captured by batch size alone; a walk or region the
+node captures nothing for at this deployment (a model that turns its captures off, such as
+GLM-5.2 with ``dsa_long_context``) is logged and skipped.
+
+Loading also fails where a model refuses a region whose buckets it uses elsewhere: CosyVoice3's
+``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``.
+
+The key replaces ``model_kwargs.prefill_token_buckets``, ``prefill_batched_token_buckets``
+(GLM-5.2), ``backbone_token_buckets`` (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3),
+which fail loading.
+
+.. _config-can-override-mixed-max-tokens:
+
+``can_override_mixed_max_tokens``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget of its own
+under the step's. See `chunked prefill budgets <#chunked-prefill-budgets>`__.
+
+.. _config-speculate-mid-prefill:
+
+``speculate_mid_prefill``
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional, default true)* Per node, ``true``/``false`` for every walk it chunks, or a mapping
+of walk -> ``true``/``false``. On, a prompt mid-prefill takes its next chunk in the step
+speculated during the current one, so a lone long prompt pays no scheduling gap between chunks;
+other ready work still goes first after every prompt step. Off, the next chunk waits for the
+current one to land. Naming a node or walk the model does not chunk fails loading.
+
+.. _config-batch-builder:
+
+``batch_builder``
+^^^^^^^^^^^^^^^^^
+
+*(optional, default* ``fifo`` *)* How the worker composes a step under a token budget
+(``max_batch_tokens``). ``fifo`` serves prompts in the order they started: a prompt mid-prefill
+takes the budget before a newer one, so it finishes first, and prompts short enough for an equal
+share still go in whole. ``fair_share`` splits the budget max-min fair over every waiting
+prompt, so each advances every step and all finish late together.
+
+.. _config-min-chunk-tokens:
+
+``min_chunk_tokens``
+^^^^^^^^^^^^^^^^^^^^
+
+*(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs in a step, or
+the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
+chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds up
+to a page. See `chunked prefill budgets <#chunked-prefill-budgets>`__.
+
+.. _config-tp-async-sched:
+
+``tp_async_sched``
+^^^^^^^^^^^^^^^^^^
+
+*(optional)* Async scheduling for the parallel nodes: ``true`` (default), ``false`` or a list of
+node names (see ``MSTAR_TP_ASYNC_SCHED``, which overrides it).
+
+.. _model-and-host-settings:
+
+Model and host settings
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. _config-model-kwargs:
+
+``model_kwargs``
+^^^^^^^^^^^^^^^^
+
+*(optional)* Server-init model parameters (see below).
+
+.. _config-preprocess-workers:
+
+``preprocess_workers``
+^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Requests the data worker prepares at once, for a model that declares
+``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left beside the API server's intra-op
+threads (``preprocess_torch_threads``), at most 8; ``1`` prepares inline. It must be a positive
+integer, for any model: the server refuses to start on another value. See `Adding a New
+Model <adding_models.html>`__.
+
+.. _config-knobs:
+
+``knobs``
+^^^^^^^^^
+
+*(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
+``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
+``kv_chain_lazy_steps``, ``kv_pinned_indptrs``, ``gc_gen0_threshold``, ``pre_plan``,
+``step_threads``, ``step_thread_core``, ``idle_hold``, ``compile_deterministic`` and
+``resident_planning`` (``true``/``false`` or an integer; ``step_threads`` takes ``threaded``,
+the default, or ``serial``, ``step_thread_core`` takes ``auto``, the default, ``off``,
+``always``, ``siblings`` or a CPU number, ``idle_hold`` ``off``, the default, or ``qos``, see
+`Host idle states <serving.html#host-idle>`__, and ``resident_planning`` ``auto``, the default,
+or ``off``). ``compile_deterministic`` reaches Qwen3.5's text walks and no other model (see
+`Supported Models <models.html>`__).
+
+Each one's environment variable (``MSTAR_DEVICE_LOOPBACK`` and so on; see `Environment
+variables <environment_variables.html>`__) overrides it when set, and an unknown name fails at
+startup. For example ``knobs: {kv_chain_lazy_steps: 4, kv_pinned_indptrs: true}``, or
+``knobs: {pre_plan: false}`` (``whisper_large_v3_turbo.yaml``).
+
+.. _other-settings:
+
+Warmup, distributed execution and host memory
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. _config-rebuild-host-mb:
+
+``rebuild_host_mb``
+^^^^^^^^^^^^^^^^^^^
+
+*(optional, default 64)* MiB of pinned host memory a worker serving a node whose model declares
+a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64), which
+a request dropped from the KV cache is rebuilt from. A request the pool can't hold keeps no ids,
+so it is never dropped on that node, though it can still move to the host with
+``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it keeps no ids and sets
+no memory aside. A non-negative int, and 0 keeps no ids.
+
+.. _config-warmup-requests:
+
+``warmup_requests``
+^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Requests the server runs after the workers are ready and before it binds, so no
+client pays a shape's first-request cost (torch.compile of a step, a cold cache). Each entry is
+a ``/generate`` request in yaml form: ``text``, ``output_modalities``, ``model_kwargs``, and
+``files``, a list of media inputs in prompt order (text follows them). A file is a path or
+``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo, fetched into ``--cache-dir``); its
+modality comes from the extension, or give ``{path: ..., modality: ...}``. ``repeat: N`` sends
+``text`` N times over, a long prompt for a path only long prompts take (a long-context prefill).
+
+Each entry is sent as many times at once as the most data-parallel replicas any of the model's
+worker graphs is served by (the replicas the conductor picks from; a node group no walk places
+adds none). The conductor's pick during these warmups (least loaded, ties to the replica picked
+longest ago) puts a group's copies on every one of its replicas in whatever order they finish,
+so every replica warms.
+
+When some worker graph has fewer replicas than that, such as one DiT instance beside a
+replicated VAE, the entry first runs once alone, so that graph also warms its one-request shape
+before the copies reach it together. A malformed or failing warmup is logged and skipped.
+
+.. _config-dist-timeout-s:
+
+``dist_timeout_s``
+^^^^^^^^^^^^^^^^^^
+
+*(optional)* Timeout in seconds for the NCCL world group and its parallel subgroups during
+weight load and warmup; serving keeps PyTorch's default. Unset keeps PyTorch's default
+throughout. Raise it only where weight load, JIT or CUDA-graph capture can exceed that default.
+
+.. _config-tp-allreduce:
+
+``tp_allreduce``
+^^^^^^^^^^^^^^^^
+
+*(optional)* Small-message all-reduce path of every TP, SP and CFG group: ``nccl`` (default),
+``symm_oneshot``, ``symm_multimem`` or ``flashinfer``; any other value fails at startup.
+``flashinfer`` sends 2-D bf16 CUDA messages up to ``tp_allreduce_max_kb`` through FlashInfer's
+one-kernel all-reduce. The symmetric-memory modes send contiguous bf16 and fp32 CUDA messages up
+to ``tp_allreduce_max_kb`` through torch symmetric memory: one-shot reads every peer's buffer
+over NVLink and reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
+Larger messages stay on NCCL, and so does one-shot inside a ``torch.compile``'d forward. Both
+are CUDA-graph capturable. Reduction order differs from NCCL's, so bf16 results can differ at
+the last bit. Falls back to NCCL, with a warning, where the chosen path cannot be set up on
+every rank of the group.
+
+.. _config-tp-allreduce-max-kb:
+
+``tp_allreduce_max_kb``
+^^^^^^^^^^^^^^^^^^^^^^^
+
+*(optional)* Largest message, in KiB, the non-NCCL path takes; larger ones go to NCCL. It is
+also the size of the buffer each group rendezvouses. Default 512.
+
+.. _resource-overrides:
+
+Resource capacity and overrides
+-------------------------------
+
+A model declares the KV caches, attention backends, positions and samplers that its nodes need.
+Each declaration has a ``resource_key``. A deployment tunes it by that name. This excerpt
+illustrates settings from several models; keep only the resource names and settings your model
+declares:
+
+.. code:: yaml
 
    resources:
      kv_cache:
@@ -520,51 +1002,76 @@ them by that name:
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
-Use one block per resource. A model with two caches, such as Whisper's decoder cache and
-its encoder context, can therefore size each one separately. If a block names a resource
-that the model does not declare, or sets a key that the resource does not accept, loading
-fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
-no longer read. It raises an error with a message describing the migration.
+Use one block per resource. A model with two caches, such as Whisper's decoder cache and its
+encoder context, can therefore size each one separately. If a block names a resource that the
+model does not declare, or sets a key that the resource does not accept, loading fails. A
+misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is no longer read.
+It raises an error with a message describing the migration.
 
-``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
-argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
-whose vocabulary is past 4096 has them by default (see ``SamplerSpec`` in
-:doc:`adding_models`), so a deployment that never samples greedily can save their capture
-memory and time this way.
+.. _greedy-capture:
+
+Greedy capture
+~~~~~~~~~~~~~~
+
+``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's argmax, and
+the engine from capturing a twin of each batched bucket for them. A sampler whose vocabulary is
+past 4096 has them by default (see ``SamplerSpec`` in `Adding a New
+Model <adding_models.html>`__), so a deployment that never samples greedily can save their
+capture memory and time this way.
+
+.. _prefix-reuse:
+
+Prefix reuse and offload
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
-``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
-cached pages. A single request opts out by sending ``prefix_cache=False``, which
-travels with its other ``model_kwargs``. Above one rank the cache stays off unless
-``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
-ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
-cache's nodes must run on one TP group, with no replicas and no walks placed on other
-ranks. Loading fails otherwise. A cache that keeps
-a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
-``prefix_cache`` goes off (logged at info), and a serving config that sets
+``prefix_cache_salt`` keeps two otherwise identical deployments off each other's cached pages. A
+single request opts out by sending ``prefix_cache=False``, which travels with its other
+``model_kwargs``. Above one rank the cache stays off unless ``prefix_cache_tp: true`` is set as
+well: rank 0 then decides each hit and the other ranks adopt it.
+
+``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the cache's nodes must run
+on one TP group, with no replicas and no walks placed on other ranks. Loading fails otherwise.
+
+A cache that keeps a sliding window (``AttentionConfig.sliding_window``) has no prefix cache
+yet: its ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
 
-On a single rank, a request waits at the head of its pool's queue until its prompt fits
-beside the prompts already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that
-can't fit in its pool at its full output length gets a 400 if it asked for that length,
-and otherwise has the model's default length cut until it fits. The pool
-reserves only prompts, so it still has to hold the decode of every request allowed to run
-at once, and a decode step that finds no page outside the admitted prompts holds its
-requests until they time out.
-``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
-frees only the device pages no other running request reads, though, so a request that
-shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is
-copied to the host once no request holds it, and a later request whose prefix the device
-evicted copies it back from there. So the host pool should hold more pages than the device's
-prefix cache.
+.. _resource-admission:
 
-**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
-budget per step, and a longer prompt is split across steps. Each model sets its own
-budgets:
+Admission and concurrency
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On a single rank, the resource pool admits requests in queue order. The request at the head
+waits until its prompt fits beside the admitted prompts; later requests cannot pass it. A
+prefix-cache hit still consumes a page if no running request already holds that page.
+
+A request that can't fit in its pool at its full output length gets a 400 if it asked for that
+length, and otherwise has the model's default length cut until it fits.
+
+Admission reserves prompt pages, not the pages needed for all future output. The pool must also
+hold the decode state of every concurrent request. If decode cannot find a page outside the
+admitted prompts, its requests wait and can time out.
+
+Set ``max_concurrent_requests`` to leave room for output. A safe cap is the pool's page count
+divided by the maximum pages one request needs for its prompt and output together, rounded down.
+
+``cpu_offload_pages`` lets a full pool move a request to the host. An offload frees only the
+device pages no other running request reads, though, so a request that shares most of its prompt
+frees little. Use offload for temporary capacity pressure; keep the concurrency cap to bound the
+total decode state.
+
+With a host pool and the prefix cache on, a cached page is copied to the host once no request
+holds it, and a later request whose prefix the device evicted copies it back from there. So the
+host pool should hold more pages than the device's prefix cache.
+
+.. _chunked-prefill-budgets:
+
+Set chunked prefill budgets
+---------------------------
+
+A walk that supports chunked prefill runs at most its token budget per step, and a longer prompt
+is split across steps. Each model sets its own budgets:
 
 .. list-table::
    :header-rows: 1
@@ -590,27 +1097,26 @@ budgets:
      - ``prefill`` (in ``mixed``)
      - 512
 
-A deployment can override them per node, either with one budget for every walk
-the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
-that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
-budget if that is smaller. When less than that is left of a step's budget, the prompt waits
-for the next step rather than running the step over its budget. Under ``fifo`` the first
-prompt in line, started or not, keeps that much of each step from the other prompts, so a
-stream of short ones cannot hold it off.
+A deployment can override them per node, either with one budget for every walk the model budgets
+or with a budget per walk; null turns a walk's chunking off. A prompt that is cut runs at least
+``min_chunk_tokens`` tokens a step (default 128), or the whole budget if that is smaller. When
+less than that is left of a step's budget, the prompt waits for the next step rather than
+running the step over its budget. Under ``fifo`` the first prompt in line, started or not, keeps
+that much of each step from the other prompts, so a stream of short ones cannot hold it off.
 
 A node whose resources keep state only on a grid of tokens counted from where a chunk starts
-(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each
-chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
-default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
-up to a page, a budget under a page fails loading, and one under three pages logs a warning:
-a step can then leave up to a page, less one token, of its budget unused.
+(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each chunk
+starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by default),
+since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds up to a page,
+a budget under a page fails loading, and one under three pages logs a warning: a step can then
+leave up to a page, less one token, of its budget unused.
 
-Most chunked walks run inside a combined walk, which batches a node's prompts and its
-decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
-BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
-walk's budget, so that is the one to set, by naming the node or the combined walk:
+Most chunked walks run inside a combined walk, which batches a node's prompts and its decode
+rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for BAGEL's,
+``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined walk's budget,
+so that is the one to set, by naming the node or the combined walk:
 
-.. code-block:: yaml
+.. code:: yaml
 
    max_batch_tokens:
      LLM: 512                    # every budgeted walk of LLM, its combined walk's too
@@ -618,11 +1124,10 @@ walk's budget, so that is the one to set, by naming the node or the combined wal
        thinker_mixed: 1024       # the budget of a Thinker step
 
 A walk inside a combined walk takes a budget of its own only on a node listed in
-``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps
-that walk's rows within each step, under the step's budget, and null keeps its prompts
-whole:
+``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps that
+walk's rows within each step, under the step's budget, and null keeps its prompts whole:
 
-.. code-block:: yaml
+.. code:: yaml
 
    can_override_mixed_max_tokens: {Thinker: true}
    max_batch_tokens:
@@ -630,213 +1135,66 @@ whole:
        prefill_vision: 512       # vision rows take at most 512 of a step's tokens
        prefill_audio: null       # audio prompts run whole
 
-Loading fails if a node is not in any node group, if a walk is one the model never runs, if
-the model sets no budget for that walk, or if the walk is inside a combined walk and its
-node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
+Loading fails if a node is not in any node group, if a walk is one the model never runs, if the
+model sets no budget for that walk, or if the walk is inside a combined walk and its node does
+not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
 
-Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
-ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
-degree above one runs its prefills whole, whatever the model and these budgets say, and
-logs a warning at load.
+Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same ones.
+Chunked prefill is not supported under sequence parallelism yet: a node with an SP degree above
+one runs its prefills whole, whatever the model and these budgets say, and logs a warning at
+load.
 
-**Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
-(``cfg_size * sp_size * tp_size`` ranks each, or one rank) runs each request on one of them, its
-replica. The conductor picks it per request, at ingest, as the replica with the lowest
-cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
-groups that pick together, for each request with a partition on them that is not done at
-ingest), plus the price of what the conductor predicts about the request there. Ties go
-to the replica picked longest ago, so requests that never overlap still take turns. Every
-term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
-replica, take one pick together.
+.. _data-parallel-routing:
 
-Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
-KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``
-times minus the share of the request's prompt positions (every label's, keyed or not)
-the replica's caches are predicted to hold, all the caches on the replica together. At
-the default weights a prompt held whole is worth up to 8 live requests: a request
-follows its prefix to a busier replica, and a hot prefix spreads once its replica runs
-about 8 times its hit share more requests than another. The term is a share rather than
-a token count so that one weight fits models whose prefill and decode costs differ.
+Route requests across replicas
+------------------------------
+
+A node group whose ``ranks`` hold several lockstep instances (``cfg_size * sp_size * tp_size``
+ranks each, or one rank) runs each request on one of them, its replica. The conductor picks it
+per request, at ingest, as the replica with the lowest cost: ``routing_weights.load`` times the
+live requests on the replica (counted per set of groups that pick together, for each request
+with a partition on them that is not done at ingest), plus the price of what the conductor
+predicts about the request there. Ties go to the replica picked longest ago, so requests that
+never overlap still take turns. Every term is in request-equivalents. Groups whose replicas sit
+on the same ranks, replica for replica, take one pick together.
+
+Today the one prediction is the KV prefix cache's, on the replicas that run any walk a KV label
+keys the cache on (``kv_labels``): ``routing_weights.prefix`` times minus the share of the
+request's prompt positions (every label's, keyed or not) the replica's caches are predicted to
+hold, all the caches on the replica together. At the default weights a prompt held whole is
+worth up to 8 live requests: a request follows its prefix to a busier replica, and a hot prefix
+spreads once its replica runs about 8 times its hit share more requests than another. The term
+is a share rather than a token count so that one weight fits models whose prefill and decode
+costs differ.
 
 The prediction runs the worker's own prefix index and page ownership (``PrefixIndex``,
-``PageArena``) per replica, with no storage, and takes a request's steps at dispatch: its
-lease of the matched pages, its own pages, evicting on a shortfall, the index entries of
-its whole pages, and the page of an image or other item that ends inside one, cached up
-to the item's end. Its end releases its pages; a request that ends before a pass of it
-comes back (aborted while queued, say) also takes back the entries only it made. Workers send
-nothing for it, so it does not see admit timing, decode growth, preemption or a reply's
-tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
-With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it,
-replicas above one rank, where the cache stays off: ``prefix_cache_tp`` on a pool with
-replicas fails at startup, or a keyed node whose recurrent state pool keeps no snapshots,
-``prefix_slots: 0``) the pick is the replica with the fewest live requests.
+``PageArena``) per replica, with no storage, and takes a request's steps at dispatch: its lease
+of the matched pages, its own pages, evicting on a shortfall, the index entries of its whole
+pages, and the page of an image or other item that ends inside one, cached up to the item's end.
+Its end releases its pages; a request that ends before a pass of it comes back (aborted while
+queued, say) also takes back the entries only it made.
 
-**Single GPU.** Everything on rank 0:
+Workers send nothing for it, so it does not see admit timing, decode growth, preemption or a
+reply's tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
 
-.. code-block:: yaml
+With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it, replicas
+above one rank, where the cache stays off: ``prefix_cache_tp`` on a pool with replicas fails at
+startup, or a keyed node whose recurrent state pool keeps no snapshots, ``prefix_slots: 0``) the
+pick is the replica with the fewest live requests.
 
-   model: "bagel"
-   max_seq_len: 32768
-   node_groups:
-     - {node_names: [vit_encoder], ranks: [0]}
-     - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
-     - {node_names: [LLM], ranks: [0]}
+.. _model-kwargs:
 
-**Several workers on one GPU.** A worker is one process per rank, and by default rank
-``n`` runs on device ``n``. ``rank_devices`` maps ranks onto devices explicitly, so two
-node groups can run as separate workers on the same GPU: a heavy autoregressive node then
-never waits for a light node's steps on its worker loop (a TTS talker and its codec):
+Set model parameters at startup
+-------------------------------
 
-.. code-block:: yaml
-
-   node_groups:
-     - {node_names: [Talker], ranks: [0]}
-     - {node_names: [Codec], ranks: [1]}
-   rank_devices: {1: 0}
-
-At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws
-away, then captures the cheapest buckets across all of them while its largest eager step
-still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
-other's memory only as used, so the first to capture can take the other's room. Set
-``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
-counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
-
-Workers that share a GPU time-slice it by default: one process's kernels wait for the
-other's. ``mps: true`` makes the conductor start a CUDA MPS control daemon of its own
-before it spawns the workers, run every worker as its client so their kernels overlap,
-and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
-processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
-driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
-
-**A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
-group runs that node's steps on a lane of their own instead of the worker's main chain:
-they take no turn on it, run on a second CUDA stream beside its steps, and whatever
-comes ready meanwhile batches into the next one. It applies to the walks the node's
-submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
-``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
-worker and one CUDA context, unlike a split with MPS. Startup fails with a
-``ValueError`` naming the field where the lane can't apply: a TP, SP or CFG node, a node
-alone on its worker, a device without streams, a node that also runs walks on the
-chain or holds resources, or a side walk that isn't the node's alone, is part of a
-combined walk, or has output spans or a stop check. Without the field the node runs on
-the chain:
-
-.. code-block:: yaml
-
-   node_groups:
-     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
-     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
-
-**Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
-prefill, decode, and image generation on three GPUs:
-
-.. code-block:: yaml
-
-   node_groups:
-     - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
-     - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
-     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
-
-Because placement is config-only, the *same* model code runs single-GPU or fully
-disaggregated. ``configs/`` ships several layouts per model (``*_single_gpu``,
-``*_colocated``, ``*_pd_disaggregated``, ``*_cfg_parallel``, …).
-
-**Tensor parallelism.** Shard a node across GPUs with ``tp_size`` and that many ``ranks``:
-
-.. code-block:: yaml
-
-   model: "orpheus"
-   max_seq_len: 131072
-   node_groups:
-     - {node_names: [LLM], ranks: [0, 1], tp_size: 2, graph_walks: [prefill, decode]}
-     - {node_names: [snac_decoder], ranks: [0], graph_walks: [snac_chunk]}
-
-A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1``; the
-weight loaders then shard parameters automatically, with no model-code changes. See
-:ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
-details.
-
-**Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
-that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
-classifier-free-guidance branches, each rank running its share of them and the noise
-predictions gathered every step. Each needs the model to declare the node SP- or
-CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
-The axes compose: a group's ``ranks`` form lockstep instances of
-``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
-each instance's ranks listed in ascending order, and the conductor routes each request to
-one whole instance:
-
-.. code-block:: yaml
-
-   model: "wan22"
-   max_seq_len: 512
-   node_groups:
-     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
-     # one guidance branch per pair of ranks, each branch's tokens split over its pair
-     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
-
-Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same
-groups on every axis, each declared parallel on those axes by the model. The ranks then run
-every node's steps in one order. The conductor refuses lockstep nodes on one worker in
-different groups, and two lockstep nodes on one worker that share a paged KV cache:
-rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
-per node, riding on one node's next step, so two nodes on one pool could admit out of step on
-a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
-different workers.
-
-**Expert parallelism.** By default a TP group shards every MoE expert along its
-intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
-whole experts. Attention and dense MLPs stay TP-sharded:
-
-.. code-block:: yaml
-
-   model: "qwen3_omni"
-   max_seq_len: 32768
-   node_groups:
-     - node_names: [Thinker]
-       ranks: [0, 1]
-       tp_size: 2
-       ep_config:
-         parallel: ep          # each rank holds 64 of the 128 experts at full width
-     - {node_names: [audio_encoder, vision_encoder], ranks: [0]}
-     - {node_names: [Talker], ranks: [2]}
-     - {node_names: [Code2Wav], ranks: [2]}
-
-.. list-table::
-   :header-rows: 1
-
-   * - ``ep_config`` key
-     - Meaning
-   * - ``parallel``
-     - ``tp`` (default) or ``ep``.
-   * - ``ep_group``
-     - The ranks EP spans. Only ``tp``, the group's TP ranks, exists today.
-   * - ``debug_check_routing``
-     - Device-assert that every rank routes each token to the same experts. Costs one
-       all-gather per MoE layer; off by default. Needs ``parallel: ep``.
-   * - ``log_expert_load_every``
-     - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off.
-       Needs ``parallel: ep``.
-   * - ``mask_padding``
-     - Skip CUDA-graph padding rows in the routed experts, TP or EP. Off by default;
-       it gave no throughput gain on Qwen3-Omni at 8 GPUs.
-
-The number of experts must divide evenly by the group size. A node must be declared
-EP-enabled by the model; an ``ep_config`` on any other node, an unknown key, or two
-per-walk groups giving one node different ``ep_config`` blocks fails at start-up. See
-``configs/qwen3omni_thinker_ep2.yaml``.
-
-model_kwargs
-------------
-
-``model_kwargs`` are model parameters fixed at server start (not per request) — they are
-baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune (whose
-``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
+``model_kwargs`` are model parameters fixed at server start (not per request) — they are baked
+into the model's config dataclass and into CUDA-graph captures. The following excerpt uses
+placeholders for the normalization arrays; use the full ``configs/pi05_droid.yaml`` when
+launching. The Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune
+(whose ``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
 DROID robot's normalization stats:
 
-.. code-block:: yaml
+.. code:: yaml
 
    model: "pi05"
    max_seq_len: 2048
@@ -850,35 +1208,71 @@ DROID robot's normalization stats:
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
 
-With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
-actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
-of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
-[-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
-``max_state_dim``, 32 when it sets none); anything else is a 400.
+With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns actions
+in robot units, as openpi's policy server does. ``norm_stats`` can also be the path of an openpi
+``norm_stats.json``. Without it, ``robot_state`` must already be normalized to [-1, 1]. Either
+way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's ``max_state_dim``, 32
+when it sets none); anything else is a 400.
 
-Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
-sampling knob means.
-Give each request its own ``seed`` for independent
-samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
-with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
-most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
-with none of ``min_p``, the windowed penalty, ``min_tokens``, ``top_p_first`` or processed
-log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
-text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
-reads the first row's seed for the whole batch and folds each row's batch position into
-its random stream, so there the same seed and settings sample the same tokens only in the
-same batch, such as a request sent alone.
+Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the client
+instead — see `Using a Server <clients.html>`__, and `Generation
+parameters <clients.html#generation-parameters>`__ for what each sampling knob means.
+
+.. _seed-behavior:
+
+Seed behavior
+~~~~~~~~~~~~~
+
+Give each request its own ``seed`` for independent samples.
+
+A seed fixes a request's tokens whatever it is batched with only where M\* draws with one kernel
+that reads each row's own seed: on CUDA, a sampler whose vocabulary is at most 4,096 tokens (the
+talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni), with none of ``min_p``, the
+windowed penalty, ``min_tokens``, ``top_p_first`` or processed log-probs enabled on its node, on
+eager and captured steps alike.
+
+Every other sampler (every text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through
+FlashInfer, which reads the first row's seed for the whole batch and folds each row's batch
+position into its random stream, so there the same seed and settings sample the same tokens only
+in the same batch, such as a request sent alone.
+
+.. _compile-levels:
+
+Compile levels
+--------------
+
+Use ``-O`` to select startup tuning for captured forwards:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Level
+     - Compile behavior
+   * - ``-O0``
+     - ``torch.compile`` default mode, with no tuning.
+   * - ``-O1`` (default)
+     - Coordinate descent tuning for decode GEMM/epilogue fusion.
+   * - ``-O2``
+     - Full max-autotune, adding the GEMM template search.
+
+The Qwen3.5-0.8B measurement on an H200 with an empty cache took 170 s, 320 s and 1,294
+s to start at ``-O0``, ``-O1`` and ``-O2``, respectively, at the same throughput. The choice is
+workload-dependent: Qwen3-TTS was 25–30% slower at ``-O0`` at concurrency 1. Use ``-O2`` for
+numbers quoted against other engines.
+
+Compiles initiated by a model itself, such as a diffusion VAE decode, keep their own mode.
+
+.. _restarts-and-the-compile-cache:
 
 Restarts and the compile cache
 ------------------------------
 
-On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
-``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
-start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
-empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's
-compile and tuning. torch's default cache in ``/tmp`` already survives a process restart on
-the same host; M*'s default keeps it across a new container or a reboot that clears ``/tmp``.
+On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and ``-O2``), and
+FlashInfer JIT-builds its kernels. Both cache the results, and a start that finds them skips
+that work. Qwen3.5-0.8B on an H200 took 320 s to start with an empty cache at the default
+``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's compile and tuning. torch's default
+cache in ``/tmp`` already survives a process restart on the same host; M\*'s default keeps it
+across a new container or a reboot that clears ``/tmp``.
 
 To keep it, persist these (all under ``~/.cache`` by default):
 
@@ -889,52 +1283,53 @@ To keep it, persist these (all under ``~/.cache`` by default):
   default home, not ``$XDG_CACHE_HOME``)
 - ``$HF_HOME``: the weights (``$XDG_CACHE_HOME/huggingface`` by default)
 
-``$XDG_CACHE_HOME`` defaults to ``~/.cache``. M* sets both variables unless you export them,
+``$XDG_CACHE_HOME`` defaults to ``~/.cache``. M\* sets both variables unless you export them,
 and ``TRITON_CACHE_DIR`` follows an exported ``TORCHINDUCTOR_CACHE_DIR``.
 
 In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
-Inductor keys compiled graphs and ``-O1``'s picks on the torch build. On CUDA and ROCm,
-compiled graphs (and ``-O2``'s GEMM timings) also key on the Triton build, the device (its
-name on CUDA, its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those.
-``-O1``'s picks key on the kernel source, which names the compute capability and SM count but
-not the GPU model, so give each GPU model (or each ROCm card sharing an arch) its own cache
-if one home serves several. Neither key covers the ``ptxas`` that built a kernel or the driver: after changing
-either, delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
+
+Inductor keys compiled graphs and ``-O1``'s picks on the torch build. On CUDA and ROCm, compiled
+graphs (and ``-O2``'s GEMM timings) also key on the Triton build, the device (its name on CUDA,
+its gfx arch on ROCm) and the CUDA or HIP version; on XPU, on none of those. ``-O1``'s picks key
+on the kernel source, which names the compute capability and SM count but not the GPU model, so
+give each GPU model (or each ROCm card sharing an arch) its own cache if one home serves
+several.
+
+Neither key covers the ``ptxas`` that built a kernel or the driver: after changing either,
+delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
 
 The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
 upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
-concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
-path and copy a warm cache in at job start.
+concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local path
+and copy a warm cache in at job start.
 
 .. _host-idle:
 
 Host idle states
 ----------------
 
-A decode step hands work between a worker's main, GPU and plan threads several
-times, and every step's tokens go from the API server's message thread to the
-frontend. On a host whose idle cores drop into deep C-states each handoff to a
-sleeping core waits for it to wake, and a core that sleeps between handoffs stays
-at a low clock under the ``powersave`` governor, so a small model's step is mostly
-host time spent waking CPUs. Two knobs deal with it:
+A decode step hands work between a worker's main, GPU and plan threads several times, and every
+step's tokens go from the API server's message thread to the frontend. On a host whose idle
+cores drop into deep C-states each handoff to a sleeping core waits for it to wake, and a core
+that sleeps between handoffs stays at a low clock under the ``powersave`` governor, so a small
+model's step is mostly host time spent waking CPUs. Two knobs deal with it:
 
-- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
-  one hardware thread of each, and the API server a core of its own. ``siblings``
-  puts a worker's three threads on one core's hardware threads (two cores of an L2
-  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
-  and logs one line saying why for this host, since neither layout has beaten no pin
-  on every host it was measured on (table below). ``off`` never pins, a number names
-  the first worker's core. Under a job's mask too small for every GPU the container
-  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
-  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores, one
+  hardware thread of each, and the API server a core of its own. ``siblings`` puts a worker's
+  three threads on one core's hardware threads (two cores of an L2 cluster where there is no
+  SMT), which keeps that core awake. ``auto`` pins nothing and logs one line saying why for this
+  host, since neither layout has beaten no pin on every host it was measured on (table below).
+  ``off`` never pins, a number names the first worker's core. Under a job's mask too small for
+  every GPU the container can open (8 cores on a node of four GPUs), ``always`` and ``siblings``
+  size by the GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
   on different cores.
-- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
-  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
-  containers hide, and it logs what it got.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states through
+  ``/dev/cpu_dma_latency`` for the server's life. It needs a device most containers hide, and it
+  logs what it got.
 
-Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
-to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:
+Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset`` to 8
+cores (with their siblings where the CPU has SMT), medians over server sessions:
 
 .. list-table::
    :header-rows: 1
@@ -966,16 +1361,16 @@ to 8 cores (with their siblings where the CPU has SMT), medians over server sess
      - not measured
 
 The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
-``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
-With the cores held awake, ``siblings`` loses to no pin and three separate cores are
-level with it, so ``auto`` names the hold first when it is set.
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured. With the
+cores held awake, ``siblings`` loses to no pin and three separate cores are level with it, so
+``auto`` names the hold first when it is set.
 
-Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
-at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
-at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
-leave it ``off``.
+Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token at high
+concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein at c=1 lost about
+12% there (c=8 level). A low-duty model with eager host work can leave it ``off``.
 
-Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
+Details are in `Environment variables <environment_variables.html>`__ under
+``MSTAR_STEP_THREAD_CORE``.
 
 .. _tensor-transport:
 
@@ -986,18 +1381,17 @@ Workers route tensors directly to one another using one of three transports, sel
 ``--tensor-comm-protocol``:
 
 - ``SHM`` — shared memory; the safe default for single-node deployments.
-- ``TCP`` — works anywhere; used for some multi-node setups.
-- ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
-  (requires RDMA-capable networking).
+- ``TCP`` — network transfer through Mooncake's TCP transport.
+- ``RDMA`` — network transfer through Mooncake's RDMA transport; requires RDMA-capable
+  networking.
 
-``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers.
-Each worker's engine picks its handshake and data ports at startup, so restrict by host: only
-the deployment's own hosts should reach the workers. The model extras require
-``mooncake-transfer-engine`` 0.3.13.post1
-or newer: earlier than 0.3.12.post1, any host that reaches the TCP data port can read or
-write the worker's memory (CVE-2026-103764), and a worker warns at startup if it finds such a
-version. Two denial-of-service issues on the handshake port (CVE-2026-103760 and
-CVE-2026-103761) are still open in 0.3.13.post1.
+``TCP`` and ``RDMA`` run Mooncake's transfer engine, which does not authenticate its peers. Each
+worker's engine picks its handshake and data ports at startup, so restrict by host: only the
+deployment's own hosts should reach the workers. The model extras require
+``mooncake-transfer-engine`` 0.3.13.post1 or newer: earlier than 0.3.12.post1, any host that
+reaches the TCP data port can read or write the worker's memory (CVE-2026-103764), and a worker
+warns at startup if it finds such a version. Two denial-of-service issues on the handshake port
+(CVE-2026-103760 and CVE-2026-103761) are still open in 0.3.13.post1.
 
 .. _request-profiling:
 
@@ -1005,17 +1399,17 @@ Request profiling
 -----------------
 
 Pass ``--log-stats`` (to either ``mstar serve`` or ``mstar-serve``) to print a per-request
-profile when each request finishes. Add ``--log-stats-file <path>`` to append the profiles
-to a file instead of stdout (it implies ``--log-stats``):
+profile when each request finishes. Add ``--log-stats-file <path>`` to append the profiles to a
+file instead of stdout (it implies ``--log-stats``):
 
-.. code-block:: bash
+.. code:: bash
 
    mstar serve bagel --log-stats
    mstar-serve --config configs/orpheus_colocated.yaml --log-stats-file stats.txt
 
 The report has four sections (any that has no data is omitted):
 
-.. code-block:: text
+.. code:: text
 
    ============================================================
     Request profile: 3f9c1e2a-…
@@ -1052,253 +1446,277 @@ The report has four sections (any that has no data is omitted):
           hidden                  106.7 MiB       0.90 ms  (x49)
    ============================================================
 
-**Inputs / Outputs** — per-modality count and byte size. Inputs are the *raw*
-client-supplied bytes (uploaded file sizes on disk, UTF-8 length of the prompt), not the
-much larger decoded tensors, so they line up with what was sent over the wire.
+**Inputs / Outputs** — per-modality count and byte size. Inputs are the *raw* client-supplied
+bytes (uploaded file sizes on disk, UTF-8 length of the prompt), not the much larger decoded
+tensors, so they line up with what was sent over the wire.
 
 **Timeline** — wall-clock stage boundaries for the request as it flows
-``api server → conductor → workers → api server``. Stages are ordered by their actual
-timestamp, so a stage is never negative even when two checkpoints race (e.g. the API
-server's ``last chunk`` and the conductor's ``done`` can arrive in either order). All
-timestamps are ``time.perf_counter()``; they are comparable across the api-server,
-conductor, and worker processes because those run on the **same host** (``perf_counter`` is
-``CLOCK_MONOTONIC``, which is boot-relative and shared).
-This implementation will be updated when multi-node support is added.
+``api server → conductor → workers → api server``. Stages are ordered by their actual timestamp,
+so a stage is never negative even when two checkpoints race (e.g. the API server's
+``last chunk`` and the conductor's ``done`` can arrive in either order). All timestamps are
+``time.perf_counter()``; they are comparable across the api-server, conductor, and worker
+processes because those run on the **same host** (``perf_counter`` is ``CLOCK_MONOTONIC``, which
+is boot-relative and shared). This implementation will be updated when multi-node support is
+added.
 
-**Graph timings** — CPU time per ``(node, graph_walk)``, accumulated over the request.
-Each cell shows the **total over the request** and, in parentheses, the **average per
-execution** (``n`` is the execution count, so e.g. one entry covers all ``588`` decode
-steps). The columns:
+**Graph timings** — CPU time per ``(node, graph_walk)``, accumulated over the request. Each cell
+shows the **total over the request** and, in parentheses, the **average per execution** (``n``
+is the execution count, so e.g. one entry covers all ``588`` decode steps). The columns:
 
 - ``all`` — the full node execution (= ``pre`` + ``fwd`` + ``post``).
-- ``fwd`` — the GPU forward region. Because execution is asynchronous and *not* synced
-  (a sync would serialize the pipeline), this measures the CPU launch/enqueue span of the
-  whole batch, not per-request GPU time.
+- ``fwd`` — the GPU forward region. Because execution is asynchronous and *not* synced (a sync
+  would serialize the pipeline), this measures the CPU launch/enqueue span of the whole batch,
+  not per-request GPU time.
 - ``pre`` — input preparation / preprocessing before the launch.
-- ``post`` — CPU postprocess after the forward. Marked ``post*`` because under
-  speculative scheduling it can overlap the next step's forward or another in-flight
-  batch, so it is **not necessarily additive**.
+- ``post`` — CPU postprocess after the forward. Marked ``post*`` because under speculative
+  scheduling it can overlap the next step's forward or another in-flight batch, so it is **not
+  necessarily additive**.
 
 **Tensor transfer** — bytes moved between entities via the tensor transport
-(:ref:`above <tensor-transport>`). ``rx`` (received) is grouped by ``source → dest``; ``tx``
-(sent) is grouped by source only — the sender registers/writes data without knowing a
+(`above <serving.html#tensor-transport>`__). ``rx`` (received) is grouped by ``source → dest``;
+``tx`` (sent) is grouped by source only — the sender registers/writes data without knowing a
 priori which worker will read it (and may register data that is never sent), so there is no
-per-destination breakdown. ``size`` is total bytes, the time is transport cost (the
-RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-write time on
-``tx``), and ``count`` is the number of tensors.
+per-destination breakdown. ``size`` is total bytes, the time is transport cost (the RDMA-read or
+SHM file-read time on ``rx``; the registration / serialize-and-write time on ``tx``), and
+``count`` is the number of tensors.
 
 .. note::
 
-   Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
-   conductor, and data worker skip the timing/transfer bookkeeping entirely.
-
+   Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers, conductor, and
+   data worker skip the timing/transfer bookkeeping entirely.
 .. _serving-metrics:
 
 Metrics
 -------
 
-Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve
-Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
-(``pip install 'mstar[metrics]'``); without it the server stops at startup with that
-hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
-API key even when one is set, the usual convention for scrape endpoints. It exposes
-request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. With
-``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
-it over the bridge, so both frontends show the same names, and it answers ``503`` if the
-bridge does not reply within two seconds, as ``/health`` does.
+With the model and ``metrics`` extra installed, start the server with metrics enabled. For
+example, run these commands in separate terminals for Kokoro:
 
-:doc:`metrics` documents every family in one place, with a Prometheus and Grafana setup.
+.. code:: bash
 
-Requests are counted when they leave the API server, from the first request after the
-warmup requests. Every family has a ``model_name`` label (the config's ``model``);
-``output_modalities`` is the request's output modalities, sorted and comma-joined
-(e.g. ``audio,text``).
+   mstar serve kokoro --enable-metrics
+   curl -s localhost:8000/metrics | grep '^mstar_'
 
-- ``mstar_requests_total{model_name, output_modalities, outcome}``: counter.
-  ``outcome`` is ``success`` (the result went to the HTTP layer), ``error`` (the
-  request failed in the engine, preprocessing or result delivery), ``abort`` (the client
-  went away, or its finished result was dropped unread) or ``timeout`` (``--timeout``
-  expired). Requests refused before they were submitted (a 400 for a bad form, a 409
-  for a ``request_id`` in flight) are not counted here but in
-  ``mstar_http_refusals_total``.
-- ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds
-  (submitted and not yet returned, failed or aborted).
+The scrape should contain ``mstar_`` metric families.
+
+Pass ``--enable-metrics`` (to either ``mstar serve`` or ``mstar-serve``) to serve Prometheus
+metrics at ``GET /metrics``. It needs the ``metrics`` extra (``pip install 'mstar[metrics]'``);
+without it the server stops at startup with that hint. Off by default, and ``/metrics`` answers
+404 then. Like ``/health``, it needs no API key even when one is set, the usual convention for
+scrape endpoints. It exposes request counts, latencies and the model name (never prompts or
+outputs); if that matters for a deployment, keep the port on an internal network.
+
+With ``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for it
+over the bridge, so both frontends show the same names, and it answers ``503`` if the bridge
+does not reply within two seconds, as ``/health`` does.
+
+`Metrics reference <metrics.html>`__ documents every family in one place, with a Prometheus and
+Grafana setup.
+
+.. _request-metrics:
+
+Request outcomes and latency
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Requests are counted when they leave the API server, from the first request after the warmup
+requests. Every family has a ``model_name`` label (the config's ``model``);
+``output_modalities`` is the request's output modalities, sorted and comma-joined (e.g.
+``audio,text``).
+
+- ``mstar_requests_total{model_name, output_modalities, outcome}``: counter. ``outcome`` is
+  ``success`` (the result went to the HTTP layer), ``error`` (the request failed in the engine,
+  preprocessing or result delivery), ``abort`` (the client went away, or its finished result was
+  dropped unread) or ``timeout`` (``--timeout`` expired). Requests refused before they were
+  submitted (a 400 for a bad form, a 409 for a ``request_id`` in flight) are not counted here
+  but in ``mstar_http_refusals_total``.
+- ``mstar_requests_in_flight{model_name}``: gauge, requests the API server holds (submitted and
+  not yet returned, failed or aborted).
 - ``mstar_e2e_request_latency_seconds{model_name, output_modalities}``: histogram over
-  successful requests, from submission (after the request body was read) to the result
-  leaving the API server.
+  successful requests, from submission (after the request body was read) to the result leaving
+  the API server.
 - ``mstar_time_to_first_output_seconds{model_name, output_modalities}``: histogram over
-  successful requests, from submission to the first result chunk of any modality
-  reaching the API server. It is measured on the server, so it does not include the
-  network to the client, and a non-streaming client sees nothing until the end.
-- ``mstar_http_refusals_total{model_name, route, status}``: counter, HTTP requests the
-  frontend answered with a 4xx status without submitting them to the API server: ``401``
-  (missing or wrong API key), ``413`` (body over ``MSTAR_MAX_BODY_MB``), ``422`` (body
-  that fails validation), ``400`` (a bad form field or request), ``409`` (a
-  ``request_id`` in flight), ``404`` (unknown route, or a model without the endpoint),
-  ``405`` (wrong method), plus ``503`` when the Rust frontend's
-  ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
-  path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
-  A request that was submitted and then failed counts once, as an ``error`` in
-  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
-  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
-  ``/metrics`` request, so the API server exports them under the same name.
-- ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
-  successful requests, from the conductor taking the request in to admitting it for
-  dispatch. Zero unless the request queued at ``max_concurrent_requests``.
+  successful requests, from submission to the first result chunk of any modality reaching the
+  API server. It is measured on the server, so it does not include the network to the client,
+  and a non-streaming client sees nothing until the end.
+- ``mstar_http_refusals_total{model_name, route, status}``: counter, HTTP requests the frontend
+  answered with a 4xx status without submitting them to the API server: ``401`` (missing or
+  wrong API key), ``413`` (body over ``MSTAR_MAX_BODY_MB``), ``422`` (body that fails
+  validation), ``400`` (a bad form field or request), ``409`` (a ``request_id`` in flight),
+  ``404`` (unknown route, or a model without the endpoint), ``405`` (wrong method), plus ``503``
+  when the Rust frontend's ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route``
+  is the route's path as declared (``/v1/chat/completions``), ``unmatched`` when no route
+  matches. A request that was submitted and then failed counts once, as an ``error`` in
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted.
 
-While metrics are on, the conductor sends the API server a status message every second
-(nothing when they are off). These gauges show its latest one, so they can be up to a
-second old:
+With ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+``/metrics`` request, so the API server exports them under the same name. -
+``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over successful
+requests, from the conductor taking the request in to admitting it for dispatch. Zero unless the
+request queued at ``max_concurrent_requests``.
 
-- ``mstar_conductor_requests{model_name, state}``: requests the conductor holds.
-  ``state`` is ``waiting`` (queued at ``max_concurrent_requests``, not dispatched yet),
-  ``running`` (dispatched to workers, not finished) or ``draining`` (completed, aborted
-  or failed, and waiting for every reader to release its outputs before the workers free
-  its state; it still counts toward ``max_concurrent_requests``).
-- ``mstar_component_in_flight{model_name, component}``: per graph node (the
-  ``node_names`` of the config's ``node_groups``), running requests with a pass on that
-  node that the conductor dispatched and has not heard back from. The conductor sees
-  whole passes, so a node running a request's decode loop counts it once for the loop.
+.. _conductor-metrics:
+
+Conductor status
+~~~~~~~~~~~~~~~~
+
+While metrics are on, the conductor sends the API server a status message every second (nothing
+when they are off). These gauges show its latest one, so they can be up to a second old:
+
+- ``mstar_conductor_requests{model_name, state}``: requests the conductor holds. ``state`` is
+  ``waiting`` (queued at ``max_concurrent_requests``, not dispatched yet), ``running``
+  (dispatched to workers, not finished) or ``draining`` (completed, aborted or failed, and
+  waiting for every reader to release its outputs before the workers free its state; it still
+  counts toward ``max_concurrent_requests``).
+- ``mstar_component_in_flight{model_name, component}``: per graph node (the ``node_names`` of
+  the config's ``node_groups``), running requests with a pass on that node that the conductor
+  dispatched and has not heard back from. The conductor sees whole passes, so a node running a
+  request's decode loop counts it once for the loop.
 - ``mstar_routing_predicted_saving_total{model_name, term}``: counter, per term of the
-  data-parallel replica cost, the saving predicted on the replica each request went to,
-  in request-equivalents. For ``prefix``, each request adds the share of its prompt
-  predicted cached there.
-- ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server
-  received the last status message, or since metrics were enabled before the first one.
-  More than a few seconds means the conductor stopped reporting.
+  data-parallel replica cost, the saving predicted on the replica each request went to, in
+  request-equivalents. For ``prefix``, each request adds the share of its prompt predicted
+  cached there.
+- ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server received the
+  last status message, or since metrics were enabled before the first one. More than a few
+  seconds means the conductor stopped reporting.
 
-The engine workers also send the conductor their own metrics every second, which it
-adds to its status message, so these can be up to two seconds old. ``component`` is the
-graph node; a node with replicas on several workers shows their sum, and the ranks of a
-TP, SP or CFG instance count once (the instance's first rank reports).
-The histograms and counters count from the first request after the warmup requests, as
-the API server's do (the gauges show the current state), so read them with ``rate()``
-or ``increase()``.
+.. _worker-metrics:
+
+Worker and cache metrics
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The engine workers also send the conductor their own metrics every second, which it adds to its
+status message, so these can be up to two seconds old. ``component`` is the graph node; a node
+with replicas on several workers shows their sum, and the ranks of a TP, SP or CFG instance
+count once (the instance's first rank reports). The histograms and counters count from the first
+request after the warmup requests, as the API server's do (the gauges show the current state),
+so read them with ``rate()`` or ``increase()``.
 
 - ``mstar_kv_pages_used{model_name, component, resource}``,
-  ``mstar_kv_pages_total{model_name, component, resource}``: pages of each paged KV
-  cache (``resource`` is its key in the model, since a node can have several, e.g.
-  Whisper's decoder self and cross attention caches). Used counts every page off the
-  free list, including the pages the prefix cache keeps; a cache two nodes of one
-  worker share shows under each node.
-- ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
-  names. Some may also be in use by running requests; the cache frees the others when a
-  request needs the room.
+  ``mstar_kv_pages_total{model_name, component, resource}``: pages of each paged KV cache
+  (``resource`` is its key in the model, since a node can have several, e.g. Whisper's decoder
+  self and cross attention caches). Used counts every page off the free list, including the
+  pages the prefix cache keeps; a cache two nodes of one worker share shows under each node.
+- ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache names. Some
+  may also be in use by running requests; the cache frees the others when a request needs the
+  room.
 - ``mstar_rebuild_host_bytes_used{model_name, component}``,
-  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
-  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
-  A prompt the pool has no room for keeps no ids, so its request is never dropped.
-- ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
-  steps that ran a forward. A step counts from when the worker hands it to its GPU
-  thread, or from the end of the previous step if that was later, to the end of its
-  postprocess (outputs on the host, stop check, routing). Overlapping steps are not
-  counted twice: in steady state this is the interval between step completions, and
-  ``rate(..._sum)`` is the share of time the worker had a step running.
-- ``mstar_batch_size{model_name, component, graph_walk}``: histogram, rows the step's
-  forward ran.
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's rebuild host
+  pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size. A prompt the pool
+  has no room for keeps no ids, so its request is never dropped.
+- ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine steps that
+  ran a forward. A step counts from when the worker hands it to its GPU thread, or from the end
+  of the previous step if that was later, to the end of its postprocess (outputs on the host,
+  stop check, routing). Overlapping steps are not counted twice: in steady state this is the
+  interval between step completions, and ``rate(..._sum)`` is the share of time the worker had a
+  step running.
+- ``mstar_batch_size{model_name, component, graph_walk}``: histogram, rows the step's forward
+  ran.
 - ``mstar_prefix_cache_query_tokens_total{model_name, component}``,
-  ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
-  tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
-  tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
-  Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
-  ``prefix_cache_tp`` set. Qwen3.5's hit counts the KV cache's tokens before its
-  recurrent pool cuts the hit to a snapshot.
-- ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
-  step on the node is ready (its inputs arrived) and not running: waiting for room in a
-  step or for the worker to pick the node.
+  ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt tokens looked
+  up in the prefix cache (once per request, its whole keyed prompt) and tokens found there. Only
+  models that key their prompts for prefix reuse (BAGEL, Orpheus, Qwen3.5 and Qwen3-Omni's
+  Thinker) count, and above one rank only with ``prefix_cache_tp`` set. Qwen3.5's hit counts the
+  KV cache's tokens before its recurrent pool cuts the hit to a snapshot.
+- ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next step on
+  the node is ready (its inputs arrived) and not running: waiting for room in a step or for the
+  worker to pick the node.
 
-Tensor transfers between graph nodes (:ref:`tensor transport <tensor-transport>`) are
-counted by the reader, once per edge read: the tensors of one graph edge that one worker
-read from one producer. The workers send them with the engine metrics above, and the
-API server adds the results its data worker read:
+.. _transfer-metrics:
 
-- ``mstar_transfer_bytes_total{model_name, src, dst, transport}``: counter, tensor bytes
-  read over the edge.
-- ``mstar_transfers_total{model_name, src, dst, transport}``: counter, tensors read over
-  the edge.
-- ``mstar_transfer_seconds{model_name, src, dst, transport}``: histogram, one observation
-  per edge read: the reader's time to read that edge's tensors, which is the SHM file
-  read and copy, the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of
-  the arena only issues its host-to-device copies in that time; they finish
-  asynchronously. The producer's own work (serializing, staging into the arena,
-  registering memory) is not included; it is the ``tx`` time of
-  :ref:`request profiling <request-profiling>`.
+Tensor transfer metrics
+~~~~~~~~~~~~~~~~~~~~~~~
 
-``src`` is the graph node that produced the tensors and ``dst`` the node that reads them.
-An edge the conductor joined from several producers (one input name produced in several
-walks or nodes) is one read per producing node, with its read time split between them by
-bytes.
-``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
-which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (the arena on CUDA and CPU, and the tensors it spills to files; other
-accelerators send every tensor as a file until the arena is measured there), ``TCP``
-or ``RDMA``. A
-tensor already on the reader (one it made, or one it read once
-for two of its nodes) moves nothing and is not counted. With tensor parallelism every
-rank counts its own read, of its slice or of the whole tensor when the edge is
-replicated, so an edge two ranks read is two reads. Like the data worker, the workers
+Tensor transfers between graph nodes (`tensor transport <serving.html#tensor-transport>`__) are
+counted by the reader, once per edge read: the tensors of one graph edge that one worker read
+from one producer. The workers send them with the engine metrics above, and the API server adds
+the results its data worker read:
+
+- ``mstar_transfer_bytes_total{model_name, src, dst, transport}``: counter, tensor bytes read
+  over the edge.
+- ``mstar_transfers_total{model_name, src, dst, transport}``: counter, tensors read over the
+  edge.
+- ``mstar_transfer_seconds{model_name, src, dst, transport}``: histogram, one observation per
+  edge read: the reader's time to read that edge's tensors, which is the SHM file read and copy,
+  the copy out of the SHM arena, or the RDMA or TCP read. A GPU reader of the arena only issues
+  its host-to-device copies in that time; they finish asynchronously. The producer's own work
+  (serializing, staging into the arena, registering memory) is not included; it is the ``tx``
+  time of `request profiling <serving.html#request-profiling>`__.
+
+``src`` is the graph node that produced the tensors and ``dst`` the node that reads them. An
+edge the conductor joined from several producers (one input name produced in several walks or
+nodes) is one read per producing node, with its read time split between them by bytes.
+``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``), which
+the API server's data worker sends and reads. ``transport`` is the protocol: ``SHM`` (the arena
+on CUDA and CPU, and the tensors it spills to files; other accelerators send every tensor as a
+file until the arena is measured there), ``TCP`` or ``RDMA``. A tensor already on the reader
+(one it made, or one it read once for two of its nodes) moves nothing and is not counted. With
+tensor parallelism every rank counts its own read, of its slice or of the whole tensor when the
+edge is replicated, so an edge two ranks read is two reads. Like the data worker, the workers
 count from the first request after the warmup requests.
 
-Where a successful request's time went, from the timestamps every request already
-carries (same ``model_name`` and ``output_modalities`` labels; the conductor's
-timestamps are compared with the API server's, which assumes both run on one host, as
-they do today):
+.. _phase-metrics:
 
-- ``mstar_request_preprocess_seconds``: histogram, from submission to the data worker
-  handing the preprocessed request to the conductor, including its wait in the data
-  worker's queue.
-- ``mstar_request_engine_seconds``: histogram, from the conductor dispatching the
-  request to the workers (after any admission wait) to the conductor finishing it.
-- ``mstar_request_delivery_seconds``: histogram, from the conductor finishing the
-  request to the result leaving the API server (the last chunks' postprocessing and
-  transfer, and the client handler picking it up).
+Request phase metrics
+~~~~~~~~~~~~~~~~~~~~~
+
+Where a successful request's time went, from the timestamps every request already carries (same
+``model_name`` and ``output_modalities`` labels; the conductor's timestamps are compared with
+the API server's, which assumes both run on one host, as they do today):
+
+- ``mstar_request_preprocess_seconds``: histogram, from submission to the data worker handing
+  the preprocessed request to the conductor, including its wait in the data worker's queue.
+- ``mstar_request_engine_seconds``: histogram, from the conductor dispatching the request to the
+  workers (after any admission wait) to the conductor finishing it.
+- ``mstar_request_delivery_seconds``: histogram, from the conductor finishing the request to the
+  result leaving the API server (the last chunks' postprocessing and transfer, and the client
+  handler picking it up).
+
+.. _output-metrics:
+
+Output metrics
+~~~~~~~~~~~~~~
 
 Output, per output modality (``modality`` is the chunk's modality, e.g. ``audio``):
 
 - ``mstar_output_chunks_total{model_name, modality}`` and
-  ``mstar_output_bytes_total{model_name, modality}``: counters of the result chunks (and
-  their bytes) that reached the API server, for every request whatever its outcome;
-  error chunks are not counted.
-- ``mstar_output_audio_seconds_total{model_name}``: counter, seconds of audio in those
-  chunks (16-bit PCM at the chunk's sample rate and channel count).
-- ``mstar_time_to_first_chunk_seconds{model_name, modality}``: histogram over
-  successful requests, from submission to the first chunk of each output modality
-  reaching the API server (time to first audio, first image, first video frame).
+  ``mstar_output_bytes_total{model_name, modality}``: counters of the result chunks (and their
+  bytes) that reached the API server, for every request whatever its outcome; error chunks are
+  not counted.
+- ``mstar_output_audio_seconds_total{model_name}``: counter, seconds of audio in those chunks
+  (16-bit PCM at the chunk's sample rate and channel count).
+- ``mstar_time_to_first_chunk_seconds{model_name, modality}``: histogram over successful
+  requests, from submission to the first chunk of each output modality reaching the API server
+  (time to first audio, first image, first video frame).
 
-The data worker (a thread in the API server that loads each request's media and runs
-the model's prompt processing, preprocessing one request at a time) reports its own
-work.
+.. _preprocessing-metrics:
+
+Preprocessing metrics
+~~~~~~~~~~~~~~~~~~~~~
+
+The data worker (a thread in the API server that loads each request's media and runs the model's
+prompt processing, preprocessing one request at a time) reports its own work.
 ``input_modalities`` is the request's input modalities, sorted and comma-joined like
 ``output_modalities``:
 
 - ``mstar_data_worker_preprocess_seconds{model_name, input_modalities}``: histogram over
-  requests whose preprocessing finished, from the data worker taking the request off its
-  queue to handing it to the conductor. Unlike ``mstar_request_preprocess_seconds`` it
-  leaves out the wait in the queue, and it counts requests whatever their outcome later.
-- ``mstar_data_worker_preprocess_failures_total{model_name, input_modalities}``:
-  counter, requests whose preprocessing failed in the data worker, each once, whatever
-  raised: a file count or media length over its limit, a file that cannot be decoded,
-  the model's prompt processing, or handing the inputs on. The client gets the error
-  (a 400 for a bad input), so the request also ends as ``outcome="error"`` in
-  ``mstar_requests_total`` unless its client had already gone. That counter counts
-  failures from every stage by output modalities; this one only the data worker's
-  preprocessing, by input modalities (failures turning results into output chunks are
-  not counted here).
-- ``mstar_upload_size_bytes{model_name, modality}``: histogram, the size on disk of
-  each image, audio or video file a request carried to the data worker (``modality`` is
-  ``image``, ``audio`` or ``video``), whether the request succeeded or failed. Every
-  route writes its media to a file first: an upload as received, inline media (a
-  ``data:`` URL, base64 files on ``/generate/ws``) after base64 decoding. The realtime
-  route and long transcriptions send WAV files they write from the decoded audio, so
-  those count the WAV sizes. Requests refused before they were submitted (an oversized
-  body, a bad form) are not counted.
-- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests
-  submitted and not yet taken up by the data worker (the one it is working on is not
-  counted). A request whose client went away still counts until the data worker takes
-  it up.
-
-.. code-block:: bash
-
-   mstar serve kokoro --enable-metrics
-   curl -s localhost:8000/metrics | grep '^mstar_'
+  requests whose preprocessing finished, from the data worker taking the request off its queue
+  to handing it to the conductor. Unlike ``mstar_request_preprocess_seconds`` it leaves out the
+  wait in the queue, and it counts requests whatever their outcome later.
+- ``mstar_data_worker_preprocess_failures_total{model_name, input_modalities}``: counter,
+  requests whose preprocessing failed in the data worker, each once, whatever raised: a file
+  count or media length over its limit, a file that cannot be decoded, the model's prompt
+  processing, or handing the inputs on. The client gets the error (a 400 for a bad input), so
+  the request also ends as ``outcome="error"`` in ``mstar_requests_total`` unless its client had
+  already gone. That counter counts failures from every stage by output modalities; this one
+  only the data worker's preprocessing, by input modalities (failures turning results into
+  output chunks are not counted here).
+- ``mstar_upload_size_bytes{model_name, modality}``: histogram, the size on disk of each image,
+  audio or video file a request carried to the data worker (``modality`` is ``image``, ``audio``
+  or ``video``), whether the request succeeded or failed. Every route writes its media to a file
+  first: an upload as received, inline media (a ``data:`` URL, base64 files on ``/generate/ws``)
+  after base64 decoding. The realtime route and long transcriptions send WAV files they write
+  from the decoded audio, so those count the WAV sizes. Requests refused before they were
+  submitted (an oversized body, a bad form) are not counted.
+- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests submitted
+  and not yet taken up by the data worker (the one it is working on is not counted). A request
+  whose client went away still counts until the data worker takes it up.

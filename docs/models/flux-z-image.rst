@@ -1,0 +1,255 @@
+FLUX.2 klein and Z-Image
+========================
+
+``flux2_klein``
+---------------
+
+FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
+image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.
+
+Checkpoint: ``black-forest-labs/FLUX.2-klein-4B``.
+
+``flux2_klein_9b``
+------------------
+
+FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
+the FLUX Non-Commercial License; check it before deploying.
+
+Checkpoint: ``black-forest-labs/FLUX.2-klein-9B``.
+
+``z_image_turbo``
+-----------------
+
+Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
+
+Checkpoint: ``Tongyi-MAI/Z-Image-Turbo``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``flux2_klein``
+     - ``configs/flux2_klein.yaml``
+   * - ``flux2_klein_9b``
+     - ``configs/flux2_klein_9b.yaml``
+   * - ``z_image_turbo``
+     - ``configs/z_image_turbo.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve flux2_klein
+
+For client requests and response formats, see :doc:`/clients`.
+
+Text-to-image and reference-image editing on the step-distilled **FLUX.2 [klein]**
+checkpoints. Four stateless nodes: a native Qwen3 encoder that runs only the 27 layers
+whose hidden states the DiT consumes (taps 9/18/27 concatenated), the rectified-flow
+transformer as the body of a ``denoise_loop`` (one Euler step per iteration, 4 by
+default, no classifier-free guidance), the FLUX.2 VAE encode of reference images and
+the VAE decode. All of them are exact ports; the CPU suite pins them bit-for-bit against
+the diffusers modules on tiny random configs and the GPU suite compares real-weight
+trajectories and PSNR against a recorded pipeline run
+(``test/flux2_klein/record_oracle.py``).
+
+Generate and edit an image
+--------------------------
+
+Start the server on one GPU::
+
+   mstar serve flux2_klein --gpus 0
+
+In a second terminal, run this client. It writes ``cat.png`` and ``edit.png``::
+
+   python - <<'PY'
+   from mstar import MStarClient
+   client = MStarClient("http://localhost:8000")
+   png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
+   open("cat.png", "wb").write(png)
+   open("edit.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png", seed=1))
+   PY
+
+Image API fields
+----------------
+
+The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``seed``,
+``n``; ``num_inference_steps`` through ``extra_body``) and ``POST /v1/images/edits``
+(multipart ``image`` + ``prompt``; up to four reference images are concatenated as
+conditioning tokens, in order).
+
+Deployment settings
+-------------------
+
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+
+``attention_backend``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
+cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
+runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
+GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
+ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
+backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
+same knob.
+
+``compile``
+~~~~~~~~~~~~~~~
+
+``torch.compile`` of the transformer, one trace per shape.
+
+``compile_eager_rounding``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Inductor rounds intermediates where eager PyTorch does, and fuses no FMAs.
+
+``compile_exact_ops``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``true``, or a list of op classes among ``norms`` and ``activations``: those modules
+keep the eager result inside the compiled forward, so inductor only fuses the chains
+around the GEMMs and attention. Each kept module other than a 1-D ``torch.nn.RMSNorm``
+is a graph break, so this is a latency-for-exactness trade:
+
+* The norms alone make the transformer bit-exact with eager (measured on klein-4B and
+  9B while the q/k norms were graph breaks), so klein-4B and 9B ship ``[norms]``.
+  Klein's per-head q/k norms (1-D ``RMSNorm``) run as an op the compiled graph keeps
+  whole. On NVIDIA GPUs that op is a Triton replica of torch's kernel with the same
+  arithmetic order: bit-identical and faster than torch's one-block-per-row launch.
+  Kept norms of one class share a class-level forward, so the blocks share one
+  compiled frame: with a forward per module, dynamo hit its recompile limit and the
+  small batches ran the blocks eagerly (klein-4B 2.86 / 3.10 / 3.69 against 3.33 /
+  3.75 / 3.80 img/s at concurrency 1 / 4 / 16, H200). Keeping the activations too
+  adds cost and nothing else.
+* Z-Image's 180 norms per step cost 45% of its B=1 latency, so it ships ``false``
+  and lands at a median 34 dB (the ``false`` figures were measured before its compiled
+  forward fused the q/k norms and rotary into one kernel). ``[norms]``, which keeps
+  that fusion off, turns it reference-faithful (at least 55.9 dB on every prompt).
+* Without ``[norms]``, the plain compile — even with eager rounding — lands at a
+  median 37.6 dB (klein-4B) and 35.6 dB (9B) PSNR from eager over the 100 protocol
+  prompts (measured with the earlier compiled VAE decode), because a 4- or 8-step
+  distilled sampler amplifies the last bit of inductor's own reductions and
+  activation decompositions.
+
+``accelerator_graph``, ``capture_sizes``, ``capture_batch_sizes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The denoise step, Euler update included, is captured per listed ``[height, width]``
+and batch size. Other shapes run the eager batched path.
+
+``capture_edit_sizes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+klein only: edit buckets with one reference image of the output size, the shape of an
+edit that keeps its reference's size. Defaults to ``capture_sizes``; ``[]`` captures
+none. The eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on
+klein-4B and 6 GiB on 9B, and every extra capture size adds roughly 7 minutes of
+startup.
+
+``async_scheduling``
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The engine's speculative scheduling of the image nodes: the worker assembles a batch's
+next denoise step while the current one runs and merges requests that became ready
+meanwhile, so requests at different steps share a forward. On by default; the loop's cap
+(the request's step count) keeps speculation from running past its schedule, and ``false``
+restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
+to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
+concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the
+denoise phase is compute-bound either way.
+
+``max_batch_size``
+~~~~~~~~~~~~~~~~~~~~~~
+
+Rows batched per denoise step.
+
+``vae_compile``
+~~~~~~~~~~~~~~~~~~~
+
+``torch.compile`` of the VAE decode with inductor autotuning, each nearest-x2 upsample
+folded into its conv and the GroupNorms (with their SiLU) on a split-reduction kernel.
+Before those two it measured 89 to 29 ms at 1024² on an H100 and about 55 dB PSNR from
+the eager decode on every prompt; neither figure is re-measured since. The compiled
+decode is not bit-exact, and the autotuner may pick different conv kernels in another
+server process, so set it to ``false`` for bit-exact, repeatable output — which is how the
+parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
+grids and the decode batch sizes; any other latent shape decodes eagerly rather than
+paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
+peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
+36 to 44 GiB compiled.
+
+``linear_dtype``
+~~~~~~~~~~~~~~~~~~~~
+
+``bf16`` (default), ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
+the model declares (``QUANTIZABLE_LINEARS`` beside each transformer) in that format: a
+``QuantLinear`` holding the weight quantized once at load, after any ``lora``, whose forward
+is one op (``mstar::mxfp8_linear`` / ``mstar::nvfp4_linear``) that quantizes the activation
+with a Triton kernel and runs cuBLASLt's block-scaled GEMM. Modulation, timestep, patch and
+caption embedders and the final projection stay bf16. A GPU below compute capability 10.0
+stays on bf16 with a warning, and a linear whose K isn't a whole number of scale tiles (MXFP8
+128, NVFP4 64), whose N isn't a multiple of 16, or whose kind can't take a format (a
+tensor-parallel linear) is refused at load.
+
+NVFP4 quantizes an activation's 16-value blocks with e4m3 scales in units of a per-linear
+tensor scale ``s``, so a block clips above ``2688 * s``. Over the 100 protocol prompts,
+klein's text feed-forward outputs reach 4080 (4B) and 5056 (9B) and Z-Image's feed-forward
+outputs up to 340k; every other input stays under 1800. Those linears take the power of two
+that holds their measured maximum (``input_amax`` in the declaration), the rest ``s = 1``.
+
+It stays off by default because the images move. Against the bf16 image of the same prompt
+and seed, over the 100 protocol prompts with the shipped config on one B300 (compute capability
+10.3): klein 4B MXFP8 lands at a median 22.3 dB, lowest 13.6 dB, and NVFP4 at 15.6 dB,
+lowest 9.3 dB. Two bf16 images of a prompt at different seeds are a median 10.4 dB apart.
+MXFP8 keeps the scene with its details shifted; NVFP4 sometimes changes the composition. On
+the same GPU the 4B's denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
+and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
+concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
+9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+
+``linear_keep_bf16``
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A list of module-name patterns over the transformer's linears to keep in bf16 for one
+deployment, on top of the declaration. A pattern matches name segment by segment, ``*``
+within one segment, and a segment may be an index range: ``single_blocks.0-3.*``. A pattern
+that names none of the candidate linears, or a bare string, is refused at load; the log
+names the linears each pattern kept.
+
+``linear_dtype_steps``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some denoise steps in bf16 under a low-precision ``linear_dtype``: a count of leading steps
+(``1``: the first step in bf16), or a dtype per step, each ``bf16`` or the ``linear_dtype``,
+past the list its last entry. Those steps run a bf16 copy of the transformer taken before
+quantizing, so the deployment holds both sets of weights. Rows batch, and each capture bucket
+is captured, per dtype, and the scheduler keeps a step of one dtype apart from the other.
+One leading bf16 step takes klein 4B MXFP8 from a median 22.3 dB to 27.0 dB, lowest 16.0 dB,
+at a 26.0 ms step (24.4 ms MXFP8, 31.4 ms bf16); at 8 concurrent requests it serves 17% more
+images per second than bf16, against MXFP8's 25%. Ignored when nothing is quantized (``bf16``,
+or no block-scaled GEMM).
+
+``max_image_area``
+~~~~~~~~~~~~~~~~~~~~~~
+
+Pixels, default 2048². Bounds the output size a request may ask for; larger requests
+are rejected with a 400 before scheduling instead of occupying the worker for minutes
+(an 8192² request means 262k tokens of quadratic attention). Z-Image also refuses a side
+over 8192 px, the 512 tokens its rotary table covers.
+
+Image parity and adapter merging
+--------------------------------
+
+With the klein defaults every served image was within 53 dB of the eager path on all 100 protocol prompts, and with ``vae_compile: false`` it was bit-exact; both were measured while the q/k norms were graph breaks, and the 53 dB before the folded, split-GroupNorm VAE decode. For scale, SGLang 0.5.22's images sit at a median 23.8 dB (minimum 13.1) on klein-4B and 24.0 dB (14.5) on 9B from klein's output at the same seeds. Requests at the same output size batch across users in every node, including the text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or BFL-layout safetensors), so a styled deployment runs at the base model's speed.
+
+The adapter's own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha`` (and ``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``; ``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers' fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16). A DoRA adapter (PEFT's ``lora_magnitude_vector`` or Kohya's ``dora_scale``) is refused, since its magnitudes would be dropped from the merge.

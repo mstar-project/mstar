@@ -1,0 +1,248 @@
+Qwen3-TTS
+=========
+
+``qwen3_tts``
+-------------
+
+Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.
+
+Checkpoint: ``Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice``.
+
+``qwen3_tts_1p7b``
+------------------
+
+1.7B CustomVoice: built-in speakers plus style/emotion ``instruct`` control.
+
+Checkpoint: ``Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice``.
+
+``qwen3_tts_voicedesign``
+-------------------------
+
+1.7B VoiceDesign: the voice is described by the request's ``instruct`` text.
+
+Checkpoint: ``Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign``.
+
+``qwen3_tts_base``
+------------------
+
+1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).
+
+Checkpoint: ``Qwen/Qwen3-TTS-12Hz-1.7B-Base``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``qwen3_tts``
+     - ``configs/qwen3tts.yaml``
+   * - ``qwen3_tts_1p7b``
+     - ``configs/qwen3tts_1p7b.yaml``
+   * - ``qwen3_tts_voicedesign``
+     - ``configs/qwen3tts_voicedesign.yaml``
+   * - ``qwen3_tts_base``
+     - ``configs/qwen3tts_base.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve qwen3_tts
+
+For client requests and response formats, see :doc:`/clients`.
+
+Choose and install a checkpoint
+-------------------------------
+
+Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
+plus ``pip install --no-deps 'qwen-tts==0.1.1'`` (see :doc:`/installation`), and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
+``<key>`` is one of ``qwen3_tts`` (0.6B CustomVoice), ``qwen3_tts_1p7b``,
+``qwen3_tts_voicedesign`` or ``qwen3_tts_base``. One model class serves every
+12 Hz checkpoint; the variant (speakers, instruction support, reference
+audio) is read from the checkpoint's ``config.json``.
+
+Voice and instruction fields
+----------------------------
+
+Requests: ``voice`` selects a built-in speaker (CustomVoice), ``language``
+defaults to automatic detection, ``instruct`` (OpenAI: ``instructions``)
+carries a style instruction (1.7B CustomVoice) or the voice description
+(VoiceDesign, required). Base clones a voice from one reference clip: on
+``/v1/audio/speech`` pass ``ref_audio`` (data URL, base64, or an http(s) URL
+when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the server are refused) plus
+``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
+``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
+conditioning (x-vector and codec frames) is memoised by content, so a voice
+reused across requests, or by the sentence chunks of one long request, is
+encoded once; named, persisted voices arrive with the shared voice registry.
+
+Text layout
+-----------
+
+Text layout follows the reference defaults: CustomVoice and VoiceDesign put
+the whole text in the prefill; Base feeds it one token per frame. Override
+per request with ``non_streaming_mode``.
+
+Append live text
+----------------
+
+Live text: with ``non_streaming_mode: false`` (Base, or x-vector-only
+cloning), a ``/generate/ws`` call opened with ``end_input: false`` takes the
+rest of its text as ``append`` messages, one token per frame as it arrives,
+through the ``text_in`` client stream (see :doc:`/clients`). Each append is
+tokenized alone, which matches tokenizing the whole text when the cut falls
+before a space or at punctuation. In ``non_streaming_mode`` and for an
+in-context clone, the prefill's pairing fixes the text's length and where TTS
+EOS sits, so a live opening (``end_input: false``) gets a 400; send those
+one-shot.
+
+Long text
+---------
+
+``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
+ordered sentence chunks of about 400 characters (one Talker request each,
+two kept in flight while the current one streams); set
+``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
+
+Audio chunk ramp and codec state
+--------------------------------
+
+Audio streams in a ramp of codec chunks: the first frame is decoded on its own (first audio one Talker step after prefill), the next chunks add 3, 8 and 16 frames, then 25 frames a chunk. The decoder is causal, so the codec decodes every frame once: per stream it keeps each causal conv's last input samples, the transformer's sliding-window keys and values (71 per layer) and the frame count, about 5 MiB in float32, in the ``codec_state`` recurrent pool. ``resources: {codec_state: {max_slots: N}}`` sizes it for N - 1 streams (one slot is the pool's sink); 256 streams by default.
+
+Each chunk width is a CUDA-graph bucket captured for batch sizes 1 to 32 (densely: the codec's cost is per row, so a padding row costs as much as a real one). A step takes ready chunks of any width and pads them to its widest, since a step of its own for each width costs more than the padding. A voice clone's stream leads with the reference's last 72 frames, decoded with the first chunk to warm the state on the voice and trimmed from its audio.
+
+The SnakeBeta activations run as one fused kernel. A deployment sets the ramp and the steady chunk with ``model_kwargs: {codec_chunk_schedule: [1, 3, 8, 16], codec_chunk_frames: 25}``. ``configs/qwen3tts_1p7b.yaml`` opens with 4 frames ([4, 8, 16]): on an H200 the streaming SLO (first audio within 200 ms, under 10 ms of pauses) then holds 101 Seed-TTS sentences a second against 90 with [1, 3, 8, 16], which halves idle first audio (15 vs 31 ms p50 at 1 req/s).
+
+Talker capture and code prediction
+----------------------------------
+
+Talker prefill, the clone prefill included, replays a packed CUDA Graph for the smallest token bucket (32 to 1024 tokens) that holds the batch; a clone's reference frames join the codec stream in ``postprocess``. Prefill and decode are one combined walk (``talker_mixed``): up to four new prompts ride a decode step instead of a prefill-only step every decode row waits behind, replaying a packed capture sized to the decode batch. A decode-only step uses the whole-walk CUDA Graph (up to 128 rows a step), with the 15-step CodePredictor loop captured inside it; request-local EOS suppression is carried as a graph tensor input so replay does not consult capture-slot dummy request state.
+
+Residual ``code_predictor_*`` sampling (``subtalker_*`` is a deprecated alias) is per-request through the ``code_predictor`` aux sampler, so custom values neither block batching nor fall off the graph. On the 1.7B checkpoints the CodePredictor projects the Talker-width inputs through ``small_to_mtp_projection`` before its depth loop. It is the same component as Qwen3-Omni's code predictor (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``): the depth sequence opens with the Talker hidden state in a one-token pass and takes one token per group after it, five launches a layer. Each projection is one ``cp_linear`` launch with the RMSNorm folded into its weight (a row scale from partial sums of squares its producer recorded) and the residual add or the SwiGLU in its epilogue; the q/k norm, RoPE, KV write and attention are one ``cp_attend`` launch, and the frame's 16 codec embeddings are summed in one launch per group.
+
+Where the predictor projects its inputs (``small_to_mtp_projection``, the 1.7B), every embedding table a later depth step reads is kept projected. None of this is bit-exact with the unfused ops: the sampled residual codes can differ at near-ties. Each Talker keeps the sum it had before the two shared the component: Qwen3-TTS accumulates in the model dtype, rounding after every add (the reference sums in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more SMs, a step of up to 64 rows whose residual draws the graph sampler can hand over runs the whole loop, sampling included, as one persistent kernel (``mstar.model.qwen3_tts.components.depth_frame``).
+
+The kernel needs Triton 3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs why and runs the loop.
+
+Why the codec needs a worker
+----------------------------
+
+The Codec does not run beside the Talker on a side stream (``side_stream``,
+see :doc:`/serving`): its windows read and write their streams' ``codec_state``
+rows, and the side lane only takes a node that holds no resources, since it
+neither admits nor plans a step ahead. No Qwen3-TTS config sets the field.
+
+Split codec deployment
+----------------------
+
+``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
+for the 0.6B) runs the Codec on a second worker that
+shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
+On its own it lowers first-audio latency at high concurrency; with
+``mps: true`` in the YAML (see :doc:`/serving`; ``qwen3tts_split.yaml`` sets
+it) the two workers' kernels also overlap, which raised c=32 throughput by
+about a fifth on an H100.
+
+Talker attention
+----------------
+
+The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
+KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
+the position resource, which declares the checkpoint's.
+
+Decode kernel selection
+-----------------------
+
+The Talker's decode rows run on FlashInfer's CUDA-core decode kernel. Every
+checkpoint has 16 query heads over 8 KV heads, and the tensor-core kernel pads
+the 2 query heads per KV head out to a tile. On an H200 the 1.7B serves 1.01x
+to 1.03x the audio from c1 to c128 with the same WER. It's unmeasured on the
+0.6B and on B300. ``talker_attn: decode_tensor_cores: true`` in a deployment's
+YAML selects the tensor-core kernel.
+
+Codec precision
+---------------
+
+The codec decoder runs in float32 by default: a stream's audio is the reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs: {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay float32), which ``configs/qwen3tts_1p7b.yaml`` serves. Against the float32 whole decode of the 1.7B's frames it gives 35 dB SNR median (20 dB worst), 1.0 dB mel cepstral distortion, 0.9999 speaker cosine and the same WER, and the streaming SLO holds 101 Seed-TTS req/s against float32's 90 (H200). Its dilated convs run as undilated ones over their interleaved subsequences: cuDNN takes some bfloat16 dilated convs (384 and 768 channels) through a direct kernel without tensor cores, about 100x slower on an H100.
+
+On a B300 the bf16 codec measured slower while those convs still ran dilated; measure there before switching. The decode is compiled (Inductor) twice per chunk width, batch 1 apart: its batch dimension is dynamic.
+
+AudioSeal watermark
+-------------------
+
+Opt-in AudioSeal watermark on the codec's output (off by default; install
+``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
+
+   model_kwargs:
+     audio_watermark:
+       enabled: true      # default false
+       message: 0xBEEF    # 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)
+       alpha: 1.0         # strength, in (0, 4] (default 1.0)
+       generator: audioseal_wm_streaming   # AudioSeal card name or checkpoint path (default)
+
+Unknown keys or out-of-range values fail startup, and so does ``enabled: true`` without the package. Each request's PCM is marked chunk by chunk with its own streaming state, so a streamed utterance carries the same mark as a whole one. At startup the engine captures the generator per chunk length of the codec schedule (by default 1, 3, 8, 16 and 25 frames) and batch bucket, so marking a step's chunks costs one graph replay per distinct length. The captures hold GPU memory: about 2.5 GiB for the default 30 graphs (5 lengths, 6 batch buckets) on an H200, 5.7 GiB with 25 lengths.
+
+A chunk outside them (another length, more rows than the largest bucket, a partial frame) runs eagerly, and the first one of each kind is logged. Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav`` (``--message``, the deployment's payload: without it the verdict is the score alone, and an unmarked file re-encoded as MP3 can score above 0.5; ``--threshold``, default 0.5; ``--device``; needs ``.[audio]`` for ``soundfile``); a file at another rate than 24 kHz is resampled to 24 kHz first, since the mark is found only at the rate it was added at.
+
+Detect on whole utterances: a clip under a few seconds can miss the mark. The helper lives in ``mstar/model/audio_watermark.py``.
+
+Weight coverage
+---------------
+
+Weight loading checks coverage in both directions: a parameter the checkpoint
+does not fill, or a checkpoint tensor the port does not load, fails startup.
+
+SoX is not required
+-------------------
+
+The 12 Hz codec does not require the system SoX executable. M* imports only
+the exact upstream speech-tokenizer modules, avoiding qwen-tts's unrelated
+25 Hz SoX probe during worker startup.
+
+Benchmarks and parity
+---------------------
+
+For throughput/latency validation, run the native serving benchmark with the
+Qwen3-TTS model metadata rather than the Orpheus compatibility entry::
+
+ python -m benchmark.runner \
+     --url localhost:8000 \
+     --model qwen3_tts \
+     --profiling-type closed_loop \
+     --request-type text_to_speech \
+     --num-requests 20 \
+     --inference-system ours \
+     --num-warmup 2 \
+     --max-concurrency 4 \
+     --dataset seed_tts \
+     --output-dir .bench_outs
+
+The benchmark stops on the model's natural codec EOS by default. Use
+``--ignore-eos --output-len-min N --output-len-max N`` only when measuring
+fixed-length decode throughput rather than end-user latency.
+The first process-local request can include eager FlashInfer kernel JIT, so
+keep the warmup requests enabled when reporting steady-state latency.
+
+For cross-engine comparisons (M*, vLLM-Omni, SGLang-Omni) use the shared
+streaming ``/v1/audio/speech`` client, which measures time-to-first-audio, RTF
+and audio-seconds per second with the same request for every engine, and score
+the saved WAVs with ``benchmark/tts_speech_wer.py``::
+
+ python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
+     --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
+     --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json \
+     --save-audio-dir results/mstar_c8_wav
+
+
+
+Sampling precedence
+-------------------
+
+Qwen3-TTS: ``talker_<knob>`` wins over a plain ``<knob>`` when a request
+sends both.

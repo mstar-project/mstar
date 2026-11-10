@@ -1,0 +1,87 @@
+Per-request LoRA adapters
+=========================
+
+Use this reference to check which models support per-request PEFT adapters and which targets each accepts. For the configuration and runtime lifecycle, see :doc:`/models/qwen`.
+
+A ``resources: lora:`` block in a serving config serves PEFT adapters per request (sized and loaded as described in :doc:`/models/qwen`). A request picks one with the ``model`` field on any OpenAI route, or with ``lora_adapter: <name>`` in ``extra_body`` or ``/generate``'s ``model_kwargs``; an adapter the deployment does not serve is a 400. Without the block a model runs exactly as before. The table lists the models that take one and their targets, by the names a ``targets:`` list in the block uses. Every row is validated on CPU (each model's own stack against merged weights at simulated tensor parallelism); the GPU checks are in ``benchmark/lora/README.md``.
+
+Qwen3.5 passes them, Orpheus agrees with transformers + PEFT on every row and misses the merged check on a few, and Higgs Audio passes them, though its transformers check has not been rerun since that reference moved to fp32 RoPE. The rows marked *not validated* do not yet, and serve adapters at your own risk. None of their misses in the eager checks so far is an adapter error: the checks are tighter than bf16 noise on these models, and when each layer is fed an fp32 reference's input, an adapter's median error is within about 10% of a bf16 merge's.
+
+Supported targets
+-----------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Model (node)
+     - Targets
+   * - Qwen3.5 / Qwen3.8 (``LLM``, ``vision_encoder``)
+     - every linear of the text stack, ``lm_head``, ``embed_tokens``; the vision tower's blocks, merger and patch embed
+   * - Orpheus (``LLM``)
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head``, ``embed_tokens``
+   * - Higgs Audio (``LLM``)
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head`` (the checkpoint's ``audio_decoder_proj.text_lm_head``)
+   * - Qwen3-Omni (``Thinker``), *not validated*
+     - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
+   * - Qwen3-TTS (``Talker``), *not validated*
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``codec_head``
+   * - Chatterbox (``T3``), *not validated*
+     - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``speech_head``
+
+Validation and model restrictions
+---------------------------------
+
+Qwen3.5 / Qwen3.8 (``LLM``, ``vision_encoder``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+See :doc:`/models/qwen`.
+
+Orpheus (``LLM``)
+~~~~~~~~~~~~~~~~~~~~~
+
+Hub Orpheus adapters (PEFT on ``q/k/v/o/gate/up/down``, ranks 8 to 512) are
+served; set ``max_rank`` to the largest.
+
+Higgs Audio (``LLM``)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No embedding target.
+
+Qwen3-Omni (``Thinker``), *not validated*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Attention only on MoE layers: an adapter on the routed experts or the router is
+refused. Talker, code predictor and encoders take none. Not validated: this MoE
+model's bf16 noise is about 10x a dense model's (its router flips experts on
+near-ties), so even base rows, run in a larger batch than the reference's, miss
+the check against merged weights.
+
+Qwen3-TTS (``Talker``), *not validated*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Not the text projection (runs before the step) or the CodePredictor. Not
+validated: both checks fail on some rows, but against an fp32 reference LoRA
+gets every row's top-1 right while a bf16 merge of the adapter (the merged
+check's yardstick) flips one.
+
+Chatterbox (``T3``), *not validated*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+English and multilingual; a request's guidance (uncond) rows run its adapter too.
+Not Turbo (GPT-2's fused ``c_attn``), nor the conditioning encoder. Not
+validated: the check against merged weights fails on some rows, and an early
+layer's massive activation (its largest value grows from 8 to about 1200)
+amplifies bf16 noise.
+
+Models without per-request adapters
+-----------------------------------
+
+Not yet: Whisper (its encoder node plans no step rows, and the decoder's cross-attention
+K/V run over encoder rows, so the usual ``q_proj`` / ``v_proj`` adapters cannot be served
+whole), BAGEL and Cosmos3 (mixture-of-transformers weights chosen per row inside one
+forward, and guidance branches run as separate forwards), π0.5 (openpi's adapters are
+not PEFT), FLUX.2 [klein] (merges a LoRA into its weights at load, not per request), and
+every other family, which declares no LoRA specs yet: Canary, Canary-Qwen, Command A+,
+CosyVoice3, Fish Audio S2-Pro, GLM-5.2, Kokoro, LingBot-World, LTX-2.5, Nemotron
+VoiceChat, Omnilingual ASR, OmniVoice, Parakeet and Nemotron ASR, Qwen3-ASR, V-JEPA 2,
+VoxCPM2, Wan2.2, Waypoint and Z-Image.

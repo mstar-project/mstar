@@ -1,0 +1,319 @@
+Qwen3.5 and Qwen3.8
+===================
+
+``qwen3_5_{0.8,2,4,9,27}b``
+---------------------------
+
+Hybrid-attention VLM (text, image and video in, text out): gated DeltaNet linear
+attention interleaved with full attention, plus a ViT tower.
+
+Checkpoint: ``Qwen/Qwen3.5-4B``.
+
+``qwen3_8_27b``
+---------------
+
+Qwen3.8-27B on the Qwen3.5 implementation (same architecture); ships a TP4 config.
+
+Checkpoint: ``Qwen/Qwen3.8-27B``.
+
+Deployment configs
+------------------
+
+The CLI maps the model keys to these deployment configs. See :doc:`/installation`
+for dependencies; model-specific requirements and limits follow on this page:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CLI model key
+     - Config in the repository
+   * - ``qwen3_5_0.8b``
+     - ``configs/qwen3_5_0.8b.yaml``
+   * - ``qwen3_5_2b``
+     - ``configs/qwen3_5_2b.yaml``
+   * - ``qwen3_5_4b``
+     - ``configs/qwen3_5_4b.yaml``
+   * - ``qwen3_5_9b``
+     - ``configs/qwen3_5_9b.yaml``
+   * - ``qwen3_5_27b``
+     - ``configs/qwen3_5_27b_tp4.yaml``
+   * - ``qwen3_8_27b``
+     - ``configs/qwen3_8_27b_tp4.yaml``
+
+From the repository root, launch a deployment with:
+
+.. code-block:: bash
+
+   mstar serve qwen3_5_0.8b
+
+For client requests and response formats, see :doc:`/clients`.
+
+Text, image and video chat on the Qwen3.5 dense family (five sizes; MoE
+variants are not supported yet). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (``image_url`` and ``video_url`` parts). Images and
+videos may be interleaved with text anywhere in the prompt, and prefill follows
+the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Video input and capacity
+------------------------
+
+Video follows transformers' ``Qwen3VLProcessor`` exactly: frames are decoded with torchcodec on the host (FFmpeg's shared libraries must be installed; without them a video request gets a 400, as there is no fallback decoder), sampled at the checkpoint's ``video_preprocessor_config.json`` rate (2 fps, 4 to 768 frames for the released checkpoints), resized within its pixel budget, and paired into temporal groups of two frames. Each group is preceded by a ``<t seconds>`` timestamp in the prompt and placed in MRoPE like a one-frame image. The prompt layout is the one transformers uses from 5.10 (and vLLM and SGLang): the template's ``<|vision_start|>``/``<|vision_end|>`` around a video stay, with each group's own pair inside.
+
+Earlier transformers replaced the outer pair too; mstar keeps the 5.10 layout whatever version is installed. Resizing follows the installed transformers version: transformers 5.22 turns on the per-frame pixel cap of qwen-vl-utils by default, which lowers the token count of short clips. Notes:
+
+- The vision encoder attends within each image and each video frame group
+  separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
+  segments per prompt. A prompt over either limit runs the encoder without the
+  graph (still compiled, so only the launches are extra): a long video at
+  ordinary resolution exceeds the patches, and one over ~64 s with frames
+  resized below ~256x256 pixels exceeds the segments.
+- An encoder step packs the images and videos of up to 8 requests into one
+  replay. Requests that fit alone but would overflow it together run one
+  after another in that step. While the block loop is captured, a request too
+  large for a replay alone (a long video) gets a step of its own. The packed
+  GEMMs' shapes follow the step's total patches, so an image's
+  embeddings can differ at the last bit with what it is batched beside.
+- On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
+  serves video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``, whose
+  vision encoder runs on one rank while the other waits for it in the lockstep
+  LLM: 9B on 2xH200 with TP-async on, DP2 gave 12.5-44% more output tok/s on
+  30 s and 60 s videos at c=16 and c=32.
+- A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
+  beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
+  eagerly.
+- Size the KV pool for video. ``configs/qwen3_5_*.yaml`` keep the default
+  2048 pages of 128 tokens (262k tokens per deployment); 32 concurrent long
+  videos need about twice that. Measured on Qwen3.8-27B at TP4: 32 concurrent
+  long videos on the default pool gave 67 tok/s with most requests timing out,
+  and 1,585 tok/s with none failing on 8192 pages. Raise
+  ``resources: kv_cache: max_num_pages`` to fit the concurrency you serve.
+- Decoding happens in the API server process, before the request is queued,
+  and counts against ``MSTAR_MAX_VIDEO_PIXELS``: at the default, a 1080p
+  video over about 259 s gets a 400.
+
+Recurrent-state capacity
+------------------------
+
+Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
+well as a KV allocation. Set ``gdn_state.max_slots`` in
+``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
+CUDA-graph capture and padded replays use the sink, not slots. A slot is
+~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
+not the 256-slot default. The state defaults to the checkpoint's
+``mamba_ssm_dtype`` (fp32 for the released checkpoints);
+``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
+needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+Capture buckets and startup
+---------------------------
+
+Text prefill and mixed steps replay captured graphs by total tokens, on the ladder ``32 ... 8192`` (powers of two, plus 2176 as a mixed step's slack: a step passes its budget only when its decode rows leave its next prompt less than ``min_chunk_tokens`` of it, and then by at most its decode rows); a step pads to its bucket and a longer one runs eagerly. A text-prefill step, one with no decode rows beside it, also has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn't pad to 2048; a mixed step captures only the ladder's powers of two and 2176. 4096 and 8192 stay in the default ladder for a deployment that raises ``max_batch_tokens`` or turns chunking off, which fills them exactly.
+
+The ladder leaves out slack rungs above them (4352, 8704): such a deployment adds them to its own ladder, and without them a step just past a power of two pads to the next one and a step past 8192 runs eagerly. The serving config's ``prefill_token_buckets`` sets a deployment's own ladder per walk (see :doc:`/serving`): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048 for ``prefill_text`` and ``mixed``, and 1152-1792 for ``prefill_text``, since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``) caps both and at the default ``min_chunk_tokens`` no step passes it.
+
+Each bucket adds captures and startup time.
+
+A captured decode step builds its rotary tables inside the graph from the
+planned positions, rather than staging tables built eagerly before the replay
+(that build sat on the per-step critical path: +13% output tok/s at c=32 on
+0.8B, H200). Greedy output can differ from earlier releases at near-tie
+tokens; prefill and eager steps are unchanged (``knobs: {ingraph_decode_rope: true}``
+does the same for captured text prefill and mixed steps).
+
+The prefill, mixed and vision captures compile in Inductor's deterministic mode
+whatever ``-O`` says: autotuning them bought no GPU time and took about a fifth of
+the cold start. The decode capture keeps the ``-O`` level's tuned kernels. ``knobs:
+{compile_deterministic: true}`` compiles it deterministically too: greedy output then
+reproduces across server processes and the cold start more than halves. One-row
+decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
+at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
+c=4 up it makes no difference.
+
+Sampling and reasoning
+----------------------
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
+``enable_thinking`` (default true; the template opens a ``<think>`` block;
+``chat_template_kwargs.enable_thinking`` also works) are read by the model but
+are not OpenAI fields — pass them via ``extra_body``.
+Sampling defaults to the checkpoint's generation_config, under whatever the
+request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
+and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
+and 9B ship none, so the engine sampler's defaults apply. A request's
+``min_p`` above 0 is refused (a 400) unless the checkpoint sets a ``min_p``,
+which turns the sampler's min-p filter on; none of these does.
+``max_output_tokens`` may not exceed ``max_position_embeddings``.
+
+Token IDs and log probabilities
+-------------------------------
+
+With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
+YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
+token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
+token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
+with a 400. Add ``enable_processed_logprobs: true`` and ``"logprobs_mode":
+"processed"`` for the log-prob under the distribution it was actually drawn from
+(penalties and top-k/top-p applied); greedy requests want ``"raw"``, as a greedy
+token scores 0 there. Top alternatives and OpenAI's ``logprobs`` are not
+supported yet. On any deployment,
+``"return_token_ids": true`` adds each text chunk's sampled ids
+(``{"token_ids": [...]}``), stop tokens included, so a trainer need not
+re-tokenize the text.
+
+Serve LoRA adapters
+-------------------
+
+**LoRA adapters.** A ``resources: lora:`` block in the serving config serves
+per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
+from the ``adapter_config.json`` beside it). The OpenAI ``model`` field picks one,
+as in vLLM: the base model's name (or its HF repo id, or no ``model`` at all) runs
+the base model, an adapter's name runs that adapter, and any other name is a 400.
+``GET /v1/models`` lists the adapters beside the base model. On ``POST /generate``,
+pass ``model_kwargs: {lora_adapter: <name>}``, checked the same way. Rows on different adapters, and on
+none, share a batch::
+
+    resources:
+      lora:
+        max_slots: 4        # adapters resident on the GPU at once
+        max_rank: 16        # the largest rank served; slots are sized to it
+        cpu_capacity: 16    # adapters kept in pinned host memory
+        adapters:
+          sql: /adapters/qwen3_5-4b-sql/adapter_model.safetensors
+          chat: /adapters/qwen3_5-4b-chat   # a PEFT directory names its adapter_model.safetensors
+
+Validate adapter targets
+------------------------
+
+Every adapter the config names is checked at startup, before any worker starts (LoRA
+layers present, rank within ``max_rank``, only the targets below, shapes that fit them),
+and one that fails stops the server with an error naming it.
+
+Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:
+
+* every linear of the text stack, as ``target_modules="all-linear"`` picks them: the
+  full-attention layers' ``q_proj`` (its output gate included), ``k_proj``, ``v_proj``
+  and ``o_proj``, the gated DeltaNet layers' ``linear_attn.in_proj_qkv`` (or
+  ``in_proj_q`` / ``_k`` / ``_v`` split, as Tinker trains them), ``in_proj_z``,
+  ``in_proj_a``, ``in_proj_b`` and ``out_proj``, and every layer's ``gate_proj``,
+  ``up_proj`` and ``down_proj``;
+* the LM head (``lm_head``, or Tinker's ``unembed_tokens``) and the token embedding
+  (PEFT's ``lora_embedding_A`` / ``_B`` on ``embed_tokens``). With tied weights (0.8B,
+  2B, 4B) each delta stays on its own side, as PEFT applies them;
+* the vision tower, as unsloth's vision fine-tunes adapt it: each block's
+  ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1`` and ``mlp.linear_fc2``, the merger's
+  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. One spec covers
+  both nodes, sized by the one ``lora:`` block; the vision encoder node has a pool of
+  its own (``lora@vision_encoder``, beside the LLM's ``lora@LLM``) and runs the
+  request's adapter too.
+
+Module names may be in any layout PEFT writes for the model: the released checkpoint's
+(``model.language_model.layers.*``, ``model.visual.*``), the text-only causal LM's
+(``model.layers.*``), the inner model's (``language_model.layers.*``) or the bare text
+model's (``layers.*``). An adapter on the MTP head is accepted and that part ignored
+(the head never runs). The DeltaNet in-projections are one fused GEMM, so their deltas
+are one shrink and one expand per layer, added before the conv reads the output.
+
+Refused with a 400 that says why, when the adapter is named: DoRA (``use_dora``),
+``modules_to_save`` (full copies of a module, e.g. a classifier ``score`` head or a
+retrained ``lm_head``), trainable tokens, bias LoRA, other PEFT methods (OFT), a module
+outside the list above, a module whose shapes do not fit (an adapter for another size),
+and a linear-shaped LoRA on ``embed_tokens`` (``lora_A.weight`` of ``[r, hidden]``, as
+some Tinker exports name a tied head's LoRA; rename its keys to ``lm_head`` to serve it
+on the head).
+
+Adapter memory and capture
+--------------------------
+
+Every target is sized into each slot and runs its kernels on every step that has an
+adapter row, whether that row's adapter uses it or not. The LM head and embedding are
+vocabulary-sized: at ``max_rank: 16`` and 4 slots, about 40 MB each per GPU (the head's
+split over TP ranks, the embedding's whole on each). So with ``runtime_updates`` off
+(no adapter can arrive after startup), the pools keep only the targets the configured
+adapters touch, and a vision encoder whose adapters are all text-only builds no pool.
+With it on, every target is kept unless the YAML lists the ones to keep::
+
+    resources:
+      lora:
+        targets: [qkv_proj, o_proj, in_proj_fused, out_proj, gate_up_proj, down_proj,
+                  qkv, attn_proj, mlp_linear_fc1, mlp_linear_fc2, merger_linear_fc1,
+                  merger_linear_fc2, patch_embed_proj]
+
+An adapter deployment captures and compiles the LLM node as one without adapters does,
+each bucket twice: with the LoRA kernels, and base-only for steps none of whose rows names
+an adapter. The vision encoder's block loop is captured base-only; a step with an adapter
+row runs it uncaptured. The LoRA pool keeps no resident table yet, so a ``lora:`` block
+turns resident decode planning off on the LLM node (the server logs it): every decode
+step, base-only ones included, is planned on the host as before resident planning.
+
+Every size takes the same ``resources: lora:`` block; ``max_rank`` must cover the
+largest adapter served. Example blocks (Hub adapters, ranks as published; no shipped
+config has one, so add the line to that size's serving config)::
+
+    # e.g. in configs/qwen3_5_0.8b.yaml: a vision fine-tune (blocks and merger, rank 16)
+    lora: {max_slots: 4, max_rank: 16, adapters: {agnews: <hammamwahab/jev-agnews-lora>/adapter_model.safetensors}}
+    # e.g. in configs/qwen3_5_2b.yaml: vision with the conv patch embed (rank 32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {comma: <wjbmattingly/comma-qwen-3.5-2b>/adapter_model.safetensors}}
+    # e.g. in configs/qwen3_5_4b.yaml: LM head and embedding (rank 8), Tinker (rank 32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {pirate: <William-Gao1/qwen3.5-4b-pirate-lora>/...,
+                                                  oneinbox: <dKhRr/oneinbox-qwen3.5-4b-lora>/...}}
+    # e.g. in configs/qwen3_5_9b.yaml or qwen3_5_9b_tp2.yaml: released layout (16), Tinker (32)
+    lora: {max_slots: 4, max_rank: 32, adapters: {nimble: <bespokelabs/Bespoke-Nimble-9B>/...,
+                                                  rlvr: <lucabaroni/qwen3.5-9b-rlvr-reward-hacking>/...}}
+    # e.g. in configs/qwen3_5_27b_tp4.yaml: text and vision (rank 16)
+    lora: {max_slots: 4, max_rank: 16, adapters: {tcg: <heftyTuna/qwen35-27b-tcg-lora>/...}}
+
+Under TP the LLM's targets split as its linears do (the 27B's single K/V head per rank
+at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
+on one GPU in every shipped config.
+
+Both frontends serve LoRA: a request's ``model`` names the adapter it runs under
+(``ServedModels``), and ``/v1/models`` lists the adapters beside the base model.
+Runtime updates (below) are the Python frontend's only for now: ``mstar-server``
+reads the served adapters once at launch and has neither route, so ``mstar serve``
+refuses ``--rust-frontend`` with ``runtime_updates: true``.
+
+Load and unload adapters at runtime
+-----------------------------------
+
+Adapters can also be loaded and unloaded while the server runs, with vLLM's
+endpoints and bodies. They make the server read paths a client names, so they are off
+unless the ``lora`` block opts in, and answer 404 otherwise (as vLLM's do without
+``VLLM_ALLOW_RUNTIME_LORA_UPDATING``). The block may name no adapters at all
+(``resources: {lora: {max_slots: 4, runtime_updates: true}}``)::
+
+    curl -X POST localhost:8000/v1/load_lora_adapter -H 'Content-Type: application/json' \
+        -d '{"lora_name": "sql", "lora_path": "/adapters/qwen3_5-4b-sql"}'
+    curl -X POST localhost:8000/v1/unload_lora_adapter -H 'Content-Type: application/json' \
+        -d '{"lora_name": "sql"}'
+
+``lora_path`` is a PEFT directory (its ``adapter_model.safetensors`` is read) or a safetensors file, readable at the same path by the API server and every worker. A load is checked first (LoRA layers present, rank within ``max_rank``, only the targets above, shapes that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM's or the vision encoder's); the name is selectable, and listed by ``/v1/models``, once all of them have it. A load that fails on any worker is undone on all of them and answered with a 400, as is a name that is already loaded.
+
+A refusal says why the adapter cannot be served (its rank, its modules, its shapes); a file that cannot be read at all gets the same answer whether it is missing, unreadable or not an adapter, and the details go to the server log. A worker that does not answer within ``runtime_update_timeout_s`` (default 120) fails the load with a 504, and the load is undone everywhere, so the name is free to try again.
+
+To change an adapter's weights, unload it and load it again: each adapter is pinned to
+the digest of the weights checked when it was configured or loaded, and a worker that
+reads other weights from its path (the file overwritten in place) refuses them, on every
+rank, rather than serve them under the old name and prefix-cache entries. An unload stops
+new requests on the name at once (they get the 400 an unknown adapter gets; an unknown
+name in the unload is a 404); if the conductor refuses it, the name is selectable again.
+Requests already running on it finish on its weights, after which its slot and host copy
+are freed; loading the name again before then is a 400 that says so.
+
+Qwen3.8 checkpoint behavior
+---------------------------
+
+Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
+code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
+
+    mstar serve qwen3_8_27b --gpus 0,1,2,3
+
+Its ``output_gate_type: swish`` names the gated DeltaNet norm's activation,
+which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
+the key and hard-codes SiLU. Video is still
+refused and the MTP head is skipped. The chat template's new
+``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
+request gets the template's defaults (``xhigh`` and preserved), whatever the
+client sends, and a request that sends one is logged as ignoring it.
