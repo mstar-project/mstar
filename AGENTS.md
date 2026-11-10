@@ -120,6 +120,8 @@ To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platfo
 
 ### 9. Update the documentation
 
+For user and contributor documentation, read [.claude/skills/writing-docs/SKILL.md](.claude/skills/writing-docs/SKILL.md). It covers page structure, examples, prose, and documentation audits, with annotated sources and worked edits.
+
 **Sphinx and Mintlify**: `docs/*.rst` remains canonical during the migration. When changing a guide that has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the same PR. This applies to the model, resource, installation, and environment-variable documentation below. See [docs/mintlify/CONTRIBUTING.md](docs/mintlify/CONTRIBUTING.md) for preview and validation commands; the generated Python API reference remains on Sphinx.
 
 **Models and resources**: should be documented in docs/models.rst and docs/adding_models.rst, respectively.
