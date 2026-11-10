@@ -2,7 +2,9 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from jinja2 import TemplateError
@@ -27,6 +29,11 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -38,7 +45,13 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import capture_ladder, load_snapshot_tokenizer, read_fp8_block_quant_config, resolve_checkpoint
+from mstar.model.utils import (
+    ByteLevelTextOutput,
+    capture_ladder,
+    load_snapshot_tokenizer,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
@@ -55,14 +68,20 @@ _RETIRED_KWARGS = (
 # (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
 QUANT_METHODS = ("fp8",)
 
+# what zai-org/GLM-5.2's generation_config.json declares, for a checkpoint whose file is not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 
-class Glm52Model(Model):
+
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
     DECODE_LOOP = "decode_loop"
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
@@ -123,8 +142,9 @@ class Glm52Model(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     def _check_mtp(self, kwargs: dict) -> None:
         if self.config.dsa_long_context:
@@ -230,9 +250,12 @@ class Glm52Model(Model):
                 resource_key=POS_RESOURCE, nodes=nodes,
                 config=self.config.position_config(),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
         if self.config.dsa_long_context:
@@ -323,9 +346,10 @@ class Glm52Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
+        # read here, in the data worker: a bad knob is the client's 400 before any work
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
         if self.config.mtp_num_draft_tokens > 0:
             # refused here as a 400; prepare_inputs would refuse it as a 500
-            sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
                     f"MTP drafting is greedy only (temperature={sampling.temperature}, "
@@ -382,20 +406,18 @@ class Glm52Model(Model):
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default; dropped, a request got none of them
-        for k, cast in (("top_k", int), ("min_p", float), ("penalize_prompt", bool)):
-            if model_kwargs.get(k) is not None:
-                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # greedy by default under MTP, so a request that names no temperature serves
             # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     def context_limit(self) -> int:
         """The bound the submodule's preprocess holds every context to:
@@ -425,19 +447,7 @@ class Glm52Model(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; return raw
-                # bytes without ever touching the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.2: {modality!r}")
 
     # -------------------------------------------------------------------

@@ -48,6 +48,7 @@ impl OpenAIAdapter for Qwen3Omni {
         }
         Ok(SubmitArgs {
             tokens: None,
+            report_usage: false,
             text,
             file_paths,
             input_modalities: in_mods,
@@ -58,7 +59,6 @@ impl OpenAIAdapter for Qwen3Omni {
     }
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk = speech_kwargs(req, "talker_temperature", "talker_top_p");
-        forward_sent_speed(&mut mk, req);
         Ok(SubmitArgs { output_modalities: vec!["text".to_string(), "audio".to_string()], ..speech_submission(req, mk) })
     }
 }

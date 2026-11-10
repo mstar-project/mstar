@@ -182,15 +182,13 @@ def test_glm52_request_config_is_the_sampler_config():
     assert set(configs) == {SAMPLER_RESOURCE}
     sampling = configs[SAMPLER_RESOURCE]
     assert isinstance(sampling, SamplingReqConfig)
-    # the config's generation defaults, unless the request overrides them
-    assert sampling.temperature == cfg.temperature
-    assert sampling.top_p == cfg.top_p
-    assert sampling.repetition_penalty == cfg.repetition_penalty
-    assert sampling.ignore_eos is cfg.ignore_eos
+    # the checkpoint's generation defaults, unless the request overrides them
+    assert (sampling.temperature, sampling.top_p) == (1.0, 0.95)
+    assert (sampling.repetition_penalty, sampling.ignore_eos) == (1, False)
     over = model.get_request_resource_configs(
         [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
-    assert over.temperature == cfg.temperature
+    assert over.temperature == 1.0
 
 
 @pytest.mark.parametrize("kwargs, match", [
@@ -459,6 +457,7 @@ def test_glm52_a_chat_the_template_refuses_is_a_400():
 
 def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
     m = object.__new__(Glm52Model)
+    m.config = Glm52ModelConfig.reduced()
     m._tokenizer_mode = "byte"
     m._tokenizer = None
     out = m.postprocess(torch.tensor([72, 105]), "text")

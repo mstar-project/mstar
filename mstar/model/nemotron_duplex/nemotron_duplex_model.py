@@ -116,6 +116,9 @@ from mstar.streaming.topology import (
 
 logger = logging.getLogger(__name__)
 
+# model_kwargs forwarded to the nano sampler; an unset one takes the config's value
+SAMPLING_KEYS = ("temperature", "top_p", "repetition_penalty", "ignore_eos")
+
 
 def _sample_text_token(
     logits: torch.Tensor,          # (B, vocab)
@@ -392,7 +395,7 @@ class NemotronDuplexModel(Model):
             SamplerSpec(
                 resource_key=NANO_SAMPLER, nodes={"nano_llm"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             RecurrentStateSpec(
                 resource_key=CODEC_STATE, nodes={"eartts_talker"},
@@ -433,10 +436,11 @@ class NemotronDuplexModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+        keys = SAMPLING_KEYS
         return {
             NANO_SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
+                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys},
+                min_p=model_kwargs.get("min_p", 0.0),
             ),
             # every talker session reads both of its streams
             TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
@@ -569,6 +573,10 @@ class NemotronDuplexModel(Model):
     # Prompt processing
     # -------------------------------------------------------------------
 
+    def request_kwargs(self) -> frozenset[str]:
+        # max_output_tokens is not read: the audio fixes the length
+        return frozenset({*SAMPLING_KEYS, "min_p"})
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -628,14 +636,17 @@ class NemotronDuplexModel(Model):
         # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
         # its speaker warm-up
         prompt_len = ids.numel() if prompt else 0
+        # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, and no session
+        # writes that margin.
+        frames = self.max_session_frames + 1
         nano = LabelLayout(
             spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
-            growth=(("decode_loop", 1),),
+            growth=(("decode_loop", 1),), max_growth=frames,
         )
         warmup = self.TALKER_WARMUP_POSITIONS
         talker = LabelLayout(
             spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
-            growth=(("talker_decode_loop", 1),),
+            growth=(("talker_decode_loop", 1),), max_growth=frames,
         )
         return ProcessPromptOutput(out, {"kv_layout": {
             NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},

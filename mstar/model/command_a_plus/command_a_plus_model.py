@@ -1,7 +1,9 @@
 """Text and image-in, text-out generation with pinned metadata and explicitly supplied weights."""
 
 import json
+from collections.abc import Mapping
 from itertools import chain
+from types import MappingProxyType
 
 import torch
 
@@ -15,7 +17,6 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -29,10 +30,17 @@ from mstar.model.command_a_plus.config import (
     SAMPLER,
     CommandAPlusConfig,
 )
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
     MediaPads,
+    MediaRun,
     expand_media_pads,
     media_layout,
     media_walk_name,
@@ -42,24 +50,27 @@ from mstar.model.multimodal import (
 
 TEXT_WEIGHTS = ("model.language_model.",)
 VISION_WEIGHTS = ("model.vision_tower.", "model.multi_modal_projector.")
+# Cohere's published recipe; the checkpoint's generation_config.json sets no sampling knob
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 0.9, "top_p": 0.95, "repetition_penalty": 1.04})
 
 
 class CommandAPlusModel(Model):
     DECODE_LOOP = "decode_loop"
+    # the checkpoint's sampling defaults over the recipe, set by __init__
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
         max_seq_len: int | None = None, checkpoint_dir: str | None = None, **kwargs,
     ):
         self.local_dir = resolve_metadata(checkpoint_dir or model_path_hf, cache_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir, DEFAULT_SAMPLING)
         config = CommandAPlusConfig.from_json(self.local_dir / "config.json")
         self.config = config.text_config
         self.vision_config = config.vision_config
         # the image tower, whose output fills the image pads in prompt order;
         # it names the image walk, `prefill_image`
-        self.image_encoder = MediaEncoder(
-            "image", "vision_encoder", ("pixel_values",), "image_embeds", (self.vision_config.image_token_id,),
-        )
+        self.image_encoder = MediaEncoder("image", "vision_encoder", ("pixel_values",), "image_embeds")
         self.image_walk = media_walk_name((self.image_encoder,))
         self.max_seq_len = min(8192, self.config.max_position_embeddings) if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= self.config.max_position_embeddings:
@@ -132,14 +143,14 @@ class CommandAPlusModel(Model):
                 rope_theta=config.rope_theta,
             )),
             SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                        enable_repetion_penalty=True),
+                        **sampler_capabilities(self.sampling_defaults)),
         ]
 
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-        defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
-                        repetition_penalty=1.04, ignore_eos=False)
-        supplied = model_kwargs or {}
-        return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self):
+        return frozenset({"messages", "max_output_tokens", *SAMPLING_KEYS})
 
     def kv_labels(self):
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
@@ -252,7 +263,7 @@ class CommandAPlusModel(Model):
                     ids.numel(), ids.numel(), "text_inputs")
         layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
         # always set, so a layout the client sent never reaches the LLM
-        media = media_layout(pads, {self.image_encoder.pad_ids[0]: self.image_encoder.output})
+        media = media_layout(pads)
         return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
@@ -280,7 +291,7 @@ class CommandAPlusModel(Model):
         """Tile each image and write its one ``<|IMG_PATCH|>`` placeholder out as
         the processor lays it out: the image's start, each tile's pads ending
         in a line break, the image's end. Each tile is one run of pads."""
-        pad = self.image_encoder.pad_ids[0]
+        pad = self.vision_config.image_token_id
         positions = (ids == pad).nonzero().flatten().tolist()
         if len(positions) != len(images):
             raise ValueError(f"The prompt has {len(positions)} image placeholders for {len(images)} images")
@@ -306,7 +317,7 @@ class CommandAPlusModel(Model):
             pixel_values.append(tiles.to(torch.bfloat16))
             start = position + 1
         pieces.append(ids[start:])
-        runs = [tokens] * sum(len(tiles) for tiles in pixel_values)
+        runs = [MediaRun(tokens, self.image_encoder.output)] * sum(len(tiles) for tiles in pixel_values)
         return expand_media_pads(torch.cat(pieces), {pad: runs}), pixel_values
 
     def postprocess(self, output, modality, request_kwargs=None):

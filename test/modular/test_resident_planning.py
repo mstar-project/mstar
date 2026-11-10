@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
-from mstar.engine.resources.base import CGSlotKey, Residency, Resource  # noqa: E402
+from mstar.engine.resources.base import CGSlotKey, MoveKind, Residency, Resource  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -42,9 +42,11 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
+from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
 
 PAGE = 4
@@ -1062,11 +1064,12 @@ def _preplan_batch(planner, rids, bs):
 
 
 @pytest.mark.parametrize("raiser", ["resident", "runner"])
-def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, raiser):
+def test_a_raise_in_the_preplan_gives_its_reservation_back(monkeypatch, raiser):
     """`pre_admit` reserved a crossing page and something raises before the stage
-    is done. The plan thread's wrapper resets the pre-plan: the page stays with the
-    stream, the in-flight mark goes, and exec's admit finds the page and takes no
-    other. The same for a raise from the planner and from the runner's own pre-plan."""
+    is done. The plan thread's wrapper unwinds the pre-plan as it does one thrown
+    away: the page goes back, so rank 0 holds no page a TP follower that never
+    planned the step lacks, the in-flight mark goes, and exec's admit takes the page
+    again. The same for a raise from the planner and from the runner's own pre-plan."""
     res = _resources()
     planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     _ingest(res, 1)
@@ -1096,14 +1099,14 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     assert engine._pre_plan_done["n"].recorded
     assert engine._runner._pre_admitted is None and not engine._runner.staged
     assert not stream.step_in_flight
-    assert len(stream.page_indices) == 2
-    pages, free = list(stream.page_indices), kv._arena.num_free
+    assert len(stream.page_indices) == 1
+    free = kv._arena.num_free
     kv.assert_pages_conserved()
 
-    # exec re-drives it: the page it finds is the one pre_admit took
+    # exec re-drives it and takes the crossing page itself
     s = _captured_step(res, planner, [1], slot=1, bs=1)
-    assert stream.page_indices == pages and kv._arena.num_free == free
-    assert s.pages[0] == pages[1]
+    assert len(stream.page_indices) == 2 and kv._arena.num_free == free - 1
+    assert s.pages[0] == stream.page_indices[1]
     _assert_step_read_its_streams(res, s, [1])
     _assert_row(planner, res, 1)
     kv.assert_pages_conserved()
@@ -1173,8 +1176,11 @@ def _offload_engine(resources, planner):
 
     engine = make_engine(
         _resources=resources,
+        _resource_nodes={key: frozenset({"n"}) for key in resources},
         _submodules={"n": make_mgmt(resources=resources, resident=planner)},
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
     return engine
 
@@ -1313,6 +1319,8 @@ def test_an_offload_another_node_causes_gives_the_slot_up():
         },
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
         _resource_planners=dict.fromkeys(owned, planner),
+        # these requests were taken in by their resources alone, so no admission queue holds them
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
 
     # a step of m's over n's two short rows, crossing a page: the pool refuses
@@ -1364,8 +1372,8 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     engine._tp_follower_nodes = {"n"}
     delta = OffloadDelta.new()
-    delta.add_offloaded("1")
-    assert engine.apply_resident_delta("n", delta)
+    delta.add(MoveKind.OFFLOAD, "1", node="n")
+    assert engine.apply_resident_delta(delta, Rebuilds({}, {}))
     assert planner.slot_of(1) is None
 
 
@@ -1729,11 +1737,7 @@ def test_the_fmha_gather_kernel_reads_the_second_pools_table():
     assert wrapper._table[2, :1].tolist() == rows[0, 10:11].tolist()
 
 
-class _Attention(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
-
+class _Attention(StubResource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
@@ -1778,10 +1782,8 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
 # ---- refusals ----
 
-class _Spare(Resource):
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
+class _Spare(StubResource):
+    pass
 
 
 def _build(resources, nodes=None, walks=(WALK,), max_bs=4):

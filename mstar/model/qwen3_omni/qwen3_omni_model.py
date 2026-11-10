@@ -104,7 +104,7 @@ from mstar.model.qwen3_omni.config import (
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.model.utils import Operation, TextOutput, WeightConverter
+from mstar.model.utils import Operation, TextOutput, WeightConverter, load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import (
     Connection,
@@ -131,6 +131,29 @@ def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
             value = model_kwargs.pop(name)
             setattr(code2wav, name, tuple(value) if isinstance(value, list) else value)
     code2wav.check_streaming_knobs()
+
+
+# per-stage sampler knobs; a plain key targets the Thinker, ``<stage>_<knob>`` its stage
+SAMPLING_KNOBS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt")
+
+# used where the checkpoint's generation_config.json names no value
+FALLBACK_GENERATION_DEFAULTS = {
+    "thinker_temperature": 0.7,
+    "thinker_top_p": 0.9,
+    "thinker_repetition_penalty": 1.0,
+    "thinker_max_output_tokens": MAX_OUTPUT_TOKENS,
+    "talker_temperature": 0.9,
+    "talker_top_k": 50,
+    "talker_top_p": 1.0,
+    "talker_repetition_penalty": 1.05,
+    "talker_max_output_tokens": MAX_OUTPUT_TOKENS,
+    # no repetition penalty: the CodePredictor sampler lacks the capability
+    "code_predictor_temperature": 1.0,
+    "code_predictor_top_k": 50,
+    "code_predictor_top_p": 0.8,
+}
+
+DEFAULT_VOICE = "Ethan"
 
 
 def _thinker_to_talker_policy() -> FixedChunkPolicy:
@@ -283,12 +306,13 @@ class Qwen3OmniModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
     def _lora_spec(self) -> LoraSpec:
-        """Per-request adapters on the Thinker: its attention, any dense MLP layers and
-        the LM head (one row per request: the last token's). The routed experts and the
-        router take none (packed expert tensors, run by the fused-MoE kernel), so an
-        adapter touching them is refused with that reason; so is one touching the
-        Talker or the encoders, which are other nodes. Modules are named as the full
-        model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
+        """Per-request adapters on the Thinker: its attention, any dense MLP layers, the
+        LM head (one row per request: the last token's), and the routed experts when the
+        YAML's ``targets:`` names them (``experts_gate_up_proj`` / ``experts_down_proj``,
+        opt-in). The router takes none, so an adapter touching it is refused with that
+        reason; so is one touching the Talker or the encoders, which are other nodes.
+        Modules are named as the full model's checkpoint names them (``thinker.*``) or as
+        the Thinker alone does."""
         from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
         return module_lora_spec(
@@ -298,6 +322,8 @@ class Qwen3OmniModel(Model):
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        # min_p is on where the checkpoint defaults it on, so that default is not refused
+        defaults = self._generation_defaults()
         thinker_kv = PagedKVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
             num_kv_heads=self.config.thinker_text.num_key_value_heads,
@@ -356,19 +382,22 @@ class Qwen3OmniModel(Model):
                 resource_key=THINKER_SAMPLER,
                 nodes={"Thinker"},
                 vocab_size=self.config.thinker_text.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
+                enable_min_p=bool(defaults.get("thinker_min_p")),
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.talker_text.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
+                enable_min_p=bool(defaults.get("talker_min_p")),
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.code_predictor.vocab_size,
-                enable_repetion_penalty=False,
+                enable_repetition_penalty=False,
+                enable_min_p=bool(defaults.get("code_predictor_min_p")),
             ),
             *self._encoder_resources(),
             self._lora_spec(),
@@ -414,34 +443,88 @@ class Qwen3OmniModel(Model):
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
+        """One sampler per stage. Plain keys target the Thinker; a
+        ``<stage>_<knob>`` key wins over a plain one for its stage."""
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
-
         return {
             THINKER_SAMPLER: SamplingReqConfig(
-                temperature=model_kwargs.get("thinker_temperature", 0.7),
-                top_p=model_kwargs.get("thinker_top_p", 0.9),
+                **self._stage_sampling("thinker_", model_kwargs, primary=True),
                 ignore_eos=model_kwargs.get("ignore_eos", False),
-                repetition_penalty=model_kwargs.get("thinker_repetition_penalty", 1.0)
             ),
             TALKER_SAMPLER: SamplingReqConfig(
-                temperature=model_kwargs.get("talker_temperature", 0.9),
-                top_k=model_kwargs.get("talker_top_k", 50),
-                top_p=model_kwargs.get("talker_top_p", 1.0),
-                repetition_penalty=model_kwargs.get("talker_repetition_penalty", 1.05)
+                **self._stage_sampling("talker_", model_kwargs),
             ),
             CODE_PRED_SAMPLER: SamplingReqConfig(
-                temperature=model_kwargs.get("code_predictor_temperature", 1.0),
-                top_k=model_kwargs.get("code_predictor_top_k", 50),
-                top_p=model_kwargs.get("code_predictor_top_p", 0.8),
-            )
+                **self._stage_sampling("code_predictor_", model_kwargs),
+            ),
         }
+
+    def _stage_sampling(self, stage: str, model_kwargs: dict, primary: bool = False) -> dict:
+        """One stage's sampling knobs: its prefixed key, else the plain key
+        (primary stage only), else the checkpoint or fallback default."""
+        defaults = self._generation_defaults()
+        values = {}
+        for knob in SAMPLING_KNOBS:
+            key = stage + knob
+            if key in model_kwargs:
+                values[knob] = model_kwargs[key]
+            elif primary and knob in model_kwargs:
+                values[knob] = model_kwargs[knob]
+            elif key in defaults:
+                values[knob] = defaults[key]
+        return values
+
+    def _generation_defaults(self) -> dict:
+        """Stage-prefixed defaults: the checkpoint's ``generation_config.json``
+        over ``FALLBACK_GENERATION_DEFAULTS``."""
+        cached = getattr(self, "_generation_defaults_cache", None)
+        if cached is None:
+            local_dir = getattr(self, "local_dir", None)
+            cached = {
+                **FALLBACK_GENERATION_DEFAULTS,
+                **load_generation_defaults(local_dir, stage="thinker_"),
+                **load_generation_defaults(local_dir, prefix="talker_", stage="talker_"),
+            }
+            self._generation_defaults_cache = cached
+        return cached
+
+    def get_max_output_tokens(self, **model_kwargs):
+        return model_kwargs.get(
+            "max_output_tokens", self._generation_defaults()["thinker_max_output_tokens"],
+        )
+
+    def _get_max_talker_output_tokens(self, **model_kwargs) -> int:
+        value = model_kwargs.get(
+            "talker_max_output_tokens", self._generation_defaults()["talker_max_output_tokens"],
+        )
+        # the conductor refuses a cap past the Talker loop's max_iters
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"talker_max_output_tokens must be an integer >= 1; got {value!r}")
+        return value
+
+    def _resolve_voice(self, model_kwargs: dict, audio_output: bool) -> str:
+        """The Talker speaker; an explicit voice is checked even for text-only output."""
+        if "voice" not in model_kwargs and not audio_output:
+            return DEFAULT_VOICE
+        voice = model_kwargs.get("voice", DEFAULT_VOICE)
+        if not isinstance(voice, str) or not voice:
+            raise ValueError(f"voice must be a non-empty name; got {voice!r}")
+        voices = self.config.talker.speaker_id or {}
+        if voice.lower() not in voices:
+            supported = ", ".join(sorted(voices)) or "none"
+            raise ValueError(f"unknown voice {voice!r}; supported: {supported}")
+        return voice
+
+    def request_kwargs(self) -> frozenset[str]:
+        stages = ("", "thinker_", "talker_", "code_predictor_")
+        return frozenset(
+            {stage + knob for stage in stages for knob in SAMPLING_KNOBS}
+            | {"ignore_eos", "voice", "max_output_tokens", "talker_max_output_tokens", "seed"}
+        )
 
     def checkpoint_path(self) -> str:
         return self.local_dir
-
-    def _get_max_talker_output_tokens(self, **model_kwargs):
-        return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -----------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -468,9 +551,18 @@ class Qwen3OmniModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # the Talker's KV is built from the Thinker's states, which no ids recompute
-        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                         loop="thinker_decode_loop")}
+        # Audio, images and video are rebuilt from host copies of the encoders' outputs, one embedding per slot, and
+        # for vision one more per deepstack layer. A prompt with a video keys only its leading text, so it's rebuilt
+        # only with the prefix cache off for the request or the server. The Talker's KV is built from the Thinker's
+        # states, which no rebuild recomputes.
+        vision = self.config.vision
+        return {"Thinker": RebuildPolicy(
+            walks=frozenset({"prefill_text", "prefill_audio", "prefill_vision"}), ids_input="text_inputs",
+            sample_output="new_token", loop="thinker_decode_loop", copy_width={
+                "prefill_audio": self.config.thinker_text.hidden_size,
+                "prefill_vision": vision.out_hidden_size * (1 + len(vision.deepstack_visual_indexes)),
+            },
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -813,12 +905,14 @@ class Qwen3OmniModel(Model):
             ] + [WalkStep(self._decode_walk(audio_output), bind={"text_inputs": "new_token"}, step_metadata=thinker)]
         if partition_name not in ("Talker", "Code2Wav"):
             raise ValueError(f"Unknown partition: {partition_name!r}")
+        # an explicit voice is checked even for text-only output: an unknown one is a 400 at admission
+        voice = self._resolve_voice(model_kwargs, audio_output)
         if not audio_output:
             return []
         if partition_name == "Code2Wav":
             return [WalkStep("code2wav_chunk")]
         talker_max_tokens = self._get_max_talker_output_tokens(**model_kwargs)
-        prefill = {"voice": model_kwargs.get("voice", "Ethan"), "talker_max_tokens": talker_max_tokens}
+        prefill = {"voice": voice, "talker_max_tokens": talker_max_tokens}
         return [
             WalkStep("talker_prefill", step_metadata=prefill),
             WalkStep("talker_last_prefill", step_metadata=prefill),
@@ -1002,7 +1096,7 @@ class Qwen3OmniModel(Model):
         # So writing the parts out in request order and tokenizing once lets
         # the placement be read back off the ids, with no boundary
         # re-tokenized. The walks re-emit the sentinels themselves
-        # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
+        # (``ThinkerSubmodule._audio_row``, ``_wrap_vision_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
         #
@@ -1105,6 +1199,10 @@ class Qwen3OmniModel(Model):
         for k, step in enumerate(_thinker_steps(plan)):
             out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
         return split_spans(out, self.MEDIA_SPANS, kv_layout)
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each attachment, whose span in the Thinker's layout counts its sentinels and rows
+        return sum(span.length for span in kv_layout[THINKER_KV]["main"].spans)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.

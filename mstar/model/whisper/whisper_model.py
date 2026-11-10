@@ -39,6 +39,7 @@ adapter lifts those into ``language`` / ``segments``.
 """
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -57,7 +58,6 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -70,7 +70,14 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.components.audio_features import LogMelSpectrogram
-from mstar.model.components.request_kwargs import checked_request_kwargs
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput, check_kv_pools_fit, kv_pages
 from mstar.model.whisper.components import alignment
@@ -97,6 +104,9 @@ from mstar.model.whisper.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# greedy, as openai-whisper decodes; the checkpoint's generation_config.json overrides
+DEFAULT_SAMPLING = GREEDY_SAMPLING
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -147,9 +157,13 @@ class WhisperModel(Model):
 
     DECODE_LOOP = DECODE_LOOP
 
-    # A requested length is cut to the room the prompt leaves in the position
-    # table rather than refused, as a length past the table is clamped below:
-    # long-form windows carry the transcript so far as <|startofprev|> context.
+    # the checkpoint's sampling defaults, set by __init__; a model built without it has the built-in ones
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
+
+    # A requested length that fits the table is cut to the room a longer prompt
+    # leaves rather than refused: long-form windows carry the transcript so far
+    # as <|startofprev|> context. One past the table is still refused (see
+    # get_max_output_tokens).
     LENGTH_KWARGS = ()
 
     # Requests the default decoder caches hold at once, each at full length.
@@ -175,6 +189,7 @@ class WhisperModel(Model):
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         self.AUDIO_INPUT_RATE = self.config.sampling_rate
 
         from transformers import AutoTokenizer
@@ -264,8 +279,9 @@ class WhisperModel(Model):
             SamplerSpec(
                 resource_key=SAMPLER, nodes=nodes,
                 vocab_size=self.config.vocab_size,
-                # ASR transcription decodes greedily; no seen-token buffers.
-                enable_repetion_penalty=False,
+                # ASR decodes greedily; without the capability a request
+                # penalty or min_p is refused at admission.
+                **sampler_capabilities(self.sampling_defaults),
                 # the decode loop's timestamp rule state, kept by slot
                 loopback_state={TS_RULES: LoopbackState(
                     width=len(inactive_state()), dtype=torch.long, default=tuple(inactive_state()),
@@ -277,15 +293,12 @@ class WhisperModel(Model):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
-        kw = checked_request_kwargs(model_kwargs or {})
-        return {
-            SAMPLER: SamplingReqConfig(
-                # ASR default is greedy (temperature 0 -> argmax).
-                temperature=kw.get("temperature", 0.0),
-                top_p=kw.get("top_p", 1.0),
-                ignore_eos=kw.get("ignore_eos", False),
-            )
-        }
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            "language", "task", "timestamps", "initial_prompt", "max_output_tokens", *SAMPLING_KEYS,
+        })
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the decoder caches cannot hold: a request keeps
@@ -324,10 +337,11 @@ class WhisperModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
-        # max_target_positions (448), the shortest forced prompt takes 4.
-        # The conductor cuts a longer prompt's cap to what is left.
-        limit = self.config.max_target_positions - 4
-        return min(checked_request_kwargs(model_kwargs).get("max_output_tokens", limit), limit)
+        # max_target_positions (448), less the plain forced prompt. A larger
+        # request is refused by the conductor, not clamped; it cuts a longer
+        # prompt's cap to what is left.
+        limit = self.config.max_target_positions - self.config.decoder_prompt_len()
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", limit)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def emit_first_token() -> list[GraphEdge]:
@@ -381,7 +395,8 @@ class WhisperModel(Model):
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # the default request's iterations: past them a request overruns the position table
+            max_iters=self.get_loop_caps()[DECODE_LOOP],
             outputs=[],
         )
 
@@ -457,7 +472,7 @@ class WhisperModel(Model):
     # Model ABC: media loading + prompt processing
     # -------------------------------------------------------------------
 
-    def prompt_tokens(self, prompt: str | None) -> list[int]:
+    def _initial_prompt_ids(self, prompt: str | None) -> list[int]:
         """The ``<|startofprev|>`` context: prior transcript text, tokenized
         the way openai-whisper does (a leading space, no specials)."""
         if not prompt or not prompt.strip():
@@ -508,7 +523,7 @@ class WhisperModel(Model):
         if task not in self.config.task_to_id:
             raise ValueError(f"Whisper task must be one of {sorted(self.config.task_to_id)}, got {task!r}")
         timestamps = bool(kw.get("timestamps", False))
-        prev_tokens = self.prompt_tokens(kw.get("initial_prompt"))
+        prev_tokens = self._initial_prompt_ids(kw.get("initial_prompt"))
         prompt_ids = self.config.decoder_prompt_ids(
             language=language, task=task, timestamps=timestamps, prev_tokens=prev_tokens,
         )

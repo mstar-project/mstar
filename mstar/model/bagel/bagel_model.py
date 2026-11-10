@@ -42,10 +42,14 @@ processed causally, then each image is processed bidirectionally.
 
 import json
 import logging
+import math
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.errors import EntryNotFoundError
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
@@ -117,7 +121,7 @@ from mstar.model.base import (
     WalkStep,
     prompt_spans,
 )
-from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -135,7 +139,7 @@ from mstar.model.multimodal import (
 )
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.model.utils import TextOutput
+from mstar.model.utils import TextOutput, load_generation_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +177,67 @@ def uses_role_turns(parts: list[PromptPart], understanding: bool) -> bool:
     """
     turns = chat_turns(parts)
     return understanding and bool(turns) and any(part.modality == TEXT for part in turns[-1].parts)
+
+
+# ---------------------------------------------------------------------------
+# Request knobs
+# ---------------------------------------------------------------------------
+
+# sampling knobs a request may set; unset ones take the checkpoint's value
+SAMPLING_KEYS = (
+    "temperature", "top_k", "top_p", "min_p", "repetition_penalty",
+    "ignore_eos", "penalize_prompt",
+)
+CFG_RENORM_TYPES = ("global", "channel", "text_channel")
+IMAGE_PREPROCESS_MODES = ("default", "vllm")
+
+
+def _is_real(value) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _is_side(value, max_side: int, stride: int) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, int)
+        and stride <= value <= max_side and value % stride == 0
+    )
+
+
+# every BAGEL knob a request may set -> (check(value, max_side, stride), what it must be)
+IMAGE_KNOBS = {
+    "cfg_text_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_img_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_interval": (
+        lambda v, *_: isinstance(v, (list, tuple)) and len(v) == 2
+        and all(_is_real(x) for x in v) and 0 <= v[0] <= v[1] <= 1,
+        "[lo, hi] with 0 <= lo <= hi <= 1",
+    ),
+    "cfg_renorm_type": (lambda v, *_: v in CFG_RENORM_TYPES, f"one of {list(CFG_RENORM_TYPES)}"),
+    "cfg_renorm_min": (lambda v, *_: _is_real(v) and 0 <= v <= 1, "a number in [0, 1]"),
+    "think_mode": (lambda v, *_: isinstance(v, bool), "true or false"),
+    "image_preprocess": (
+        lambda v, *_: v in IMAGE_PREPROCESS_MODES, f"one of {list(IMAGE_PREPROCESS_MODES)}",
+    ),
+    "width": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+    "height": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+}
+
+
+def check_request_kwargs(model_kwargs: dict | None, max_side: int, stride: int) -> None:
+    """Raise ``ValueError`` on a BAGEL knob outside its allowed values.
+
+    Sampling knobs are checked at the API boundary and by the sampler.
+    ``max_side`` and ``stride`` bound ``width`` / ``height`` (see ``BagelModel.image_sides``).
+    """
+    for key, value in (model_kwargs or {}).items():
+        if key in IMAGE_KNOBS and value is not None:  # an explicit null is the default
+            ok, rule = IMAGE_KNOBS[key]
+            if not ok(value, max_side, stride):
+                rule = rule.format(max_side=max_side, stride=stride)
+                raise ValueError(f"{key} must be {rule}; got {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +380,10 @@ class BagelModel(Model):
     # the prompt lists whose entries each prefill in a walk of their own
     SPANS = ("text_inputs", "image_inputs")
 
+    # the checkpoint's sampling switches over the config's recipe, set by __init__ (`_load_sampling_defaults`);
+    # a model built without it samples with the config's
+    sampling_defaults: Mapping[str, object] = MappingProxyType({})
+
 
     INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)
 
@@ -337,6 +406,7 @@ class BagelModel(Model):
             self.config = load_bagel_config(json.load(f))
         if accelerator_graph is not None:
             self.config.accelerator_graph = accelerator_graph
+        self.sampling_defaults = self._load_sampling_defaults(model_path_hf, cache_dir)
 
         self.model_path_hf = model_path_hf
 
@@ -374,6 +444,22 @@ class BagelModel(Model):
         # The separate image-generation placement needs serial denoising
         # until its published KV handoff and speculative scheduling agree.
         self._image_gen_remote_handoff = False
+
+    def _load_sampling_defaults(self, repo_id: str, cache_dir: str | None) -> dict:
+        """BAGEL's recipe from the config; ``generation_config.json`` can only turn sampling off.
+
+        BAGEL-7B-MoT ships Qwen2.5-7B-Instruct's file (0.7 / top_k 20 / top_p 0.8),
+        the backbone's chat preset, so its knob values are not read.
+        """
+        defaults = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id, filename="generation_config.json", cache_dir=cache_dir,
+            )
+        except EntryNotFoundError:
+            return defaults
+        defaults.update(load_generation_defaults(Path(path).parent, switch_only=True))
+        return defaults
 
     def _image_gen_phases(self, window) -> tuple[ImageGenPhase, ...]:
         """The request's denoise walks on this deployment (`image_gen_phases`)."""
@@ -687,13 +773,10 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        check_request_kwargs(kwargs, *self.image_sides)
         params = self._request_params(input_modalities, output_modalities, kwargs)
         if "image" in output_modalities:
             image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
-            for key in ("width", "height"):
-                value = params[key]
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
         # nothing to prefill (blank text is the template alone): a 400 here, before admission
@@ -760,7 +843,7 @@ class BagelModel(Model):
             and tensors.get("image_inputs")
         ):
             result["image_inputs"] = [
-                self._resize_to_fit(img, params["width"], params["height"])
+                self._resize_to_fit(img, params["width"], params["height"], self.image_sides[0])
                 for img in tensors["image_inputs"]
             ]
 
@@ -793,6 +876,10 @@ class BagelModel(Model):
         layout = self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns)
         result, metadata["kv_layout"] = split_spans(result, self.SPANS, {"kv": layout})
         return ProcessPromptOutput(result, metadata)
+
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        # text_inputs leaves out each image, whose spans in the layout count its sentinels and patches
+        return sum(span.length for span in kv_layout["kv"]["main"].spans)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
@@ -857,18 +944,25 @@ class BagelModel(Model):
             ),
         }
 
+    @property
+    def image_sides(self) -> tuple[int, int]:
+        """``(max_side, stride)`` of an image in pixels: the latent grid times its downsample."""
+        stride = self.config.latent_downsample
+        return self.config.max_latent_size * stride, stride
+
     @staticmethod
     def _resize_to_fit(
         image: torch.Tensor,
         max_width: int,
         max_height: int,
+        max_side: int,
     ) -> torch.Tensor:
         """Resize a c x h x w image to the largest size fitting within
         max_width x max_height while preserving aspect ratio. Both dimensions
-        are capped at 1024.
+        are capped at ``max_side``.
         """
         _, h, w = image.shape
-        scale = min(1024 / w, 1024 / h, max_width / w, max_height / h)
+        scale = min(max_side / w, max_side / h, max_width / w, max_height / h)
         new_h = max(1, round(h * scale))
         new_w = max(1, round(w * scale))
         if new_h == h and new_w == w:
@@ -944,6 +1038,11 @@ class BagelModel(Model):
                 (denoise_loop(phase.walk), phase.steps) for phase in self._image_gen_phases(window) if phase.steps
             )
         return caps
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            *SAMPLING_KEYS, "max_output_tokens", *IMAGE_KNOBS, *OUTPUT_FORMAT_KWARGS,
+        })
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -1074,6 +1173,8 @@ class BagelModel(Model):
                 top_p=sampling.top_p,
                 ignore_eos=sampling.ignore_eos,
                 repetition_penalty=sampling.repetition_penalty,
+                min_p=sampling.min_p,
+                penalize_prompt=sampling.penalize_prompt,
             ),
         }
 
@@ -1146,10 +1247,14 @@ class BagelModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # Only understanding decodes, and an image's KV can't be recomputed from ids, so the KV cache
-        # refuses to drop a prompt with one. The CFG nodes run only image generation.
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        # Understanding and a think-mode edit decode, and an image is rebuilt from host copies of the ViT's or the
+        # VAE's output, one embedding per slot. A think-mode edit keys only part of its prompt, so it's rebuilt only
+        # with the prefix cache off for the request or the server. The CFG nodes run only image generation.
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({"prefill_text", "prefill_vit", "prefill_vae"}), ids_input="text_inputs",
+            sample_output="new_token", loop="decode_loop",
+            copy_width=dict.fromkeys(("prefill_vit", "prefill_vae"), self.config.hidden_size),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
@@ -1348,17 +1453,15 @@ class BagelModel(Model):
         plan = prefill_plan(parts_from_modalities(input_modalities), leading_text=role_turns)
         for step in plan:
             pool = texts if step.modality == "text" else images
-            if step.index >= len(pool):
-                # ``check_plan`` already failed a mismatch at intake, where a
-                # 400 can still be returned. This runs in the conductor, whose
-                # loop only logs — raising here orphans the request and hangs
-                # the client instead. Same choice as Qwen3-Omni's builder.
-                logger.warning(
-                    "BAGEL prefill plan wants a %s span at index %d but the "
-                    "prompt produced %d; skipping it",
-                    step.modality, step.index, len(pool),
-                )
+            if step.index >= len(pool) and step.modality == "text":
+                # a request without text has no span for the plan's text step
                 continue
+            if step.index >= len(pool):
+                # ``check_plan`` fails this at intake; a ValueError here is a 400 too
+                raise ValueError(
+                    f"BAGEL prefill plan wants a {step.modality} span at index "
+                    f"{step.index} but the prompt produced {len(pool)}"
+                )
             if step.modality == "text":
                 schedule.append(("prefill_text", "text_inputs", texts[step.index]))
             else:
@@ -1371,15 +1474,9 @@ class BagelModel(Model):
     def _request_params(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
     ) -> dict:
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        params["width"] = 1024
-        params["height"] = 1024
-        params["image_preprocess"] = "default"
-        overridable_keys += ["width", "height", "image_preprocess"]
+        max_side, _ = self.image_sides
+        params = {"width": max_side, "height": max_side, "image_preprocess": "default"}
+        params.update({k: getattr(self.config, k) for k in IMAGE_KNOBS if k not in params})
 
         if "image" in input_modalities and "image" in output_modalities:
             params["cfg_img_scale"] = 2.0
@@ -1387,7 +1484,7 @@ class BagelModel(Model):
             params["cfg_renorm_type"] = "text_channel"
 
         if model_kwargs:
-            for key in overridable_keys:
+            for key in IMAGE_KNOBS:
                 if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return params
@@ -1419,6 +1516,7 @@ class BagelModel(Model):
         request still has its image to make.
         """
         target_output = output_modalities[0]  # "text" or "image"
+        check_request_kwargs(model_kwargs, *self.image_sides)
         params = self._request_params(input_modalities, output_modalities, model_kwargs)
         image = input_signals.get(span_name("image_inputs", 0))
         if "image" in output_modalities and image:
@@ -1449,6 +1547,10 @@ class BagelModel(Model):
             # a request with nothing to prefill opens on decode, its last walk
             after = [decode]
         first_token = after[0] is decode
+        if first_token and schedule and self.get_max_output_tokens(**(model_kwargs or {})) == 1:
+            # the last prefill samples the only token asked for: no decode step follows
+            # it (a think-then-image request goes straight to its image)
+            after = after[1:]
         return [
             WalkStep(walk, bind={name: span}, step_metadata={
                 **params, FINAL_PREFILL: first_token and k == len(schedule) - 1,
@@ -1460,13 +1562,10 @@ class BagelModel(Model):
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
-        keys = [
-            "temperature", "top_k", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
-        params = {k: getattr(self.config, k) for k in keys}
+        params = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
+        params.update(self.sampling_defaults)
         if model_kwargs:
-            for key in keys:
+            for key in SAMPLING_KEYS:
                 if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return SamplingConfig(

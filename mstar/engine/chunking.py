@@ -73,6 +73,8 @@ class ChunkingManagement:
         self._min_chunk_tokens = DEFAULT_MIN_CHUNK_TOKENS
         # (rid, node) -> a chunked row's whole input, prepared on its first chunk
         self.prepared: dict[tuple[int, str], NodeInputs] = {}
+        # (rid, node) -> a prompt's whole input, out of `prepared` while its rebuild runs the steps before it
+        self.aside: dict[tuple[int, str], NodeInputs] = {}
 
     def policy(self, node_name: str, graph_walk: str) -> ChunkingPolicy:
         """The model's, or ``NO_CHUNKING`` where it declares none.
@@ -283,8 +285,18 @@ class ChunkingManagement:
         """Drop a row's whole input once its last chunk lands."""
         self.prepared.pop((rid, node_name), None)
 
+    def set_aside(self, rid: int, node_name: str) -> None:
+        """Move a prompt's whole input out of `prepared`, where its rebuild's rows prepare their own."""
+        self.aside[(rid, node_name)] = self.prepared.pop((rid, node_name))
+
+    def restore(self, rid: int, node_name: str) -> None:
+        """Put a prompt's whole input back, for its rebuild and then its own chunks to cut from."""
+        self.prepared[(rid, node_name)] = self.aside.pop((rid, node_name))
+
     def forget_request(self, rid: int) -> None:
         # over a snapshot: this runs on the main thread, while the gpu thread
         # may still be adding the next step's rows to `prepared`
         for key in [key for key in list(self.prepared) if key[0] == rid]:
             del self.prepared[key]
+        for key in [key for key in self.aside if key[0] == rid]:
+            del self.aside[key]

@@ -97,6 +97,14 @@ mod flex {
     }
 }
 
+/// A chat's `stream_options`; `include_usage` is a bool as pydantic reads one,
+/// matching Python's `StreamOptions`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    pub include_usage: Option<bool>,
+}
+
 /// One chat message. `content` is either a plain string or an array of
 /// multimodal content parts (`text` / `image_url` / `audio_url` / `input_audio`
 /// / `video_url`); both are accepted, matching `str | list[dict] | None`.
@@ -144,6 +152,9 @@ pub struct ChatCompletionRequest {
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub stream: Option<bool>,
+    /// `{"include_usage": true}` ends a stream with a chunk that carries `usage`.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 
     // Multimodal output (vllm-omni / sglang-omni style).
     #[serde(default)]
@@ -168,8 +179,8 @@ pub struct SpeechRequest {
     #[serde(default = "default_wav")]
     pub response_format: String,
     /// Kept out of `extra`. `None` when the request did not send it,
-    /// `Some(None)` for an explicit `null`: an adapter forwards a sent speed
-    /// (pydantic's `model_fields_set`) and leaves an unsent one out.
+    /// `Some(None)` for an explicit `null`: `audio_speech` forwards a sent
+    /// speed (pydantic's `model_fields_set`) and leaves an unsent one out.
     #[serde(default, deserialize_with = "flex::sent_f64")]
     pub speed: Option<Option<f64>>,
     /// `bool | None` in Python (default False); accept an explicit `null`
@@ -299,6 +310,23 @@ mod tests {
         let r = chat(r#"{"messages":[]}"#);
         assert_eq!(r.stream, None); // absent
         assert_eq!(r.temperature, None);
+    }
+
+    #[test]
+    fn include_usage_reads_a_bool_as_pydantic_does() {
+        let usage = |v: &str| {
+            chat(&format!(r#"{{"messages":[],"stream":true,"stream_options":{{"include_usage":{v}}}}}"#))
+                .stream_options
+                .and_then(|o| o.include_usage)
+        };
+        assert_eq!(usage("true"), Some(true));
+        assert_eq!(usage(r#""false""#), Some(false));
+        assert_eq!(usage("1"), Some(true));
+        assert_eq!(usage("null"), None);
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"messages":[],"stream_options":{"include_usage":"maybe"}}"#
+        )
+        .is_err());
     }
 
     #[test]

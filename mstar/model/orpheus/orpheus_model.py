@@ -20,6 +20,7 @@ windows of frames with left and right context (``OrpheusModelConfig.snac_*``);
 the SNAC decoder emits the audio of each window's own frames.
 """
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -48,9 +49,40 @@ from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+# model_kwargs forwarded to the engine sampler; an unset one takes the config's value
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+
+
+def _checkpoint_sampling_defaults(model_path_hf: str, cache_dir: str | None) -> dict:
+    """Greedy when the checkpoint's generation_config.json sets ``do_sample: false``;
+    {} when it is unreachable (the repo is gated).
+
+    The file is Llama-3.2-3B's chat preset (top_p 0.9), not Orpheus's recipe, so
+    its knob values are not read and the config's apply on every host.
+    """
+    if not model_path_hf:
+        return {}
+    if Path(model_path_hf).is_dir():
+        checkpoint_dir = model_path_hf
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            checkpoint_dir = Path(hf_hub_download(
+                model_path_hf, "generation_config.json", cache_dir=cache_dir,
+            )).parent
+        except Exception as e:
+            logger.warning("No generation_config.json for %s (%s); using config defaults", model_path_hf, e)
+            return {}
+    return load_generation_defaults(checkpoint_dir, switch_only=True)
 
 
 # What the LLM checkpoint is loaded from (configs, tokenizer, safetensors shards).
@@ -100,8 +132,9 @@ class OrpheusModel(Model):
             "snac_left_context_frames": snac_left_context_frames,
             "snac_right_context_frames": snac_right_context_frames,
         }
-        self.config = OrpheusModelConfig(
-            **{k: v for k, v in snac_overrides.items() if v is not None}
+        self.config = dataclasses.replace(
+            OrpheusModelConfig(**{k: v for k, v in snac_overrides.items() if v is not None}),
+            **_checkpoint_sampling_defaults(model_path_hf, cache_dir),
         )
 
         tokenizer_source = _resolve_local_hf_snapshot(
@@ -135,7 +168,7 @@ class OrpheusModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+        return {"LLM": RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token",
                                      loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -262,18 +295,18 @@ class OrpheusModel(Model):
         if prompt is None or not prompt.strip():
             raise ValueError("Orpheus requires a non-empty text prompt")
 
-        # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
-        if voice:
-            voice = str(voice).lower()
-            if voice not in self.config.available_voices:
-                supported = ", ".join(self.config.available_voices)
-                raise ValueError(
-                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
-                )
+        if not isinstance(voice, str) or not voice:
+            raise ValueError(f"voice must be a non-empty name; got {voice!r}")
+        voice = voice.lower()
+        if voice not in self.config.available_voices:
+            supported = ", ".join(self.config.available_voices)
+            raise ValueError(
+                f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+            )
 
         # Format: "{voice}: {text}"
-        adapted_prompt = f"{voice}: {prompt}" if voice else prompt
+        adapted_prompt = f"{voice}: {prompt}"
         prompt_tokens = self.tokenizer(adapted_prompt, return_tensors="pt")
 
         # Wrap with special tokens: [128259, ...tokens..., 128009, 128260, 128261, 128257]
@@ -344,7 +377,10 @@ class OrpheusModel(Model):
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True
+                enable_repetition_penalty=True,
+                # on only when the recipe sets min_p (the checkpoint's file can't: it is read
+                # switch_only); otherwise a request min_p > 0 is refused
+                enable_min_p=self.config.min_p > 0,
             ),
             PositionSpec(
                 resource_key=ROPE,
@@ -366,19 +402,17 @@ class OrpheusModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
-        keys = [
-            "temperature", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{
                     k: model_kwargs.get(k, getattr(self.config, k))
-                    for k in keys
+                    for k in SAMPLING_KEYS
                 }
             )
         }
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"voice", "max_output_tokens", *SAMPLING_KEYS})
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate

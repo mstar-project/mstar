@@ -41,6 +41,7 @@ from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 MIB = 1024 * 1024
 CPU = torch.device("cpu")
@@ -438,15 +439,12 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
         def warmup_and_capture(self, planned):
             events.append("capture")
 
-    class _Resource:
+    class _Resource(StubResource):
         def seal_capture_buffers(self):
             events.append("seal")
 
-        def post_warmup_validate(self):
-            pass
-
     mgmt = make_mgmt(SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset))
-    mgmt._num_slots = 2
+    mgmt._slots.num_slots = 2
     engine = make_engine(_resources={"attn": _Resource()}, _submodules={"dit": mgmt})
     monkeypatch.setattr(engine_mod, "AcceleratorGraphRunner", _Runner)
     monkeypatch.setattr(engine, "_compile_regions", lambda: None, raising=False)

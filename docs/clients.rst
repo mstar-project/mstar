@@ -108,10 +108,10 @@ as a msgpack binary frame (``data`` raw bytes); a field sent as ``null`` counts 
 absent. Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
-``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends with one such reply. Both carry the HTTP ``status`` when there is one
-(``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
-``finish`` follows. Messages may be pipelined —
+``{"request_id", "error": ..., "status": ...}`` with the HTTP status ``/generate`` would
+have returned (``409`` for a ``request_id`` still in flight), and the socket stays open; a
+request that fails after it was accepted ends the same way, and no ``finish`` follows.
+Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 ``request_id`` tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one ``request_id`` it is the later one that gets the
@@ -277,6 +277,103 @@ event loop, so a very large one holds up the server's other requests while it is
        "observation/gripper_position": gripper,        # 1 float
        "prompt": "put the marker in the cup",
    })["actions"]                                       # float32 (15, 8)
+
+.. _generation-parameters:
+
+Generation parameters
+---------------------
+
+``model_kwargs`` knobs mean the same thing on every model, every endpoint, and every
+execution path (eager or CUDA graph). The server checks them once, before the request is
+queued; a value outside these rules is a ``400`` that names the knob and its range, and a
+streaming request gets that status instead of a ``200`` followed by an in-band error. A
+model may narrow a range further (CosyVoice3's ``top_k`` is 1-128 and its ``seed`` at
+least 0; Chatterbox caps ``temperature`` at 5 and ``repetition_penalty`` at 2), and its
+notes in :doc:`models` say so.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 30 48
+
+   * - Knob
+     - Allowed
+     - Meaning
+   * - ``temperature``
+     - number ``>= 0``
+     - ``0`` is greedy (the most likely token; ties go to the lower id). Values below
+       ``1e-5`` are greedy too. A greedy request ignores ``top_k``, ``top_p`` and ``min_p``.
+   * - ``top_k``
+     - integer ``>= 0``
+     - ``0`` is off; so is any value at or above the vocabulary size.
+   * - ``top_p``
+     - number in ``(0, 1]``
+     - ``1`` is off. ``0`` is refused: ask for greedy with ``temperature: 0``.
+   * - ``min_p``
+     - number in ``[0, 1]``
+     - ``0`` is off. A model whose sampler has no min-p filter refuses ``min_p > 0``.
+   * - ``repetition_penalty``
+     - number ``> 0``
+     - ``1`` is off. Counts the prompt's tokens as well as generated ones unless
+       ``penalize_prompt`` is ``false``. A model whose sampler has no penalty refuses
+       any value other than ``1``.
+   * - ``penalize_prompt``
+     - ``true`` / ``false``
+     - Whether ``repetition_penalty`` also counts the prompt (default ``true``).
+   * - ``seed``
+     - signed 64-bit integer
+     - Seeds FlashInfer's sampler. A seeded request repeats only when its batch
+       repeats: the draw also depends on its batch position and on the batch's
+       first request, so under continuous batching the same seed can give different
+       tokens. Absent, the server derives a seed from the request id.
+       Each sampler of a multi-stage model draws its own stream from it.
+   * - ``max_output_tokens``
+     - integer ``>= 1``
+     - In the model's output unit (text tokens, codec frames). ``max_tokens``,
+       ``max_completion_tokens`` and ``max_new_tokens`` are accepted as aliases, in
+       that order of increasing precedence below ``max_output_tokens`` itself. A value
+       above the model's limit is refused rather than cut short.
+   * - ``ignore_eos``
+     - ``true`` / ``false``
+     -
+   * - ``num_inference_steps``
+     - integer ``>= 1``
+     - Denoising steps of an image or video model. Past the denoise loop's ``max_iters``
+       is a 400.
+   * - ``num_step``
+     - integer ``>= 1``
+     - OmniVoice's unmask steps. Past the unmask loop's ``max_iters`` is a 400.
+   * - ``rollout_horizon``
+     - integer ``>= 0``
+     - V-JEPA2's rollout length. Past the rollout loop's ``max_iters`` is a 400.
+   * - ``height``, ``width``, ``num_frames``
+     - integer ``>= 1``
+     - Output size of an image or video model, which may refuse sizes its VAE cannot tile.
+   * - ``fps``
+     - number ``> 0``
+     -
+   * - ``guidance_scale``
+     - number
+     - Classifier-free guidance strength.
+   * - ``speed``
+     - number ``> 0``
+     - Speech rate, for a model that reads it (Kokoro, OmniVoice); any other model logs it
+       as ignored. Only a sent ``speed`` is forwarded, not the OpenAI default of 1.0.
+
+A string that spells a number is read as that number, since some JSON clients send
+numbers as strings: ``"0.7"`` or ``" 0.7 "`` for a real-valued knob, ``"5"`` or ``"5.0"``
+for an integer one (``"5e0"``, ``"5.5"`` and ``"0x1"`` are not integers and are a 400).
+Booleans stay strict: ``"false"`` is not a boolean, and ``true`` is not a number. ``null``
+is the same as leaving the knob out: the model's default applies, which is the
+checkpoint's own ``generation_config.json`` value where it ships one. BAGEL and Orpheus
+are the exception: their files are the backbone's chat presets, so only their
+``do_sample: false`` is read and the models' own defaults stay. MiniCPM-o keeps
+upstream ``chat``'s defaults over its file. Multi-stage models
+take a stage prefix (``talker_temperature``, ``code_predictor_top_k``) with the same
+rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
+of Qwen3-TTS), and a prefixed one wins over it for its stage.
+
+A knob the model does not read is not an error: the request is served, and the server
+logs its name as ignored (check the server log for typos such as ``temprature``).
 
 Python SDK
 ----------
@@ -474,9 +571,12 @@ Per-model notes:
   ignored, and ``null`` means the default. The PNG writer favours
   speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL's
   defaults; a higher ``png_compress_level`` shrinks them.
-- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
-  residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
-  ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
+- **Qwen3-Omni** — text sampling uses plain or ``thinker_*`` keys (a ``thinker_*`` key wins),
+  speech uses ``talker_*`` (on ``/v1/audio/speech`` the plain ``temperature`` / ``top_p``
+  set the Talker), and the residual codec groups use ``code_predictor_*``; set the
+  speaker with ``voice`` (``Ethan`` default, ``Chelsie``, ``Aiden``; any other is a 400) and
+  request audio output by including ``"audio"`` in ``modalities``. ``max_output_tokens``
+  defaults to 2048 and ``talker_max_output_tokens`` to 4096 (the checkpoint's value).
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
 - **Whisper / Higgs-Audio** — for Whisper, ``language`` (ISO-639-1) skips language
@@ -508,6 +608,10 @@ Per-model notes:
   once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
   data worker). The decode up to that point still runs, so this bounds memory, not
   time: refusing a 31 min file takes about as long as decoding it.
+  Whisper also reads ``task`` (``transcribe``, the default, or ``translate`` into
+  English). Its ``max_output_tokens`` is at most 444, the 448-position table less the
+  forced prompt; more is a 400. Higgs-Audio's default is 1024. A key the model does not
+  read is logged as ignored on each request that sends it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal
@@ -602,7 +706,7 @@ Per-model notes:
   drops what the VAD has not put in a turn yet. ``create_response`` and
   ``interrupt_response`` are accepted and echoed but do nothing in a transcription
   session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
-  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  decision waits 3 ms more for the resampler. Install ``mstar-ai[vad]`` (Silero VAD, MIT,
   bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
   ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
@@ -618,7 +722,7 @@ Per-model notes:
   Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
   as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
   thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
-  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  (``mstar-ai[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
   Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
   them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
   and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a
@@ -632,4 +736,5 @@ Per-model notes:
   ``temperature`` / ``top_p`` are ignored: Kokoro does not sample.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
-  in the Orpheus config).
+  in the Orpheus config); an empty or unknown voice is a 400. ``max_output_tokens``
+  defaults to 2048.

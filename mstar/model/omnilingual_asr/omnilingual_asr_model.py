@@ -72,6 +72,11 @@ class OmnilingualASRModel(Model):
       (320): padded audio per forward; a step over it runs as several forwards.
     """
 
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and the decode releases the GIL. Inline at c=32, a 300M request
+    # queued 84 of its 102 ms behind the ones before it.
+    PREPROCESS_PARALLEL = True
+
     def __init__(
         self,
         model_path_hf: str | None = None,
@@ -162,6 +167,10 @@ class OmnilingualASRModel(Model):
         del device
         waveform = load_waveform(filepath)
         return TensorAndMetadata(data=waveform, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
+
+    def request_kwargs(self) -> frozenset[str]:
+        # argmax CTC: the transcription adapter's language, prompt and temperature are not read
+        return frozenset()
 
     def process_prompt(
         self,

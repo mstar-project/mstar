@@ -14,10 +14,12 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05AdaRMSNorm, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
     euler_step,
@@ -25,7 +27,7 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
@@ -67,23 +69,31 @@ def _pi05_cpu_threads():
 @pytest.mark.parametrize(
     ("batched", "batch_size"), [(False, 1), (True, 1), (True, 2)],
 )
-def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+    """The ViT node opts out of the engine's autocast and runs in openpi's
+    precision: bfloat16 except the patch and position embeddings."""
     from mstar.engine.accelerator_graph_runner import autocast_scope
     from mstar.engine.node_dtype import resolve_node_dtype
 
     class Encoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.projection = torch.nn.Linear(3, 8)
+            self.embeddings = torch.nn.Module()
+            self.embeddings.patch_embedding = torch.nn.Linear(3, 4)
+            self.projection = torch.nn.Linear(4, 8)
 
         def forward(self, pixels):
-            return self.projection(pixels.mean(dim=(-1, -2))).unsqueeze(1)
+            pooled = pixels.mean(dim=(-1, -2)).to(self.embeddings.patch_embedding.weight.dtype)
+            embedded = self.embeddings.patch_embedding(pooled)
+            return self.projection(embedded.to(self.projection.weight.dtype)).unsqueeze(1)
 
     with torch.random.fork_rng(devices=[]), torch.no_grad():
         torch.manual_seed(19)
         submodule = Pi05ViTEncoderSubmodule(
             Encoder(), Pi05Config(vit_image_size=4, num_cameras=2),
         ).to("cpu").eval()
+        assert submodule.encoder.embeddings.patch_embedding.weight.dtype == torch.float32
+        assert submodule.encoder.projection.weight.dtype == torch.bfloat16
         images = torch.linspace(-1, 1, batch_size * 96).reshape(batch_size, 2, 3, 4, 4)
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(range(batch_size)), per_request_info={},
@@ -99,7 +109,7 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
                 else:
                     actual = submodule.forward("prefill", engine_inputs, images)["img_emb"][0].unsqueeze(0)
 
-        assert actual.dtype == torch.float32
+        assert actual.dtype == torch.bfloat16
         assert torch.equal(actual, reference)
 
 
@@ -200,8 +210,7 @@ def test_pi05_prefix_scaling_follows_openpi():
     """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
     config = Pi05Config(hidden_size=16)
     embed = torch.nn.Embedding(10, 16)
-    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
-                           torch.nn.Identity(), torch.nn.Identity(), config)
+    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), config)
     img = torch.randn(6, 16)
     ids = torch.tensor([1, 4, 7])
     with torch.no_grad():
@@ -234,51 +243,25 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_pi05_graph_walks_have_expected_keys():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    assert set(walks.keys()) == {Pi05Model.PREFILL_WALK, Pi05Model.ACTION_GEN_WALK}
+def test_pi05_runs_one_graph_walk():
+    assert set(_make_model().get_graph_walk_graphs()) == {Pi05Model.CHUNK_WALK}
 
 
-def test_pi05_prefill_is_sequential_vit_then_llm():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    prefill = walks[Pi05Model.PREFILL_WALK]
-    assert isinstance(prefill, Sequential)
-    assert len(prefill.sections) == 2
-    first, second = prefill.sections
-    assert isinstance(first, GraphNode) and first.name == "vit_encoder"
-    assert isinstance(second, GraphNode) and second.name == "LLM"
-    # vit_encoder must emit img_emb to LLM.
-    assert any(
-        edge.next_node == "LLM" and edge.name == "img_emb"
-        for edge in first.outputs
-    )
-    # LLM consumes img_emb + text_inputs (state is encoded in text_inputs
-    # as a decimal-string suffix per Pi0.5's prompt format).
-    assert set(second.input_names) == {"img_emb", "text_inputs"}
-
-
-def test_pi05_action_gen_is_loop_with_action_output_emission():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    action_gen = walks[Pi05Model.ACTION_GEN_WALK]
-    assert isinstance(action_gen, Loop)
-    assert action_gen.max_iters== model.config.num_flow_steps == 10
-    # The terminal output emits to the client with the action modality.
-    # Its ``name`` must match one of the section's loop-back edge names so
-    # that Loop._replace_outputs_for_final_iter can swap it in on the final
-    # iteration (see the comment in Pi05Model.get_graph_walk_graphs).
-    assert len(action_gen.outputs) == 1
-    terminal = action_gen.outputs[0]
-    assert terminal.next_node == EMIT_TO_CLIENT
-    assert terminal.name == "noisy_actions"
-    assert terminal.output_modality == "action"
-    # Loop body is a single LLM node with two loop-back edges.
-    body = action_gen.section
-    assert isinstance(body, GraphNode) and body.name == "LLM"
-    assert {e.name for e in body.outputs} == {"noisy_actions", "timestep_index"}
-    assert all(e.next_node == "LLM" for e in body.outputs)
+def test_pi05_chunk_walk_is_vit_then_llm_then_action_expert():
+    walk = _make_model().get_graph_walk_graphs()[Pi05Model.CHUNK_WALK]
+    assert isinstance(walk, Sequential)
+    vit, llm, action = walk.sections
+    assert (vit.name, llm.name, action.name) == ("vit_encoder", "LLM", "action_expert")
+    assert [(e.next_node, e.name) for e in vit.outputs] == [("LLM", "img_emb")]
+    # the robot state is part of text_inputs, per Pi0.5's prompt format
+    assert set(llm.input_names) == {"img_emb", "text_inputs"}
+    assert [(e.next_node, e.name) for e in llm.outputs] == [("action_expert", "prefix_done")]
+    assert set(action.input_names) == {"prefix_done"}
+    # the whole denoising loop runs inside this one step
+    assert len(action.outputs) == 1
+    out = action.outputs[0]
+    assert out.next_node == EMIT_TO_CLIENT
+    assert out.output_modality == "action"
 
 
 def test_pi05_kv_cache_config_matches_pi05_config():
@@ -287,12 +270,26 @@ def test_pi05_kv_cache_config_matches_pi05_config():
         spec for spec in model.get_node_resources() if isinstance(spec, KVSpec)
     ]
     assert len(kv_specs) == 1
-    assert kv_specs[0].nodes == {"LLM"}
+    assert kv_specs[0].nodes == {"LLM", "action_expert"}
     kv = kv_specs[0].config
     assert kv.num_layers == model.config.num_layers
     assert kv.num_kv_heads == model.config.num_kv_heads
     assert kv.head_dim == model.config.head_dim
     assert kv.num_qo_heads == model.config.num_qo_heads
+
+
+@pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
+def test_pi05_deployments_pin_flashinfer_fa2(config_name):
+    """The model keeps FlashInfer's "auto" kernel; the pi05 deployments pin
+    FA2, and the override has to reach the LLM node's attention."""
+    from mstar.engine.resources import AttentionSpec
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = _make_model().get_node_resources()
+    attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
+    assert attn.config.flashinfer_backend == "auto"
+    apply_yaml_overrides(specs, yaml.safe_load((Path(CONFIG_PATH).parent / config_name).read_text()))
+    assert attn.config.flashinfer_backend == "fa2"
 
 
 # ----------------------------------------------------------------------
@@ -303,12 +300,7 @@ def test_pi05_kv_cache_config_matches_pi05_config():
 def test_pi05_worker_graphs_from_yaml():
     model = _make_model()
     worker_graphs = model.get_worker_graphs(CONFIG_PATH)
-    # 2 graph walks * 2 worker graphs apiece... but the prefill walk has both
-    # nodes on rank 0 and they belong to different node_groups, so they remain
-    # 2 separate worker graphs. action_gen has only the LLM node.
-    walks_seen = {tuple(sorted(wg.graph_walks)) for wg in worker_graphs}
-    assert (Pi05Model.PREFILL_WALK,) in walks_seen
-    assert (Pi05Model.ACTION_GEN_WALK,) in walks_seen
+    assert {tuple(sorted(wg.graph_walks)) for wg in worker_graphs} == {(Pi05Model.CHUNK_WALK,)}
 
 
 # ----------------------------------------------------------------------
@@ -325,6 +317,12 @@ def test_pi05_plan_refuses_a_request_without_images():
     # without the images the prefill could never run
     with pytest.raises(ValueError, match="image_inputs"):
         _make_model().walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
+
+
+def test_pi05_plan_is_one_chunk_walk():
+    signals = {"image_inputs": [_pointer()], "text_inputs": [_pointer()]}
+    plan = _make_model().walk_plan("default", ["image", "text"], ["action"], signals, {})
+    assert [step.walk for step in plan] == [Pi05Model.CHUNK_WALK]
 
 
 # ----------------------------------------------------------------------
@@ -359,14 +357,6 @@ def test_sincos_timestep_embedding_shape_and_range():
     )
     assert emb.shape == (1, dim)
     assert torch.all(emb.abs() <= 1.0 + 1e-6)
-
-
-def test_pi05_action_gen_time_embedding_fits_an_eager_batch_past_the_capture_sizes():
-    """The buffer was sized to the largest captured batch (4), so an eager batch of 5 got 4 rows and crashed."""
-    llm = object.__new__(Pi05LLMSubmodule)
-    llm._time_emb_buffer, llm.config = None, Pi05Config()
-    llm.get_device = lambda: torch.device("cpu")
-    assert llm._get_time_emb_buffer(5).shape == (5, llm.config.action_hidden_size)
 
 
 def test_euler_step_shapes():
@@ -835,6 +825,48 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
     assert remap("totally.unknown.key") is None
 
 
+# ----------------------------------------------------------------------
+# generation-input contract
+# ----------------------------------------------------------------------
+
+
+def test_pi05_request_kwargs_are_only_the_robot_state():
+    model = _make_model()
+    # flow steps are deployment YAML; a client num_steps is reported as ignored
+    assert model.request_kwargs() == {"robot_state"}
+
+
+@pytest.mark.parametrize("state", [
+    "0.1 0.2",
+    [0.1, "0.2"],
+    [True, 0.0],
+    [[0.1, 0.2]],
+    [],
+    [0.0] * 33,
+    [float("nan")],
+    {"a": 1},
+])
+def test_pi05_bad_robot_state_is_a_400(state):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="robot_state"):
+        model.process_prompt(
+            prompt="pick", input_modalities=["image", "text"], output_modalities=["action"], robot_state=state,
+        )
+
+
+def test_pi05_out_of_range_state_bins_as_openpi_does():
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors=_ONE_IMAGE, robot_state=[-5.0, 0, 5.0] + [0.5] * 29,
+    )
+    # below -1 is bin -1 and at or above 1 the last bin (`discretize_state`)
+    assert stub.last_prompt.split("State: ", 1)[1].startswith("-1 128 255 192 ")
+
+
 @pytest.mark.parametrize("policy_saved", [False, True])
 def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy_saved):
     """lerobot/pi05_droid is a saved PI05Policy: every key sits under ``model.`` and
@@ -879,3 +911,120 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
     assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
+
+
+def test_pi05_prefill_buckets_hold_whole_requests():
+    """Three 256-token cameras and a 200-token prompt make a 968-token prefix. Each
+    captured batch size gets a bucket for that many whole prefixes, and none longer."""
+    capture = Pi05LLMSubmodule(None, None, _make_model().config).get_accelerator_graph_configs(torch.device("cpu"))[0]
+    assert capture.get_total_tokens(1) == [512, 968]
+    assert capture.get_total_tokens(2) == [512, 968, 1936]
+    assert capture.get_total_tokens(4) == [512, 968, 1936, 3872]
+
+
+@pytest.mark.parametrize("action_ranks", [[0], [1]])
+def test_pi05_refuses_experts_in_separate_node_groups(action_ranks):
+    # on rank 1 the action expert would read an empty KV cache; on rank 0 it would
+    # share the cache, but its step would go through the conductor after the prefix
+    groups = [{"node_names": ["LLM"], "ranks": [0]}, {"node_names": ["action_expert"], "ranks": action_ranks}]
+    with pytest.raises(ValueError, match="one entry"):
+        _make_model().validate_config_yaml({"node_groups": groups}, "pi05.yaml")
+
+
+def test_pi05_shipped_configs_keep_the_experts_together():
+    for name in ("pi05.yaml", "pi05_droid.yaml"):
+        groups = yaml.safe_load((Path(CONFIG_PATH).parent / name).read_text())["node_groups"]
+        assert any({"LLM", "action_expert"} <= set(group["node_names"]) for group in groups)
+
+
+class _PassThroughExpert(torch.nn.Module):
+    """Returns the action tokens unchanged and records, per Euler step, the row each
+    adaRMS norm would read from the modulations it is handed."""
+
+    modulations = Pi05ActionExpert.modulations
+
+    def __init__(self, hidden: int, num_layers: int = 2):
+        super().__init__()
+
+        def norm(slot):
+            return Pi05AdaRMSNorm(hidden, cond_dim=hidden, eps=1e-6, slot=slot)
+
+        self.layers = torch.nn.ModuleList(
+            torch.nn.ModuleDict({"input_layernorm": norm(0), "post_attention_layernorm": norm(1)})
+            for _ in range(num_layers)
+        )
+        self.norm = norm(0)
+        for module in self.modules():
+            if isinstance(module, Pi05AdaRMSNorm):
+                torch.nn.init.normal_(module.dense.weight, std=0.1)
+                torch.nn.init.normal_(module.dense.bias, std=0.1)
+        self.read: list[dict[Pi05AdaRMSNorm, torch.Tensor]] = []
+
+    def forward(self, query_sequence, layer_modulations, final_modulation, *, label):
+        rows = {self.norm: final_modulation[self.norm.slot]}
+        for layer, block in zip(self.layers, layer_modulations, strict=True):
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+                rows[norm] = block[norm.slot]
+        self.read.append(rows)
+        return query_sequence
+
+
+def _action_submodule(velocity_scale: float = 0.5) -> Pi05ActionSubmodule:
+    """An action expert node whose velocity is ``velocity_scale`` times the actions."""
+    config = Pi05Config(action_hidden_size=16, action_horizon=3, action_dim=4)
+    hidden, dim = config.action_hidden_size, config.action_dim
+    action_in_proj = torch.nn.Linear(dim, hidden, bias=False)
+    action_out_proj = torch.nn.Linear(hidden, dim, bias=False)
+    with torch.no_grad():
+        action_in_proj.weight.copy_(torch.eye(hidden, dim))
+        action_out_proj.weight.copy_(velocity_scale * torch.eye(dim, hidden))
+    return Pi05ActionSubmodule(_PassThroughExpert(hidden), action_in_proj, action_out_proj, Pi05TimeMLP(hidden), config)
+
+
+@torch.no_grad()
+def test_pi05_each_euler_step_conditions_every_norm_on_its_own_time():
+    """The loop maps the adaRMS condition of every step before the first. Step ``k``
+    runs at t = 1 - k/n, where each norm reads ``dense(time_mlp(sincos(t)))`` through
+    its own dense layer."""
+    torch.manual_seed(0)
+    action = _action_submodule()
+    config, fraction = action.config, action._get_timestep_emb_fraction()
+    action._denoise(torch.randn(config.action_horizon, config.action_dim), fraction=fraction)
+    read = action.action_expert.read
+    assert len(read) == config.num_flow_steps
+    for k, rows in enumerate(read):
+        t = torch.tensor([1.0 - k / config.num_flow_steps])
+        time_emb = sincos_timestep_embedding(
+            t, dim=config.action_hidden_size, fraction=fraction,
+            output_buffer=torch.empty(1, config.action_hidden_size),
+            min_period=config.timestep_min_period, max_period=config.timestep_max_period,
+        )
+        cond = action.time_mlp(time_emb)
+        for norm, row in rows.items():
+            torch.testing.assert_close(
+                row, norm.dense(cond)[0], msg=f"step {k}: a norm read another step's or another norm's modulation",
+            )
+
+
+@torch.no_grad()
+def test_pi05_denoising_takes_num_flow_steps_euler_steps_toward_t_0():
+    """With a velocity of 0.5 x, ten steps of dt = -1/10 scale the noise by 0.95^10."""
+    action = _action_submodule(velocity_scale=0.5)
+    config = action.config
+    noise = torch.randn(config.action_horizon, config.action_dim)
+    actions = action._denoise(noise, fraction=action._get_timestep_emb_fraction())
+    torch.testing.assert_close(
+        actions, noise * (1 - 0.5 / config.num_flow_steps) ** config.num_flow_steps,
+        msg="the loop took another number of steps, or stepped away from t=0",
+    )
+
+
+@torch.no_grad()
+def test_pi05_denoises_an_eager_batch_past_the_capture_sizes():
+    """A batch one past the largest captured one runs eagerly. The time embedding has a row per
+    Euler step rather than per request, so no buffer is sized to the captured batches."""
+    action = _action_submodule(velocity_scale=0.5)
+    config = action.config
+    noise = torch.randn((max(action.ACTION_GEN_CAPTURE_BATCH_SIZES) + 1) * config.action_horizon, config.action_dim)
+    actions = action._denoise(noise, fraction=action._get_timestep_emb_fraction())
+    torch.testing.assert_close(actions, noise * (1 - 0.5 / config.num_flow_steps) ** config.num_flow_steps)
