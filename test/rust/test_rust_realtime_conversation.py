@@ -84,7 +84,8 @@ class _Duplex:
             setattr(self.model, k, v)
         self.client_audio = [Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None,
                                         audio=ClientAudio(16000, FRAME))]
-        # Model.live_transcription_stream: the one ClientAudio stream, with no turn tokens
+        # Model.live_transcription_stream: the one ClientAudio stream, with no turn tokens (and, as
+        # these fakes declare no walks, no audio out)
         self.model.live_transcription_stream = self.client_audio[0] if self.model.turn_tokens is None else None
         self.client_streams = frozenset({"audio_in"})
         self.takes_stream_input = True
@@ -535,6 +536,9 @@ LIVE = {
     "failed": ([_text(0, b" hello"), _Chunk("error", b"boom reading /srv/ckpt/model.safetensors", {"status": 500})], [
         _append(_tone(16000, 0.2).tobytes()), 0.3, _append(_tone(16000, 0.2).tobytes()), COMMIT,
         _append(_tone(16000, 0.1).tobytes()), 0.3, COMMIT, END]),
+    # an append that fails inside the server is an error event; the item's call goes on
+    "append-fails": ([_text(0, b" hello")], [
+        _append(np.array([16384], "<i2").tobytes()), _append(_tone(16000, 0.2).tobytes()), COMMIT, END]),
 }
 
 
@@ -556,6 +560,10 @@ def test_live_transcription_reads_as_pythons(stacks, monkeypatch, name):
         assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello wörld"] * 2
         assert [s["model_kwargs"] for s in py[2]["submits"]] == [None, {"language": "de"}]
         assert py[2]["ended"] == 2 and "mstar.transcription.partial" in kinds
+    elif name == "append-fails":
+        assert [e["error"]["message"] for e in py[0] if e["type"] == "error"][0] == "the append failed (error id X)"
+        assert [e["transcript"] for e in py[0] if e["type"].endswith(".completed")] == ["hello"]
+        assert len(py[2]["appends"]) == 1 and py[2]["ended"] == 1
     else:
         assert kinds.count("conversation.item.input_audio_transcription.failed") == 2
         assert len(py[2]["appends"]) == 2 and py[2]["ended"] == 0

@@ -362,6 +362,14 @@ def decode_append(payload: str, carry: bytes = b"", codec: str = "audio/pcm") ->
     return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
 
 
+def _append_failed(exc: Exception, session_id: str) -> dict:
+    """The error event for an append that failed inside the server: an error
+    id, under which the log has the error."""
+    error_id = uuid.uuid4().hex[:12]
+    logger.error("realtime append failed (error id %s, session %s)", error_id, session_id, exc_info=exc)
+    return error_event(f"the append failed (error id {error_id})", kind="server_error")
+
+
 def _append_error(audio: np.ndarray, rate: int) -> dict | None:
     """The ``error`` for an append of more than ``MAX_ITEM_SECONDS`` of
     ``rate`` audio, or None."""
@@ -1098,6 +1106,9 @@ class RealtimeLiveTranscription(RealtimeTranscription):
         except ValueError as exc:  # past the call's input budget: the item ends with it
             self.api.reject_input(self.key, f"append rejected: {exc}", 400)
             return
+        except Exception as exc:  # noqa: BLE001 — an error event, and the session goes on, as a conversation's
+            await self.send(_append_failed(exc, s.session_id))
+            return
         s.streamed_samples += int(chunk.size)
         s.chunk_id += 1
 
@@ -1427,10 +1438,7 @@ class RealtimeConversation:
                 self.api.reject_input(self.key, f"append rejected: {exc}", 400)
                 return False
             except Exception as exc:  # noqa: BLE001 — the client gets an error event, not a bare close
-                error_id = uuid.uuid4().hex[:12]
-                logger.error("realtime append failed (error id %s, session %s)", error_id, self.session_id,
-                             exc_info=exc)
-                await self.send(error_event(f"the append failed (error id {error_id})", kind="server_error"))
+                await self.send(_append_failed(exc, self.session_id))
                 return False
 
     async def _clock(self) -> None:
