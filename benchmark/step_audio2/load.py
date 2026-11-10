@@ -13,6 +13,10 @@ Workloads (``POST /generate``, streamed):
   the model, so its length varies: compare steps/s and audio s/s, not req/s.
 * ``t2s``: a text question, a spoken reply, as ``s2s``.
 
+``--unique-lengths`` trims each request's clip to its own length (seeded by the request), as
+real traffic's clips are: a shape-keyed cost (a kernel plan per input length) then lands on
+every request rather than once per clip.
+
 A streamed text chunk is one LLM step (a speech id's is empty), so steps/s is the LLM's
 decode rate as the client sees it. Prints one JSON line of aggregates; ``--out`` keeps the
 per-request records.
@@ -44,6 +48,20 @@ QUESTIONS = [
 SAMPLE_RATE = 24000
 
 
+def trimmed(clip: bytes, i: int) -> bytes:
+    """``clip`` cut to a length of its own for request ``i``: between 1.5 s and all of it."""
+    import io
+    import random
+
+    import soundfile as sf
+
+    data, rate = sf.read(io.BytesIO(clip), dtype="float32")
+    keep = random.Random(i).randint(int(1.5 * rate), len(data))
+    out = io.BytesIO()
+    sf.write(out, data[:keep], rate, format="WAV")
+    return out.getvalue()
+
+
 async def one(session: aiohttp.ClientSession, url: str, i: int, args, clips: list[bytes]) -> dict:
     spoken = args.workload in ("s2s", "t2s")
     audio_in = args.workload in ("s2t", "s2s")
@@ -59,7 +77,8 @@ async def one(session: aiohttp.ClientSession, url: str, i: int, args, clips: lis
     form.add_field("model_kwargs", json.dumps(kwargs))
     if audio_in:
         k = i % len(clips)
-        form.add_field("files", clips[k], filename=f"clip{k}.wav")
+        clip = trimmed(clips[k], i) if args.unique_lengths else clips[k]
+        form.add_field("files", clip, filename=f"clip{k}.wav")
     else:
         form.add_field("text", QUESTIONS[i % len(QUESTIONS)])
     t0 = time.perf_counter()
@@ -141,6 +160,7 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=0, help="requests sent (at the concurrency) before timing")
     ap.add_argument("--text-tokens", type=int, default=256)
     ap.add_argument("--speech-tokens", type=int, default=1024)
+    ap.add_argument("--unique-lengths", action="store_true", help="trim each request's clip to its own length")
     ap.add_argument("--out", type=Path, default=None)
     print(json.dumps(asyncio.run(run(ap.parse_args()))), flush=True)
 
