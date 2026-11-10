@@ -222,6 +222,18 @@ class TestCarry(unittest.TestCase):
                          {"run": "targeted", "checks": "correctness"},
                          "an AMD box would test only the commits since an NVIDIA-only pass")
 
+    def test_the_review_gets_no_since_diff_from_a_pass_that_missed_a_vendor(self):
+        pull = {"title": "T", "base": {"repo": BASE_REPO}}
+        for vendors, written in (("nvidia", False), ("nvidia,amd", True)):
+            with self.subTest(vendors), workspace() as ws:
+                routes = {f"GET repos/{R}/compare/main...*": {"files": [{"filename": "mstar/ops/rocm_attention.py"}]},
+                          f"GET repos/{R}/compare/{'a' * 40}...*": {"status": "ahead", "commits": []}}
+                earlier = live_test("pass", vendors=vendors)
+                conversation = [{"user": earlier["user"]["login"], "body": earlier["body"]}]
+                step(lambda out, c=conversation: bot.since_live_test(R, pull, "1" * 40, c), routes)
+                self.assertEqual((ws / "since-live-test.diff").exists(), written,
+                                 "the review would call `targeted` on the commits since an NVIDIA-only pass")
+
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
                              ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):

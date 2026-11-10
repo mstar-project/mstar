@@ -205,6 +205,13 @@ def vendors_of(words):
     return [v for v in VENDORS if v == "nvidia" or any(AMD_HARDWARE.fullmatch(w) for w in words)]
 
 
+def vendors_for(pull, sha):
+    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
+    against the default branch, as the approval reads it. carry decides with it, and so does the review's
+    since-live-test diff (bot.since_live_test)."""
+    return vendors_of(hardware_named(pull, changed_files(pull["base"]["repo"]["default_branch"], sha) or []))
+
+
 def vendor_list(text):
     """VENDORS named in `text`, comma-separated, NVIDIA's always among them; anything else raises."""
     vendors = text.split(",")
@@ -274,9 +281,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
         print("::notice::No live test: the review left open items to fix first.")
         out["gated"] = "true"
         return
-    pull = bot.api(f"repos/{REPO}/pulls/{pr}")
-    # Against the default branch, as the approval reads the hardware the PR names.
-    vendors = vendors_of(hardware_named(pull, changed_files(pull["base"]["repo"]["default_branch"], head_sha) or []))
+    vendors = vendors_for(bot.api(f"repos/{REPO}/pulls/{pr}"), head_sha)
     out["vendors"] = ",".join(vendors)
     last = last_live_test(pr)
     live = review.get("live_test") or {}

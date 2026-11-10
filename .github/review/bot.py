@@ -543,7 +543,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if not prev:
         rereview_inputs(out, repo, pull, head_sha, diff, conversation)
     if mode == "full":
-        since_live_test(repo, head_sha, conversation)
+        since_live_test(repo, pull, head_sha, conversation)
     write_stacked_above(out, repo, pull, head_sha)
     write_open_issues(repo, mode)
     out["lines"] = diff.count("\n")
@@ -653,13 +653,16 @@ def passed_on_ancestor(repo, live, head_sha):
     return status in ("ahead", "identical")
 
 
-def since_live_test(repo, head_sha, conversation):
+def since_live_test(repo, pull, head_sha, conversation):
     """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
-    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor), for the
-    review's live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused
-    either) the review judges the whole PR."""
+    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
+    vendor this PR's live test needs (gpu_review.vendors_for, as the live-test job decides), for the review's
+    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either) the review
+    judges the whole PR."""
+    import gpu_review  # here, not at the top: it imports this module
     live = last_live_test(conversation)
-    if not passed_on_ancestor(repo, live, head_sha):
+    if not passed_on_ancestor(repo, live, head_sha) \
+            or not set(gpu_review.vendors_for(pull, head_sha)) <= set(live["vendors"]):
         return
     tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:
