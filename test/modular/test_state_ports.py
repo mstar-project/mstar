@@ -48,7 +48,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Layout, Span
 from mstar.engine.state.adapters import (
     PAGED,
@@ -63,7 +63,13 @@ from mstar.engine.state.adapters import (
 )
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import causal_conv
-from mstar.model.base import LabelLayout, enabled_resources, parse_autocast_dtype, serving_resources
+from mstar.model.base import (
+    LabelLayout,
+    ProcessPromptOutput,
+    enabled_resources,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
@@ -71,6 +77,7 @@ from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED, ROPE
 from mstar.model.multimodal import vision_encoder
+from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -504,6 +511,19 @@ def test_qwen3_5_leased_vision_step_declares_none_as_it_did(monkeypatch):
     assert step is None
 
 
+def test_qwen3_5_leased_vision_step_beside_a_lora_pool_declares_its_spans_and_no_attention(monkeypatch):
+    """The replayed block loop's region declares the attention, and the patch embed and merger outside it still need
+    the spans planned for a resource whose step is the segments (a LoRA pool), as `main` declares them."""
+    encoder = _qwen3_5_encoder(monkeypatch)
+    encoder.bind_node_resources({"lora": SimpleNamespace(steps_from_segments=True)})
+    inputs = [SimpleNamespace(resource_step_info={"main": (4, 4)})]
+    leases = {VISION_BLOCK_LOOP: object()}
+    step = engine_step(encoder, graph_walk="prefill_vision", request_ids=[1], inputs=inputs, piecewise_leases=leases)
+    segments = [Segment(1, "main", 4), Segment(1, "main", 4)]
+    assert not step.state, "a leased step's attention is its region's, which would plan it twice"
+    assert step.segments == segments and step.steps == {"lora": ResourceStep(segments=tuple(segments))}
+
+
 def test_qwen3_5_vision_region_steps_equal_the_hand_written_ones(monkeypatch):
     encoder = _qwen3_5_encoder(monkeypatch)
     config = encoder.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.bfloat16)[VISION_BLOCK_LOOP]
@@ -560,6 +580,24 @@ def test_qwen3_5_vision_layout_converts_to_the_hand_written_one_with_no_keyed_sp
     assert converted == reference
     assert converted.keyed_count() == 0, "the data worker refuses a keyed span from any walk but prefill_text"
     assert converted.row() == reference.row(), "the one-walk check runs in row(), and the conductor reads what it gives"
+
+
+def test_qwen3_5_hands_on_the_scaffolds_keyed_spans(monkeypatch):
+    """The scaffold keys no span of a media prompt, whose leading text the data worker would refuse to key on its
+    `prefill_vision` walk. The state layout holds no count, so it rides beside it."""
+    spans = (
+        Span("ids", "prefill_vision", 3, 3, "text_inputs"), Span("rows", "prefill_vision", 8, 6, "text_inputs"),
+        Span("ids", "prefill_vision", 2, 2, "text_inputs"),
+    )
+    scaffold = LabelLayout(spans=spans, growth=(("decode_loop", 1),), keyed_spans=0)
+    monkeypatch.setattr(
+        MultimodalDecoderModel, "process_prompt",
+        lambda *args, **kwargs: ProcessPromptOutput({}, {"kv_layout": {KV_CACHE: {"main": scaffold}}}),
+    )
+    model = _qwen3_5(**QWEN3_5["9B"])
+    metadata = model.process_prompt("hello", ["text", "image"], ["text"]).metadata
+    converted = kv_layouts(model.declare_state(), metadata["state_layout"], metadata.get("keyed_spans", {}))
+    assert converted == {KV_CACHE: {"main": scaffold}}, "the leading text span would be keyed"
 
 
 def test_qwen3_5_request_settings_equal_the_hand_written_config():
