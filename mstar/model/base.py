@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
+    from mstar.streaming.topology import Connection
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -1282,6 +1283,17 @@ class Model(ABC):
     # and open them.
     turn_idle_steps: int | None = None
     turn_silence_rms: float = 0.005
+
+    @property
+    def live_transcription_stream(self) -> "Connection | None":
+        """The client stream ``/v1/realtime?intent=transcription`` hears as it
+        comes: the model's one ``ClientAudio`` stream when it declares no
+        ``turn_tokens``, so its text is a transcript rather than replies (such
+        as Nemotron ASR with ``live_lookahead``). None otherwise."""
+        if self.turn_tokens is not None:
+            return None
+        audio = [conn for conn in self.get_partition_topology().client_connections() if conn.audio is not None]
+        return audio[0] if len(audio) == 1 else None
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

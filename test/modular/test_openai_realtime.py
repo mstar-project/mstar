@@ -1739,8 +1739,11 @@ class _LiveTranscriptionAPI(_DuplexAPI):
     item, whose output ends once its input does, or after an error chunk."""
 
     def __init__(self, outputs=()):
+        from mstar.streaming.topology import PartitionTopology
+
         super().__init__(outputs)
         self.model.turn_tokens = None
+        self.model.get_partition_topology = lambda: PartitionTopology(["Encoder"], self.client_audio)
         self.ended: list = []
         self.input_ended: asyncio.Event | None = None
 

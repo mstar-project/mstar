@@ -232,9 +232,9 @@ async def realtime(websocket: WebSocket):
     api = _api()
     audio = api.client_audio if api is not None else []
     # a model that hears audio as it comes and writes a transcript, with no turns
-    if len(audio) == 1 and intent == "transcription" and api.model.turn_tokens is None \
-            and (adapter := get_adapter(api.model_name)) is not None:
-        await serving_realtime.RealtimeLiveTranscription(api, api.model_name, adapter, websocket, audio[0]).run()
+    stream = api.model.live_transcription_stream if api is not None else None
+    if stream is not None and intent == "transcription" and (adapter := get_adapter(api.model_name)) is not None:
+        await serving_realtime.RealtimeLiveTranscription(api, api.model_name, adapter, websocket, stream).run()
         return
     # why a model with an audio client stream can't hold a conversation (None: it can)
     no_conversation = None
