@@ -213,10 +213,11 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     """Only ``decode_spoken``'s graph routes each row's input id and hidden, which
     the TTS prefill reads. The LLM, built with its graph's decode and hidden walks,
     returns them from the one decode capture both decode walks replay; a text
-    reply's row drops them, and a spoken reply's keeps its own copy for its loop
-    to accumulate."""
+    reply's row drops them, and the step's spoken rows keep theirs, taken as one
+    copy for their loops to accumulate."""
     from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
     from mstar.model.minicpm_o.submodules import MiniCPMOLLM
+    from mstar.model.submodule_base import BatchedModelOutput
 
     model = a_model(tmp_path)
     graphs = model.get_graph_walk_graphs()
@@ -230,19 +231,24 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     sampler = SimpleNamespace(sample=lambda rids, logits: logits[:, 0].long())
     # a mixed step of one-token rows: each row is its own last token
     attn = SimpleNamespace(select_last_hidden=lambda rows: rows)
-    engine_inputs = SimpleNamespace(request_ids=["text", "spoken"], resources={SAMPLER: sampler, "attn": attn})
-    rows = llm.forward_batched("mixed", engine_inputs, input_ids=torch.tensor([5, 6])).row_outputs
-    assert rows[ROW_IDS].tolist() == [5, 6]
-    assert rows[ROW_HIDDEN].tolist() == [[5.0, 6.0], [6.0, 7.0]]
-    for i, walk in enumerate(("decode", DECODE_SPOKEN)):
-        outputs = {name: [rows[name][i:i + 1]] for name in rows}
-        llm.postprocess(engine_inputs.request_ids[i], SimpleNamespace(graph_walk=walk), outputs)
-        if walk == "decode":
-            assert ROW_IDS not in outputs and ROW_HIDDEN not in outputs
-        else:
-            (hidden,) = outputs[ROW_HIDDEN]
-            assert hidden.tolist() == [[6.0, 7.0]]
-            assert hidden.untyped_storage().data_ptr() != rows[ROW_HIDDEN].untyped_storage().data_ptr()
+    walks = {"text": "decode", "spoken": DECODE_SPOKEN, "spoken2": DECODE_SPOKEN}
+    engine_inputs = SimpleNamespace(request_ids=list(walks), resources={SAMPLER: sampler, "attn": attn})
+    rows = llm.forward_batched("mixed", engine_inputs, input_ids=torch.tensor([5, 6, 7])).row_outputs
+    assert rows[ROW_IDS].tolist() == [5, 6, 7]
+    assert rows[ROW_HIDDEN].tolist() == [[5.0, 6.0], [6.0, 7.0], [7.0, 8.0]]
+    # the engine's per-request outputs: views of the step's one batch clone
+    outputs = BatchedModelOutput(per_rid_outputs={
+        rid: {name: [rows[name][i:i + 1]] for name in rows} for i, rid in enumerate(walks)
+    })
+    infos = {rid: SimpleNamespace(graph_walk=walk) for rid, walk in walks.items()}
+    llm.batch_postprocess(outputs, infos, [None] * len(walks))
+    assert ROW_IDS not in outputs.get("text") and ROW_HIDDEN not in outputs.get("text")
+    spoken = [outputs.get(rid)[ROW_HIDDEN][0] for rid in ("spoken", "spoken2")]
+    assert [h.tolist() for h in spoken] == [[[6.0, 7.0]], [[7.0, 8.0]]]
+    assert [outputs.get(rid)[ROW_IDS][0].tolist() for rid in ("spoken", "spoken2")] == [[6], [7]]
+    # one copy for the step's spoken rows, apart from the batch clone
+    assert spoken[0].untyped_storage().data_ptr() == spoken[1].untyped_storage().data_ptr()
+    assert spoken[0].untyped_storage().data_ptr() != rows[ROW_HIDDEN].untyped_storage().data_ptr()
 
 
 def test_tts_code_budget_is_its_loop_cap():

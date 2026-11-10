@@ -721,20 +721,31 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             return {loopback.signal: loopback.buffer}
         return super().inline_client_signals(graph_walk)
 
-    def postprocess(
+    def batch_postprocess(
         self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        super().postprocess(request_id, request_info, outputs, **kwargs)
-        if ROW_HIDDEN not in outputs:
+        outputs: BatchedModelOutput,
+        request_infos: Mapping[str, CurrentForwardPassInfo],
+        inputs: list[ARNodeInputs],
+        piecewise_runners: Mapping[str, Any] | None = None,
+    ) -> None:
+        """A row whose own walk (in a mixed step too) routes `ROW_IDS` and
+        `ROW_HIDDEN` keeps them, all such rows of the step gathered into one
+        copy: its loop may accumulate them for the reply's life, and a view of
+        the step's batch clone would keep every row of it alive. Any other row
+        drops them. A rows-only step routes nothing off the device."""
+        if not self._hidden_walks or not outputs.per_rid_outputs:
             return
-        if request_info.graph_walk not in self._hidden_walks:  # the row's own walk, in a mixed step too
-            del outputs[ROW_IDS], outputs[ROW_HIDDEN]
-            return
-        # A loop accumulates them for the reply's life, and a row is a view
-        # of the step's batch clone, which it would keep alive whole.
-        for name in (ROW_IDS, ROW_HIDDEN):
-            outputs[name] = [t.clone() for t in outputs[name]]
+        kept = []
+        for rid, info in request_infos.items():
+            out = outputs.get(rid)
+            if out is None or ROW_HIDDEN not in out:
+                continue
+            if info.graph_walk in self._hidden_walks:
+                kept.append(out)
+            else:
+                del out[ROW_IDS], out[ROW_HIDDEN]
+        if kept:
+            for name in (ROW_IDS, ROW_HIDDEN):
+                rows = torch.cat([out[name][0] for out in kept]).split(1)
+                for out, row in zip(kept, rows, strict=True):
+                    out[name] = [row]

@@ -3496,7 +3496,8 @@ together). The model reads both sets off its graph once (``decoder_walks()``, a
 ``DecoderWalks``) and builds its node with them (``walks=``; the default is ``DECODE_WALK``
 alone, the scaffold's own graph). A node with hidden walks returns both outputs from every
 step, so every capture holds them; a row whose walk has no edge for them leaves them
-unrouted, and a row whose walk has one gets its own copy, which a loop may accumulate.
+unrouted, and the step's rows whose walk has one take them as one copy (in
+``batch_postprocess``), which a loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
