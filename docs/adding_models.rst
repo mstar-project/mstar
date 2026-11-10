@@ -843,7 +843,9 @@ The spec types are:
        An MTP verify block that the device places after its last accepted row rather than
        where the host planned it declares ``DSAStep(rows_may_move=True)`` and moves its rows
        with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
-       ``spare_row``, masked in its rope slot.
+       ``spare_row``, masked in its rope slot. That needs ``DSAConfig(rope_slot_masks=True)``:
+       a rope slot holding no key (NoPE) and queries that fill it with ones; the resource
+       refuses a moving step otherwise, since a padded entry would score against a real RoPE key.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
