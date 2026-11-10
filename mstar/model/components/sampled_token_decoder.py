@@ -13,9 +13,10 @@ and its attention key, and an MRoPE model adds its own positions.
 
 The decode loop may run under more than one walk: MiniCPM-o's spoken reply
 decodes on ``decode_spoken``, whose graph also hands each row's input id and
-post-norm hidden state to its TTS. A node is built with the walks its model's
-graph runs it in the decode loop and the walks that route those two
-(`DecoderWalks`, read off the graph by `decoder_walks`). With any of the
+post-norm hidden state to its TTS. A node takes the walks its model's graph
+runs it in the decode loop and the walks that route those two
+(`DecoderWalks`, read off the graph by `decoder_walks`) through `bind_walks`,
+which the scaffold's `get_submodule` calls. With any of the
 latter it returns them as `ROW_IDS` and `ROW_HIDDEN` from every step, one row
 per request, so every capture holds them; a row whose walk has no edge for
 them leaves them unrouted.
@@ -131,7 +132,10 @@ def decoder_walks(
             raise ValueError(f"{node} sends {sorted(sent)} alone in {walk!r}: a row's ids and hidden go together")
         if sent:
             hidden.add(walk)
-    return DecoderWalks(loop_walks(graphs, loop, node), frozenset(hidden))
+    decode = loop_walks(graphs, loop, node)
+    if not decode:
+        raise ValueError(f"no walk runs {node} inside Loop {loop!r}: a decoder needs a decode walk")
+    return DecoderWalks(decode, frozenset(hidden))
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
@@ -198,21 +202,26 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
         text_prompts: bool = True,
-        walks: DecoderWalks | None = None,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
         them; a text-only node passes none. ``text_prompts`` is the model's
         `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
-        prefill walk, so nothing captures one or a mixed step. ``walks`` are
-        its model's `DecoderWalks` (`MultimodalDecoderModel.decoder_walks`);
-        None is ``DECODE_WALK`` alone, the scaffold's own graph."""
+        prefill walk, so nothing captures one or a mixed step. Its walks are
+        ``DECODE_WALK`` alone until `bind_walks` gives it its graph's, as
+        `MultimodalDecoderModel.get_submodule` does for every model on the
+        scaffold."""
         super().__init__()
         self._text_prompts = text_prompts
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
-        walks = walks or DecoderWalks(frozenset({self.DECODE_WALK}))
+        self.bind_walks(DecoderWalks(frozenset({self.DECODE_WALK})))
+
+    def bind_walks(self, walks: DecoderWalks) -> None:
+        """Run under the `DecoderWalks` of its model's graph
+        (`decoder_walks`): the stop, the decode capture, the mixed step and
+        the hidden outputs all read them."""
         if self.DECODE_WALK not in walks.decode:
             raise ValueError(f"{type(self).__name__}'s decode walks {sorted(walks.decode)} miss {self.DECODE_WALK!r}")
         self._decode_walks, self._hidden_walks = walks
@@ -220,7 +229,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # decode, which the walk plan marks
         prefills = self._media_walks | ({self.PREFILL_WALK} if self._text_prompts else set())
         self.token_stop = TokenStop(
-            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
+            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(self.config.stop_token_ids),
             sampler=self.SAMPLER, walk=self._decode_walks, prefill_walks=frozenset(prefills),
             last_prefill_flag=FINAL_PREFILL,
             # the graph runtime checks a decode row's stop ids itself, without

@@ -32,7 +32,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
-from mstar.model.components.sampled_token_decoder import DecoderWalks, decoder_walks
+from mstar.model.components.sampled_token_decoder import DecoderWalks, SampledTokenDecoder, decoder_walks
 from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -195,7 +195,7 @@ class MultimodalDecoderModel(Model):
 
     def decoder_walks(self) -> DecoderWalks:
         """The LLM node's decode and hidden walks, read off this model's graph:
-        what its node is built with, and what the mixed step and the KV growth
+        what `get_submodule` binds to its node, and what the mixed step and the KV growth
         name."""
         return decoder_walks(self.get_graph_walk_graphs(), "LLM", self.DECODE_LOOP)
 
@@ -477,9 +477,11 @@ class MultimodalDecoderModel(Model):
         if node_name not in self._submodule_cache:
             # the weights' dtype, and the fused kernel's: they must agree
             dtype = autocast_dtype or torch.bfloat16
-            self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, dtype, tp_group,
-            )
+            submodule = self._create_submodule(node_name, device, dtype, tp_group)
+            if isinstance(submodule, SampledTokenDecoder):
+                # the walks it decodes in are the graph's, whatever the model built
+                submodule.bind_walks(self.decoder_walks())
+            self._submodule_cache[node_name] = submodule
             if tp_group is not None and tp_group.world_size > 1:
                 # the LLM's norms reduce its row-parallel partial sums in one
                 # fused kernel; collective, and every rank builds the node here

@@ -156,10 +156,16 @@ def a_bare_model(**attrs):
     return model
 
 
-def an_llm(walks=None, **kwargs):
+def an_llm(model=None, decoder=None, **kwargs):
+    """The LLM node, without weights; given a ``model``, built through its
+    `get_submodule`, as a worker builds it."""
     from mstar.model.minicpm_o.submodules import MiniCPMOLLM
 
-    return MiniCPMOLLM(torch.nn.Identity(), a_config(**kwargs), (IMAGE_ENCODER, AUDIO_ENCODER), walks=walks)
+    llm = MiniCPMOLLM(decoder or torch.nn.Identity(), a_config(**kwargs), (IMAGE_ENCODER, AUDIO_ENCODER))
+    if model is None:
+        return llm
+    model._create_submodule = lambda *args: llm
+    return model.get_submodule("LLM")
 
 
 @pytest.mark.parametrize("walk", PREFILL_WALKS)
@@ -199,7 +205,7 @@ def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
     outputs = ["text", "audio"] if speech else ["text"]
     walk = model.walk_plan(MAIN, ["text"], outputs, {"text_inputs": [None]}, {})[1].walk
     signals = {edge.name for edge in model.get_graph_walk_graphs()[walk].section.outputs}
-    llm = an_llm(model.decoder_walks())
+    llm = an_llm(model)
     llm.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=True)}
     # the worker's test for a rows-only step (``Worker._all_on_device``)
     assert (signals <= llm.device_loopback_signals(walk)) == (not speech)
@@ -253,7 +259,6 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     reply's row drops them, and the step's spoken rows keep theirs, taken as one
     copy for their loops to accumulate."""
     from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
-    from mstar.model.minicpm_o.submodules import MiniCPMOLLM
     from mstar.model.submodule_base import BatchedModelOutput
 
     model = a_model(tmp_path)
@@ -261,7 +266,7 @@ def test_the_spoken_decode_hands_the_tts_each_rows_id_and_hidden(tmp_path):
     walks = model.decoder_walks()
     assert walks == ({"decode", DECODE_SPOKEN}, {DECODE_SPOKEN})
     assert set(graphs["tts_prefill"].input_names) == {ROW_IDS, ROW_HIDDEN}
-    llm = MiniCPMOLLM(_Decoder(), a_config(), model.encoders, walks=walks)
+    llm = an_llm(model, _Decoder())
     (decode,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
     assert DECODE_SPOKEN in decode.replay_graph_walks
 

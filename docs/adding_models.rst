@@ -3568,9 +3568,10 @@ accumulated)``. Their rows share the decode capture, the client token inline, th
 mixed step and the KV label's growth, and only ``DECODE_WALK`` keeps its token on the device.
 MiniCPM-o's spoken reply decodes on ``decode_spoken``, whose graph also sends each row's input
 id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``, which a walk routes
-together). The model reads both sets off its graph once (``decoder_walks()``, a
-``DecoderWalks``) and builds its node with them (``walks=``; the default is ``DECODE_WALK``
-alone, the scaffold's own graph). A node with hidden walks returns both outputs from every
+together). The scaffold reads both sets off the model's graph as one value
+(``decoder_walks()``, a ``DecoderWalks``, refused when no walk decodes) and binds them to the
+LLM node whatever the model builds (``get_submodule`` calls its ``bind_walks``), so a model
+declares nothing for them. A node with hidden walks returns both outputs from every
 step, so every capture holds them; a row whose walk has no edge for them leaves them
 unrouted, and the step's rows whose walk has one take them as one copy (in
 ``batch_postprocess``), which a loop may accumulate.

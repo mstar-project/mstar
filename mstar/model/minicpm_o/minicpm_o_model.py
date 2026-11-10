@@ -815,4 +815,4 @@ class MiniCPMOModel(MultimodalDecoderModel):
         )
         weight_loader.load_llm_weights(lm, weights, device)
         logger.info("Loaded MiniCPM-o LLM onto %s", device)
-        return MiniCPMOLLM(lm.requires_grad_(False).eval(), self.config, self.encoders, walks=self.decoder_walks())
+        return MiniCPMOLLM(lm.requires_grad_(False).eval(), self.config, self.encoders)
