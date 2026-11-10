@@ -250,8 +250,8 @@ def _reference_latents(model, subs, count: int) -> tuple[list[torch.Tensor], tup
     refs = []
     with torch.inference_mode():
         for i in range(count):
-            # float [3, H, W] in [0, 1] -- what Flux2KleinModel.load_image returns
-            pixels = torch.rand(3, HEIGHT, WIDTH, generator=gen)
+            # uint8 [3, H, W] -- what Flux2KleinModel.load_image returns
+            pixels = torch.randint(0, 256, (3, HEIGHT, WIDTH), dtype=torch.uint8, generator=gen)
             rid = f"ref{i}"
             node = encoder.prepare_inputs(
                 IMAGE_EDIT_WALK, _info(rid, 0, i, walk=IMAGE_EDIT_WALK, ref_grids=(grid,)),

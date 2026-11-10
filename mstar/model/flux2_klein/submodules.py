@@ -37,13 +37,13 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSu
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import (
     image_grid_ids,
-    normalize_pixels,
     pack_latents,
     patchify_latents,
     pixels_to_uint8,
     text_ids,
     unpack_latents,
     unpatchify_latents,
+    vae_pixels,
 )
 from mstar.model.components.diffusion.qwen.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
@@ -96,7 +96,8 @@ class KleinVaeEncoderSubmodule(NodeSubmodule):
     ``[1, R, 128]`` (all references concatenated, in request order).
 
     Consumes ``image_inputs``: ``[3, H, W]`` tensors already sized to the pipeline's
-    rule (``Flux2KleinModel.load_image``), float in ``[0, 1]``. Images can differ in
+    rule (``Flux2KleinModel.load_image``), uint8, laid out for the VAE as the reference's image
+    processor hands them (:func:`vae_pixels`). Images can differ in
     size, so each is encoded on its own; requests do not batch here.
     """
 
@@ -114,12 +115,8 @@ class KleinVaeEncoderSubmodule(NodeSubmodule):
         device = self.get_device()
         tokens = []
         for key in sorted(images, key=lambda name: int(name.split("_")[1])):
-            pixels = normalize_pixels(images[key]).to(device=device, dtype=self.vae.dtype).unsqueeze(0)
-            # The reference's image processor hands the VAE an NHWC-strided view (numpy HWC transposed
-            # to NCHW); cuDNN picks different convolution kernels for that layout than for a dense
-            # NCHW tensor, and the one-ulp differences propagate into the edit. Same layout, same
-            # kernels, bit-exact reference latents.
-            pixels = pixels.contiguous(memory_format=torch.channels_last)
+            # [1, 3, H, W], NHWC-strided: the layout picks cuDNN's kernels, and so the latents' bits
+            pixels = vae_pixels(images[key])[:, :, 0].to(device=device, dtype=self.vae.dtype)
             latent = self.vae.normalize_latents(patchify_latents(self.vae.encode(pixels)))
             tokens.append(pack_latents(latent))
         return {REF_LATENTS: [torch.cat(tokens, dim=1)]}

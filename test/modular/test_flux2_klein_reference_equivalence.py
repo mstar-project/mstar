@@ -210,7 +210,7 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
     encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
-    reference = model.load_image(str(ORACLE_DIR / meta["edit_reference"]), "cpu").data  # [3, H, W] in [0, 1]
+    reference = model.load_image(str(ORACLE_DIR / meta["edit_reference"]), "cpu").data  # uint8 [3, H, W]
     ref_grids = [model.config.latent_grid(reference.shape[1], reference.shape[2])]
     with torch.no_grad():
         embeds = _text_embeds(text, IMAGE_EDIT_WALK, model.tokenize(meta["edit_prompt"]))

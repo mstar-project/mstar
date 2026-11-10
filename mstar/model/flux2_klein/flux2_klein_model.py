@@ -271,7 +271,7 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``, upright by its EXIF
+        token grid, center crop, RGB; returned as uint8 ``[3, H, W]``, upright by its EXIF
         orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
@@ -297,7 +297,7 @@ class Flux2KleinModel(Model):
             # image and then dropping the alpha differs from resampling its RGB conversion
             image = image.convert("RGB")
         tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
-        return TensorAndMetadata(tensor.to(torch.float32).div_(255.0).to(device))
+        return TensorAndMetadata(tensor.to(device))
 
     def _resolve_size(self, model_kwargs: dict, ref_dims: list[tuple[int, int]]) -> tuple[int, int]:
         """(height, width) of the output: request kwargs, else the first reference image's

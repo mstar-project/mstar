@@ -242,10 +242,3 @@ def vae_pixels(image: torch.Tensor) -> torch.Tensor:
     layout). Both change the latents' bits."""
     pixels = image.cpu().permute(1, 2, 0).contiguous().float() / 255.0
     return (2.0 * pixels - 1.0)[None].permute(0, 3, 1, 2).unsqueeze(2)
-
-
-def normalize_pixels(image: torch.Tensor) -> torch.Tensor:
-    """``[0, 1]`` float (or uint8) pixels -> ``[-1, 1]`` float, the VAE's input range."""
-    if image.dtype == torch.uint8:
-        image = image.to(torch.float32) / 255.0
-    return image.to(torch.float32) * 2.0 - 1.0

@@ -326,8 +326,8 @@ def test_load_image_resamples_before_rgb_conversion(tmp_path):
     box = ((w - cw) // 2, (h - ch) // 2, (w - cw) // 2 + cw, (h - ch) // 2 + ch)
     expected = rgba.resize((w, h), Image.Resampling.LANCZOS).crop(box).convert("RGB")
     got = model.load_image(str(path), "cpu").data
-    assert got.shape == (3, ch, cw) and got.dtype == torch.float32
-    assert torch.equal(got, torch.from_numpy(np.array(expected)).permute(2, 0, 1).float() / 255)
+    assert got.shape == (3, ch, cw) and got.dtype == torch.uint8
+    assert torch.equal(got, torch.from_numpy(np.array(expected)).permute(2, 0, 1))
     # converting first would resample without the alpha weighting Pillow applies to RGBA
     other = rgba.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).crop(box)
     assert not np.array_equal(np.array(other), np.array(expected))
