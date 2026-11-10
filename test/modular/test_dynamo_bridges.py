@@ -811,6 +811,7 @@ def _realtime_error(server):
     error = next(e["error"] for e in out if e["type"] == "error")
     assert out[-1]["response"]["status_details"]["error"]["type"] == error["type"]
     if error["type"] == "invalid_request_error":
+        assert "code" not in error  # a refusal is sent as main's realtime route sends it
         raise ValueError(error["message"])
     raise RuntimeError(error["message"])
 

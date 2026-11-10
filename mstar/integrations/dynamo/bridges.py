@@ -169,7 +169,8 @@ class _StatusError(ValueError):
     Dynamo's worker reads ``code`` and ``message`` off any exception the
     handler raises, before it looks at the type, and sanitizes a 5xx body
     itself; a bare ``ValueError`` is a 400 too, but reaches the client as
-    ``ValueError: <message>``.
+    ``ValueError: <message>``. It stays a ``ValueError`` so a request-parse
+    failure is still one; read ``code``, never the type, for the status.
     """
 
     def __init__(self, message: str, code: int = 400):
