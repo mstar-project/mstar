@@ -441,14 +441,15 @@ def media_runs(prompt, output: str) -> list[tuple[int, int, tuple[int, ...]]]:
     ]
 
 
-@needs_ckpt
 @pytest.mark.parametrize("max_slice_nums", [1, None])
-def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
-    """Each slice is a run of 64 ``<unk>`` whose grid is its (h, w) in patches,
+def test_image_placeholders_line_up_with_slices(chat_model, max_slice_nums):
+    """Each slice is a run of the resampler's queries of ``<unk>`` whose grid is
+    its (h, w) in patches, as many as the request's ``max_slice_nums`` allows,
     and the prompt is upstream's, its placeholders written out whole."""
     from mstar.model.minicpm_o import processor
     from mstar.model.multimodal import PromptPart
 
+    model = chat_model
     prompt = model.process_prompt(
         None, ["image", "text"], ["text"],
         tensors={"image_inputs": [an_image()]},
@@ -461,6 +462,8 @@ def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
     grid = processor.slice_grid((640, 448), max_slice_nums or processor.MAX_SLICE_NUMS)
     assert [tokens for _, tokens, _ in runs] == [queries] * processor.image_runs(grid)
     assert out["pixel_values"][0].shape[0] == sum(h * w for _, _, (h, w) in runs)
+    if isinstance(model.tokenizer, _ChatTokenizer):
+        return  # upstream's prompt needs the checkpoint's chat template
     upstream = processor.image_placeholder(0, grid).replace("<unk>", "<unk>" * queries)
     text = model.tokenizer.apply_chat_template(
         [{"role": "user", "content": f"{upstream}\nDescribe it."}], tokenize=False, add_generation_prompt=True,

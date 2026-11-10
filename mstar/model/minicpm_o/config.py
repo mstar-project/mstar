@@ -44,8 +44,8 @@ TTS_DECODE_LOOP = "tts_decode_loop"
 # a spoken reply's text cap (``get_max_output_tokens``), a default rather than a
 # length kwarg, so admission still fits it to the prompt
 SPEECH_TEXT_TOKENS = "speech_text_tokens"
-# the request's ``max_slice_nums``, carried in each image's intake metadata
-# (``MediaIntake`` hands its callables an attachment and its metadata only)
+# the request kwarg capping an image's slices, which the image intake reads off
+# the request's kwargs (``MediaIntake`` hands them to its callables)
 MAX_SLICE_NUMS_KEY = "max_slice_nums"
 
 # ragged span labels
