@@ -261,16 +261,17 @@ class Resource(ResidentHooks, ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> Any:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, as lists of them `adopt_cached_prefix` takes back, or None."""
+        return the lease, or None. The followers' `adopt_cached_prefix` takes it back as it is,
+        so its class must be registered for the wire (`mstar.communication.wire_types`)."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[list[int]], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: Any, caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
-        raises if it still lacks them once ``caught_up``."""
+        """On a TP follower, lease what ``lease`` holds as rank 0 did. False until this rank holds it
+        too, and raises if it still lacks it once ``caught_up``."""
         return True
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:

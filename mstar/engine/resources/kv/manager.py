@@ -1090,9 +1090,8 @@ class KVManager(AttentionResource):
             end = self._recut(rid, stream, held, cursor.consumed)
             return self._answer(prefix.label, cursor, step, end)
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[list[int]] | None:
-        """Returns the same lease's pages, group by group and then its walk starts' window pages, with every step
-        until `admit` converts it."""
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> Lease | None:
+        """Returns the same lease with every step until `admit` converts it."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -1100,7 +1099,7 @@ class KVManager(AttentionResource):
             stream = self._ensure_label(rid, label)
             chain, cursor = stream.chain, stream.span_cursor
             if stream.lease is not None:
-                return [*stream.lease.groups, stream.lease.starts]
+                return stream.lease
             if (
                 chain is None or cursor.done == len(chain.spans)
                 or chain.spans[cursor.done].walk != graph_walk
@@ -1110,10 +1109,10 @@ class KVManager(AttentionResource):
         if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
-            return None if stream.lease is None else [*stream.lease.groups, stream.lease.starts]
+            return stream.lease
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[list[int]], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: Lease, caught_up: bool,
     ) -> bool:
         """False while some pages are missing and ``caught_up`` is False, since this rank's commit of
         the step that wrote them can lag rank 0's. Once ``caught_up`` nothing will index a missing
@@ -1129,25 +1128,25 @@ class KVManager(AttentionResource):
                 return True
             if chain is None or stream.stored_len:
                 raise RuntimeError(
-                    f"KV {self.name}: rank 0 leased {len(pages[0])} cached pages for {rid}/{label}, "
+                    f"KV {self.name}: rank 0 leased {len(lease.groups[0])} cached pages for {rid}/{label}, "
                     "whose stream here already holds tokens or has no keys"
                 )
         self._root_chain(chain)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
-            # above one rank a lease has no cached image end, so it ends on its first group's last page
-            end = len(pages[0]) * self.config.tokens_per_page
-            found, matched = self._match(chain.rooted, len(pages[0]))
+            # above one rank a lease has no cached image end (`_cache_image_end`), so it ends on a page
+            end, starts = lease.end, lease.starts
+            found, matched = self._match(chain.rooted, end // self.config.tokens_per_page)
             # rank 0's walk starts, which this rank's index may hold more of
-            *groups, starts = pages
             held = set(self._start_pages(chain, end, matched))
             if (found < end or not held.issuperset(starts)) and not caught_up:
                 return False
-            if matched != groups or not held.issuperset(starts):
+            if matched != lease.groups or not held.issuperset(starts):
                 raise RuntimeError(
                     f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
-                    f"pages {matched[0][:4]}... here ({len(matched[0])}), {pages[0][:4]}... there ({len(pages[0])})"
+                    f"pages {matched[0][:4]}... here ({len(matched[0])}), "
+                    f"{lease.groups[0][:4]}... there ({len(lease.groups[0])})"
                 )
             stream.lease = Lease(end, matched, starts=starts)
             self._arena.retain(stream.lease.pages())

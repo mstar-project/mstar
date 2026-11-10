@@ -184,20 +184,20 @@ class StepRunner:
 
     def lease_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-    ) -> dict[str, list[list[int]]]:
+    ) -> dict[str, Any]:
         leases = {}
         for key in self._sweep(self._node_order, self._order, node_name):
-            pages = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
-            if pages is not None:
-                leases[key] = pages
+            lease = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
+            if lease is not None:
+                leases[key] = lease
         return leases
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[list[int]]], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, Any], caught_up: bool,
     ) -> bool:
         ready = True
-        for key, pages in leases.items():
-            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
+        for key, lease in leases.items():
+            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, lease, caught_up)
         return ready
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:

@@ -1575,7 +1575,7 @@ class Engine:
                     keys=keys,
                 )
 
-    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[list[int]]]]:
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, Any]]:
         """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
         followers can take the same pages before they build it."""
         keyed = self._keyed_walks.get(batch.node_name)

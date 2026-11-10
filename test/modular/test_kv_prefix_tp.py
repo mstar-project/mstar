@@ -17,6 +17,7 @@ from test_kv_prefix_lease import _Holding, _StubTransfer
 from test_tp_async_teardown_order import _rank, _Stop
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication import wire
 from mstar.engine.engine import Engine
 from mstar.engine.resources import StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
@@ -131,11 +132,12 @@ def _batch(rid: str, walk: str = WALK) -> SimpleNamespace:
 
 
 def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
+    """Rank 0's head for ``rid``'s step, as a follower decodes it."""
     engine = _engine(leader)
-    return ScheduleTPNode(
+    return wire.decode(wire.encode(ScheduleTPNode(
         NODE, WALK, [f"wire-{rid}"],
         prefix_hits=engine.decide_cached_prefix(_batch(rid)), page_trails=engine.page_trails(NODE),
-    )
+    )))
 
 
 def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -> bool:

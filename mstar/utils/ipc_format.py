@@ -1,5 +1,6 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import Any
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
@@ -259,8 +260,9 @@ class ScheduleTPNode(MessageBody):
     # means every rid runs graph_walk
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
-    # rank 0's prefix-cache leases, by wire request id and then resource
-    prefix_hits: dict[str, dict[str, list[list[int]]]] = field(default_factory=dict)
+    # rank 0's prefix-cache leases, by wire request id and then resource, each the resource's own
+    # (`Resource.lease_cached_prefix`)
+    prefix_hits: dict[str, dict[str, Any]] = field(default_factory=dict)
     page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
