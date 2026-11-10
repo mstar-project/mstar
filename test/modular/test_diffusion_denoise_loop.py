@@ -133,6 +133,16 @@ def test_missing_loop_back_latents_past_iteration_zero_raises():
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
 
 
+
+def test_a_step_builds_each_rows_bucket_key_once():
+    """Each memo and the check past the schedule built the row's key again, three times a row on every step."""
+    sub = ToyDenoise()
+    built = []
+    bucket_key_for = sub.bucket_key_for
+    sub.bucket_key_for = lambda info: built.append(info.request_id) or bucket_key_for(info)
+    sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    assert built == ["r0"], f"prepare_inputs built the key {len(built)} times"
+
 def test_a_step_without_the_loop_counter_raises():
     """Read as 0, it would reseed from noise every iteration and run to max_iters."""
     sub = ToyDenoise()

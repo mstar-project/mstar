@@ -15,7 +15,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import yaml
 
+from mstar.distributed.base import node_group_axis_sizes
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
@@ -28,7 +30,8 @@ from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Block, Read
 from mstar.engine.state.adapters import StateSetup, build_handle, node_handles, node_resources, state_setup, state_steps
-from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
+from mstar.model.base import serving_resources
 from mstar.model.components.diffusion.attention import dit_entry
 from mstar.model.flux2_klein.components.transformer import Flux2JointAttention
 from mstar.model.flux2_klein.config import DENOISE_LOOP, JOINT_TOKENS, Flux2KleinConfig
@@ -49,7 +52,7 @@ from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
 from mstar.model.ltx2_5.submodules import LTXDenoiseSubmodule, LTXShape
 from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.model.wan22.components.dit import Wan22DiTAttention
-from mstar.model.wan22.config import SELF_ATTN, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, Wan22Config
 from mstar.model.wan22.submodules import Wan22DitSubmodule, WanStepKey
 from mstar.model.wan22.wan22_model import Wan22Model
 from mstar.model.z_image.components.transformer import ZImageAttention
@@ -258,6 +261,53 @@ def test_wan22_steps_equal_the_hand_written_one(guidance, branches):
     )
     _assert_plans_equal(_expanded(model, sub, [key], [0]), reference, SELF_ATTN)
 
+
+
+# Wan2.2's parallel configs, whose ranks main's model code split
+
+
+WAN_PARALLEL_CONFIGS = ["configs/wan22_cfg_parallel_2gpu.yaml", "configs/wan22_cfg2_sp2_4gpu.yaml"]
+
+
+def _serving(path: str) -> tuple[dict, dict[str, int]]:
+    """The serving config at ``path``, and the size of its dit's node group on each mesh axis."""
+    with open(path) as f:
+        config = yaml.safe_load(f)
+    (group,) = [group for group in config["node_groups"] if "dit" in group["node_names"]]
+    return config, node_group_axis_sizes(group)
+
+
+@pytest.mark.parametrize("path", WAN_PARALLEL_CONFIGS)
+def test_wan22_parallel_configs_serve_the_hand_written_spec(path):
+    config, axes = _serving(path)
+    model = _wan()
+    assert serving_resources(model, config) == [_wan_reference()]
+    head_shards = {"dit": axes["tp"] * axes["sp"]}
+    assert deployment_problems(model, config.get("resources") or {}, head_shards=head_shards) == []
+
+
+@pytest.mark.parametrize("guidance", [5.0, 1.0])
+@pytest.mark.parametrize("path", WAN_PARALLEL_CONFIGS)
+def test_wan22_parallel_configs_plan_each_ranks_step_as_main_did(path, guidance):
+    """A CFG rank plans the guidance branches it forwards, and an SP rank the whole sequence, which its read
+    exchanges."""
+    _, axes = _serving(path)
+    model = _wan()
+    key = WanStepKey(frames=3, height=8, width=8, guidance=guidance, i2v=False)
+    branches = 2 // axes["cfg"] if guidance > 1.0 else 1
+    for cfg_rank in range(axes["cfg"]):
+        sub = Wan22DitSubmodule(None, model.config, cfg_group=SimpleNamespace(world_size=axes["cfg"], rank=cfg_rank))
+        segments = [Segment(request_id=0, label="main", span=sub.num_tokens(key))] * branches
+        reference = SubmoduleStep(
+            segments=segments, steps={SELF_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=key,
+        )
+        for sp_rank in range(axes["sp"]):
+            sp_group = SimpleNamespace(world_size=axes["sp"], rank=sp_rank)
+            handles = node_handles(model, "dit", {SELF_ATTN: _StubRagged()}, sp_group=sp_group)
+            step = state_steps(sub.declare_step("gen", [0], [_inputs(key)]), handles)
+            _assert_plans_equal(step, reference, SELF_ATTN)
+            exchanges = (handles[DIT_TOKENS]._keys_sharded, handles[DIT_TOKENS]._queries_sharded)
+            assert exchanges == (axes["sp"] > 1,) * 2, "a sharded sequence needs the Ulysses exchange"
 
 def test_a_step_on_sdpa_is_none_as_the_hand_written_model_returned():
     model = _klein()

@@ -211,6 +211,19 @@ def _thinker_reference(rids, spans, *, tokens=None, kept=None, advance=None) -> 
     )
 
 
+
+def test_the_audio_encoder_batches_by_the_window_ceiling_its_read_holds():
+    """Qwen3-Omni's AuT names no resource, so it reads how many windows a replay's plan holds per row off its array:
+    looking for the resource raised on every multi-clip batch."""
+    model = _model()
+    window = model.config.audio_encoder.window_tokens
+    encoder = AudioEncoderSubmodule(SimpleNamespace(config=model.config.audio_encoder), model.config)
+    encoder.bind_node_state(_handles(model, "audio_encoder"))
+    encoder.state_handles[AUDIO_TOKENS].reads[AUDIO_ATTN].max_segments_per_request = 2
+    clips = [SimpleNamespace(input_seq_len=2 * window)] * 2
+    assert encoder.can_batch(None, clips)
+    assert not encoder.can_batch(None, [SimpleNamespace(input_seq_len=3 * window)] * 2), "a YAML override should hold"
+
 def test_a_thinker_decode_step_equals_the_hand_written_one():
     sub = _thinker()
     rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)]
