@@ -220,7 +220,7 @@ class SamplerResource(Resource):
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
             enable_grammar=spec.enable_grammar,
-            text_output=info.text_output,
+            text_output=info.text_output if spec.enable_grammar else None,
         )
 
     def build_accelerator_graph_buffers(
