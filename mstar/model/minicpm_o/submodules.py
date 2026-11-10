@@ -65,7 +65,6 @@ from mstar.model.minicpm_o.config import (
     ATTN,
     AUDIO_ATTN,
     AUDIO_ENCODER,
-    DECODE_SPOKEN,
     IMAGE_ENCODER,
     PATCHES,
     QUERIES,
@@ -103,7 +102,6 @@ class MiniCPMOLLM(SampledTokenDecoder):
     and its graph takes each row's input id and hidden for the TTS."""
 
     ATTN_KEY = ATTN
-    DECODE_WALKS = frozenset({SampledTokenDecoder.DECODE_WALK, DECODE_SPOKEN})
     # the ladders it captured before moving onto the scaffold
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]

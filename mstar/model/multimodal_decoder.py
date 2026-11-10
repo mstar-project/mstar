@@ -32,6 +32,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.sampled_token_decoder import DecoderWalks, decoder_walks
 from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -49,7 +50,6 @@ from mstar.model.multimodal import (
     media_walk_name,
     media_walks,
     parts_from_modalities,
-    text_combined_walks,
 )
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
@@ -185,8 +185,15 @@ class MultimodalDecoderModel(Model):
     # Graph
     # -----------------------------------------------------------------------
 
+    def decoder_walks(self) -> DecoderWalks:
+        """The LLM node's decode and hidden walks, read off this model's graph:
+        what its node is built with, and what the mixed step and the KV growth
+        name."""
+        return decoder_walks(self.get_graph_walk_graphs(), "LLM", self.DECODE_LOOP)
+
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return text_combined_walks() if self.TEXT_PROMPTS else {}
+        # text prefill and every decode walk's rows share a step
+        return {"LLM": {MIXED: {PREFILL_TEXT, *self.decoder_walks().decode}}} if self.TEXT_PROMPTS else {}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
@@ -209,11 +216,11 @@ class MultimodalDecoderModel(Model):
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
         # keys; a media prompt's one `rows` span is not (`LabelLayout.keyed_count`), so nothing of
         # it is.
+        growth = tuple((walk, self.DECODE_LOOP) for walk in sorted(self.decoder_walks().decode))
         if not self.TEXT_PROMPTS:
-            return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+            return {KV_CACHE: {"main": KVLabel(growth=growth)}}
         return {KV_CACHE: {"main": KVLabel(
-            growth=(("decode", "decode_loop"),),
-            keys=PrefixKeys("text_inputs", (PREFILL_TEXT,), growth=True),
+            growth=growth, keys=PrefixKeys("text_inputs", (PREFILL_TEXT,), growth=True),
         )}}
 
     def checkpoint_path(self) -> str:

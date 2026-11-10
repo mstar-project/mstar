@@ -7,6 +7,14 @@ from mstar.graph.base import GraphSection
 from mstar.model.submodule_base import chunk_tick_name
 
 
+def loop_walks(graphs: Mapping[str, GraphSection], loop: str, node: str) -> frozenset[str]:
+    """The walks whose graph runs ``node`` inside the Loop named ``loop``."""
+    return frozenset(
+        walk for walk, graph in graphs.items()
+        if (found := graph.get_loops().get(loop)) is not None and node in found.get_nodes()
+    )
+
+
 @dataclass(frozen=True)
 class RebuildPolicy:
     """One row of ``walk`` prefills the request's prompt and every id it has sampled since, but the
@@ -23,10 +31,7 @@ class RebuildPolicy:
 
     def loop_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
         """The walks in which ``loop`` runs ``node``: those a request can be dropped in."""
-        return frozenset(
-            walk for walk, graph in graphs.items()
-            if (loop := graph.get_loops().get(self.loop)) is not None and node in loop.get_nodes()
-        )
+        return loop_walks(graphs, self.loop, node)
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> None:
         """Raise unless ``walk`` runs ``node``, which reads only ``ids_input``, the one input a rebuild row

@@ -67,8 +67,8 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
-from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS, row_hidden_walks
-from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, VISION_ATTN
+from mstar.model.components.sampled_token_decoder import ROW_HIDDEN, ROW_IDS
+from mstar.model.keys import KV_CACHE, ROPE, VISION_ATTN
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -114,6 +114,7 @@ from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     TEXT,
     PromptPart,
+    decode_walk,
     media_walks,
     messages_from_parts,
     parts_from_modalities,
@@ -439,22 +440,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
         # its hidden state, accumulated until the reply ends; nothing reads them
         # per step.
         hidden = (ROW_IDS, ROW_HIDDEN)
-        walks[DECODE_SPOKEN] = Loop(
-            name=self.DECODE_LOOP,
-            section=GraphNode(
-                name=LLM,
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(next_node=LLM, name="text_inputs"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
-                    *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in hidden),
-                ],
-            ),
-            max_iters=self.max_seq_len,
-            outputs=[],
-            # the reply's TTS condition, handed over whole when it ends
-            accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in hidden],
-        )
+        walks[DECODE_SPOKEN] = decode_walk(self.max_seq_len, LLM, accumulated=hidden)
         tts_outputs = [
             StreamingGraphEdge(next_node=TOKEN2WAV, name="tts_code", target_partition=TOKEN2WAV),
         ]
@@ -486,11 +472,6 @@ class MiniCPMOModel(MultimodalDecoderModel):
         )
         return walks
 
-    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        # a walk joins one combined walk a node: both replies' decode rows share
-        # the text prompts' mixed step
-        return {LLM: {MIXED: {PREFILL_TEXT, "decode", DECODE_SPOKEN}}}
-
     def get_partitions(self) -> list[PartitionDefinition]:
         main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK}
         return [
@@ -510,12 +491,7 @@ class MiniCPMOModel(MultimodalDecoderModel):
         )
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        (main,) = super().kv_labels()[KV_CACHE].values()
-        return {
-            # a spoken reply's decode writes the LLM's label as a text reply's does
-            KV_CACHE: {"main": main._replace(growth=(*main.growth, (DECODE_SPOKEN, self.DECODE_LOOP)))},
-            TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))},
-        }
+        return {**super().kv_labels(), TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))}}
 
     # ------------------------------------------------------------------
     # Prompt
@@ -834,7 +810,4 @@ class MiniCPMOModel(MultimodalDecoderModel):
         )
         weight_loader.load_llm_weights(lm, weights, device)
         logger.info("Loaded MiniCPM-o LLM onto %s", device)
-        return MiniCPMOLLM(
-            lm.requires_grad_(False).eval(), self.config, self.encoders,
-            hidden_walks=row_hidden_walks(self.get_graph_walk_graphs(), LLM),
-        )
+        return MiniCPMOLLM(lm.requires_grad_(False).eval(), self.config, self.encoders, walks=self.decoder_walks())

@@ -351,6 +351,41 @@ def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():
     assert captured == {"prefill_audio", "decode"}
 
 
+def test_a_second_decode_walk_in_the_graph_is_a_decode_walk_everywhere():
+    """A walk whose graph runs the LLM in the decode loop, which nothing else
+    lists, stops on the stop ids, replays the decode capture, joins the mixed
+    step and grows the KV label, as ``decode`` does."""
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal_decoder import MultimodalDecoderModel
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    class Model(MultimodalDecoderModel):
+        NAME = "two decodes"
+
+        def get_graph_walk_graphs(self):
+            walks = media_walks(8, self.encoders)
+            walks["decode_other"] = walks["decode"]
+            return walks
+
+        def get_node_resources(self):
+            return []
+
+    model = object.__new__(Model)
+    assert model.get_combined_graph_walks() == {"LLM": {MIXED: {"prefill_text", "decode", "decode_other"}}}
+    (label,) = model.kv_labels()[KV_CACHE].values()
+    assert label.growth == (("decode", "decode_loop"), ("decode_other", "decode_loop"))
+
+    llm = object.__new__(LLMSubmodule)
+    SampledTokenDecoder.__init__(
+        llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=(7,)),
+        walks=model.decoder_walks(),
+    )
+    assert llm.get_stop_policies("decode_other")["decode_loop"].eos_tokens == frozenset({7})
+    (decode,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu")) if c.capture_graph_walk == "decode"]
+    assert decode.replay_graph_walks == ["decode", "decode_other"]
+
+
 def test_qwen_media_capture_stages_every_media_buffer():
     """The captured media step's static inputs are `preprocess`'s outputs:
     the ids, a row per token for every encoder's media, and the cos/sin built

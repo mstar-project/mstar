@@ -26,8 +26,8 @@ import torch
 
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.keys import MIXED, PREFILL_TEXT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.keys import PREFILL_TEXT
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import NameToTensorList
@@ -560,7 +560,16 @@ def media_walks(
                 outputs=[emit_first_token()],
             ),
         ])
-    walks["decode"] = Loop(
+    walks["decode"] = decode_walk(max_iters, node)
+    return walks
+
+
+def decode_walk(max_iters: int, node: str = "LLM", accumulated: Sequence[str] = ()) -> Loop:
+    """The decode loop over the decoder ``node``: a token a step, fed back
+    and sent to the client. ``accumulated`` names outputs the loop gathers
+    over the reply and hands over whole when it ends (a spoken reply's
+    TTS condition)."""
+    return Loop(
         name="decode_loop",
         section=GraphNode(
             name=node,
@@ -568,17 +577,13 @@ def media_walks(
             outputs=[
                 GraphEdge(next_node=node, name="text_inputs"),
                 GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+                *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in accumulated),
             ],
         ),
         max_iters=max_iters,
         outputs=[],
+        accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in accumulated],
     )
-    return walks
-
-
-def text_combined_walks(node: str = "LLM") -> dict[str, dict[str, set[str]]]:
-    """Text prefill and decode rows of the decoder ``node`` share a step."""
-    return {node: {MIXED: {PREFILL_TEXT, "decode"}}}
 
 
 def media_prefill_step(

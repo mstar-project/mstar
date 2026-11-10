@@ -3399,8 +3399,8 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
     mixed          : prefill_text and decode rows in one step (a combined walk)
 
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
-which declares the walks (``media_walks(max_iters, encoders)`` and
-``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
+which declares the walks (``media_walks(max_iters, encoders)``, and the mixed step over
+``prefill_text`` and every decode walk), plans the one prefill walk ``media_prefill_step`` picks
 and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
 request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
@@ -3486,15 +3486,17 @@ only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model
 calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
 ``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
-A decode loop that runs under more than one walk names them all in ``DECODE_WALKS``
-(``DECODE_WALK`` alone by default): their rows share the decode capture, the client token
-inline, the stop and the mixed step, and only ``DECODE_WALK`` keeps its token on the device.
+The decode loop may run under more than one walk: every walk whose graph runs the node in
+``DECODE_LOOP`` is a decode walk, and a second one is built with ``decode_walk(max_iters, node,
+accumulated)``. Their rows share the decode capture, the client token inline, the stop, the
+mixed step and the KV label's growth, and only ``DECODE_WALK`` keeps its token on the device.
 MiniCPM-o's spoken reply decodes on ``decode_spoken``, whose graph also sends each row's input
-id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``). Built with the walks
-whose graph routes them (``hidden_walks``, read off the model's graph by ``row_hidden_walks``),
-the node returns both from every step, so every capture holds them; a row whose walk has no
-edge for them leaves them unrouted, and a row whose walk has one gets its own copy, which a
-loop may accumulate.
+id and post-norm hidden state to its TTS (``ROW_IDS``, ``ROW_HIDDEN``, which a walk routes
+together). The model reads both sets off its graph once (``decoder_walks()``, a
+``DecoderWalks``) and builds its node with them (``walks=``; the default is ``DECODE_WALK``
+alone, the scaffold's own graph). A node with hidden walks returns both outputs from every
+step, so every capture holds them; a row whose walk has no edge for them leaves them
+unrouted, and a row whose walk has one gets its own copy, which a loop may accumulate.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
