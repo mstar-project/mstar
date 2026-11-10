@@ -27,8 +27,6 @@ bounded KV (``encoder_kv_config``).
 """
 from __future__ import annotations
 
-import dataclasses
-
 import torch
 import torch.nn.functional as F
 
@@ -170,9 +168,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     has no graph for its streams, those streams run eagerly too.
 
     Used by Nemotron VoiceChat's duplex model and by Nemotron ASR's live walks.
-    ``lookahead`` sets the stream's chunk when it is narrower than the encoder
-    config's, which the offline node keeps (Nemotron ASR streams at 3 and hears
-    clips at 13); build the node's resources from a config at that lookahead.
+    ``config`` is the stream's encoder config, the one its resources are built
+    from: the encoder's own, or the encoder's at a narrower lookahead, which
+    sets the stream's chunk while the offline node keeps the encoder's
+    (Nemotron ASR streams at 3 and hears clips at 13).
     Construction refuses ``normalize=True``: a per-clip normalization can't be
     streamed. A stream's audio comes one chunk per step: its client stream cuts
     it on ``chunk_samples``, and only the first and last chunks can differ.
@@ -192,6 +191,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def __init__(
         self,
         encoder: FastConformerEncoder,
+        config: FastConformerConfig,
         log_mel: NemoLogMel,
         projection: torch.nn.Module | None,
         *,
@@ -200,12 +200,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         front_key: str,
         batch_sizes: list[int],
         item_per_step: bool = False,
-        lookahead: int | None = None,
     ):
         super().__init__()
-        # the stream's chunk is lookahead + 1 frames: the encoder's own unless
-        # given, so a deployment can stream narrower than its offline node runs
-        c = encoder.config if lookahead is None else dataclasses.replace(encoder.config, lookahead=lookahead)
+        c = config
         frame_samples = log_mel.hop_length * c.subsampling_factor
         unsupported = {
             name: value for name, value, ok in (
@@ -276,14 +273,14 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 and st.samples >= 2 * self.frame_samples and st.samples % cs == 0)
 
     def bind_node_resources(self, resources: dict) -> None:
-        # the layers bind their stream state only where it exists, as the encoder
-        # may serve an offline node too: this node must have it
+        # the encoder's layers take their stream state from this node alone, as
+        # the encoder may serve an offline node too
         missing = [k for k in (self.encoder.kv_key, self.encoder.conv_key, self.front_key) if k not in resources]
         if missing:
             raise ValueError(f"the stream encoder's node has no resources {missing}")
         super().bind_node_resources(resources)
         self.front = resources[self.front_key]
-        self.encoder.bind_stream(self.chunk_frames)
+        self.encoder.bind_stream(self.chunk_frames, resources)
 
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as

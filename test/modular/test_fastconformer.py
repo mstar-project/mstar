@@ -4,6 +4,7 @@ installed transformers has them), batch invariance offline and causal, the
 causal variant's causality, the BatchNorm fold and NeMo's weight names; and the
 stream node, whose frames over any chunking are the offline ones.
 """
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -364,10 +365,11 @@ def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflec
     weights (the same at any lookahead) and a featurizer with random filters,
     NeMo's pre-2.5 convention; ``stream_lookahead`` streams narrower."""
     torch.manual_seed(0)
-    enc = FastConformerEncoder(FastConformerConfig(
+    config = FastConformerConfig(
         hidden_size=64, num_heads=4, num_layers=3, intermediate_size=256, num_mel_bins=32, subsampling_channels=8,
         attention_bias=False, convolution_bias=False, causal=True, left_context=6, lookahead=lookahead,
-    ), kv_key=KV, conv_key=CONV)
+    )
+    enc = FastConformerEncoder(config, kv_key=KV, conv_key=CONV)
     proj = nn.Linear(64, 48)
     with torch.no_grad():
         for t in [*enc.parameters(), *proj.parameters()]:
@@ -376,9 +378,11 @@ def _stream_node(n_fft=512, win_length=400, lookahead=0, normalize=False, reflec
         num_mel_bins=32, n_fft=n_fft, win_length=win_length, normalize=normalize, reflect_edges=reflect_edges,
         mel_filters=torch.rand(32, n_fft // 2 + 1),
     )
+    if stream_lookahead is not None:
+        config = dataclasses.replace(config, lookahead=stream_lookahead)
     return FastConformerStreamSubmodule(
-        enc.eval(), log_mel, proj.eval(), input_edge="audio_in", output_edge="audio_frame",
-        front_key=FRONT, batch_sizes=[1, 2, 4, 8, 16, 32], lookahead=stream_lookahead,
+        enc.eval(), config, log_mel, proj.eval(), input_edge="audio_in", output_edge="audio_frame",
+        front_key=FRONT, batch_sizes=[1, 2, 4, 8, 16, 32],
     )
 
 
@@ -950,6 +954,16 @@ def test_encoder_steps_do_not_reproject_the_relative_positions():
     for at in range(0, wav.numel(), 1280):
         enc.encode(1, wav[at:at + 1280])
     assert not calls
+
+
+def test_encoder_layers_stream_at_one_chunk():
+    """The layers keep one stream's chunk, with its band of distances and its
+    retained frames: binding them at another is refused, not served with the
+    first chunk's band."""
+    enc = _Encoder(lookahead=3)
+    with pytest.raises(ValueError, match="chunk of 4 frames"):
+        enc.node.encoder.bind_stream(1, enc.resources)
+    enc.node.encoder.bind_stream(4, enc.resources)
 
 
 def test_encoder_waits_for_enough_audio_to_featurize():

@@ -373,11 +373,10 @@ class ParakeetModel(Model):
             from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
 
             return FastConformerStreamSubmodule(
-                self._encoder(device, autocast_dtype),
+                self._encoder(device, autocast_dtype), self.config.live_encoder,
                 NemoLogMel(num_mel_bins=self.config.encoder.num_mel_bins, normalize=False, device=device), None,
                 input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
                 batch_sizes=list(self.LIVE_CAPTURE_BATCH_SIZES), item_per_step=True,
-                lookahead=self.config.live_encoder.lookahead,
             )
         if node_name == "transducer":
             from mstar.model.parakeet.submodules import TransducerSubmodule

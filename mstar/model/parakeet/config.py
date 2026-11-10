@@ -72,24 +72,24 @@ class ParakeetModelConfig:
             raise ValueError(f"unsupported transducer checkpoint {model_type!r}; supported: {SUPPORTED_MODEL_TYPES}")
         gen = json.loads((local_dir / "generation_config.json").read_text())
         proc = json.loads((local_dir / "processor_config.json").read_text())
-        supported = hf["encoder_config"].get("supported_num_lookahead_tokens") or []
-        if lookahead is None and supported:
-            # M* hears whole clips, so the widest lookahead the checkpoint was
-            # trained with: the most accurate, at the same cost
-            lookahead = max(supported)
-        elif lookahead is not None and supported and lookahead not in supported:
-            raise ValueError(f"lookahead {lookahead} is not one of the checkpoint's {supported}")
-        encoder = FastConformerConfig.from_hf(hf["encoder_config"], lookahead=lookahead)
+        enc = hf["encoder_config"]
+        allowed = enc.get("supported_num_lookahead_tokens") or [enc.get("default_num_lookahead_tokens", 0)]
+
+        def checked(name: str, value) -> int:
+            # an int, not a bool (False would read as 0) or a float (3.0 would be found)
+            if type(value) is not int or value not in allowed:
+                raise ValueError(f"{name} must be one of the checkpoint's lookaheads {sorted(allowed)}; got {value!r}")
+            return value
+
+        # M* hears whole clips, so by default the widest lookahead the checkpoint
+        # was trained with: the most accurate, at the same cost
+        lookahead = max(allowed) if lookahead is None else checked("lookahead", lookahead)
+        encoder = FastConformerConfig.from_hf(enc, lookahead=lookahead)
         live_encoder = None
         if live_lookahead is not None:
             if not encoder.causal:
                 raise ValueError(f"live_lookahead needs a cache-aware (causal) checkpoint; {model_type} is not one")
-            allowed = supported or [hf["encoder_config"].get("default_num_lookahead_tokens", 0)]
-            # an int, not a bool (False would read as 0) or a float (3.0 would be found)
-            if type(live_lookahead) is not int or live_lookahead not in allowed:
-                raise ValueError(f"live_lookahead must be one of the checkpoint's lookaheads {sorted(allowed)}; "
-                                 f"got {live_lookahead!r}")
-            live_encoder = replace(encoder, lookahead=live_lookahead)
+            live_encoder = replace(encoder, lookahead=checked("live_lookahead", live_lookahead))
         prompts = dict(proc.get("prompt_dictionary", {}))
         return cls(
             model_type=model_type,

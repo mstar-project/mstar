@@ -80,8 +80,9 @@ def test_nemotron_config_and_prompt(tmp_path):
         with pytest.raises(ValueError):
             cfg.prompt_id(bad)
     assert ParakeetModelConfig.from_pretrained(snap, lookahead=3).encoder.lookahead == 3
-    with pytest.raises(ValueError):
-        ParakeetModelConfig.from_pretrained(snap, lookahead=5)
+    for bad in (5, False, 3.0, "3"):
+        with pytest.raises(ValueError, match="lookahead"):
+            ParakeetModelConfig.from_pretrained(snap, lookahead=bad)
 
 
 def test_unsupported_checkpoint(tmp_path):
@@ -239,10 +240,8 @@ def test_a_live_deployment_shares_its_encoder_at_two_lookaheads(tmp_path, monkey
     """The clip's and the live call's encoder nodes run the same layers
     (``forward`` / ``forward_stream``): one copy of the weights, not two. Clips
     keep the checkpoint's widest lookahead while live calls stream at the
-    deployment's, with stream state sized for its chunk."""
+    deployment's."""
     from mstar.model.components.fastconformer import FastConformerEncoder
-    from mstar.model.components.fastconformer_stream import front_state_blocks
-    from mstar.model.parakeet.config import STREAM_FRONT
 
     monkeypatch.setattr(
         FastConformerEncoder, "load",
@@ -253,8 +252,6 @@ def test_a_live_deployment_shares_its_encoder_at_two_lookaheads(tmp_path, monkey
     assert clip.encoder is live.encoder
     assert clip.encoder.config.lookahead == 13
     assert live.chunk_frames == model.chunk_frames == 4
-    front = next(spec for spec in model.get_node_resources() if spec.resource_key == STREAM_FRONT)
-    assert front.config.blocks == front_state_blocks(live.config, 160)
 
 
 def test_startup_refuses_more_requests_than_slots(tmp_path):

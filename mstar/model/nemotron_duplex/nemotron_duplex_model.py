@@ -1022,7 +1022,7 @@ class NemotronDuplexModel(Model):
             kv_key=ENCODER_KV, conv_key=ENCODER_STATE, **stt.log_mel_settings,
         )
         return FastConformerStreamSubmodule(
-            encoder, log_mel, proj, input_edge=AUDIO_IN, output_edge="audio_frame",
+            encoder, encoder.config, log_mel, proj, input_edge=AUDIO_IN, output_edge="audio_frame",
             front_key=ENCODER_FRONT, batch_sizes=SESSION_BATCH_SIZES,
         )
 

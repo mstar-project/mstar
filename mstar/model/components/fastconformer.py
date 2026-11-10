@@ -243,17 +243,17 @@ def rel_positional_encoding(seq_len: int, hidden_size: int, device, dtype: torch
 class RelPositionAttention(nn.Module):
     """``softmax(((q + u) k^T + skew((q + v) R^T)) / sqrt(d))`` with ``R``
     the projected position sinusoids; the second term enters SDPA as a bias.
-    A stream step attends its new frames in the bounded KV ``kv_key`` names
+    A stream step attends its new frames in the stream node's bounded KV
     instead, which keeps each stream's window of keys and values, with the
-    distances it can see projected once, at bind (``band``)."""
+    distances it can see projected once, at bind (``bind_stream``)."""
 
     lora_unservable = {"relative_k_proj": "projects position encodings, not the step's tokens (a stream's at bind)"}
 
-    def __init__(self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None):
+    def __init__(self, config: FastConformerConfig, layer_idx: int = 0):
         super().__init__()
         h, d = config.num_heads, config.head_dim
         self.num_heads, self.head_dim = h, d
-        self.layer_idx, self._kv_key = layer_idx, kv_key
+        self.layer_idx = layer_idx
         self.left_context = config.left_context
         # a stream's: its KV, its chunk and the frames it keeps (``bind_stream``)
         self.kv = self.band = self.chunk = self.retained = None
@@ -263,23 +263,21 @@ class RelPositionAttention(nn.Module):
         self.bias_u = nn.Parameter(torch.zeros(h, d))
         self.bias_v = nn.Parameter(torch.zeros(h, d))
 
-    def bind_resources(self, resources: dict) -> None:
-        # One layer serves an offline node and a stream node at once (one copy of
-        # the weights); only the stream node has the KV, and the stream submodule
-        # checks it is there (`FastConformerStreamSubmodule.bind_node_resources`).
-        if self._kv_key in resources:
-            self.kv = resources[self._kv_key]
-
-    def bind_stream(self, chunk: int) -> None:
-        """The stream node's chunk, ``chunk`` frames a step, which may be
-        narrower than the offline node's (the config's lookahead). Every
+    def bind_stream(self, chunk: int, kv) -> None:
+        """The stream node's KV and its chunk, ``chunk`` frames a step, which
+        may be narrower than the offline node's (the config's lookahead). One
+        layer serves an offline node and a stream node at once (one copy of the
+        weights), and only one stream chunk: the band is that chunk's. Every
         distance a stream's frame sees, ascending, is projected here, in the
         weights' dtype, which is what autocast computes it in: fixed weights,
         so once, at bind, before any capture. Frame by frame (a chunk of one)
         those are 0..left_context. A chunk's frames also see each other, and a
         stream's last step can run into a chunk more (its end pads a few
         frames), so the widest step is two chunks."""
-        self.chunk = chunk
+        if self.chunk is not None and self.chunk != chunk:
+            raise ValueError(f"the encoder's layers stream at a chunk of {self.chunk} frames; "
+                             f"a second stream node asks for {chunk}")
+        self.kv, self.chunk = kv, chunk
         self.retained = stream_retained_frames(self.left_context, chunk)
         w = self.relative_k_proj.weight
         widest = 1 if chunk == 1 else 2 * chunk
@@ -348,14 +346,15 @@ class ConvModule(nn.Module):
     pointwise. The offline checkpoints' BatchNorm is folded into the depthwise
     conv at load (it is a per-channel affine at inference); the streaming ones
     use a LayerNorm, which stays. A stream step's causal conv continues each
-    stream's last ``k - 1`` inputs, kept in the pool ``conv_key`` names."""
+    stream's last ``k - 1`` inputs, kept in the stream node's pool
+    (``bind_stream``)."""
 
-    def __init__(self, config: FastConformerConfig, layer_idx: int = 0, conv_key: str | None = None):
+    def __init__(self, config: FastConformerConfig, layer_idx: int = 0):
         super().__init__()
         c, k = config.hidden_size, config.conv_kernel_size
         self.causal = config.causal
         self.kernel_size = k
-        self.layer_idx, self._conv_key = layer_idx, conv_key
+        self.layer_idx = layer_idx
         self.state = None
         self.pointwise_conv1 = nn.Linear(c, 2 * c, bias=config.convolution_bias)
         # bias always on: the folded BatchNorm shift lands here
@@ -363,10 +362,9 @@ class ConvModule(nn.Module):
         self.norm = nn.LayerNorm(c) if self.causal else None
         self.pointwise_conv2 = nn.Linear(c, c, bias=config.convolution_bias)
 
-    def bind_resources(self, resources: dict) -> None:
-        # only a stream node has it, as for the attention's KV
-        if self._conv_key in resources:
-            self.state = resources[self._conv_key]
+    def bind_stream(self, state) -> None:
+        """The stream node's recurrent-state pool of conv inputs."""
+        self.state = state
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
         x = self.pointwise_conv1(x)
@@ -416,17 +414,15 @@ class FeedForward(nn.Module):
 
 
 class FastConformerBlock(nn.Module):
-    def __init__(
-        self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None, conv_key: str | None = None,
-    ):
+    def __init__(self, config: FastConformerConfig, layer_idx: int = 0):
         super().__init__()
         c = config.hidden_size
         self.norm_feed_forward1 = nn.LayerNorm(c)
         self.feed_forward1 = FeedForward(config)
         self.norm_self_att = nn.LayerNorm(c)
-        self.self_attn = RelPositionAttention(config, layer_idx, kv_key)
+        self.self_attn = RelPositionAttention(config, layer_idx)
         self.norm_conv = nn.LayerNorm(c)
-        self.conv = ConvModule(config, layer_idx, conv_key)
+        self.conv = ConvModule(config, layer_idx)
         self.norm_feed_forward2 = nn.LayerNorm(c)
         self.feed_forward2 = FeedForward(config)
         self.norm_out = nn.LayerNorm(c)
@@ -515,7 +511,7 @@ class FastConformerEncoder(nn.Module):
         self.kv_key, self.conv_key = kv_key, conv_key
         self.subsampling = _Subsampling(config)
         self.layers = nn.ModuleList(
-            FastConformerBlock(config, i, kv_key, conv_key) for i in range(config.num_layers)
+            FastConformerBlock(config, i) for i in range(config.num_layers)
         )
 
     @classmethod
@@ -593,12 +589,15 @@ class FastConformerEncoder(nn.Module):
             x = layer.forward_stream(x, tails)
         return x
 
-    def bind_stream(self, chunk: int) -> None:
-        """Bind the stream node's chunk, ``chunk`` frames a step, to each
-        layer's attention (``RelPositionAttention.bind_stream``); the offline
-        ``blocks`` keep the config's lookahead."""
+    def bind_stream(self, chunk: int, resources: dict) -> None:
+        """Bind the stream node's state, its KV and conv pool from its
+        ``resources``, and its chunk, ``chunk`` frames a step, to each layer
+        (``RelPositionAttention.bind_stream``); the offline ``blocks`` keep the
+        config's lookahead and need neither."""
+        kv, state = resources[self.kv_key], resources[self.conv_key]
         for layer in self.layers:
-            layer.self_attn.bind_stream(chunk)
+            layer.self_attn.bind_stream(chunk, kv)
+            layer.conv.bind_stream(state)
 
     # ------------------------------------------------------------------
     # weights
