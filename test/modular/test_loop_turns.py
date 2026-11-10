@@ -396,6 +396,38 @@ def test_the_run_loop_counts_a_steps_turns_once_its_admit_takes_it(monkeypatch):
     assert sched.last_ran == {KEY: {0: 1}}
 
 
+@pytest.mark.parametrize("consumes_stream", [True, False])
+def test_a_stream_consumers_step_is_followed_by_a_poll_before_the_next_pick(monkeypatch, consumes_stream):
+    """The preamble polls while a step runs, so the next chunk of each of its rows
+    is refused then; once a stream consumer's step is post-processed, the loop
+    polls again before it picks the next step, which can then take those rows."""
+    runtime = _Runtime()
+    sched, state = _scheduler(runtime, TURNS)
+    for rid in (0, 1):
+        runtime.requests[rid] = None
+        sched.lifecycle.add(rid, str(rid))
+    runtime.ready |= {0, 1}
+    w = _looping_worker(monkeypatch, sched, state)
+    w.pipeline._stream_consumer_nodes = frozenset({NODE} if consumes_stream else ())
+    events = []
+    w.ingest.poll_stream_buffers = lambda: events.append("poll")
+    next_batch = sched.next_batch
+
+    def pick(*args, **kwargs):
+        events.append("pick")
+        return next_batch(*args, **kwargs)
+
+    sched.next_batch = pick
+
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    # pass 1 has no step to finish; each later pass finishes one before it picks
+    after_a_step = events[events.index("pick") + 1:]
+    expected = ["poll", "poll", "pick"] if consumes_stream else ["poll", "pick"]
+    assert after_a_step[:len(expected)] == expected, events
+
+
 def test_a_lone_request_keeps_its_chain_without_a_scan():
     """Nothing else on the worker: the chain continues, so speculation still
     overlaps, and the queues are not scanned for it."""
@@ -479,3 +511,15 @@ def test_a_chain_that_gives_its_whole_step_away_runs_the_waiting_rows():
     spec = speculator._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3]))
 
     assert spec.scheduled_batch is waiting and spec.gave_way
+
+
+def test_only_a_worker_of_nothing_but_stream_consumers_repolls():
+    from mstar.worker.step_pipeline import repoll_nodes
+
+    # MiniCPM-o's vocoder worker: one consumer, nothing else
+    assert repoll_nodes(frozenset({"Token2Wav"}), frozenset({"Token2Wav"}), frozenset()) == {"Token2Wav"}
+    # Chatterbox on one worker: the consumer shares its loop with its producer
+    assert repoll_nodes(frozenset({"s3gen"}), frozenset({"T3", "voice_encoder", "s3gen"}), frozenset()) == set()
+    # a lockstep consumer
+    assert repoll_nodes(frozenset({"vae"}), frozenset({"vae"}), frozenset({"vae"})) == set()
+    assert repoll_nodes(frozenset(), frozenset({"LLM"}), frozenset()) == set()

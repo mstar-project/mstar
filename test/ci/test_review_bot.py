@@ -786,6 +786,20 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertTrue(all(posted not in arg for argv, _ in fake.calls for arg in argv),
                         "posted text would reach gh's command line")
 
+    def test_a_team_review_that_skipped_files_is_posted_as_incomplete(self):
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": ["a.py"], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}}
+        with workspace():
+            _, fake = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="nogpu", salvaged="false",
+               team="true")
+        (_, posted), = fake.writes()
+        self.assertIn("Incomplete review", posted, "the author would be left the files the review didn't finish")
+
     def test_inline_comments_post_from_stdin_anchored_to_the_review_and_a_refused_one_joins_the_summary(self):
         token = "ghp_" + "b" * 36
         review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
