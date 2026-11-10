@@ -816,6 +816,12 @@ class PreprocessWorkerThread:
         self._prepare_workers = workers
         if workers > 1:
             self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
+        model = self.model
+        if getattr(model, "PREPROCESS_PARALLEL_IMAGES", False) and not getattr(model, "PREPROCESS_PARALLEL", False):
+            logger.warning(
+                "%s sets PREPROCESS_PARALLEL_IMAGES without PREPROCESS_PARALLEL, so its images decode in turn",
+                type(model).__name__,
+            )
         decode_workers = self._num_decode_workers()
         if decode_workers > 1:
             self._decode_pool = ThreadPool(max_workers=decode_workers, thread_name_prefix="mstar-decode")

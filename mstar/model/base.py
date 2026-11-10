@@ -655,6 +655,7 @@ class Model(ABC):
     PREPROCESS_PARALLEL: bool = False
     # Also decode one request's images at once, for a ``load_image`` that is mostly
     # a GIL-free decode: intra-op work in it would run on each of these threads.
+    # It needs PREPROCESS_PARALLEL, since the decode pool is sized like the prepare pool.
     PREPROCESS_PARALLEL_IMAGES: bool = False
 
     # The rate the default ``load_audio`` decodes an upload to, and the longest
