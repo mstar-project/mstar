@@ -262,35 +262,41 @@ class CpuSelectionTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
         job = workflow[workflow.index("\n  cpu-tests:\n"):]
         job = job[:re.search(r"\n  [\w-]+:\n", job[1:]).start() + 1].splitlines()
+        def value(text):  # a value as YAML reads it here: without a trailing comment or quotes
+            return re.sub(r"\s+#.*$", "", text).strip().strip("'\"")
+
         # the matrix legs, each as its keys (a "- name:" line at 10 spaces, then keys at 12)
         include = job[job.index("        include:") + 1:]
         legs = []
         for line in include[:next(i for i, x in enumerate(include) if x.strip() and not x.startswith(" " * 10))]:
-            key, _, value = line.strip().removeprefix("- ").partition(": ")
+            key, _, text = line.strip().removeprefix("- ").partition(": ")
             if line.startswith(" " * 10 + "- "):
                 legs.append({})
-            if value and not line.strip().startswith("#"):
-                legs[-1][key] = value
+            if text and not line.strip().startswith("#"):
+                legs[-1][key] = value(text)
         listed = [leg["shard"] for leg in legs if "shard" in leg]
         total = {spec.split("/")[1] for spec in listed}
         self.assertEqual(len(total), 1, f"the cpu-tests shards don't agree on how many there are: {listed}")
         total = int(total.pop())
         self.assertEqual(sorted(listed), [f"{i}/{total}" for i in range(1, total + 1)],
                          "a CPU Core shard would be missing or run twice")
-        self.assertEqual([leg for leg in legs if "shard" in leg and "args" in leg], [],
-                         "a shard with its own args would run them, not the shared CPU_CORE")
+        self.assertEqual([leg for leg in legs if ("shard" in leg) == ("args" in leg)], [],
+                         "a leg needs exactly one of shard (the shared CPU_CORE) and args (its own)")
         # what the shards run: the job's CPU_CORE, through the run step's `matrix.args || env.CPU_CORE`
         cpu_core = job[job.index("      CPU_CORE: >-") + 1:]
         cpu_core = " ".join(x.strip() for x in cpu_core[:next(i for i, x in enumerate(cpu_core)
                                                               if not x.startswith(" " * 8))])
-        self.assertTrue(cpu_core.startswith("-p shard_plugin "), "the shards wouldn't load the plugin")
+        tokens = cpu_core.split()
+        self.assertIn(("-p", "shard_plugin"), list(zip(tokens, tokens[1:], strict=False)),
+                      "the shards wouldn't load the plugin")
         step = job[job.index("      - name: Run CPU tests"):]
         step = step[:next(i for i, x in enumerate(step[1:], 1) if x.startswith("      - "))]
-        env = dict(x.strip().split(": ", 1) for x in step if x.startswith(" " * 10) and ": " in x
-                   and not x.strip().startswith("#") and not x.startswith(" " * 11))
+        keys = [x.strip() for x in step if x.startswith(" " * 10) and not x.startswith(" " * 11)]
+        env = {key: value(text) for key, _, text in (x.partition(": ") for x in keys if ": " in x and x[0] != "#")}
         self.assertEqual((env.get("MSTAR_CI_SHARD"), env.get("PYTHONPATH")), ("${{ matrix.shard }}", "scripts/ci"),
                          "the shards wouldn't pick their files, or -p wouldn't find the plugin")
-        self.assertTrue(any(x.rstrip().endswith("${{ matrix.args || env.CPU_CORE }}") for x in step),
+        self.assertTrue(any(value(x).endswith("${{ matrix.args || env.CPU_CORE }}") for x in step
+                            if not x.strip().startswith("#")),
                         "the shards would run without the shared CPU_CORE arguments")
         modules = [path for path in repo_test_modules() if IS_COLLECTED(path, EXPANDED_PATHS)]
         config = unittest.mock.Mock(rootpath=REPO_ROOT)
