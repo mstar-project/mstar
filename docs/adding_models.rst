@@ -2153,9 +2153,9 @@ signal to ``device_loopback_signals`` and passes its name to ``loopback_inputs``
 
 The sampler keeps one row per request by slot, grows it with its other per-request
 buffers, and resets a row to ``default`` when its slot is given to a new request. A step
-reads the rows with ``sampler.loopback_state(name, request_ids)`` in ``preprocess`` and
-stores the next ones from the forward with ``sampler.store_loopback_state(name,
-request_ids, values)``. Under a CUDA-graph slot the store is captured into a per-step
+reads the rows with ``sampler.loopback_state(name)`` in ``preprocess`` and stores the
+next ones from the forward with ``sampler.store_loopback_state(name, values)``, for the
+rows the step was planned with. Under a CUDA-graph slot the store is captured into a per-step
 buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
