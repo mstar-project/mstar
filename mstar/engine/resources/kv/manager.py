@@ -108,9 +108,10 @@ class RoomMark(NamedTuple):
 
 
 class PassMark(NamedTuple):
-    """What `reserve_past` refused ``rid`` against: its room less `KVManager._kept`, and the index counts
-    when a page the index files could still make the request fit."""
-    rid: str
+    """What `reserve_past` refused a request against: the room of its class less `KVManager._kept`, and the index
+    counts when a page the index files could still make the request fit. Passers of one class refused against the
+    same room share a mark."""
+    guaranteed: bool
     room: int
     filed: int | None
     taken: int | None
@@ -4478,12 +4479,12 @@ class KVManager(AttentionResource):
         growth that admission leaves to the room fit in the room less `_kept`. A request that holds an allotment
         waits for its shortage in order."""
         with self._lock:
-            room = self._room_for(rid, passing=True)
+            mark = self._pass_mark(rid)
             # When even the fewest pages ``rid`` can take don't fit, no page the index files helps, so only the room
             # moves the mark.
             least = (self._fixed_need(rid) or 0) + self._footprint(rid) - self._asks[rid]
-            if rid in self._allotments or least > room:
-                return PassMark(rid, room, None, None)
+            if rid in self._allotments or least > mark.room:
+                return mark
             chains = [] if self._index is None or self._on_host(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
@@ -4494,14 +4495,20 @@ class KVManager(AttentionResource):
             # before `_need`, as in `reserve`
             counts = self._index_counts()
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
-            room = self._room_for(rid, passing=True)
-            if pages > room:
-                return PassMark(rid, room, *counts)
+            mark = self._pass_mark(rid, *counts)
+            if pages > mark.room:
+                return mark
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
             if not self._admit(rid, pages, passed=True):
-                return PassMark(rid, room, None, None)
+                return self._pass_mark(rid)
             return None
+
+    def _pass_mark(self, rid: str, filed: int | None = None, taken: int | None = None) -> PassMark:
+        """The mark of passing ``rid``, whose own room is the room of its class. One that holds an allotment is
+        refused whatever the room, and is tried again with the others of its class."""
+        guaranteed = rid in self._guaranteed
+        return PassMark(guaranteed, self._class_room(guaranteed, passing=True), filed, taken)
 
     def _admit(self, rid: str, pages: int, passed: bool = False) -> bool:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers, or return False when ``rid`` turns
@@ -4663,7 +4670,7 @@ class KVManager(AttentionResource):
     def _grew_since(self, mark: RoomMark | PassMark) -> bool:
         if isinstance(mark, PassMark):
             # pages kept for a waiting request are no room for a passer
-            room = self._room_for(mark.rid, passing=True)
+            room = self._class_room(mark.guaranteed, passing=True)
         elif mark.rid not in self._asks:
             return True
         else:
@@ -4671,21 +4678,26 @@ class KVManager(AttentionResource):
         return room > mark.room or (mark.filed is not None and (mark.filed, mark.taken) != self._index_counts())
 
     def _room_for(self, rid: str, passing: bool = False) -> int:
-        """The room ``rid`` may take past what its allotment holds back from borrowers. A preemptible request also
-        borrows what guaranteed requests lend, unless one of them waits to take pages back. A guaranteed request takes
-        back what it lends, and past its allotment only the room. One that asks to be admitted counts what moving
-        every preemptible request would free, since it can take that back. ``passing``, or ``rid`` returning past the
-        first request, leaves out `_kept`."""
-        room = self._room()
+        """The room ``rid`` may take past what its allotment holds back from borrowers. A guaranteed request that holds
+        an allotment takes back what it lends, and past it only the room. Any other request takes the room of its
+        class. ``passing``, or ``rid`` returning past the first request, leaves out `_kept`."""
+        passing = passing or rid in self._passers
         allotment = self._allotments.get(rid)
-        if rid not in self._guaranteed:
-            if not self._taking_back():
-                room += self._borrowable
-        elif allotment is None:
-            room += self._frees([other for other in self._streams if other not in self._guaranteed])
+        if rid not in self._guaranteed or allotment is None:
+            return self._class_room(rid in self._guaranteed, passing)
+        room = self._room()
+        return min(room + self._borrowable, allotment.lends + max(0, room)) - (self._kept if passing else 0)
+
+    def _class_room(self, guaranteed: bool, passing: bool) -> int:
+        """`_room_for` a request that holds no guaranteed allotment. A preemptible request also borrows what
+        guaranteed requests lend, unless one of them waits to take pages back. A guaranteed request that asks to be
+        admitted counts what moving every preemptible request would free, since it can take that back."""
+        room = self._room()
+        if not guaranteed:
+            room += 0 if self._taking_back() else self._borrowable
         else:
-            room = min(room + self._borrowable, allotment.lends + max(0, room))
-        return room - (self._kept if passing or rid in self._passers else 0)
+            room += self._frees([other for other in self._streams if other not in self._guaranteed])
+        return room - (self._kept if passing else 0)
 
     def _spare(self) -> int:
         """The free and evictable pages no allotment holds back from borrowers."""
