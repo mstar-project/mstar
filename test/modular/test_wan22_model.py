@@ -21,7 +21,6 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
@@ -32,7 +31,6 @@ from mstar.model.wan22.submodules import (
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
     _inference_ctx,
-    _SingleRequestMixin,
     normalize_decode_tiling_mode,
 )
 from mstar.model.wan22.wan22_model import Wan22Model
@@ -117,58 +115,17 @@ def test_wan22_declares_only_dit_attention_resources():
     assert all(spec.nodes == {"dit"} for spec in specs)
     model.config = Wan22Config(attention_backend="sdpa")
     assert model.get_node_resources() == []
-    assert model.get_request_resource_configs(partition_fwd_args={}) == {}
+    assert model.get_request_resource_configs([], [], {}) == {}
 
 
-def test_wan22_submodules_route_through_forward_batched():
-    """The v1 worker builds every batch ``running_batched=True``, so the engine
-    only ever calls ``forward_batched``. Each node has to answer there."""
-    for cls in (
-        Wan22TextEncoderSubmodule,
-        Wan22VaeEncoderSubmodule,
-        Wan22DitSubmodule,
-        Wan22VaeDecoderSubmodule,
-    ):
-        assert cls.forward_batched is not NodeSubmodule.forward_batched, cls.__name__
-    # ...and the encoders and the decoder cap the batch at one, which is what keeps
-    # their delegation honest (the scheduler reads this). The dit batches for real.
+def test_wan22_batch_caps():
+    """The encoders and the decoder serve one request a step; the dit batches
+    up to its configured cap."""
     for cls in (Wan22TextEncoderSubmodule, Wan22VaeEncoderSubmodule, Wan22VaeDecoderSubmodule):
         assert cls.max_batch_size(cls, Wan22Model.VIDEO_GEN_WALK) == 1, cls.__name__
     assert Wan22DitSubmodule(transformer=None, config=Wan22Config()).max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 1
     dit = Wan22DitSubmodule(transformer=None, config=Wan22Config(dit_max_batch_size=2))
     assert dit.max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 2
-
-
-def test_wan22_forward_batched_delegates_to_forward():
-    class _Node(_SingleRequestMixin, NodeSubmodule):
-        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-            raise AssertionError("not exercised")
-
-        def forward(self, graph_walk, engine_inputs, **kwargs):
-            return {"walk": [graph_walk], "seen": [kwargs["latents"]]}
-
-    node = _Node()
-    engine_inputs = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
-    latents = torch.zeros(1)
-    out = node.forward_batched(
-        Wan22Model.VIDEO_GEN_WALK, engine_inputs=engine_inputs, latents=latents,
-    )
-    assert set(out) == {"r0"}
-    assert out["r0"]["walk"] == [Wan22Model.VIDEO_GEN_WALK]
-    assert out["r0"]["seen"][0] is latents
-
-
-def test_wan22_forward_batched_rejects_a_multi_request_batch():
-    class _Node(_SingleRequestMixin, NodeSubmodule):
-        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-            raise AssertionError("not exercised")
-
-        def forward(self, graph_walk, engine_inputs, **kwargs):
-            raise AssertionError("must not reach the forward")
-
-    engine_inputs = ModelInputsFromEngine(request_ids=["r0", "r1"], per_request_info={})
-    with pytest.raises(AssertionError, match="does not batch"):
-        _Node().forward_batched(Wan22Model.VIDEO_GEN_WALK, engine_inputs=engine_inputs)
 
 
 def test_wan22_forwards_run_without_autograd():
@@ -262,172 +219,106 @@ def test_wan22_worker_graphs_from_yaml():
 
 
 # ----------------------------------------------------------------------
-# Forward pass transitions (schedule-driven state machine)
+# Walk plan
 # ----------------------------------------------------------------------
 
 
-def test_wan22_initial_schedule_t2v():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-    )
-    assert args.full_metadata.graph_walk == Wan22Model.ENCODE_TEXT_WALK
-    assert args.full_metadata.is_prefill is True
-    assert args.full_metadata.kwargs["walk_schedule"] == [
-        Wan22Model.ENCODE_TEXT_WALK,
-        Wan22Model.VIDEO_GEN_WALK,
-    ]
-    edge_targets = {(e.next_node, e.name) for e in args.inputs}
-    assert edge_targets == {("text_encoder", "text_inputs")}
-    assert args.step_metadata["num_inference_steps"] == \
-        model.config.default_num_inference_steps
-    assert args.step_metadata["guidance_scale"] == model.config.guidance_scale
+def _plan(model, input_modalities, output_modalities, input_signals, model_kwargs=None):
+    return model.walk_plan("default", input_modalities, output_modalities, input_signals, model_kwargs or {})
 
 
-def test_wan22_initial_schedule_i2v_inserts_encode_image():
+@pytest.mark.parametrize("input_modalities, walks", [
+    (["text"], [Wan22Model.ENCODE_TEXT_WALK, Wan22Model.VIDEO_GEN_WALK]),
+    (["text", "image"], [Wan22Model.ENCODE_TEXT_WALK, Wan22Model.ENCODE_IMAGE_WALK, Wan22Model.VIDEO_GEN_I2V_WALK]),
+], ids=["t2v", "i2v"])
+def test_wan22_plan_walks_and_request_metadata(input_modalities, walks):
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text", "image"],
-        output_modalities=["video"],
-        input_signals={
-            "text_inputs": [_tensor_info("text")],
-            "image_inputs": [_tensor_info("image")],
-        },
-    )
-    assert args.full_metadata.kwargs["walk_schedule"] == [
-        Wan22Model.ENCODE_TEXT_WALK,
-        Wan22Model.ENCODE_IMAGE_WALK,
-        Wan22Model.VIDEO_GEN_I2V_WALK,
-    ]
+    signals = {"text_inputs": [_tensor_info("text")], "image_inputs": [_tensor_info("image")]}
+    plan = _plan(model, input_modalities, ["video"], signals)
+    assert [step.walk for step in plan] == walks and not any(step.bind for step in plan)
+    cfg = model.config
+    assert all(step.step_metadata == {
+        "num_inference_steps": cfg.default_num_inference_steps, "guidance_scale": cfg.guidance_scale,
+        "height": cfg.default_height, "width": cfg.default_width, "num_frames": cfg.default_num_frames,
+    } for step in plan)
 
 
 def test_wan22_rejects_non_video_output():
     model = _make_model()
     with pytest.raises(ValueError, match="video"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["text"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["text"], {"text_inputs": [_tensor_info("text")]})
 
 
 def test_wan22_rejects_promptless_request():
     model = _make_model()
     with pytest.raises(ValueError, match="text prompt"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["image"],
-            output_modalities=["video"],
-            input_signals={"image_inputs": [_tensor_info("image")]},
+        _plan(model, ["image"], ["video"], {"image_inputs": [_tensor_info("image")]})
+
+
+@pytest.mark.parametrize("requested", [1, 50, 100])  # 100 is exactly the ceiling
+def test_wan22_num_inference_steps_in_range_are_honored(requested):
+    model = _make_model()
+    assert model.config.max_denoise_steps == 100
+    plan = _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]},
+                 {"num_inference_steps": requested})
+    assert plan[0].step_metadata["num_inference_steps"] == requested
+    # the same count ends the denoise loop (and its speculation)
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP_NAME: requested}
+
+
+@pytest.mark.parametrize("requested", [0, -1, 50.0, "50", True])
+def test_wan22_num_inference_steps_out_of_range_is_a_400(requested):
+    model = _make_model()
+    with pytest.raises(ValueError, match="num_inference_steps must be an integer >= 1"):
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": requested})
+    with pytest.raises(ValueError, match="num_inference_steps"):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"],
+            num_inference_steps=requested,
         )
 
 
-@pytest.mark.parametrize("requested,expected", [
-    (1, 1),
-    (50, 50),
-    (100, 100),   # exactly the ceiling
-    (10_000, 100),  # clamped to max_denoise_steps
-    (0, 1),       # floored at one step
+@pytest.mark.parametrize("requested", [101, 10_000])
+def test_wan22_steps_past_the_denoise_loop_are_refused_by_the_conductor(requested):
+    from mstar.conductor.conductor import Conductor
+
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model = _make_model()
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": 100})[model.DENOISE_LOOP_NAME] == 100
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_inference_steps": requested})
+
+
+@pytest.mark.parametrize("kwargs,fragment", [
+    ({"guidance_scale": "5"}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": float("inf")}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": False}, "guidance_scale must be a finite number"),
+    ({"negative_prompt": 3}, "negative_prompt must be a string"),
 ])
-def test_wan22_num_inference_steps_clamped(requested, expected):
+def test_wan22_bad_denoise_knobs_are_400s(kwargs, fragment):
     model = _make_model()
-    assert model.config.max_denoise_steps == 100
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-        model_kwargs={"num_inference_steps": requested},
-    )
-    assert args.step_metadata["num_inference_steps"] == expected
+    with pytest.raises(ValueError, match=fragment):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"], **kwargs,
+        )
 
 
-def _step(model, metadata, persist_signals):
-    return model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals=persist_signals,
-    )
-
-
-def test_wan22_t2v_transitions_encode_text_to_video_gen_to_done():
+def test_wan22_null_knobs_mean_default_and_request_kwargs_are_declared():
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-    )
-    metadata = args.full_metadata
-
-    persist = {
-        "text_embeds_pos": [_tensor_info("pos")],
-        "text_embeds_neg": [_tensor_info("neg")],
-    }
-    result = _step(model, metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.VIDEO_GEN_WALK
-    assert result.full_metadata.is_prefill is False
-    assert result.request_done is False
-    edge_targets = {(e.next_node, e.name) for e in result.inputs}
-    assert edge_targets == {("dit", name) for name in (
-        {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
-    )}
-    # Persisted embeddings carry tensor_info; loop-seeding edges arrive empty.
-    by_name = {e.name: e for e in result.inputs}
-    assert by_name["text_embeds_pos"].tensor_info == persist["text_embeds_pos"]
-    assert by_name["text_embeds_neg"].tensor_info == persist["text_embeds_neg"]
-    for name in LOOP_BACK_NAMES:
-        assert by_name[name].tensor_info == []
-    # The embeddings see their last use here and must be unpersisted.
-    unpersisted = {info.uuid for info in result.unpersist_tensors}
-    assert {persist["text_embeds_pos"][0].uuid, persist["text_embeds_neg"][0].uuid} \
-        <= unpersisted
-
-    result = _step(model, result.full_metadata, {})
-    assert result.request_done is True
-    assert result.inputs == []
-
-
-def test_wan22_i2v_transitions_include_encode_image_and_image_latent():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text", "image"],
-        output_modalities=["video"],
-        input_signals={
-            "text_inputs": [_tensor_info("text")],
-            "image_inputs": [_tensor_info("image")],
-        },
-    )
-    metadata = args.full_metadata
-
-    # encode_text -> encode_image: the persisted raw image feeds vae_encoder.
-    persist = {"image_inputs": [_tensor_info("image")]}
-    result = _step(model, metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.ENCODE_IMAGE_WALK
-    assert result.full_metadata.is_prefill is True
-    edge_targets = {(e.next_node, e.name) for e in result.inputs}
-    assert edge_targets == {("vae_encoder", "image_inputs")}
-
-    # encode_image -> video_gen_i2v: dit also consumes the persisted latent.
-    persist = {
-        "text_embeds_pos": [_tensor_info("pos")],
-        "text_embeds_neg": [_tensor_info("neg")],
-        "image_latent": [_tensor_info("latent")],
-    }
-    result = _step(model, result.full_metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.VIDEO_GEN_I2V_WALK
-    assert result.full_metadata.is_prefill is False
-    by_name = {e.name: e for e in result.inputs}
-    assert by_name["image_latent"].tensor_info == persist["image_latent"]
-
-    result = _step(model, result.full_metadata, {})
-    assert result.request_done is True
+    plan = _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]},
+                 {"guidance_scale": None, "num_inference_steps": None, "width": None})
+    meta = plan[0].step_metadata
+    assert meta["guidance_scale"] == model.config.guidance_scale
+    assert meta["num_inference_steps"] == model.config.default_num_inference_steps
+    assert meta["width"] == model.config.default_width
+    # the video adapter maps size -> height/width and forwards num_frames/fps
+    assert {"height", "width", "num_frames", "fps"} <= model.request_kwargs()
+    assert {"guidance_scale", "num_inference_steps", "negative_prompt"} <= model.request_kwargs()
 
 
 # ----------------------------------------------------------------------
@@ -455,34 +346,8 @@ def _dit() -> Wan22DitSubmodule:
     return submodule
 
 
-# iter_count reads k while 0-based iteration k is being postprocessed, so
-# stopping at k == N - 1 runs exactly N iterations.
-@pytest.mark.parametrize("requested_steps,iter_count,expect_stop", [
-    (1, 0, True),     # single-step request stops on its only iteration
-    (2, 0, False),
-    (2, 1, True),
-    (50, 0, False),
-    (50, 48, False),  # one before the boundary: keep going
-    (50, 49, True),   # k + 1 == N: exactly N iterations run
-    (50, 50, True),   # deferred-stop overshoot (speculative iter N) still stops
-    (100, 99, True),  # request at the ceiling stops on the loop's last iter
-])
-def test_wan22_check_stop_boundary(requested_steps, iter_count, expect_stop):
-    submodule = _dit()
-    submodule.request_state("r0").add("num_steps", requested_steps)
-    stops = submodule.check_stop("r0", _fwd_info(requested_steps, iter_count), outputs={})
-    assert (DENOISE_LOOP_NAME in stops) == expect_stop
-    if not expect_stop:
-        assert stops == set()
-
-
-def test_wan22_check_stop_without_a_schedule_never_stops():
-    # A missing step count must not stop the loop; max_iters still bounds it.
-    assert _dit().check_stop("r0", _fwd_info(requested_steps=0, iter_count=99), outputs={}) == set()
-
-
 # ----------------------------------------------------------------------
-# prepare_inputs: async-overshoot veto (dit) and no-CFG negative skip
+# prepare_inputs: an in-range dit iteration and no-CFG negative skip
 # (text encoder)
 # ----------------------------------------------------------------------
 
@@ -497,18 +362,6 @@ def _dit_loop_inputs() -> dict:
         "unipc_model_outputs": [torch.zeros((2, *shape))],
         "unipc_last_sample": [torch.zeros(shape)],
     }
-
-
-def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
-    # Async scheduling can dispatch iteration N after check_stop fired at
-    # N - 1; prepare_inputs returns None so the engine skips that forward.
-    submodule = _dit()
-    result = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK,
-        fwd_info=_fwd_info(requested_steps=2, iter_count=2),
-        inputs=_dit_loop_inputs(),
-    )
-    assert result is None
 
 
 def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
@@ -659,7 +512,8 @@ def test_wan22_process_prompt_rejects_unaligned_sizes(height, width, bad_axis, n
     ({"height": 0}, "must be positive"),
     ({"width": -32}, "must be positive"),
     ({"height": "tall"}, "must be an integer"),
-    ({"width": None}, "must be an integer"),
+    ({"height": "480"}, "must be an integer"),
+    ({"width": 832.0}, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_sizes(kwargs, fragment):
     model = _make_model()
@@ -715,6 +569,7 @@ def test_wan22_process_prompt_rejects_unaligned_num_frames(frames, nearest):
     (0, "must be positive"),
     (-4, "must be positive"),      # would have crashed the worker on a negative dim
     ("many", "must be an integer"),
+    (33.0, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_num_frames(frames, fragment):
     model = _make_model()
@@ -747,6 +602,7 @@ def test_wan22_process_prompt_accepts_valid_fps(fps):
     (float("nan"), "must be positive"),
     (float("inf"), "must be positive"),
     ("fast", "must be a number"),
+    ("24", "must be a number"),
 ])
 def test_wan22_process_prompt_rejects_bad_fps(fps, fragment):
     model = _make_model()
@@ -767,12 +623,7 @@ def test_wan22_get_submodule_dummy_mode_returns_none():
 def test_wan22_i2v_declared_without_image_tensor_raises():
     model = _make_model()
     with pytest.raises(ValueError, match="image_inputs"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text", "image"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text", "image"], ["video"], {"text_inputs": [_tensor_info("text")]})
 
 
 def _uint8_video(frames=4, height=64, width=96):
@@ -810,7 +661,6 @@ def test_wan22_postprocess_honors_request_fps():
 
 
 def test_wan22_postprocess_rejects_bad_fps():
-    pytest.importorskip("av")
     model = _make_model()
     for bad in (0, -24, "fast"):
         with pytest.raises(ValueError, match="fps"):
@@ -825,24 +675,18 @@ def test_wan22_postprocess_rejects_non_video_modality():
 
 # ----------------------------------------------------------------------
 # Feature 3: config echo — one resolved-settings line per request at generation
-# start. No weights/GPU needed; the line is emitted from get_initial_forward_pass_args.
+# start. No weights/GPU needed; the line is emitted from walk_plan.
 # ----------------------------------------------------------------------
 
 
 def test_wan22_config_echo_logs_resolved_settings(caplog):
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-            model_kwargs={
-                "height": 480, "width": 832, "num_frames": 33,
-                "num_inference_steps": 20, "guidance_scale": 5.0, "seed": 7,
-                "negative_prompt": "blurry", "fps": 30,
-            },
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {
+            "height": 480, "width": 832, "num_frames": 33,
+            "num_inference_steps": 20, "guidance_scale": 5.0, "seed": 7,
+            "negative_prompt": "blurry", "fps": 30,
+        })
     echoes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:")]
     assert len(echoes) == 1, f"expected exactly one config echo, got {echoes}"
     line = echoes[0]
@@ -856,16 +700,11 @@ def test_wan22_config_echo_logs_resolved_settings(caplog):
 
 def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
     # No seed and an empty negative prompt: seed reads "auto", negative "absent",
-    # and steps reflect the clamped/defaulted value.
+    # and steps echo the requested value.
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-            model_kwargs={"num_inference_steps": 10_000},  # clamps to max_denoise_steps
-        )
+        # exactly the max_denoise_steps ceiling
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": 100})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "seed=auto" in line
     assert "negative_prompt=absent" in line
@@ -877,12 +716,7 @@ def test_wan22_config_echo_reflects_compile_off(caplog):
     model = _make_model()
     model.config.compile_dit = False
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "compile=off" in line
 
@@ -974,12 +808,7 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
     monkeypatch.setenv(_DECODE_TILING_ENV, "banana")
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "decode=auto" in line
     assert "banana" not in line

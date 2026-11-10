@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.chunking import ChunkRange
@@ -194,6 +195,61 @@ def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget_in_start_order(["d0", "p0"], {"d0": 3, "p0": 100}, {"p0"}, 0, 4)
     assert take == {"d0": 3}
     assert dropped == {"p0"}
+
+
+@pytest.mark.parametrize("fill, cut", [
+    (fill_token_budget_in_start_order, {"a": 1500, "b": 512}),
+    (fill_token_budget, {"a": 896, "b": 896}),
+])
+def test_a_cut_row_takes_a_multiple_of_the_alignment_so_its_next_chunk_starts_on_it(fill, cut):
+    """A recurrent pool keeps state only on its page grid, counted from where a chunk starts;
+    a chunk cut off the grid leaves every later chunk of its prompt off it too."""
+    decodes = _decodes(31)
+    take, dropped = fill(
+        [*decodes, "a", "b"], decodes | {"a": 1500, "b": 1500}, {"a", "b"}, 2048, 128, align=128,
+    )
+    assert take == decodes | cut
+    assert not dropped
+
+
+def test_the_head_cut_over_its_budget_takes_a_multiple_of_the_alignment():
+    take, _ = fill_token_budget_in_start_order(["p"], {"p": 5000}, {"p"}, 300, 128, align=128)
+    assert take == {"p": 256}
+
+
+@pytest.mark.parametrize("floor, align, budget, short", [
+    (128, 256, 512, 128),  # a KV page_size of 256 under the default floor
+    (64, 128, 2048, 62),
+    (200, 128, 2048, 100),
+])
+def test_short_prompts_cannot_starve_the_oldest_prompt_under_an_alignment(floor, align, budget, short):
+    """The oldest prompt mid-prefill keeps the floor out of the finishing pass. A floor between
+    two multiples of the alignment leaves it too little to cut, every step that short prompts
+    take the rest, so the floor rounds up to one."""
+    from mstar.engine.chunking import ChunkingManagement
+
+    chunking = ChunkingManagement({})
+    chunking.set_budgets({}, set(), min_chunk_tokens=floor)
+    min_chunk = chunking.min_chunk_tokens(budget, align)
+    shorts = {f"s{i}": short for i in range(2 * budget // short)}
+    take, dropped = fill_token_budget_in_start_order(
+        [*shorts, "old"], shorts | {"old": 20000}, set(shorts) | {"old"}, budget, min_chunk, {"old": 0}, align,
+    )
+    assert "old" not in dropped
+    assert take["old"] >= floor and take["old"] % align == 0
+
+
+def test_the_floor_rounds_up_to_the_alignment_within_the_budget():
+    from mstar.engine.chunking import ChunkingManagement
+
+    chunking = ChunkingManagement({})
+    assert chunking.min_chunk_tokens(2048, 128) == 128
+    assert chunking.min_chunk_tokens(512, 256) == 256
+    chunking.set_budgets({}, set(), min_chunk_tokens=200)
+    assert chunking.min_chunk_tokens(2048, 128) == 256
+    # never past the budget's whole multiples, which a cut could not reach
+    assert chunking.min_chunk_tokens(250, 128) == 128
+    assert chunking.min_chunk_tokens(2048) == 200, "a node that declares no alignment keeps its floor"
 
 
 # ── engine: prepare once, cut per chunk ─────────────────────────────────
@@ -536,13 +592,16 @@ def test_a_continuing_decode_row_is_estimated_at_one_token():
 # ── engine: the serving config's max_batch_tokens ──────────────────────
 
 
-def _budgeted_engine():
+def _budgeted_engine(align: int = 1):
+    """An engine whose LLM node carries a resource declaring ``align`` (`Resource.chunk_alignment`)."""
     from types import SimpleNamespace
 
     from mstar.model.submodule_base import ChunkingPolicy
     from mstar.testing_utils.engine import make_engine, make_mgmt
+    from mstar.testing_utils.resource import make_resource
 
-    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace())})
+    state = make_resource(chunk_alignment=align)
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace(), resources={"state": state})})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
         ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),
@@ -621,11 +680,11 @@ COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}
 WALKS = {"prefill", "decode"}
 
 
-def _mixed_engine():
+def _mixed_engine(align: int = 1):
 
     from mstar.model.submodule_base import ChunkingPolicy
 
-    engine = _budgeted_engine()
+    engine = _budgeted_engine(align)
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=512),
@@ -681,6 +740,29 @@ def test_with_the_flag_a_null_walk_budget_turns_its_chunking_off():
     assert engine.walk_token_caps("LLM", "mixed") is None
 
 
+def test_a_budget_under_the_chunk_alignment_is_refused_and_one_under_three_is_warned(caplog):
+    """A cut chunk is a whole number of alignments: under one, every cut would run past the
+    budget, and under three, up to an alignment of each step can go unused."""
+    engine = _mixed_engine(align=128)
+    with pytest.raises(ValueError, match="LLM/mixed: 64 is under the 128-token chunk alignment"):
+        engine.set_token_budgets({"LLM": {"mixed": 64}}, WALKS, COMBINED)
+
+    with caplog.at_level("WARNING", logger="mstar.engine.engine"):
+        engine.set_token_budgets({"LLM": {"mixed": 300}}, WALKS, COMBINED)
+    assert [r.getMessage().split(":")[0] for r in caplog.records] == ["max_batch_tokens for LLM/mixed"]
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="mstar.engine.engine"):
+        _mixed_engine(align=128).set_token_budgets({}, WALKS, COMBINED)
+    assert not caplog.records
+
+
+def test_a_budget_the_scheduler_never_cuts_by_is_not_held_to_the_alignment():
+    engine = _budgeted_engine(align=128)
+    engine.set_token_budgets({"LLM": 64}, {"prefill", "vision"})
+    assert engine.get_max_batch_tokens("LLM", "prefill") == 64
+
+
 def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(caplog):
     """A step of only prompt rows runs as ``prefill`` but was scheduled under
     ``mixed``'s budget; the walk's own cap is not what the step is held to."""
@@ -697,6 +779,290 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
 
     assert engine._chunking._overruns == {("LLM", "mixed"): 1}
     assert "over its budget of 1024" in caplog.records[0].getMessage()
+
+
+# ── engine: the serving config's prefill_token_buckets ─────────────────
+
+
+def _captured_buckets(submodule, walk, ladders, engine, bs=1) -> list[int]:
+    """The token counts the engine's runner captures ``submodule``'s ``walk``
+    at (batch size ``bs``), given the serving config's ladders and ``engine``'s budgets."""
+    import functools
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=submodule, resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1,
+        token_ladders=ladders, step_tokens=functools.partial(engine._chunking.max_step_tokens, "LLM"),
+    )
+    return sorted({
+        spec.bucket.num_tokens for spec in runner._get_slot_specs()
+        if spec.bucket.graph_walk == walk and spec.bucket.bs == bs
+    })
+
+
+def _orpheus_prefill_buckets(ladders) -> list[int]:
+    """Orpheus's ``prefill`` capture."""
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+    engine = _mixed_engine()
+    engine.set_token_budgets({}, WALKS, COMBINED)
+    # its capture configs read no weights
+    return _captured_buckets(object.__new__(OrpheusLLMSubmodule), "prefill", ladders, engine)
+
+
+def test_a_ladder_reaches_the_capture_of_a_model_that_plumbs_none():
+    assert _orpheus_prefill_buckets({"prefill": [48, 16]}) == [16, 48]
+
+
+def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
+    """Qwen3.5's ``prefill_text`` capture replays only ``prefill_text`` steps,
+    which run inside ``mixed`` and are scheduled under its budget (4096 here),
+    not the walk's own 2048. With chunking off nothing is dropped, nor where
+    only the walk's is off: a prompt that cannot be cut runs whole."""
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    walks, combined = {"prefill_text", "decode"}, {("LLM", "prefill_text"): "mixed", ("LLM", "decode"): "mixed"}
+    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
+    ladder = {"prefill_text": [1024, 2048, 3000, 4096, 8192]}
+
+    def buckets(budgets, walk="prefill_text", override_mixed=()):
+        engine = _budgeted_engine()
+        engine.set_chunking_policies({
+            ("LLM", "prefill_text"): ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=2048),
+            ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=2048),
+        })
+        engine.set_token_budgets(budgets, walks, combined, override_mixed=override_mixed)
+        bs = llm.MIXED_CAPTURE_BATCH_SIZES[0] if walk == "mixed" else 1
+        return _captured_buckets(llm, walk, {walk: ladder["prefill_text"]}, engine, bs=bs)
+
+    assert buckets({"LLM": {"mixed": 4096}}) == [1024, 2048, 3000, 4096]
+    assert buckets({"LLM": {"mixed": 2500}}) == [1024, 2048, 3000]
+    assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
+    for walk in ("prefill_text", "mixed"):
+        assert buckets({"LLM": {"prefill_text": None}}, walk, {"LLM"}) == [1024, 2048, 3000, 4096, 8192]
+
+
+def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the_budget():
+    """Where a mixed step's decode rows leave a prompt less than
+    ``min_chunk_tokens`` of the budget, the prompt still runs that many beside
+    them: 127 decode rows and a 2048-token chunk replay at 2176, which stays.
+    At the default floor no step passes the budget, so 2176 is dropped. A
+    ``prefill_text`` step carries no decode rows, so its ladder drops it too."""
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.batch_builder import fill_token_budget_in_start_order
+
+    walks, combined = {"prefill_text", "decode"}, {("LLM", "prefill_text"): "mixed", ("LLM", "decode"): "mixed"}
+    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
+    rows = llm.MIXED_CAPTURE_BATCH_SIZES[-1]
+
+    def buckets(min_chunk_tokens):
+        engine = _budgeted_engine()
+        engine.set_chunking_policies({
+            ("LLM", "prefill_text"): ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=2048),
+            ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=2048),
+        })
+        engine.set_token_budgets({}, walks, combined, min_chunk_tokens=min_chunk_tokens)
+        # the scheduler's step: the decode rows a speculation brought, then a long prompt
+        take, _ = fill_token_budget_in_start_order(
+            [0], {0: 5000}, {0}, 2048 - (rows - 1), engine.min_chunk_tokens(2048),
+        )
+        ladder = [1024, 2048, 2176, 4096]
+        return (
+            rows - 1 + take[0],
+            _captured_buckets(llm, "mixed", {"mixed": ladder}, engine, bs=rows),
+            _captured_buckets(llm, "prefill_text", {"prefill_text": ladder}, engine),
+        )
+
+    assert buckets(128) == (2048, [1024, 2048], [1024, 2048])
+    assert buckets(2048) == (2175, [1024, 2048, 2176], [1024, 2048])
+
+
+def test_a_walk_with_no_token_ladder_to_set_is_refused():
+    # Orpheus's ``decode`` capture takes a batch size, one token a row (a walk whose steps
+    # replay another's capture is refused in test_cosyvoice3_model)
+    with pytest.raises(ValueError, match="batch size, not tokens"):
+        _orpheus_prefill_buckets({"decode": [64]})
+
+
+def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):
+    """GLM-5.2 captures nothing under ``dsa_long_context``, and serves eagerly
+    whatever the ladder."""
+    import logging
+
+    from mstar.model.glm52.config import Glm52ModelConfig
+    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    glm = Glm52LLMSubmodule(language_model, Glm52ModelConfig(dsa_long_context=True, mla_absorb=True))
+    engine = _budgeted_engine()
+    with caplog.at_level(logging.WARNING):
+        assert _captured_buckets(glm, "prefill", {"prefill": [64]}, engine) == []
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def _graph_model():
+    """LLM runs prefill and decode, which it combines into mixed; ViT runs encode.
+    Loading a node raises."""
+    from mstar.testing_utils.model import make_model
+
+    def unloadable(*args, **kwargs):
+        raise AssertionError("loaded weights before checking the config")
+
+    return make_model(
+        get_graph_walk_graphs=lambda: {
+            walk: SimpleNamespace(get_nodes=lambda nodes=nodes: nodes)
+            for walk, nodes in {"prefill": ["LLM"], "decode": ["LLM"], "encode": ["ViT"]}.items()
+        },
+        get_combined_graph_walks=lambda: {"LLM": {"mixed": {"prefill", "decode"}}},
+        get_submodule=unloadable,
+    )
+
+
+@pytest.mark.parametrize("model_config, match", [
+    # the key's place before it moved, which every model's `**kwargs` would swallow
+    ({"model_kwargs": {"prefill_token_buckets": [32, 64]}}, "moved to the top level"),
+    ({"model_kwargs": {"prefill_batched_token_buckets": [256]}}, "moved to the top level"),
+    ({"model_kwargs": {"backbone_token_buckets": [256]}}, "moved to the top level"),
+    ({"model_kwargs": {"lm_prefill_token_buckets": [256]}}, "moved to the top level"),
+    ({"prefill_token_buckets": [32, 64]}, "node -> capture walk -> ladder"),
+    ({"prefill_token_buckets": {"LLM": []}}, "node -> capture walk -> ladder"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": []}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": [64, 64]}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": [0, 64]}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": 2048}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": {"1": [64]}}}}, "min batch size"),
+    # a batch's ladder short of one request's would outgrow the static buffers its capture sized
+    ({"prefill_token_buckets": {"LLM": {"prefill": {1: [64, 4096], 2: [64, 2048]}}}}, "at least as far"),
+    # a walk of the model, but another node's
+    ({"prefill_token_buckets": {"LLM": {"encode": [64]}}}, "does not run"),
+    # no walk, so a piecewise region's, which takes one ladder
+    ({"prefill_token_buckets": {"LLM": {"layers": {1: [64]}}}}, "piecewise region"),
+])
+def test_a_serving_config_ladder_that_cannot_apply_is_refused_before_loading(model_config, match):
+    """EngineManager.build refuses it from the config and the model's graph, before any
+    node's weights load."""
+    import types
+
+    import torch
+
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.worker.engine_manager import EngineManager
+
+    with pytest.raises(ValueError, match=match):
+        EngineManager.build(
+            node_names={"LLM"}, device=torch.device("cpu"),
+            model_config={"node_groups": [{"node_names": ["LLM", "ViT"], "ranks": [0]}], **model_config},
+            parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+            transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
+            model=_graph_model(), graph_runtime=types.SimpleNamespace(),
+        )
+
+
+def test_a_name_that_is_no_walk_sets_the_piecewise_region_it_labels():
+    """OmniVoice's backbone layer loop, by its label; a label it doesn't declare is refused."""
+    from mstar.model.omnivoice.config import OmniVoiceConfig
+    from mstar.model.omnivoice.submodules import BACKBONE_LAYERS, OmniVoiceBackboneSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    backbone = OmniVoiceBackboneSubmodule(torch.nn.Module(), OmniVoiceConfig())
+
+    def regions(ladders):
+        mgmt = make_mgmt(backbone, joint_comm_group=SimpleNamespace(world_size=1), region_ladders=ladders)
+        return make_engine(_submodules={"backbone": mgmt})._build_piecewise_runners("backbone", mgmt)
+
+    (runner,) = regions({BACKBONE_LAYERS: [512, 256]}).values()
+    assert runner._config.total_tokens == [256, 512]
+    with pytest.raises(ValueError, match="neither"):
+        regions({"backbone_layer": [256]})
+
+
+def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
+    """A vision block-loop or AuT encoder node, its region captured on the serving
+    config's ``ladder`` (or, with ``walk``, the ladder named for that walk instead)
+    and its attention resource sized from the class's own top bucket, as the models
+    declare it: the node and its region's runner."""
+    from mstar.model.components.aut_encoder import AuTEncoderConfig
+    from mstar.model.components.aut_submodule import AuTEncoderSubmodule
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP, PackedBlockLoopEncoder
+    from mstar.model.keys import VISION_ATTN
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    if tower == "vision":
+        tower_class = type("Tower", (PackedBlockLoopEncoder,), {"prepare_inputs": None})
+        node = tower_class(torch.nn.Module(), SimpleNamespace(hidden_size=8, head_dim=4), "out")
+        node.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=8)}
+        label = VISION_BLOCK_LOOP
+    else:
+        config = AuTEncoderConfig()
+        node = type("Encoder", (AuTEncoderSubmodule,), {"prepare_inputs": None})(
+            SimpleNamespace(config=config), "audio_attn")
+        node.node_resources = {"audio_attn": SimpleNamespace(
+            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config))}
+        label = "aut_encode"
+    named = {"token_ladders": {walk: ladder}} if walk else {"region_ladders": {label: ladder}}
+    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), **named)
+    (runner,) = make_engine(_submodules={"node": mgmt})._build_piecewise_runners("node", mgmt).values()
+    return node, runner
+
+
+def test_a_vision_ladder_past_the_class_top_replays_and_batches_to_its_own_top():
+    node, runner = _tower_with_ladder("vision", [256, 32768])
+    rows = [SimpleNamespace(input_seq_len=10000, resource_step_info={"main": [10000]}) for _ in range(2)]
+    assert runner.can_lease(rows, ["a", "b"]) and node.can_batch(None, rows)
+
+
+def test_an_audio_clip_past_the_window_ceiling_runs_eagerly_however_long_the_ladder():
+    """The resource's windows per row are sized from the class's top bucket; a clip
+    with more than a replay's plan holds takes no lease, so its stack runs eagerly
+    rather than overflowing the plan."""
+    node, runner = _tower_with_ladder("audio", [64, 16384])
+    windows = node.node_resources["audio_attn"].max_segments_per_request
+    rows = [SimpleNamespace(input_seq_len=104 * n) for n in (windows, windows + 1)]
+    assert runner.can_lease(rows[:1], ["a"])
+    assert not runner.can_lease(rows[1:], ["b"])
+    # a batch the longer ladder holds packs, past the class's top bucket
+    assert node.can_batch(None, [SimpleNamespace(input_seq_len=3000)] * 2)
+    # clips over the ceiling run one by one, not as one eager step of them all
+    assert not node.can_batch(None, [SimpleNamespace(input_seq_len=5000)] * 2)
+
+
+def test_a_walk_named_on_a_node_that_captures_no_walk_is_refused_naming_its_regions():
+    """Qwen3.5's vision tower captures only its block-loop region, so a ladder named
+    for one of its walks could never apply."""
+    with pytest.raises(ValueError, match="vision_block_loop"):
+        _tower_with_ladder("vision", [256, 1024], walk="prefill_vision")
+
+
+@pytest.mark.parametrize("regions_off", [True, False])
+def test_a_name_on_a_node_with_no_region_here_is_skipped_only_if_it_declares_some(regions_off, caplog):
+    """OmniVoice's backbone declares its region but captures none with ``backbone_graphs``
+    off, so the ladder does nothing; Orpheus's LLM declares none at all, so the name is a
+    typo of a walk."""
+    import logging
+
+    from mstar.model.omnivoice.config import OmniVoiceConfig
+    from mstar.model.omnivoice.submodules import OmniVoiceBackboneSubmodule
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    node = (
+        OmniVoiceBackboneSubmodule(torch.nn.Module(), OmniVoiceConfig(backbone_graphs=False)) if regions_off
+        else object.__new__(OrpheusLLMSubmodule)
+    )
+    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), region_ladders={"prefil": [64]})
+    engine = make_engine(_submodules={"node": mgmt})
+    if regions_off:
+        with caplog.at_level(logging.WARNING):
+            assert engine._build_piecewise_runners("node", mgmt) == {}
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+    else:
+        with pytest.raises(ValueError, match="neither"):
+            engine._build_piecewise_runners("node", mgmt)
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────

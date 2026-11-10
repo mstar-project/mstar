@@ -74,6 +74,9 @@ def test_distilled_request_resolution(tmp_path) -> None:
     assert p["num_inference_steps"] == 4 and p["guidance_scale"] == 1.0
     v = model._resolve_gen_params({"num_frames": 33}, ["image", "text"], ["video"])
     assert v["num_inference_steps"] == 4 and v["guidance_scale"] == 1.0 and v["has_image_condition"]
+    # the loop's cap is what ends it, after the sigma list's four steps
+    assert model._denoise_cap(["image"], p) == {IMAGE_GEN_LOOP: 4}
+    assert model._denoise_cap(["video"], v) == {"video_gen_loop": 4}
     # Explicit matching values pass; anything else is a request error.
     ok = model._resolve_gen_params({"num_inference_steps": 4, "guidance_scale": 1.0}, ["text"], ["image"])
     assert ok["num_inference_steps"] == 4
@@ -135,7 +138,7 @@ def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
 def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
     """Driven through prepare_inputs / forward for the four steps with a fake
     velocity: the SDE re-noises every frame, and frame 0 is re-pinned to the
-    conditioning anchor after each step; the loop stops after step 4."""
+    conditioning anchor after each step."""
     sub = _distilled_dit(tmp_path)
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
     latent_shape = (1, 16, 3, 4, 4)
@@ -175,11 +178,6 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
         assert not torch.equal(lat[:, :, 1], anchor[:, :, 1])
         inputs = {"latents": [lat]}
     assert calls == [1000.0, 937.5, pytest.approx(833.333, abs=0.01), 625.0]
-    counts["video_gen_loop"] = 4
-    assert sub.prepare_inputs("video_gen", fwd, inputs) is None  # the loop's extra dispatch is vetoed
-    info = SimpleNamespace(graph_walk="video_gen", dynamic_loop_iter_counts={"video_gen_loop": 3})
-    assert sub.check_stop("r", info, {}) == {"video_gen_loop"}
-    assert IMAGE_GEN_LOOP  # keep the import honest for the t2i loop name
     # Deterministic: the same seed reproduces the rollout.
     st2 = sub.request_state("r2")
     st2.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},

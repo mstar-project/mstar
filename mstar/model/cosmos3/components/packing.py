@@ -156,15 +156,19 @@ def vision_condition_frame_indexes(mode: str, latent_frames: int) -> list[int]:
 def normalize_condition_frame_indexes(value, default: tuple[int, ...]) -> tuple[int, ...]:
     """Normalize a request's video-conditioning latent-frame indexes.
 
-    Accepts an int, a comma-separated string, or an iterable of ints; returns a
-    sorted, de-duplicated tuple. ``None`` falls back to ``default``."""
+    Accepts an int, a comma-separated string, or an iterable of ints (a whole
+    float such as ``2.0`` counts); returns a sorted, de-duplicated tuple.
+    ``None`` falls back to ``default``."""
     if value is None:
         return tuple(default)
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, int):
+    elif isinstance(value, (int, float)):
         value = [value]
     try:
+        value = [int(v) if isinstance(v, float) and v.is_integer() else v for v in value]
+        if any(isinstance(v, (bool, float)) for v in value):
+            raise TypeError("indexes are integers")
         indexes = tuple(sorted({int(v) for v in value}))
     except (TypeError, ValueError) as exc:
         raise ValueError(
@@ -224,13 +228,19 @@ def resolve_action_domain_id(domain_id, domain_name, num_domains: int) -> int:
     default would predict actions for the wrong embodiment. The id indexes the
     model's ``num_domains``-row embedding table on the GPU, so it must be below."""
     if domain_id is not None:
-        resolved = int(domain_id)
+        if isinstance(domain_id, float) and domain_id.is_integer():
+            domain_id = int(domain_id)
+        if isinstance(domain_id, bool) or not isinstance(domain_id, int):
+            raise ValueError(f"Cosmos3 domain_id must be an integer, got {domain_id!r}.")
+        resolved = domain_id
     else:
-        if domain_name is None or not str(domain_name).strip():
+        if domain_name is not None and not isinstance(domain_name, str):
+            raise ValueError(f"Cosmos3 domain_name must be a string, got {domain_name!r}.")
+        if domain_name is None or not domain_name.strip():
             raise ValueError(
                 "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
             )
-        key = str(domain_name).strip().lower()
+        key = domain_name.strip().lower()
         if key not in EMBODIMENT_TO_DOMAIN_ID:
             raise ValueError(
                 f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "

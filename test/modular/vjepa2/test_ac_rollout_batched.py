@@ -69,7 +69,6 @@ def _request_info(rid: str, iter_idx: int = 0) -> CurrentForwardPassInfo:
         max_tokens=0,
     )
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
-    info.step_metadata["rollout_horizon"] = 4
     return info
 
 
