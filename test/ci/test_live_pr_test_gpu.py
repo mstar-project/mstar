@@ -447,18 +447,22 @@ class TestDigitalOcean(unittest.TestCase):
                          {"id": 2, "name": "live-pr-8-2-1-amd", "status": "active", "created_at": ago(4.5)},
                          {"id": 3, "name": "someone-else", "status": "active", "created_at": ago(30)},
                          {"id": 4, "name": "live-pr-9-3-1-amd", "status": "active", "created_at": ago(0.5)}]
+        past = {"launched_at": time.time() - 1800, "deadline": time.time() - 60, "usd_per_hour": 1.99}
         GPU["save_ledger"]({"digitalocean:4": {"provider": "digitalocean", "instance_id": "4",
-                                               "name": "live-pr-9-3-1-amd", "launched_at": time.time() - 1800,
-                                               "deadline": time.time() - 60, "usd_per_hour": 1.99}})
+                                               "name": "live-pr-9-3-1-amd", **past},
+                            # its Pod's deadline ends it; reap must leave it alone even past the ledger's
+                            "eras:e1": {"provider": "eras", "instance_id": "e1", "name": "live-pr-5-x", **past}})
         self.addCleanup(GPU.update, {"eras": GPU["eras"]})
-        GPU["eras"] = lambda *a, **k: {"items": [{"id": "e1", "name": "live-pr-5-x", "status": "active"}]}
+        eras_calls = []
+        GPU["eras"] = lambda method, path, *a, **k: eras_calls.append((method, path)) or {
+            "items": [{"id": "e1", "name": "live-pr-5-x", "status": "active"}]}
         with keys("digitalocean", "eras"), contextlib.redirect_stderr(io.StringIO()):
             created = self.launch(None, cfg={"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": 4,
-                                                        "max_concurrent_instances": 2}})
+                                                        "max_concurrent_instances": 3}})
         self.assertEqual(sorted(d["name"] for d in self.droplets), ["live-pr-8-2-1-amd", "someone-else"],
                          "a box whose runner died would bill until someone noticed, or a live or foreign one would go")
         self.assertIsNotNone(created, "runaway boxes would hold budget.max_running")
-        self.assertNotIn("POST", [m for m, path, *_ in self.calls if path.startswith("/instances")],
+        self.assertEqual([c for c in eras_calls if c[0] != "GET"], [],
                          "an Eras box, which its Pod's deadline ends, would be released early")
 
 

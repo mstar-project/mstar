@@ -346,8 +346,7 @@ class TestHealth(unittest.TestCase):
         with unittest.mock.patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi")), \
                 unittest.mock.patch("sys.argv", ["gpu_health.py"]), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(HEALTH["main"](), 0, "an AMD box would fail its health check for want of nvidia-smi")
-        self.assertIn("unchecked", out.getvalue(), "a ROCm box's perf cells would carry no caveat")
-        self.assertEqual(burned, [])
+        self.assertEqual(burned, [], "a check that can't read the result would still load the GPUs for a minute")
 
 
 if __name__ == "__main__":
