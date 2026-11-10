@@ -161,6 +161,7 @@ mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
 - Sampling defaults come from the checkpoint's `generation_config.json` (temperature 1.0 and top_p 0.95 for both), read from a local checkpoint or the cached Hub snapshot; the conductor never fetches it, and without it the same values apply. A request may set `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `penalize_prompt` and `ignore_eos`. `min_p` above 0 is refused, since neither checkpoint defaults one. With MTP drafting, only greedy, unpenalized sampling is served.
 - GLM-5.2's `max_tokens` may run to its serving window (`index_topk`, or `max_seq_len` with `dsa_long_context`). GLM-5.3-Flash holds contexts to `index_topk` (2048), where dense MLA computes exactly what its sparse attention does, unless `dsa_long_context` serves up to `max_seq_len`; a `max_tokens` past its window is a 400 rather than being shortened, and under MTP, a `max_tokens` past the room the prompt leaves is refused too.
 - `configs/glm5_next_tp8_longctx.yaml` serves GLM-5.3-Flash a 1M-token window (`dsa_long_context`); `python -m benchmark.glm.longctx_probe` measures decode speed and passkey retrieval by prompt length against a running server.
+- `configs/glm5_next_tp8_longctx_mtp.yaml` and `configs/glm52_tp8_longctx_mtp.yaml` keep MTP on with long context.
 
 ## Muse Glimmer (`muse_glimmer`) {#muse-glimmer-muse-glimmer}
 
