@@ -11,7 +11,6 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
 from mstar.model.multimodal import SUPPORTED_MODALITIES
@@ -157,8 +156,9 @@ def validate_deployment(
             specs = built_resources(specs)
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
-            # the placement checks still see the specs the build would have kept
-            specs = [spec for spec in specs if not (isinstance(spec, LoraSpec) and not spec.targets)]
+            # the placement checks still see the specs built whole; a per-node one (LoRA) may be what
+            # failed, and reading it again would raise again
+            specs = [spec for spec in specs if not spec.per_node]
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,

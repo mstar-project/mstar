@@ -289,17 +289,18 @@ def test_parallel_node_group_over_a_node_without_support_is_refused(axis, patter
     _refused(_Model(), cfg, pattern)
 
 
-def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path, monkeypatch):
-    """Both problems are reported, not the build failure alone."""
-    from mstar import validation
+def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path):
+    """Both problems are reported, not the build failure alone, and the LoRA spec that failed
+    isn't read again."""
+    from mstar.engine.resources.lora.config import LoraSpec
 
-    def refuse(specs):
-        raise ValueError("a LoRA spec left no targets")
+    def declare():
+        raise OSError("the checkpoint's modules can't be read")
 
-    monkeypatch.setattr(validation, "built_resources", refuse)
-    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
-    problems = _problems(_Model(), cfg)
-    assert any("building the node resources failed" in p for p in problems), problems
+    lora = LoraSpec(resource_key="lora", nodes={"llm"}, declare=declare)
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources={"lora": {}})
+    problems = _problems(_Model(specs=[lora]), cfg)
+    assert any("building the node resources failed: OSError" in p for p in problems), problems
     assert any("node 'llm' on 2 SP ranks is not in sp_enabled_nodes" in p for p in problems), problems
 
 
