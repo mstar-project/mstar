@@ -36,7 +36,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state.analysis import position_key
+from mstar.engine.state.analysis import position_key, written_by_step
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.contract import (
     EMPTY,
@@ -755,8 +755,9 @@ class ValueHandle(ArrayHandle):
         }
         self._runners = {type(bound.declared): bound.binding.bind(array, bound.key, resources) for bound in bindings}
         self._layouts = _field_layouts(bindings)
-        # `_written` holds the fields each layer's write set this step.
+        # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
         # `_start` holds each layer's start state from `set_start`, in the pool's layout, fixed from the first step on.
+        self._step_written = written_by_step(array)
         self._written: dict[int, set[str]] = {}
         self._start: dict[int, dict[str, torch.Tensor]] = {}
         self._stepped = False
@@ -768,7 +769,7 @@ class ValueHandle(ArrayHandle):
 
     def check_step(self, step) -> None:
         super().check_step(step)
-        if not step.ctx.replays and not self.array.updates:
+        if self._step_written and not step.ctx.replays:
             self._check_written(step.state[self.name].segments or step.segments or ())
 
     def _check_written(self, segments) -> None:
@@ -776,10 +777,10 @@ class ValueHandle(ArrayHandle):
         if not rows:
             return
         for layer in sorted(self.array.layers):
-            unwritten = sorted(self.array.entry.tensors.keys() - self._written.get(layer, set()))
+            unwritten = sorted(self._step_written - self._written.get(layer, set()))
             if unwritten:
                 raise self._refusal(f"layer {layer}'s fields {unwritten} are unwritten in a kept step for rows {rows}, "
-                                    "and a Value with no update is written whole by the step's own write")
+                                    "and no update op writes them")
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:

@@ -803,7 +803,9 @@ class _Declares:
 def test_state_dtype_on_a_plain_value_is_refused_by_the_deployment():
     plain = Value("plain", nodes={"LLM"}, layers={0}, entry=Entry({"state": TensorType((2,), dtype=torch.float32)}))
     (problem,) = deployment_problems(_Declares(plain), {"plain": {"state_dtype": "bfloat16"}})
-    assert problem.startswith("Array 'plain': resources.plain.state_dtype"), "only a GatedDeltaNet picks a stored dtype"
+    assert problem.startswith("Array 'plain': resources.plain.state_dtype"), (
+        "only a field an update op writes takes a stored dtype"
+    )
 
 
 def test_state_dtype_on_a_gated_delta_net_is_the_deployments_choice():
