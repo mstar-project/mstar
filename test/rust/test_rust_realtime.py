@@ -67,12 +67,18 @@ def _pcm(audio: np.ndarray) -> str:
 
 
 def _tokenizer():
-    try:
-        from transformers import AutoTokenizer
+    """A byte-level BPE with no merges, so one token is one byte: a stable
+    prefix holds back ``unfixed_tokens`` bytes and backs off inside a
+    multi-byte character, the same on every machine and with nothing to
+    download."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
 
-        return AutoTokenizer.from_pretrained("Qwen/Qwen3-ASR-1.7B", local_files_only=True)
-    except Exception:  # noqa: BLE001 — not cached: partials hold nothing back on either side
-        return None
+    vocab = {ch: i for i, ch in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+    tok = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(tokenizer_object=tok, clean_up_tokenization_spaces=False)
 
 
 class _Model:
