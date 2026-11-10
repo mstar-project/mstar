@@ -363,10 +363,9 @@ class LoraAdapterPool(Resource):
             # its rows are laid out per request over the whole batch; every axis but TP
             # (cfg branches, sp token shards) hands each rank only part of it, except SP
             # under a node whose pools place positions over its SP ranks, which runs
-            # replicated over them, heads split over TP alone (`head_shards`)
-            replicated_sp = info.head_shards == joint.tp_group.world_size
+            # replicated over them
             for axis in PARALLEL_AXES:
-                if axis == "tp" or (axis == "sp" and replicated_sp):
+                if axis == "tp" or (axis == "sp" and info.replicated_over_sp):
                     continue
                 if (size := getattr(joint, f"{axis}_group").world_size) > 1:
                     raise ValueError(
