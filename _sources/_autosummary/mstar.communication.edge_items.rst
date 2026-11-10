@@ -16,6 +16,7 @@ mstar.communication.edge\_items
       frame_dtypes
       row_infos
       row_input_signals
+      row_values_frame
       rows
    
    

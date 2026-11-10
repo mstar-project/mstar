@@ -1135,7 +1135,23 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># pass's items run under the consumer walk it returns: the producer, which</span>
     <span class="c1"># owns the consumer's walk, decides it, and the consumer only applies it.</span>
     <span class="n">consumer_walk</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">ProducerWalkCtx</span><span class="p">],</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">audio</span><span class="p">:</span> <span class="n">ClientAudio</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">audio</span><span class="p">:</span> <span class="n">ClientAudio</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The consumer takes a window of this stream as one CPU int64 tensor of its</span>
+    <span class="c1"># items' values, so a producer that names the signal inline</span>
+    <span class="c1"># (``NodeSubmodule.inline_signals``) sends each item as its value in the</span>
+    <span class="c1"># step's EDGE_ITEMS frame, with nothing to stage, read or acknowledge.</span>
+    <span class="n">by_value</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># a joined item or an assigned walk rides only a tensor's descriptor,</span>
+        <span class="c1"># and a client stream has no producer route to send values</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">by_value</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">join_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">consumer_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">==</span> <span class="n">CLIENT</span>
+        <span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> goes by value, so it cannot join its items, drive its "</span>
+                <span class="s2">"consumer's walk or come from the client"</span>
+            <span class="p">)</span></div>
 
 
 

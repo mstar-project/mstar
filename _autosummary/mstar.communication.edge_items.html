@@ -727,6 +727,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.add_values"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.add_values()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.build"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.try_add"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.try_add()</span></code></a></li>
 </ul>
@@ -744,6 +745,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.frame_dtypes"><code class="docutils literal notranslate"><span class="pre">frame_dtypes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_infos"><code class="docutils literal notranslate"><span class="pre">row_infos()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_input_signals"><code class="docutils literal notranslate"><span class="pre">row_input_signals()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_values_frame"><code class="docutils literal notranslate"><span class="pre">row_values_frame()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.rows"><code class="docutils literal notranslate"><span class="pre">rows()</span></code></a></li>
 </ul>
             </nav>
@@ -778,7 +780,10 @@ still want that (a request not known yet, a transport without a batched read).</
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_input_signals" title="mstar.communication.edge_items.row_input_signals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_input_signals</span></code></a>(frame, row)</p></td>
 <td><p>The row as the INPUT_SIGNALS that carried it before EDGE_ITEMS.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.rows" title="mstar.communication.edge_items.rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rows</span></code></a>(frame)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_values_frame" title="mstar.communication.edge_items.row_values_frame"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_values_frame</span></code></a>(frame, row)</p></td>
+<td><p>A row of inline items as a frame of its own (to park it for a request that has not arrived).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.rows" title="mstar.communication.edge_items.rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rows</span></code></a>(frame)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -806,6 +811,29 @@ still want that (a request not known yet, a transport without a batched read).</
 <dd class="field-odd"><p><strong>partition_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.edge_items.EdgeItemsBuilder.add_values">
+<span class="sig-name descname"><span class="pre">add_values</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">signal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">next_node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/edge_items.html#EdgeItemsBuilder.add_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.edge_items.EdgeItemsBuilder.add_values" title="Link to this definition">#</a></dt>
+<dd><p>Add a row of inline items, <code class="docutils literal notranslate"><span class="pre">source</span></code> the producer’s (session, entity,
+node, tp_size, tp_rank); False, adding nothing, when the frame holds
+descriptor rows or another producer’s (a frame is one kind or the other).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>signal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>next_node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>values</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.edge_items.EdgeItemsBuilder.build">
 <span class="sig-name descname"><span class="pre">build</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/edge_items.html#EdgeItemsBuilder.build"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.edge_items.EdgeItemsBuilder.build" title="Link to this definition">#</a></dt>
@@ -951,6 +979,24 @@ column), and their dims and strides <code class="docutils literal notranslate"><
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.communication.edge_items.row_values_frame">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.edge_items.</span></span><span class="sig-name descname"><span class="pre">row_values_frame</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">frame</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/edge_items.html#row_values_frame"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.edge_items.row_values_frame" title="Link to this definition">#</a></dt>
+<dd><p>A row of inline items as a frame of its own (to park it for a request
+that has not arrived).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>frame</strong> (<a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.EdgeItems" title="mstar.utils.ipc_format.EdgeItems"><em>EdgeItems</em></a>)</p></li>
+<li><p><strong>row</strong> (<a class="reference internal" href="#mstar.communication.edge_items.StreamRow" title="mstar.communication.edge_items.StreamRow"><em>StreamRow</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.EdgeItems" title="mstar.utils.ipc_format.EdgeItems"><em>EdgeItems</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.communication.edge_items.rows">
 <span class="sig-prename descclassname"><span class="pre">mstar.communication.edge_items.</span></span><span class="sig-name descname"><span class="pre">rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">frame</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/edge_items.html#rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.edge_items.rows" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1013,6 +1059,7 @@ column), and their dims and strides <code class="docutils literal notranslate"><
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.add_values"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.add_values()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.build"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.EdgeItemsBuilder.try_add"><code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder.try_add()</span></code></a></li>
 </ul>
@@ -1030,6 +1077,7 @@ column), and their dims and strides <code class="docutils literal notranslate"><
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.frame_dtypes"><code class="docutils literal notranslate"><span class="pre">frame_dtypes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_infos"><code class="docutils literal notranslate"><span class="pre">row_infos()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_input_signals"><code class="docutils literal notranslate"><span class="pre">row_input_signals()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_values_frame"><code class="docutils literal notranslate"><span class="pre">row_values_frame()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.rows"><code class="docutils literal notranslate"><span class="pre">rows()</span></code></a></li>
 </ul>
   </nav></div>

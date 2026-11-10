@@ -23,6 +23,7 @@ mstar.streaming.stream\_buffer
 
    .. autosummary::
    
+      InlineValue
       StreamBuffer
       StreamChunk
       StreamChunkInfo

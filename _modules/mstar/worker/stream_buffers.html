@@ -1036,7 +1036,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="n">TensorCommunicationManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">GraphSection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnarEdgeSpecs</span><span class="p">,</span> <span class="n">EdgeSpec</span><span class="p">,</span> <span class="n">InputTensors</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamBuffer</span><span class="p">,</span> <span class="n">StreamChunkInfo</span><span class="p">,</span> <span class="n">StreamingEdge</span><span class="p">,</span> <span class="n">collate</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">InlineValue</span><span class="p">,</span> <span class="n">StreamBuffer</span><span class="p">,</span> <span class="n">StreamChunkInfo</span><span class="p">,</span> <span class="n">StreamingEdge</span><span class="p">,</span> <span class="n">collate</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.topology</span><span class="w"> </span><span class="kn">import</span> <span class="n">Connection</span><span class="p">,</span> <span class="n">PartitionTopology</span><span class="p">,</span> <span class="n">ProducerWalkCtx</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.worker.node_manager_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">RequestStateManager</span>
 
@@ -1292,17 +1292,47 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># The chunk's items as the buffer holds them: their uuids, or none for</span>
         <span class="c1"># an empty chunk (producer done, nothing left). The edge carries every</span>
         <span class="c1"># item; ``input_tensors`` stacks them when the consuming batch is built.</span>
-        <span class="n">uuids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"data"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[])</span>
+        <span class="n">items</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"data"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[])</span>
         <span class="n">tm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span>
-        <span class="k">if</span> <span class="n">uuids</span><span class="p">:</span>
-            <span class="c1"># the edge's own reference, dropped once its node consumes it</span>
-            <span class="n">tm</span><span class="o">.</span><span class="n">increment_ref_batch_uniform</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">chunk</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="ow">is</span> <span class="n">InlineValue</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">):</span>
+            <span class="c1"># items that came inline: the window as one stored tensor, holding</span>
+            <span class="c1"># the edge's reference</span>
+            <span class="n">uuids</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_pack_window</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">edge_name</span><span class="p">,</span> <span class="n">items</span><span class="p">)]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">uuids</span> <span class="o">=</span> <span class="n">items</span>
+            <span class="k">if</span> <span class="n">uuids</span><span class="p">:</span>
+                <span class="c1"># the edge's own reference, dropped once its node consumes it</span>
+                <span class="n">tm</span><span class="o">.</span><span class="n">increment_ref_batch_uniform</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span>
+        <span class="n">released</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">chunk</span><span class="o">.</span><span class="n">released</span> <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">InlineValue</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">released</span><span class="p">:</span>
             <span class="c1"># the buffer's references to the items it advanced past; after</span>
             <span class="c1"># the increment, so an item in both stays alive</span>
-            <span class="n">tm</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">released</span><span class="p">))</span>
+            <span class="n">tm</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">(</span><span class="n">released</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">StreamingEdge</span><span class="p">(</span><span class="n">edge_name</span><span class="p">,</span> <span class="n">consumer_node</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">chunk</span><span class="o">.</span><span class="n">info</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_pack_window</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A window that holds inline items, as one stored CPU int64 tensor ``[n]``</span>
+<span class="sd">        (what stacking ``n`` scalar items gives), with one reference: the edge's.</span>
+<span class="sd">        A window that also holds stored items (a step that could not send its</span>
+<span class="sd">        values inline) copies theirs to the host."""</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="ow">is</span> <span class="n">InlineValue</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">):</span>
+            <span class="n">window</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">items</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">stored</span> <span class="o">=</span> <span class="nb">iter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">get_tensors</span><span class="p">(</span>
+                <span class="p">[</span><span class="n">item</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span> <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">InlineValue</span><span class="p">]</span>
+            <span class="p">))</span>
+            <span class="n">window</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">item</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span> <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="ow">is</span> <span class="n">InlineValue</span>
+                <span class="k">else</span> <span class="nb">next</span><span class="p">(</span><span class="n">stored</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span>
+            <span class="p">])</span>
+        <span class="n">tm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span>
+        <span class="p">(</span><span class="n">info</span><span class="p">,)</span> <span class="o">=</span> <span class="n">tm</span><span class="o">.</span><span class="n">store_and_return_tensor_info</span><span class="p">(</span>
+            <span class="n">request_id</span><span class="p">,</span> <span class="p">{</span><span class="n">edge_name</span><span class="p">:</span> <span class="p">[</span><span class="n">window</span><span class="p">]},</span> <span class="n">skip_cuda_sync</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)[</span><span class="n">edge_name</span><span class="p">]</span>
+        <span class="n">tm</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
 
 <div class="viewcode-block" id="StreamBufferManager.poll">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.stream_buffers.html#mstar.worker.stream_buffers.StreamBufferManager.poll">[docs]</a>

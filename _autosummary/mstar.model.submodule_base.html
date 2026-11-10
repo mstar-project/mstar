@@ -740,7 +740,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.get_stop_policies()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.loopback_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
@@ -866,7 +866,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_input_sequence_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_rows_in_combined()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>
@@ -1233,13 +1233,18 @@ Every policy must agree with <code class="docutils literal notranslate"><span cl
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals">
-<span class="sig-name descname"><span class="pre">inline_client_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.inline_client_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals" title="Link to this definition">#</a></dt>
-<dd><p>Output signals whose client-facing value is one scalar per row that
-the stop check already copies to the host, as signal name -&gt; the name
-of the row-addressed stop buffer holding it. The worker then sends
-those values inline, one frame per step, instead of one tensor per
-request. Only for a walk whose emit edge is not persisted.</p>
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.inline_signals">
+<span class="sig-name descname"><span class="pre">inline_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.inline_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_signals" title="Link to this definition">#</a></dt>
+<dd><p>Output signals whose value is one scalar per row that the stop check
+already copies to the host, as signal name -&gt; the name of the
+row-addressed stop buffer holding it. The worker then sends those values
+inline, one frame per step, instead of one tensor per request: to the
+client on an emit edge that is not persisted, and down a stream whose
+<code class="docutils literal notranslate"><span class="pre">Connection</span></code> goes <code class="docutils literal notranslate"><span class="pre">by_value</span></code>. A step carries one inline signal, the
+first of these it outputs. Its rows stay on the device only if every
+output is a <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code> one, so a stream’s signal sent
+inline lets the step run rows-only when it is also the loop-back
+signal.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
@@ -1662,7 +1667,7 @@ sampler’s slot masters instead of a routed tensor
 inline, off the stop check’s host copy.</p>
 <p>Declared as <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code>; the loop-back hooks
 (<code class="docutils literal notranslate"><span class="pre">uniform_row_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>,
-<code class="docutils literal notranslate"><span class="pre">inline_client_signals</span></code>) and the read in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>
+<code class="docutils literal notranslate"><span class="pre">inline_signals</span></code>) and the read in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>
 (<code class="docutils literal notranslate"><span class="pre">loopback_inputs</span></code>) follow from it. The sampler keeps the masters only
 for a node that declares this: their eager step write is a small
 synchronous host-to-device copy per step, which a node that reads its
@@ -2513,13 +2518,18 @@ Every policy must agree with <code class="docutils literal notranslate"><span cl
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.inline_client_signals">
-<span class="sig-name descname"><span class="pre">inline_client_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.inline_client_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals" title="Link to this definition">#</a></dt>
-<dd><p>Output signals whose client-facing value is one scalar per row that
-the stop check already copies to the host, as signal name -&gt; the name
-of the row-addressed stop buffer holding it. The worker then sends
-those values inline, one frame per step, instead of one tensor per
-request. Only for a walk whose emit edge is not persisted.</p>
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.inline_signals">
+<span class="sig-name descname"><span class="pre">inline_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.inline_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.inline_signals" title="Link to this definition">#</a></dt>
+<dd><p>Output signals whose value is one scalar per row that the stop check
+already copies to the host, as signal name -&gt; the name of the
+row-addressed stop buffer holding it. The worker then sends those values
+inline, one frame per step, instead of one tensor per request: to the
+client on an emit edge that is not persisted, and down a stream whose
+<code class="docutils literal notranslate"><span class="pre">Connection</span></code> goes <code class="docutils literal notranslate"><span class="pre">by_value</span></code>. A step carries one inline signal, the
+first of these it outputs. Its rows stay on the device only if every
+output is a <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code> one, so a stream’s signal sent
+inline lets the step run rows-only when it is also the loop-back
+signal.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
@@ -3428,7 +3438,7 @@ step without segments gets none: a resource that needs one refuses for want of a
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.get_stop_policies()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.loopback_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
@@ -3554,7 +3564,7 @@ step without segments gets none: a resource that needs one refuses for want of a
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_input_sequence_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_rows_in_combined()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>

@@ -1077,6 +1077,20 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="InlineValue">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.InlineValue">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">InlineValue</span><span class="p">(</span><span class="nb">int</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A stream item that came as its value rather than as a handle to a stored</span>
+<span class="sd">    tensor: a token the producer sent inline (``StreamBuffer.put_values``)."""</span>
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">()</span></div>
+
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_InlineValues</span><span class="p">(</span><span class="nb">tuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Inline items queued in arrival order behind the items registered before them."""</span>
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">()</span>
+
+
 <div class="viewcode-block" id="collate">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.collate">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">collate</span><span class="p">(</span><span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
@@ -1193,6 +1207,21 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">tuple</span><span class="p">(</span><span class="n">tensor_ids</span><span class="p">),</span> <span class="n">walk</span><span class="p">))</span></div>
 
 
+<div class="viewcode-block" id="StreamBuffer.put_values">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.put_values">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_values</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Items that came inline, already here: they join the buffer after every</span>
+<span class="sd">        item registered before them, so a stream keeps its order whichever way</span>
+<span class="sd">        each item travelled."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">values</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">join_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"stream </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> joins its items and cannot take them inline"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_tensors_registered</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">values</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">_InlineValues</span><span class="p">(</span><span class="n">InlineValue</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">values</span><span class="p">),</span> <span class="n">walk</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">maybe_ready</span> <span class="o">=</span> <span class="kc">True</span></div>
+
+
 <div class="viewcode-block" id="StreamBuffer.put">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.put">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">item</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1212,6 +1241,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">entry</span><span class="p">))</span>
                 <span class="c1"># producer's units: see pre_read_register_joined</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">elif</span> <span class="nb">type</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span> <span class="ow">is</span> <span class="n">_InlineValues</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">tensor_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span> <span class="k">for</span> <span class="n">tensor_id</span> <span class="ow">in</span> <span class="n">entry</span><span class="p">):</span>
                     <span class="k">return</span>
@@ -1221,10 +1254,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">))</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk_tagged</span><span class="p">:</span>
+                <span class="n">added</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span> <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span> <span class="ow">is</span> <span class="n">_InlineValues</span> <span class="k">else</span> <span class="mi">1</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">walk</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="n">added</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">walk</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">walk</span><span class="p">,</span> <span class="n">added</span><span class="p">])</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_join</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pieces</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""One item from a chunked producer's pieces, in chunk order.</span>

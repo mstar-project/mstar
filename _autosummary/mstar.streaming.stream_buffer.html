@@ -726,6 +726,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.InlineValue"><code class="docutils literal notranslate"><span class="pre">InlineValue</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer"><code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.edge_name"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.from_partition"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.from_partition</span></code></a></li>
@@ -743,6 +744,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.prime_context"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.prime_context()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.producer_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.producer_done</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put_values"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put_values()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.request_id"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.signal_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.signal_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.store_uningested_edge"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.store_uningested_edge()</span></code></a></li>
@@ -800,21 +802,32 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamBuffer" title="mstar.streaming.stream_buffer.StreamBuffer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamBuffer</span></code></a>(request_id, edge_name, ...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.InlineValue" title="mstar.streaming.stream_buffer.InlineValue"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InlineValue</span></code></a></p></td>
+<td><p>A stream item that came as its value rather than as a handle to a stored tensor: a token the producer sent inline (<code class="docutils literal notranslate"><span class="pre">StreamBuffer.put_values</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamBuffer" title="mstar.streaming.stream_buffer.StreamBuffer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamBuffer</span></code></a>(request_id, edge_name, ...[, ...])</p></td>
 <td><p>Per-request, per-edge buffer on the CONSUMER worker.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunk" title="mstar.streaming.stream_buffer.StreamChunk"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamChunk</span></code></a>(data, chunk_index[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunk" title="mstar.streaming.stream_buffer.StreamChunk"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamChunk</span></code></a>(data, chunk_index[, ...])</p></td>
 <td><p>A chunk of data popped from a StreamBuffer.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamChunkInfo</span></code></a>(start_offset, context_items, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamChunkInfo</span></code></a>(start_offset, context_items, ...)</p></td>
 <td><p>A chunk's place in its stream, without its data.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamingEdge" title="mstar.streaming.stream_buffer.StreamingEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a>(name, next_node, uuids, chunk)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamingEdge" title="mstar.streaming.stream_buffer.StreamingEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a>(name, next_node, uuids, chunk)</p></td>
 <td><p>A popped chunk as a synthetic input edge into its consumer node: the uuid of each of its items, and its place in the stream.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.InlineValue">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">InlineValue</span></span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#InlineValue"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.InlineValue" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a></p>
+<p>A stream item that came as its value rather than as a handle to a stored
+tensor: a token the producer sent inline (<code class="docutils literal notranslate"><span class="pre">StreamBuffer.put_values</span></code>).</p>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamBuffer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">policy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joiner</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_tagged</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_waiting_graph_edges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ingested_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_buffer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_walk_runs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_tensor_ids_in_order</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_id_to_tensor</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_consumed</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_chunks_popped</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_delivered_end</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">producer_done</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_final_chunk_emitted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maybe_ready</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer" title="Link to this definition">#</a></dt>
@@ -998,6 +1011,25 @@ ahead of its new items, reported as <code class="docutils literal notranslate"><
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>tensor_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.put_values">
+<span class="sig-name descname"><span class="pre">put_values</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer.put_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.put_values" title="Link to this definition">#</a></dt>
+<dd><p>Items that came inline, already here: they join the buffer after every
+item registered before them, so a stream keeps its order whichever way
+each item travelled.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>values</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
@@ -1250,6 +1282,7 @@ stored tensor, which other destinations may read too.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.InlineValue"><code class="docutils literal notranslate"><span class="pre">InlineValue</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer"><code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.edge_name"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.from_partition"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.from_partition</span></code></a></li>
@@ -1267,6 +1300,7 @@ stored tensor, which other destinations may read too.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.prime_context"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.prime_context()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.producer_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.producer_done</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put_values"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put_values()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.request_id"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.signal_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.signal_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.store_uningested_edge"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.store_uningested_edge()</span></code></a></li>

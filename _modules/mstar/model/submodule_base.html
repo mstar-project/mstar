@@ -1134,7 +1134,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks</span>
 <span class="sd">    (``uniform_row_inputs``, ``device_loopback_signals``,</span>
-<span class="sd">    ``inline_client_signals``) and the read in ``preprocess``</span>
+<span class="sd">    ``inline_signals``) and the read in ``preprocess``</span>
 <span class="sd">    (``loopback_inputs``) follow from it. The sampler keeps the masters only</span>
 <span class="sd">    for a node that declares this: their eager step write is a small</span>
 <span class="sd">    synchronous host-to-device copy per step, which a node that reads its</span>
@@ -1969,6 +1969,12 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Base class for a model's compute units: defines the prepare_inputs →</span>
 <span class="sd">    preprocess → forward(_batched) contract the engines drive."""</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">__init_subclass__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__init_subclass__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="c1"># nothing calls the old name, so an override of it would be skipped silently</span>
+        <span class="k">if</span> <span class="s2">"inline_client_signals"</span> <span class="ow">in</span> <span class="nb">vars</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">.inline_client_signals is now inline_signals"</span><span class="p">)</span>
+
     <span class="c1"># Set True on a submodule whose forward does not benefit from (or is broken</span>
     <span class="c1"># by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot</span>
     <span class="c1"># forward where the trace cost dwarfs the win. The KV-cache / stateless</span>
@@ -2408,14 +2414,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span></div>
 
 
-<div class="viewcode-block" id="NodeSubmodule.inline_client_signals">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.inline_client_signals">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">inline_client_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""Output signals whose client-facing value is one scalar per row that</span>
-<span class="sd">        the stop check already copies to the host, as signal name -&gt; the name</span>
-<span class="sd">        of the row-addressed stop buffer holding it. The worker then sends</span>
-<span class="sd">        those values inline, one frame per step, instead of one tensor per</span>
-<span class="sd">        request. Only for a walk whose emit edge is not persisted."""</span>
+<div class="viewcode-block" id="NodeSubmodule.inline_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.inline_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">inline_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Output signals whose value is one scalar per row that the stop check</span>
+<span class="sd">        already copies to the host, as signal name -&gt; the name of the</span>
+<span class="sd">        row-addressed stop buffer holding it. The worker then sends those values</span>
+<span class="sd">        inline, one frame per step, instead of one tensor per request: to the</span>
+<span class="sd">        client on an emit edge that is not persisted, and down a stream whose</span>
+<span class="sd">        ``Connection`` goes ``by_value``. A step carries one inline signal, the</span>
+<span class="sd">        first of these it outputs. Its rows stay on the device only if every</span>
+<span class="sd">        output is a ``device_loopback_signals`` one, so a stream's signal sent</span>
+<span class="sd">        inline lets the step run rows-only when it is also the loop-back</span>
+<span class="sd">        signal."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="p">{}</span></div>
 
@@ -2846,13 +2857,13 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">device_loopback_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="ARNodeSubmodule.inline_client_signals">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">inline_client_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-        <span class="c1"># the client's copy of the token the stop check already has on the host</span>
+<div class="viewcode-block" id="ARNodeSubmodule.inline_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.inline_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">inline_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># the loop-back token, which the stop check already has on the host</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loops_back</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">signal</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">buffer</span><span class="p">}</span>
-        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">inline_client_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">inline_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="ARNodeSubmodule.loopback_inputs">
