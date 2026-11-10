@@ -135,7 +135,7 @@ def _rank(
             get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
             remove_request=lambda rid: None,
         ),
-        engine_manager=SimpleNamespace(warmup_all=lambda: None, remove_request=_tear_down),
+        engine_manager=SimpleNamespace(warmup_all=lambda *_: None, remove_request=_tear_down),
         communicator=SimpleNamespace(send=_send, wait_for_work=lambda timeout: None),
         request_state=request_state, tensor_manager=tensor_manager,
         streams=StreamBufferManager(request_state, tensor_manager, []),

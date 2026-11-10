@@ -57,6 +57,18 @@ class AcceleratorGraphBackend(ABC):
     def device_type(self) -> str:
         return self.device.type
 
+    def while_refusal(self) -> str | None:
+        """Why this backend has no WHILE run (``mstar.engine.device_run``), or None."""
+        return f"{type(self).__name__} has no WHILE graph node"
+
+    def while_runtime(self) -> Any:
+        """What a WHILE run calls: a ``device_run.CudaWhile``."""
+        raise NotImplementedError(self.while_refusal())
+
+    def loop(self, child: CapturedGraph, predicate: torch.Tensor) -> CapturedGraph:
+        """WHILE(``predicate``) { ``child`` }, one launch."""
+        raise NotImplementedError(self.while_refusal())
+
     @abstractmethod
     def is_available(self) -> bool: ...
 
@@ -187,9 +199,37 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="cuda", runtime=torch.cuda)
+        self._while = None
 
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
+
+    def raw_stream(self) -> int:
+        """The current ``cudaStream_t``, which ``torch.Stream`` doesn't expose."""
+        return int(self._runtime.current_stream(self.device).cuda_stream)
+
+    def while_refusal(self) -> str | None:
+        if not torch.version.cuda or torch.version.hip is not None:
+            return "this torch has no CUDA runtime"
+        if tuple(int(part) for part in torch.version.cuda.split(".")[:2]) < (12, 4):
+            return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"
+        from mstar.engine.device_run import CudaWhile
+
+        if CudaWhile.devrt_path() is None:
+            return "no libcudadevrt.a to link its stop kernel against (set CUDA_HOME)"
+        return None
+
+    def while_runtime(self) -> Any:
+        from mstar.engine.device_run import CudaWhile
+
+        if self._while is None:
+            self._while = CudaWhile()
+        return self._while
+
+    def loop(self, child: CapturedGraph, predicate: torch.Tensor) -> CapturedGraph:
+        from mstar.engine.device_run import WhileGraph
+
+        return WhileGraph(self.while_runtime(), child, predicate, self.raw_stream)
 
 
 class XPUGraphBackend(_TorchGraphBackend):

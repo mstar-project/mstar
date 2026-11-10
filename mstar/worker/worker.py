@@ -513,7 +513,7 @@ class Worker:
 
         # CUDA graph capture before entering the main loop
         repeats = self.layout.step_repeats
-        self.engine_manager.warmup_all()
+        self.engine_manager.warmup_all(repeats.asked_walks() if repeats is not None else {})
         if repeats is not None:
             repeats.settle(self.executor.repeat_refusal)
 

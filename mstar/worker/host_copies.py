@@ -236,6 +236,8 @@ class HostCopies:
             outputs.host_rows = HostRows(
                 tuple(outputs.row_request_ids),
                 self._copy_to_pinned(buffers, f"host_rows{slot}"),
+                None if outputs.run_replays is None
+                else self._copy_to_pinned({"ran": outputs.run_replays}, f"run_replays{slot}")["ran"],
             )
         if outputs.output_spans:
             outputs.host_spans = self._copy_to_pinned(

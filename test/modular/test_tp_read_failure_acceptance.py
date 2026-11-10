@@ -667,7 +667,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         get_instance_world_size_for_node=lambda node: 2,
     )
     engine_manager = SimpleNamespace(
-        get_engine=lambda node: engine, warmup_all=lambda: None,
+        get_engine=lambda node: engine, warmup_all=lambda *_: None,
         remove_request=engine.remove_request,
     )
     w = make_worker(

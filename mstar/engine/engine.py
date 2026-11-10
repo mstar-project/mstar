@@ -10,6 +10,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
@@ -29,6 +30,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.device_run import RunAsk, WalkAsk
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -203,6 +205,8 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # walk -> the stop policy its device runs read ``ignore_eos`` through
+    run_policies: dict[str, StopPolicy] = field(default_factory=dict)
     # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
     # and piecewise region label -> ladder
     token_ladders: Mapping[str, Any] = field(default_factory=dict)
@@ -796,7 +800,10 @@ class Engine:
                     "the decode walk while the request is rebuilt"
                 )
 
-    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
+    def _build_resident_planner(
+        self, node_name: str, runner: AcceleratorGraphRunner,
+        repeat_walks: Mapping[str, WalkAsk] = MappingProxyType({}),
+    ) -> None:
         """Put ``node_name`` on resident tables if it can and the deployment
         lets it; the startup log says why a node that named walks stays on the
         host. In `order`, so an owner runs after what it depends on. Built here
@@ -825,6 +832,11 @@ class Engine:
             logger.warning("resident planning stays off on %s: %s", node_name, refused)
         else:
             self._resource_planners.update(dict.fromkeys(resources, submodule_mgmt.resident))
+            if asks := {
+                walk: run_ask for walk, ask in repeat_walks.items()
+                if ask.device_limit and (run_ask := self._run_ask(node_name, submodule_mgmt, walk, ask)) is not None
+            }:
+                runner.ask_device_runs(asks)
         runner.bind_resident(submodule_mgmt.resident)
 
     def _bind_foreign_planners(self) -> None:
@@ -943,7 +955,9 @@ class Engine:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
-    def warmup(self) -> None:
+    def warmup(self, repeat_walks: Mapping[str, Mapping[str, WalkAsk]] = MappingProxyType({})) -> None:
+        """Capture every node's graphs. ``repeat_walks``: the walks a step of
+        which may stand for several iterations, by node."""
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -966,7 +980,7 @@ class Engine:
                 token_ladders=submodule_mgmt.token_ladders,
                 step_tokens=functools.partial(self._chunking.max_step_tokens, node_name),
             )
-            self._build_resident_planner(node_name, runner)
+            self._build_resident_planner(node_name, runner, repeat_walks.get(node_name, MappingProxyType({})))
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
@@ -2284,6 +2298,12 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
+            run = cg_runner.slot_run(lease)
+            if run is not None:
+                run.stage(
+                    len(request_ids), self._ignore_eos(submodule_mgmt, graph_walk, engine_inputs, request_ids),
+                    ctx.repeats,
+                )
             out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
@@ -2604,6 +2624,7 @@ class Engine:
                 check_stop_buffers=raw_outputs.check_stop_buffers,
                 row_request_ids=tuple(request_ids),
                 rows_only=True,
+                run_replays=raw_outputs.run_replays,
             )
         out_ids = (
             step_request_ids if lease is None
@@ -2636,6 +2657,7 @@ class Engine:
             row_views=row_views,
             output_spans=spans or None,
             span_request_ids=tuple(request_ids) if spans else None,
+            run_replays=raw_outputs.run_replays,
         )
 
     @staticmethod
@@ -2903,6 +2925,31 @@ class Engine:
         if (loopback := getattr(mgmt.submodule, "device_loopback", None)) is not None:
             mgmt.resources[loopback.sampler].enable_device_loopback_reader()
 
+    @staticmethod
+    def _run_ask(node_name: str, submodule_mgmt: SubmoduleManagement, walk: str, ask: WalkAsk) -> RunAsk | None:
+        """A device run's needs off the walk's declared stop. None when it has
+        no token stop or carries, which ``repeat_refusal`` reports after capture."""
+        submodule = submodule_mgmt.submodule
+        policies = [p for p in (submodule.get_stop_policies(walk) or {}).values() if p.reads_token]
+        if len(policies) > 1:
+            raise ValueError(
+                f"step_repeats for {node_name!r} sets device_stop, but its walk {walk!r} declares "
+                f"{len(policies)} token stop policies and a device run ends on one; drop device_stop for the node"
+            )
+        policy = policies[0] if policies else None
+        carries = submodule.repeat_carry(walk, ask.loop_back)
+        if policy is None or carries is None:
+            return None
+        submodule_mgmt.run_policies[walk] = policy
+        return RunAsk(ask.device_limit, policy.token_signal, policy.eos_tokens, carries)
+
+    def _ignore_eos(
+        self, submodule_mgmt: SubmoduleManagement, walk: str, engine_inputs: ModelInputsFromEngine, request_ids,
+    ) -> list[bool]:
+        """Each row's ``ignore_eos``: a device run must not stop such a row."""
+        policy, infos = submodule_mgmt.run_policies[walk], engine_inputs.per_request_info
+        return [policy.request_ignores_eos(infos[rid]) for rid in request_ids]
+
     def record_tokens(self, batch: ExecutingBatch, host_rows: HostRows, info_of) -> None:
         self._submodules[batch.node_name].submodule.record_tokens(batch.step_context.graph_walk, host_rows, info_of)
 
@@ -2916,7 +2963,9 @@ class Engine:
         carries = mgmt.submodule.repeat_carry(graph_walk, loop_back)
         if carries is None:
             return "node: it keeps no device loop-back to carry between replays"
-        refusal = mgmt.accelerator_graph_runner.carry_refusal(graph_walk, carries)
+        refusal = mgmt.accelerator_graph_runner.device_run_refusal(graph_walk)
+        if refusal is None:
+            refusal = mgmt.accelerator_graph_runner.carry_refusal(graph_walk, carries)
         if refusal is None:
             step = mgmt.resident.captured_steps[graph_walk]
             step.ctx.resident = mgmt.resident  # the capture's context; its step is over

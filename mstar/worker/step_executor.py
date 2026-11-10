@@ -35,7 +35,7 @@ from mstar.profile.worker import WorkerProfileInfo
 from mstar.utils import cpus, knobs
 from mstar.utils.containers import ParallelList
 from mstar.utils.device import DeviceCapability
-from mstar.utils.profiler import PhaseLaps, range_pop, range_push, set_step_key
+from mstar.utils.profiler import PhaseLaps, phase_record, range_pop, range_push, set_step_key
 from mstar.utils.threads import InlineExecutor, ThreadPool, pin_thread
 from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs, crop_to_spans
 from mstar.worker.lockstep import Lockstep
@@ -821,6 +821,8 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
+        if host_rows is not None and host_rows.ran is not None:
+            self._settle_device_run(batch_N, host_rows)
         self._rebuilds.keep_prompts(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
@@ -917,6 +919,16 @@ class StepExecutor:
         _pp_stage("tail")
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
+
+    @staticmethod
+    def _settle_device_run(batch_N: PendingBatch, host_rows: HostRows) -> None:
+        """A device run that ended short (every row stopped) wrote only the
+        columns it ran; everything after this reads the width it really had."""
+        ran = int(host_rows.ran[0])
+        phase_record(f"repeats.{batch_N.graph_walk}.ran#", ran)
+        for name, column in host_rows.buffers.items():
+            host_rows.buffers[name] = column[:, :ran]
+        batch_N.node_batch.step_context.repeats = ran
 
     def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why no step of this walk can stand for several iterations, or None:

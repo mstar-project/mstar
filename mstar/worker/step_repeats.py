@@ -36,6 +36,9 @@ class RepeatConfig:
     # Ready rows wait for a full-length run: after a step that ran once, the next
     # takes no new rows. Trades admission latency for longer runs.
     ready_waits: bool = False
+    # A step's WHILE node ends on the device once every row has stopped, in one
+    # launch, instead of the host launching each iteration.
+    device_stop: bool = False
 
     @classmethod
     def parse(cls, node: str, block: object) -> RepeatConfig:
@@ -47,7 +50,7 @@ class RepeatConfig:
         config = cls(**block)
         if type(config.max) is not int or config.max < 1:
             raise ValueError(f"step_repeats for {node!r}: max is {config.max!r}; it must be an integer of at least 1")
-        for name in ("ready_waits",):
+        for name in ("ready_waits", "device_stop"):
             if type(getattr(config, name)) is not bool:
                 raise ValueError(
                     f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
@@ -119,7 +122,7 @@ class StepRepeats:
         for (node, walk), signals in self.loops.items():
             if signals.refusal is None:
                 config = self._configs[node]
-                asked.setdefault(node, {})[walk] = WalkAsk(signals.loop_back)
+                asked.setdefault(node, {})[walk] = WalkAsk(signals.loop_back, config.max if config.device_stop else 0)
         return asked
 
     def settle(self, refusal: Callable[[str, str], str | None]) -> None:

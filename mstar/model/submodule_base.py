@@ -31,6 +31,8 @@ class HostRows(NamedTuple):
 
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
+    # ``BatchedModelOutput.run_replays`` on the host; None on any other step
+    ran: torch.Tensor | None = None
 
     def first_values(self, name: str, request_ids: Sequence[str]):
         """``(rid, value)`` for each of ``request_ids`` that has a row, where
@@ -233,13 +235,16 @@ class StopPolicy:
         max_iters = None
         if self.kind is not StopKind.EOS:
             max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
-        ignore_eos = False
+        return StopLimits(max_iters, self.request_ignores_eos(info))
+
+    def request_ignores_eos(self, info: CurrentForwardPassInfo) -> bool:
+        """``StopLimits.ignore_eos`` for one request, alone."""
         if self.reads_token and self.ignores_eos is not None:
-            ignore_eos = bool(self.ignores_eos(info))
-        elif self.reads_token and self.sampler is not None:
+            return bool(self.ignores_eos(info))
+        if self.reads_token and self.sampler is not None:
             config = info.resource_configs.get(self.sampler)
-            ignore_eos = bool(getattr(config, "ignore_eos", False))
-        return StopLimits(max_iters, ignore_eos)
+            return bool(getattr(config, "ignore_eos", False))
+        return False
 
     def stops(self, count: int, token: int | None, limits: StopLimits) -> bool:
         """Whether a row with the loop at ``count`` and sampled ``token``
@@ -299,6 +304,9 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
+    # A device run's iterations, [1] int64, on the device; None on any other
+    # step. Its host copy is ``HostRows.ran``.
+    run_replays: torch.Tensor | None = None
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
