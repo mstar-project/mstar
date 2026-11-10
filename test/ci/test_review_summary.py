@@ -181,6 +181,13 @@ class TestReviewSummary(unittest.TestCase):
         pages = threads(thread("P2", comment_id=7), thread("P1", resolved=True, comment_id=8))
         text = render(review(prior=prior), pages, "0123456789", "light", [])
         self.assertIn("🔴 **1 P1, 1 P2**", text, "resolving a thread would clear a finding the re-review found open")
+        crash = [{"ref": "7", "priority": "P1", "status": "open", "why": "a crash, not a nit"}]
+        same_place = {**review(prior=crash), "outside_diff": [
+            {"priority": "P2", "claim": "typo", "location": "a.py:9", "detail": "d"},
+            {"priority": "P1", "claim": "double free", "location": "a.py:9", "detail": "d"}]}
+        self.assertEqual(open_findings(same_place, threads(thread("P3", comment_id=7)), []),
+                         [("earlier 7", "P1", "a crash, not a nit"), ("outside the diff, a.py:9", "P1", "double free")],
+                         "a finding would show at its worst priority with another row's text")
 
     def test_state_survives_model_text_that_closes_a_comment(self):
         r = review()

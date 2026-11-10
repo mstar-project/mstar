@@ -621,40 +621,45 @@ class TestApprove(unittest.TestCase):
                     "untouched": earlier if untouched else []}
 
         # name, the earlier state's items, this run's items, its verdicts, the tag of bot thread 4, whether a.py is
-        # untouched since the last review, how many re-reviews run, what the checklist says (None: approved)
-        for name, earlier, new, verdicts, tag, untouched, runs, says in (
+        # untouched since the last review, the verdicts of a second re-review at the same head (None: there is none),
+        # what the last checklist says (None: approved)
+        for name, earlier, new, verdicts, tag, untouched, again, says in (
                 ("a P1 thread the re-review calls P2, fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P1",
-                 False, 1, must),
-                ("a P2 thread fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P2", False, 1, None),
-                ("a P3 thread the re-review disputes at P1", [], [], [verdict("4", "P1", "disputed")], "P3", False, 1,
-                 "disputed"),
-                ("an earlier P1 restated as P2, fixed above", [item("P1", None)], [item("P2")], [], None, False, 1,
-                 must),
+                 False, None, must),
+                ("a P2 thread fixed above", [], [], [verdict("4", "P2", "fixed_above")], "P2", False, None, None),
+                ("a P3 thread the re-review disputes at P1", [], [], [verdict("4", "P1", "disputed")], "P3", False,
+                 None, "disputed"),
+                ("an earlier P1 restated as P2, fixed above", [item("P1", None)], [item("P2")], [], None, False,
+                 None, must),
                 ("the most severe of two earlier items at one place", [item("P1", None, "x"), item("P2", None, "y")],
-                 [item("P2")], [], None, False, 1, must),
+                 [item("P2")], [], None, False, None, must),
                 ("an earlier P2 judged P1 and fixed above", [item("P2", None)], [],
-                 [verdict("a.py:1", "P1", "fixed_above")], None, False, 1, must),
+                 [verdict("a.py:1", "P1", "fixed_above")], None, False, None, must),
                 ("an earlier P1 judged fixed at P3, its file untouched", [item("P1", None)], [],
-                 [verdict("a.py:1", "P3", "fixed")], None, True, 1, "disputed"),
+                 [verdict("a.py:1", "P3", "fixed")], None, True, None, "disputed"),
                 ("an earlier P1 judged fixed twice, its file untouched", [item("P1", None)], [],
-                 [verdict("a.py:1", "P1", "fixed")], None, True, 2, "disputed"),
-                ("a new P3 where an untouched earlier P1 was judged fixed", [item("P1", None)],
-                 [item("P3", None, "new")], [verdict("a.py:1", "P1", "fixed")], None, True, 1, "disputed"),
-                ("a P2 fixed above where an untouched earlier P1 was judged moot", [item("P1", None)], [item("P2")],
-                 [verdict("a.py:1", "P1", "moot")], None, True, 1, "disputed"),
+                 [verdict("a.py:1", "P1", "fixed")], None, True, [verdict("a.py:1", "P1", "fixed")], "disputed"),
+                ("an earlier P3 judged fixed at P1, then at P3, its file untouched", [item("P3", None)], [],
+                 [verdict("a.py:1", "P1", "fixed")], None, True, [verdict("a.py:1", "P3", "fixed")], "disputed"),
+                ("a new P3 where an untouched earlier P1 was judged fixed, then the place judged open at P3",
+                 [item("P1", None)], [item("P3", None, "new")], [verdict("a.py:1", "P1", "fixed")], None, True,
+                 [verdict("a.py:1", "P3", "open")], "a.py:1"),
+                ("a P2 fixed above where an untouched earlier P1 was judged moot, then the place fixed above at P2",
+                 [item("P1", None)], [item("P2")], [verdict("a.py:1", "P1", "moot")], None, True,
+                 [verdict("a.py:1", "P2", "fixed_above")], must),
                 ("a new P3 where an earlier P1 was fixed", [item("P1", None)], [item("P3", None, "new")],
-                 [verdict("a.py:1", "P1", "fixed")], None, False, 1, None)):
+                 [verdict("a.py:1", "P1", "fixed")], None, False, None, None)):
             with self.subTest(name):
                 pages = [threads_page(*([thread(4, f"**[{tag}]** x")] if tag else []))]
                 review = run(earlier, new, verdicts, pages, untouched)
-                if runs == 2:  # the next re-review at the same head, from the state this one saved
+                if again is not None:  # the next re-review at the same head, from the state this one saved
                     state = render_summary.read_state(render_summary.render(
                         {**review, "since_last": "", "description_problems": [], "skipped": [], "types": ["bug"],
                          "checked": [], "design": [], "latent": [],
                          "risk": {"level": "low", "reason": "r", "look_at": []}},
                         pages, "0123456789", "full", [9]))["outside_diff"]
                     held = {f["location"] for f in state}
-                    review = run(state, new, [v for v in verdicts if v["ref"] in held], pages, untouched)
+                    review = run(state, [], [v for v in again if v["ref"] in held], pages, untouched)
                 text, _, writes = self.approve({"value": "on"}, above=above, outside=review["outside_diff"],
                                                prior=review["prior_findings"], untouched=review["untouched"],
                                                extra={**still, "POST graphql": pages[0]})
