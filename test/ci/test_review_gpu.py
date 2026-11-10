@@ -92,7 +92,7 @@ class TestApproval(unittest.TestCase):
         self.assertEqual(why("pass", "full"), [])
         self.assertEqual(why("pass", "full", [f"docs/{i}.rst" for i in range(300)]),
                          ["the file list is too long to check"], "a long file list would crash the approval")
-        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
+        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), [render_summary.UNFINISHED],
                          "a review that left files unread could approve them")
         self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
                          "a review that left a question open could approve")
@@ -277,7 +277,7 @@ class TestCarry(unittest.TestCase):
         p1 = {"priority": "P1", "claim": "c", "location": "mstar/engine/engine.py:10", "detail": "d"}
         for review, threads, why in [({"outside_diff": [p1]}, (), "engine.py:10 (P1)"),
                                      ({}, [thread(4, "**[P2]** an inline finding")], "inline 4 (P2)"),
-                                     ({"skipped": ["a.py"]}, (), "the review skipped files"),
+                                     ({"skipped": ["a.py"]}, (), render_summary.UNFINISHED),
                                      ({"inline": {"4": "P2"}}, (), "deleted or retagged since the bot"),
                                      ({"inline": {"4": "P2"}}, [thread(4, "**[P3]** retagged")],
                                       "deleted or retagged since the bot"),
@@ -1100,6 +1100,15 @@ class TestPost(unittest.TestCase):
         self.assertIn("edited after the bot posted it", comment)
         self.assertIn("a person has to decide", comment)
         self.assertNotIn("then comment `/review` again", comment, "no later review can clear an edited thread")
+
+    def test_an_unfinished_review_is_not_left_to_the_author(self):
+        with tempfile.TemporaryDirectory() as temp, workspace():
+            Path(temp, "gate.txt").write_text(render_summary.UNFINISHED)
+            _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
+                             run_url="u", trusted="true", gated="true")
+        (_, comment), = posted.writes()
+        self.assertIn("the bot's to finish, not yours", comment)
+        self.assertNotIn("fix what the review left open", comment, "the author would be told to fix the bot's gap")
 
 
 class TestEras(unittest.TestCase):
