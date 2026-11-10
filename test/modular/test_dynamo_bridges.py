@@ -805,10 +805,52 @@ def test_tensor_bad_images_shape_error(tmp_path):
     assert not server.submitted
 
 
-def test_tensor_error_chunk_raises(tmp_path):
-    server = _FakeRealtimeServer([_chunk("error", b"engine exploded")], tmp_path)
-    with pytest.raises(RuntimeError, match="engine exploded"):
-        _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+def _realtime_error(server):
+    """The in-band error a realtime turn sends, raised the way the other routes fail."""
+    out = _run_connection(server, [_append(PCM), {"type": "input_audio_buffer.commit"}])
+    error = next(e["error"] for e in out if e["type"] == "error")
+    assert out[-1]["response"]["status_details"]["error"]["type"] == error["type"]
+    if error["type"] == "invalid_request_error":
+        raise ValueError(error["message"])
+    raise RuntimeError(error["message"])
+
+
+async def _drain(gen):
+    return [out async for out in gen]
+
+
+_ERROR_ROUTES = {
+    "chat": lambda server: asyncio.run(_drain(RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o").generate(
+        {"messages": [{"role": "user", "content": "hi"}]}, _Ctx()))),
+    "images": lambda server: asyncio.run(RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")._images(
+        {"prompt": "a cat"}, _Ctx())),
+    "speech": lambda server: asyncio.run(RequestBridge(server, ADAPTER_REGISTRY["kokoro"], "kokoro")._speech(
+        {"input": "hi"}, _Ctx())),
+    "videos": lambda server: asyncio.run(_drain(RequestBridge(server, ADAPTER_REGISTRY["ltx2_5"], "ltx2_5").videos(
+        {"prompt": "a dog"}, _Ctx()))),
+    "tensor": lambda server: _run_tensor(server, _pi05_request(_pi05_frames(cameras=1))),
+    "realtime": _realtime_error,
+}
+
+
+@pytest.mark.parametrize("route", list(_ERROR_ROUTES))
+@pytest.mark.parametrize("status", [413, None])
+def test_an_error_chunk_reaches_the_client_with_its_status(tmp_path, route, status):
+    """Every error chunk was raised as a RuntimeError, so a request the engine
+    refused with a 4xx reached its Dynamo client as a server error."""
+    chunk = SimpleNamespace(modality="error", data=b"engine said no",
+                            metadata={} if status is None else {"status": status})
+    server = _FakeRealtimeServer([chunk], tmp_path)
+    server.model = None
+    with pytest.raises(Exception) as failed:
+        _ERROR_ROUTES[route](server)
+    assert "engine said no" in str(failed.value)
+    if status is None:  # no status is the engine's own failure
+        assert not isinstance(failed.value, ValueError)
+    elif route != "realtime":
+        assert (failed.value.code, failed.value.message) == (413, "engine said no")
+    else:
+        assert isinstance(failed.value, ValueError)
     assert server.aborted
 
 
