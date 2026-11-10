@@ -153,6 +153,13 @@ _EAGER_ATTENTION_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 MAX_CAPTURE_MEL_FRAMES = 32 * 1024
 
 
+class _Region(NamedTuple):
+    """A captured region a step replays: its bucket and the runner's label."""
+
+    bucket: int
+    label: str
+
+
 def _subsample_region(bucket: int) -> str:
     return f"subsample_T{bucket}"
 
@@ -288,11 +295,10 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
         return configs
 
     @staticmethod
-    def _region(runners: dict, labels: Iterable[tuple[int, str]], needed: int, rows: int) -> tuple[int, str] | None:
-        """The smallest ``(bucket, label)`` holding ``needed`` whose runner
-        replays ``rows`` rows."""
+    def _region(runners: dict, labels: Iterable[tuple[int, str]], needed: int, rows: int) -> "_Region | None":
+        """The smallest bucket holding ``needed`` whose runner replays ``rows`` rows."""
         return next(
-            ((bucket, label) for bucket, label in labels
+            (_Region(bucket, label) for bucket, label in labels
              if bucket >= needed and label in runners and runners[label].can_run(rows)),
             None,
         )
@@ -310,20 +316,20 @@ class Phi4MMAudioEncoderSubmodule(NodeSubmodule):
         runners = engine_inputs.piecewise_runners
         longest = max(int(clip.shape[0]) for clip in clips)
         tokens = self.config.tokens(longest)
-        windows = sum(self.config.windows(self.config.tokens(int(clip.shape[0]))) for clip in clips)
+        windows = sum(inp.kwargs["windows"] for inp in inputs)
         subsample = self._region(runners, ((b, _subsample_region(b)) for b in MEL_BUCKETS), longest, len(clips))
         blocks = self._region(
             runners, ((w, _blocks_region(w)) for w in WIDTH_BUCKETS), min(tokens, self.config.window), windows,
         )
         batch = audio_batch(
             clips, self.config, self.get_device(), self._dtype(),
-            mel_frames=None if subsample is None else subsample[0],
-            width=None if blocks is None else blocks[0],
+            mel_frames=None if subsample is None else subsample.bucket,
+            width=None if blocks is None else blocks.bucket,
         )
         return {
             "batch": batch,
             "regions": StepRegions(
-                None if subsample is None else subsample[1], None if blocks is None else blocks[1],
+                None if subsample is None else subsample.label, None if blocks is None else blocks.label,
             ),
             "rows_per_request": [inp.input_seq_len for inp in inputs],
         }

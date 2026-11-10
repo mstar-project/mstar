@@ -5,12 +5,15 @@
 #
 # usage: benchmark/phi4mm/interleave.sh <engine A> <url A> <engine B> <url B> <workload> \
 #            <out.jsonl> [rounds=2] [concurrency=32] [requests=8*concurrency]
-#   engines: mstar | vllm. Media offsets advance per run (OFFSET=<first>), so an engine
-#   that caches encoder outputs never sees an image or clip twice. CLOCK_CPU picks the
-#   probe's core (default 100).
+#   engines: mstar | vllm. Media offsets advance per run and carry over between calls
+#   that share <out.jsonl> (kept in <out.jsonl>.offset; OFFSET=<first> overrides), so
+#   servers that cache encoder outputs or media-keyed prefixes never see an image or clip
+#   twice. Use one <out.jsonl> per pair of resident servers. CLOCK_CPU picks the probe's
+#   core (default 100).
 set -eu
 EA=$1 UA=$2 EB=$3 UB=$4 W=$5 OUT=$6 R=${7:-2} C=${8:-32}
-N=${9:-$((C * 8))} CPU=${CLOCK_CPU:-100} OFF=${OFFSET:-0}
+N=${9:-$((C * 8))} CPU=${CLOCK_CPU:-100}
+OFF=${OFFSET:-$(cat "$OUT.offset" 2>/dev/null || echo 0)}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 clock_mhz() {
@@ -34,6 +37,7 @@ print(d['arm'], d['workload'], 'tok/s', d['output_tok_s'], 'itl p50', d['itl_ms'
       'ttft p50', d['ttft_ms'].get('p50'), 'failed', d['failed'], 'tokens', d['mean_output_tokens'],
       'SHORT' if d['short_output'] else '', 'busy core', $mhz, 'MHz')"
   OFF=$((OFF + N + C))
+  echo "$OFF" > "$OUT.offset"
 }
 
 for r in $(seq "$R"); do
